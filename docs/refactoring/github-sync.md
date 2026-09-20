@@ -259,4 +259,26 @@ the last report bytes.
 
 Final success is report-layer success plus an explicit `exit-status = 0`.
 EOF or close without `exit-status` is `ssh_exit_missing` and is never
-success; the wait is bounded by GS-20.
+success; the wait is bounded by the exit deadline below.
+
+## 时间边界
+
+Four independent receive-pack deadlines live on `[github_sync]`:
+
+| Field | Default | Stage on expiry |
+|---|---|---|
+| `advertise_timeout_seconds` | 30 | `advertise` |
+| `send_timeout_seconds` | 300 | `send` |
+| `report_timeout_seconds` | 60 | `report` |
+| `exit_timeout_seconds` | 15 | `report` |
+
+Each expiry cancels the in-flight future, marks the receive-pack
+aborted, and shuts down the SSH TCP socket (SO_LINGER 0 + close/RST)
+so queued writes cannot resume when the peer reads again. The SSH
+session inactivity bound is at least the max of these four fields
+(and the 15s connect timeout); connect itself is still cancelled at
+15s and aborts the TCP fd so a failed handshake cannot leak.
+`exit_timeout_seconds` starts when report-status parses successfully
+or stdout closes, then covers the SSH exit-status/exit-signal wait
+and any remaining stdout drain. Zero is rejected at config validate.
+Diagnostic byte budgets are GS-26.

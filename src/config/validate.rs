@@ -8,9 +8,10 @@ use toml::Value;
 use url::Url;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig, LFSConfig,
-    LogConfig, MonoConfig, NotificationConfig, OAuthConfig, PackConfig, PushAuth, PushPolicy,
-    RedisConfig, VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
+    ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig,
+    GithubSyncConfig, LFSConfig, LogConfig, MonoConfig, NotificationConfig, OAuthConfig,
+    PackConfig, PushAuth, PushPolicy, RedisConfig, VAULT_AUDIT_SINKS, VaultConfig,
+    normalize_token_path,
     secret::{SecretRef, SecretResolver, is_secret_ref_value},
 };
 use crate::common::{errors::MegaError, oci_name::valid_repository_name};
@@ -760,6 +761,7 @@ fn validate_github_sync_config_inner(
     let sync = &config.github_sync;
     const FIELD: &str = "github_sync.ssh_key_ref";
     const SUFFIX: &str = "github_sync/ssh_key";
+    validate_github_sync_deadlines(sync)?;
 
     if !sync.ssh_key_ref.is_empty() {
         let secret_ref = parse_secret_ref_for_field(FIELD, &sync.ssh_key_ref)?;
@@ -800,6 +802,22 @@ fn validate_github_sync_config_inner(
     }
 
     validate_github_sync_bindings(config)
+}
+
+fn validate_github_sync_deadlines(sync: &GithubSyncConfig) -> Result<(), MegaError> {
+    for (name, value) in [
+        ("advertise_timeout_seconds", sync.advertise_timeout_seconds),
+        ("send_timeout_seconds", sync.send_timeout_seconds),
+        ("report_timeout_seconds", sync.report_timeout_seconds),
+        ("exit_timeout_seconds", sync.exit_timeout_seconds),
+    ] {
+        if value == 0 {
+            return Err(MegaError::Other(format!(
+                "[github_sync] {name} must be > 0"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn github_sync_path_components(path: &str) -> Vec<&str> {
@@ -2022,6 +2040,10 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "ssh_host_key",
             "ssh_key_ref",
             "bindings",
+            "advertise_timeout_seconds",
+            "send_timeout_seconds",
+            "report_timeout_seconds",
+            "exit_timeout_seconds",
         ]),
         "github_sync.bindings" => Some(&["id", "path", "remote"]),
         "cedar" => Some(&["enforcement"]),

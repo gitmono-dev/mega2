@@ -879,6 +879,28 @@ fn collect_github_sync_restart_fields(
     if current.github_sync.bindings != candidate.github_sync.bindings {
         report.restart_required_fields.push("github_sync.bindings");
     }
+    if current.github_sync.advertise_timeout_seconds
+        != candidate.github_sync.advertise_timeout_seconds
+    {
+        report
+            .restart_required_fields
+            .push("github_sync.advertise_timeout_seconds");
+    }
+    if current.github_sync.send_timeout_seconds != candidate.github_sync.send_timeout_seconds {
+        report
+            .restart_required_fields
+            .push("github_sync.send_timeout_seconds");
+    }
+    if current.github_sync.report_timeout_seconds != candidate.github_sync.report_timeout_seconds {
+        report
+            .restart_required_fields
+            .push("github_sync.report_timeout_seconds");
+    }
+    if current.github_sync.exit_timeout_seconds != candidate.github_sync.exit_timeout_seconds {
+        report
+            .restart_required_fields
+            .push("github_sync.exit_timeout_seconds");
+    }
 }
 
 fn collect_storage_events_restart_fields(

@@ -1,9 +1,12 @@
 use std::{
+    io::{self, ErrorKind},
     net::SocketAddr,
+    pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -11,6 +14,7 @@ use russh::{
     client,
     keys::{Algorithm, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate},
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{common::errors::MegaError, config::GithubSyncConfig};
 
@@ -19,6 +23,106 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Established outbound SSH session after host-key pin and public-key auth.
 pub struct SshSession {
     session: client::Handle<PinHandler>,
+    abort: TransportAbort,
+}
+
+#[derive(Clone)]
+pub(crate) struct TransportAbort {
+    inner: Arc<Mutex<Option<tokio::net::TcpStream>>>,
+    waker: Arc<Mutex<Option<Waker>>>,
+}
+
+impl TransportAbort {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            waker: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn abort(&self) {
+        let taken = self.inner.lock().expect("tcp abort").take();
+        if let Some(stream) = taken
+            && let Ok(std_sock) = stream.into_std()
+        {
+            close_with_rst(std_sock);
+        }
+        if let Some(waker) = self.waker.lock().expect("tcp waker").take() {
+            waker.wake();
+        }
+    }
+}
+
+fn close_with_rst(stream: std::net::TcpStream) {
+    #[cfg(unix)]
+    {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: `stream` is the unique fd after take(); SO_LINGER 0 + close
+        // sends RST so queued TCP writes cannot drain.
+        unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&stream),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            );
+        }
+    }
+    drop(stream);
+}
+
+struct AbortableStream {
+    abort: TransportAbort,
+}
+
+impl AbortableStream {
+    fn poll_inner<T>(
+        &self,
+        cx: &mut Context<'_>,
+        op: impl FnOnce(Pin<&mut tokio::net::TcpStream>, &mut Context<'_>) -> Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        let mut inner = self.abort.inner.lock().expect("tcp abort");
+        let Some(stream) = inner.as_mut() else {
+            return Poll::Ready(Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "github_sync ssh transport aborted",
+            )));
+        };
+        *self.abort.waker.lock().expect("tcp waker") = Some(cx.waker().clone());
+        op(Pin::new(stream), cx)
+    }
+}
+
+impl AsyncRead for AbortableStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_inner(cx, |stream, cx| stream.poll_read(cx, buf))
+    }
+}
+
+impl AsyncWrite for AbortableStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_inner(cx, |stream, cx| stream.poll_write(cx, buf))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_inner(cx, |stream, cx| stream.poll_flush(cx))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_inner(cx, |stream, cx| stream.poll_shutdown(cx))
+    }
 }
 
 impl std::fmt::Debug for SshSession {
@@ -28,6 +132,14 @@ impl std::fmt::Debug for SshSession {
 }
 
 impl SshSession {
+    pub(crate) fn abort_transport(&self) {
+        self.abort.abort();
+    }
+
+    pub(crate) fn abort_transport_handle(&self) -> TransportAbort {
+        self.abort.clone()
+    }
+
     pub(crate) async fn exec(
         &mut self,
         command: &str,
@@ -255,19 +367,30 @@ async fn connect_inner(config: &GithubSyncConfig, limit: Duration) -> Result<Ssh
         pinned: config.ssh_host_key.clone(),
         auth_called: auth_called.clone(),
     };
-    // Finite so a timed-out `connect` cannot leak the russh session task
-    // that `client::connect` spawns before KEX finishes. Successful
-    // sessions stay live while they see traffic within this bound.
+    // Handshake still bounded by `limit` (GS-07). After auth, inactivity
+    // must cover the receive-pack deadlines (GS-20); a timed-out connect
+    // closes the TCP fd so the russh task cannot leak until that bound.
     let client_config = Arc::new(client::Config {
-        inactivity_timeout: Some(limit),
+        inactivity_timeout: Some(session_inactivity(config, limit)),
         nodelay: true,
         ..Default::default()
     });
 
     let user = config.ssh_user.trim().to_string();
     let private = Arc::new(key.private_key().clone());
+    let abort = TransportAbort::new();
     let work = async {
-        let mut session = russh::client::connect(client_config, (host.as_str(), port), handler)
+        let socket = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .map_err(|err| SshError::connect(format!("ssh connect failed: {err}")))?;
+        if let Err(err) = socket.set_nodelay(true) {
+            tracing::warn!(error = %err, "github_sync ssh set_nodelay failed");
+        }
+        *abort.inner.lock().expect("tcp abort") = Some(socket);
+        let stream = AbortableStream {
+            abort: abort.clone(),
+        };
+        let mut session = russh::client::connect_stream(client_config, stream, handler)
             .await
             .map_err(|err| err.with_auth_flag(auth_called.load(Ordering::SeqCst)))?;
         auth_called.store(true, Ordering::SeqCst);
@@ -289,17 +412,38 @@ async fn connect_inner(config: &GithubSyncConfig, limit: Duration) -> Result<Ssh
         if !result.success() {
             return Err(SshError::auth("publickey authentication rejected").with_auth_flag(true));
         }
-        Ok(SshSession { session })
+        Ok(SshSession {
+            session,
+            abort: abort.clone(),
+        })
     };
 
     match tokio::time::timeout(limit, work).await {
-        Err(_) => Err(SshError::connect(format!(
-            "ssh connect timed out after {}ms",
-            limit.as_millis()
-        ))
-        .with_auth_flag(auth_called.load(Ordering::SeqCst))),
-        Ok(result) => result,
+        Err(_) => {
+            abort.abort();
+            Err(SshError::connect(format!(
+                "ssh connect timed out after {}ms",
+                limit.as_millis()
+            ))
+            .with_auth_flag(auth_called.load(Ordering::SeqCst)))
+        }
+        Ok(Err(err)) => {
+            abort.abort();
+            Err(err)
+        }
+        Ok(Ok(session)) => Ok(session),
     }
+}
+
+fn session_inactivity(config: &GithubSyncConfig, connect_limit: Duration) -> Duration {
+    let pack = config
+        .advertise_timeout_seconds
+        .max(config.send_timeout_seconds)
+        .max(config.report_timeout_seconds)
+        .max(config.exit_timeout_seconds);
+    Duration::from_secs(pack)
+        .max(connect_limit)
+        .max(CONNECT_TIMEOUT)
 }
 
 #[cfg(test)]
@@ -412,6 +556,28 @@ mod tests {
             ssh_host_key: host_key.to_string(),
             ..GithubSyncConfig::default()
         }
+    }
+
+    #[test]
+    fn inactivity_covers_receive_pack_deadlines() {
+        let defaulted = GithubSyncConfig::default();
+        assert_eq!(
+            session_inactivity(&defaulted, CONNECT_TIMEOUT),
+            Duration::from_secs(defaulted.send_timeout_seconds)
+        );
+        let mut custom = defaulted;
+        custom.send_timeout_seconds = 10;
+        custom.report_timeout_seconds = 8;
+        custom.exit_timeout_seconds = 5;
+        custom.advertise_timeout_seconds = 40;
+        assert_eq!(
+            session_inactivity(&custom, CONNECT_TIMEOUT),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            session_inactivity(&custom, Duration::from_secs(90)),
+            Duration::from_secs(90)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

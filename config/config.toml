@@ -349,6 +349,10 @@ enforcement = "off"
 # ssh_user = "git"
 # ssh_host_key = "ssh-ed25519 AAAAEXAMPLE"
 # ssh_key_ref = "vault://secret/config/<profile>/github_sync/ssh_key#value"
+# advertise_timeout_seconds = 30
+# send_timeout_seconds = 300
+# report_timeout_seconds = 60
+# exit_timeout_seconds = 15
 # [[github_sync.bindings]]
 # id = "core"
 # path = "/project/core"

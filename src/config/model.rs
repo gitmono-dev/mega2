@@ -71,8 +71,8 @@ pub struct Config {
     pub cedar: CedarConfig,
 }
 
-/// `[github_sync]` configuration structure (plan-20260916 GS-03).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+/// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GithubSyncConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -86,6 +86,52 @@ pub struct GithubSyncConfig {
     pub ssh_key_ref: String,
     #[serde(default)]
     pub bindings: Vec<GithubSyncBinding>,
+    #[serde(default = "default_github_sync_advertise_timeout_seconds")]
+    pub advertise_timeout_seconds: u64,
+    #[serde(default = "default_github_sync_send_timeout_seconds")]
+    pub send_timeout_seconds: u64,
+    #[serde(default = "default_github_sync_report_timeout_seconds")]
+    pub report_timeout_seconds: u64,
+    #[serde(default = "default_github_sync_exit_timeout_seconds")]
+    pub exit_timeout_seconds: u64,
+}
+
+pub const DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS: u64 = 60;
+pub const DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS: u64 = 15;
+
+fn default_github_sync_advertise_timeout_seconds() -> u64 {
+    DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS
+}
+
+fn default_github_sync_send_timeout_seconds() -> u64 {
+    DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS
+}
+
+fn default_github_sync_report_timeout_seconds() -> u64 {
+    DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS
+}
+
+fn default_github_sync_exit_timeout_seconds() -> u64 {
+    DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS
+}
+
+impl Default for GithubSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssh_host: String::new(),
+            ssh_user: String::new(),
+            ssh_host_key: String::new(),
+            ssh_key_ref: String::new(),
+            bindings: Vec::new(),
+            advertise_timeout_seconds: DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS,
+            send_timeout_seconds: DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS,
+            report_timeout_seconds: DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS,
+            exit_timeout_seconds: DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS,
+        }
+    }
 }
 
 /// One monorepo-path → GitHub remote binding (plan-20260916 GS-03).

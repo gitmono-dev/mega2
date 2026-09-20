@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, io::Write};
+use std::{collections::BTreeSet, future::Future, io::Write, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use russh::{ChannelMsg, client};
@@ -9,6 +9,7 @@ use crate::{
         protocol::smart::{PktLine, try_read_pkt_line},
     },
     common::errors::MegaError,
+    config::GithubSyncConfig,
 };
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -159,6 +160,72 @@ pub struct WriteStats {
 pub struct ReceivePack {
     channel: russh::Channel<client::Msg>,
     pub advertisement: Advertisement,
+    deadlines: ReceivePackDeadlines,
+    aborted: bool,
+    tcp_abort: crate::ceres::github_sync::ssh::TransportAbort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivePackDeadlines {
+    pub advertise: Duration,
+    pub send: Duration,
+    pub report: Duration,
+    pub exit: Duration,
+}
+
+impl ReceivePackDeadlines {
+    pub fn from_config(config: &GithubSyncConfig) -> Self {
+        Self {
+            advertise: Duration::from_secs(config.advertise_timeout_seconds),
+            send: Duration::from_secs(config.send_timeout_seconds),
+            report: Duration::from_secs(config.report_timeout_seconds),
+            exit: Duration::from_secs(config.exit_timeout_seconds),
+        }
+    }
+
+    pub fn defaults() -> Self {
+        Self::from_config(&GithubSyncConfig::default())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadlineStage {
+    Advertise,
+    Report,
+    Send,
+}
+
+impl DeadlineStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Advertise => "advertise",
+            Self::Report => "report",
+            Self::Send => "send",
+        }
+    }
+}
+
+const ABORT_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn with_deadline<T, F>(stage: DeadlineStage, limit: Duration, fut: F) -> Result<T, MegaError>
+where
+    F: Future<Output = Result<T, MegaError>>,
+{
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(deadline_error(stage)),
+    }
+}
+
+async fn abort_channel(channel: &russh::Channel<client::Msg>) {
+    let _ = tokio::time::timeout(ABORT_TIMEOUT, channel.close()).await;
+}
+
+fn deadline_error(stage: DeadlineStage) -> MegaError {
+    MegaError::Other(format!(
+        "github_sync receive-pack {} deadline exceeded",
+        stage.as_str()
+    ))
 }
 
 pub fn build_command_frame(
@@ -197,12 +264,44 @@ fn require_oid(oid: &str, which: &str) -> Result<String, MegaError> {
 }
 
 pub async fn begin(session: &mut SshSession, remote: &str) -> Result<ReceivePack, MegaError> {
+    begin_from_config(session, remote, &GithubSyncConfig::default()).await
+}
+
+pub async fn begin_from_config(
+    session: &mut SshSession,
+    remote: &str,
+    config: &GithubSyncConfig,
+) -> Result<ReceivePack, MegaError> {
+    begin_with_deadlines(session, remote, ReceivePackDeadlines::from_config(config)).await
+}
+
+pub async fn begin_with_deadlines(
+    session: &mut SshSession,
+    remote: &str,
+    deadlines: ReceivePackDeadlines,
+) -> Result<ReceivePack, MegaError> {
     let command = receive_pack_command(remote)?;
     let mut channel = session.exec(&command).await?;
-    let buf = read_advertisement(&mut channel).await?;
+    let buf = match with_deadline(
+        DeadlineStage::Advertise,
+        deadlines.advertise,
+        read_advertisement(&mut channel),
+    )
+    .await
+    {
+        Ok(buf) => buf,
+        Err(err) => {
+            session.abort_transport();
+            abort_channel(&channel).await;
+            return Err(err);
+        }
+    };
     Ok(ReceivePack {
         advertisement: accept_advertisement(&buf)?,
         channel,
+        deadlines,
+        aborted: false,
+        tcp_abort: session.abort_transport_handle(),
     })
 }
 
@@ -220,73 +319,140 @@ impl ReceivePack {
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
     {
+        self.ensure_live()?;
         let plan = build_command_frame(&self.advertisement.main_tip, new_oid, &self.advertisement)?;
         let command_bytes = plan.bytes.len();
-        self.channel
-            .data_bytes(Bytes::from(plan.bytes))
-            .await
-            .map_err(|err| {
-                MegaError::Other(format!(
-                    "github_sync receive-pack command write failed: {err}"
-                ))
+        let missing_sideband = plan.missing_sideband;
+        let command = plan.bytes;
+        match with_deadline(DeadlineStage::Send, self.deadlines.send, async {
+            self.channel
+                .data_bytes(Bytes::from(command))
+                .await
+                .map_err(|err| {
+                    MegaError::Other(format!(
+                        "github_sync receive-pack command write failed: {err}"
+                    ))
+                })?;
+            let mut pack_bytes = 0_u64;
+            let mut peak_chunk = 0_usize;
+            for chunk in chunks {
+                for window in pack_windows(chunk.as_ref()) {
+                    peak_chunk = peak_chunk.max(window.len());
+                    pack_bytes += window.len() as u64;
+                    self.channel
+                        .data_bytes(Bytes::copy_from_slice(window))
+                        .await
+                        .map_err(|err| {
+                            MegaError::Other(format!(
+                                "github_sync receive-pack pack write failed: {err}"
+                            ))
+                        })?;
+                }
+            }
+            self.channel.eof().await.map_err(|err| {
+                MegaError::Other(format!("github_sync receive-pack pack eof failed: {err}"))
             })?;
-        let mut pack_bytes = 0_u64;
-        let mut peak_chunk = 0_usize;
-        for chunk in chunks {
-            for window in pack_windows(chunk.as_ref()) {
-                peak_chunk = peak_chunk.max(window.len());
-                pack_bytes += window.len() as u64;
-                self.channel
-                    .data_bytes(Bytes::copy_from_slice(window))
-                    .await
-                    .map_err(|err| {
-                        MegaError::Other(format!(
-                            "github_sync receive-pack pack write failed: {err}"
-                        ))
-                    })?;
+            Ok(WriteStats {
+                command_bytes,
+                pack_bytes,
+                peak_chunk,
+                missing_sideband,
+            })
+        })
+        .await
+        {
+            Ok(stats) => Ok(stats),
+            Err(err) => {
+                self.abort().await;
+                Err(err)
             }
         }
-        self.channel.eof().await.map_err(|err| {
-            MegaError::Other(format!("github_sync receive-pack pack eof failed: {err}"))
-        })?;
-        Ok(WriteStats {
-            command_bytes,
-            pack_bytes,
-            peak_chunk,
-            missing_sideband: plan.missing_sideband,
-        })
     }
 
     pub async fn read_report(&mut self, sideband: bool) -> Result<(), MegaError> {
+        self.ensure_live()?;
         let mut transport = ReportTransport::default();
-        loop {
-            let step = match self.channel.wait().await {
-                Some(ChannelMsg::Data { data }) => transport.on_data(&data, sideband),
-                Some(ChannelMsg::ExtendedData { data, ext }) => transport.on_stderr(ext, &data),
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    transport.on_exit_status(exit_status, sideband)
+        let report_phase = async {
+            loop {
+                let step = apply_channel_msg(&mut transport, sideband, self.channel.wait().await);
+                match step {
+                    TransportStep::Done(result) => return Ok(Some(result)),
+                    TransportStep::Continue if transport.awaiting_exit() => return Ok(None),
+                    TransportStep::Continue => {}
                 }
-                Some(ChannelMsg::ExitSignal {
-                    signal_name,
-                    error_message,
-                    ..
-                }) => {
-                    let signal = if error_message.is_empty() {
-                        format!("{signal_name:?}")
-                    } else {
-                        format!("{signal_name:?} {error_message}")
-                    };
-                    transport.on_exit_signal(signal, sideband)
+            }
+        };
+        let after_report =
+            match with_deadline(DeadlineStage::Report, self.deadlines.report, report_phase).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.abort().await;
+                    return Err(err);
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => transport.on_eof(sideband),
-                None => transport.on_end(sideband),
-                _ => TransportStep::Continue,
             };
-            match step {
-                TransportStep::Done(result) => return result,
-                TransportStep::Continue => {}
+        if let Some(result) = after_report {
+            return result;
+        }
+        let exit_phase = async {
+            loop {
+                let step = apply_channel_msg(&mut transport, sideband, self.channel.wait().await);
+                match step {
+                    TransportStep::Done(result) => return result,
+                    TransportStep::Continue => {}
+                }
+            }
+        };
+        match with_deadline(DeadlineStage::Report, self.deadlines.exit, exit_phase).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.abort().await;
+                Err(err)
             }
         }
+    }
+
+    fn ensure_live(&self) -> Result<(), MegaError> {
+        if self.aborted {
+            return Err(MegaError::Other(
+                "github_sync receive-pack channel was aborted after a deadline".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn abort(&mut self) {
+        self.aborted = true;
+        self.tcp_abort.abort();
+        abort_channel(&self.channel).await;
+    }
+}
+
+fn apply_channel_msg(
+    transport: &mut ReportTransport,
+    sideband: bool,
+    waited: Option<ChannelMsg>,
+) -> TransportStep {
+    match waited {
+        Some(ChannelMsg::Data { data }) => transport.on_data(&data, sideband),
+        Some(ChannelMsg::ExtendedData { data, ext }) => transport.on_stderr(ext, &data),
+        Some(ChannelMsg::ExitStatus { exit_status }) => {
+            transport.on_exit_status(exit_status, sideband)
+        }
+        Some(ChannelMsg::ExitSignal {
+            signal_name,
+            error_message,
+            ..
+        }) => {
+            let signal = if error_message.is_empty() {
+                format!("{signal_name:?}")
+            } else {
+                format!("{signal_name:?} {error_message}")
+            };
+            transport.on_exit_signal(signal, sideband)
+        }
+        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => transport.on_eof(sideband),
+        None => transport.on_end(sideband),
+        _ => TransportStep::Continue,
     }
 }
 
@@ -533,6 +699,7 @@ struct ReportTransport {
     buf: Vec<u8>,
     stderr: Vec<u8>,
     stream_closed: bool,
+    report_ok: bool,
     exit_status: Option<u32>,
     exit_signal: Option<String>,
 }
@@ -547,7 +714,11 @@ impl ReportTransport {
         self.buf.extend_from_slice(data);
         match report_progress(&self.buf, sideband, false) {
             ReportProgress::Fail(err) => self.done_with(Err(err)),
-            ReportProgress::Ok | ReportProgress::Pending => self.maybe_done(sideband),
+            ReportProgress::Ok => {
+                self.report_ok = true;
+                self.maybe_done(sideband)
+            }
+            ReportProgress::Pending => self.maybe_done(sideband),
         }
     }
 
@@ -574,6 +745,10 @@ impl ReportTransport {
     fn on_end(&mut self, sideband: bool) -> TransportStep {
         self.stream_closed = true;
         self.done_with(parse_report_status(&self.buf, sideband, true))
+    }
+
+    fn awaiting_exit(&self) -> bool {
+        self.report_ok || self.stream_closed
     }
 
     fn maybe_done(&self, sideband: bool) -> TransportStep {
@@ -1076,5 +1251,512 @@ mod tests {
         let fatal = encode_sideband(3, b"index-pack failed");
         let err = drive(true, &[TestEv::Data(&fatal)]).expect_err("fatal is immediate");
         assert!(err.to_string().contains(REPORT_FATAL), "{err}");
+    }
+
+    const OLD_OID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const NEW_OID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SHORT: Duration = Duration::from_millis(400);
+    const LONG: Duration = Duration::from_secs(30);
+
+    fn deadlines(
+        advertise: Duration,
+        send: Duration,
+        report: Duration,
+        exit: Duration,
+    ) -> ReceivePackDeadlines {
+        ReceivePackDeadlines {
+            advertise,
+            send,
+            report,
+            exit,
+        }
+    }
+
+    struct ClearHold;
+    impl Drop for ClearHold {
+        fn drop(&mut self) {
+            crate::ceres::github_sync::key::clear_held_for_it();
+        }
+    }
+
+    #[derive(Clone)]
+    struct LoopServer {
+        user: String,
+        public: russh::keys::PublicKey,
+        expected_exec: String,
+        advertisement: Option<Vec<u8>>,
+        report: Option<Vec<u8>>,
+        send_stall: Option<SendStall>,
+        inbound: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    #[derive(Clone)]
+    struct SendStall {
+        drain: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        wake: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl SendStall {
+        fn new() -> Self {
+            Self {
+                drain: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        fn release(&self) {
+            self.drain.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.wake.notify_waiters();
+        }
+    }
+
+    impl russh::server::Server for LoopServer {
+        type Handler = Self;
+
+        fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
+            self.clone()
+        }
+    }
+
+    impl russh::server::Handler for LoopServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            user: &str,
+            public_key: &russh::keys::PublicKey,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            if user == self.user
+                && public_key.algorithm() == self.public.algorithm()
+                && public_key.key_data() == self.public.key_data()
+            {
+                Ok(russh::server::Auth::Accept)
+            } else {
+                Ok(russh::server::Auth::reject())
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            data: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            if data == self.expected_exec.as_bytes() {
+                session.channel_success(channel)?;
+                if let Some(advertisement) = &self.advertisement {
+                    session.data(channel, advertisement.clone())?;
+                }
+            } else {
+                session.channel_failure(channel)?;
+            }
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            _channel: russh::ChannelId,
+            data: &[u8],
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.inbound
+                .lock()
+                .expect("inbound")
+                .extend_from_slice(data);
+            if let Some(stall) = &self.send_stall
+                && !stall.drain.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                stall.wake.notified().await;
+            }
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(report) = &self.report {
+                session.data(channel, report.clone())?;
+            }
+            Ok(())
+        }
+    }
+
+    fn advertise_bytes() -> Vec<u8> {
+        let first = format!("{OLD_OID} refs/heads/main\0report-status\n");
+        encode(&[&first])
+    }
+
+    fn install_client() -> russh::keys::PublicKey {
+        let client_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .expect("client key");
+        let openssh = client_key
+            .to_openssh(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+            .expect("encode hold");
+        crate::ceres::github_sync::key::install_openssh_for_it(openssh.as_str()).expect("hold");
+        client_key.public_key().clone()
+    }
+
+    async fn connect_loopback(
+        server: LoopServer,
+        host_key: russh::keys::PrivateKey,
+        window_size: u32,
+    ) -> crate::ceres::github_sync::ssh::SshSession {
+        let host_pub = host_key
+            .public_key()
+            .to_openssh()
+            .expect("host public")
+            .trim()
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let config = std::sync::Arc::new(russh::server::Config {
+            auth_rejection_time: Duration::from_millis(0),
+            auth_rejection_time_initial: Some(Duration::from_millis(0)),
+            keys: vec![host_key],
+            inactivity_timeout: Some(Duration::from_secs(5)),
+            window_size,
+            maximum_packet_size: window_size,
+            ..Default::default()
+        });
+        let mut server = server;
+        tokio::spawn(async move {
+            let _ = russh::server::Server::run_on_socket(&mut server, config, &listener).await;
+        });
+        crate::ceres::github_sync::ssh::connect(&crate::config::GithubSyncConfig {
+            ssh_host: addr.to_string(),
+            ssh_user: "git".to_string(),
+            ssh_host_key: host_pub,
+            ..Default::default()
+        })
+        .await
+        .expect("loopback auth")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn four_deadlines() {
+        let _serial = crate::ceres::github_sync::key::HOLDER_TEST_SERIAL
+            .lock()
+            .await;
+        let _clear = ClearHold;
+        let exec = receive_pack_command("acme/app").expect("exec");
+
+        let client_pub = install_client();
+        let inbound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = connect_loopback(
+            LoopServer {
+                user: "git".to_string(),
+                public: client_pub.clone(),
+                expected_exec: exec.clone(),
+                advertisement: None,
+                report: None,
+                send_stall: None,
+                inbound: inbound.clone(),
+            },
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .expect("host"),
+            2 * 1024 * 1024,
+        )
+        .await;
+        let err = match begin_with_deadlines(
+            &mut session,
+            "acme/app",
+            deadlines(SHORT, LONG, LONG, LONG),
+        )
+        .await
+        {
+            Ok(_) => panic!("advertise should time out"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(text.contains("advertise"), "{text}");
+        assert!(text.contains("deadline"), "{text}");
+        assert_session_dead(&mut session).await;
+        drop(session);
+
+        let inbound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stall = SendStall::new();
+        let mut session = connect_loopback(
+            LoopServer {
+                user: "git".to_string(),
+                public: client_pub.clone(),
+                expected_exec: exec.clone(),
+                advertisement: Some(advertise_bytes()),
+                report: None,
+                send_stall: Some(stall.clone()),
+                inbound: inbound.clone(),
+            },
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .expect("host"),
+            128,
+        )
+        .await;
+        let mut receive =
+            begin_with_deadlines(&mut session, "acme/app", deadlines(LONG, SHORT, LONG, LONG))
+                .await
+                .expect("begin send");
+        let err = receive
+            .write_pack(NEW_OID, std::iter::once([0_u8; 64].as_slice()))
+            .await
+            .expect_err("send");
+        let text = err.to_string();
+        assert!(text.contains("send"), "{text}");
+        assert!(text.contains("deadline"), "{text}");
+        stall.release();
+        drop(receive);
+        assert_session_dead(&mut session).await;
+        drop(session);
+
+        let inbound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = connect_loopback(
+            LoopServer {
+                user: "git".to_string(),
+                public: client_pub.clone(),
+                expected_exec: exec.clone(),
+                advertisement: Some(advertise_bytes()),
+                report: None,
+                send_stall: None,
+                inbound: inbound.clone(),
+            },
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .expect("host"),
+            2 * 1024 * 1024,
+        )
+        .await;
+        let mut receive =
+            begin_with_deadlines(&mut session, "acme/app", deadlines(LONG, LONG, SHORT, LONG))
+                .await
+                .expect("begin report");
+        receive
+            .write_pack(NEW_OID, std::iter::once([0_u8; 8].as_slice()))
+            .await
+            .expect("pack");
+        let err = receive.read_report(false).await.expect_err("report");
+        let text = err.to_string();
+        assert!(text.contains("report"), "{text}");
+        assert!(text.contains("deadline"), "{text}");
+        drop(receive);
+        assert_session_dead(&mut session).await;
+        drop(session);
+
+        let inbound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = connect_loopback(
+            LoopServer {
+                user: "git".to_string(),
+                public: client_pub,
+                expected_exec: exec,
+                advertisement: Some(advertise_bytes()),
+                report: Some(encode(&["unpack ok\n", "ok refs/heads/main\n"])),
+                send_stall: None,
+                inbound,
+            },
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .expect("host"),
+            2 * 1024 * 1024,
+        )
+        .await;
+        let mut receive =
+            begin_with_deadlines(&mut session, "acme/app", deadlines(LONG, LONG, LONG, SHORT))
+                .await
+                .expect("begin exit");
+        receive
+            .write_pack(NEW_OID, std::iter::once([0_u8; 8].as_slice()))
+            .await
+            .expect("pack");
+        let err = receive.read_report(false).await.expect_err("exit wait");
+        let text = err.to_string();
+        assert!(text.contains("report"), "{text}");
+        assert!(text.contains("deadline"), "{text}");
+        drop(receive);
+        assert_session_dead(&mut session).await;
+        assert_eq!(
+            ReceivePackDeadlines::defaults().advertise,
+            Duration::from_secs(crate::config::DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS)
+        );
+    }
+
+    async fn assert_session_dead(session: &mut crate::ceres::github_sync::ssh::SshSession) {
+        let started = std::time::Instant::now();
+        match begin_with_deadlines(session, "acme/app", deadlines(LONG, LONG, LONG, LONG)).await {
+            Ok(_) => panic!("aborted session accepted a new receive-pack"),
+            Err(err) => assert!(
+                started.elapsed() < Duration::from_millis(400),
+                "dead session did not fail fast: {err}"
+            ),
+        }
+    }
+
+    async fn assert_aborted_fast(receive: &mut ReceivePack) {
+        let started = std::time::Instant::now();
+        let again = receive
+            .write_pack(NEW_OID, std::iter::once([0_u8; 8].as_slice()))
+            .await
+            .expect_err("aborted channel");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "follow-up did not fail fast after abort: {again}"
+        );
+        assert!(
+            again.to_string().contains("aborted"),
+            "follow-up should see the aborted channel: {again}"
+        );
+    }
+
+    fn random_host() -> russh::keys::PrivateKey {
+        russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+            .expect("host")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn deadline_cancels_inflight() {
+        let _serial = crate::ceres::github_sync::key::HOLDER_TEST_SERIAL
+            .lock()
+            .await;
+        let _clear = ClearHold;
+        let exec = receive_pack_command("acme/app").expect("exec");
+        let client_pub = install_client();
+        let wide = 2 * 1024 * 1024;
+
+        let inbound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = connect_loopback(
+            LoopServer {
+                user: "git".to_string(),
+                public: client_pub.clone(),
+                expected_exec: exec.clone(),
+                advertisement: None,
+                report: None,
+                send_stall: None,
+                inbound: inbound.clone(),
+            },
+            random_host(),
+            wide,
+        )
+        .await;
+        match begin_with_deadlines(&mut session, "acme/app", deadlines(SHORT, LONG, LONG, LONG))
+            .await
+        {
+            Ok(_) => panic!("advertise should time out"),
+            Err(err) => {
+                let text = err.to_string();
+                assert!(text.contains("advertise"), "{text}");
+                assert!(text.contains("deadline"), "{text}");
+            }
+        }
+        assert_session_dead(&mut session).await;
+        drop(session);
+
+        let inbound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stall = SendStall::new();
+        let mut session = connect_loopback(
+            LoopServer {
+                user: "git".to_string(),
+                public: client_pub.clone(),
+                expected_exec: exec.clone(),
+                advertisement: Some(advertise_bytes()),
+                report: None,
+                send_stall: Some(stall.clone()),
+                inbound: inbound.clone(),
+            },
+            random_host(),
+            wide,
+        )
+        .await;
+        let mut receive =
+            begin_with_deadlines(&mut session, "acme/app", deadlines(LONG, SHORT, LONG, LONG))
+                .await
+                .expect("begin send");
+        let fat = vec![7_u8; 3 * 1024 * 1024];
+        let err = receive
+            .write_pack(NEW_OID, std::iter::once(fat.as_slice()))
+            .await
+            .expect_err("send cancelled");
+        assert!(err.to_string().contains("send"), "{err}");
+        stall.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after_timeout = inbound.lock().expect("inbound").len();
+        assert!(
+            after_timeout < fat.len() / 4,
+            "queued transport writes survived abort: {after_timeout}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let later = inbound.lock().expect("inbound").len();
+        assert_eq!(later, after_timeout, "queued writes continued after abort");
+        assert_aborted_fast(&mut receive).await;
+        drop(receive);
+        assert_session_dead(&mut session).await;
+        drop(session);
+
+        let inbound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = connect_loopback(
+            LoopServer {
+                user: "git".to_string(),
+                public: client_pub.clone(),
+                expected_exec: exec.clone(),
+                advertisement: Some(advertise_bytes()),
+                report: None,
+                send_stall: None,
+                inbound: inbound.clone(),
+            },
+            random_host(),
+            wide,
+        )
+        .await;
+        let mut receive =
+            begin_with_deadlines(&mut session, "acme/app", deadlines(LONG, LONG, SHORT, LONG))
+                .await
+                .expect("begin report");
+        receive
+            .write_pack(NEW_OID, std::iter::once([0_u8; 8].as_slice()))
+            .await
+            .expect("pack");
+        let err = receive.read_report(false).await.expect_err("report cancel");
+        assert!(err.to_string().contains("report"), "{err}");
+        assert_aborted_fast(&mut receive).await;
+        drop(receive);
+        assert_session_dead(&mut session).await;
+        drop(session);
+
+        let inbound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = connect_loopback(
+            LoopServer {
+                user: "git".to_string(),
+                public: client_pub,
+                expected_exec: exec,
+                advertisement: Some(advertise_bytes()),
+                report: Some(encode(&["unpack ok\n", "ok refs/heads/main\n"])),
+                send_stall: None,
+                inbound,
+            },
+            random_host(),
+            wide,
+        )
+        .await;
+        let mut receive =
+            begin_with_deadlines(&mut session, "acme/app", deadlines(LONG, LONG, LONG, SHORT))
+                .await
+                .expect("begin exit");
+        receive
+            .write_pack(NEW_OID, std::iter::once([0_u8; 8].as_slice()))
+            .await
+            .expect("pack");
+        let err = receive.read_report(false).await.expect_err("exit cancel");
+        assert!(err.to_string().contains("report"), "{err}");
+        assert_aborted_fast(&mut receive).await;
+        drop(receive);
+        assert_session_dead(&mut session).await;
     }
 }
