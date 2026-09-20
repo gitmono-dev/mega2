@@ -45,10 +45,7 @@ git push origin main
 ### 3. API 读回与 Swagger UI
 
 ```bash
-# 树对象下载（二进制流），200 即读回成功
-curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:9000/api/v1/file/tree?path=/project"
-
-# 刚推送的文件内容
+# 读回刚推送的文件内容，应输出 hello.md 的内容
 curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 ```
 

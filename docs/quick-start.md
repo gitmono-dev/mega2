@@ -45,10 +45,7 @@ You can only push to `main` (pushes of other branches are rejected); Git-client 
 ### 3. Read back over the API + Swagger UI
 
 ```bash
-# Tree object download (binary stream); 200 means the read-back succeeded
-curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:9000/api/v1/file/tree?path=/project"
-
-# The file you just pushed
+# Read back the file you just pushed; this should print the contents of hello.md
 curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 ```
 
