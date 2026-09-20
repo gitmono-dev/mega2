@@ -225,3 +225,22 @@ residency is the command frame plus one window, not the full pack.
 
 Loopback evidence is `loopback_receive_pack`. Report-status termination
 is GS-15.
+
+## 报告层终止契约
+
+Success requires all three of `unpack ok`, `ok refs/heads/main`, and a
+terminating flush. `ng refs/heads/main <reason>` is a ref rejection and
+keeps the reason string. `unpack <error>` that is not `ok` is
+`report_unpack` and keeps the server error text. A missing or
+half-finished report is `report_incomplete`. A closed connection before
+flush is `report_disconnect`. Side-band channel 3 is `report_fatal` and
+stops without waiting for later report lines.
+
+When `side-band-64k` is negotiated, channel 1 carries the inner
+pkt-line `report-status` stream and may split a pkt-line across
+packets. Channel 2 is ignored. Channel 3 is fatal immediately. An
+outer multiplex flush without a complete inner report is
+`report_incomplete`, not a disconnect.
+
+SSH `exit-status` / `exit-signal` / stderr priority is GS-25. Deadlines
+are GS-20. Diagnostic byte budgets are GS-26.

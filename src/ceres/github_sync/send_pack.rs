@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, io::Write};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use russh::{ChannelMsg, client};
 
 use crate::{
@@ -256,6 +256,26 @@ impl ReceivePack {
             missing_sideband: plan.missing_sideband,
         })
     }
+
+    pub async fn read_report(&mut self, sideband: bool) -> Result<(), MegaError> {
+        let mut buf = Vec::new();
+        loop {
+            match self.channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    buf.extend_from_slice(&data);
+                    match report_progress(&buf, sideband, false) {
+                        ReportProgress::Ok => return Ok(()),
+                        ReportProgress::Fail(err) => return Err(err),
+                        ReportProgress::Pending => continue,
+                    }
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    return parse_report_status(&buf, sideband, true);
+                }
+                _ => continue,
+            }
+        }
+    }
 }
 
 async fn read_advertisement(
@@ -286,6 +306,205 @@ fn accept_advertisement(bytes: &[u8]) -> Result<Advertisement, MegaError> {
     Ok(advertisement)
 }
 
+const REPORT_NG: &str = "report_ng";
+const REPORT_UNPACK: &str = "report_unpack";
+const REPORT_INCOMPLETE: &str = "report_incomplete";
+const REPORT_DISCONNECT: &str = "report_disconnect";
+const REPORT_FATAL: &str = "report_fatal";
+
+enum ReportProgress {
+    Ok,
+    Fail(MegaError),
+    Pending,
+}
+
+/// Judge a receive-pack report-status payload (plan-20260916 GS-15).
+pub fn parse_report_status(
+    bytes: &[u8],
+    sideband: bool,
+    connection_closed: bool,
+) -> Result<(), MegaError> {
+    match report_progress(bytes, sideband, connection_closed) {
+        ReportProgress::Ok => Ok(()),
+        ReportProgress::Fail(err) => Err(err),
+        ReportProgress::Pending => Err(report_error(
+            REPORT_INCOMPLETE,
+            "report-status is not finished",
+        )),
+    }
+}
+
+fn report_progress(bytes: &[u8], sideband: bool, connection_closed: bool) -> ReportProgress {
+    if sideband {
+        report_progress_sideband(bytes, connection_closed)
+    } else {
+        judge_report_lines(bytes, connection_closed, false)
+    }
+}
+
+fn report_progress_sideband(bytes: &[u8], connection_closed: bool) -> ReportProgress {
+    let mut remaining = Bytes::copy_from_slice(bytes);
+    let mut channel1 = BytesMut::new();
+    let mut saw_outer_flush = false;
+
+    while !remaining.is_empty() {
+        let line = match try_read_pkt_line(&mut remaining) {
+            Ok(line) => line,
+            Err(_) => {
+                return if connection_closed {
+                    ReportProgress::Fail(report_error(
+                        REPORT_DISCONNECT,
+                        "connection closed mid pkt-line",
+                    ))
+                } else {
+                    match judge_report_lines(&channel1, false, false) {
+                        ReportProgress::Pending => ReportProgress::Pending,
+                        other => other,
+                    }
+                };
+            }
+        };
+        match line {
+            PktLine::Flush => {
+                saw_outer_flush = true;
+                break;
+            }
+            PktLine::Data(payload) => {
+                if payload.is_empty() {
+                    continue;
+                }
+                match payload[0] {
+                    3 => {
+                        let msg = String::from_utf8_lossy(&payload[1..]).into_owned();
+                        return ReportProgress::Fail(report_error(REPORT_FATAL, msg));
+                    }
+                    2 => continue,
+                    1 => {
+                        channel1.extend_from_slice(&payload[1..]);
+                        match judge_report_lines(&channel1, false, false) {
+                            ReportProgress::Ok => return ReportProgress::Ok,
+                            ReportProgress::Fail(err) => return ReportProgress::Fail(err),
+                            ReportProgress::Pending => {}
+                        }
+                    }
+                    _ => {
+                        return ReportProgress::Fail(report_error(
+                            REPORT_INCOMPLETE,
+                            "unexpected side-band channel",
+                        ));
+                    }
+                }
+            }
+            PktLine::Delim | PktLine::ResponseEnd => {
+                return ReportProgress::Fail(report_error(
+                    REPORT_INCOMPLETE,
+                    "unexpected pkt-line in report-status",
+                ));
+            }
+        }
+    }
+
+    judge_report_lines(&channel1, connection_closed, saw_outer_flush)
+}
+
+fn judge_report_lines(
+    bytes: &[u8],
+    connection_closed: bool,
+    multiplex_flushed: bool,
+) -> ReportProgress {
+    let mut remaining = Bytes::copy_from_slice(bytes);
+    let mut unpack_ok = false;
+    let mut ref_ok = false;
+    let mut ref_ng: Option<String> = None;
+    let mut saw_flush = false;
+
+    while !remaining.is_empty() {
+        let line = match try_read_pkt_line(&mut remaining) {
+            Ok(line) => line,
+            Err(_) => {
+                return if connection_closed {
+                    ReportProgress::Fail(report_error(
+                        REPORT_DISCONNECT,
+                        "connection closed mid pkt-line",
+                    ))
+                } else if multiplex_flushed {
+                    ReportProgress::Fail(report_error(
+                        REPORT_INCOMPLETE,
+                        "side-band stream flushed mid pkt-line",
+                    ))
+                } else {
+                    ReportProgress::Pending
+                };
+            }
+        };
+        match line {
+            PktLine::Flush => {
+                saw_flush = true;
+                break;
+            }
+            PktLine::Data(payload) => {
+                let text = match std::str::from_utf8(&payload) {
+                    Ok(text) => text.trim_end_matches(['\n', '\r']),
+                    Err(_) => {
+                        return ReportProgress::Fail(report_error(
+                            REPORT_INCOMPLETE,
+                            "report line is not UTF-8",
+                        ));
+                    }
+                };
+                if let Some(rest) = text.strip_prefix("unpack ") {
+                    if rest == "ok" {
+                        unpack_ok = true;
+                    } else {
+                        return ReportProgress::Fail(report_error(REPORT_UNPACK, rest));
+                    }
+                } else if let Some(name) = text.strip_prefix("ok ") {
+                    if name == MAIN_REF {
+                        ref_ok = true;
+                    }
+                } else if let Some(rest) = text.strip_prefix("ng ") {
+                    let mut parts = rest.splitn(2, ' ');
+                    let name = parts.next().unwrap_or_default();
+                    let reason = parts.next().unwrap_or_default();
+                    if name == MAIN_REF {
+                        ref_ng = Some(reason.to_string());
+                    }
+                }
+            }
+            PktLine::Delim | PktLine::ResponseEnd => {
+                return ReportProgress::Fail(report_error(
+                    REPORT_INCOMPLETE,
+                    "unexpected pkt-line in report-status",
+                ));
+            }
+        }
+    }
+
+    if let Some(reason) = ref_ng {
+        return ReportProgress::Fail(report_error(REPORT_NG, reason));
+    }
+    if saw_flush && unpack_ok && ref_ok {
+        return ReportProgress::Ok;
+    }
+    if saw_flush || multiplex_flushed {
+        return ReportProgress::Fail(report_error(
+            REPORT_INCOMPLETE,
+            "report-status flush arrived without unpack ok and ok refs/heads/main",
+        ));
+    }
+    if connection_closed {
+        return ReportProgress::Fail(report_error(
+            REPORT_DISCONNECT,
+            "connection closed before report-status flush",
+        ));
+    }
+    ReportProgress::Pending
+}
+
+fn report_error(kind: &str, detail: impl std::fmt::Display) -> MegaError {
+    MegaError::Other(format!("github_sync receive-pack report {kind}: {detail}"))
+}
+
 fn advertisement_complete(buf: &[u8]) -> bool {
     let mut remaining = Bytes::copy_from_slice(buf);
     loop {
@@ -311,6 +530,21 @@ mod tests {
         }
         out.extend_from_slice(b"0000");
         out.to_vec()
+    }
+
+    fn encode_sideband(channel: u8, data: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(data.len() + 1);
+        payload.push(channel);
+        payload.extend_from_slice(data);
+        let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    fn wrap_report_sideband(inner: &[u8]) -> Vec<u8> {
+        let mut out = encode_sideband(1, inner);
+        out.extend_from_slice(b"0000");
+        out
     }
 
     #[test]
@@ -445,5 +679,128 @@ mod tests {
         assert_eq!(windows.iter().map(|w| w.len()).sum::<usize>(), fat.len());
         assert_eq!(windows.len(), 4);
         assert_eq!(pack_windows(&[]).count(), 0);
+    }
+
+    #[test]
+    fn success_requires_full_report() {
+        let full = encode(&["unpack ok\n", "ok refs/heads/main\n"]);
+        parse_report_status(&full, false, false).expect("full report");
+
+        let no_unpack = encode(&["ok refs/heads/main\n"]);
+        let err = parse_report_status(&no_unpack, false, false).expect_err("unpack");
+        assert!(err.to_string().contains(REPORT_INCOMPLETE), "{err}");
+        assert!(!err.to_string().contains(REPORT_NG), "{err}");
+
+        let no_ref = encode(&["unpack ok\n"]);
+        let err = parse_report_status(&no_ref, false, false).expect_err("ref");
+        assert!(err.to_string().contains(REPORT_INCOMPLETE), "{err}");
+
+        let mut no_flush = BytesMut::new();
+        add_pkt_line_string(&mut no_flush, "unpack ok\n".to_string());
+        add_pkt_line_string(&mut no_flush, "ok refs/heads/main\n".to_string());
+        let err = parse_report_status(&no_flush, false, false).expect_err("flush");
+        assert!(err.to_string().contains(REPORT_INCOMPLETE), "{err}");
+
+        let inner = encode(&["unpack ok\n", "ok refs/heads/main\n"]);
+        parse_report_status(&wrap_report_sideband(&inner), true, false)
+            .expect("side-band channel 1 report");
+        parse_report_status(&encode_sideband(1, &inner), true, false)
+            .expect("inner flush is enough without outer flush");
+
+        let (head, tail) = inner.split_at(6);
+        let mut split = encode_sideband(1, head);
+        split.extend_from_slice(&encode_sideband(1, tail));
+        split.extend_from_slice(b"0000");
+        parse_report_status(&split, true, false).expect("reassembled channel 1");
+    }
+
+    #[test]
+    fn failure_modes_are_distinguishable() {
+        let ng = encode(&["unpack ok\n", "ng refs/heads/main non-fast-forward\n"]);
+        let err = parse_report_status(&ng, false, false).expect_err("ng");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_NG), "{text}");
+        assert!(text.contains("non-fast-forward"), "{text}");
+        assert!(!text.contains(REPORT_INCOMPLETE), "{text}");
+        assert!(!text.contains(REPORT_DISCONNECT), "{text}");
+        assert!(!text.contains(REPORT_FATAL), "{text}");
+        assert!(!text.contains(REPORT_UNPACK), "{text}");
+
+        let unpack_fail = encode(&["unpack index-pack failed\n"]);
+        let err = parse_report_status(&unpack_fail, false, false).expect_err("unpack");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_UNPACK), "{text}");
+        assert!(text.contains("index-pack failed"), "{text}");
+        assert!(!text.contains(REPORT_INCOMPLETE), "{text}");
+        assert!(!text.contains(REPORT_NG), "{text}");
+        assert!(!text.contains(REPORT_FATAL), "{text}");
+
+        let incomplete = encode(&["unpack ok\n"]);
+        let err = parse_report_status(&incomplete, false, false).expect_err("incomplete");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_INCOMPLETE), "{text}");
+        assert!(!text.contains(REPORT_NG), "{text}");
+        assert!(!text.contains(REPORT_DISCONNECT), "{text}");
+
+        let mut half = BytesMut::new();
+        add_pkt_line_string(&mut half, "unpack ok\n".to_string());
+        let err = parse_report_status(&half, false, true).expect_err("disconnect");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_DISCONNECT), "{text}");
+        assert!(!text.contains(REPORT_NG), "{text}");
+        assert!(!text.contains(REPORT_INCOMPLETE), "{text}");
+
+        let unpack_inner = encode(&["unpack index-pack failed\n"]);
+        let err = parse_report_status(&wrap_report_sideband(&unpack_inner), true, false)
+            .expect_err("side-band unpack");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_UNPACK), "{text}");
+        assert!(text.contains("index-pack failed"), "{text}");
+        assert!(!text.contains(REPORT_INCOMPLETE), "{text}");
+
+        let ng_inner = encode(&["unpack ok\n", "ng refs/heads/main non-fast-forward\n"]);
+        let err = parse_report_status(&wrap_report_sideband(&ng_inner), true, false)
+            .expect_err("side-band ng");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_NG), "{text}");
+        assert!(text.contains("non-fast-forward"), "{text}");
+        assert!(!text.contains(REPORT_INCOMPLETE), "{text}");
+
+        let incomplete_inner = encode(&["unpack ok\n"]);
+        let err = parse_report_status(&wrap_report_sideband(&incomplete_inner), true, false)
+            .expect_err("side-band incomplete");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_INCOMPLETE), "{text}");
+        assert!(!text.contains(REPORT_NG), "{text}");
+        assert!(!text.contains(REPORT_DISCONNECT), "{text}");
+
+        let mut half_inner = BytesMut::new();
+        add_pkt_line_string(&mut half_inner, "unpack ok\n".to_string());
+        let half_outer = encode_sideband(1, &half_inner);
+        let err = parse_report_status(&half_outer, true, true).expect_err("side-band disconnect");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_DISCONNECT), "{text}");
+        assert!(!text.contains(REPORT_NG), "{text}");
+        assert!(!text.contains(REPORT_INCOMPLETE), "{text}");
+
+        let err = parse_report_status(&half_outer[..4], true, false)
+            .expect_err("fragmented outer frame still open");
+        assert!(err.to_string().contains(REPORT_INCOMPLETE), "{err}");
+        let err = parse_report_status(&half_outer[..4], true, true)
+            .expect_err("fragmented outer frame closed");
+        assert!(err.to_string().contains(REPORT_DISCONNECT), "{err}");
+
+        let mut fatal = BytesMut::new();
+        fatal.extend_from_slice(&encode_sideband(3, b"index-pack failed"));
+        fatal.extend_from_slice(&encode_sideband(
+            1,
+            &encode(&["unpack ok\n", "ok refs/heads/main\n"]),
+        ));
+        fatal.extend_from_slice(b"0000");
+        let err = parse_report_status(&fatal, true, false).expect_err("fatal");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_FATAL), "{text}");
+        assert!(text.contains("index-pack failed"), "{text}");
+        assert!(!text.contains(REPORT_NG), "{text}");
     }
 }
