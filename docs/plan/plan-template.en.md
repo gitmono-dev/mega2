@@ -101,7 +101,7 @@ This file only plans work. It does not claim the work is done. At execution time
 | Migration | `<m<YYYYMMDD>_<HHMMSS>_<slug>>` | `<migrations() registration line>` |
 | Docs | `<docs/...>` | `<file:line>` |
 | Tests | `<-p mega2 --lib '<mod::tests>' or --test <target>>` | `<file:line>` |
-| Workspace prelude | `<.env.test present / test stack up (Postgres 15432, Redis 16379, …)>` | `<.env.test.example / docker-compose.test.yml:line>` |
+| Workspace prelude | `<.env.test present / test stack up (Postgres 15432, Redis 16379, …)>` | `<.env.test.example / docker/docker-compose.test.yml:line>` |
 | External reference | `<Mega repo@sha>` | `<path + check date>` |
 
 ### Current gaps
@@ -184,7 +184,7 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
    - Confirm branch, dirty state, and that target files have no unconfirmed user edits (`libra status` or the equivalent in `AGENTS.md`). If target files already have unconfirmed edits, report and do not overwrite.
    - Object storage is in-tree (`src/orbit_api/` + `src/orbit/`). There is no sibling `../orbit` and no `crates/orbit*` workspace members. A cargo resolve failure is not "missing orbit checkout".
    - Confirm `.env.test` exists (the repo ships `.env.test.example` only; `.env.test` is ignored). If it is missing, stop and ask per `AGENTS.md`. Do **not** silently run `cargo test --all` without sourcing it.
-   - Confirm required test services are up: `docker compose -f docker-compose.test.yml up -d --wait` (Postgres `15432`, Redis `16379`, Mailpit `11025/18025`, RustFS `19000/19001`; bucket init needs `--profile init run --rm rustfs-init` or the default `rustfs-init` health wait). Missing Postgres makes related tests panic, not skip.
+   - Confirm required test services are up: `docker compose -f docker/docker-compose.test.yml up -d --wait` (Postgres `15432`, Redis `16379`, Mailpit `11025/18025`, RustFS `19000/19001`; bucket init needs `--profile init run --rm rustfs-init` or the default `rustfs-init` health wait). Missing Postgres makes related tests panic, not skip.
 
 2. **ER-02 Check, then implement:** Refresh this card's source anchors, doc anchors, test targets, and external revisions. Then decide: implement, add tests, add docs, close, or downgrade.
 
