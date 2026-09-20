@@ -51,6 +51,29 @@ curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 
 完整 HTTP 表面（Git smart HTTP、LFS、产品写、tags、可选 OCI `/v2`）在 Swagger UI 浏览：`http://127.0.0.1:9000/swagger-ui`（OpenAPI JSON：`/api/openapi.json`）。交互式终端浏览用 Libra 的 `libra mega2 browser`；mega2 本身不提供 Web UI。
 
+## 案例：推送嵌套目录（目录层级自动创建）
+
+monorepo 里**不需要预先创建目录**。在 `/project` 的克隆里直接建多级目录再推送，`rust-lang/` 与 `rust-lang/crate/` 两层会随这次 push 一并写入：
+
+```bash
+git clone http://127.0.0.1:9000/project
+cd project
+mkdir -p rust-lang/crate
+echo "# crate" > rust-lang/crate/README.md
+git add . && git commit -m "add rust-lang/crate"
+git push origin main
+```
+
+推送后，这个嵌套路径就是一个可独立 clone / push 的子路径，也可以直接经 API 读回：
+
+```bash
+# 读回嵌套路径下的文件
+curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/rust-lang/crate/README.md"
+
+# 子路径克隆（不要对根 / 做根 clone）
+git clone http://127.0.0.1:9000/project/rust-lang/crate
+```
+
 ## 案例：推送一个已存在的 Git 仓库
 
 迁入已有仓库（要保留分支与 tag）用 `/third-party` 下的 **ImportRepo**：那里按普通 Git 语义工作——多分支与客户端 tag 均合法（[`monorepo.md`](./monorepo.md)）。推送目标路径不存在时会在 push 中自动建仓，无需事先创建：

@@ -51,6 +51,29 @@ curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 
 Browse the full HTTP surface (Git smart HTTP, LFS, product writes, tags, optional OCI `/v2`) in Swagger UI: `http://127.0.0.1:9000/swagger-ui` (OpenAPI JSON: `/api/openapi.json`). For interactive terminal browsing use Libra's `libra mega2 browser`; mega2 itself serves no Web UI.
 
+## Case: push nested directories (hierarchy is created automatically)
+
+You **don't need to create directories in advance** in the monorepo. Just build a multi-level directory inside your `/project` clone and push — both `rust-lang/` and `rust-lang/crate/` are written by that push:
+
+```bash
+git clone http://127.0.0.1:9000/project
+cd project
+mkdir -p rust-lang/crate
+echo "# crate" > rust-lang/crate/README.md
+git add . && git commit -m "add rust-lang/crate"
+git push origin main
+```
+
+After the push, the nested path is a subpath you can clone / push independently, and you can read it back over the API:
+
+```bash
+# Read back the file under the nested path
+curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/rust-lang/crate/README.md"
+
+# Clone the subpath (never root-clone /)
+git clone http://127.0.0.1:9000/project/rust-lang/crate
+```
+
 ## Case: push an existing Git repository into mega2
 
 To migrate an existing repository (keeping its branches and tags), use an **ImportRepo** under `/third-party`: repos there follow ordinary Git semantics — multi-branch and Git-client tags are both allowed ([`monorepo.md`](./monorepo.md)). If the target path does not exist yet, it is created automatically by the push; no prior setup is needed:
