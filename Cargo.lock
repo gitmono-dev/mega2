@@ -2873,9 +2873,9 @@ dependencies = [
 
 [[package]]
 name = "git-internal"
-version = "0.9.0"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d265f273ae8635bbcfd3634d0a8705a1970cd734d9eb5b9ff0eaaac14f4a067"
+checksum = "d119c7387b2fa0b751436dc2b8dd1da6d3356c4a7eb9e821dc78a37a0f3eb8ab"
 dependencies = [
  "ahash",
  "async-trait",
@@ -4166,7 +4166,7 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "mega2"
-version = "0.38.18"
+version = "0.38.19"
 dependencies = [
  "anyhow",
  "async-recursion",
