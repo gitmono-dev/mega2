@@ -51,16 +51,13 @@ mega2 只以 **trunk / storage-only** 形态部署：`push_policy=trunk`，推�
 
 ## 用 Compose 快速启动
 
-Git HTTP + 对象存储：
+评估栈直接从 Docker Hub 拉取正式发布镜像（`genedna/mega2:latest`），不构建源码、不需要 bootstrap：
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
-
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
-  mega2 --config /etc/mega2/config.toml service init --yes
+docker compose -f mega2-compose.yml up -d --wait
 ```
 
-HTTP：`http://127.0.0.1:9000/`。默认 push token 见 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。
+HTTP：`http://127.0.0.1:9000/`。这是仅限本机的匿名设置（`push_auth=none`，绑定 `127.0.0.1`）；token 鉴权或共享部署见 [`docs/deployment.zh.md`](docs/deployment.zh.md) 与 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。完整操作演示见 [`docs/quick-start.zh.md`](docs/quick-start.zh.md)。
 
 需要交互式浏览时，在 Libra 工作副本中执行 `libra mega2 browser`。该命令提供仓库导航与受支持的目录 / Tag 操作的终端体验；mega2 本身不提供 Web UI。
 
@@ -69,7 +66,7 @@ HTTP：`http://127.0.0.1:9000/`。默认 push token 见 [`docs/deploy-trunk.md`]
 ### 停止
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml down -v
+docker compose -f mega2-compose.yml down -v
 ```
 
 ## 贡献

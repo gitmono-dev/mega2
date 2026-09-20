@@ -13,9 +13,25 @@ mega2 开源版只交付一种形态：**trunk / storage-only**——无 Web UI�
 - SSH 仅 upload-pack（clone / fetch / pull）；`ssh_receive_pack` 必须显式 `false`，省略会拒绝启动。
 - 写鉴权：`git.push_auth = "token"`（推荐）或 `"none"`（仅受控网络）。鉴权语义、fail-closed 清单与 SSH 细节见 [`deploy-trunk.md`](./deploy-trunk.md) §1–§4。
 
-## 2. Compose 部署（推荐路径）
+## 2. Compose 部署
 
-仓库根的 [`docker-compose-storage-only.yml`](../docker-compose-storage-only.yml) 是本地 / 实验室参考栈：mega2 + Postgres + Redis + RustFS，挂载 [`config/config-storage-only.toml`](../config/config-storage-only.toml)。与 IT 栈 `docker-compose.test.yml` 可并存（端口不冲突）。
+仓库根的 Compose 文件分两类：**正式评估栈**与**测试 / 实验栈**。
+
+### 2.1 评估栈：`mega2-compose.yml`（本机试用，推荐入口）
+
+[`mega2-compose.yml`](../mega2-compose.yml) 从 **Docker Hub 拉取正式发布镜像** `genedna/mega2:latest`（`pull_policy: always`），不构建源码。组件：mega2 + Postgres + Redis + RustFS + `rustfs-init`（自动建 `mega2` 桶）；mega2 在服务启动时自动初始化空 Monorepo，**不需要** `service init` bootstrap。
+
+```bash
+docker compose -f mega2-compose.yml up -d --wait
+docker compose -f mega2-compose.yml logs -f mega2
+docker compose -f mega2-compose.yml down      # 具名卷保留数据；down -v 清空
+```
+
+该栈是**仅限本机的匿名设置**：`push_auth=none`、匿名读写，HTTP 只发布到 `127.0.0.1:9000`（mega2 容器内 8000）。不要绑定 `0.0.0.0` 或经反向代理暴露；共享 / 公网部署用下面的 token 栈或自建编排。端到端操作演示见 [`quick-start.zh.md`](./quick-start.zh.md)。
+
+### 2.2 源码构建的测试 / 实验栈：`docker-compose-storage-only.yml`
+
+[`docker-compose-storage-only.yml`](../docker-compose-storage-only.yml) 是从源码**构建**镜像的本地 / 实验室参考栈（用于部署演练与 smoke，不是正式分发形态）：mega2 + Postgres + Redis + RustFS，挂载 [`config/config-storage-only.toml`](../config/config-storage-only.toml)。与 IT 栈 `docker-compose.test.yml` 可并存（端口不冲突）。
 
 服务与宿主端口（以 compose 文件为准）：
 
@@ -45,7 +61,7 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
 
 **Push token secret**：compose 把 token 文件挂载为 `/run/secrets/mega2-push-token`，默认源 `./secrets/mega2-push-token.local`（`secrets/` 已 gitignore，需自行创建）。生产部署用 `MEGA2_PUSH_TOKEN_FILE=/path/to/secret` 指向真实 secret 文件，勿提交明文。token 配置与 `paths` 授权语义见 [`deploy-trunk.md`](./deploy-trunk.md) §3。
 
-### 2.1 `push_auth=none` 覆盖变体
+### 2.2.1 `push_auth=none` 覆盖变体
 
 [`docker-compose-storage-only.auth-none.yml`](../docker-compose-storage-only.auth-none.yml) 是 opt-in 覆盖：与基础文件双 `-f` 组合，把 mega2 的配置重挂载为 `config/config-storage-only.none.toml`，并 `--force-recreate mega2`：
 
@@ -58,7 +74,7 @@ docker compose -p mega2-trunk \
 
 > **警告**：`push_auth=none` 等于匿名 receive-pack **以及匿名 LFS 上传**，只适用于受控内网、回环或 Unix socket 前置的部署。绝不暴露到公网。切回 token：去掉第二个 `-f`，再 `--force-recreate mega2`。
 
-### 2.2 对象存储切换
+### 2.2.2 对象存储切换
 
 默认后端是 RustFS（`s3compatible`），直接 `up` 即可。仅当把 mega2 改成本地文件系统后端时加 `--env-file`（RustFS 容器仍会启动，只切 mega2 的 `storage_type`）：
 
@@ -71,7 +87,7 @@ env 文件内容见 [`config/compose.env.storage-only.local`](../config/compose.
 
 ## 3. 二进制 / 容器部署
 
-不用 compose 时：
+不想从源码构建时，可以直接用 Docker Hub 上的正式发布镜像 `genedna/mega2:latest`（`mega2-compose.yml` 用的就是它）。自行构建二进制：
 
 ```bash
 cargo build --release -p mega2   # 产物 target/release/mega2

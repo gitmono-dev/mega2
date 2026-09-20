@@ -13,9 +13,25 @@ The only supported deployment shape is trunk / storage-only:
 - SSH is upload-pack only (clone / fetch / pull); `ssh_receive_pack` must be explicitly `false` — omitting it refuses startup.
 - Write auth: `git.push_auth = "token"` (recommended) or `"none"` (controlled networks only). Auth semantics, the fail-closed checklist, and SSH details: [`deploy-trunk.md`](./deploy-trunk.md) §1–§4.
 
-## 2. Compose deployment (recommended path)
+## 2. Compose deployment
 
-The repository-root [`docker-compose-storage-only.yml`](../docker-compose-storage-only.yml) is the local / lab reference stack: mega2 + Postgres + Redis + RustFS, mounting [`config/config-storage-only.toml`](../config/config-storage-only.toml). It can coexist with the IT stack `docker-compose.test.yml` (no port conflicts).
+The Compose files at the repository root fall into two groups: the **official evaluation stack** and the **test / lab stacks**.
+
+### 2.1 Evaluation stack: `mega2-compose.yml` (local trial, recommended entry)
+
+[`mega2-compose.yml`](../mega2-compose.yml) pulls the **official release image from Docker Hub**, `genedna/mega2:latest` (`pull_policy: always`) — no source build. Components: mega2 + Postgres + Redis + RustFS + `rustfs-init` (creates the `mega2` bucket automatically); mega2 initializes the empty Monorepo during service startup, so **no** `service init` bootstrap is needed.
+
+```bash
+docker compose -f mega2-compose.yml up -d --wait
+docker compose -f mega2-compose.yml logs -f mega2
+docker compose -f mega2-compose.yml down      # named volumes keep the data; down -v wipes it
+```
+
+This stack is a **local-only, anonymous setup**: `push_auth=none`, anonymous reads and writes, and HTTP is published only on `127.0.0.1:9000` (container port 8000). Do not rebind to `0.0.0.0` or expose it through a reverse proxy; for shared / public deployments use the token-based stack below or your own orchestration. An end-to-end walkthrough: [`quick-start.md`](./quick-start.md).
+
+### 2.2 Source-built test / lab stack: `docker-compose-storage-only.yml`
+
+[`docker-compose-storage-only.yml`](../docker-compose-storage-only.yml) is the local / lab reference stack that **builds** the image from source (for deployment rehearsals and smoke tests — not the official distribution form): mega2 + Postgres + Redis + RustFS, mounting [`config/config-storage-only.toml`](../config/config-storage-only.toml). It can coexist with the IT stack `docker-compose.test.yml` (no port conflicts).
 
 Services and host ports (authoritative source is the compose file):
 
@@ -45,7 +61,7 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
 
 **Push token secret**: compose mounts the token file as `/run/secrets/mega2-push-token`, defaulting to `./secrets/mega2-push-token.local` (`secrets/` is gitignored — create it yourself). For real deployments point `MEGA2_PUSH_TOKEN_FILE=/path/to/secret` at the real secret file; never commit plaintext. Token configuration and `paths` authorization semantics: [`deploy-trunk.md`](./deploy-trunk.md) §3.
 
-### 2.1 `push_auth=none` override variant
+### 2.2.1 `push_auth=none` override variant
 
 [`docker-compose-storage-only.auth-none.yml`](../docker-compose-storage-only.auth-none.yml) is an opt-in override: compose it with the base file via two `-f` flags to remount mega2's config as `config/config-storage-only.none.toml`, and `--force-recreate mega2`:
 
@@ -58,7 +74,7 @@ docker compose -p mega2-trunk \
 
 > **Warning**: `push_auth=none` means anonymous receive-pack **and anonymous LFS upload**. It is only suitable for controlled internal networks, loopback, or deployments behind a Unix socket front. Never expose it publicly. To revert to token auth: drop the second `-f` and `--force-recreate mega2` again.
 
-### 2.2 Object storage switch
+### 2.2.2 Object storage switch
 
 The default backend is RustFS (`s3compatible`) — plain `up` works. Add `--env-file` only when switching mega2 to the local filesystem backend (the RustFS container still starts; only mega2's `storage_type` changes):
 
@@ -71,7 +87,7 @@ Env file contents: [`config/compose.env.storage-only.local`](../config/compose.e
 
 ## 3. Binary / container deployment
 
-Without compose:
+If you don't want to build from source, use the official release image on Docker Hub, `genedna/mega2:latest` (the same image `mega2-compose.yml` pulls). To build the binary yourself:
 
 ```bash
 cargo build --release -p mega2   # artifact: target/release/mega2

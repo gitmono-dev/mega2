@@ -2,65 +2,42 @@
 
 English · [中文](quick-start.zh.md)
 
-This guide brings up mega2 (trunk / storage-only) locally with the in-repo Compose stack and runs the first closed loop: HTTP clone → token push to `main` → read back over the API. Product rules: [`monorepo.md`](./monorepo.md). Deploy/ops source of truth: [`deploy-trunk.md`](./deploy-trunk.md). This page keeps only the minimal runnable path and does not duplicate the config keys, port tables, or token values owned by those docs.
+This guide brings up the mega2 (trunk / storage-only) evaluation stack locally with the repository-root [`mega2-compose.yml`](../mega2-compose.yml) and runs the first closed loop: HTTP clone → push to `main` → read back over the API. The stack pulls the **official release image from Docker Hub** (`genedna/mega2:latest`) — no source build, no bootstrap, no token. Product rules: [`monorepo.md`](./monorepo.md).
 
 ## Prerequisites
 
-- Docker Compose v2, `git`, `curl`; run everything from the repository root.
-- Time: about 10 minutes once the image exists. The first `up` builds the `mega2:local` image (a Rust release build — noticeably longer; build definition in the root `Dockerfile`).
+- Docker Engine with the Compose plugin (v2), `git`, `curl`; run everything from the repository root.
+- The first `up` pulls the `genedna/mega2:latest`, PostgreSQL, Redis, RustFS, and RustFS CLI images; duration depends on your network.
 
-## Bring up the Compose stack
-
-Stack contents (mega2 HTTP 9000 / SSH 2222, plus Postgres / Redis / RustFS) and ports are documented in the header comments of `docker-compose-storage-only.yml`; they are not copied here.
-
-The push token is injected as a Docker secret file (`${file:/run/secrets/mega2-push-token}` on the config side; see `config/config-storage-only.toml`). The file is not committed, so create it first:
+## Bring up the stack
 
 ```bash
-mkdir -p secrets
-openssl rand -hex 16 > secrets/mega2-push-token.local
+docker compose -f mega2-compose.yml up -d --wait
 ```
 
-> If you later run the repo's smoke scripts, the file must instead contain the local default token registered in [`deploy-trunk.md`](./deploy-trunk.md) §8 (that doc is the single source of truth for the value; it is not copied here). A self-generated random token works equally well for this guide's loop.
+No initialization command is needed after `up`: `rustfs-init` creates the `mega2` bucket automatically, and mega2 initializes the empty Monorepo (`main` and the top-level directories) during service startup. The readiness probe is `/api/openapi.json`.
 
-Start the stack and wait for the healthchecks (mega2's readiness probe is `/api/openapi.json`):
-
-```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
-```
-
-The object store defaults to RustFS (s3compatible); do **not** add `--env-file` for the default bring-up — it is only needed when switching mega2 to the local-filesystem backend, see [`deploy-trunk.md`](./deploy-trunk.md) §8.
-
-## Bootstrap (empty-volume init)
-
-After the first start, initialize the repository: create `main`, the admin, and the top-level directories agreed in [`monorepo.md`](./monorepo.md) (`/project`, `/third-party`, …):
-
-```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
-  mega2 --config /etc/mega2/config.toml service init --yes
-```
-
-Run once per empty volume; re-run after a `down -v` rebuild.
+> **This is a local-only, anonymous setup**: the stack runs with `push_auth=none`, so clone / fetch / push need no credentials, and port 9000 is bound to `127.0.0.1` for that reason. Do not rebind it to `0.0.0.0` or expose it through a reverse proxy; shared or internet-facing deployments must use token authentication instead — see [`deployment.md`](./deployment.md) and [`deploy-trunk.md`](./deploy-trunk.md).
 
 ## First closed loop: clone → push → read back
 
 ### 1. Clone a subpath over HTTP
 
-In storage-only mode you clone a subpath (do not root-clone `/`, see [`deploy-trunk.md`](./deploy-trunk.md) §9). The sample config sets `git.anonymous_access=true`, so reads need no credentials:
+In storage-only mode you clone a subpath (do not root-clone `/`, see [`deploy-trunk.md`](./deploy-trunk.md) §9):
 
 ```bash
 git clone http://127.0.0.1:9000/project
 cd project
 ```
 
-### 2. Push to main with the push token
+### 2. Push to main
 
-`main` is the only public branch of the monorepo. Pushes authenticate over HTTP Basic: the username is arbitrary and only the password (the token bytes) takes part in the decision ([`deploy-trunk.md`](./deploy-trunk.md) §4):
+`main` is the only public branch of the monorepo. With the anonymous setup the push needs no credentials:
 
 ```bash
-TOKEN=$(cat ../secrets/mega2-push-token.local)
 echo "# hello mega2" > hello.md
 git add hello.md && git commit -m "add hello.md"
-git push "http://x:${TOKEN}@127.0.0.1:9000/project" main
+git push origin main
 ```
 
 Pushes enter `main` through the MonoWriteQueue, sharing tip authority with the product API writes ([`monorepo.md`](./monorepo.md)). Git-client tag pushes are rejected; manage tags via the HTTP API or `libra mega2 browser`.
@@ -77,20 +54,29 @@ curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 
 Browse the full HTTP surface (Git smart HTTP, LFS, product writes, tags, optional OCI `/v2`) in Swagger UI: `http://127.0.0.1:9000/swagger-ui` (OpenAPI JSON: `/api/openapi.json`). For interactive terminal browsing use Libra's `libra mega2 browser`; mega2 itself serves no Web UI.
 
-## Stop and clean up
+## Observe, stop, and clean up
 
 ```bash
-# Stop, keeping the data volumes
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml down
+# Follow the mega2 logs
+docker compose -f mega2-compose.yml logs -f mega2
 
-# Also delete the data volumes (destructive; re-run the bootstrap afterwards)
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml down -v
+# Stop; the named volumes keep the Postgres / Redis / RustFS / mega2 data
+docker compose -f mega2-compose.yml down
+
+# Also delete the data volumes (destructive; wipes this local evaluation instance)
+docker compose -f mega2-compose.yml down -v
 ```
+
+## The other Compose files
+
+The repository ships two more Compose files, **both aimed at testing and development** — neither replaces this evaluation stack:
+
+- [`docker-compose-storage-only.yml`](../docker-compose-storage-only.yml) (plus the `docker-compose-storage-only.auth-none.yml` override): a trunk lab stack that **builds** the image from source, uses token authentication, and needs a `service init` bootstrap — used for deployment rehearsals and smoke tests. Usage: [`deployment.md`](./deployment.md) and [`deploy-trunk.md`](./deploy-trunk.md) §8.
+- [`docker-compose.test.yml`](../docker-compose.test.yml): the integration-test (IT) data plane, see [`development.md`](./development.md).
 
 ## Next steps
 
 - Day-to-day usage (clone / push / API / tags / LFS): [`user-guide.md`](./user-guide.md)
 - Config keys, Profile, SecretRef, hot reload: [`configuration.md`](./configuration.md); commented sample at `config/config.toml`
 - Deployment and operations (token management, morphology invariants, OCI, Agent Capture): [`deployment.md`](./deployment.md), [`deploy-trunk.md`](./deploy-trunk.md)
-- Stack-level protocol / API-write smoke (git, LFS black-box): [`deploy-trunk.md`](./deploy-trunk.md) §8.1
 - Local development and tests: [`development.md`](./development.md)

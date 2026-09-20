@@ -51,16 +51,13 @@ The product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) s
 
 ## Quick start with Compose
 
-Git HTTP + object storage:
+The evaluation stack pulls the official release image from Docker Hub (`genedna/mega2:latest`) — no source build, no bootstrap:
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
-
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
-  mega2 --config /etc/mega2/config.toml service init --yes
+docker compose -f mega2-compose.yml up -d --wait
 ```
 
-HTTP: `http://127.0.0.1:9000/`. Default push token: [`docs/deploy-trunk.md`](docs/deploy-trunk.md).
+HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see [`docs/deployment.md`](docs/deployment.md) and [`docs/deploy-trunk.md`](docs/deploy-trunk.md). A full walkthrough: [`docs/quick-start.md`](docs/quick-start.md).
 
 For interactive browsing, run `libra mega2 browser` in a Libra working copy. It provides the terminal experience for repository navigation and supported directory / tag operations; mega2 itself does not serve a Web UI.
 
@@ -69,7 +66,7 @@ For local development and tests, see [`docs/development.md`](docs/development.md
 ### Stop
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml down -v
+docker compose -f mega2-compose.yml down -v
 ```
 
 ## Contributing
