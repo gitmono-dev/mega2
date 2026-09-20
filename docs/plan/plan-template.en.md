@@ -261,6 +261,11 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
 
 12. **ER-12 Concurrency vs serial release:** Concurrent work is allowed only in implementation and review, and only when `Implementation write set`s are disjoint (G-10). **Release is always serial and has one publisher:** bump, build, commit, push, and D tracking. Only one card may be in "bumped but not yet pushed" at a time. Do not invent an unverified document lease as a repo lock.
 
+13. **ER-13 Tests must not leak shared state:** When adding or changing tests, every shared side effect a case creates must be cleaned up before the case ends — above all table creation / seeding / migrations written directly into the shared test PostgreSQL **`public` schema** (i.e. anything not going through `test_db_connection`, which gives each case its own schema), as well as shared Redis, shared object-storage buckets, and fixed-path directories.
+    - Background: test connections use a `search_path` that includes `public` (`src/jupiter/tests.rs::database_url_with_search_path`), so any table left in `public` is visible to other cases' unqualified lookups (e.g. `to_regclass`) and causes mass fixture failures on later runs (measured 2026-09-21: 84 stale tables in `public` broke 14 unrelated cases).
+    - Requirements: on case exit (including panic paths — prefer guards / Drop / scoped cleanup) drop the tables, schemas, databases, buckets, and directories the case created; if a table must live in `public`, give it a case-unique name prefix and `DROP TABLE IF EXISTS ... CASCADE` at the end.
+    - Review gate: when reviewing test diffs, "does every shared side effect have matching cleanup" is a mandatory check; when an existing case is found leaking shared state, fix it as its own card — do not copy the pattern into new cards.
+
 ## Implementation order
 
 Edge format: `A -> B` means A before B. The graph must be acyclic. Every edge points at a card, not a whole Phase (G-06). Update this section when cards split.

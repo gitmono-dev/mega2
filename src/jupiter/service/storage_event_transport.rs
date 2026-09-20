@@ -577,6 +577,13 @@ mod tests {
             .build(&builder.x509v3_context(None, None))
             .expect("san");
         builder.append_extension(san).expect("append san");
+        // rustls-webpki (0.103+) rejects server certificates without a
+        // serverAuth EKU; the reqwest client then fails with a Connect error.
+        let eku = openssl::x509::extension::ExtendedKeyUsage::new()
+            .server_auth()
+            .build()
+            .expect("eku");
+        builder.append_extension(eku).expect("append eku");
         builder
             .sign(&key, MessageDigest::sha256())
             .expect("sign cert");

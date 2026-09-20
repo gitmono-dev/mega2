@@ -289,6 +289,10 @@
     - 进入发布前重新读取 `Cargo.toml` 权威版本（ER-08 的 parity 预检），按顺序做完整套发布动作后才轮到下一张卡。
     - **禁止多 Agent 并发发布。** 本仓库当前**没有**仓库级发布锁：`libra push origin main` 推送的是本地 `main` 的整个 ref tip，无法只发布一条协调记录，也无法在 push 之外提供 CAS 仲裁；靠纯文档约定实现的 lease 无法验证，属于未经实现验证的协议。若某计划确实需要并发发布，必须先用独立 ADR + 独立计划落地一个仓库级发布锁（含原子认领、fence 校验、超时回收、崩溃恢复与测试），并在本计划以 `DEFER-*` 登记；在该机制落地并通过验收之前，一律按本条串行执行。
     - 并发实现期间仍受 I–R 约束（G-10）：发布者持有发布窗口时，其它卡不得修改 `Release write set` 内的文件。
+13. **ER-13 测试不得残留共享状态:** 新增或修改测试用例时，用例创建的共享副作用必须在用例结束前清理，尤其是不走 `test_db_connection`（每用例独立 schema）而直接写入共享测试 Postgres **`public` schema**（或共享 Redis、共享对象存储桶、固定路径目录）的建表 / 播种 / 迁移操作。
+    - 背景：测试连接的 `search_path` 含 `public`（`src/jupiter/tests.rs::database_url_with_search_path`），任何留在 `public` 的表都会被其它用例的未限定名查询（如 `to_regclass`）命中，造成后续运行大面积 fixture 断言失败（2026-09-21 实测：`public` 残留 84 张旧表导致 14 个无关用例失败）。
+    - 要求：用例结束（含 panic 路径，尽量用 guard / Drop / 作用域清理）删除自己创建的表、schema、数据库、桶与目录；必须在 `public` 建表的，表名带用例唯一前缀并在结尾 `DROP TABLE IF EXISTS ... CASCADE`。
+    - 评审门：review 测试 diff 时把「共享副作用是否有对应清理」列为必查项；发现存量用例泄漏共享状态，按独立卡修复，不得在新卡中沿袭。
 
 ## 实施顺序
 
