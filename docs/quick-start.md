@@ -67,6 +67,41 @@ docker compose -f mega2-compose.yml down
 docker compose -f mega2-compose.yml down -v
 ```
 
+## Important: persist data to a local directory
+
+The default stack uses Docker named volumes, so `down -v` deletes your data together with the volumes. If you plan to **use this instance long-term** (repository data must survive rebuilds), switch the database, object storage, and mega2 data directories to bind mounts on the host — then **even if the containers and volumes are deleted, the data stays in the local directory and is picked up again on the next `up`**.
+
+Create an override file `mega2-compose.persist.yml` in the repository root:
+
+```yaml
+# Layered on top of mega2-compose.yml: replace the named volumes with host bind mounts
+services:
+  postgres:                              # metadata database
+    volumes:
+      - ./mega2-data/postgres:/var/lib/postgresql
+  redis:                                 # cache / queues
+    volumes:
+      - ./mega2-data/redis:/data
+  rustfs:                                # object storage (Git blobs / LFS)
+    volumes:
+      - ./mega2-data/rustfs:/data
+  mega2:                                 # mega2 data directory (MEGA_BASE_DIR)
+    volumes:
+      - ./mega2-data/mega2:/var/lib/mega2
+```
+
+Start with both `-f` flags (use the same two `-f` flags for stop and cleanup commands):
+
+```bash
+docker compose -f mega2-compose.yml -f mega2-compose.persist.yml up -d --wait
+```
+
+From then on all data lives under `./mega2-data/`:
+
+- `docker compose ... down -v` only removes named volumes — it **does not** touch `./mega2-data/`; the next `up` resumes from that directory with repositories, push history, and LFS objects intact.
+- Backup = stop the stack and archive `./mega2-data/`.
+- The directory is written by in-container processes (owned by container users such as postgres); do not commit it to version control and do not edit its contents by hand.
+
 ## The other Compose files
 
 The repository ships two more Compose files, **both aimed at testing and development** — neither replaces this evaluation stack:

@@ -67,6 +67,41 @@ docker compose -f mega2-compose.yml down
 docker compose -f mega2-compose.yml down -v
 ```
 
+## 重要：把数据持久化到本地目录
+
+默认栈用的是 Docker 具名卷，`down -v` 会把数据连同卷一起删掉。如果你要**长期使用**这个实例（仓库数据需要跨重建保留），把数据库、对象存储与 mega2 数据目录改成绑定挂载到宿主本地目录——这样**即使容器和卷都被删除，数据仍保留在本地目录里，下次 `up` 直接继续使用**。
+
+在仓库根新建一个覆盖文件 `mega2-compose.persist.yml`：
+
+```yaml
+# 与 mega2-compose.yml 叠加使用：把具名卷替换为宿主目录绑定挂载
+services:
+  postgres:                              # 元数据库
+    volumes:
+      - ./mega2-data/postgres:/var/lib/postgresql
+  redis:                                 # 缓存 / 队列
+    volumes:
+      - ./mega2-data/redis:/data
+  rustfs:                                # 对象存储（Git blob / LFS）
+    volumes:
+      - ./mega2-data/rustfs:/data
+  mega2:                                 # mega2 数据目录（MEGA_BASE_DIR）
+    volumes:
+      - ./mega2-data/mega2:/var/lib/mega2
+```
+
+用双 `-f` 启动（停止、清理命令同样要带两个 `-f`）：
+
+```bash
+docker compose -f mega2-compose.yml -f mega2-compose.persist.yml up -d --wait
+```
+
+之后所有数据都落在 `./mega2-data/` 下：
+
+- `docker compose ... down -v` 只删除具名卷，**不会**触碰 `./mega2-data/`；下次 `up` 从该目录恢复，仓库、推送历史、LFS 对象原样保留。
+- 备份 = 停栈后打包 `./mega2-data/` 即可。
+- 该目录由容器内进程写入（属主是容器内用户，如 postgres），不要提交进版本库，也不要手工改动目录内容。
+
 ## 其它 Compose 文件的定位
 
 仓库里还有两份 Compose，**都面向测试与开发**，不是本评估栈的替代品：
