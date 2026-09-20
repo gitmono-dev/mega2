@@ -59,7 +59,9 @@ pub fn routers_for(policy: PushPolicy) -> OpenApiRouter<MonoApiServiceState> {
 }
 
 /// Git-adjacent surface for storage-only / trunk HTTP (no OAuth/CL/user
-/// routers): read-only preview, the product writes and the tag routes.
+/// routers): read-only preview, the product writes, the tag routes and
+/// (plan-20260921 AR-01) the artifacts protocol routes (writes gated by
+/// `git.push_auth`).
 pub fn storage_only_routers() -> OpenApiRouter<MonoApiServiceState> {
     storage_only_routers_with(false)
 }
@@ -75,7 +77,8 @@ pub fn storage_only_routers_with(
         .route("/file/tree", get(get_tree_file))
         .merge(preview_router::readonly_routers())
         .merge(preview_router::write_routers())
-        .merge(tag_router::routers());
+        .merge(tag_router::routers())
+        .merge(artifacts_router::routers());
     if include_agent_capture {
         router.merge(agent_capture_router::routers())
     } else {

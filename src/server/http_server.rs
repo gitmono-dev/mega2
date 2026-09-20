@@ -1424,6 +1424,17 @@ mod tests {
                 "storage-only OpenAPI must include {needle} (LB-04): {paths:?}"
             );
         }
+        for needle in [
+            "/api/v1/repos/{repo}/artifacts/discovery",
+            "/api/v1/repos/{repo}/artifacts/batch",
+            "/api/v1/repos/{repo}/artifacts/commit",
+            "/api/v1/repos/{repo}/artifacts/objects/{oid}",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == needle),
+                "storage-only OpenAPI must include {needle} (AR-01): {paths:?}"
+            );
+        }
         assert_tags_list_is_get_only(&api);
         assert!(
             paths.iter().any(|p| p.contains("/edit/save")),
@@ -1604,6 +1615,17 @@ mod tests {
             assert!(
                 paths.iter().any(|p| p.ends_with(needle)),
                 "trunk OpenAPI must include {needle} (LB-04): {paths:?}"
+            );
+        }
+        for needle in [
+            "/api/v1/repos/{repo}/artifacts/discovery",
+            "/api/v1/repos/{repo}/artifacts/batch",
+            "/api/v1/repos/{repo}/artifacts/commit",
+            "/api/v1/repos/{repo}/artifacts/objects/{oid}",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == needle),
+                "trunk OpenAPI must include {needle} (AR-01): {paths:?}"
             );
         }
         assert_tags_list_is_get_only(&api);

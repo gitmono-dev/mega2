@@ -2417,3 +2417,185 @@ fn tag_path_isolation_same_name() {
     assert_eq!(status, 403, "scoped token delete at / must 403: {json}");
     scoped.finish();
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260921 AR-02: artifacts protocol on storage-only — token upload →
+// batch → commit → sets → byte read-back; the same writes without a
+// credential → 401. The seeded token covers `/project`, so `repos/project`
+// passes the ADR-AR-02 authorization path.
+// ---------------------------------------------------------------------------
+
+const AR02_NAMESPACE: &str = "ar02-it";
+const AR02_OBJECT_TYPE: &str = "snapshot";
+
+fn artifacts_url(api: &str, repo: &str, suffix: &str) -> String {
+    format!("{api}/repos/{repo}/artifacts{suffix}")
+}
+
+#[test]
+fn artifacts_storage_only_token_lifecycle() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let bearer = EntryCase::bearer();
+    let api = &case.api;
+    let repo = "project";
+
+    // Unauthenticated writes are rejected before touching storage.
+    let unauth_oid = uuid::Uuid::new_v4().to_string();
+    let unauth_put = case
+        .client
+        .put(artifacts_url(api, repo, &format!("/objects/{unauth_oid}")))
+        .body("nope")
+        .send()
+        .expect("unauth PUT object");
+    assert_eq!(
+        unauth_put.status().as_u16(),
+        401,
+        "PUT object without credential must 401"
+    );
+    let (status, json) = case.post(
+        &format!("repos/{repo}/artifacts/batch"),
+        None,
+        serde_json::json!({
+            "namespace": AR02_NAMESPACE,
+            "object_type": AR02_OBJECT_TYPE,
+            "intent": "upload",
+            "objects": [{"path": "bin/app", "oid": unauth_oid, "size": 4}]
+        }),
+    );
+    assert_eq!(status, 401, "batch without credential must 401: {json}");
+    assert!(
+        !json.to_string().contains(PUSH_TOKEN),
+        "error body must not echo the token: {json}"
+    );
+    let (status, json) = case.post(
+        &format!("repos/{repo}/artifacts/commit"),
+        None,
+        serde_json::json!({
+            "namespace": AR02_NAMESPACE,
+            "object_type": AR02_OBJECT_TYPE,
+            "files": [{"path": "bin/app", "oid": unauth_oid, "size": 4}]
+        }),
+    );
+    assert_eq!(status, 401, "commit without credential must 401: {json}");
+
+    // Reads stay anonymous (ADR-AR-03): discovery works without a header.
+    let (status, json) = case.get(&format!("repos/{repo}/artifacts/discovery"), None);
+    assert_eq!(status, 200, "anonymous discovery must 200: {json}");
+    assert_eq!(
+        json["protocol_version"],
+        Value::String("artifacts/v1".into()),
+        "{json}"
+    );
+
+    // Authorized lifecycle: PUT bytes → batch → commit → sets → read-back.
+    let oid = uuid::Uuid::new_v4().to_string();
+    let artifact_set_id = uuid::Uuid::new_v4().to_string();
+    let payload = b"ar02 artifact bytes\n";
+    let put = case
+        .client
+        .put(artifacts_url(api, repo, &format!("/objects/{oid}")))
+        .header("Authorization", &bearer)
+        .body(payload.to_vec())
+        .send()
+        .expect("token PUT object");
+    assert_eq!(
+        put.status().as_u16(),
+        204,
+        "token PUT object must 204; body={}",
+        put.text().unwrap_or_default()
+    );
+
+    let (status, json) = case.post(
+        &format!("repos/{repo}/artifacts/batch"),
+        Some(&bearer),
+        serde_json::json!({
+            "namespace": AR02_NAMESPACE,
+            "object_type": AR02_OBJECT_TYPE,
+            "intent": "upload",
+            "objects": [{"path": "bin/app", "oid": oid, "size": payload.len()}]
+        }),
+    );
+    assert_eq!(status, 200, "token batch must 200: {json}");
+    assert_eq!(
+        json["objects"][0]["exists"],
+        Value::Bool(true),
+        "uploaded object must report exists: {json}"
+    );
+
+    let (status, json) = case.post(
+        &format!("repos/{repo}/artifacts/commit"),
+        Some(&bearer),
+        serde_json::json!({
+            "namespace": AR02_NAMESPACE,
+            "object_type": AR02_OBJECT_TYPE,
+            "artifact_set_id": artifact_set_id,
+            "files": [{"path": "bin/app", "oid": oid, "size": payload.len()}]
+        }),
+    );
+    assert_eq!(status, 200, "token commit must 200: {json}");
+    assert_eq!(
+        json["status"],
+        Value::String("ok".into()),
+        "commit status: {json}"
+    );
+    assert_eq!(
+        json["artifact_set_id"],
+        Value::String(artifact_set_id.clone()),
+        "{json}"
+    );
+
+    let (status, json) = case.get(
+        &format!(
+            "repos/{repo}/artifacts/sets?namespace={AR02_NAMESPACE}&object_type={AR02_OBJECT_TYPE}"
+        ),
+        None,
+    );
+    assert_eq!(status, 200, "anonymous sets list must 200: {json}");
+    let sets = json["sets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("sets: {json}"));
+    assert!(
+        sets.iter()
+            .any(|s| s["artifact_set_id"].as_str() == Some(artifact_set_id.as_str())),
+        "committed set must be listed: {json}"
+    );
+
+    let download = case
+        .client
+        .get(artifacts_url(api, repo, &format!("/objects/{oid}")))
+        .send()
+        .expect("anonymous GET object");
+    assert_eq!(
+        download.status().as_u16(),
+        200,
+        "anonymous object download must 200"
+    );
+    assert_eq!(
+        download.bytes().expect("object bytes").as_ref(),
+        payload,
+        "downloaded bytes must match the upload"
+    );
+
+    // Runtime OpenAPI evidence (AR-01): the booted storage-only surface lists
+    // the artifacts routes.
+    let (status, doc) = case.exchange(
+        case.client
+            .get(format!("http://127.0.0.1:{}/api/openapi.json", case.port)),
+        None,
+        "GET /api/openapi.json",
+    );
+    assert_eq!(status, 200, "GET /api/openapi.json");
+    for needle in [
+        "/api/v1/repos/{repo}/artifacts/discovery",
+        "/api/v1/repos/{repo}/artifacts/batch",
+        "/api/v1/repos/{repo}/artifacts/commit",
+        "/api/v1/repos/{repo}/artifacts/objects/{oid}",
+    ] {
+        assert!(
+            doc["paths"].get(needle).is_some(),
+            "runtime OpenAPI must list {needle}"
+        );
+    }
+
+    case.finish();
+}

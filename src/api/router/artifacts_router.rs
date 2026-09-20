@@ -14,7 +14,7 @@ use percent_encoding::percent_decode_str;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::ARTIFACTS_TAG},
+    api::{MonoApiServiceState, api_doc::ARTIFACTS_TAG, api_write_auth::authorize_trunk_api_write},
     common::errors::{ApiError, MegaError},
     contract::api::artifacts::{
         ARTIFACT_PRESIGN_URL_TTL_SECS, ArtifactBatchRequest, ArtifactBatchResponse,
@@ -49,6 +49,29 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
 
 fn decode_path_segment(segment: &str) -> String {
     percent_decode_str(segment).decode_utf8_lossy().into_owned()
+}
+
+/// Trunk / storage-only write gate (plan-20260921 AR-01 / ADR-AR-01):
+/// `git.push_auth` exists exactly on the storage-only morphology, so when it
+/// is set the write is authorized through `authorize_trunk_api_write` against
+/// the decoded repo path with a leading `/` (ADR-AR-02). On Review
+/// (`push_auth = None`) this is a no-op and `cedar_guard` keeps deciding.
+fn authorize_artifacts_write(
+    state: &MonoApiServiceState,
+    headers: &HeaderMap,
+    repo: &str,
+) -> Result<(), ApiError> {
+    let config = state.storage.config();
+    if config.git.push_auth.is_none() {
+        return Ok(());
+    }
+    let path = if repo.starts_with('/') {
+        repo.to_owned()
+    } else {
+        format!("/{repo}")
+    };
+    authorize_trunk_api_write(&config.git, headers, &path)?;
+    Ok(())
 }
 
 fn mega_to_api(err: MegaError) -> ApiError {
@@ -377,9 +400,12 @@ pub async fn head_artifact_object(
 )]
 pub async fn batch(
     State(state): State<MonoApiServiceState>,
-    Path(_repo): Path<String>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<ArtifactBatchRequest>,
 ) -> Result<Json<ArtifactBatchResponse>, ApiError> {
+    let repo = decode_path_segment(&repo);
+    authorize_artifacts_write(&state, &headers, &repo)?;
     let body = state
         .storage
         .artifact_service
@@ -408,9 +434,11 @@ pub async fn batch(
 pub async fn commit(
     State(state): State<MonoApiServiceState>,
     Path(repo): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<ArtifactCommitRequest>,
 ) -> Result<Json<ArtifactCommitResponse>, ApiError> {
     let repo = decode_path_segment(&repo);
+    authorize_artifacts_write(&state, &headers, &repo)?;
     let body = state
         .storage
         .artifact_service
@@ -439,10 +467,13 @@ pub async fn commit(
 )]
 pub async fn upload_object_fallback(
     State(state): State<MonoApiServiceState>,
-    Path((_repo, oid)): Path<(String, String)>,
+    Path((repo, oid)): Path<(String, String)>,
+    headers: HeaderMap,
     req: Request<Body>,
 ) -> Result<StatusCode, ApiError> {
+    let repo = decode_path_segment(&repo);
     let oid = decode_path_segment(&oid);
+    authorize_artifacts_write(&state, &headers, &repo)?;
     let content_length = req
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -475,4 +506,198 @@ pub async fn upload_object_fallback(
         .await
         .map_err(mega_to_api)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use utoipa::OpenApi;
+    use utoipa_axum::router::OpenApiRouter;
+
+    use super::*;
+    use crate::api::api_doc::ApiDoc;
+
+    fn path_list(router: OpenApiRouter<MonoApiServiceState>) -> Vec<String> {
+        OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(router)
+            .split_for_parts()
+            .1
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn assert_artifacts_paths_present(paths: &[String]) {
+        for needle in [
+            "/repos/{repo}/artifacts/discovery",
+            "/repos/{repo}/artifacts/sets",
+            "/repos/{repo}/artifacts/sets/{artifact_set_id}",
+            "/repos/{repo}/artifacts/resolve-file",
+            "/repos/{repo}/artifacts/objects/{oid}",
+            "/repos/{repo}/artifacts/batch",
+            "/repos/{repo}/artifacts/commit",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == needle),
+                "must register {needle}: {paths:?}"
+            );
+        }
+    }
+
+    /// AR-01: the storage-only / trunk router mounts the artifacts protocol.
+    #[test]
+    fn storage_only_router_registers_artifacts_paths() {
+        let paths = path_list(crate::api::api_router::storage_only_routers());
+        assert_artifacts_paths_present(&paths);
+    }
+
+    /// AR-01 regression: the review router keeps the artifacts paths (they
+    /// were already merged there before this plan).
+    #[test]
+    fn review_router_keeps_artifacts_paths() {
+        let paths = path_list(crate::api::api_router::routers());
+        assert_artifacts_paths_present(&paths);
+    }
+
+    /// AR-01: artifact writes authorize through `authorize_trunk_api_write`
+    /// when `git.push_auth` is set — a missing credential is 401, a token
+    /// scoped to another repo is 403, and a covering token passes the gate.
+    #[tokio::test]
+    async fn artifact_writes_call_trunk_write_gate() {
+        use std::sync::Arc;
+
+        use axum::{
+            body::Body,
+            http::{HeaderValue, Request, StatusCode, header::AUTHORIZATION},
+            response::IntoResponse,
+        };
+
+        use crate::{
+            api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
+            ceres::api_service::cache::GitObjectCache,
+            config::{PushAuth, PushTokenConfig},
+            contract::policy::entitystore::SharedEntityStore,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.git.push_auth = Some(PushAuth::Token);
+        config.git.push_tokens = vec![PushTokenConfig {
+            name: "ar01-ci".to_owned(),
+            token: "secret-ok".to_owned(),
+            paths: Some(vec!["/project".to_owned()]),
+        }];
+        let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+        let state = MonoApiServiceState {
+            session_store: BrowserSessionStore::Counting(CountingSessionStore::new(vec![Ok(None)])),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                    ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
+                    ::redis::aio::ConnectionManagerConfig::new(),
+                )
+                .expect("lazy connection manager"),
+                prefix: "ar01-test".to_string(),
+            }),
+            listen_addr: "http://127.0.0.1:0".to_string(),
+            entity_store: Arc::new(SharedEntityStore::new()),
+            storage,
+        };
+
+        let oid = uuid::Uuid::new_v4().to_string();
+        let batch_body = || {
+            Json(ArtifactBatchRequest {
+                namespace: "ar01".to_owned(),
+                object_type: ArtifactObjectType::Snapshot,
+                intent: crate::contract::api::artifacts::ArtifactIntent::Upload,
+                objects: vec![crate::contract::api::artifacts::ArtifactObjectDescriptor {
+                    path: "bin/app".to_owned(),
+                    oid: oid.clone(),
+                    size: 4,
+                    content_type: None,
+                }],
+                metadata: None,
+            })
+        };
+
+        // Missing credential → 401 on all three write handlers.
+        let Err(err) = batch(
+            State(state.clone()),
+            Path("project".to_owned()),
+            HeaderMap::new(),
+            batch_body(),
+        )
+        .await
+        else {
+            panic!("batch without credential must be rejected");
+        };
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+
+        let commit_req = |namespace: &str| {
+            Json(ArtifactCommitRequest {
+                namespace: namespace.to_owned(),
+                object_type: ArtifactObjectType::Snapshot,
+                artifact_set_id: None,
+                files: vec![],
+                metadata: None,
+                expires_in_seconds: None,
+            })
+        };
+        let Err(err) = commit(
+            State(state.clone()),
+            Path("project".to_owned()),
+            HeaderMap::new(),
+            commit_req("ar01"),
+        )
+        .await
+        else {
+            panic!("commit without credential must be rejected");
+        };
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+
+        let upload_req = || {
+            Request::builder()
+                .method("PUT")
+                .body(Body::from(vec![1_u8, 2, 3, 4]))
+                .expect("upload request")
+        };
+        let Err(err) = upload_object_fallback(
+            State(state.clone()),
+            Path(("project".to_owned(), oid.clone())),
+            HeaderMap::new(),
+            upload_req(),
+        )
+        .await
+        else {
+            panic!("upload without credential must be rejected");
+        };
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+
+        // Valid token scoped to /project, repo /other → 403.
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret-ok"));
+        let Err(err) = batch(
+            State(state.clone()),
+            Path("other".to_owned()),
+            headers.clone(),
+            batch_body(),
+        )
+        .await
+        else {
+            panic!("uncovered repo must be rejected");
+        };
+        assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+
+        // Covering token passes the gate; the batch itself succeeds.
+        let result = batch(
+            State(state),
+            Path("project".to_owned()),
+            headers,
+            batch_body(),
+        )
+        .await;
+        let Json(body) = result.expect("covered token must pass the write gate");
+        assert_eq!(body.objects.len(), 1);
+        assert!(!body.objects[0].exists);
+    }
 }
