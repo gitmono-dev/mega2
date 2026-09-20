@@ -493,3 +493,153 @@ N/A — this card is `go`. If a later review rejects Q3's park-only
 resume, the alternative already named for GS-10 is an explicit
 force-replace (or inbound merge) plan; do not silently treat a third
 GitHub oid as fast-forward.
+
+## pack 错误通道冻结（Q6a）
+
+Spike GS-18. Freezes **in-stream pack errors, completion, and
+cancel** for the outbound sync worker. Byte budget and `have`
+negotiation stay on GS-27. No production code in this card.
+
+Today `RepoHandler::incremental_pack` returns
+`Result<ReceiverStream<Vec<u8>>, GitError>` (`pack/mod.rs:254`–`:258`).
+The `Result` is only the setup failure. After the stream exists there
+is no item-level error and no completion token. Both implementations
+still `unwrap` storage lookups (`monorepo.rs` walk; `import_repo.rs:187`
+–`:190`). Clone/fetch consume that stream at `smart.rs:283` and
+`v2.rs:284`; `full_pack` (`monorepo.rs:248`) and default
+`filtered_pack` (`pack/mod.rs:284`) are the other two call sites.
+
+Changing that return type in place would force a behavior change onto
+the live upload-pack path. This freeze **does not do that**.
+
+### AC-1 — trait shape
+
+**Scheme.** Keep `incremental_pack` byte-identical for clone/fetch.
+Add a **parallel** method (name is DEP-01's; call it
+`incremental_pack_reported` here) that is **not** on the live
+upload-pack call sites:
+
+```
+async fn incremental_pack_reported(
+    &self,
+    want: Vec<String>,
+    have: Vec<String>,
+) -> Result<ReportedPackStream, GitError>
+```
+
+The method has a **default body** that returns
+`GitError` “unsupported” so `ImportRepo` (and `Arc<dyn RepoHandler>`)
+need not implement it. Only the monorepo handler used by github_sync
+overrides it.
+
+`ReportedPackStream` is a `Stream<Item = Result<Bytes, PackStreamError>>`:
+
+| Item | Meaning |
+|---|---|
+| `Ok(chunk)` | pack window (same 16 KiB cap the receive-pack writer already uses) |
+| `Err(e)` | terminal in-stream failure; stream ends |
+| stream end (`None`) | **completion** — trailer was written; no extra success item |
+
+`PackStreamError` is a closed enum: `Storage`, `Encode`, `Canceled`,
+`Protocol`. Setup failures (bad want, handler missing) still return
+from the `async fn` as `GitError`, same as today. The outbound worker
+is the only required consumer in DEP-01. Migrating clone/fetch onto
+this method is optional and out of this plan.
+
+### AC-2 — consumer impact
+
+| Site | Role | Impact of this freeze |
+|---|---|---|
+| `pack/mod.rs:254` | trait declaration | unchanged |
+| `pack/monorepo.rs:497` | monorepo impl | unchanged; new method added beside it |
+| `pack/import_repo.rs:175` | import-repo impl | unchanged; default “unsupported” body (sync is monorepo-path only, ADR-GS-01) |
+| `protocol/smart.rs:283` | upload-pack v1 | **no change** |
+| `protocol/v2.rs:284` | upload-pack v2 | **no change** |
+| `pack/monorepo.rs:249` | `full_pack` → `incremental_pack` | **no change** |
+| `pack/mod.rs:284` | `filtered_pack` default | **no change** |
+| `pack/monorepo.rs:3281` | unit test | **no change** |
+
+1 declaration / 2 implementations / 4 production call sites stay on
+the existing `Vec<u8>` stream. That is how Q6a avoids regressing
+clone/fetch. The new method's first production caller is the
+github_sync worker (DEP-01).
+
+### AC-3 — producer cancel (consumer drops the stream)
+
+**Scheme.** Today's `incremental_pack` walks **inline** before
+returning the stream (`monorepo.rs:497`–`:617`); only the encoder
+is a spawned task. The reported method must **move the walk into a
+task owned by the stream** (DEP-01 structural delta). The stream
+owns:
+
+- an `mpsc` (or equivalent) from that walker/encoder task, and
+- a `CancellationToken` (or `Drop` flag) that the consumer drop
+  cancels.
+
+When the outbound worker drops the stream (timeout from GS-20,
+park from GS-09 Q3, or process shutdown):
+
+1. The token is cancelled.
+2. The next `sender.send` fails or the walker sees the token and
+   returns `Err(Canceled)`.
+3. The producer task exits; it does not start a new tree walk or
+   blob fold.
+
+A late chunk already sitting in the channel may be lost; that is
+acceptable because the worker has abandoned the receive-pack. The
+producer must not `unwrap` a closed send (today's
+`map_err` on send is the model, `pack/mod.rs:475`–`:481`).
+
+### AC-4 — encoder-task cancel
+
+**Scheme.** The pack encoder (the task that turns `Entry`s into
+pack windows) is a child of the same token:
+
+- On cancel: abort the encoder `JoinHandle` (or select on the token
+  next to `entry_rx`). Drop the in-flight `Vec` from
+  `try_fold` (`pack/mod.rs:464`–`:470`) without sending it.
+- On `sender` closed: same path — treat as `Canceled`, not as
+  `Encode`.
+- Do not spawn an unbound encoder per blob; the existing
+  `try_for_each_concurrent(16, …)` stays the concurrency cap
+  (budget numbers are GS-27). Cancel must stop scheduling new
+  concurrent folds.
+
+Completion is the encoder finishing the pack trailer and closing
+the chunk channel. The worker treats a clean `None` as success
+only if it had already written that stream to receive-pack; a
+cancel mid-trailer is `Canceled` and the GitHub attempt is not
+recorded as success (GS-09 Q4/Q5).
+
+### AC-5 — storage failure chain
+
+**Scheme.** On the **reported** path only, every storage lookup
+that today's impls `unwrap` (`get_commits_by_hashes`,
+`get_commit_by_hash`, `get_trees_by_hashes`) maps `Err` to
+`PackStreamError::Storage` and ends the stream. No `unwrap` /
+`expect` / `panic` on that path (plan GC-11).
+
+The live `incremental_pack` path is **not** rewritten by this
+freeze (`DEFER-GS-07` still owns those unwraps). Clone/fetch keep
+today's panic-or-disconnect behavior until a later plan migrates
+them onto `incremental_pack_reported`.
+
+A storage error that happens after some windows were already
+sent is still terminal: the worker must not send those bytes as
+a successful pack (GS-15 incomplete report). The first `Err`
+item is the only diagnostic; later items are not produced.
+
+### 三分支判定
+
+| Field | Value |
+|---|---|
+| Branch | **go** |
+| Timebox | 2026-09-20, same session as GS-09 `17c3905` |
+| Basis | Additive reported stream; 4 live call sites untouched; cancel via token+drop; storage errors only on the new path |
+| Not claimed | Rewriting clone/fetch; pack byte budget; `have` ACK semantics (GS-27) |
+
+### no-go 替代方向
+
+N/A — this card is `go`. The rejected alternative is changing
+`incremental_pack`'s return type in place (would force smart.rs /
+v2.rs to handle `Result` items and is a live-protocol rewrite).
