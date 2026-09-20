@@ -2043,6 +2043,12 @@ mod tests {
 
         let inbound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let stall = SendStall::new();
+        // Narrow the server channel window so the in-flight cap stays well
+        // below the fat/4 threshold no matter how fast the host fills the
+        // window within the send deadline; with the default 2MiB window a
+        // fast loopback host flushes ~1MiB before the abort lands and the
+        // assertion becomes host-speed dependent.
+        let narrow = 256 * 1024;
         let mut session = connect_loopback(
             LoopServer {
                 user: "git".to_string(),
@@ -2054,7 +2060,7 @@ mod tests {
                 inbound: inbound.clone(),
             },
             random_host(),
-            wide,
+            narrow,
         )
         .await;
         let mut receive =
