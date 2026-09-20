@@ -1140,9 +1140,9 @@ Operator checklist before the first **real** GitHub push
 
 ## 模板漂移（GAP-07）
 
-`docs/plan/plan-template.md` GC-12 / ER-07 still say this repo is
-Git-managed and that `.libra` was deleted (2026-08-27 note). **That
-is false on 2026-09-20:** `.git` is absent, `.libra` is present,
-`AGENTS.md` says VCS is Libra. This project executed
-`libra add` / `libra commit` / `libra push origin main`. Template
-correction is `DEP-02` (60916 does not edit the template).
+**Closed 2026-09-20.** `docs/plan/plan-template.md` GC-12 / ER-01 /
+ER-07 now match `AGENTS.md`「Task card release」: this repo is
+Libra-managed (`.libra` present, `.git` absent). Workflow is
+`libra add` / `libra commit -s -m` / `libra push origin main`.
+`DEP-02` is closed. `README.md` Contributing lists the three
+cargo gates and defers VCS commands to `AGENTS.md`.

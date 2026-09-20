@@ -170,14 +170,14 @@
 - **GC-09 并发与资源生命周期:** DB 连接池、redis 连接、文件句柄、异步任务队列和临时目录必须有释放/恢复语义；测试不得依赖未隔离的全局状态（改环境变量的测试必须使用 `src/config/testing.rs` 的 `env_lock` / `EnvVarGuard`）。
 - **GC-10 性能预算:** HTTP 热路径、DB 查询、对象存储读写、Git 协议操作和后台任务不得引入无界扫描、无界内存或 N+1 DB/网络调用。需要时写出数据规模和断言。
 - **GC-11 生产 panic 禁止:** 生产路径不得新增裸 `unwrap()`、`expect()`、`panic!()`；必须用 `MegaResult`、`anyhow::Context` 或领域错误返回可操作信息。
-- **GC-12 精确提交:** 提交前只 `git add <相关路径>`，不得使用 `commit -a`。发现无关脏状态时保留并报告，不得清理、重置或混入提交。（**2026-08-27 起本仓由 Git 管理**，`.libra` 已删除；此前计划中的 `libra add` / 「本仓无 `.git`」表述是当时的事实记录，按「模板版本与迁移政策」不追认为违规，也不回改历史计划。）
+- **GC-12 精确提交:** 提交前只 `libra add <相关路径>`，不得使用 `commit -a`。发现无关脏状态时保留并报告，不得清理、重置或混入提交。**本仓由 Libra 管理**（权威目录 `.libra`；**不得**使用 `git`）。（**2026-09-20 订正：** 2026-08-27 模板曾误称 checkout 由 Git 托管且 Libra 元数据已移除——该记录与当前事实不符（无 `.git`）。存量计划里的 `git add` / `git commit` 是当时的事实记录，按「模板版本与迁移政策」不追认为违规，也不回改历史计划。）
 
 ## 执行检查必备需求（强制）
 
 任一要求未满足，对应任务不得标记完成。条目使用稳定 ID，正文引用时用 ID 而不是序号，便于后续插入条目而不破坏交叉引用。
 
 1. **ER-01 开工前安全检查:** 必须完成下列四项，缺一不可。
-   - `git status --short --branch`（`--branch` 才会输出 `## <branch>...<upstream>` 行；不带它只有文件状态），确认当前分支与计划指定分支一致、工作区脏状态、目标文件是否已有无关改动。若目标文件已有未确认用户改动，先报告并避免覆盖。已知现状（2026-08-27 核对）：`main` **未配置 upstream**（`git rev-parse --abbrev-ref main@{upstream}` 报 `no upstream configured`），因此 status 的 `## main` 行不带 ahead/behind，**不要**把它当作推送判据；需要判断领先/落后时显式用 `git rev-list --left-right --count origin/main...main`。
+   - `libra status --short --branch`（`--branch` 才会输出 `## <branch>...<upstream>` 行；不带它只有文件状态），确认当前分支与计划指定分支一致、工作区脏状态、目标文件是否已有无关改动。若目标文件已有未确认用户改动，先报告并避免覆盖。需要 ahead/behind 时读 `libra --json status` 的 `data.upstream`（`ahead` / `behind` / `gone` / `remote_ref`），或看短格式的 `[ahead N, behind M]`。禁止 `git status` / `git rev-parse` / `git rev-list`（本仓无 `.git`，这些命令会直接失败）。（**2026-09-20 订正：** 2026-08-27 模板要求 `git status` 并声称 `main` 未配置 upstream——该记录已过期；当前 `main` 跟踪 `origin/main`。）
    - ~~确认路径依赖 `../orbit` 已就位~~ **（2026-08-27 订正：本项已失效，无需执行。）** 对象存储自 `plan-20260824` 起完全内联为 `src/orbit_api/`（traits/config/errors）与 `src/orbit/`（`object_store` 后端），由 `src/jupiter/storage/object_storage.rs::build_object_storage` 直接调用 `crate::orbit::factory::ObjectStorageFactory::build`；**已无** sibling `../orbit`、**已无** `crates/orbit*` workspace 成员、**已无** `orbit-api` path 依赖，也**没有** `ObjectStorageProvider` 进程级注册表。因此不存在「缺失 sibling checkout 导致 cargo 依赖解析失败」这一失败模式，遇到 `cargo` 解析失败应按真实原因排查。拓扑说明见 `docs/refactoring/orbit.md` 头部与 `README.md`「目录关系」。
    - 确认 `.env.test` 是否存在（仓库只提供 `.env.test.example`，`.env.test` 本身被忽略）。缺失时按 `AGENTS.md` 的规定停下来确认，**不得**静默降级为不 source 的 `cargo test --all`。
    - 确认需要的测试服务是否已启动：`docker compose -f docker/docker-compose.test.yml up -d --wait`（Postgres `15432`、Redis `16379`、Mailpit `11025/18025`、RustFS `19000/19001`；RustFS 桶初始化需要额外的 `--profile init run --rm rustfs-init`）。Postgres 缺失会让相关用例直接 panic 而不是跳过。
@@ -247,11 +247,11 @@
    | Task type | 类型门 |
    |---|---|
    | `implementation` / `migration` / `removal` | 无额外类型门（由 A 组 + C 组构成完整验收；`family child` 自跑 A 组 + fmt/clippy，C 覆盖继承自家族唯一发布点） |
-   | `docs` / `audit` / `handoff` | 结构与链接门：本卡产物文件存在且章节完整、内部链接与 `file:line` 锚点可解析、新引入的 `docs/*.md` 路径全部真实存在（本仓已有多处悬空文档引用，不得新增）、`git status --short --branch` 无越界改动。这三类**必须保持 no-code / no-config**：一旦发现需要改动代码或配置，不得「就地升级门」，必须先按 ER-03 把卡重分类为 `implementation` / `migration` / `removal`，同步 `Release boundary`、`Version increment`、`Release write set`，重跑粒度门后再执行 |
-   | `spike` | 产物门：结论文档或 ADR 已落盘、go/no-go 已判定、承接卡已登记；**allowlist diff 门**——`git status --short --branch` 的全部变更必须落在本卡 `Deliverables` 声明的产物内，且生产表面零改动（至少覆盖 `src/**`、`tests/**`、`config/**`、`scripts/**`、`Cargo.toml`、`Cargo.lock`、`rustfmt.toml`、`docker/docker-compose.test.yml`、`.github/workflows/**`），用「Verification 判定口径」的退出码模板逐条守卫 |
+   | `docs` / `audit` / `handoff` | 结构与链接门：本卡产物文件存在且章节完整、内部链接与 `file:line` 锚点可解析、新引入的 `docs/*.md` 路径全部真实存在（本仓已有多处悬空文档引用，不得新增）、`libra status --short --branch` 无越界改动。这三类**必须保持 no-code / no-config**：一旦发现需要改动代码或配置，不得「就地升级门」，必须先按 ER-03 把卡重分类为 `implementation` / `migration` / `removal`，同步 `Release boundary`、`Version increment`、`Release write set`，重跑粒度门后再执行 |
+   | `spike` | 产物门：结论文档或 ADR 已落盘、go/no-go 已判定、承接卡已登记；**allowlist diff 门**——`libra status --short --branch` 的全部变更必须落在本卡 `Deliverables` 声明的产物内，且生产表面零改动（至少覆盖 `src/**`、`tests/**`、`config/**`、`scripts/**`、`Cargo.toml`、`Cargo.lock`、`rustfmt.toml`、`docker/docker-compose.test.yml`、`.github/workflows/**`），用「Verification 判定口径」的退出码模板逐条守卫 |
    | `release` | 聚合守卫（本组引入的全部新守卫用例）+ release note / 兼容证据 |
 
-   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面 parity 预检（ER-08）→ ② 按 `Version increment` bump 版本面（当前为**一处**：`Cargo.toml` 的 `version`，处数以 ER-08 的开工日核对为准）+ 让工具链刷新 `Cargo.lock` 的对应条目（不手改）→ ③ 在**已 bump 的状态**上跑 `AGENTS.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ④ `cargo build` 与 `cargo build --tests` 均 0 错误 0 警告；需要可执行产物时另跑 `cargo build --release -p mega2` → ⑤ `libra add <相关路径>` + `libra commit -m` → ⑥ 推送并确认 branch ref：`libra push origin main` 成功且远端 ref 已更新 → ⑦ 对每次实际版本 bump，在该提交上创建同名标注 tag：`libra tag -m "v<version>: <summary>" v<version>`，并以 `libra push origin refs/tags/v<version>` 推送 → ⑧ 分析该版本最终 diff，人工撰写标准 release note 后执行 `gh release create v<version> -R gitmono-dev/mega2 --title "v<version>" --notes-file <release-notes-file>`。release note 必须包含 Highlights、用户可见变更、兼容性 / 配置 / 迁移说明（无则写 `N/A`）、验证结果和已知限制；禁止使用 `--generate-notes` 或其它自动生成内容。`Version increment=N/A` 的卡不创建 tag 或 release。
+   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面 parity 预检（ER-08）→ ② 按 `Version increment` bump 版本面（当前为**一处**：`Cargo.toml` 的 `version`，处数以 ER-08 的开工日核对为准）+ 让工具链刷新 `Cargo.lock` 的对应条目（不手改）→ ③ 在**已 bump 的状态**上跑 `AGENTS.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ④ `cargo build` 与 `cargo build --tests` 均 0 错误 0 警告；需要可执行产物时另跑 `cargo build --release -p mega2` → ⑤ `libra add <相关路径>` + `libra commit -s -m` → ⑥ 推送并确认 branch ref：`libra push origin main` 成功且远端 ref 已更新 → ⑦ 对每次实际版本 bump，在该提交上创建同名标注 tag：`libra tag -m "v<version>: <summary>" v<version>`，并以 `libra push origin refs/tags/v<version>` 推送 → ⑧ 分析该版本最终 diff，人工撰写标准 release note 后执行 `gh release create v<version> -R gitmono-dev/mega2 --title "v<version>" --notes-file <release-notes-file>`。release note 必须包含 Highlights、用户可见变更、兼容性 / 配置 / 迁移说明（无则写 `N/A`）、验证结果和已知限制；禁止使用 `--generate-notes` 或其它自动生成内容。`Version increment=N/A` 的卡不创建 tag 或 release。
 
    三门必须覆盖 bump 后的最终状态——bump 与 `Cargo.lock` 刷新本身可能引入格式、lint 或编译回归，`cargo build` 不能替代 clippy 与全量测试。
 
@@ -268,12 +268,12 @@
    「完成判据」的计划级门是最后一次总检查，不替代每张会推送的卡各自跑过的发布收口门。
 5. **ER-05 代码 review 闭环:** 实现和本地验收完成后进行代码 review；review 问题修复后重跑相关验收，直到 review 明确给出 `PASS`。P0/P1 必须关闭，不得以「residual risk 已接受」替代 `PASS`（仅 P2 可由具名责任人书面接受）。
 6. **ER-06 文档与兼容同步:** 涉及公开行为的任务必须同步用户文档、开发文档、`config/config.toml` 示例、错误契约、运行时 OpenAPI 证据和测试矩阵。
-7. **ER-07 提交工作流与提交签名:** 本仓库使用 Git 工作流：`git status`、`git add <相关路径>`、`git commit -m "<scope>: <summary>"`、`git push origin main`。（**2026-08-27 变更**：本条原名「Libra-native 工作流与提交签名」，`.libra` 删除后改为 Git；历史计划中的 `libra *` 命令是当时的事实记录，不回改。）
-   - 签名策略：`commit.gpgSign=true` 时 `git commit` **自动签名**，无需显式 `-S`；显式 `-S`/`--gpg-sign` 与 `--no-gpg-sign` 可逐次覆盖。优先级为命令行 `--no-gpg-sign` / `-S`（最高）> `commit.gpgSign` > 不签名。`-s` 是 `Signed-off-by`，与 GPG 签名是两件事，按下条的仓库惯例决定是否使用。
-   - 预检读 `git config --get commit.gpgSign` 与 `git config --get user.signingkey`；二者任一缺失或 `commit.gpgSign=false` 时不得当作「已启用签名」。
-   - 每次提交后强制校验：`git cat-file -p HEAD | rg -q '^gpgsig'`。校验失败不得推送。
-   - **本仓已知现状（2026-08-27 核对）:** `commit.gpgSign=true`、`user.signingkey=7B2F49AE3A9E8BDC`，实测最近提交**均带 `gpgsig` 头**——即旧版记录的「配置为签名但实际不签名」缺口在 Git 下已消失，`EX-*` 豁免路径当前无需启用。若某次校验仍失败（签名密钥不可用、agent 未解锁等），必须查明原因并记录，不得静默跳过；确需以 sign-off-only 方式提交时，仍按「字段全局默认与例外」登记 `豁免项 = ER-07 签名要求` 的 `EX-*`（含 Approver、Review round、证据、有效期），「事实基线」最多链接该 `EX-*`，不构成独立授权路径。
-   - **与 `README.md` / `AGENTS.md` 的已知漂移及优先级（必须按此执行）:** `README.md` 的 Contributing 一节写的是「Sign your commits (`git commit -s -S …`)」——该命令**现已可执行**（旧版记录的「双重不可执行」随 `.libra` 删除而失效），但与本仓实际惯例仍有一处差异：近期提交**不带 `Signed-off-by`**，签名由 `commit.gpgSign` 自动完成而非显式 `-S`。`AGENTS.md` 则**完全没有**提交/分支/签名指引，同时含若干过期事实（`src/common/config/loader.rs` 的真实路径是 `src/config/loader.rs`；把 `cargo test` 写成全量测试，与其自身收口门的 `source .env.test && cargo test --all` 不一致；子命令 executor 签名**待复核**）。**（2026-08-27 订正：本条旧文还把「单一 binary crate」「`src/main.rs`」列为过期事实——那是双 package 拆分期的判断；`plan-20260824` 单体内联后本仓确实是单 package、入口确实是 `src/main.rs`，AGENTS.md 这两处已与事实一致，不再计为漂移。）**计划执行时**以 ER-07 + GC-12 为准**：`git add <相关路径>` → `git commit -m` →（按上三条做签名预检与提交后 `gpgsig` 校验）。这些漂移应作为独立的文档修复项承接，不得在计划执行中两套并行。
+7. **ER-07 提交工作流与提交签名:** 本仓库使用 **Libra** 工作流：`libra status`、`libra add <相关路径>`、`libra commit -s -m "<scope>: <summary>"`、`libra push origin main`。**禁止 `git`**（无 `.git`）。**禁止 `--force`**；本地与 `origin/main` 分叉时停止并报告，按 ER-09 rebase/integrate 后再推。权威源：`AGENTS.md`「Task card release」与 `.cursor/rules/task-card-release.mdc`。（**2026-09-20 订正：** 2026-08-27 本条曾改写为 Git 工作流并声称 `.libra` 已删除——该记录与当前 checkout 不符。存量计划里的 `git *` 命令是当时的事实记录，不回改。）
+   - 签名策略：Libra 默认 `vault.signing=true`，用仓库 vault 钥做 PGP 签名（`.libra/vault.db`），**不走**外部 `gpg` / `user.signingkey`。**不暴露** `-S` / `--gpg-sign`（传入即用法错误）。覆盖优先级：命令行 `--no-gpg-sign`（最高）> `commit.gpgSign=true|false` > `vault.signing`。`-s` / `--signoff` 是 `Signed-off-by` trailer，与 vault PGP 签名是两件事。
+   - 预检读 `libra config --get vault.signing`；值为 `true` 才可当作「已启用 vault 签名」。`commit.gpgSign` 未配置时走 vault 默认，不得去读 `git config`。
+   - 每次提交后强制校验：`libra cat-file -p HEAD` 含本仓惯例的 `Signed-off-by` trailer（用 `libra commit -s`）。若同时存在 `gpgsig` 头，一并记录。`gpgsig` 在 vault 未解封时可能缺失——必须记录 sanitized 原因，不得改用 `git`，也不得把「无 `gpgsig`」静默当成未签名成功。确需以 sign-off-only 作为仓库策略时，仍按「字段全局默认与例外」登记 `豁免项 = ER-07 签名要求` 的 `EX-*`。
+   - **本仓已知现状（2026-09-20 核对）:** `vault.signing=true`；`commit.gpgSign` 未配置；近期提交带 `Signed-off-by`（`libra commit -s`）。`EX-*` 豁免路径当前无需启用。
+   - **与 `README.md` / `AGENTS.md` 的优先级（必须按此执行）:** `README.md` Contributing 只列三门 cargo 命令并指向 `AGENTS.md`，不写提交命令。`AGENTS.md`「Task card release」已写 Libra 流程（`libra add` / `libra commit -m` / `libra push origin main`，禁止 `git` 与 `--force`）。计划执行时**以 ER-07 + GC-12 + `AGENTS.md` 为准**：`libra add <相关路径>` → `libra commit -s -m` → `libra push origin main`。
    - 提交信息沿用本仓已观察到的两种既有风格：发布类改动用 `v<version>: <summary>`；文档/测试/CI 类改动用 `<type>(<scope>): <summary>`。
 8. **ER-08 版本与发布:** 版本权威源是根 `Cargo.toml` 的 `version`。**版本面自 plan-20260824 单体内联后只有一处**（2026-08-27 核对）：唯一 package 是 `mega2`（`Cargo.toml` `[package] name`，lib target 名 `mega2_core`，另有两个 `[[bin]]` target `mega2` / `migrate_local_to_s3`）；`bin/Cargo.toml` **已不存在**，`crates/orbit*` workspace 成员与 sibling `../orbit` 也已随内联移除。因此发布前的「版本面 parity 预检」在当前拓扑下退化为空操作，但**开工时仍须重新核对版本面文件数量**（`rg -n '^version' Cargo.toml` 与 `rg -l '^\[package\]' --glob '**/Cargo.toml'`）——若未来重新拆包，parity 预检与「不一致时先建立修复卡对齐、禁止直接 bump」的规则立即恢复适用。按任务卡的 `Version increment` 递增该处 version，让工具链刷新 `Cargo.lock` 的对应条目，其余步骤与顺序按 ER-04 的「发布收口门」执行（bump 后必须重跑三门）。
    - **包名口径**：`cargo` 命令一律用 `-p mega2`；模板与存量计划里出现的 `-p mega2-core` 是单体内联前的旧包名，已失效（同一裁定见 `plan-20260827.md` 的「包名口径」与其 R5 评审记录）。
@@ -287,7 +287,7 @@
 12. **ER-12 并发边界与串行发布:** 并发只适用于**实现与 review 阶段**：只有 `Implementation write set` 不相交（G-10）的卡可以并发推进。**发布动作一律串行，且由单一发布者执行**：
     - 计划必须在「发布分组与并发窗口」声明发布者（哪个 Agent/人负责 C 组的 bump、构建、提交、推送，以及推送后跟踪 D 组远端证据）。同一时刻只允许一个卡处于「已 bump 未完成推送」状态。
     - 进入发布前重新读取 `Cargo.toml` 权威版本（ER-08 的 parity 预检），按顺序做完整套发布动作后才轮到下一张卡。
-    - **禁止多 Agent 并发发布。** 本仓库当前**没有**仓库级发布锁：`git push origin main` 推送的是本地 `main` 的整个 ref tip，无法只发布一条协调记录，也无法在 push 之外提供 CAS 仲裁；靠纯文档约定实现的 lease 无法验证，属于未经实现验证的协议。若某计划确实需要并发发布，必须先用独立 ADR + 独立计划落地一个仓库级发布锁（含原子认领、fence 校验、超时回收、崩溃恢复与测试），并在本计划以 `DEFER-*` 登记；在该机制落地并通过验收之前，一律按本条串行执行。
+    - **禁止多 Agent 并发发布。** 本仓库当前**没有**仓库级发布锁：`libra push origin main` 推送的是本地 `main` 的整个 ref tip，无法只发布一条协调记录，也无法在 push 之外提供 CAS 仲裁；靠纯文档约定实现的 lease 无法验证，属于未经实现验证的协议。若某计划确实需要并发发布，必须先用独立 ADR + 独立计划落地一个仓库级发布锁（含原子认领、fence 校验、超时回收、崩溃恢复与测试），并在本计划以 `DEFER-*` 登记；在该机制落地并通过验收之前，一律按本条串行执行。
     - 并发实现期间仍受 I–R 约束（G-10）：发布者持有发布窗口时，其它卡不得修改 `Release write set` 内的文件。
 
 ## 实施顺序
