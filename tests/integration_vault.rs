@@ -42,7 +42,7 @@ const S3_SECRET_KEY_VALUE: &str = "wJalrXUtnFEMI/test/secret/key/EXAMPLE";
 const REDIS_URL_PATH: &str = "config/it/redis/url";
 const REDIS_URL_REF: &str = "vault://secret/config/it/redis/url#value";
 
-// 默认连接信息与 `docker-compose.test.yml`、`.env.test.example` 保持一致。
+// 默认连接信息与 `docker/docker-compose.test.yml`、`.env.test.example` 保持一致。
 // 如果 CI 或开发机需要改端口，可以通过 `.env.test` 中的环境变量覆盖。
 const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
@@ -200,7 +200,7 @@ impl TestDatabase {
             // 如果 compose PostgreSQL 没有启动，错误信息直接提示开发者先启动测试环境。
             let db = Database::connect(admin_url.as_str()).await.unwrap_or_else(|_| {
                 panic!(
-                    "integration PostgreSQL is not available; run `docker compose -f docker-compose.test.yml up -d` first"
+                    "integration PostgreSQL is not available; run `docker compose -f docker/docker-compose.test.yml up -d` first"
                 )
             });
 
@@ -612,7 +612,7 @@ fn assert_failure(output: &Output) -> (String, String) {
 }
 
 fn integration_postgres_url() -> String {
-    // `.env.test` 可以覆盖默认值；没有覆盖时使用 docker-compose.test.yml 的本地端口。
+    // `.env.test` 可以覆盖默认值；没有覆盖时使用 docker/docker-compose.test.yml 的本地端口。
     std::env::var("MEGA_DATABASE__DB_URL").unwrap_or_else(|_| DEFAULT_POSTGRES_URL.to_string())
 }
 
@@ -882,7 +882,7 @@ fn integration_compose_mega2_http_smoke() {
         eprintln!(
             "integration_compose_mega2_http_smoke requires compose mega2 at \
              127.0.0.1:19180; build/start with \
-             `docker compose -p mega2-it -f docker-compose.test.yml --profile app up -d --wait mega2` \
+             `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app up -d --wait mega2` \
              (see docs/refactoring/test-infra.md), skipping"
         );
         return;
@@ -932,7 +932,7 @@ fn integration_object_storage_s3_compatible_smoke() {
     if !rustfs_available {
         eprintln!(
             "integration_object_storage_s3_compatible_smoke requires RustFS at {}; \
-             run `docker compose -p mega2-it -f docker-compose.test.yml up -d --wait` \
+             run `docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --wait` \
              first (includes rustfs-init creating mega2 and monoui buckets), skipping",
             rustfs_endpoint
         );

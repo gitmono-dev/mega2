@@ -2,8 +2,8 @@
 # Must be composed with the base file and recreate mega2:
 #
 #   docker compose -p mega2-trunk \
-#     -f docker-compose-storage-only.yml \
-#     -f docker-compose-storage-only.auth-none.yml \
+#     -f docker/docker-compose-storage-only.yml \
+#     -f docker/docker-compose-storage-only.auth-none.yml \
 #     up -d --wait --force-recreate mega2
 #
 # Revert to token: drop the second -f and --force-recreate mega2 again.
@@ -11,4 +11,4 @@
 services:
   mega2:
     volumes:
-      - ./config/config-storage-only.none.toml:/etc/mega2/config.toml:ro
+      - ../config/config-storage-only.none.toml:/etc/mega2/config.toml:ro

@@ -29,9 +29,9 @@ docker compose -f mega2-compose.yml down      # 具名卷保留数据；down -v 
 
 该栈是**仅限本机的匿名设置**：`push_auth=none`、匿名读写，HTTP 只发布到 `127.0.0.1:9000`（mega2 容器内 8000）。不要绑定 `0.0.0.0` 或经反向代理暴露；共享 / 公网部署用下面的 token 栈或自建编排。端到端操作演示见 [`quick-start.zh.md`](./quick-start.zh.md)。
 
-### 2.2 源码构建的测试 / 实验栈：`docker-compose-storage-only.yml`
+### 2.2 源码构建的测试 / 实验栈：`docker/docker-compose-storage-only.yml`
 
-[`docker-compose-storage-only.yml`](../docker-compose-storage-only.yml) 是从源码**构建**镜像的本地 / 实验室参考栈（用于部署演练与 smoke，不是正式分发形态）：mega2 + Postgres + Redis + RustFS，挂载 [`config/config-storage-only.toml`](../config/config-storage-only.toml)。与 IT 栈 `docker-compose.test.yml` 可并存（端口不冲突）。
+[`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml) 是从源码**构建**镜像的本地 / 实验室参考栈（用于部署演练与 smoke，不是正式分发形态）：mega2 + Postgres + Redis + RustFS，挂载 [`config/config-storage-only.toml`](../config/config-storage-only.toml)。与 IT 栈 `docker/docker-compose.test.yml` 可并存（端口不冲突）。
 
 服务与宿主端口（以 compose 文件为准）：
 
@@ -49,13 +49,13 @@ docker compose -f mega2-compose.yml down      # 具名卷保留数据；down -v 
 
 ```bash
 # 首次构建（context = 仓库根）
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml build mega2
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml build mega2
 
 # 启动（默认 RustFS，不要加 --env-file）
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml up -d --wait
 
 # 空卷 bootstrap（一次性；创建初始图，不起监听）
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml exec -T mega2 \
   mega2 --config /etc/mega2/config.toml service init --yes
 ```
 
@@ -63,12 +63,12 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
 
 ### 2.2.1 `push_auth=none` 覆盖变体
 
-[`docker-compose-storage-only.auth-none.yml`](../docker-compose-storage-only.auth-none.yml) 是 opt-in 覆盖：与基础文件双 `-f` 组合，把 mega2 的配置重挂载为 `config/config-storage-only.none.toml`，并 `--force-recreate mega2`：
+[`docker/docker-compose-storage-only.auth-none.yml`](../docker/docker-compose-storage-only.auth-none.yml) 是 opt-in 覆盖：与基础文件双 `-f` 组合，把 mega2 的配置重挂载为 `config/config-storage-only.none.toml`，并 `--force-recreate mega2`：
 
 ```bash
 docker compose -p mega2-trunk \
-  -f docker-compose-storage-only.yml \
-  -f docker-compose-storage-only.auth-none.yml \
+  -f docker/docker-compose-storage-only.yml \
+  -f docker/docker-compose-storage-only.auth-none.yml \
   up -d --wait --force-recreate mega2
 ```
 
@@ -79,7 +79,7 @@ docker compose -p mega2-trunk \
 默认后端是 RustFS（`s3compatible`），直接 `up` 即可。仅当把 mega2 改成本地文件系统后端时加 `--env-file`（RustFS 容器仍会启动，只切 mega2 的 `storage_type`）：
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
   --env-file config/compose.env.storage-only.local up -d --wait
 ```
 

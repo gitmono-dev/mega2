@@ -168,7 +168,7 @@ docker run -d --name mega2 \
   -p 8000:8000 mega2:local
 ```
 
-要点：配置文件**只读挂载**（`:ro`）；环境相关项（数据面端点、凭据）不写入挂入的文件，改由 env 注入；`MEGA_BASE_DIR` 对应的数据目录挂持久卷。本仓 `docker-compose.test.yml` 的 `mega2` 服务即「镜像基线 + env 覆盖」的完整参照。
+要点：配置文件**只读挂载**（`:ro`）；环境相关项（数据面端点、凭据）不写入挂入的文件，改由 env 注入；`MEGA_BASE_DIR` 对应的数据目录挂持久卷。本仓 `docker/docker-compose.test.yml` 的 `mega2` 服务即「镜像基线 + env 覆盖」的完整参照。
 
 **Kubernetes（ConfigMap + Secret）：**
 
@@ -232,6 +232,6 @@ volumes:
 | 协议路径判定与 smoke 矩阵 | [`../refactoring/protocol.md`](../refactoring/protocol.md)、`scripts/git_protocol_smoke.sh` |
 | 初始化实现 | `src/jupiter/service/mono_service.rs::init_monorepo`、`src/jupiter/utils/converter.rs`（`init_trees` / `MegaModelConverter::init`） |
 | 配置模型与默认值 | `src/config/model.rs::MonoConfig`、`config/config.toml` `[monorepo]` |
-| 配置加载链与容器基线 | `src/config/loader.rs`、`src/config/source.rs`、`Dockerfile`、`docker-compose.test.yml` |
+| 配置加载链与容器基线 | `src/config/loader.rs`、`src/config/source.rs`、`Dockerfile`、`docker/docker-compose.test.yml` |
 | 结构排序回归测试 | `src/jupiter/utils/converter.rs` `init_trees_sorts_git_tree_entries` |
 | 本地开发入口 | [`../development.md`](../development.md) |

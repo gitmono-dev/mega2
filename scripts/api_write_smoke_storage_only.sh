@@ -38,7 +38,7 @@ Registered cases (exact names for MEGA2_SMOKE_CASE):
 
 Compose example (after mega2-trunk up + service init):
   TOKEN='mega2-storage-only-local-dev-token-0001'
-  docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+  docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
     exec -T \
     -e MEGA2_HTTP_REPO_URL="http://x:${TOKEN}@mega2:8000/" \
     -e MEGA2_API_BASE=http://mega2:8000 \

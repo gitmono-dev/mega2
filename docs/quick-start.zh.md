@@ -148,8 +148,8 @@ docker compose -f mega2-compose.yml -f mega2-compose.persist.yml up -d --wait
 
 仓库里还有两份 Compose，**都面向测试与开发**，不是本评估栈的替代品：
 
-- [`docker-compose-storage-only.yml`](../docker-compose-storage-only.yml)（及 `docker-compose-storage-only.auth-none.yml` 覆盖）：从源码**构建**镜像的 trunk 实验栈，token 鉴权、需要 `service init` bootstrap，用于部署演练与 smoke。用法见 [`deployment.zh.md`](./deployment.zh.md) 与 [`deploy-trunk.md`](./deploy-trunk.md) §8。
-- [`docker-compose.test.yml`](../docker-compose.test.yml)：集成测试（IT）数据面，见 [`development.md`](./development.md)。
+- [`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml)（及 `docker/docker-compose-storage-only.auth-none.yml` 覆盖）：从源码**构建**镜像的 trunk 实验栈，token 鉴权、需要 `service init` bootstrap，用于部署演练与 smoke。用法见 [`deployment.zh.md`](./deployment.zh.md) 与 [`deploy-trunk.md`](./deploy-trunk.md) §8。
+- [`docker/docker-compose.test.yml`](../docker/docker-compose.test.yml)：集成测试（IT）数据面，见 [`development.md`](./development.md)。
 
 ## 下一步
 

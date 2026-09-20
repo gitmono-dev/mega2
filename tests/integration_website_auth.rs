@@ -143,7 +143,7 @@ fn website_it_stack_is_requested_and_available() -> bool {
         assert!(
             is_reachable(address),
             "WEBSITE_IT=1 requires {name} at {address}; start with \
-             `docker compose -p mega2-it -f docker-compose.test.yml \
+             `docker compose -p mega2-it -f docker/docker-compose.test.yml \
              --profile app --profile web up -d --wait`"
         );
     }

@@ -21,7 +21,7 @@ Optional environment:
   MEGA2_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones
 
 Compose black-box example (after service init — see docs/deploy-trunk.md):
-  docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+  docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
     exec -T -e MEGA2_HTTP_REPO_URL=http://mega2:8000/ \
     -e MEGA2_SMOKE_CASE='HTTP ls-remote' \
     git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
@@ -30,7 +30,7 @@ Persist host log (ADR-SO-10):
   mkdir -p target/tmp
   LOG="target/tmp/so-smoke-$(date -u +%Y%m%dT%H%M%SZ)-${MEGA2_SMOKE_CASE:-all}.log"
   set -o pipefail
-  docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+  docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
     exec -T git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh \
     2>&1 | tee "$LOG"
 USAGE

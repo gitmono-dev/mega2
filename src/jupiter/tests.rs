@@ -125,7 +125,7 @@ async fn create_test_database_url() -> String {
 
     let admin = Database::connect(admin_opt).await.unwrap_or_else(|_| {
         panic!(
-            "test PostgreSQL is not available; run `docker compose -f docker-compose.test.yml up -d` first"
+            "test PostgreSQL is not available; run `docker compose -f docker/docker-compose.test.yml up -d` first"
         )
     });
     execute_postgres(&admin, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;

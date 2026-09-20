@@ -10,7 +10,7 @@ _MEGA2_IT_LIB_LOADED=1
 
 _MEGA2_IT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEGA2_IT_ROOT="$(cd "${_MEGA2_IT_LIB_DIR}/../.." && pwd)"
-MEGA2_IT_COMPOSE_FILE="${MEGA2_IT_ROOT}/docker-compose.test.yml"
+MEGA2_IT_COMPOSE_FILE="${MEGA2_IT_ROOT}/docker/docker-compose.test.yml"
 MEGA2_IT_PROJECT="${MEGA2_IT_PROJECT:-mega2-it}"
 
 mega2_it_die() {

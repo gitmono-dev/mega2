@@ -148,8 +148,8 @@ From then on all data lives under `./mega2-data/`:
 
 The repository ships two more Compose files, **both aimed at testing and development** — neither replaces this evaluation stack:
 
-- [`docker-compose-storage-only.yml`](../docker-compose-storage-only.yml) (plus the `docker-compose-storage-only.auth-none.yml` override): a trunk lab stack that **builds** the image from source, uses token authentication, and needs a `service init` bootstrap — used for deployment rehearsals and smoke tests. Usage: [`deployment.md`](./deployment.md) and [`deploy-trunk.md`](./deploy-trunk.md) §8.
-- [`docker-compose.test.yml`](../docker-compose.test.yml): the integration-test (IT) data plane, see [`development.md`](./development.md).
+- [`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml) (plus the `docker/docker-compose-storage-only.auth-none.yml` override): a trunk lab stack that **builds** the image from source, uses token authentication, and needs a `service init` bootstrap — used for deployment rehearsals and smoke tests. Usage: [`deployment.md`](./deployment.md) and [`deploy-trunk.md`](./deploy-trunk.md) §8.
+- [`docker/docker-compose.test.yml`](../docker/docker-compose.test.yml): the integration-test (IT) data plane, see [`development.md`](./development.md).
 
 ## Next steps
 

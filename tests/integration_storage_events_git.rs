@@ -73,7 +73,7 @@ impl TestDatabase {
             tokio::time::timeout(Duration::from_secs(30), async {
                 let db = Database::connect(admin_url.as_str())
                     .await
-                    .expect("integration PostgreSQL unavailable; start docker-compose.test.yml");
+                    .expect("integration PostgreSQL unavailable; start docker/docker-compose.test.yml");
                 execute_postgres(&db, format!("DROP DATABASE IF EXISTS {db_name}")).await;
                 execute_postgres(&db, format!("CREATE DATABASE {db_name}")).await;
             })

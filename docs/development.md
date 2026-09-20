@@ -38,7 +38,7 @@
 
 ## 概念（先读这四条）
 
-1. **Compose = 数据面**：`docker-compose.test.yml` 提供 Postgres / Redis / RustFS 等
+1. **Compose = 数据面**：`docker/docker-compose.test.yml` 提供 Postgres / Redis / RustFS 等
    mega2 依赖；Mailpit 仅供 website 的认证/产品邮件 IT 捕获，**不**替代用例内拉起的被测进程。
 2. **黑盒隔离**：`tests/integration_*.rs` 通过 `CARGO_BIN_EXE_mega2`
    按用例启动独立 `service http`（独立端口、临时目录、隔离 DB）。
@@ -76,7 +76,7 @@
 ```bash
 ./scripts/dev-test.sh basic
 # 等价手贴：
-# docker compose -p mega2-it -f docker-compose.test.yml up -d --wait
+# docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --wait
 # cp -n .env.test.example .env.test && source .env.test
 # cargo test --all
 ```
@@ -105,7 +105,7 @@ export MEGA2_IT_GIT_UID="$(id -u)" MEGA2_IT_GIT_GID="$(id -g)"
 
 # 2) 数据面 + rustfs-init 建桶 + git-cli（mailpit 仅供 website IT 捕获）
 #    一次 --profile git up，避免漏启 git-cli 导致 integration_git_cli 硬失败。
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile git up -d --wait
 
 # 3) 注入连接串并跑全量（含黑盒 + 模块集成）
@@ -119,7 +119,7 @@ cargo test --all
 
 ```bash
 ./scripts/dev-test.sh up-data
-# 或：docker compose -p mega2-it -f docker-compose.test.yml up -d --wait
+# 或：docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --wait
 ```
 
 用完清理（含 profile 服务与命名卷）：
@@ -127,7 +127,7 @@ cargo test --all
 ```bash
 ./scripts/dev-test.sh down
 # 等价：
-# docker compose -p mega2-it -f docker-compose.test.yml \
+# docker compose -p mega2-it -f docker/docker-compose.test.yml \
 #   --profile git --profile app --profile web --profile smoke --profile scorpio down -v
 ```
 
@@ -144,7 +144,7 @@ cargo test --all
 栈级 HTTP 探针示例（需先 build 镜像，见 `test-infra.md`）：
 
 ```bash
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile app up -d --wait mega2
 curl -sf http://127.0.0.1:19180/api/openapi.json >/dev/null
 # 可选：export MEGA2_IT_HTTP_URL=http://127.0.0.1:19180
@@ -155,7 +155,7 @@ curl -sf http://127.0.0.1:19180/api/openapi.json >/dev/null
 
 [ScorpioFS](https://github.com/gitmono-dev/scorpiofs) 是把 monorepo 路径挂载成本地文件系统的
 FUSE 守护进程，只读路径走 mega2 的 `/api/v1/tree*`、`/api/v1/file/tree`、
-`/api/v1/file/blob/{oid}`。`docker-compose.test.yml` 以 profile `scorpio` 提供常驻
+`/api/v1/file/blob/{oid}`。`docker/docker-compose.test.yml` 以 profile `scorpio` 提供常驻
 `scorpiofs` 服务（登记条目见 [`refactoring/test-infra.md`](./refactoring/test-infra.md)），
 **从 sibling checkout `../scorpiofs` 构建** `scorpiofs:local`，并 `depends_on` 常驻
 `mega2`（profile `app`），因此两个 profile 必须同启。
@@ -177,7 +177,7 @@ ls /tmp/mega2-scorpiofs/mount             # 宿主上直接浏览 monorepo
 ```bash
 dir="${MEGA2_IT_SCORPIO_WORKDIR:-/tmp/mega2-scorpiofs}"
 mkdir -p "$dir/mount" "$dir/antares"      # 由测试 UID 创建；mount 必须为空
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile app --profile scorpio up -d --wait
 bash scripts/scorpiofs_smoke.sh
 ```
@@ -203,7 +203,7 @@ dockerd 与宿主共享 mount namespace；macOS Docker Desktop 的传播止于 V
 联调要点：
 
 - 宿主看到的是同一个 FUSE 挂载；容器内路径 `/mnt/scorpiofs/mount` ⇄ 宿主 `<workdir>/mount`。
-  也可进容器看：`docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio exec -T scorpiofs ls -la /mnt/scorpiofs/mount`。
+  也可进容器看：`docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile scorpio exec -T scorpiofs ls -la /mnt/scorpiofs/mount`。
 - `down`/`stop` 走 SIGTERM 优雅卸载（`stop_grace_period: 45s`），宿主挂载随之消失；若容器被
   SIGKILL，宿主会残留 `Transport endpoint is not connected` 的挂载，`up-scorpio` 会拒绝启动并提示
   `sudo umount -l <path>`。跑 `down` 前不要让 shell 停在挂载目录里（EBUSY 会拖慢卸载）。
@@ -211,10 +211,10 @@ dockerd 与宿主共享 mount namespace；macOS Docker Desktop 的传播止于 V
   元数据在 `postgres` 的 `public` schema，拆开删会得到 `core key file is missing` 与 0 字节文件。
   要重置就整栈 `down -v`。
 - 排查 API 契约时把日志调到 debug：`MEGA2_IT_SCORPIO_LOG_LEVEL=scorpio=debug ./scripts/dev-test.sh up-scorpio`，
-  再 `docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio logs -f scorpiofs`。
+  再 `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile scorpio logs -f scorpiofs`。
 - ScorpioFS HTTP API 无认证，端口只绑 `127.0.0.1`；不要改成 `0.0.0.0`。
 - Antares CL 层（`/api/v1/cl/{link}/files-list`）只有 review policy 提供；IT 栈 `mega2`
-  默认即 review，trunk 栈（`mega2-compose.yml` / `docker-compose-storage-only.yml`）不含。
+  默认即 review，trunk 栈（`mega2-compose.yml` / `docker/docker-compose-storage-only.yml`）不含。
 
 ## 聚焦命令
 
@@ -288,8 +288,8 @@ dockerd 与宿主共享 mount namespace；macOS Docker Desktop 的传播止于 V
 **栈未就绪 / 连错库**
 
 ```bash
-docker compose -p mega2-it -f docker-compose.test.yml ps
-docker compose -p mega2-it -f docker-compose.test.yml logs postgres redis mailpit rustfs
+docker compose -p mega2-it -f docker/docker-compose.test.yml ps
+docker compose -p mega2-it -f docker/docker-compose.test.yml logs postgres redis mailpit rustfs
 psql 'postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2' \
   -c "select current_database(), count(*) from seaql_migrations"
 ```
@@ -310,7 +310,7 @@ psql 'postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2' \
 dir="${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}"
 mkdir -p "$dir" && chmod 1777 "$dir"
 export MEGA2_IT_GIT_UID="$(id -u)" MEGA2_IT_GIT_GID="$(id -g)"
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile git up -d --force-recreate --wait git-cli
 ```
 
@@ -328,7 +328,7 @@ Mailpit 可用性作为启动或测试门。注意 IT 栈默认注入的是 `EMA
 
 **Workspace Code 栈 IT（`WEBSITE_IT=1`）**
 
-`docker-compose.test.yml` 的 `website-next` 服务注入
+`docker/docker-compose.test.yml` 的 `website-next` 服务注入
 `MEGA_CODE_DATA_BACKEND=mega2` 与容器内 `MEGA2_PUBLIC_BASE_URL=http://mega2:8000`，
 使 megaui `/api/mega` Code 读路径经 BFF 转发 mega2。在 megaui 仓执行：
 
@@ -366,7 +366,7 @@ cp .env.test.example .env.test
 
 ## 相关文档
 
-- 编排事实源：[`docker-compose.test.yml`](../docker-compose.test.yml)
+- 编排事实源：[`docker/docker-compose.test.yml`](../docker/docker-compose.test.yml)
 - Env 模板：[`.env.test.example`](../.env.test.example)
 - 测试脚本：[`scripts/dev-test.sh`](../scripts/dev-test.sh)
 - 基建规范 / 服务登记：[`docs/refactoring/test-infra.md`](./refactoring/test-infra.md)

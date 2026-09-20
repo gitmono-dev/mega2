@@ -1,5 +1,5 @@
 # Local / lab stack for storage-only (trunk) mode.
-# 对照 `docker-compose.test.yml` 的数据面，去掉 website / mailpit / OAuth IT，
+# 对照 `docker/docker-compose.test.yml` 的数据面，去掉 website / mailpit / OAuth IT，
 # 以 `config/config-storage-only.toml` 跑 Git smart HTTP 推送 + 可选 SSH 只读。
 # 对象存储默认 RustFS（s3compatible）——直接 up 即可，不必加 --env-file。
 # 仅当要把 mega2 改成本地文件系统后端时，才加
@@ -10,18 +10,18 @@
 #   docs/deploy-trunk.md
 #
 # 与 IT 栈并存时务必带不同项目名，且本文件端口不与
-# `docker-compose.test.yml`（15432 / 16379 / 19000 / 19180）冲突:
+# `docker/docker-compose.test.yml`（15432 / 16379 / 19000 / 19180）冲突:
 #
 #   # 默认 RustFS（无需 --env-file）
-#   docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
+#   docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml up -d --wait
 #
 #   # 可选：mega2 改用本地文件系统对象存储（仅此情况需要 --env-file）
-#   docker compose -p mega2-trunk -f docker-compose-storage-only.yml \
+#   docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
 #     --env-file config/compose.env.storage-only.local up -d --wait
 #
 # 首次构建（context = 本仓库根；`.dockerignore` 排除 target/）:
 #
-#   docker compose -p mega2-trunk -f docker-compose-storage-only.yml build mega2
+#   docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml build mega2
 #
 # HTTP:  http://127.0.0.1:9000/
 # SSH:   ssh://git@127.0.0.1:2222/   (upload-pack only; receive-pack 关闭)
@@ -111,7 +111,7 @@ services:
     image: mega2:local
     pull_policy: never
     build:
-      context: .
+      context: ..
       dockerfile: Dockerfile
     depends_on:
       postgres:
@@ -145,7 +145,7 @@ services:
     secrets:
       - mega2-push-token
     volumes:
-      - ./config/config-storage-only.toml:/etc/mega2/config.toml:ro
+      - ../config/config-storage-only.toml:/etc/mega2/config.toml:ro
       - mega2-trunk-data:/var/lib/mega2
     ports:
       - "127.0.0.1:9000:8000"
@@ -176,11 +176,11 @@ services:
   # Optional linked Git CLI smoke against the compose-hosted mega2.
   # Bring up with: --profile smoke
   # Empty-volume bootstrap (once):
-  #   docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
-  #   docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
+  #   docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml up -d --wait
+  #   docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml exec -T mega2 \
   #     mega2 --config /etc/mega2/config.toml service init --yes
   # Then (storage-only / trunk black-box; uses git client, not libra):
-  #   docker compose -p mega2-trunk -f docker-compose-storage-only.yml \
+  #   docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
   #     --profile smoke exec -T git-smoke \
   #     env MEGA2_HTTP_REPO_URL=http://mega2:8000/ \
   #         MEGA2_IT_SEED_TOKEN=mega2-storage-only-local-dev-token-0001 \
@@ -189,7 +189,7 @@ services:
   #
   # Product API write → Git visibility (plan-20260904 AW-04; curl+git):
   #   TOKEN='mega2-storage-only-local-dev-token-0001'
-  #   docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+  #   docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
   #     exec -T \
   #     -e MEGA2_HTTP_REPO_URL="http://x:${TOKEN}@mega2:8000/" \
   #     -e MEGA2_API_BASE=http://mega2:8000 \
@@ -205,7 +205,7 @@ services:
   git-smoke:
     image: mega2-git-smoke:3.7.1
     build:
-      context: .
+      context: ..
       dockerfile: Dockerfile.git-smoke
     profiles: ["smoke"]
     init: true
@@ -219,7 +219,7 @@ services:
       MEGA2_IT_SEED_TOKEN: mega2-storage-only-local-dev-token-0001
     volumes:
       - ${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-trunk-git}:/work
-      - .:/repo:ro
+      - ..:/repo:ro
     working_dir: /work
     healthcheck:
       test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]7[.]1 '"]
@@ -230,7 +230,7 @@ services:
 secrets:
   mega2-push-token:
     # Override for real deployments: MEGA2_PUSH_TOKEN_FILE=/path/to/secret
-    file: ${MEGA2_PUSH_TOKEN_FILE:-./secrets/mega2-push-token.local}
+    file: ${MEGA2_PUSH_TOKEN_FILE:-../secrets/mega2-push-token.local}
 
 volumes:
   mega2-trunk-pg:

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="$REPO_ROOT/docker-compose.test.yml"
+COMPOSE_FILE="$REPO_ROOT/docker/docker-compose.test.yml"
 PROJECT="${MEGA2_IT_PROJECT:-mega2-it}"
 DEBOUNCE_SEC="${WEBSITE_NEXT_RELOAD_DEBOUNCE_SEC:-3}"
 STATE_DIR="${TMPDIR:-/tmp}/mega2-reload-website-next"

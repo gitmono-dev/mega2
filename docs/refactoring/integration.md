@@ -17,13 +17,13 @@ The landing cases depend on the shared root writer specified in `trunk-push.md`.
 
 ## Test stack
 
-`docker-compose.test.yml` provides PostgreSQL, Redis, RustFS, optional
+`docker/docker-compose.test.yml` provides PostgreSQL, Redis, RustFS, optional
 profiled `git-cli`, profile `app` mega2, and profile `web` website-next.
 The default data plane does not start an SMTP capture service. Use the
 fixed project name:
 
 ```bash
-docker compose -p mega2-it -f docker-compose.test.yml up -d --wait
+docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --wait
 ```
 
 The embedded `VaultCore` is part of mega2; no external Vault container is
@@ -70,7 +70,7 @@ package (lib `mega2_core`). Black-box tests drive the real CLI via
 For the real website-session check:
 
 ```bash
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile app --profile web up -d --wait
 source .env.test
 WEBSITE_IT=1 cargo test -p mega2 --test integration_website_auth -- --test-threads=1

@@ -29,9 +29,9 @@ docker compose -f mega2-compose.yml down      # named volumes keep the data; dow
 
 This stack is a **local-only, anonymous setup**: `push_auth=none`, anonymous reads and writes, and HTTP is published only on `127.0.0.1:9000` (container port 8000). Do not rebind to `0.0.0.0` or expose it through a reverse proxy; for shared / public deployments use the token-based stack below or your own orchestration. An end-to-end walkthrough: [`quick-start.md`](./quick-start.md).
 
-### 2.2 Source-built test / lab stack: `docker-compose-storage-only.yml`
+### 2.2 Source-built test / lab stack: `docker/docker-compose-storage-only.yml`
 
-[`docker-compose-storage-only.yml`](../docker-compose-storage-only.yml) is the local / lab reference stack that **builds** the image from source (for deployment rehearsals and smoke tests — not the official distribution form): mega2 + Postgres + Redis + RustFS, mounting [`config/config-storage-only.toml`](../config/config-storage-only.toml). It can coexist with the IT stack `docker-compose.test.yml` (no port conflicts).
+[`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml) is the local / lab reference stack that **builds** the image from source (for deployment rehearsals and smoke tests — not the official distribution form): mega2 + Postgres + Redis + RustFS, mounting [`config/config-storage-only.toml`](../config/config-storage-only.toml). It can coexist with the IT stack `docker/docker-compose.test.yml` (no port conflicts).
 
 Services and host ports (authoritative source is the compose file):
 
@@ -49,13 +49,13 @@ First start and bootstrap:
 
 ```bash
 # First build (context = repo root)
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml build mega2
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml build mega2
 
 # Start (default RustFS; do NOT add --env-file)
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml up -d --wait
 
 # Empty-volume bootstrap (one-shot; creates the initial graph, starts no listeners)
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml exec -T mega2 \
   mega2 --config /etc/mega2/config.toml service init --yes
 ```
 
@@ -63,12 +63,12 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
 
 ### 2.2.1 `push_auth=none` override variant
 
-[`docker-compose-storage-only.auth-none.yml`](../docker-compose-storage-only.auth-none.yml) is an opt-in override: compose it with the base file via two `-f` flags to remount mega2's config as `config/config-storage-only.none.toml`, and `--force-recreate mega2`:
+[`docker/docker-compose-storage-only.auth-none.yml`](../docker/docker-compose-storage-only.auth-none.yml) is an opt-in override: compose it with the base file via two `-f` flags to remount mega2's config as `config/config-storage-only.none.toml`, and `--force-recreate mega2`:
 
 ```bash
 docker compose -p mega2-trunk \
-  -f docker-compose-storage-only.yml \
-  -f docker-compose-storage-only.auth-none.yml \
+  -f docker/docker-compose-storage-only.yml \
+  -f docker/docker-compose-storage-only.auth-none.yml \
   up -d --wait --force-recreate mega2
 ```
 
@@ -79,7 +79,7 @@ docker compose -p mega2-trunk \
 The default backend is RustFS (`s3compatible`) — plain `up` works. Add `--env-file` only when switching mega2 to the local filesystem backend (the RustFS container still starts; only mega2's `storage_type` changes):
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
   --env-file config/compose.env.storage-only.local up -d --wait
 ```
 

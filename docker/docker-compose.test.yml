@@ -97,7 +97,7 @@ services:
   git-cli:
     image: mega2-git-cli:3.7.1
     build:
-      context: .
+      context: ..
       dockerfile: Dockerfile.git-cli
     # Opt-in profile: keeping git-cli off the default `up -d --wait` set avoids
     # pulling the runner into data-plane-only dev loops. Enable with
@@ -133,11 +133,11 @@ services:
   #
   # It depends on `mega2` (profile `app`) being up, so bring the whole
   # linked stack up together:
-  #   docker compose -p mega2-it -f docker-compose.test.yml \
+  #   docker compose -p mega2-it -f docker/docker-compose.test.yml \
   #     --profile app --profile smoke up -d --wait
   #
   # Then drive the smoke from the host:
-  #   docker compose -p mega2-it -f docker-compose.test.yml \
+  #   docker compose -p mega2-it -f docker/docker-compose.test.yml \
   #     --profile smoke exec -T git-smoke \
   #     bash scripts/git_protocol_smoke.sh
   # (with MEGA2_HTTP_REPO_URL=http://mega2:8000/ and a seeded token).
@@ -150,7 +150,7 @@ services:
   git-smoke:
     image: mega2-git-smoke:3.7.1
     build:
-      context: .
+      context: ..
       dockerfile: Dockerfile.git-smoke
     profiles: ["smoke"]
     init: true
@@ -171,7 +171,7 @@ services:
       - ${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}:/work
       # Mount the mega2 repo so the smoke script is available inside the
       # linked container (scripts/git_protocol_smoke.sh).
-      - .:/repo:ro
+      - ..:/repo:ro
     working_dir: /work
     healthcheck:
       test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]7[.]1 '"]
@@ -190,7 +190,7 @@ services:
     image: mega2:local
     pull_policy: never
     build:
-      context: .
+      context: ..
       dockerfile: Dockerfile
     depends_on:
       postgres:
@@ -249,7 +249,7 @@ services:
   # upper+cl layers stay in the volume at the image defaults.
   #
   # Lives in its own profile because it depends on `mega2` (profile `app`):
-  #   docker compose -p mega2-it -f docker-compose.test.yml \
+  #   docker compose -p mega2-it -f docker/docker-compose.test.yml \
   #     --profile app --profile scorpio up -d --wait
   #   bash scripts/scorpiofs_smoke.sh        # or: ./scripts/dev-test.sh scorpio-smoke
   #   ls /tmp/mega2-scorpiofs/mount          # the monorepo, on the host
@@ -258,7 +258,7 @@ services:
     image: scorpiofs:local
     pull_policy: never
     build:
-      context: ../scorpiofs
+      context: ../../scorpiofs
     depends_on:
       mega2:
         condition: service_healthy
@@ -321,7 +321,7 @@ services:
   website-db-init:
     profiles: ["web"]
     build:
-      context: ../megaui
+      context: ../../megaui
       dockerfile: apps/web/Dockerfile
       target: db-init
     depends_on:
@@ -367,7 +367,7 @@ services:
     image: megaui-collab:local
     pull_policy: never
     build:
-      context: ../megaui
+      context: ../../megaui
       dockerfile: apps/collab-server/Dockerfile
     environment:
       MEGA_COLLAB_PORT: "7002"
@@ -394,7 +394,7 @@ services:
     image: website-next:local
     pull_policy: never
     build:
-      context: ../megaui
+      context: ../../megaui
       dockerfile: apps/web/Dockerfile
       target: runner
       args:
