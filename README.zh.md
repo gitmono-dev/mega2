@@ -24,7 +24,12 @@ mega2 只支持一种部署模式：trunk / storage-only。它不包含 Web UI�
 - **Git Smart HTTP 与 SSH**：对标准 Git 客户端提供 Smart HTTP 与 SSH，覆盖 clone / fetch / pull / push。storage-only 形态下 SSH 只保留只读拉取（clone / fetch / pull），receive-pack 关闭：该形态没有用户系统，无法为用户配置 SSH key 这类按人鉴权的方式，因此推送统一走 HTTP（token 或匿名 `none`）是最佳选择，写鉴权只需维护一套。
 - **Git LFS**：遵循 Git LFS 标准，使用 git-lfs 管理的大文件使用标准 Git LFS 接口（`/info/lfs` 与 `/api/v1/lfs`）。
 - **FastCDC Media**：在标准 LFS 之上为大型媒体提供按内容分块的上传与复用（`--features fastcdc`）。FastCDC 和 BLAKE3 支持是 Monorepo 针对大文件和哈希安全开发的特性，需要配合 Libra 才能使用。
-- **OCI Distribution**：mega2 还可以作为标准的 OCI 容器镜像仓库（`/v2` 协议端点）。启用 `[oci].enabled=true` 后即可用 `docker push` / `docker pull` 推送和拉取镜像，镜像 blob 与 Git blob 共用同一套对象存储，无需再单独部署一套 registry。
+
+### OCI Distribution
+
+mega2 内置标准 **OCI 容器镜像仓库**（`/v2` 协议端点），启用 `[oci].enabled=true` 后，`docker push` / `docker pull` 等标准客户端可直接推送、拉取镜像，manifest 与 blob 都走 OCI Distribution 标准接口。
+
+镜像 blob 与 Git blob、LFS 对象**共用同一套对象存储**（本地文件系统或 S3-compatible 云服务），无需再单独部署、运维一套 registry；仓库鉴权复用统一的 HTTP `push_auth` 模型（token 或匿名 `none`），与 Git 推送同一套凭据和路径授权语义。
 
 ### 部署形态
 

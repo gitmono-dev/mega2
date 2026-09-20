@@ -24,7 +24,12 @@ Product rules: [`docs/monorepo.md`](docs/monorepo.md). Quick start: [`docs/quick
 - **Git Smart HTTP and SSH**: Mega2 speaks Smart HTTP and SSH to stock Git clients for clone / fetch / pull / push. In storage-only mode, SSH keeps only read-only fetch (clone / fetch / pull) and receive-pack is disabled: without a user system there is no way to provision per-user credentials such as SSH keys, so routing all pushes through the unified HTTP authentication (token or anonymous `none`) is the best choice — write auth is maintained in exactly one place.
 - **Git LFS**: following the Git LFS standard, large files managed with git-lfs use the standard Git LFS endpoints (`/info/lfs` and `/api/v1/lfs`).
 - **FastCDC Media**: on top of stock LFS, large media can be uploaded and reused as content-defined chunks (`--features fastcdc`). FastCDC and BLAKE3 support are Monorepo features built for large files and hash safety; they require Libra.
-- **OCI Distribution**: mega2 can also serve as a standard OCI container registry (`/v2` endpoints). With `[oci].enabled=true` you can `docker push` / `docker pull` images directly; image blobs share the same object storage as Git blobs, so no separate registry deployment is needed.
+
+### OCI Distribution
+
+mega2 ships a built-in standard **OCI container registry** (`/v2` endpoints). With `[oci].enabled=true`, stock clients such as `docker push` / `docker pull` can push and pull images directly, with manifests and blobs served over the standard OCI Distribution interface.
+
+Image blobs **share the same object storage** as Git blobs and LFS objects (local filesystem or an S3-compatible cloud service), so there is no separate registry to deploy and operate. Registry authentication reuses the unified HTTP `push_auth` model (token or anonymous `none`) — the same credentials and path-scoped authorization semantics as Git pushes.
 
 ### Deployment
 
