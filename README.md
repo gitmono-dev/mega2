@@ -17,7 +17,7 @@ Product rules: [`docs/monorepo.md`](docs/monorepo.md). Quick start: [`docs/quick
   - **No Change List in the open-source edition**: The Mega2 open-source edition ships the core monorepo storage capability and does not include Change List. A Change List implementation needs multiple branches, so this edition does not have multi-branch capability.
 - **ImportRepo**: under `[monorepo].import_dir` (default `/third-party`), ordinary Git multi-branch and client tags apply — its structure is identical to a normal Git repository. This Mega2 feature encourages developers to store the source of the open-source third-party dependencies they use: you can modify that source directly during development, then let an Agent maintain the merges with upstream (continuously tracking upstream updates).
 - **Tags**: Monorepo forbids `git push --tags`. Create / list / delete go through the HTTP API only. Mega2 is meant to be used together with Libra as the version-control tool. Use `libra mega2 browser` for an interactive terminal interface to browse repositories and manage directories, tags, and similar operations.
-- **Object graph**: metadata in Postgres; blobs in pluggable object storage (local filesystem or S3-compatible object storage). `object_format` supports `sha1` (default) and the extensions `sha256` / `blake3` (these features require Libra as the version-control tool).
+- **Object storage**: metadata in Postgres; blobs in an object storage service (local filesystem or an S3-compatible cloud service). `object_format` supports `sha1` (default); `sha256` / `blake3` are optional and require [Libra](https://libra.tools) as the version-control tool.
 
 ### Protocols and large files
 
