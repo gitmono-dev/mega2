@@ -29,7 +29,7 @@ mega2 只支持一种部署模式：trunk / storage-only。它不包含 Web UI�
 
 mega2 只以 **trunk / storage-only** 形态部署：`push_policy=trunk`，所有推送经一个全局串行的写队列依次合并进 `main`——同一时刻只有一笔写入落地，保证主干历史线性可追溯（该机制内部称为 MonoWriteQueue）。
 
-产品写 API（`POST /api/v1/create-entry`、`POST /api/v1/edit/save`）与 `git push` 写入的是同一条 `main` 分支：无论用哪种方式，新提交都追加在同一个分支顶端，写完后用另一种方式立刻就能读到。根树写入全局串行，多 commit 推送按产品规则合并进 `main`。
+产品写 API（`POST /api/v1/create-entry`、`POST /api/v1/edit/save`）与 `git push` 写入的是同一条 `main` 分支：无论用哪种方式，新提交都追加在同一个分支顶端，写完后用另一种方式立刻就能读到。对仓库根目录的写入同一时刻只落地一笔，不会互相覆盖；一次推送携带多个 commit 时会按产品规则压缩合并进 `main`，推送后执行 `git fetch && git reset --hard origin/main` 即可与远端对齐。
 
 ### HTTP API
 
