@@ -15,7 +15,7 @@ mega2 只支持一种部署模式：trunk / storage-only。它不包含 Web UI�
 - **Monorepo**：Git 公开分支只接受 `refs/heads/main`，不接受其它 heads（例如 `refs/heads/dev`）。协议校验会拒绝，Git 客户端收到 `ng <ref> …`（`trunk push rejects ref '…'; the only public branch is refs/heads/main`）。这只约束 Git receive-pack / `ls-remote` 的 heads；Agent Capture 不走这条协议，见下方 Agent Capture 条目。
   - **[Trunk-based development](https://trunkbaseddevelopment.com)**：monorepo 的最佳实践是单一主干，而不是长期并存的多条功能分支。
   - **开源版没有 CL**：Mega2 开源版本提供的是 Monorepo 核心的存储能力，没有 Change List 部分的功能，在 Change List 的实现中需要使用多分支，所以不具备多分支的能力。
-- **ImportRepo**：`[monorepo].import_dir`（默认 `/third-party`）下按普通 Git 多分支、客户端 tag 工作，这是 Mega2 的一个特性，用于开发者存储使用开源的第三方依赖库的源码，以便在本地开发时使用这些库的最新版本，其结构等同于
+- **ImportRepo**：`[monorepo].import_dir`（默认 `/third-party`）下按普通 Git 多分支、客户端 tag 工作，其结构等同于普通 Git 仓库。这是 Mega2 的一个特性，建议开发者把使用的开源第三方依赖库的源码存储在这里：开发过程中可以直接修改这些源码，再让 Agent 维护与上游的合并（持续跟进上游更新）。
 - **Tag**：Monorepo 禁止 `git push --tags`；创建 / 查询 / 删除只走 HTTP API。Mega2 需要配合 Libra 作为版本管理工具使用；可通过 `libra mega2 browser` 获得交互式终端界面，以浏览仓库、管理目录、Tag 等操作。
 - **对象图**：元数据在 Postgres，blob 在可插拔对象存储（本地文件系统或 S3-compatible 的对象存储中）。`object_format` 支持 `sha1`（默认）与扩展的 `sha256` / `blake3`（必须配合 Libra 作为版本管理工具才能使用其特性）。
 
