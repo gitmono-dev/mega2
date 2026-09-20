@@ -6,7 +6,7 @@
 
 mega2 只支持一种部署模式：trunk / storage-only。它不包含 Web UI，也不集成 megaui。如需交互式浏览仓库，以及进行相应的目录 / Tag 操作，请使用 Libra 的 `libra mega2 browser` 命令。
 
-产品规则见 [`docs/monorepo.md`](docs/monorepo.md)。storage-only 部署见 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。本地开发与测试见 [`docs/development.md`](docs/development.md)。
+产品规则见 [`docs/monorepo.md`](docs/monorepo.md)。快速开始见 [`docs/quick-start.zh.md`](docs/quick-start.zh.md)。storage-only 部署见 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。本地开发与测试见 [`docs/development.md`](docs/development.md)。
 
 ## 主要功能
 
@@ -97,6 +97,12 @@ source .env.test && cargo test --all
 | 文档 | 内容 |
 |---|---|
 | [`README.md`](README.md) | English product README |
+| [`docs/quick-start.zh.md`](docs/quick-start.zh.md) ([English](docs/quick-start.md)) | 快速开始：compose 栈、初始化、首次推送 |
+| [`docs/user-guide.zh.md`](docs/user-guide.zh.md) ([English](docs/user-guide.md)) | 使用说明：git / LFS / HTTP API / Libra 使用 |
+| [`docs/configuration.zh.md`](docs/configuration.zh.md) ([English](docs/configuration.md)) | 配置参考：加载顺序、密钥、热重载 |
+| [`docs/deployment.zh.md`](docs/deployment.zh.md) ([English](docs/deployment.md)) | 部署指南：compose、二进制、生产加固 |
+| [`docs/architecture.zh.md`](docs/architecture.zh.md) ([English](docs/architecture.md)) | 架构设计：模块、存储、写路径 |
+| [`docs/contributing.zh.md`](docs/contributing.zh.md) ([English](docs/contributing.md)) | 贡献指南：流程、门禁、约定 |
 | [`docs/monorepo.md`](docs/monorepo.md) | Monorepo 产品规则 |
 | [`docs/deploy-trunk.md`](docs/deploy-trunk.md) | trunk / storage-only 部署 |
 | [`docs/development.md`](docs/development.md) | 本地开发与测试 |

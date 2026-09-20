@@ -6,7 +6,7 @@ English · [中文](README.zh.md)
 
 mega2 supports one deployment mode: trunk / storage-only. It does not include a Web UI or megaui integration. For interactive repository browsing and the corresponding directory / tag operations, use Libra's `libra mega2 browser` command.
 
-Product rules: [`docs/monorepo.md`](docs/monorepo.md). Storage-only deploy: [`docs/deploy-trunk.md`](docs/deploy-trunk.md). Local development and tests: [`docs/development.md`](docs/development.md).
+Product rules: [`docs/monorepo.md`](docs/monorepo.md). Quick start: [`docs/quick-start.md`](docs/quick-start.md). Storage-only deploy: [`docs/deploy-trunk.md`](docs/deploy-trunk.md). Local development and tests: [`docs/development.md`](docs/development.md).
 
 ## Features
 
@@ -97,6 +97,12 @@ Details: [`AGENTS.md`](AGENTS.md) and [`docs/plan/README.md`](docs/plan/README.m
 | Doc | Contents |
 |---|---|
 | [`README.zh.md`](README.zh.md) | Chinese product README |
+| [`docs/quick-start.md`](docs/quick-start.md) ([中文](docs/quick-start.zh.md)) | Quick start: compose stack, bootstrap, first push |
+| [`docs/user-guide.md`](docs/user-guide.md) ([中文](docs/user-guide.zh.md)) | User guide: git / LFS / HTTP API / Libra usage |
+| [`docs/configuration.md`](docs/configuration.md) ([中文](docs/configuration.zh.md)) | Configuration reference: load order, secrets, hot reload |
+| [`docs/deployment.md`](docs/deployment.md) ([中文](docs/deployment.zh.md)) | Deployment guide: compose, binary, hardening |
+| [`docs/architecture.md`](docs/architecture.md) ([中文](docs/architecture.zh.md)) | Architecture design: modules, storage, write path |
+| [`docs/contributing.md`](docs/contributing.md) ([中文](docs/contributing.zh.md)) | Contributing guide: process, gates, conventions |
 | [`docs/monorepo.md`](docs/monorepo.md) | Monorepo product rules |
 | [`docs/deploy-trunk.md`](docs/deploy-trunk.md) | trunk / storage-only deploy |
 | [`docs/development.md`](docs/development.md) | Local development and tests |
