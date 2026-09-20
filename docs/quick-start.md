@@ -40,7 +40,7 @@ git add hello.md && git commit -m "add hello.md"
 git push origin main
 ```
 
-Pushes enter `main` through the MonoWriteQueue, sharing tip authority with the product API writes ([`monorepo.md`](./monorepo.md)). Git-client tag pushes are rejected; manage tags via the HTTP API or `libra mega2 browser`.
+You can only push to `main` (pushes of other branches are rejected); Git-client tag pushes are rejected too — create, list, and delete tags via the HTTP API or `libra mega2 browser` ([`monorepo.md`](./monorepo.md)).
 
 ### 3. Read back over the API + Swagger UI
 

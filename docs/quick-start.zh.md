@@ -40,7 +40,7 @@ git add hello.md && git commit -m "add hello.md"
 git push origin main
 ```
 
-推送经 MonoWriteQueue 直入 `main`，与产品 API 写共用 tip 权威（[`monorepo.md`](./monorepo.md)）。Git 客户端的 tag 推送会被拒绝；tag 管理走 HTTP API 或 `libra mega2 browser`。
+只能推送到 `main`（推送其它分支会被拒绝）；Git 客户端的 tag 推送同样被拒绝，tag 的创建 / 查看 / 删除走 HTTP API 或 `libra mega2 browser`（[`monorepo.md`](./monorepo.md)）。
 
 ### 3. API 读回与 Swagger UI
 
