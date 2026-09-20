@@ -147,8 +147,8 @@ re-read inside the lock so concurrent replicas converge on one key.
 If the lock is lost (TTL expiry or Redis partition) while a replica is
 still generating, a second replica may also generate. The last writer
 wins; a process hold may then diverge from vault until restart. This
-window is not closed here (vault has no compare-and-set). Residual-risk
-questions are frozen at plan-20260916 GS-28 Q8. The operator repair
+window is not closed here (vault has no compare-and-set). The close
+is the GS-28 「原子写入冻结（Q8）」 scheme. The operator repair
 is: stop every replica, delete the vault entry, restart one replica to
 bootstrap, start the rest, replace the GitHub machine-account key with
 the new public key.
@@ -959,3 +959,138 @@ not a replay of the parked attempt.
 N/A — this card is `go`. Rejected alternatives: reuse `anonymous` /
 `git.push_tokens` for force; auto-force on a third GitHub oid;
 mount `cedar_guard` on trunk as a hidden dep of this plan.
+
+## 原子写入冻结（Q8）
+
+Spike GS-28. Freezes the **conditional-write primitive** that closes
+the RedLock drop-lock window (GS-16 residual). No production code in
+this card.
+
+Today `VaultStorage::save` is an upsert that always overwrites
+`value` on `key` conflict (`vault_storage.rs:57`–`:61`). The vault
+row is `(id, key, value)` with no version column (`callisto/vault.rs:8`–
+`:14`). After lock loss, RedLock only stops the renew task
+(`lock.rs:323`); `unlock` (`:359`) does not fence a writer already
+inside the critical section. `ensure_server_signing_key`
+(`server_signing.rs:250`–`:255`) and `github_sync::key::ensure`
+(`key.rs:228`–`:237`) share that window.
+
+`VaultCore::write_secret` does **not** call `VaultStorage::save`. It
+calls `rvault.write` (`vault_core.rs:1231`–`:1233`) → libvault
+barrier → `Backend::put` (`jupiter_backend.rs:116`) → `save`.
+`libvault` `put` is blind. Physical `value` bytes are barrier
+ciphertext, so `UPDATE vault SET value=new WHERE value=expected`
+is **not** a logical CAS (callers never see those bytes; a new
+nonce would miss even an uncontended write). That path is
+**rejected**. Do not add `write_secret_cas`. Do not patch
+`libvault` in this freeze.
+
+### AC-1 — conditional-write interface
+
+**Scheme.** A **SQL create-once fence**, in-repo, beside vault — not
+inside `vault.value`.
+
+```text
+table vault_create_once (
+    logical_name  TEXT PRIMARY KEY,
+    created_at    TIMESTAMPTZ NOT NULL
+)
+
+enum Fence {
+    Applied,   -- this replica won; it may write_secret
+    Conflict,  -- another replica already won; do not write
+}
+
+fn claim_create_once(logical_name) -> Result<Fence, MegaError>
+    -- INSERT … ON CONFLICT DO NOTHING
+    -- 1 row inserted → Applied; 0 → Conflict
+```
+
+`logical_name` is a **fixed** string (not a generated `key_id`).
+Only the winner of `claim_create_once` may call `write_secret` for
+that init. The loser only `read_secret`. `VaultStorage::save` and
+`write_secret` stay last-writer-wins for everyone else.
+
+A fence row with empty secrets (winner crashed after INSERT) is
+the GS-16 repair: delete the fence row and the vault secrets,
+bootstrap one replica.
+
+github_sync **cursor** CAS (Q4 / Q7) is a third table:
+`UPDATE … WHERE last_pushed = $expected`. Not vault, not this
+fence.
+
+### AC-2 — `ensure_server_signing_key` callers
+
+**Scheme.** `persist_new_key_generation` writes **three** secrets
+(key entry at `{KEYS_PREFIX}/{key_id}`, `KEY_INDEX`,
+`ACTIVE_POINTER` — `server_signing.rs:456` / `:468` / `:473`).
+`key_id` is a fingerprint, so two racers write **different** key
+rows; create-once on the key entry never conflicts.
+
+**Authoritative fence:** `logical_name = ACTIVE_POINTER` (the one
+fixed, contended name).
+
+Order for **first init** only:
+
+1. `claim_create_once(ACTIVE_POINTER)`.
+2. `Applied` → write key entry, then `KEY_INDEX`, then
+   `ACTIVE_POINTER` (today’s `write_secret`). Losers never enter
+   this step, so they cannot orphan-overwrite the index.
+3. `Conflict` → `read_secret(ACTIVE_POINTER)` and load that key.
+   Do **not** write key entry, index, or pointer. If the pointer
+   secret is still missing, fail closed (winner crashed); operator
+   repair is GS-16 (also delete the fence row).
+
+Outer `ensure_server_signing_key` signature unchanged.
+
+**Rotation** (`rotate_server_signing_key` `:289`) is
+operator-driven and **out of this fence**. It keeps RedLock +
+`write_secret`. This card does not add a rotation HTTP route
+(ADR-GS-02).
+
+### AC-3 — other vault writers
+
+**Scheme.**
+
+| Writer | Path | Change |
+|---|---|---|
+| `VaultStorage::save` / `JupiterBackend::put` | generic KV / barrier | **unchanged** |
+| `github_sync::key::generate_and_store` (`key.rs:206`) | one config-derived secret name | `claim_create_once(ssh_key_ref name)` then `write_secret`; Conflict → `read_secret` only |
+| Token / barrier / other `write_secret` | existing secrets, including other create-once identities (`ssh_server_key`, nostr, PGP) that this card does not fence | no fence |
+
+Do **not** fence every vault put. Only create-once identity
+material (active signing pointer, github_sync SSH secret name).
+
+### 三分支判定
+
+| Field | Value |
+|---|---|
+| Branch | **go** |
+| Timebox | 2026-09-20, after GS-21 `9adfd31` |
+| Basis | SQL `INSERT … ON CONFLICT DO NOTHING` is expressible in-repo; it fences writes **before** blind `write_secret`; no libvault / ciphertext CAS |
+| Not claimed | `write_secret_cas`; comparing `vault.value` bytes; patching `libvault`; implementing the table in this crate; rotation CAS |
+
+AC-4 / AC-5 apply only on no-go; this card is go, so they are N/A.
+
+### no-go 替代方向
+
+N/A — this card is `go`. Rejected alternatives: `WHERE value =
+expected` on ciphertext; extending `libvault::Backend` in this
+plan; accepting the residual window forever; Redis fencing without
+a SQL claim (still last-writer-wins on `save`).
+
+### AC-7 — receiving-plan handoff
+
+DEP-01 (or the vault follow-up it names) must:
+
+1. Add `vault_create_once` + `claim_create_once` (AC-1). Keep `save`.
+2. First-init of `ensure_server_signing_key`: fence `ACTIVE_POINTER`
+   **before** any of the three `write_secret`s; Conflict → read
+   pointer only (AC-2).
+3. First-init of `github_sync::key::ensure`: fence the configured
+   secret name the same way (AC-3).
+4. Leave generic KV and rotation on `write_secret`.
+5. Implement github_sync cursor CAS as SQL `UPDATE … WHERE`, not
+   vault and not this fence.
+6. Repair: stop replicas, delete fence row **and** vault secrets,
+   bootstrap one replica (GS-16).
