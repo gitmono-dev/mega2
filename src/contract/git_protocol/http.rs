@@ -390,6 +390,21 @@ pub async fn git_receive_pack(
     check_push_permission(state, &pack_protocol.auth, &pack_protocol.repo_path).await?;
     let receive_request = collect_body_data(req.into_body(), "receive-pack").await?;
 
+    // Before streaming a push larger than the client's http.postBuffer (1 MiB
+    // by default), git's remote-curl sends a flush-only probe request to check
+    // reachability; the real request then arrives with a chunked body. Answer
+    // the probe with an empty 200 result — rejecting the command-less body
+    // aborts every push over the buffer size client-side.
+    if receive_request.as_ref() == b"0000" {
+        let response = Response::builder()
+            .body(Body::empty())
+            .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?;
+        return add_default_header(
+            String::from("application/x-git-receive-pack-result"),
+            response,
+        );
+    }
+
     let (commands, pack_bytes) =
         pack_protocol.split_receive_pack_request(receive_request.freeze())?;
     let report_status = pack_protocol

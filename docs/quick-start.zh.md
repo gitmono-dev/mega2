@@ -110,13 +110,12 @@ cd brewfs.git
 git lfs fetch --all origin                # 尽力而为；有一个历史对象在 GitHub 上已 404
 git config lfs.allowincompletepush true   # 推送仍可用的 LFS 对象
 git remote add mega2 http://127.0.0.1:9000/third-party/brewfs
-git -c http.postBuffer=536870912 push --mirror mega2
+git push --mirror mega2
 ```
 
-三点说明：
+两点说明：
 
 - `--mirror` 推送**全部** ref（所有分支 + 所有 tag）。上一案例的 `git push mega2 --all` 只推*本地*分支，普通克隆里通常只有 `main`。
-- `-c http.postBuffer=536870912` 是临时绕过：pack 超过 git 默认 1 MiB 的 `http.postBuffer` 后，客户端会改用 chunked 请求体，而当前 receive-pack 端点对 chunked 请求体会直接返回 HTTP 400。调大缓冲可让请求保持 content-length 形式。
 - brewfs 用 Git LFS 管理大型测试固件。旧历史引用的一个对象在 GitHub 上已不存在，所以 `git lfs fetch --all` 会打印 404 错误——属预期；`lfs.allowincompletepush true` 允许推送在缺少该对象的情况下继续。
 
 验证回路——annotated tag 与 LFS 内容都完好：

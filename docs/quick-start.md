@@ -110,13 +110,12 @@ cd brewfs.git
 git lfs fetch --all origin                # best effort; one historic object is 404 on GitHub
 git config lfs.allowincompletepush true   # push the LFS objects that are still available
 git remote add mega2 http://127.0.0.1:9000/third-party/brewfs
-git -c http.postBuffer=536870912 push --mirror mega2
+git push --mirror mega2
 ```
 
-Three things worth knowing:
+Two things worth knowing:
 
 - `--mirror` pushes **every** ref (all branches + all tags). The `git push mega2 --all` in the previous case only pushes *local* branches, which in a normal clone is usually just `main`.
-- `-c http.postBuffer=536870912` is a temporary workaround: once the pack exceeds git's default 1 MiB `http.postBuffer`, the client switches to a chunked request body, which the current receive-pack endpoint rejects with HTTP 400. Raising the buffer keeps the request content-length'd.
 - brewfs tracks large test fixtures with Git LFS. One object referenced by old history no longer exists on GitHub, so `git lfs fetch --all` prints a 404 error — expected; `lfs.allowincompletepush true` lets the push proceed without it.
 
 Verify the round trip — annotated tags and LFS content both survive:
