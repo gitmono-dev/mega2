@@ -100,6 +100,31 @@ Do not confuse the two path semantics:
 - `/third-party/**` (ImportRepo): multi-branch and client tags allowed — suited for hosting third-party dependency sources and migrating existing repositories.
 - Everywhere else (Monorepo): `main` is the only public branch and Git-client tags are forbidden. An existing repo's multi-branch history cannot be pushed straight into a monorepo subpath; the rules are in [`monorepo.md`](./monorepo.md).
 
+## Case: large files with Git LFS
+
+The stack speaks standard Git LFS (`/info/lfs`), so a stock `git-lfs` client works as-is. LFS write authorization shares `git.push_auth` with Git push — anonymous in this evaluation setup. Prerequisite: `git-lfs` on the host (check with `git lfs version`).
+
+```bash
+git clone http://127.0.0.1:9000/project
+cd project
+git lfs install --local                       # once per clone
+mkdir -p lfs-demo && cd lfs-demo
+git lfs track "*.bin"                         # writes .gitattributes
+head -c 2097152 /dev/urandom > big.bin        # a 2 MiB binary
+git add .gitattributes big.bin
+git commit -m "add LFS-tracked big.bin"
+git push origin main                          # "Uploading LFS objects: 100% (1/1)" runs first
+```
+
+The Git commit stores only an LFS pointer; the 2 MiB of bytes went to the object store during the push. Verify from a fresh clone of the subpath — checkout downloads the real content:
+
+```bash
+git clone http://127.0.0.1:9000/project/lfs-demo /tmp/verify-lfs
+cmp lfs-demo/big.bin /tmp/verify-lfs/big.bin && echo identical
+```
+
+LFS objects live in the same object storage as Git blobs (RustFS in this stack), so everything said about volumes, `down -v`, and the persist override below covers them too.
+
 ## Observe, stop, and clean up
 
 ```bash

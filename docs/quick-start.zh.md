@@ -100,6 +100,31 @@ git clone http://127.0.0.1:9000/third-party/your-repo
 - `/third-party/**`（ImportRepo）：多分支、客户端 tag 合法——适合托管第三方依赖源码、迁入已有仓库。
 - 其它路径（Monorepo）：只有公开分支 `main`、Git 客户端禁 tag。已有仓库的多分支历史不能直接推进 monorepo 子路径；规则见 [`monorepo.md`](./monorepo.md)。
 
+## 案例：用 Git LFS 管理大文件
+
+该栈讲标准 Git LFS 协议（`/info/lfs`），stock `git-lfs` 客户端开箱即用。LFS 写授权与 Git push 共用 `git.push_auth`——本评估栈为匿名。前置条件：宿主机已安装 `git-lfs`（用 `git lfs version` 确认）。
+
+```bash
+git clone http://127.0.0.1:9000/project
+cd project
+git lfs install --local                       # 每个克隆执行一次
+mkdir -p lfs-demo && cd lfs-demo
+git lfs track "*.bin"                         # 写入 .gitattributes
+head -c 2097152 /dev/urandom > big.bin        # 一个 2 MiB 二进制
+git add .gitattributes big.bin
+git commit -m "add LFS-tracked big.bin"
+git push origin main                          # 先执行 "Uploading LFS objects: 100% (1/1)"
+```
+
+Git 提交里只存 LFS 指针；2 MiB 字节在 push 时已进入对象存储。从子路径全新克隆验证——检出时会下载真实内容：
+
+```bash
+git clone http://127.0.0.1:9000/project/lfs-demo /tmp/verify-lfs
+cmp lfs-demo/big.bin /tmp/verify-lfs/big.bin && echo identical
+```
+
+LFS 对象与 Git blob 共用同一套对象存储（本栈为 RustFS），下文关于数据卷、`down -v` 与持久化覆盖文件的说明对它同样适用。
+
 ## 观察、停止与清理
 
 ```bash
