@@ -2,17 +2,21 @@
 
 English · [中文](quick-start.zh.md)
 
-This guide brings up the mega2 (trunk / storage-only) evaluation stack locally with the repository-root [`mega2-compose.yml`](../mega2-compose.yml) and runs the first closed loop: HTTP clone → push to `main` → read back over the API. The stack pulls the **official release image from Docker Hub** (`genedna/mega2:latest`) — no source build, no bootstrap, no token. Product rules: [`monorepo.md`](./monorepo.md).
+This guide brings up the mega2 (trunk / storage-only) evaluation stack locally with the repository-root compose file for your platform — [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml) on macOS with OrbStack, [`linux-mega2-compose.yml`](../linux-mega2-compose.yml) on Linux Docker — and runs the first closed loop: HTTP clone → push to `main` → read back over the API. The stack pulls the **official release image from Docker Hub** (`genedna/mega2:latest`) — no source build, no bootstrap, no token. Product rules: [`monorepo.md`](./monorepo.md).
 
 ## Prerequisites
 
-- Docker Engine with the Compose plugin (v2), `git`, `curl`; run everything from the repository root.
+- macOS: OrbStack (the macOS compose file relies on its `*.orb.local` DNS). Linux: Docker Engine; the Linux compose file uses host networking for mega2 instead. Either way: the Compose plugin (v2), `git`, `curl`; run everything from the repository root.
 - The first `up` pulls the `genedna/mega2:latest`, PostgreSQL, Redis, RustFS, and RustFS CLI images; duration depends on your network.
 
 ## Bring up the stack
 
 ```bash
-docker compose -f mega2-compose.yml up -d --wait
+# Pick the compose file for your platform:
+COMPOSE=macos-orbstack-mega2-compose.yml   # macOS with OrbStack
+COMPOSE=linux-mega2-compose.yml            # Linux Docker
+
+docker compose -f $COMPOSE up -d --wait
 ```
 
 No initialization command is needed after `up`: `rustfs-init` creates the `mega2` bucket automatically, and mega2 initializes the empty Monorepo (`main` and the top-level directories) during service startup. The readiness probe is `/api/openapi.json`.
@@ -100,13 +104,13 @@ Do not confuse the two path semantics:
 
 ```bash
 # Follow the mega2 logs
-docker compose -f mega2-compose.yml logs -f mega2
+docker compose -f $COMPOSE logs -f mega2
 
 # Stop; the named volumes keep the Postgres / Redis / RustFS / mega2 data
-docker compose -f mega2-compose.yml down
+docker compose -f $COMPOSE down
 
 # Also delete the data volumes (destructive; wipes this local evaluation instance)
-docker compose -f mega2-compose.yml down -v
+docker compose -f $COMPOSE down -v
 ```
 
 ## Important: persist data to a local directory
@@ -116,7 +120,7 @@ The default stack uses Docker named volumes, so `down -v` deletes your data toge
 Create an override file `mega2-compose.persist.yml` in the repository root:
 
 ```yaml
-# Layered on top of mega2-compose.yml: replace the named volumes with host bind mounts
+# Layered on top of your chosen compose file: replace the named volumes with host bind mounts
 services:
   postgres:                              # metadata database
     volumes:
@@ -135,7 +139,7 @@ services:
 Start with both `-f` flags (use the same two `-f` flags for stop and cleanup commands):
 
 ```bash
-docker compose -f mega2-compose.yml -f mega2-compose.persist.yml up -d --wait
+docker compose -f $COMPOSE -f mega2-compose.persist.yml up -d --wait
 ```
 
 From then on all data lives under `./mega2-data/`:

@@ -2,17 +2,21 @@
 
 [English](quick-start.md) · 中文
 
-本文用仓库根的 [`mega2-compose.yml`](../mega2-compose.yml) 在本机拉起 mega2（trunk / storage-only）评估栈，跑通第一个闭环：HTTP clone → push `main` → API 读回。该栈直接从 **Docker Hub 拉取正式发布镜像**（`genedna/mega2:latest`），不构建源码、不需要 bootstrap、不需要 token。产品规则见 [`monorepo.md`](./monorepo.md)。
+本文用仓库根对应平台的 compose 文件——macOS + OrbStack 用 [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml)，Linux Docker 用 [`linux-mega2-compose.yml`](../linux-mega2-compose.yml)——在本机拉起 mega2（trunk / storage-only）评估栈，跑通第一个闭环：HTTP clone → push `main` → API 读回。该栈直接从 **Docker Hub 拉取正式发布镜像**（`genedna/mega2:latest`），不构建源码、不需要 bootstrap、不需要 token。产品规则见 [`monorepo.md`](./monorepo.md)。
 
 ## 前置条件
 
-- Docker Engine + Compose plugin（v2）、`git`、`curl`；全程在仓库根目录执行。
+- macOS：需要 OrbStack（macOS 版 compose 依赖其 `*.orb.local` DNS）。Linux：Docker Engine，Linux 版 compose 对 mega2 使用 host networking。两者都需要 Compose plugin（v2）、`git`、`curl`；全程在仓库根目录执行。
 - 首次 `up` 会拉取 `genedna/mega2:latest`、PostgreSQL、Redis、RustFS 与 RustFS CLI 镜像，耗时取决于网络。
 
 ## 启动栈
 
 ```bash
-docker compose -f mega2-compose.yml up -d --wait
+# 按平台选择 compose 文件：
+COMPOSE=macos-orbstack-mega2-compose.yml   # macOS + OrbStack
+COMPOSE=linux-mega2-compose.yml            # Linux Docker
+
+docker compose -f $COMPOSE up -d --wait
 ```
 
 `up` 之后无需任何初始化命令：`rustfs-init` 自动创建 `mega2` 桶，mega2 在服务启动时自动初始化空的 Monorepo（`main` 与顶层目录）。就绪探针是 `/api/openapi.json`。
@@ -100,13 +104,13 @@ git clone http://127.0.0.1:9000/third-party/your-repo
 
 ```bash
 # 跟随 mega2 日志
-docker compose -f mega2-compose.yml logs -f mega2
+docker compose -f $COMPOSE logs -f mega2
 
 # 停止，具名卷保留 Postgres / Redis / RustFS / mega2 数据
-docker compose -f mega2-compose.yml down
+docker compose -f $COMPOSE down
 
 # 连数据卷一起删除（破坏性，清空这个本机评估实例）
-docker compose -f mega2-compose.yml down -v
+docker compose -f $COMPOSE down -v
 ```
 
 ## 重要：把数据持久化到本地目录
@@ -116,7 +120,7 @@ docker compose -f mega2-compose.yml down -v
 在仓库根新建一个覆盖文件 `mega2-compose.persist.yml`：
 
 ```yaml
-# 与 mega2-compose.yml 叠加使用：把具名卷替换为宿主目录绑定挂载
+# 与你选用的 compose 文件叠加使用：把具名卷替换为宿主目录绑定挂载
 services:
   postgres:                              # 元数据库
     volumes:
@@ -135,7 +139,7 @@ services:
 用双 `-f` 启动（停止、清理命令同样要带两个 `-f`）：
 
 ```bash
-docker compose -f mega2-compose.yml -f mega2-compose.persist.yml up -d --wait
+docker compose -f $COMPOSE -f mega2-compose.persist.yml up -d --wait
 ```
 
 之后所有数据都落在 `./mega2-data/` 下：

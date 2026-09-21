@@ -21,7 +21,7 @@ Product rules: [`docs/monorepo.md`](docs/monorepo.md). Quick start: [`docs/quick
 
 ### Protocols and large files
 
-- **Artifacts repository**: mega2 can serve as a build-artifacts repository for binaries such as build outputs and release bundles. Artifacts are organized per repository into artifact sets and uploaded and downloaded through the `/api/v1/repos/{repo}/artifacts` protocol (a three-step discovery → batch → commit upload, presigned-URL downloads); writes are gated by the same `git.push_auth` tokens as Git push while reads stay anonymous. Artifact blobs share the same object storage as Git blobs, LFS, and OCI images, and `[artifacts_gc]` optionally reclaims unreferenced artifact objects in the background.
+- **Artifacts repository**: mega2 can serve as a build-artifacts repository for binaries such as build outputs and release bundles. Artifacts are organized per repository into artifact sets and uploaded and downloaded through the `/api/v1/repos/{repo}/artifacts` protocol (a three-step discovery → batch → commit upload; uploads and downloads transfer directly against the object storage via presigned URLs where the backend supports them, with server-proxy fallback otherwise); writes are gated by the same `git.push_auth` tokens as Git push while reads stay anonymous. Artifact blobs share the same object storage as Git blobs, LFS, and OCI images, and `[artifacts_gc]` optionally reclaims unreferenced artifact objects in the background.
 - **Git Smart HTTP and SSH**: Mega2 speaks Smart HTTP and SSH to stock Git clients for clone / fetch / pull / push. In storage-only mode, SSH keeps only read-only fetch (clone / fetch / pull) and receive-pack is disabled: without a user system there is no way to provision per-user credentials such as SSH keys, so routing all pushes through the unified HTTP authentication (token or anonymous `none`) is the best choice — write auth is maintained in exactly one place.
 - **Git LFS**: following the Git LFS standard, large files managed with git-lfs use the standard Git LFS endpoints (`/info/lfs` and `/api/v1/lfs`).
 - **FastCDC Media**: on top of stock LFS, large media can be uploaded and reused as content-defined chunks (`--features fastcdc`). FastCDC and BLAKE3 support are Monorepo features built for large files and hash safety; they require Libra.
@@ -58,10 +58,13 @@ The product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) a
 
 ## Quick start with Compose
 
-The evaluation stack pulls the official release image from Docker Hub (`genedna/mega2:latest`) — no source build, no bootstrap:
+The evaluation stack pulls the official release image from Docker Hub (`genedna/mega2:latest`) — no source build, no bootstrap. Pick the compose file for your platform (they differ in how artifact presigned URLs are made reachable from the host — see [`docs/deployment.md`](docs/deployment.md)):
 
 ```bash
-docker compose -f mega2-compose.yml up -d --wait
+# macOS with OrbStack
+docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
+# Linux Docker
+docker compose -f linux-mega2-compose.yml up -d --wait
 ```
 
 HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see [`docs/deployment.md`](docs/deployment.md) and [`docs/deploy-trunk.md`](docs/deploy-trunk.md). A full walkthrough: [`docs/quick-start.md`](docs/quick-start.md).
@@ -73,7 +76,7 @@ For local development and tests, see [`docs/development.md`](docs/development.md
 ### Stop
 
 ```bash
-docker compose -f mega2-compose.yml down -v
+docker compose -f macos-orbstack-mega2-compose.yml down -v   # or linux-mega2-compose.yml
 ```
 
 ## Contributing

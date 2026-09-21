@@ -1,9 +1,10 @@
-# mega2 local evaluation stack.
+# mega2 local evaluation stack — macOS (OrbStack) variant.
 #
-# Prerequisite: Docker Engine with the Docker Compose plugin.
+# Prerequisite: OrbStack (provides `*.orb.local` DNS on the host and inside
+# containers). On Linux Docker use `linux-mega2-compose.yml` instead.
 #
 # Quick start:
-#   docker compose -f mega2-compose.yml up -d --wait
+#   docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
 #
 # The first start pulls `genedna/mega2:latest`, PostgreSQL, Redis, RustFS,
 # and the RustFS CLI (`rc`). `rustfs-init` then creates the `mega2` bucket
@@ -12,14 +13,17 @@
 # Access:
 #   Mega2 API / Git Smart HTTP: http://127.0.0.1:9000
 #   OpenAPI document:           http://127.0.0.1:9000/api/openapi.json
+#   RustFS S3 endpoint:         http://mega2-rustfs.orb.local:9000
+#   (artifact presigned URLs point here; OrbStack DNS resolves it both on the
+#   host and inside containers, so host clients can download blobs directly)
 #
 # Observe or stop the stack:
-#   docker compose -f mega2-compose.yml logs -f mega2
-#   docker compose -f mega2-compose.yml down
+#   docker compose -f macos-orbstack-mega2-compose.yml logs -f mega2
+#   docker compose -f macos-orbstack-mega2-compose.yml down
 #
 # Named volumes preserve the PostgreSQL, Redis, RustFS, and mega2 data across
 # `down` / future `up` commands. To discard this local evaluation instance:
-#   docker compose -f mega2-compose.yml down -v
+#   docker compose -f macos-orbstack-mega2-compose.yml down -v
 #
 # This is deliberately a local-only, anonymous Git HTTP write setup:
 # `push_auth=none` means clone, fetch, and push require no token. Port 9000 is
@@ -27,12 +31,13 @@
 # it through a reverse proxy; use token or OAuth authentication for any shared
 # or internet-facing deployment.
 #
-# mega2 本機試用環境。
+# mega2 本機試用環境 — macOS（OrbStack）版本。
 #
-# 前置需求：已安裝 Docker Engine 與 Docker Compose plugin。
+# 前置需求：OrbStack（在宿主机与容器内都提供 `*.orb.local` DNS）。
+# Linux Docker 請改用 `linux-mega2-compose.yml`。
 #
 # 快速啟動：
-#   docker compose -f mega2-compose.yml up -d --wait
+#   docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
 #
 # 首次啟動會拉取 `genedna/mega2:latest`、PostgreSQL、Redis、RustFS 與
 # RustFS CLI（`rc`）。`rustfs-init` 會自動建立 `mega2` bucket，mega2 則會
@@ -41,14 +46,17 @@
 # 存取位址：
 #   Mega2 API / Git Smart HTTP: http://127.0.0.1:9000
 #   OpenAPI document:           http://127.0.0.1:9000/api/openapi.json
+#   RustFS S3 endpoint:         http://mega2-rustfs.orb.local:9000
+#   （artifact 预签名 URL 指向这里；OrbStack DNS 在宿主机与容器内都能解析
+#   该名称，宿主机客户端因此能直连对象存储下载 blob）
 #
 # 查看日誌或停止服務：
-#   docker compose -f mega2-compose.yml logs -f mega2
-#   docker compose -f mega2-compose.yml down
+#   docker compose -f macos-orbstack-mega2-compose.yml logs -f mega2
+#   docker compose -f macos-orbstack-mega2-compose.yml down
 #
 # 具名 volumes 會在 `down` 或下次 `up` 後保留 PostgreSQL、Redis、RustFS
 # 與 mega2 的資料。若要刪除這個本機試用環境的所有資料：
-#   docker compose -f mega2-compose.yml down -v
+#   docker compose -f macos-orbstack-mega2-compose.yml down -v
 #
 # 這是僅限本機使用的匿名 Git HTTP 寫入設定：`push_auth=none` 代表 clone、
 # fetch 與 push 都不需要 token。因此 9000 埠只綁定 127.0.0.1。請勿改成
@@ -80,6 +88,10 @@ services:
 
   rustfs:
     image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    # Fixed container name → stable OrbStack DNS name `mega2-rustfs.orb.local`,
+    # which resolves both on the host and inside containers. Artifact presigned
+    # URLs carry this host in their SigV4 signature, so one name must serve both.
+    container_name: mega2-rustfs
     environment:
       RUSTFS_VOLUMES: /data
       RUSTFS_ADDRESS: 0.0.0.0:9000
@@ -141,7 +153,10 @@ services:
       MEGA_OBJECT_STORAGE__S3__BUCKET: mega2
       MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID: rustfs
       MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY: rustfs_secret
-      MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: http://rustfs:9000
+      # OrbStack DNS name: reachable from host clients (presigned URL download)
+      # and from this container (SDK + presigning) alike. Linux has no such
+      # DNS — see linux-mega2-compose.yml for the host-networking approach.
+      MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: http://mega2-rustfs.orb.local:9000
       MEGA_LOG__PRINT_STD: "true"
     command: ["service", "http", "--host", "0.0.0.0", "-p", "8000"]
     volumes:

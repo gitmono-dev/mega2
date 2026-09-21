@@ -21,7 +21,7 @@ mega2 只支持一种部署模式：trunk / storage-only。它不包含 Web UI�
 
 ### 协议与大文件
 
-- **Artifacts 仓库**：mega2 可以作为构建产物仓库，存放编译产物、发布包等二进制文件。产物按仓库组织为 Artifact Set，通过 `/api/v1/repos/{repo}/artifacts` 协议接口上传（discovery → batch → commit 三步）与下载（预签名 URL）；写操作与 Git push 共用同一套 `git.push_auth` token 门控，读操作保持匿名。产物 blob 与 Git blob、LFS、OCI 镜像共用同一套对象存储，并可选配 `[artifacts_gc]` 后台回收无引用的产物对象。
+- **Artifacts 仓库**：mega2 可以作为构建产物仓库，存放编译产物、发布包等二进制文件。产物按仓库组织为 Artifact Set，通过 `/api/v1/repos/{repo}/artifacts` 协议接口上传（discovery → batch → commit 三步）与下载；后端支持时上传与下载均通过预签名 URL 直连对象存储，否则由服务器中转。写操作与 Git push 共用同一套 `git.push_auth` token 门控，读操作保持匿名。产物 blob 与 Git blob、LFS、OCI 镜像共用同一套对象存储，并可选配 `[artifacts_gc]` 后台回收无引用的产物对象。
 - **Git Smart HTTP 与 SSH**：对标准 Git 客户端提供 Smart HTTP 与 SSH，覆盖 clone / fetch / pull / push。storage-only 形态下 SSH 只保留只读拉取（clone / fetch / pull），receive-pack 关闭：该形态没有用户系统，无法为用户配置 SSH key 这类按人鉴权的方式，因此推送统一走 HTTP（token 或匿名 `none`）是最佳选择，写鉴权只需维护一套。
 - **Git LFS**：遵循 Git LFS 标准，使用 git-lfs 管理的大文件使用标准 Git LFS 接口（`/info/lfs` 与 `/api/v1/lfs`）。
 - **FastCDC Media**：在标准 LFS 之上为大型媒体提供按内容分块的上传与复用（`--features fastcdc`）。FastCDC 和 BLAKE3 支持是 Monorepo 针对大文件和哈希安全开发的特性，需要配合 Libra 才能使用。
@@ -58,10 +58,13 @@ mega2 只以 **trunk / storage-only** 形态部署：`push_policy=trunk`，所�
 
 ## 用 Compose 快速启动
 
-评估栈直接从 Docker Hub 拉取正式发布镜像（`genedna/mega2:latest`），不构建源码、不需要 bootstrap：
+评估栈直接从 Docker Hub 拉取正式发布镜像（`genedna/mega2:latest`），不构建源码、不需要 bootstrap。按平台选择 compose 文件（两者让 artifact 预签名 URL 对宿主机可达的方式不同，见 [`docs/deployment.zh.md`](docs/deployment.zh.md)）：
 
 ```bash
-docker compose -f mega2-compose.yml up -d --wait
+# macOS + OrbStack
+docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
+# Linux Docker
+docker compose -f linux-mega2-compose.yml up -d --wait
 ```
 
 HTTP：`http://127.0.0.1:9000/`。这是仅限本机的匿名设置（`push_auth=none`，绑定 `127.0.0.1`）；token 鉴权或共享部署见 [`docs/deployment.zh.md`](docs/deployment.zh.md) 与 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。完整操作演示见 [`docs/quick-start.zh.md`](docs/quick-start.zh.md)。
@@ -73,7 +76,7 @@ HTTP：`http://127.0.0.1:9000/`。这是仅限本机的匿名设置（`push_auth
 ### 停止
 
 ```bash
-docker compose -f mega2-compose.yml down -v
+docker compose -f macos-orbstack-mega2-compose.yml down -v   # 或 linux-mega2-compose.yml
 ```
 
 ## 贡献

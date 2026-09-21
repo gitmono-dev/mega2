@@ -214,7 +214,7 @@ dockerd 与宿主共享 mount namespace；macOS Docker Desktop 的传播止于 V
   再 `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile scorpio logs -f scorpiofs`。
 - ScorpioFS HTTP API 无认证，端口只绑 `127.0.0.1`；不要改成 `0.0.0.0`。
 - Antares CL 层（`/api/v1/cl/{link}/files-list`）只有 review policy 提供；IT 栈 `mega2`
-  默认即 review，trunk 栈（`mega2-compose.yml` / `docker/docker-compose-storage-only.yml`）不含。
+  默认即 review，trunk 栈（`macos-orbstack-mega2-compose.yml` / `linux-mega2-compose.yml` / `docker/docker-compose-storage-only.yml`）不含。
 
 ## 聚焦命令
 

@@ -17,17 +17,23 @@ The only supported deployment shape is trunk / storage-only:
 
 The Compose files at the repository root fall into two groups: the **official evaluation stack** and the **test / lab stacks**.
 
-### 2.1 Evaluation stack: `mega2-compose.yml` (local trial, recommended entry)
+### 2.1 Evaluation stacks (local trial, recommended entry)
 
-[`mega2-compose.yml`](../mega2-compose.yml) pulls the **official release image from Docker Hub**, `genedna/mega2:latest` (`pull_policy: always`) — no source build. Components: mega2 + Postgres + Redis + RustFS + `rustfs-init` (creates the `mega2` bucket automatically); mega2 initializes the empty Monorepo during service startup, so **no** `service init` bootstrap is needed.
+The evaluation stack ships in two platform variants; both pull the **official release image from Docker Hub**, `genedna/mega2:latest` (`pull_policy: always`) — no source build. Components: mega2 + Postgres + Redis + RustFS + `rustfs-init` (creates the `mega2` bucket automatically); mega2 initializes the empty Monorepo during service startup, so **no** `service init` bootstrap is needed.
+
+- [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml) — macOS with OrbStack. Uses OrbStack's `*.orb.local` DNS so that the RustFS endpoint (`http://mega2-rustfs.orb.local:9000`) resolves both on the host and inside containers.
+- [`linux-mega2-compose.yml`](../linux-mega2-compose.yml) — Linux Docker. Publishes Postgres/Redis/RustFS on the host loopback and runs mega2 with `network_mode: host`, so `http://127.0.0.1:29000` is reachable from both sides.
+
+The two variants exist because artifact **presigned URLs** carry the object-storage endpoint host in their SigV4 signature: one address must serve both the mega2 process (SDK + presigning) and clients on the host (direct blob download), and each platform provides a different mechanism for that shared name.
 
 ```bash
-docker compose -f mega2-compose.yml up -d --wait
-docker compose -f mega2-compose.yml logs -f mega2
-docker compose -f mega2-compose.yml down      # named volumes keep the data; down -v wipes it
+docker compose -f macos-orbstack-mega2-compose.yml up -d --wait   # macOS + OrbStack
+docker compose -f linux-mega2-compose.yml up -d --wait            # Linux Docker
+docker compose -f <file> logs -f mega2
+docker compose -f <file> down      # named volumes keep the data; down -v wipes it
 ```
 
-This stack is a **local-only, anonymous setup**: `push_auth=none`, anonymous reads and writes, and HTTP is published only on `127.0.0.1:9000` (container port 8000). Do not rebind to `0.0.0.0` or expose it through a reverse proxy; for shared / public deployments use the token-based stack below or your own orchestration. An end-to-end walkthrough: [`quick-start.md`](./quick-start.md).
+Both stacks are a **local-only, anonymous setup**: `push_auth=none`, anonymous reads and writes, and HTTP is bound to `127.0.0.1:9000` only. Do not rebind to `0.0.0.0` or expose it through a reverse proxy; for shared / public deployments use the token-based stack below or your own orchestration. An end-to-end walkthrough: [`quick-start.md`](./quick-start.md).
 
 ### 2.2 Source-built test / lab stack: `docker/docker-compose-storage-only.yml`
 
@@ -87,7 +93,7 @@ Env file contents: [`config/compose.env.storage-only.local`](../config/compose.e
 
 ## 3. Binary / container deployment
 
-If you don't want to build from source, use the official release image on Docker Hub, `genedna/mega2:latest` (the same image `mega2-compose.yml` pulls). To build the binary yourself:
+If you don't want to build from source, use the official release image on Docker Hub, `genedna/mega2:latest` (the same image the evaluation compose stacks pull). To build the binary yourself:
 
 ```bash
 cargo build --release -p mega2   # artifact: target/release/mega2

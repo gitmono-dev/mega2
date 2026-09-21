@@ -17,17 +17,23 @@ mega2 开源版只交付一种形态：**trunk / storage-only**——无 Web UI�
 
 仓库根的 Compose 文件分两类：**正式评估栈**与**测试 / 实验栈**。
 
-### 2.1 评估栈：`mega2-compose.yml`（本机试用，推荐入口）
+### 2.1 评估栈（本机试用，推荐入口）
 
-[`mega2-compose.yml`](../mega2-compose.yml) 从 **Docker Hub 拉取正式发布镜像** `genedna/mega2:latest`（`pull_policy: always`），不构建源码。组件：mega2 + Postgres + Redis + RustFS + `rustfs-init`（自动建 `mega2` 桶）；mega2 在服务启动时自动初始化空 Monorepo，**不需要** `service init` bootstrap。
+评估栈按平台提供两个变体；两者都从 **Docker Hub 拉取正式发布镜像** `genedna/mega2:latest`（`pull_policy: always`），不构建源码。组件：mega2 + Postgres + Redis + RustFS + `rustfs-init`（自动建 `mega2` 桶）；mega2 在服务启动时自动初始化空 Monorepo，**不需要** `service init` bootstrap。
+
+- [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml)——macOS + OrbStack。利用 OrbStack 的 `*.orb.local` DNS，让 RustFS endpoint（`http://mega2-rustfs.orb.local:9000`）在宿主机与容器内都能解析。
+- [`linux-mega2-compose.yml`](../linux-mega2-compose.yml)——Linux Docker。把 Postgres/Redis/RustFS 发布到宿主机回环，并让 mega2 以 `network_mode: host` 运行，使 `http://127.0.0.1:29000` 对两侧都可达。
+
+之所以分两个变体，是因为 artifact **预签名 URL** 的 host 参与 SigV4 签名：同一个地址必须同时服务 mega2 进程（SDK + 签名）与宿主机客户端（直连下载 blob），而两个平台提供这一共享名称的机制不同。
 
 ```bash
-docker compose -f mega2-compose.yml up -d --wait
-docker compose -f mega2-compose.yml logs -f mega2
-docker compose -f mega2-compose.yml down      # 具名卷保留数据；down -v 清空
+docker compose -f macos-orbstack-mega2-compose.yml up -d --wait   # macOS + OrbStack
+docker compose -f linux-mega2-compose.yml up -d --wait            # Linux Docker
+docker compose -f <文件> logs -f mega2
+docker compose -f <文件> down      # 具名卷保留数据；down -v 清空
 ```
 
-该栈是**仅限本机的匿名设置**：`push_auth=none`、匿名读写，HTTP 只发布到 `127.0.0.1:9000`（mega2 容器内 8000）。不要绑定 `0.0.0.0` 或经反向代理暴露；共享 / 公网部署用下面的 token 栈或自建编排。端到端操作演示见 [`quick-start.zh.md`](./quick-start.zh.md)。
+两个栈都是**仅限本机的匿名设置**：`push_auth=none`、匿名读写，HTTP 只绑定 `127.0.0.1:9000`。不要绑定 `0.0.0.0` 或经反向代理暴露；共享 / 公网部署用下面的 token 栈或自建编排。端到端操作演示见 [`quick-start.zh.md`](./quick-start.zh.md)。
 
 ### 2.2 源码构建的测试 / 实验栈：`docker/docker-compose-storage-only.yml`
 
@@ -87,7 +93,7 @@ env 文件内容见 [`config/compose.env.storage-only.local`](../config/compose.
 
 ## 3. 二进制 / 容器部署
 
-不想从源码构建时，可以直接用 Docker Hub 上的正式发布镜像 `genedna/mega2:latest`（`mega2-compose.yml` 用的就是它）。自行构建二进制：
+不想从源码构建时，可以直接用 Docker Hub 上的正式发布镜像 `genedna/mega2:latest`（评估栈 compose 文件拉取的就是它）。自行构建二进制：
 
 ```bash
 cargo build --release -p mega2   # 产物 target/release/mega2
