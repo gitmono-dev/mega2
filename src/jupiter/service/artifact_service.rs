@@ -150,6 +150,47 @@ impl ArtifactService {
         }
     }
 
+    /// Size of an object already present in object storage, [`None`] when absent.
+    /// Commit uses this to confirm bytes that arrived via presigned PUT, which
+    /// bypasses the server and therefore leaves no `artifact_objects` row.
+    async fn stored_object_size(&self, key: &ObjectKey) -> Result<Option<i64>, MegaError> {
+        match self.obj_storage.inner.get_stream(key).await {
+            Ok((_stream, meta)) => Ok(Some(meta.size)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Register an `artifact_objects` row for bytes already present in object
+    /// storage. Tolerates a concurrent insert of the same oid/size.
+    async fn register_artifact_object(&self, oid: &str, size_bytes: i64) -> Result<(), MegaError> {
+        let now = Utc::now().naive_utc();
+        let storage_key = Self::artifact_object_key(oid).default_sharding();
+        let am = artifact_objects::ActiveModel {
+            oid: Set(oid.to_string()),
+            size_bytes: Set(size_bytes),
+            content_type: Set(None),
+            storage_key: Set(storage_key),
+            created_at: Set(now),
+            last_seen_at: Set(now),
+            integrity: Set(None),
+        };
+
+        if let Err(e) = am.insert(self.st.get_connection()).await {
+            match self.st.find_artifact_object_by_oid(oid).await? {
+                Some(row) if row.size_bytes == size_bytes => {}
+                Some(_) => {
+                    return Err(MegaError::Other(
+                        "[code:409] oid already exists with a different size".to_string(),
+                    ));
+                }
+                None => return Err(MegaError::Db(e)),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Presigned GET when the configured backend supports it; [`None`] for local filesystem.
     pub async fn artifact_object_signed_get_url(
         &self,
@@ -268,31 +309,7 @@ impl ArtifactService {
             return Ok(());
         }
 
-        let now = Utc::now().naive_utc();
-        let storage_key = key.default_sharding();
-        let am = artifact_objects::ActiveModel {
-            oid: Set(oid.to_string()),
-            size_bytes: Set(size_bytes),
-            content_type: Set(None),
-            storage_key: Set(storage_key),
-            created_at: Set(now),
-            last_seen_at: Set(now),
-            integrity: Set(None),
-        };
-
-        if let Err(e) = am.insert(self.st.get_connection()).await {
-            match self.st.find_artifact_object_by_oid(oid).await? {
-                Some(row) if row.size_bytes == size_bytes => {}
-                Some(_) => {
-                    return Err(MegaError::Other(
-                        "[code:409] oid already exists with a different size".to_string(),
-                    ));
-                }
-                None => return Err(MegaError::Db(e)),
-            }
-        }
-
-        Ok(())
+        self.register_artifact_object(oid, size_bytes).await
     }
 
     /// `GET .../artifact_sets` pagination: `cursor` query and JSON `next_cursor`.
@@ -742,7 +759,23 @@ impl ArtifactService {
         for (_, oid, size) in &manifest {
             match by_oid.get(oid) {
                 None => {
-                    missing_objects.insert(oid.clone());
+                    // Presigned PUT bypasses the server, so no `artifact_objects`
+                    // row exists yet: confirm the bytes landed in object storage
+                    // and register them before accepting the manifest.
+                    let key = Self::artifact_object_key(oid);
+                    match self.stored_object_size(&key).await? {
+                        Some(actual) if actual == *size => {
+                            self.register_artifact_object(oid, *size).await?;
+                        }
+                        Some(_) => {
+                            return Err(MegaError::Other(format!(
+                                "[code:400] oid {oid} exists with size different from manifest"
+                            )));
+                        }
+                        None => {
+                            missing_objects.insert(oid.clone());
+                        }
+                    }
                 }
                 Some(db) if db != size => {
                     return Err(MegaError::Other(format!(
@@ -918,5 +951,119 @@ mod artifact_sets_cursor_tests {
         let utc = Utc.with_ymd_and_hms(2024, 6, 15, 12, 30, 0).unwrap();
         let s = format!("{}:9001", utc.timestamp_micros());
         assert!(ArtifactService::decode_set_cursor(&s).is_err());
+    }
+}
+
+#[cfg(test)]
+mod commit_registration_tests {
+    use super::*;
+    use crate::jupiter::{migration::apply_migrations, tests::test_db_connection};
+
+    async fn service_with_db() -> (tempfile::TempDir, ArtifactService) {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+        let base = BaseStorage::new(std::sync::Arc::new(db));
+        (temp_dir, ArtifactService::new(base, mock_object_storage()))
+    }
+
+    fn commit_request(oid: &str, size: i64) -> ArtifactCommitRequest {
+        ArtifactCommitRequest {
+            namespace: "ci".to_string(),
+            object_type: ArtifactObjectType::Run,
+            artifact_set_id: None,
+            files: vec![ArtifactFileDescriptor {
+                path: "bin/app".to_string(),
+                oid: oid.to_string(),
+                size,
+            }],
+            metadata: None,
+            expires_in_seconds: None,
+        }
+    }
+
+    /// Presigned PUT bypasses the server: bytes land in object storage with no
+    /// `artifact_objects` row. Commit must confirm the size, register the
+    /// object, and accept the manifest.
+    #[tokio::test]
+    async fn commit_registers_presigned_uploaded_object() {
+        let (_temp_dir, service) = service_with_db().await;
+        let oid = Uuid::new_v4().to_string();
+        let bytes = b"presigned-direct-bytes".to_vec();
+        let size = bytes.len() as i64;
+
+        service
+            .obj_storage
+            .inner
+            .put_stream(
+                &ArtifactService::artifact_object_key(&oid),
+                bytes.into_stream(),
+                ObjectMeta::default(),
+            )
+            .await
+            .expect("direct object-storage write");
+
+        let resp = service
+            .commit_artifacts("mega2", &commit_request(&oid, size))
+            .await
+            .expect("commit should succeed");
+        assert_eq!(resp.status, "ok");
+        assert!(resp.missing_objects.is_empty());
+
+        let row = service
+            .st
+            .find_artifact_object_by_oid(&oid)
+            .await
+            .expect("db read")
+            .expect("artifact_objects row registered");
+        assert_eq!(row.size_bytes, size);
+
+        // Re-commit is idempotent now that the row exists.
+        let again = service
+            .commit_artifacts("mega2", &commit_request(&oid, size))
+            .await
+            .expect("re-commit should succeed");
+        assert_eq!(again.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn commit_reports_missing_when_storage_lacks_object() {
+        let (_temp_dir, service) = service_with_db().await;
+        let oid = Uuid::new_v4().to_string();
+
+        let resp = service
+            .commit_artifacts("mega2", &commit_request(&oid, 42))
+            .await
+            .expect("commit should respond");
+        assert_eq!(resp.status, "missing_objects");
+        assert_eq!(resp.missing_objects, vec![oid]);
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_size_mismatch_for_presigned_uploaded_object() {
+        let (_temp_dir, service) = service_with_db().await;
+        let oid = Uuid::new_v4().to_string();
+
+        service
+            .obj_storage
+            .inner
+            .put_stream(
+                &ArtifactService::artifact_object_key(&oid),
+                b"actual bytes".to_vec().into_stream(),
+                ObjectMeta::default(),
+            )
+            .await
+            .expect("direct object-storage write");
+
+        let err = service
+            .commit_artifacts("mega2", &commit_request(&oid, 999))
+            .await
+            .expect_err("size mismatch must be rejected");
+        assert!(
+            err.to_string().contains("size different from manifest"),
+            "unexpected error: {err}"
+        );
     }
 }
