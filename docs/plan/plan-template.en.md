@@ -101,7 +101,7 @@ This file only plans work. It does not claim the work is done. At execution time
 | Migration | `<m<YYYYMMDD>_<HHMMSS>_<slug>>` | `<migrations() registration line>` |
 | Docs | `<docs/...>` | `<file:line>` |
 | Tests | `<-p mega2 --lib '<mod::tests>' or --test <target>>` | `<file:line>` |
-| Workspace prelude | `<.env.test present / test stack up (Postgres 15432, Redis 16379, …)>` | `<.env.test.example / docker-compose.test.yml:line>` |
+| Workspace prelude | `<.env.test present / test stack up (Postgres 15432, Redis 16379, …)>` | `<.env.test.example / docker/docker-compose.test.yml:line>` |
 | External reference | `<Mega repo@sha>` | `<path + check date>` |
 
 ### Current gaps
@@ -184,7 +184,7 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
    - Confirm branch, dirty state, and that target files have no unconfirmed user edits (`libra status` or the equivalent in `AGENTS.md`). If target files already have unconfirmed edits, report and do not overwrite.
    - Object storage is in-tree (`src/orbit_api/` + `src/orbit/`). There is no sibling `../orbit` and no `crates/orbit*` workspace members. A cargo resolve failure is not "missing orbit checkout".
    - Confirm `.env.test` exists (the repo ships `.env.test.example` only; `.env.test` is ignored). If it is missing, stop and ask per `AGENTS.md`. Do **not** silently run `cargo test --all` without sourcing it.
-   - Confirm required test services are up: `docker compose -f docker-compose.test.yml up -d --wait` (Postgres `15432`, Redis `16379`, Mailpit `11025/18025`, RustFS `19000/19001`; bucket init needs `--profile init run --rm rustfs-init` or the default `rustfs-init` health wait). Missing Postgres makes related tests panic, not skip.
+   - Confirm required test services are up: `docker compose -f docker/docker-compose.test.yml up -d --wait` (Postgres `15432`, Redis `16379`, Mailpit `11025/18025`, RustFS `19000/19001`; bucket init needs `--profile init run --rm rustfs-init` or the default `rustfs-init` health wait). Missing Postgres makes related tests panic, not skip.
 
 2. **ER-02 Check, then implement:** Refresh this card's source anchors, doc anchors, test targets, and external revisions. Then decide: implement, add tests, add docs, close, or downgrade.
 
@@ -260,6 +260,11 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
 11. **ER-11 Evidence hygiene:** Acceptance evidence must not store secrets, API keys, tokens, PII, unsanitized transcripts, private absolute paths, or raw tool payloads. Public test passwords (`mega2_test_password`, `smtp-test-password`, RustFS `rustfs` / `rustfs_secret`) are still redacted in records.
 
 12. **ER-12 Concurrency vs serial release:** Concurrent work is allowed only in implementation and review, and only when `Implementation write set`s are disjoint (G-10). **Release is always serial and has one publisher:** bump, build, commit, push, and D tracking. Only one card may be in "bumped but not yet pushed" at a time. Do not invent an unverified document lease as a repo lock.
+
+13. **ER-13 Tests must not leak shared state:** When adding or changing tests, every shared side effect a case creates must be cleaned up before the case ends — above all table creation / seeding / migrations written directly into the shared test PostgreSQL **`public` schema** (i.e. anything not going through `test_db_connection`, which gives each case its own schema), as well as shared Redis, shared object-storage buckets, and fixed-path directories.
+    - Background: test connections use a `search_path` that includes `public` (`src/jupiter/tests.rs::database_url_with_search_path`), so any table left in `public` is visible to other cases' unqualified lookups (e.g. `to_regclass`) and causes mass fixture failures on later runs (measured 2026-09-21: 84 stale tables in `public` broke 14 unrelated cases).
+    - Requirements: on case exit (including panic paths — prefer guards / Drop / scoped cleanup) drop the tables, schemas, databases, buckets, and directories the case created; if a table must live in `public`, give it a case-unique name prefix and `DROP TABLE IF EXISTS ... CASCADE` at the end.
+    - Review gate: when reviewing test diffs, "does every shared side effect have matching cleanup" is a mandatory check; when an existing case is found leaking shared state, fix it as its own card — do not copy the pattern into new cards.
 
 ## Implementation order
 

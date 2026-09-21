@@ -643,8 +643,10 @@ impl GitDbStorage {
         git_tag::Entity::insert(am)
             .exec(self.get_connection())
             .await?;
-        // load saved model back by tag_id
+        // load saved model back by (repo_id, tag_id): tag_id is only unique
+        // per repo since m20260921_000100_fix_git_tag_unique
         let model = git_tag::Entity::find()
+            .filter(git_tag::Column::RepoId.eq(tag.repo_id))
             .filter(git_tag::Column::TagId.eq(tag.tag_id.clone()))
             .one(self.get_connection())
             .await?;
@@ -991,5 +993,53 @@ mod tests {
             filepath_of(&git_db, 1, "q").await.as_deref(),
             Some("foo's/bar.rs")
         );
+    }
+
+    fn tag_row(repo_id: i64, tag_id: &str, tag_name: &str) -> git_tag::Model {
+        git_tag::Model {
+            id: generate_id(),
+            repo_id,
+            tag_id: tag_id.to_string(),
+            object_id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string(),
+            object_type: "commit".to_string(),
+            tag_name: tag_name.to_string(),
+            tagger: "tagger t <t@t> 1789970957 +0000".to_string(),
+            message: "release".to_string(),
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        }
+    }
+
+    // Regression for the repo-blind `uniq_gtag_tag_id` constraint: the same
+    // annotated tag object pushed into a second import repo was silently
+    // dropped by ON CONFLICT DO NOTHING, so clones of that repo could not
+    // fetch the tag object.
+    #[tokio::test]
+    async fn same_tag_object_saved_per_repo() {
+        let git_db = storage().await;
+        let tag_id = "dddddddddddddddddddddddddddddddddddddddd";
+        for repo_id in [1i64, 2i64] {
+            git_db
+                .batch_save_model::<git_tag::Entity, git_tag::ActiveModel>(vec![
+                    tag_row(repo_id, tag_id, "v1.0").into_active_model(),
+                ])
+                .await
+                .unwrap();
+        }
+        assert_eq!(git_db.get_tags_by_repo_id(1).await.unwrap().len(), 1);
+        assert_eq!(git_db.get_tags_by_repo_id(2).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn insert_tag_loads_back_row_of_same_repo() {
+        let git_db = storage().await;
+        let tag_id = "ffffffffffffffffffffffffffffffffffffffff";
+        git_tag::Entity::insert(tag_row(1, tag_id, "v1.0").into_active_model())
+            .exec(git_db.get_connection())
+            .await
+            .unwrap();
+        let model = git_db.insert_tag(tag_row(2, tag_id, "v1.0")).await.unwrap();
+        assert_eq!(model.repo_id, 2);
     }
 }

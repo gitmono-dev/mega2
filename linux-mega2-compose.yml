@@ -1,0 +1,196 @@
+# mega2 local evaluation stack — Linux Docker variant.
+#
+# Prerequisite: Docker Engine on Linux with the Docker Compose plugin.
+# On macOS with OrbStack use `macos-orbstack-mega2-compose.yml` instead.
+#
+# Why this differs from the macOS/OrbStack variant: artifact presigned URLs
+# carry the object-storage endpoint host in their SigV4 signature, so one
+# address must be reachable from BOTH the mega2 container (SDK + presigning)
+# and clients on the host (direct blob download). Linux Docker has no
+# `*.orb.local` DNS, so this file instead:
+#   - publishes Postgres/Redis/RustFS on 127.0.0.1 (ports 15433/16380/29000),
+#   - runs mega2 with `network_mode: host`,
+# making `http://127.0.0.1:29000` that single shared endpoint. mega2 binds
+# its API on 127.0.0.1:9000 directly (no port mapping with host networking).
+#
+# Alternative without host networking: keep mega2 on the bridge network,
+# add `extra_hosts: ["mega2-rustfs.internal:host-gateway"]` to it, publish
+# `127.0.0.1:29000:9000` on rustfs, set ENDPOINT_URL to
+# `http://mega2-rustfs.internal:29000`, and add `127.0.0.1 mega2-rustfs.internal`
+# to the host's /etc/hosts (requires sudo).
+#
+# Quick start:
+#   docker compose -f linux-mega2-compose.yml up -d --wait
+#
+# The first start pulls `genedna/mega2:latest`, PostgreSQL, Redis, RustFS,
+# and the RustFS CLI (`rc`). `rustfs-init` then creates the `mega2` bucket
+# automatically; mega2 initializes its empty Monorepo during service startup.
+#
+# Access:
+#   Mega2 API / Git Smart HTTP: http://127.0.0.1:9000
+#   OpenAPI document:           http://127.0.0.1:9000/api/openapi.json
+#   RustFS S3 endpoint:         http://127.0.0.1:29000
+#   (artifact presigned URLs point here; reachable from host clients and from
+#   the host-networked mega2 process alike)
+#
+# Observe or stop the stack:
+#   docker compose -f linux-mega2-compose.yml logs -f mega2
+#   docker compose -f linux-mega2-compose.yml down
+#
+# Named volumes preserve the PostgreSQL, Redis, RustFS, and mega2 data across
+# `down` / future `up` commands. To discard this local evaluation instance:
+#   docker compose -f linux-mega2-compose.yml down -v
+#
+# This is deliberately a local-only, anonymous Git HTTP write setup:
+# `push_auth=none` means clone, fetch, and push require no token. mega2 binds
+# 127.0.0.1 only for that reason. Do not bind 0.0.0.0 or expose it through a
+# reverse proxy; use token or OAuth authentication for any shared or
+# internet-facing deployment.
+#
+# mega2 本機試用環境 — Linux Docker 版本。
+#
+# 前置需求：Linux 上的 Docker Engine 與 Docker Compose plugin。
+# macOS + OrbStack 請改用 `macos-orbstack-mega2-compose.yml`。
+#
+# 為什麼與 macOS/OrbStack 版本不同：artifact 预签名 URL 的 host 參與 SigV4
+# 簽名，同一個位址必須同時對 mega2 容器（SDK + 簽名）和宿主機客戶端（直連
+# 下載 blob）可達。Linux Docker 沒有 `*.orb.local` DNS，因此本檔案改為：
+#   - 把 Postgres/Redis/RustFS 發佈到 127.0.0.1（埠 15433/16380/29000），
+#   - mega2 以 `network_mode: host` 執行，
+# 使 `http://127.0.0.1:29000` 成為雙側共用的唯一 endpoint。mega2 的 API
+# 直接綁定 127.0.0.1:9000（host networking 下無埠映射）。
+#
+# 快速啟動：
+#   docker compose -f linux-mega2-compose.yml up -d --wait
+#
+# 存取位址：
+#   Mega2 API / Git Smart HTTP: http://127.0.0.1:9000
+#   OpenAPI document:           http://127.0.0.1:9000/api/openapi.json
+#   RustFS S3 endpoint:         http://127.0.0.1:29000
+#
+# 這是僅限本機使用的匿名 Git HTTP 寫入設定：`push_auth=none` 代表 clone、
+# fetch 與 push 都不需要 token，因此 mega2 只綁定 127.0.0.1。請勿改成
+# 0.0.0.0 或透過反向代理公開；共用或網際網路部署必須改用 token 或 OAuth。
+name: mega2-linux
+
+services:
+  postgres:
+    image: postgres:18.6-alpine3.24
+    environment:
+      POSTGRES_USER: mega2
+      POSTGRES_PASSWORD: mega2_local_password
+      POSTGRES_DB: mega2
+    volumes:
+      - mega2-postgres:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:15433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mega2 -d mega2"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:8.10.1-alpine3.23
+    volumes:
+      - mega2-redis:/data
+    ports:
+      - "127.0.0.1:16380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: rustfs_secret
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+    volumes:
+      - mega2-rustfs:/data
+    ports:
+      # Published on the host loopback: this is the address baked into
+      # artifact presigned URLs, so host clients download blobs directly.
+      - "127.0.0.1:29000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  rustfs-init:
+    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/rc alias set local http://rustfs:9000 rustfs rustfs_secret &&
+      /usr/bin/rc mb --ignore-existing local/mega2 &&
+      exec sleep infinity
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/bin/rc ls local/mega2"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 3s
+
+  mega2:
+    image: genedna/mega2:latest
+    pull_policy: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_healthy
+    # Host networking: mega2 reaches Postgres/Redis/RustFS over the host
+    # loopback, and 127.0.0.1:29000 is simultaneously the endpoint host in
+    # presigned URLs it signs and the address host clients connect to.
+    network_mode: host
+    environment:
+      MEGA_BASE_DIR: /var/lib/mega2
+      MEGA_DATABASE__DB_TYPE: postgres
+      MEGA_DATABASE__DB_URL: postgres://mega2:mega2_local_password@127.0.0.1:15433/mega2
+      MEGA_DATABASE__MIN_CONNECTION: 1
+      MEGA_REDIS__URL: redis://127.0.0.1:16380
+      MEGA_MONOREPO__PUSH_POLICY: trunk
+      MEGA_CEDAR__ENFORCEMENT: "off"
+      MEGA_GIT__ANONYMOUS_ACCESS: "true"
+      MEGA_GIT__PUSH_AUTH: none
+      MEGA_GIT__SSH_RECEIVE_PACK: "false"
+      MEGA_OBJECT_STORAGE__STORAGE_TYPE: s3compatible
+      MEGA_OBJECT_STORAGE__S3__REGION: us-east-1
+      MEGA_OBJECT_STORAGE__S3__BUCKET: mega2
+      MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID: rustfs
+      MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY: rustfs_secret
+      MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: http://127.0.0.1:29000
+      # OCI Distribution surface (/v2): storage-only morphology + this switch.
+      MEGA_OCI__ENABLED: "true"
+      MEGA_LOG__PRINT_STD: "true"
+    # Loopback-only bind: push_auth=none, see the header warning. No `ports:`
+    # mapping exists under host networking; the API is at 127.0.0.1:9000.
+    command: ["service", "http", "--host", "127.0.0.1", "-p", "9000"]
+    volumes:
+      - mega2-data:/var/lib/mega2
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/api/openapi.json"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+volumes:
+  mega2-postgres:
+  mega2-redis:
+  mega2-rustfs:
+  mega2-data:

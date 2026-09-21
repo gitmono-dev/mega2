@@ -264,7 +264,7 @@ pub fn assert_database_absent(admin_url: &str, db_name: &str) {
 fn compose_up_git_cli_hint() -> String {
     format!(
         "hint: start the opt-in runner with \
-         `docker compose -p {COMPOSE_PROJECT} -f docker-compose.test.yml --profile git up -d --wait` \
+         `docker compose -p {COMPOSE_PROJECT} -f docker/docker-compose.test.yml --profile git up -d --wait` \
          (see docs/refactoring/test-infra.md / docs/development.md)"
     )
 }

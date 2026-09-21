@@ -104,23 +104,23 @@ Object PUT/GET 仍走 batch 注册后的能力 URL，不逐请求鉴权。Review
 
 ## 8. 本地 Compose 栈
 
-仓库根 `docker-compose-storage-only.yml` 对照 IT 的 `docker-compose.test.yml`，保留 Postgres / Redis / **RustFS** / mega2，挂载 `config/config-storage-only.toml` 与 `/run/secrets/mega2-push-token`（默认 `secrets/mega2-push-token.local`）。不含 website、mailpit、OAuth。
+仓库根 `docker/docker-compose-storage-only.yml` 对照 IT 的 `docker/docker-compose.test.yml`，保留 Postgres / Redis / **RustFS** / mega2，挂载 `config/config-storage-only.toml` 与 `/run/secrets/mega2-push-token`（默认 `secrets/mega2-push-token.local`）。不含 website、mailpit、OAuth。
 
 对象存储默认 **RustFS**（`s3compatible`）。**默认启动不要加 `--env-file`**；只有把 mega2 改成本地文件系统后端时，才需要 `--env-file config/compose.env.storage-only.local`（RustFS 容器仍会启动，仅切换 mega2 的 `storage_type`）。
 
 ```bash
 # 默认 RustFS（s3compatible）——无需 --env-file
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml up -d --wait
 
 # 空卷 bootstrap（可复制）
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml exec -T mega2 \
   mega2 --config /etc/mega2/config.toml service init --yes
 
 # 干净重跑（破坏性：删 named volume）
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml down -v
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml down -v
 
 # 可选：mega2 改用本地文件系统（仅此情况加 --env-file）
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
   --env-file config/compose.env.storage-only.local up -d --wait
 
 # HTTP http://127.0.0.1:9000/  SSH ssh://git@127.0.0.1:2222/
@@ -136,7 +136,7 @@ Trunk / storage-only 协议冒烟使用 **`scripts/git_protocol_smoke_storage_on
 
 ```bash
 TOKEN='mega2-storage-only-local-dev-token-0001'
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
   exec -T \
   -e MEGA2_HTTP_REPO_URL="http://x:${TOKEN}@mega2:8000/" \
   -e MEGA2_API_BASE=http://mega2:8000 \
@@ -147,7 +147,7 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke
 稳定 case：`API create-entry then git clone sees file`、`API edit/save then git pull sees update`、`API write rejects unauthenticated`；plan-20260917 LB-05 追加 `delete-entry-git-visible`、`move-entry-git-visible`、`tags-list-create-delete`、`delete-entry-unauth-401`；plan-20260918 FT-07 追加 `delete-file-git-visible`、`move-file-git-visible`、`tags-get-list-create-delete`、`tags-path-get-delete`、`delete-file-unauth-401`（文件删移后 `git clone` / `git pull` 工作树与 `GET /tree` 一致；匿名 GET list 200、POST list 405；`?path=` get/delete 隔离；未授权文件 delete 401）。单 case 用 `MEGA2_SMOKE_CASE=<精确名>`（未匹配退出 2），`-h` 列出全部 case 名。summary 须 `0 failed`——全量运行请在干净栈上（`down -v` 重建 + `service init --yes`）执行，或用 `MEGA2_SMOKE_CASE` 只选所需 case：AW-04 的 `API create-entry then git clone sees file` 用固定文件名，在同一栈上第二次全量运行会撞重名 500 而 `failed=1`（LB-05 / FT-07 的具名 case 用每次运行唯一的名字）。可被 plan-20260906 吸收为附加 case（见 `docs/refactoring/test-infra.md`）。矩阵行见 [`refactoring/integration.md`](./refactoring/integration.md) 的 `integration_api_write_trunk`。
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
   exec -T \
   -e MEGA2_HTTP_REPO_URL=http://mega2:8000/ \
   git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
@@ -158,7 +158,7 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke
 Token 写示例：
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
   exec -T \
   -e MEGA2_HTTP_REPO_URL=http://mega2:8000/ \
   -e MEGA2_IT_SEED_TOKEN=mega2-storage-only-local-dev-token-0001 \
@@ -171,13 +171,13 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke
 
 ```bash
 docker compose -p mega2-trunk \
-  -f docker-compose-storage-only.yml \
-  -f docker-compose-storage-only.auth-none.yml \
+  -f docker/docker-compose-storage-only.yml \
+  -f docker/docker-compose-storage-only.auth-none.yml \
   up -d --wait --force-recreate mega2
 
 docker compose -p mega2-trunk \
-  -f docker-compose-storage-only.yml \
-  -f docker-compose-storage-only.auth-none.yml \
+  -f docker/docker-compose-storage-only.yml \
+  -f docker/docker-compose-storage-only.auth-none.yml \
   --profile smoke \
   exec -T \
   -e MEGA2_HTTP_REPO_URL=http://mega2:8000/ \
@@ -191,11 +191,11 @@ docker compose -p mega2-trunk \
 LFS 网内 URL（ADR-SO-04）：`--env-file config/compose.env.storage-only.lfs-innetwork` 把 `MEGA_HTTP__PUBLIC_BASE_URL` / `MEGA_LFS__SSH__HTTP_URL` 设为 `http://mega2:8000`，供 `git-smoke` 容器内 LFS href 可达。opt-in case：`HTTP LFS push and pull (trunk)`（需 `MEGA2_GIT_SMOKE_PUSH=1` + `MEGA2_GIT_SMOKE_LFS=1` + token）。
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
   --env-file config/compose.env.storage-only.lfs-innetwork \
   up -d --wait --force-recreate mega2
 
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
   exec -T \
   -e MEGA2_HTTP_REPO_URL=http://mega2:8000/ \
   -e MEGA2_IT_SEED_TOKEN=mega2-storage-only-local-dev-token-0001 \
@@ -217,7 +217,7 @@ export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new -o UserKnownHost
 ```
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
   exec -T \
   -e MEGA2_SSH_REPO_URL=ssh://git@mega2:2222/ \
   -e MEGA2_SMOKE_CASE='SSH ls-remote' \
@@ -227,7 +227,7 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke
 已注册 SSH case：`SSH ls-remote`、`SSH clone`、`SSH fetch`、`SSH protocol v2 fetch`、`SSH shallow clone depth=1`、`SSH protocol v2 ls-remote`、`SSH protocol v2 blob:none clone`、`SSH reject receive-pack`（未设 `MEGA2_SSH_REPO_URL` 时后者 SKIP）。
 
 ```bash
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
   exec -T \
   -e MEGA2_SSH_REPO_URL=ssh://git@mega2:2222/ \
   -e MEGA2_SMOKE_CASE='SSH reject receive-pack' \
@@ -240,7 +240,7 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke
 mkdir -p target/tmp
 LOG="target/tmp/so-smoke-$(date -u +%Y%m%dT%H%M%SZ)-${MEGA2_SMOKE_CASE:-all}.log"
 set -o pipefail
-docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
   exec -T git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh \
   2>&1 | tee "$LOG"
 ```

@@ -1,6 +1,5 @@
-use crate::callisto::{mega_conversation, reactions};
+use crate::callisto::mega_conversation;
 
 pub struct ConvWithReactions {
     pub conversation: mega_conversation::Model,
-    pub reactions: Vec<reactions::Model>,
 }

@@ -17,20 +17,17 @@ The landing cases depend on the shared root writer specified in `trunk-push.md`.
 
 ## Test stack
 
-`docker-compose.test.yml` provides PostgreSQL, Redis, RustFS, optional
+`docker/docker-compose.test.yml` provides PostgreSQL, Redis, RustFS, optional
 profiled `git-cli`, profile `app` mega2, and profile `web` website-next.
-Use the fixed project name:
+The default data plane does not start an SMTP capture service. Use the
+fixed project name:
 
 ```bash
-docker compose -p mega2-it -f docker-compose.test.yml up -d --wait
+docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --wait
 ```
 
 The embedded `VaultCore` is part of mega2; no external Vault container is
 used. Database schemas must be created through the project's migrations.
-
-Mailpit remains an optional capture service for website authentication and
-website product-email IT only. Mega2 never connects to it, and neither
-the default integration suite nor CI requires a mega2 SMTP success path.
 
 ## Active integration targets
 
@@ -50,13 +47,13 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_git_ssh` filter `trunk_none` / `token_anon` | storage-only SSH 只读（plan-20260908 / SP-01）：`integration_git_ssh_trunk_none_anon_on_clone`、`integration_git_ssh_trunk_none_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_on_clone` | PostgreSQL, Redis；`--profile git` 或 host git |
 | `integration_git_ssh` filter `token_anon_off` / `review_pubkey` | storage-only SSH password-token（plan-20260908 / SP-02）：`integration_git_ssh_trunk_token_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_off_password_clone`、`integration_git_ssh_trunk_token_anon_off_password_fetch`、`integration_git_ssh_trunk_token_anon_off_password_pull`、`integration_git_ssh_trunk_token_push_receive_pack_disabled`、`integration_git_ssh_review_pubkey_anon_off_clone`、`integration_git_ssh_review_pubkey_anon_on_push` | PostgreSQL, Redis；host git + `127.0.0.1`（compose git-cli 无法 hairpin 时） |
 | `integration_website_auth` | Better Auth cookie to mega2 session bridge | `--profile app --profile web`, `WEBSITE_IT=1` |
-| `integration_website_mail` | Website internal product-email API acceptance (Bearer + allowlisted event → 202; bad bearer → 401) | `--profile app --profile web`, `WEBSITE_IT=1`, website tip with internal mail route |
 | `integration_authz_audit` | 只读装配零副作用黑盒（UN-30 / UN-43）+ `authz-audit` CLI（UN-29 审计/fsync + UN-37 promote） | PostgreSQL, Redis，且必须 `-- --test-threads=1` |
 | `integration_oci` | storage-only OCI `/v2` 进程级黑盒（plan-20260902 / DR-12）：`integration_oci_auth_matrix`、`integration_oci_protocol_walkthrough`、`integration_oci_docker_gated`（daemon 不可用 → SKIP，不 FAIL）；WH-04 追加 `integration_oci_storage_events_publication`（enabled+播种 secret 的 manifest 发布 201 + 一次有界投递日志 + digest 不符 400 + SIGINT 清理尾段） | PostgreSQL, Redis；raw HTTP（reqwest）；docker CLI 仅 `docker_gated` 组可选 |
 | `integration_api_write_trunk` | trunk 产品 API 写（plan-20260904 / AW-03；plan-20260917 LB-02..04；plan-20260918 FT-02..07）：token `create-entry` / `edit/save` 前进 tip、无 CL、无凭据 401；`delete_entry_*` 与 `move_entry_*` 覆盖目录与文件删移、双路径 401/403、traversal、ImportRepo 409、缺目录 404、`.gitkeep`、Review CL 复用与 tree 一致性；`tag_*`（8 例，含 `tag_path_isolation_same_name`）覆盖 storage-only tag 路由挂载、trunk 写鉴权、GET list、`(path, name)` 隔离与运行时 OpenAPI。每个 case 各自 boot 一次真实 `service http`。Compose 黑盒对照：`scripts/api_write_smoke_storage_only.sh` 的 `delete-entry-git-visible` / `move-entry-git-visible` / `tags-list-create-delete` / `delete-entry-unauth-401`（LB-05）以及 `delete-file-git-visible` / `move-file-git-visible` / `tags-get-list-create-delete` / `tags-path-get-delete` / `delete-file-unauth-401`（FT-07） | PostgreSQL, Redis；raw HTTP（reqwest）；`push_policy=trunk` + `push_auth=token`；必须 `-- --test-threads=1` |
 | `integration_agent_capture` | storage-only Agent Capture `/api/v1/agent-capture` 进程级黑盒（plan-20260911 / AC-13）：`integration_agent_capture_happy_path`、`integration_agent_capture_review_404`、`integration_agent_capture_unauthorized`、`integration_agent_capture_tracing_has_no_raw_sentinel`、`integration_agent_capture_cross_deployment_isolated`、`integration_agent_capture_tombstone_race`；WH-07 追加 `storage_events_batch`（enabled+播种 secret：OpenAPI 仍列 `events:batch`、`push_auth=none` 下无效 ingest token 401、有效 token 200、跨仓库 404、SIGINT 清理尾段；正向投递由 lib collector 覆盖）；WH-08 追加 `storage_events_checkpoint`（OpenAPI 仍列 checkpoints、无效 token 401、新/重复/共享 blob/incomplete 200、跨仓库 404；正向投递由 lib collector 覆盖） | PostgreSQL, Redis；隔离 local object backend；raw HTTP（reqwest）；`--test-threads=1` |
 | `integration_storage_events_runtime` | storage-only 出站事件关停接线进程级门（plan-20260912 / WH-13）：默认 disabled 的 `service http` SIGINT 优雅退出并记录 `storage_events_shutdown_complete`、占用端口启动失败仍经清理尾段、`service multi http` SIGINT 退出、`config validate` 无清理日志的 AC7 回归；WH-11 `secret_binding`：enabled+valid secret 经 `config secret set` 种子后启动/SIGINT 退出、enabled+missing 与 wrong-namespace 快速失败且日志无 SecretRef URI（脱敏）、disabled+dangling ref 正常启动 | PostgreSQL, Redis；`--test-threads=1` |
 | `integration_storage_events_git` | storage-only 出站 `repo.push` 进程级门（plan-20260912 / WH-03）：enabled+已播种 secret 下真实 host-git trunk push 落地、真实运输记录一次有界投递尝试（类别日志）、SIGINT 经清理尾段退出；review 形态拒绝 enabled；review 分支 push 建 CL 回归。WH-15 追加：每条 emitter 投递/drop 行带播种的 `installation_id`、drop 行不命中投递过滤器、被静态过滤的 seed push 恰好产生一条 `dropped_filter` 行（API 写用例为零条） | PostgreSQL, Redis；host git；`--test-threads=1` |
+| `integration_github_sync` | outbound GitHub-sync SSH session（plan-20260916 / GS-07）：`ssh_connect_authenticates` 钉住回环主机钥并对本地 russh 服务端完成 Ed25519 公钥认证 | 回环 only；不连 GitHub；`--test-threads=1` |
 
 storage-only outbound events（plan-20260912）地址策略、HMAC 运输与有界 emitter 由 lib 测试（`jupiter::service::storage_event_transport` / `storage_event_emitter`）覆盖；WH-15 的 drop 记账与 `installation_id` 记录字段由 `storage_event_emitter::tests::drop_accounting_and_installation_id`（thread-local tracing 捕获，覆盖七类 disposition、per-target 行、`record_invalid_event` 与 disabled/`-` 情形）覆盖，投递行的 `installation_id` 与「drop 行不命中投递过滤器」由 `integration_storage_events_git` 的 `assert_emitter_lines_carry_installation_id` 在真实进程 stdout 上断言；WH-13 的 CLI/service 关停接线与 WH-11 的启动 secret 绑定由进程级 target `integration_storage_events_runtime` 覆盖（见上表）。生产运输没有 HTTP/私网逃逸开关。WH-03 已在 B3 真实 push 提交挂钩（`repo.push`），进程级证据见 `integration_storage_events_git`；WH-07 Agent `events.committed` 的进程级认证/OpenAPI 证据见 `integration_agent_capture` 的 `storage_events_batch`；WH-08 checkpoint 见同 target 的 `storage_events_checkpoint`。
 
@@ -70,35 +67,30 @@ Integration test sources live under `tests/integration_*.rs` on the `mega2`
 package (lib `mega2_core`). Black-box tests drive the real CLI via
 `CARGO_BIN_EXE_mega2`.
 
-For the real website-session and internal-mail checks:
+For the real website-session check:
 
 ```bash
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile app --profile web up -d --wait
 source .env.test
 WEBSITE_IT=1 cargo test -p mega2 --test integration_website_auth -- --test-threads=1
-WEBSITE_IT=1 cargo test -p mega2 --test integration_website_mail -- --test-threads=1
 ```
 
 When `WEBSITE_IT=1` is set, unavailable mega2 or website-next endpoints
 are failures, not passing skips.
 
-## Notification and product-email coverage
+## Notification coverage
 
-Mega2 tests cover trigger selection, user preferences, in-app delivery,
-optional Slack/webhook handling, and the website-mail client’s request/error
-behavior. The website owns product-email rendering and delivery.
+Mega2 tests cover trigger selection, user preferences, and generic webhook
+delivery under `[notification.webhook]`. Product email is not a mega2
+outbound path; see the tombstone in [`website-mail.md`](./website-mail.md).
 
 Do not add or retain tests that:
 
 - seed or query `email_jobs`;
 - set `[mail]`, `mail.password`, or SMTP endpoint configuration;
-- require `SmtpMailer` to deliver to Mailpit;
-- treat Mailpit availability as a mega2 startup gate.
-
-Website email capture, if needed, belongs to website-next’s test provider
-configuration and may use the Compose `mailpit` service. See
-[`website-mail.md`](./website-mail.md).
+- require this repo to deliver mail or start an SMTP capture service;
+- treat SMTP capture availability as a mega2 startup gate.
 
 ## 授权首建与 shadow→enforce 集成（UN-02）
 
@@ -172,11 +164,10 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 ## CI
 
 `.github/workflows/config-validation.yml` runs formatting, Clippy, the
-compose-backed integration targets (including `integration_website_auth` and
-`integration_website_mail` under `WEBSITE_IT=1`), and the real website session
-check after checking out the `megaui` sibling. Product email is
-proven via the website internal API + `EMAIL_PROVIDER=test`; no local SMTP
-dependency is required for mega2 notification paths.
+compose-backed integration targets (including `integration_website_auth`
+under `WEBSITE_IT=1`), and the real website session check after checking
+out the `megaui` sibling. Mega2 notification paths do not require a local
+SMTP dependency.
 
 ## 只读装配的零副作用比对（UN-30 / UN-43）
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     path::{Path, PathBuf},
 };
@@ -8,10 +8,11 @@ use toml::Value;
 use url::Url;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig, LFSConfig,
-    LogConfig, MonoConfig, NotificationConfig, OAuthConfig, PackConfig, PushAuth, PushPolicy,
-    RedisConfig, VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
-    secret::{SecretRef, is_secret_ref_value},
+    ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig,
+    GithubSyncConfig, LFSConfig, LogConfig, MonoConfig, NotificationConfig, OAuthConfig,
+    PackConfig, PushAuth, PushPolicy, RedisConfig, VAULT_AUDIT_SINKS, VaultConfig,
+    normalize_token_path,
+    secret::{SecretRef, SecretResolver, is_secret_ref_value},
 };
 use crate::common::{errors::MegaError, oci_name::valid_repository_name};
 #[rustfmt::skip]
@@ -136,6 +137,7 @@ impl Config {
         validate_trunk_config_surface(self)?;
         validate_agent_capture_config(self)?;
         validate_storage_events_config(self)?;
+        validate_github_sync_config(self)?;
 
         Ok(())
     }
@@ -343,69 +345,6 @@ pub(crate) fn validate_vault_config(config: &VaultConfig) -> Result<(), MegaErro
 }
 
 pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaError> {
-    let website_mail_enabled = !config.website_mail_base_url.trim().is_empty();
-    // A present-but-blank bearer is not a configured bearer. `is_some()` alone
-    // let `MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER=` (or a whitespace value) pass
-    // validation, producing a service that boots healthy and then 401s on every
-    // product email forever — the website side never matches `Bearer <empty>`,
-    // and the failure is only a `warn!` in service.rs. Treat blank as unset so
-    // it falls into the "exactly one of ... is required" branch below.
-    let website_mail_bearer_count = usize::from(
-        config
-            .website_mail_bearer
-            .as_ref()
-            .is_some_and(|bearer| !bearer.expose_secret().trim().is_empty()),
-    ) + usize::from(config.website_mail_bearer_ref.is_some());
-    if website_mail_enabled {
-        let parsed = Url::parse(&config.website_mail_base_url).map_err(|_| {
-            MegaError::Other(
-                "notification.website_mail_base_url must be a valid HTTP(S) URL".to_string(),
-            )
-        })?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return Err(MegaError::Other(
-                "notification.website_mail_base_url must be a valid HTTP(S) URL".to_string(),
-            ));
-        }
-        if parsed.path() != "/" && !parsed.path().is_empty() {
-            return Err(MegaError::Other(
-                "notification.website_mail_base_url must not include a path".to_string(),
-            ));
-        }
-        if website_mail_bearer_count != 1 {
-            return Err(MegaError::Other(
-                "exactly one of notification.website_mail_bearer or notification.website_mail_bearer_ref is required when notification.website_mail_base_url is set".to_string(),
-            ));
-        }
-        if let Some(secret_ref) = &config.website_mail_bearer_ref {
-            validate_config_secret_ref(
-                "notification.website_mail_bearer_ref",
-                secret_ref,
-                "notification/website_mail/bearer",
-            )?;
-        }
-    } else if website_mail_bearer_count != 0 {
-        return Err(MegaError::Other(
-            "notification.website_mail_base_url is required when a website mail bearer is configured"
-                .to_string(),
-        ));
-    }
-
-    if let Some(slack) = &config.slack
-        && slack.enabled
-    {
-        let Some(secret_ref) = &slack.webhook_url_ref else {
-            return Err(MegaError::Other(
-                "notification.slack.webhook_url_ref is required when notification.slack.enabled is true".to_string(),
-            ));
-        };
-        validate_config_secret_ref(
-            "notification.slack.webhook_url_ref",
-            secret_ref,
-            "notification/slack/webhook_url",
-        )?;
-    }
-
     if let Some(webhook) = &config.webhook
         && webhook.enabled
     {
@@ -805,6 +744,219 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
             "[storage_events] shutdown_grace_seconds must be 0..=10".to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Global fail-closed gates for `[github_sync]` (plan-20260916 GS-04).
+/// `ssh_key_ref` is parsed and namespace-checked whenever it is non-empty,
+/// including `enabled=false`. Vault values are never resolved here (GS-05).
+pub(crate) fn validate_github_sync_config(config: &Config) -> Result<(), MegaError> {
+    validate_github_sync_config_inner(config, None)
+}
+
+fn validate_github_sync_config_inner(
+    config: &Config,
+    resolver: Option<&dyn SecretResolver>,
+) -> Result<(), MegaError> {
+    let sync = &config.github_sync;
+    const FIELD: &str = "github_sync.ssh_key_ref";
+    const SUFFIX: &str = "github_sync/ssh_key";
+    validate_github_sync_deadlines(sync)?;
+
+    if !sync.ssh_key_ref.is_empty() {
+        let secret_ref = parse_secret_ref_for_field(FIELD, &sync.ssh_key_ref)?;
+        validate_config_secret_ref(FIELD, &secret_ref, SUFFIX)?;
+    }
+    // AC-8: a resolver may be supplied by tests. Config validate never
+    // reads the vault value (GS-05).
+    let _do_not_resolve = resolver;
+
+    if !sync.enabled {
+        return validate_github_sync_bindings(config);
+    }
+
+    if config.git.push_auth.is_none() {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires git.push_auth (storage-only)".to_string(),
+        ));
+    }
+    if sync.bindings.is_empty() {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires a non-empty bindings list".to_string(),
+        ));
+    }
+    if config.monorepo.object_format != crate::config::MonoObjectFormat::Sha1 {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires monorepo.object_format=\"sha1\"".to_string(),
+        ));
+    }
+    if sync.ssh_host_key.trim().is_empty() {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires ssh_host_key".to_string(),
+        ));
+    }
+    if sync.ssh_key_ref.is_empty() {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires ssh_key_ref".to_string(),
+        ));
+    }
+
+    validate_github_sync_bindings(config)
+}
+
+fn validate_github_sync_deadlines(sync: &GithubSyncConfig) -> Result<(), MegaError> {
+    for (name, value) in [
+        ("advertise_timeout_seconds", sync.advertise_timeout_seconds),
+        ("send_timeout_seconds", sync.send_timeout_seconds),
+        ("report_timeout_seconds", sync.report_timeout_seconds),
+        ("exit_timeout_seconds", sync.exit_timeout_seconds),
+    ] {
+        if value == 0 {
+            return Err(MegaError::Other(format!(
+                "[github_sync] {name} must be > 0"
+            )));
+        }
+    }
+    if sync.diagnostic_budget_bytes < crate::config::MIN_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES {
+        return Err(MegaError::Other(format!(
+            "[github_sync] diagnostic_budget_bytes must be >= {}",
+            crate::config::MIN_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn github_sync_path_components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+fn github_sync_normalized_components(path: &str) -> Vec<&str> {
+    let mut components = Vec::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        if component == "." {
+            continue;
+        }
+        if component == ".." {
+            components.pop();
+            continue;
+        }
+        components.push(component);
+    }
+    components
+}
+
+fn github_sync_path_is_under(path: &str, ancestor: &str) -> bool {
+    let path_components = github_sync_path_components(path);
+    let ancestor_components = github_sync_path_components(ancestor);
+    path_components.starts_with(ancestor_components.as_slice())
+        && path_components.len() > ancestor_components.len()
+}
+
+fn github_sync_path_is_under_or_equal_normalized(path: &str, ancestor: &str) -> bool {
+    let path_components = github_sync_path_components(path);
+    let ancestor_components = github_sync_normalized_components(ancestor);
+    path_components.starts_with(ancestor_components.as_slice())
+        && path_components.len() >= ancestor_components.len()
+}
+
+fn github_sync_canonical_abs_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.contains("//")
+        && path
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn github_sync_binding_id_ok(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn github_sync_remote_segment_ok(segment: &str) -> bool {
+    if segment == "." || segment == ".." {
+        return false;
+    }
+    let mut bytes = segment.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == b'_' || first == b'-') {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+fn github_sync_binding_remote_ok(remote: &str) -> bool {
+    let mut parts = remote.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repo), None) => {
+            github_sync_remote_segment_ok(owner) && github_sync_remote_segment_ok(repo)
+        }
+        _ => false,
+    }
+}
+
+fn github_sync_unique_field<'a>(
+    seen: &mut BTreeMap<&'a str, usize>,
+    value: &'a str,
+    index: usize,
+    field: &str,
+) -> Result<(), MegaError> {
+    if let Some(&first) = seen.get(value) {
+        return Err(MegaError::Other(format!(
+            "[github_sync] bindings[{first}].{field} and bindings[{index}].{field} are not unique"
+        )));
+    }
+    seen.insert(value, index);
+    Ok(())
+}
+
+fn validate_github_sync_bindings(config: &Config) -> Result<(), MegaError> {
+    let import_dir = config.monorepo.import_dir.to_string_lossy();
+    let mut seen_ids = BTreeMap::new();
+    let mut seen_paths = BTreeMap::new();
+    let mut seen_remotes = BTreeMap::new();
+
+    for (offset, binding) in config.github_sync.bindings.iter().enumerate() {
+        let index = offset + 1;
+        if !github_sync_binding_id_ok(&binding.id) {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].id must be 1..32 [A-Za-z0-9_-] characters"
+            )));
+        }
+        github_sync_unique_field(&mut seen_ids, &binding.id, index, "id")?;
+
+        if !github_sync_canonical_abs_path(&binding.path) {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].path must be a canonical absolute path"
+            )));
+        }
+        if !github_sync_path_is_under(&binding.path, "/project") {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].path must be under /project (component boundary)"
+            )));
+        }
+        if github_sync_path_is_under_or_equal_normalized(&binding.path, import_dir.as_ref()) {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].path must not be under monorepo.import_dir"
+            )));
+        }
+        github_sync_unique_field(&mut seen_paths, &binding.path, index, "path")?;
+
+        if !github_sync_binding_remote_ok(&binding.remote) {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].remote must be <owner>/<repo>"
+            )));
+        }
+        github_sync_unique_field(&mut seen_remotes, &binding.remote, index, "remote")?;
+    }
+
     Ok(())
 }
 
@@ -1601,10 +1753,7 @@ fn is_sensitive_source_field_path(field_path: &str) -> bool {
             | "object_storage.s3.access_key_id"
             | "object_storage.s3.secret_access_key"
             | "object_storage.s3.endpoint_url"
-            | "notification.slack.webhook_url_ref"
             | "notification.webhook.token_ref"
-            | "notification.website_mail_bearer"
-            | "notification.website_mail_bearer_ref"
     )
 }
 
@@ -1774,6 +1923,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "oci",
             "agent_capture",
             "storage_events",
+            "github_sync",
             "cedar",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
@@ -1838,15 +1988,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "completed_retention_days",
         ]),
         "artifacts_gc" => Some(&["enable", "interval_secs", "grace_secs", "batch_limit"]),
-        "notification" => Some(&[
-            "enabled",
-            "website_mail_base_url",
-            "website_mail_bearer",
-            "website_mail_bearer_ref",
-            "slack",
-            "webhook",
-        ]),
-        "notification.slack" => Some(&["enabled", "webhook_url_ref"]),
+        "notification" => Some(&["enabled", "webhook"]),
         "notification.webhook" => Some(&["enabled", "url", "token_ref"]),
         "vault" => Some(&["audit"]),
         "vault.audit" => Some(&["enabled", "sink", "file_path", "fail_closed"]),
@@ -1897,6 +2039,20 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "agent_tenants",
             "agent_repo_paths",
         ]),
+        "github_sync" => Some(&[
+            "enabled",
+            "ssh_host",
+            "ssh_user",
+            "ssh_host_key",
+            "ssh_key_ref",
+            "bindings",
+            "advertise_timeout_seconds",
+            "send_timeout_seconds",
+            "report_timeout_seconds",
+            "exit_timeout_seconds",
+            "diagnostic_budget_bytes",
+        ]),
+        "github_sync.bindings" => Some(&["id", "path", "remote"]),
         "cedar" => Some(&["enforcement"]),
         _ => None,
     }
@@ -1904,10 +2060,17 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
     use super::*;
     use crate::config::{
-        PushAuth, PushPolicy, PushTokenConfig, StorageEventsTargetConfig,
-        template::config_init_template, testing::isolated_config,
+        GithubSyncBinding, MonoObjectFormat, PushAuth, PushPolicy, PushTokenConfig,
+        StorageEventsTargetConfig,
+        secret::{SecretRef, SecretResolver},
+        template::config_init_template,
+        testing::isolated_config,
     };
     #[rustfmt::skip]
     use crate::orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config};
@@ -1944,78 +2107,24 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_accepts_website_mail_it_bearer() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            website_mail_base_url: "http://website-next:7001".to_string(),
-            website_mail_bearer: Some(crate::config::secret::SecretString::new("it-shared-bearer")),
-            ..Default::default()
-        });
+    fn reject_unknown_fields_rejects_removed_product_email_keys() {
+        let removed = ["website_mail", "_base_url"].concat();
+        let value = toml::from_str::<Value>(&format!(
+            r#"
+            [notification]
+            enabled = true
+            {removed} = "https://website.internal"
+            "#
+        ))
+        .unwrap();
 
-        config
-            .validate()
-            .expect("website mail IT configuration should validate");
-    }
-
-    #[test]
-    fn config_validate_rejects_website_mail_without_single_bearer_source() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            website_mail_base_url: "http://website-next:7001".to_string(),
-            ..Default::default()
-        });
-
-        let err = config
-            .validate()
-            .expect_err("website mail must require a bearer source");
-        assert!(err.to_string().contains("website_mail_bearer"));
-    }
-
-    #[test]
-    fn config_validate_rejects_blank_website_mail_bearer() {
-        // `MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER=` (empty, or whitespace) used
-        // to satisfy the `is_some()` count, so the service booted healthy and
-        // then 401'd on every product email forever — a failure that only ever
-        // surfaces as a `warn!` in notification::service. A blank bearer is not
-        // a configured bearer.
-        for blank in ["", "   ", "\t\n"] {
-            let mut config = valid_config();
-            config.notification = Some(crate::config::NotificationConfig {
-                website_mail_base_url: "http://website-next:7001".to_string(),
-                website_mail_bearer: Some(crate::config::secret::SecretString::new(blank)),
-                ..Default::default()
-            });
-
-            let err = config
-                .validate()
-                .expect_err("a blank website mail bearer must not count as configured");
-            let message = err.to_string();
-            assert!(
-                message.contains("website_mail_bearer"),
-                "error should name the bearer field, got: {message}"
-            );
-            assert!(
-                !message.contains(blank) || blank.is_empty(),
-                "error must not echo the configured value"
-            );
-        }
-    }
-
-    #[test]
-    fn config_validate_rejects_blank_website_mail_bearer_even_without_base_url() {
-        // Mirror of the branch at the bottom of the mail block: a bearer with
-        // no base_url is an error, but a *blank* bearer alone must not trip it
-        // (nothing is configured, so nothing is inconsistent).
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            website_mail_base_url: String::new(),
-            website_mail_bearer: Some(crate::config::secret::SecretString::new("   ")),
-            ..Default::default()
-        });
-
-        config
-            .validate()
-            .expect("a blank bearer with no base_url is simply 'mail disabled'");
+        let err =
+            reject_unknown_fields(&value).expect_err("removed product-email keys must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("notification.{removed}")),
+            "{message}"
+        );
     }
 
     #[test]
@@ -2046,70 +2155,23 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_rejects_enabled_slack_without_webhook_url_ref() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            slack: Some(crate::config::SlackConfig {
-                enabled: true,
-                webhook_url_ref: None,
-            }),
-            ..Default::default()
-        });
+    fn reject_unknown_fields_rejects_removed_incoming_webhook_section() {
+        let removed = ["sl", "ack"].concat();
+        let value = toml::from_str::<Value>(&format!(
+            r#"
+            [notification.{removed}]
+            enabled = true
+            "#
+        ))
+        .unwrap();
 
-        let err = config
-            .validate()
-            .expect_err("enabled slack without webhook_url_ref should fail");
-        assert!(
-            err.to_string()
-                .contains("notification.slack.webhook_url_ref")
-        );
-    }
-
-    #[test]
-    fn config_validate_rejects_slack_secret_ref_outside_namespace_without_leaking_ref() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            slack: Some(crate::config::SlackConfig {
-                enabled: true,
-                webhook_url_ref: Some(
-                    crate::config::secret::SecretRef::parse(
-                        "vault://secret/config/prod/mail/password#value",
-                    )
-                    .unwrap(),
-                ),
-            }),
-            ..Default::default()
-        });
-
-        let err = config
-            .validate()
-            .expect_err("slack secret ref outside namespace should fail");
+        let err = reject_unknown_fields(&value)
+            .expect_err("removed incoming-webhook section must fail closed");
         let message = err.to_string();
-        assert!(message.contains("notification.slack.webhook_url_ref"));
-        assert!(message.contains("notification/slack/webhook_url"));
-        // The SecretRef value must not leak.
-        assert!(!message.contains("config/prod/mail/password"));
-    }
-
-    #[test]
-    fn config_validate_accepts_enabled_slack_with_correct_namespace() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            slack: Some(crate::config::SlackConfig {
-                enabled: true,
-                webhook_url_ref: Some(
-                    crate::config::secret::SecretRef::parse(
-                        "vault://secret/config/prod/notification/slack/webhook_url#value",
-                    )
-                    .unwrap(),
-                ),
-            }),
-            ..Default::default()
-        });
-
-        config
-            .validate()
-            .expect("slack with correct namespace should validate");
+        assert!(
+            message.contains(&format!("notification.{removed}")),
+            "{message}"
+        );
     }
 
     #[test]
@@ -3012,10 +3074,6 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"
-            [notification.slack]
-            enabled = true
-            webhook_url_ref = "vault://secret/config/base/notification/slack/webhook_url#value"
-
             [notification.webhook]
             enabled = true
             url = "https://hooks.example.test/webhook"
@@ -3026,8 +3084,8 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"
-            [notification.slack]
-            webhook_url_ref = "vault://secret/config/prod/notification/slack/webhook_url#value"
+            [notification.webhook]
+            token_ref = "vault://secret/config/prod/notification/webhook/token#value"
             "#,
         )
         .expect("write profile config");
@@ -3035,7 +3093,7 @@ mod tests {
         let diagnostics = collect_source_diagnostics_from_keys(
             Some(&config_path),
             Some(&profile_path),
-            ["MEGA_NOTIFICATION__SLACK__WEBHOOK_URL_REF"],
+            ["MEGA_NOTIFICATION__WEBHOOK__TOKEN_REF"],
         )
         .expect("diagnostics should collect");
         let source_fields = diagnostics
@@ -3053,22 +3111,15 @@ mod tests {
 
         assert!(
             source_fields.iter().any(|message| {
-                message.contains("notification.slack.webhook_url_ref")
-                    && message.contains("base file")
-            }),
-            "missing slack webhook_url_ref base field: {source_text}"
-        );
-        assert!(
-            source_fields.iter().any(|message| {
                 message.contains("notification.webhook.token_ref") && message.contains("base file")
             }),
             "missing webhook token_ref base field: {source_text}"
         );
         assert!(
-            override_text.contains("notification.slack.webhook_url_ref")
+            override_text.contains("notification.webhook.token_ref")
                 && override_text.contains("profile file")
                 && override_text.contains("base file"),
-            "missing slack webhook_url_ref override: {override_text}"
+            "missing webhook token_ref override: {override_text}"
         );
         assert!(
             source_text.contains("sensitive values are omitted"),
@@ -3077,10 +3128,6 @@ mod tests {
         assert!(
             !source_text.contains("vault://secret/"),
             "source diagnostics leaked notification SecretRef URI: {source_text}"
-        );
-        assert!(
-            !source_text.contains("config/prod/notification/slack/webhook_url"),
-            "source diagnostics leaked notification vault path: {source_text}"
         );
         assert!(
             !source_text.contains("config/base/notification/webhook/token"),
@@ -3904,5 +3951,352 @@ mod tests {
                 );
             }
         }
+    }
+
+    const GITHUB_SYNC_KEY_REF: &str = "vault://secret/config/example/github_sync/ssh_key#value";
+    const GITHUB_SYNC_KEY_REF_MARKER: &str = "gs04-redact-token";
+
+    fn github_sync_enabled_base() -> Config {
+        let mut config = storage_only_none();
+        config.github_sync.enabled = true;
+        config.github_sync.ssh_host_key = "ssh-ed25519 AAAA".to_string();
+        config.github_sync.ssh_key_ref = GITHUB_SYNC_KEY_REF.to_string();
+        config.github_sync.bindings = vec![GithubSyncBinding {
+            id: "core".to_string(),
+            path: "/project/core".to_string(),
+            remote: "example/core".to_string(),
+        }];
+        config
+    }
+
+    fn distinctive_github_sync_ref() -> String {
+        format!("vault://secret/config/example/github_sync/ssh_key#{GITHUB_SYNC_KEY_REF_MARKER}")
+    }
+
+    #[test]
+    fn github_sync_global_gates() {
+        github_sync_enabled_base()
+            .validate()
+            .expect("storage-only sha1 plus host key, namespaced ref, and one binding");
+
+        let mut no_auth = valid_config();
+        no_auth.github_sync.enabled = true;
+        no_auth.github_sync.ssh_host_key = "ssh-ed25519 AAAA".to_string();
+        no_auth.github_sync.ssh_key_ref = GITHUB_SYNC_KEY_REF.to_string();
+        no_auth.github_sync.bindings = vec![GithubSyncBinding {
+            id: "core".to_string(),
+            path: "/project/core".to_string(),
+            remote: "example/core".to_string(),
+        }];
+        let err = no_auth
+            .validate()
+            .expect_err("enabled=true requires git.push_auth");
+        assert!(err.to_string().contains("git.push_auth"), "{err}");
+        assert!(err.to_string().contains("[github_sync]"), "{err}");
+
+        let mut empty_bindings = github_sync_enabled_base();
+        empty_bindings.github_sync.bindings.clear();
+        let err = empty_bindings
+            .validate()
+            .expect_err("enabled=true requires bindings");
+        assert!(err.to_string().contains("bindings"), "{err}");
+
+        let mut bad_hash = github_sync_enabled_base();
+        bad_hash.monorepo.object_format = MonoObjectFormat::Sha256;
+        let err = bad_hash.validate().expect_err("enabled=true requires sha1");
+        assert!(err.to_string().contains("object_format"), "{err}");
+        assert!(err.to_string().contains("sha1"), "{err}");
+
+        let mut empty_host_key = github_sync_enabled_base();
+        empty_host_key.github_sync.ssh_host_key.clear();
+        let err = empty_host_key
+            .validate()
+            .expect_err("enabled=true requires ssh_host_key");
+        assert!(err.to_string().contains("ssh_host_key"), "{err}");
+
+        let mut empty_ref = github_sync_enabled_base();
+        empty_ref.github_sync.ssh_key_ref.clear();
+        let err = empty_ref
+            .validate()
+            .expect_err("enabled=true requires ssh_key_ref");
+        assert!(err.to_string().contains("ssh_key_ref"), "{err}");
+
+        let mut bad_ns = github_sync_enabled_base();
+        bad_ns.github_sync.ssh_key_ref =
+            "vault://secret/config/example/other/ssh_key#value".to_string();
+        let err = bad_ns
+            .validate()
+            .expect_err("enabled=true rejects the wrong SecretRef namespace");
+        assert!(err.to_string().contains("github_sync.ssh_key_ref"), "{err}");
+    }
+
+    struct CountingResolver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SecretResolver for CountingResolver {
+        async fn resolve(&self, _: &SecretRef) -> Result<String, MegaError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(MegaError::Other(
+                "github_sync validate must not resolve vault".to_string(),
+            ))
+        }
+
+        async fn evict(&self, _: &SecretRef) {}
+
+        async fn evict_all(&self) {}
+    }
+
+    #[test]
+    fn github_sync_disabled_validation_layers() {
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let mut disabled = valid_config();
+        disabled.github_sync.ssh_key_ref = GITHUB_SYNC_KEY_REF.to_string();
+        super::validate_github_sync_config_inner(&disabled, Some(&resolver))
+            .expect("disabled mode still accepts a namespaced ssh_key_ref");
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            0,
+            "disabled validate must not resolve vault"
+        );
+        disabled
+            .validate()
+            .expect("public validate path also skips vault");
+
+        let mut missing_field = valid_config();
+        missing_field.github_sync.ssh_key_ref =
+            "vault://secret/config/example/github_sync/ssh_key".to_string();
+        let err = missing_field
+            .validate()
+            .expect_err("disabled mode still parses ssh_key_ref");
+        assert!(err.to_string().contains("github_sync.ssh_key_ref"), "{err}");
+        assert!(err.to_string().contains("#field"), "{err}");
+
+        let mut wrong_ns = valid_config();
+        wrong_ns.github_sync.ssh_key_ref =
+            "vault://secret/config/example/other/ssh_key#value".to_string();
+        let err = wrong_ns
+            .validate()
+            .expect_err("disabled mode still checks the namespace");
+        assert!(err.to_string().contains("github_sync.ssh_key_ref"), "{err}");
+    }
+
+    #[test]
+    fn github_sync_errors_redact_secret_ref() {
+        let leaked = distinctive_github_sync_ref();
+        let cases: Vec<(&str, Config)> = vec![
+            ("disabled-parse", {
+                let mut config = valid_config();
+                config.github_sync.ssh_key_ref = format!(
+                    "vault://secret/config/example/github_sync/ssh_key{GITHUB_SYNC_KEY_REF_MARKER}"
+                );
+                config
+            }),
+            ("disabled-namespace", {
+                let mut config = valid_config();
+                config.github_sync.ssh_key_ref = format!(
+                    "vault://secret/config/example/other/ssh_key#{GITHUB_SYNC_KEY_REF_MARKER}"
+                );
+                config
+            }),
+            ("enabled-push-auth", {
+                let mut config = valid_config();
+                config.github_sync.enabled = true;
+                config.github_sync.ssh_host_key = "ssh-ed25519 AAAA".to_string();
+                config.github_sync.ssh_key_ref = leaked.clone();
+                config.github_sync.bindings = vec![GithubSyncBinding {
+                    id: "core".to_string(),
+                    path: "/project/core".to_string(),
+                    remote: "example/core".to_string(),
+                }];
+                config
+            }),
+            ("enabled-bindings", {
+                let mut config = github_sync_enabled_base();
+                config.github_sync.ssh_key_ref = leaked.clone();
+                config.github_sync.bindings.clear();
+                config
+            }),
+            ("enabled-object-format", {
+                let mut config = github_sync_enabled_base();
+                config.github_sync.ssh_key_ref = leaked.clone();
+                config.monorepo.object_format = MonoObjectFormat::Sha256;
+                config
+            }),
+            ("enabled-host-key", {
+                let mut config = github_sync_enabled_base();
+                config.github_sync.ssh_key_ref = leaked.clone();
+                config.github_sync.ssh_host_key.clear();
+                config
+            }),
+            ("enabled-namespace", {
+                let mut config = github_sync_enabled_base();
+                config.github_sync.ssh_key_ref = leaked
+                    .clone()
+                    .replace("github_sync/ssh_key", "other/ssh_key");
+                config
+            }),
+        ];
+
+        for (label, config) in cases {
+            let err = config
+                .validate()
+                .expect_err(&format!("{label} must fail closed"));
+            let message = err.to_string();
+            assert!(
+                !message.contains(&leaked),
+                "{label} leaked ssh_key_ref: {message}"
+            );
+            assert!(
+                !message.contains(GITHUB_SYNC_KEY_REF_MARKER),
+                "{label} leaked the secret-ref marker: {message}"
+            );
+        }
+    }
+
+    fn github_sync_binding(id: &str, path: &str, remote: &str) -> GithubSyncBinding {
+        GithubSyncBinding {
+            id: id.to_string(),
+            path: path.to_string(),
+            remote: remote.to_string(),
+        }
+    }
+
+    #[test]
+    fn github_sync_binding_identity() {
+        github_sync_enabled_base()
+            .validate()
+            .expect("the GS-04 happy path binding remains valid");
+
+        let mut empty_id = github_sync_enabled_base();
+        empty_id.github_sync.bindings[0].id.clear();
+        let err = empty_id.validate().expect_err("empty id");
+        assert!(err.to_string().contains("bindings[1].id"), "{err}");
+        assert!(err.to_string().contains("1..32"), "{err}");
+
+        let mut too_long = github_sync_enabled_base();
+        too_long.github_sync.bindings[0].id = "a".repeat(33);
+        let err = too_long.validate().expect_err("id longer than 32");
+        assert!(err.to_string().contains("bindings[1].id"), "{err}");
+
+        let mut dotted = github_sync_enabled_base();
+        dotted.github_sync.bindings[0].id = "core.id".to_string();
+        let err = dotted.validate().expect_err("id rejects '.'");
+        assert!(err.to_string().contains("bindings[1].id"), "{err}");
+
+        let mut duplicate = github_sync_enabled_base();
+        duplicate.github_sync.bindings = vec![
+            github_sync_binding("core", "/project/core", "example/core"),
+            github_sync_binding("core", "/project/other", "example/other"),
+        ];
+        let err = duplicate.validate().expect_err("duplicate id");
+        let message = err.to_string();
+        assert!(message.contains("bindings[1].id"), "{err}");
+        assert!(message.contains("bindings[2].id"), "{err}");
+        assert!(message.contains("not unique"), "{err}");
+    }
+
+    #[test]
+    fn github_sync_binding_path() {
+        let mut relative = github_sync_enabled_base();
+        relative.github_sync.bindings[0].path = "project/core".to_string();
+        let err = relative.validate().expect_err("relative path");
+        assert!(err.to_string().contains("canonical absolute path"), "{err}");
+
+        for invalid in [
+            "/project/./core",
+            "/project/../core",
+            "/project//core",
+            "/project/core/",
+        ] {
+            let mut config = github_sync_enabled_base();
+            config.github_sync.bindings[0].path = invalid.to_string();
+            let err = config
+                .validate()
+                .expect_err(&format!("{invalid} must be rejected"));
+            assert!(
+                err.to_string().contains("canonical absolute path"),
+                "{invalid}: {err}"
+            );
+        }
+
+        let mut sibling = github_sync_enabled_base();
+        sibling.github_sync.bindings[0].path = "/projectX/core".to_string();
+        let err = sibling
+            .validate()
+            .expect_err("/projectX is not under /project");
+        assert!(err.to_string().contains("under /project"), "{err}");
+        assert!(err.to_string().contains("component boundary"), "{err}");
+
+        let mut root_only = github_sync_enabled_base();
+        root_only.github_sync.bindings[0].path = "/project".to_string();
+        let err = root_only
+            .validate()
+            .expect_err("/project itself is not under /project");
+        assert!(err.to_string().contains("under /project"), "{err}");
+
+        let mut imported = github_sync_enabled_base();
+        imported.monorepo.import_dir = PathBuf::from("/project/vendor");
+        imported.github_sync.bindings[0].path = "/project/vendor/lib".to_string();
+        let err = imported.validate().expect_err("path under import_dir");
+        assert!(err.to_string().contains("monorepo.import_dir"), "{err}");
+
+        let mut dotted_import = github_sync_enabled_base();
+        dotted_import.monorepo.import_dir = PathBuf::from("/project/./vendor");
+        dotted_import.github_sync.bindings[0].path = "/project/vendor/lib".to_string();
+        let err = dotted_import
+            .validate()
+            .expect_err("noncanonical import_dir still covers the subtree");
+        assert!(err.to_string().contains("monorepo.import_dir"), "{err}");
+
+        let mut duplicate = github_sync_enabled_base();
+        duplicate.github_sync.bindings = vec![
+            github_sync_binding("core", "/project/core", "example/core"),
+            github_sync_binding("other", "/project/core", "example/other"),
+        ];
+        let err = duplicate.validate().expect_err("duplicate path");
+        let message = err.to_string();
+        assert!(message.contains("bindings[1].path"), "{err}");
+        assert!(message.contains("bindings[2].path"), "{err}");
+    }
+
+    #[test]
+    fn github_sync_binding_remote() {
+        for invalid in [
+            "../repo",
+            "./repo",
+            "owner/..",
+            "owner/.",
+            "owner/re po",
+            "owner/re;po",
+            "owner/$()",
+        ] {
+            let mut config = github_sync_enabled_base();
+            config.github_sync.bindings[0].remote = invalid.to_string();
+            let err = config
+                .validate()
+                .expect_err(&format!("{invalid} must be rejected"));
+            assert!(
+                err.to_string().contains("bindings[1].remote"),
+                "{invalid}: {err}"
+            );
+            assert!(
+                err.to_string().contains("<owner>/<repo>"),
+                "{invalid}: {err}"
+            );
+        }
+
+        let mut duplicate = github_sync_enabled_base();
+        duplicate.github_sync.bindings = vec![
+            github_sync_binding("core", "/project/core", "example/core"),
+            github_sync_binding("other", "/project/other", "example/core"),
+        ];
+        let err = duplicate.validate().expect_err("duplicate remote");
+        let message = err.to_string();
+        assert!(message.contains("bindings[1].remote"), "{err}");
+        assert!(message.contains("bindings[2].remote"), "{err}");
     }
 }

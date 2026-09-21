@@ -55,20 +55,3 @@ pub struct RepoPermissions {
     pub maintainer: Vec<String>,
     pub reader: Vec<String>,
 }
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ClaSignStatusRes {
-    pub username: String,
-    pub cla_signed: bool,
-    pub cla_signed_at: Option<i64>,
-}
-
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct UpdateClaContentPayload {
-    pub content: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ClaContentRes {
-    pub content: String,
-}

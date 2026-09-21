@@ -15,8 +15,7 @@
 //! at every writer entry point); until then the coordinator exists but
 //! is not wired into ref updates and is gated off by configuration.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 
 use crate::ceres::snapshot::error::{SnapshotError, SnapshotErrorCode};
 
@@ -306,8 +305,7 @@ pub mod mem {
 
 #[cfg(test)]
 mod tests {
-    use super::mem::InMemoryPublicationStore;
-    use super::*;
+    use super::{mem::InMemoryPublicationStore, *};
 
     fn req(op: &str, old: &str, new: &str) -> PrepareRequest {
         PrepareRequest {

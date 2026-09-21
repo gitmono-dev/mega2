@@ -14,7 +14,7 @@ before submitting.
 - **Entry point:** `src/main.rs` → `cli::parse(None)`.
 - **Config:** TOML loaded from `config/config.toml` (override via `--config`
   flag or `MEGA_CONFIG` env var). Loader lives in
-  `src/common/config/loader.rs`.
+  `src/config/loader.rs`.
 
 ## Tech Stack
 
@@ -26,8 +26,9 @@ before submitting.
 - **Storage / DB:** `sea-orm` 1.1 (Postgres + SQLite, `runtime-tokio-rustls`)
   and `sea-orm-migration`. Entities are in `src/callisto/`.
 - **Cache / queue:** `redis` (with `connection-manager`).
-- **Auth / policy:** `cedar-policy` (schema in `src/mega.cedarschema`,
-  policies in `src/mega_policies.cedar`).
+- **Auth / policy:** `cedar-policy` (schema in
+  `src/contract/policy/mega.cedarschema`, policies in
+  `src/contract/policy/mega_policies.cedar`).
 - **Crypto / TLS:** `rustls`, `ring`, `openssl`, `ed25519-dalek`, `rsa`,
   `secp256k1`, `pgp`. Vault‑style PKI/secret engine via the `libvault` crate
   (crates.io `0.3.0`, features `storage_pg` + `crypto_adaptor_openssl`) and the
@@ -119,7 +120,8 @@ src/
 ├── orbit/                # object_store backends (adapter, factory)
 ├── bin/                  # auxiliary binaries (e.g. migrate_local_to_s3)
 ├── commands/             # subcommand registry (builtin / builtin_exec)
-├── common/               # config loader, error types (MegaError/MegaResult), utils
+├── common/               # error types (MegaError/MegaResult), utils
+├── config/               # config loader, profiles, SecretRef, hot reload
 ├── api/                  # axum HTTP API surface
 ├── api_model/            # request/response DTOs (utoipa schemas)
 ├── server/               # HTTP/SSH/etc. server bootstrap
@@ -133,13 +135,13 @@ src/
 ├── notification/         # email notifications: dispatcher, triggers, storage
 ├── email/                # Mailer trait + impls (incl. NoopMailer)
 ├── contract/
+│   ├── policy/           # cedar authz: mega.cedarschema, mega_policies.cedar
 │   └── vault/            # PKI / KV / secret engine integration layer over the
 │       │                 # `libvault` crate (no vendored module since 2026-08-21)
 │       └── integration/
 │           ├── jupiter_backend.rs
 │           └── vault_core.rs # VaultCore, VaultCoreInterface
 ├── ceres/  context/
-└── mega.cedarschema, mega_policies.cedar
 tests/                    # process-level integration tests (integration_*.rs)
 target/                   # build artifacts (gitignored)
 ```
@@ -172,6 +174,25 @@ concrete backend is built through `crate::jupiter::storage::object_storage::buil
   comments to files that don't already use them.
 - **Files / modules:** snake_case filenames, one module per file, `mod.rs`
   only for directory module roots.
+
+## Documentation Conventions
+
+- **Bilingual guide docs:** the user-facing guides under `docs/`
+  (`quick-start`, `user-guide`, `configuration`, `deployment`,
+  `architecture`, `contributing`) ship in two languages. English is the
+  default file (`<name>.md`); Chinese lives in the `<name>.zh.md` sibling
+  (same convention as `README.md` / `README.zh.md`). Write the Chinese
+  version first, then translate; both versions must keep identical
+  structure, carry the language switcher line at the top, and cross-link
+  within the same language (zh → `.zh.md`, en → `.md`). When you change
+  one language version of a guide, update the other in the same change.
+- **Link, don't copy:** facts that have an authoritative home
+  (`config/config.toml`, `docs/monorepo.md`, `docs/deploy-trunk.md`,
+  `docs/refactoring/*.md`) are linked, not duplicated. Every relative link
+  in a doc must resolve to a file in the current checkout.
+- **Plan docs** under `docs/plan/` follow `docs/plan/README.md` and the
+  plan templates; they are Chinese-first and unchanged by the bilingual
+  convention above.
 
 ## Common Pitfalls (please read before editing tests or `vault`)
 

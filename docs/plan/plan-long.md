@@ -100,11 +100,11 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | `src/config/` 一级配置体系 | LoadMode、SecretRef/resolver、`config` 命令族、集中校验、Profile、测试分层、受控热加载已交付；对象存储与 Redis 凭据均已支持 post-vault `SecretRef`（`docs/refactoring/config.md`、`vault.md`） | PT-10 的起点；所有服务的配置承载 |
 | `src/contract/` 边界归并 | api/git_protocol/policy/vault 四域归并完成，旧路径无兼容层（`docs/refactoring/contract.md`） | 新移植模块的落点规范 |
 | Vault（crates.io `libvault` 0.3.0 crate + 集成层） | A–J 阶段可交付子集完成：fail-closed、DB-only bootstrap、root token 退役、unseal share rekey、backup/restore、可配置 file audit sink 和 fail-closed 审计策略（`docs/refactoring/vault.md`）；依赖形态已由 vendored 迁回 crates.io `libvault`，UN-31 只读引导在集成层重建（[`plan-20260820.md`](plan-20260820.md)） | PT-11 的起点；凭据类 PT 的前置 |
-| `src/notification/`（邮件投递在 website） | in-app / Slack / generic webhook 编排已交付，渠道凭据经 SecretRef；本仓 SMTP/`[mail]`/`email_jobs` 已移除，产品邮件经 website 内部 API（ADR-WA-08；`docs/refactoring/website-mail.md`） | PT-09 的起点 |
+| `src/notification/`（出站只剩 generic webhook） | 本仓出站只保留 `[notification.webhook]`（外加无关的 `[storage_events]`）；SMTP / Slack / in-app inbox / website-mail 客户端已拆除（[`plan-20260919.md`](plan-20260919.md)）；渠道凭据经 SecretRef | PT-09 的起点 |
 | orbit 对象存储（内联） | `src/orbit_api/` + `src/orbit/` 单 package；`object_store` cloud features 在 core 编译图 | LFS/artifact/构建产物的存储承载 |
 | Git smart HTTP/SSH 协议 | `info/refs` 严格化、fallible pkt-line parser、SSH exec parser、per-channel state、认证上下文、delete-only receive-pack、capability truth table、HTTP LFS 边界与首批真实 CLI smoke 已交付；HTTP/SSH 仍完整缓冲请求/通道（`docs/refactoring/protocol.md`） | PT-03/PT-04 的起点 |
 | bellatrix（orion-client 部分移植） | build dispatch 路径可用，替代 Mega mono 的 `orion_build_dispatch.rs` | PT-06/PT-07/PT-08 的客户端侧基础 |
-| 集成测试基建 | docker-compose 测试栈（Postgres/Redis/Mailpit/RustFS/git-cli/`website-next`，`-p mega2-it`）、`integration_vault` / `integration_git_cli` / `integration_website_auth` 黑盒；mailpit **消费方 = website IT**（非本仓 SMTP）；CI `config-validation.yml` 与 `git-protocol-smoke.yml` | 全部 PT 的验收承载；PT-01 收口最小矩阵；PT-04 的 SSH/LFS 与完整协议矩阵已进入 `plan-20260803.md` |
+| 集成测试基建 | docker-compose 测试栈（Postgres/Redis/RustFS/git-cli/`website-next`，`-p mega2-it`）、`integration_vault` / `integration_git_cli` / `integration_website_auth` 黑盒；本仓数据面不启动 SMTP 捕获服务；CI `config-validation.yml` 与 `git-protocol-smoke.yml` | 全部 PT 的验收承载；PT-01 收口最小矩阵；PT-04 的 SSH/LFS 与完整协议矩阵已进入 `plan-20260803.md` |
 
 ## 长期功能总览
 
@@ -118,7 +118,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | PT-06 | Orion Server 构建控制面移植 | P1 | 已验证 | 整体缺失；mega2 仅保留消费侧 API 面（buck/artifacts/build_trigger router）与 bellatrix 客户端 | `mega/orion-server/`、`mega/mono/src/api` 的 orion_runner_router | 无 | 2026-07-27 |
 | PT-07 | Orion 构建执行 Agent 移植 | P1 | 已验证 | runner（ws 客户端、buck_controller、disk/repo 管理）整体缺失 | `mega/orion/` | 无 | 2026-07-27 |
 | PT-08 | Orion Scheduler、VM 弹性调度与客户端 API 面补齐 | P2 | 已验证 | scheduler 与 orion-scheduler-client 未移植；bellatrix 仅覆盖 build dispatch，完整 OrionBuildClient API 面未核对 | `mega/orion-scheduler/`、`mega/clients/` | 无 | 2026-07-27 |
-| PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | **本仓邮件投递已移除**；**website 内部产品邮件 API、Slack 与 generic webhook 均已落地**，渠道凭据经 SecretRef；compose `mailpit` 消费方 = website IT。剩余：build 完成触发器、次渠道 retry（`DEFER-IT-10`）、真实多进程/多实例黑盒矩阵 | `mega/mono/src/notification/`、campsite slack 参考 | [`plan-20260731.md`](plan-20260731.md)（MN-01..MN-06）；[`plan-20260802.md`](plan-20260802.md)（WE-* / DEP-06） | 2026-08-03 |
+| PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | **本仓出站只剩 generic webhook**（`[notification.webhook]`；外加无关的 `[storage_events]`）。SMTP / Slack / in-app inbox / website-mail 客户端已拆除（[`plan-20260919.md`](plan-20260919.md)）。剩余：build 完成触发器、次渠道 retry（`DEFER-IT-10`）、真实多进程/多实例黑盒矩阵（对象改为 webhook，不在 60919 实现） | `mega/mono/src/notification/` | [`plan-20260731.md`](plan-20260731.md)（MN-01..MN-06）；[`plan-20260802.md`](plan-20260802.md)（WE-* / DEP-06）；[`plan-20260919.md`](plan-20260919.md)（出站拆除） | 2026-09-19 |
 | PT-10 | 配置体系与 SecretRef 收尾 | P2 | 实施中 | 对象存储与 Redis SecretRef、`[oauth]`、跨 source/profile diagnostics 和首批热加载黑盒均已落地；剩余为真实消费者订阅清单、跨 await 生命周期审计与持续扩展，而非启动顺序改造 | `mega/common/src/config`（基线对照） | [`plan-20260731.md`](plan-20260731.md)（AU-02；`[oauth]`） | 2026-08-03 |
 | PT-11 | Vault 安全工程收尾 | P2 | 实施中 | file 持久化 audit sink、可选 fail-closed、backup/restore、unseal share rekey 已交付；仍缺 KEK 轮换（无 RustyVault 原语）、异地/HTTP audit sink、外部托管 root recovery 与格式版本策略；**依赖形态**（vendored → crates.io `libvault` 0.3.0 + UN-31 只读模式集成层重建）已由 [`plan-20260820.md`](plan-20260820.md) 于 2026-08-21 交付，本 PT 安全收尾缺口不变 | `mega/vault/`（基线对照） | [`plan-20260820.md`](plan-20260820.md)（依赖形态；非 KEK/审计 sink） | 2026-08-21 |
 | PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已实现；**身份键迁移**已由 [`plan-20260812.md`](plan-20260812.md) UN-05 handoff 移交本 PT（DEP-04 outgoing，实际移交 **2026-08-17**；DEFER-UN-04 八项承接约束）；Mega #2145 账户审批、#2147 Cedar 管理及 #2165..#2169 的 identity/Cedar reviewer 域扩大全量 moon↔`apps/next-app` 对照范围；monoui `mega2` 分支 pin 须执行期确认；全量对照仍候选 | monoui `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW）；handoff [`plan-20260812.md`](plan-20260812.md) UN-05/DEP-04 | 2026-08-17 |
@@ -131,7 +131,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | ID | 修复主题 | 优先级 | 当前判断 | 阻断范围 |
 |---|---|---:|---|---|
 | SB-01 | 消除生产路径残余 panic/unwrap | P1 | 协议 response builder、`repo.rs` 路径转换、config 残余加载路径等仍有未收敛点 | 协议、API、配置加载、全部服务可靠性 |
-| SB-02 | 凭据与 secret 边界持续收敛 | P1 | 本仓 `mail.password`/SMTP 已随 ADR-WA-08 移除；剩余 redaction 覆盖面、resolver 缓存失效语义、website-mail bearer / 对象存储 SecretRef 收敛 | vault、对象存储、通知渠道（website-mail client） |
+| SB-02 | 凭据与 secret 边界持续收敛 | P1 | 本仓 `mail.password`/SMTP 与 website-mail bearer 已移除；剩余 redaction 覆盖面、resolver 缓存失效语义、对象存储 / Redis / `[notification.webhook]` SecretRef 收敛 | vault、对象存储、webhook 渠道凭据 |
 | SB-03 | 测试门禁、Docker 测试栈与 CI 可信度 | P1/P2 | 三道门禁与 docker-compose 栈运行良好；PT-01 最小真实 Git CLI + 双实例 dispatcher 基线已落地；SSH/LFS 完整矩阵与真多进程黑盒仍缺 | CI 稳定性、回归可信度与全部 PT 的验收承载 |
 
 ### SB-01：消除生产路径残余 panic/unwrap
@@ -157,8 +157,8 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 
 #### 当前风险
 
-- 本仓 SMTP / `mail.password` 已移除（ADR-WA-08）；website-mail bearer 与对象存储等凭据的 SecretRef / 脱敏覆盖仍须持续收敛。
-- redaction/SecretString 覆盖面（对象存储 key、外部服务 URL、website-mail bearer）未完全扩展。
+- 本仓 SMTP / `mail.password` 与 website-mail bearer 已移除（ADR-WA-08 / plan-20260919）；对象存储、Redis 与 `[notification.webhook]` 等凭据的 SecretRef / 脱敏覆盖仍须持续收敛。
+- redaction/SecretString 覆盖面（对象存储 key、外部服务 URL、webhook secret）未完全扩展。
 - 凭据变更时 resolver 缓存失效语义（`evict`/`evict_all` 的调用点）未逐点确认。
 
 #### 修复要求
@@ -169,14 +169,14 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 
 #### 完成判据
 
-- 本仓无 SMTP/`mail.password` 配置面；website-mail 与其它 secret 缺失时 fail-closed 且错误不回显值。
-- 活进程脱敏门禁覆盖 DB、Redis、对象存储与 website-mail bearer 等现行凭据类。
+- 本仓无 SMTP/`mail.password` / website-mail 配置面；webhook 与其它 secret 缺失时 fail-closed 且错误不回显值。
+- 活进程脱敏门禁覆盖 DB、Redis、对象存储与 `[notification.webhook]` 等现行凭据类。
 
 ### SB-03：测试门禁、Docker 测试栈与 CI 可信度
 
 #### 当前风险
 
-- 三道门禁与 docker-compose 测试栈（postgres:15、redis:7、mailpit）运行良好，但真实 Git CLI 兼容矩阵、多进程 outbox claim 竞争矩阵、热加载黑盒用例未建立。
+- 三道门禁与 docker-compose 测试栈（postgres:15、redis:7、rustfs）运行良好，但真实 Git CLI 兼容矩阵、多进程 outbox claim 竞争矩阵、热加载黑盒用例未建立。
 - 移植 orion 三件套将引入 ws、VM、构建产物等新基础设施，测试栈不扩展则验收无承载。
 
 #### 修复要求
@@ -216,7 +216,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 
 ### 审计证据、真实缺口与提升条件
 
-- **mega2 现状证据（已完成，2026-07-30）**：`docker-compose.test.yml`、`bin/tests/integration_vault.rs`、`bin/tests/integration_git_cli.rs`、`.github/workflows/config-validation.yml` / `git-protocol-smoke.yml` 已复核；`docs/refactoring/integration.md` P2 清单为 **扇出/热加载/`config init` 已落地**，缺口书面关闭（`DEFER-IT-07`/`DEFER-IT-08`/`DEFER-IT-10`）；git-cli runner、HTTP 最小矩阵、并发 dispatcher 基线与 CI 执行/触发面已由 `plan-20260727.md` 交付。IT-03 / IT-04 / IT-11 D 组已绿（`validate-config` [30466831819](https://github.com/gitmono-dev/mega2/actions/runs/30466831819)；`git-protocol-smoke` [30479301244](https://github.com/gitmono-dev/mega2/actions/runs/30479301244)）。
+- **mega2 现状证据（已完成，2026-07-30）**：`docker/docker-compose.test.yml`、`bin/tests/integration_vault.rs`、`bin/tests/integration_git_cli.rs`、`.github/workflows/config-validation.yml` / `git-protocol-smoke.yml` 已复核；`docs/refactoring/integration.md` P2 清单为 **扇出/热加载/`config init` 已落地**，缺口书面关闭（`DEFER-IT-07`/`DEFER-IT-08`/`DEFER-IT-10`）；git-cli runner、HTTP 最小矩阵、并发 dispatcher 基线与 CI 执行/触发面已由 `plan-20260727.md` 交付。IT-03 / IT-04 / IT-11 D 组已绿（`validate-config` [30466831819](https://github.com/gitmono-dev/mega2/actions/runs/30466831819)；`git-protocol-smoke` [30479301244](https://github.com/gitmono-dev/mega2/actions/runs/30479301244)）。
 - **Mega 证据**：`mega/tests/` 协议夹具存在（专项审计移植归 PT-04）；`mega/orion*` 的 ws/构建链路测试形态在 mega2 无承载（归 PT-06/07）。
 - **完成判据对照（`:202-204`）**：① 新服务接入有标准流程且以 Git CLI runner 示范落地 —— 满足（`test-infra.md` + compose `git-cli`）；② HTTP 通道真实 Git CLI 最小矩阵、热加载黑盒、多实例竞争基线用例本地绿、已接入 CI，且远端 CI 绿（IT-03/IT-04/IT-11 D 组）—— 满足；③ integration.md P2 清单全部有「落地 / 书面关闭（含理由与承接编号）」结论 —— 满足（无「延后」）。
 - **风险与边界**：测试栈膨胀会拖慢 CI；新服务必须可选启用（`profiles`），本地单元测试路径不受影响。SSH/LFS 完整矩阵与真多进程黑盒仍分别属 PT-04 / PT-09。
@@ -484,13 +484,13 @@ Mega `orion-scheduler`（QEMU VM 池、webhook、keep_alive、vm_cleanup、orion
 
 ### 移植问题
 
-`src/notification/` 在 in-app、Slack、generic webhook、用户偏好与触发器编排上已超过 Mega 对应面；Slack/webhook 均经 SecretRef 并有定向送达/脱敏测试。**本仓邮件投递已移除**（无 `[mail]`/SMTP/`email_jobs`），产品邮件投递归属 website（ADR-WA-08；事实源 `docs/refactoring/website-mail.md`）；compose 中 `mailpit` 若保留，**消费方 = website IT，不是 mega2**（与 `docs/refactoring/test-infra.md` 一致）。长期收尾缺口收敛为 build 完成触发器接入点、次渠道 retry 与真实多进程/多实例黑盒矩阵。
+`src/notification/` 的出站面已收敛为 **generic webhook**（`[notification.webhook]`，凭据经 SecretRef）。SMTP、Slack、in-app inbox 与 website-mail 客户端已拆除（[`plan-20260919.md`](plan-20260919.md)；墓碑 `docs/refactoring/website-mail.md`）。用户偏好只保留 `enabled` + per-event。本仓 compose 数据面不启动 SMTP 捕获服务。长期收尾缺口收敛为 build 完成触发器接入点、次渠道 retry 与真实多进程/多实例黑盒矩阵（对象改为 webhook）。
 
 ### 目标范围
 
 - build 完成触发器：接入点依赖 PT-05/PT-06 的事件面，先有事件后接触发器。
-- 维持「邮件在 website」边界：本仓仅 website-mail 客户端配置；禁止回退本仓 SMTP。
-- 多实例通知竞争、背压、重复发送/丢失边界的黑盒矩阵（不再以本仓 SmtpMailer→Mailpit 为门）。
+- 维持「本仓不发信」边界：禁止回退本仓 SMTP 或 website-mail 客户端。
+- 多实例 webhook 竞争、背压、重复发送/丢失边界的黑盒矩阵。
 
 ### 非目标
 
@@ -499,15 +499,15 @@ Mega `orion-scheduler`（QEMU VM 池、webhook、keep_alive、vm_cleanup、orion
 
 ### 完成判据
 
-- 文档与 IT 持续无「本仓 SMTP→Mailpit」现行门；多实例矩阵 CI 绿。
+- 文档与 IT 持续无本仓 SMTP 投递门；出站只剩 `[notification.webhook]`；多实例矩阵 CI 绿。
 - build 完成通知不绕过事件面；次渠道 retry、背压与重复/丢失边界有真实多实例证据。
 
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/mono/src/notification/` 为基线对照；slack 渠道参考 campsite `slack.ts`。
-- **mega2 现状证据**：`src/notification/` 与 `docs/refactoring/{notification,mail,website-mail,test-infra}.md`；邮件退场见 [`plan-20260731.md`](plan-20260731.md) MN-01..MN-06；website 内部 API 见 [`plan-20260802.md`](plan-20260802.md)。
+- **mega2 现状证据**：`src/notification/` 与 `docs/refactoring/{notification,mail,website-mail,test-infra}.md`；出站拆除见 [`plan-20260919.md`](plan-20260919.md)；邮件退场史见 [`plan-20260731.md`](plan-20260731.md) MN-01..MN-06。
 - **最小可验证第一阶段**：在 PT-05/PT-06 事件语义冻结后，为 build completed 接入既有通知编排；不得新建旁路投递机制。
-- **风险与边界**：build 触发器不得绕过事件面临时硬编码进 PT-06；website 邮件 API 不可达时不得拖死 in-app。
+- **风险与边界**：build 触发器不得绕过事件面临时硬编码进 PT-06；未配置 webhook 时通知面静默。
 
 ### 依赖与顺序
 
@@ -748,7 +748,7 @@ TP-20 关掉 SSH 写，是因为当时静态 token **只做了 git-over-HTTP**�
 
 ### 阶段四：收尾类（可与阶段一至三并行）
 
-1. PT-09 build 完成触发器、次渠道 retry 与多实例矩阵（邮件投递已迁 website；Slack/webhook 已交付）。
+1. PT-09 build 完成触发器、次渠道 retry 与多实例矩阵（出站只剩 generic webhook；对象改为 webhook）。
 2. PT-10 热加载消费者扩展、生命周期审计与持续 diagnostics（对象存储/Redis SecretRef、`[oauth]` 已落地）。
 3. PT-11 格式版本策略、KEK 轮换、异地审计 sink、root recovery。
 
@@ -867,6 +867,9 @@ flowchart TD
 | [`plan-20260912.md`](plan-20260912.md) | N/A（storage-only 提交后出站事件；非 Mega PT） | **已完成**（WH-01..WH-15 全部交付；WH-14 → v0.10.39，WH-15 → v0.10.40） | `[storage_events]` 默认关闭、storage-only token/none 可启用、restart-required。HTTPS HMAC 运输 + DNS 地址钉住 + 有界 emitter + 启动 secret 绑定 + CLI/service 清理尾段均已落地；六类来源 hook 全部挂上（`repo.push` / `oci.manifest.published` / `lfs.object.uploaded` / `lfs.media.finalized` / `agent_capture.events.committed` / `agent_capture.checkpoint.committed`）。2026-09-16 完成度复核追加的 WH-14（配置范围/规范名门）与 WH-15（`installation_id` 记录字段与 drop 记账）已于 2026-09-17 分别以 v0.10.39 / v0.10.40 发布。无 webhook CRUD/outbox/retry；presigned 直传与 media 静态 token 认证为 `DEFER-WH-01`/`DEFER-WH-02`。 |
 | [`plan-20260917.md`](plan-20260917.md) | N/A（Libra `mega2 browser` 所需产品 HTTP 补全；非 Mega PT，不新增 PT 编号） | **已完成**（LB-01..LB-07 全部 done/complete；LB-02 → v0.10.41、LB-03 → v0.10.42、LB-04 → v0.10.43、LB-05 → v0.10.44，每次 bump 均有同名 tag 与手写 GitHub Release） | `POST /api/v1/delete-entry`、`POST /api/v1/move-entry`（目录变更走既有 `commit_tree_update` / `land_api_tip_push`，trunk 无 CL）；`tag_router` 挂到 storage-only 并对 create / delete 走 `push_auth`（create 注解 201 → 200）；compose 黑盒新增 delete / move / tags / unauth 四个 case；契约页 `docs/refactoring/directory-entry-api.md` 含可 pin 的「Libra pin」节（八条表面，钉在 v0.10.44）。不覆盖：get/delete 的 path 选择器与 path 隔离（DEFER-LB-03 / DEFER-LB-11；**隔离面已由 [`plan-20260918.md`](plan-20260918.md) 关闭**，目标归属仍延后）、`search_tree_for_update` 类型化 400（DEFER-LB-07）、README 产品写列表（DEFER-LB-08，用户维护）、`find_git_repo_like_path` SQL 绑定与 `/` 边界（DEFER-LB-09）、读 tree 与落地的窗口（DEFER-LB-10）、Libra 客户端本身（DEP-LB-03，由 Libra 计划承接） |
 | [`plan-20260918.md`](plan-20260918.md) | N/A（文件删移与 Tag 契约跟进；非 Mega PT，不新增 PT 编号） | **已完成**（FT-01..FT-09 全部 done/complete；FT-02 → v0.10.45、FT-03 → v0.10.46、FT-04 → v0.11.0、FT-05 → v0.11.1、FT-06 → v0.11.2、FT-07 → v0.11.3；FT-04 起每次 bump 均有同名 tag 与手写 GitHub Release。FT-02/03 各自 tag 的 docker job 因 #13 `mst2-codec` path-dep 红，前滚 FIX 由 v0.11.0 job `35258572677` 证明） | 既有 `POST /api/v1/delete-entry` / `POST /api/v1/move-entry` 扩 `is_directory`（默认 true=目录；`false`=Blob/BlobExecutable）；`GET /api/v1/tags/list` 为唯一 list（必填 `page`/`per_page`/`path`，POST 405，`per_page=0`→400）；`GET|DELETE /api/v1/tags/{name}?path=` 与 `mega_tag.path` 迁移，查找键 `(path, name)`；契约页「Libra pin」重钉 v0.11.3。关闭 60917 `DEFER-LB-01/02/03` 与 `DEFER-LB-11` 隔离面（覆写 DEFER-LB-02 双方法窗口为 GET-only）。不覆盖：tag `target` commit 归属（DEFER-FT-02 / DEFER-LB-11 剩余面）、空目录-only 删除（DEFER-LB-04）、`search_tree_for_update` 类型化 400（DEFER-LB-07）、README 产品写列表（DEFER-LB-08）、SQL `/` 边界（DEFER-LB-09）、读 tree 与落地窗口（DEFER-LB-10）、blob/LFS/Media GC（DEFER-FT-01）、Libra 客户端（DEP-FT-01 outgoing） |
+| [`plan-20260919.md`](plan-20260919.md) | PT-09 / SB-02（出站拆除切片） | **已完成**（RM-01..RM-04；末卡文档；crate 停在 `0.38.1` / `eaaa59c`） | 本仓出站只留 `[notification.webhook]`（外加无关的 `[storage_events]`）。拆除 website-mail / Slack / in-app inbox / locale / 协作 UI（评论改删与 emoji、评审、labels/assignees、CLA）。不实现 PT-09 剩余的 build 触发器 / 次渠道 retry / 多实例矩阵。不改 megaui。 |
+| [`plan-20260916.md`](plan-20260916.md) | N/A（monorepo 路径 → GitHub 出站基础设施；非 Mega PT） | **已完成（2026-09-20）** | 24 张活动卡 `done`/`complete`；Q1–Q8 全 go。执行链路移交 [`plan-20260920.md`](plan-20260920.md)。`DEP-02` 已关闭（模板改回 Libra）。 |
+| [`plan-20260920.md`](plan-20260920.md) | N/A（出站同步执行；承接 60916 `DEP-01`） | **新建（0 实现）** | OX-01..05 `pending`：worker / reported pack / operator / `vault_create_once`。不改直播 ACK。 |
 
 ## 已替代 / 不采纳 / 已实现摘要
 

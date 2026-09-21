@@ -10,10 +10,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
+use super::{abs_view_path, internal, mst2_error_response};
 use crate::ceres::snapshot::{
     chunks::{ChunkProjection, get_or_project},
     error::{SnapshotError, SnapshotErrorCode},
@@ -22,8 +23,6 @@ use crate::ceres::snapshot::{
     runtime::runtime,
     view::validate_scope_relative_path,
 };
-
-use super::{abs_view_path, internal, mst2_error_response};
 
 /// One file resolved at a fixed path with verified content.
 struct ResolvedFile {
@@ -45,6 +44,7 @@ pub(super) fn fs_kind_str(k: FsKind) -> &'static str {
 /// Resolve a scope-relative path against the fixed tree and verify the
 /// optional `expected_digest`. Absence/directory/intermediate outcomes stay
 /// typed errors, never an empty body.
+#[allow(clippy::result_large_err)]
 async fn resolve_file<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     handler: &T,
     root_tree: &git_internal::internal::object::tree::Tree,
@@ -107,6 +107,7 @@ pub(super) struct BlobQuery {
 }
 
 /// HEAD uses the verified size index; no body is produced (spec 04 §9).
+#[allow(clippy::result_large_err)]
 pub(super) async fn blob_head(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
@@ -169,6 +170,7 @@ const OBJECT_MAX_ITEMS: usize = 128;
 const OBJECT_ITEM_MAX: u64 = 256 * 1024;
 const OBJECT_TOTAL_MAX: usize = 8 * 1024 * 1024;
 
+#[allow(clippy::result_large_err)]
 pub(super) async fn objects(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
@@ -239,7 +241,7 @@ pub(super) async fn objects(
     let mut seen: Vec<[u8; 32]> = Vec::new();
     let mut logical_bytes = 0u64;
     for pair in resolved {
-        let (item, f) = pair.map_err(|resp| resp)?;
+        let (_, f) = pair?;
         if !seen.contains(&f.digest) {
             if logical_bytes as usize + f.raw.len() > OBJECT_TOTAL_MAX {
                 return Err(mst2_error_response(SnapshotError::new(
@@ -306,6 +308,7 @@ pub(super) struct ChunkMapQuery {
 }
 
 /// Project a fixed-path file into its range-readable representation.
+#[allow(clippy::result_large_err)]
 async fn project_for<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     handler: &T,
     root_tree: &git_internal::internal::object::tree::Tree,
@@ -332,6 +335,7 @@ async fn project_for<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     .map_err(mst2_error_response)
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) async fn chunk_map(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
@@ -374,6 +378,7 @@ pub(super) async fn chunk_map(
     Ok(Json(body).into_response())
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) async fn chunk_map_pages(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
@@ -464,6 +469,7 @@ struct Planned {
     index: u64,
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) async fn chunks(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,

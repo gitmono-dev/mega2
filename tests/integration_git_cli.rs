@@ -58,7 +58,7 @@ impl TestDatabase {
         with_runtime(async {
             let db = Database::connect(admin_url.as_str()).await.unwrap_or_else(|_| {
                 panic!(
-                    "integration PostgreSQL is not available; run `docker compose -p mega2-it -f docker-compose.test.yml up -d --wait` first"
+                    "integration PostgreSQL is not available; run `docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --wait` first"
                 )
             });
             execute_postgres(&db, format!("DROP DATABASE IF EXISTS {db_name}")).await;
@@ -1905,6 +1905,78 @@ fn integration_git_cli_trunk_n1_identity_three_ff_and_no_cl_refs() {
         requesters.iter().any(|r| r.is_none()),
         "push_auth=none must record NULL requester: {requesters:?}"
     );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+/// Regression: a push whose pack exceeds the client's http.postBuffer makes
+/// git send a flush-only probe request before the real (chunked) request.
+/// The probe must get an empty 200 result, not a 400 — otherwise every push
+/// over ~1 MiB dies client-side with "RPC failed; HTTP 400".
+#[test]
+fn integration_git_cli_trunk_large_pack_over_postbuffer_round_trip() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let extra = trunk_boot_env();
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &extra);
+
+    seed_project_foo(&env.case_dir, port);
+    let foo_url = trunk_subpath_url(port, "/project/foo");
+    git_ok_no_auth(&env.case_dir, &["clone", &foo_url, "foo-big"]);
+    configure_git_identity_no_auth(&env.case_dir, "foo-big");
+
+    // 2 MiB of incompressible bytes: the pack stays above the 1 MiB default
+    // http.postBuffer, forcing the probe + chunked request path.
+    let mut state: u64 = 0x853c49e6748fea9b;
+    let big: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        })
+        .collect();
+    fs::write(env.case_dir.join("foo-big").join("big.bin"), &big).expect("write big.bin");
+    git_ok_no_auth(&env.case_dir, &["-C", "foo-big", "add", "big.bin"]);
+    git_ok_no_auth(
+        &env.case_dir,
+        &["-C", "foo-big", "commit", "-m", "add 2 MiB binary"],
+    );
+    let head = git_stdout_no_auth(&env.case_dir, &["-C", "foo-big", "rev-parse", "HEAD"]);
+
+    git_ok_no_auth(
+        &env.case_dir,
+        &[
+            "-C",
+            "foo-big",
+            "-c",
+            "http.postBuffer=1048576",
+            "push",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+    let remote = ls_remote_main(&env.case_dir, &foo_url);
+    assert_eq!(
+        remote, head,
+        "large-pack push over the probe/chunked path must land on main"
+    );
+
+    // Read back from a fresh clone: the 2 MiB blob must survive the round trip.
+    git_ok_no_auth(&env.case_dir, &["clone", &foo_url, "foo-big-verify"]);
+    let read_back =
+        fs::read(env.case_dir.join("foo-big-verify").join("big.bin")).expect("read back big.bin");
+    assert_eq!(read_back, big, "big.bin content mismatch after clone");
 
     let status = service.shutdown_via_sigint(Duration::from_secs(60));
     assert!(

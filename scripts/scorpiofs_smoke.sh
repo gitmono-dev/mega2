@@ -26,7 +26,7 @@ mount namespace). Cases:
 
 Bring the stack up first:
   ./scripts/dev-test.sh up-scorpio
-  # = docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio up -d --wait
+  # = docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile scorpio up -d --wait
 
 Environment:
   MEGA2_IT_SCORPIO_URL      ScorpioFS API base on the host (default http://127.0.0.1:12725)
@@ -52,7 +52,7 @@ mega2_it_require_repo_root
 SCORPIO_URL="${MEGA2_IT_SCORPIO_URL:-http://127.0.0.1:12725}"
 SCORPIO_URL="${SCORPIO_URL%/}"
 # In-container mountpoints; resolved from the service environment after the
-# availability gate (docker-compose.test.yml sets SCORPIO_WORKSPACE and
+# availability gate (docker/docker-compose.test.yml sets SCORPIO_WORKSPACE and
 # SCORPIO_ANTARES_MOUNT_ROOT to /mnt/scorpiofs/*). Image defaults as fallback.
 WORKSPACE_ROOT="/var/lib/scorpiofs/mount"
 ANTARES_MNT_ROOT="/var/lib/scorpiofs/antares/mnt"

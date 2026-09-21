@@ -14,9 +14,8 @@ use crate::{
         api_doc::SYSTEM_COMMON,
         router::{
             admin_router, agent_capture_router, artifacts_router, bot_router, buck_router,
-            cl_router, code_review_router, commit_router, conv_router, gpg_router, group_router,
-            label_router, merge_queue_router, preview_router, push_queue_router, repo_router,
-            reviewer_router, tag_router, user_router, webhook_router,
+            cl_router, commit_router, gpg_router, group_router, merge_queue_router, preview_router,
+            push_queue_router, repo_router, tag_router, user_router, webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
@@ -31,11 +30,8 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .route("/file/tree", get(get_tree_file))
         .merge(preview_router::routers())
         .merge(cl_router::routers())
-        .merge(reviewer_router::routers())
         .merge(gpg_router::routers())
         .merge(user_router::routers())
-        .merge(label_router::routers())
-        .merge(conv_router::routers())
         .merge(merge_queue_router::routers())
         .merge(push_queue_router::routers())
         .merge(commit_router::routers())
@@ -45,7 +41,6 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .merge(admin_router::routers())
         .merge(artifacts_router::routers())
         .merge(group_router::routers())
-        .merge(code_review_router::routers())
         .merge(webhook_router::routers())
         .merge(bot_router::routers())
 }
@@ -64,7 +59,9 @@ pub fn routers_for(policy: PushPolicy) -> OpenApiRouter<MonoApiServiceState> {
 }
 
 /// Git-adjacent surface for storage-only / trunk HTTP (no OAuth/CL/user
-/// routers): read-only preview, the product writes and the tag routes.
+/// routers): read-only preview, the product writes, the tag routes and
+/// (plan-20260921 AR-01) the artifacts protocol routes (writes gated by
+/// `git.push_auth`).
 pub fn storage_only_routers() -> OpenApiRouter<MonoApiServiceState> {
     storage_only_routers_with(false)
 }
@@ -80,7 +77,8 @@ pub fn storage_only_routers_with(
         .route("/file/tree", get(get_tree_file))
         .merge(preview_router::readonly_routers())
         .merge(preview_router::write_routers())
-        .merge(tag_router::routers());
+        .merge(tag_router::routers())
+        .merge(artifacts_router::routers());
     if include_agent_capture {
         router.merge(agent_capture_router::routers())
     } else {

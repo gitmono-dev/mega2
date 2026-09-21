@@ -3,7 +3,7 @@
 # Build context = this repository root (not the parent). From the mega2
 # repo root:
 #
-#   docker compose -p mega2-it -f docker-compose.test.yml --profile app build mega2
+#   docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app build mega2
 #   docker compose -p mega2-trunk -f docker-compose.storage-only.yml build mega2
 #
 # `.dockerignore` excludes `target/` and other host artifacts so they are never

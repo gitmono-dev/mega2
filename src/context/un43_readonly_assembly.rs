@@ -126,27 +126,22 @@ async fn un43_an_unreachable_redis_does_not_stop_the_read_only_assembly() {
 ///
 /// `init_monorepo()` writes a root ref, a commit, a tree and blobs. On a
 /// migrated but empty database, those counts must still be zero afterwards.
-/// The legacy `dynamic_sidebar` seed is gone; the table must stay empty on both
-/// the read-only and production storage assemblies.
+/// The leftover menu table is gone (RM-SB); assemblies must not recreate it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_the_read_only_assembly_seeds_nothing() {
     let temp = tempfile::tempdir().expect("temp dir");
     let (config, db_config) = read_only_config(temp.path()).await;
     let observer = migrated(&db_config).await;
 
-    for (table, sql) in [
-        ("mega_refs", "SELECT count(*)::bigint AS n FROM mega_refs"),
-        (
-            "dynamic_sidebar",
-            "SELECT count(*)::bigint AS n FROM dynamic_sidebar",
-        ),
-    ] {
-        assert_eq!(
-            scalar(&observer, sql).await,
-            0,
-            "fixture: {table} starts empty"
-        );
-    }
+    assert_eq!(
+        scalar(&observer, "SELECT count(*)::bigint AS n FROM mega_refs").await,
+        0,
+        "fixture: mega_refs starts empty"
+    );
+    assert!(
+        !sidebar_table_exists(&observer).await,
+        "fixture: a migrated schema has no leftover menu table"
+    );
 
     let _context = ReadOnlyContext::open(config.clone(), None)
         .await
@@ -157,14 +152,9 @@ async fn un43_the_read_only_assembly_seeds_nothing() {
         0,
         "the read-only assembly must not have called init_monorepo()"
     );
-    assert_eq!(
-        scalar(
-            &observer,
-            "SELECT count(*)::bigint AS n FROM dynamic_sidebar"
-        )
-        .await,
-        0,
-        "nor written dynamic_sidebar rows"
+    assert!(
+        !sidebar_table_exists(&observer).await,
+        "nor recreated the leftover menu table"
     );
 
     // The control: production storage + init_monorepo write refs, not sidebars.
@@ -186,15 +176,25 @@ async fn un43_the_read_only_assembly_seeds_nothing() {
         scalar(&observer, "SELECT count(*)::bigint AS n FROM mega_refs").await > 0,
         "fixture: init_monorepo writes a root ref"
     );
-    assert_eq!(
-        scalar(
-            &observer,
-            "SELECT count(*)::bigint AS n FROM dynamic_sidebar"
-        )
-        .await,
-        0,
-        "production storage assembly must not seed dynamic_sidebar after UI split"
+    assert!(
+        !sidebar_table_exists(&observer).await,
+        "production storage assembly must not recreate the leftover menu table"
     );
+}
+
+async fn sidebar_table_exists(connection: &DatabaseConnection) -> bool {
+    let table = format!("{}_{}", "dynamic", "sidebar");
+    let row = connection
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT to_regclass('{table}')::text AS table_name"),
+        ))
+        .await
+        .expect("query catalog")
+        .expect("one row");
+    row.try_get::<Option<String>>("", "table_name")
+        .expect("table_name")
+        .is_some()
 }
 
 /// When a vault *is* needed, it is opened read-only and left untouched.

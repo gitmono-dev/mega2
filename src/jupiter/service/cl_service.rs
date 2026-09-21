@@ -41,9 +41,9 @@ impl CLService {
         link: &str,
         username: String,
     ) -> Result<CLDetails, MegaError> {
-        let (cl, labels) = self
+        let cl = self
             .cl_storage
-            .get_cl_labels(link)
+            .get_cl(link)
             .await?
             .ok_or_else(|| MegaError::Other("CL not found".to_string()))?;
 
@@ -52,17 +52,9 @@ impl CLService {
             .get_comments_with_reactions(link)
             .await?;
 
-        let (_, assignees) = self
-            .cl_storage
-            .get_cl_assignees(link)
-            .await?
-            .unwrap_or((cl.clone(), vec![]));
-
         let res = CLDetails {
             cl,
-            labels,
             conversations,
-            assignees,
             username,
         };
         Ok(res)

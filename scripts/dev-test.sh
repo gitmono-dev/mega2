@@ -14,13 +14,13 @@ Usage:
   scripts/dev-test.sh <command> [args...]
 
 Stack commands:
-  up-data              Start default data plane (postgres/redis/rustfs/rustfs-init/mailpit)
+  up-data              Start default data plane (postgres/redis/rustfs/rustfs-init)
   up-full              Start data plane + git-cli (recommended for cargo test --all)
   up-scorpio [args]    Start data plane + mega2 + scorpiofs (--profile app --profile scorpio);
                        builds scorpiofs:local from ../scorpiofs on first run (pass --build to rebuild).
                        The FUSE workspace is visible on the host at $MEGA2_IT_SCORPIO_WORKDIR/mount
   down                 Tear down project (profiles git/app/web/smoke/scorpio, volumes)
-  health               Postgres / Redis / Mailpit smoke checks
+  health               Postgres / Redis smoke checks
 
 Test commands:
   unit [cargo-args...]          Unit tests only (no compose): cargo test -p mega2-core --lib

@@ -137,7 +137,7 @@ website（或显式 `AccessTokenUser`）。
 | 项 | 值 |
 |---|---|
 | Compose 项目 | `-p mega2-it` |
-| 文件 | `docker-compose.test.yml` |
+| 文件 | `docker/docker-compose.test.yml` |
 | 服务名 | `website-next`（另有 `megaui-collab`） |
 | Profile | `web`（默认 `up -d --wait` **不**拉起） |
 | Build | `website-next` / `website-db-init`：context `../megaui`，dockerfile `apps/web/Dockerfile`；`megaui-collab`：`apps/collab-server/Dockerfile` |
@@ -153,7 +153,7 @@ website（或显式 `AccessTokenUser`）。
 联调：
 
 ```bash
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile app --profile web up -d --wait
 ```
 
@@ -163,9 +163,9 @@ docker compose -p mega2-it -f docker-compose.test.yml \
 会话请求也发生在 megaui 已就绪后时，按以下顺序启动：
 
 ```bash
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile web up -d --wait website-next
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile app up -d --wait mega2
 ```
 
@@ -173,7 +173,7 @@ docker compose -p mega2-it -f docker-compose.test.yml \
 客户端重新请求，不在 mega2 会话路径中作无界重试。连通性冒烟可从共享网络运行：
 
 ```bash
-docker compose -p mega2-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile app --profile web exec -T mega2 \
   curl -fsS http://website-next:7001/api/auth/get-session
 ```

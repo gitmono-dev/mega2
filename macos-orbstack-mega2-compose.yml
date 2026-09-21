@@ -1,0 +1,179 @@
+# mega2 local evaluation stack — macOS (OrbStack) variant.
+#
+# Prerequisite: OrbStack (provides `*.orb.local` DNS on the host and inside
+# containers). On Linux Docker use `linux-mega2-compose.yml` instead.
+#
+# Quick start:
+#   docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
+#
+# The first start pulls `genedna/mega2:latest`, PostgreSQL, Redis, RustFS,
+# and the RustFS CLI (`rc`). `rustfs-init` then creates the `mega2` bucket
+# automatically; mega2 initializes its empty Monorepo during service startup.
+#
+# Access:
+#   Mega2 API / Git Smart HTTP: http://127.0.0.1:9000
+#   OpenAPI document:           http://127.0.0.1:9000/api/openapi.json
+#   RustFS S3 endpoint:         http://mega2-rustfs.orb.local:9000
+#   (artifact presigned URLs point here; OrbStack DNS resolves it both on the
+#   host and inside containers, so host clients can download blobs directly)
+#
+# Observe or stop the stack:
+#   docker compose -f macos-orbstack-mega2-compose.yml logs -f mega2
+#   docker compose -f macos-orbstack-mega2-compose.yml down
+#
+# Named volumes preserve the PostgreSQL, Redis, RustFS, and mega2 data across
+# `down` / future `up` commands. To discard this local evaluation instance:
+#   docker compose -f macos-orbstack-mega2-compose.yml down -v
+#
+# This is deliberately a local-only, anonymous Git HTTP write setup:
+# `push_auth=none` means clone, fetch, and push require no token. Port 9000 is
+# bound to 127.0.0.1 for that reason. Do not replace it with 0.0.0.0 or expose
+# it through a reverse proxy; use token or OAuth authentication for any shared
+# or internet-facing deployment.
+#
+# mega2 本機試用環境 — macOS（OrbStack）版本。
+#
+# 前置需求：OrbStack（在宿主机与容器内都提供 `*.orb.local` DNS）。
+# Linux Docker 請改用 `linux-mega2-compose.yml`。
+#
+# 快速啟動：
+#   docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
+#
+# 首次啟動會拉取 `genedna/mega2:latest`、PostgreSQL、Redis、RustFS 與
+# RustFS CLI（`rc`）。`rustfs-init` 會自動建立 `mega2` bucket，mega2 則會
+# 在服務啟動時初始化空的 Monorepo。
+#
+# 存取位址：
+#   Mega2 API / Git Smart HTTP: http://127.0.0.1:9000
+#   OpenAPI document:           http://127.0.0.1:9000/api/openapi.json
+#   RustFS S3 endpoint:         http://mega2-rustfs.orb.local:9000
+#   （artifact 预签名 URL 指向这里；OrbStack DNS 在宿主机与容器内都能解析
+#   该名称，宿主机客户端因此能直连对象存储下载 blob）
+#
+# 查看日誌或停止服務：
+#   docker compose -f macos-orbstack-mega2-compose.yml logs -f mega2
+#   docker compose -f macos-orbstack-mega2-compose.yml down
+#
+# 具名 volumes 會在 `down` 或下次 `up` 後保留 PostgreSQL、Redis、RustFS
+# 與 mega2 的資料。若要刪除這個本機試用環境的所有資料：
+#   docker compose -f macos-orbstack-mega2-compose.yml down -v
+#
+# 這是僅限本機使用的匿名 Git HTTP 寫入設定：`push_auth=none` 代表 clone、
+# fetch 與 push 都不需要 token。因此 9000 埠只綁定 127.0.0.1。請勿改成
+# 0.0.0.0 或透過反向代理公開；共用或網際網路部署必須改用 token 或 OAuth。
+services:
+  postgres:
+    image: postgres:18.6-alpine3.24
+    environment:
+      POSTGRES_USER: mega2
+      POSTGRES_PASSWORD: mega2_local_password
+      POSTGRES_DB: mega2
+    volumes:
+      - mega2-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mega2 -d mega2"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:8.10.1-alpine3.23
+    volumes:
+      - mega2-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    # Fixed container name → stable OrbStack DNS name `mega2-rustfs.orb.local`,
+    # which resolves both on the host and inside containers. Artifact presigned
+    # URLs carry this host in their SigV4 signature, so one name must serve both.
+    container_name: mega2-rustfs
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: rustfs_secret
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+    volumes:
+      - mega2-rustfs:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  rustfs-init:
+    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/rc alias set local http://rustfs:9000 rustfs rustfs_secret &&
+      /usr/bin/rc mb --ignore-existing local/mega2 &&
+      exec sleep infinity
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/bin/rc ls local/mega2"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 3s
+
+  mega2:
+    image: genedna/mega2:latest
+    pull_policy: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_healthy
+    environment:
+      MEGA_BASE_DIR: /var/lib/mega2
+      MEGA_DATABASE__DB_TYPE: postgres
+      MEGA_DATABASE__DB_URL: postgres://mega2:mega2_local_password@postgres:5432/mega2
+      MEGA_DATABASE__MIN_CONNECTION: 1
+      MEGA_REDIS__URL: redis://redis:6379
+      MEGA_MONOREPO__PUSH_POLICY: trunk
+      MEGA_CEDAR__ENFORCEMENT: "off"
+      MEGA_GIT__ANONYMOUS_ACCESS: "true"
+      MEGA_GIT__PUSH_AUTH: none
+      MEGA_GIT__SSH_RECEIVE_PACK: "false"
+      MEGA_OBJECT_STORAGE__STORAGE_TYPE: s3compatible
+      MEGA_OBJECT_STORAGE__S3__REGION: us-east-1
+      MEGA_OBJECT_STORAGE__S3__BUCKET: mega2
+      MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID: rustfs
+      MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY: rustfs_secret
+      # OrbStack DNS name: reachable from host clients (presigned URL download)
+      # and from this container (SDK + presigning) alike. Linux has no such
+      # DNS — see linux-mega2-compose.yml for the host-networking approach.
+      MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: http://mega2-rustfs.orb.local:9000
+      # OCI Distribution surface (/v2): storage-only morphology + this switch.
+      MEGA_OCI__ENABLED: "true"
+      MEGA_LOG__PRINT_STD: "true"
+    command: ["service", "http", "--host", "0.0.0.0", "-p", "8000"]
+    volumes:
+      - mega2-data:/var/lib/mega2
+    ports:
+      - "127.0.0.1:9000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/openapi.json"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+volumes:
+  mega2-postgres:
+  mega2-redis:
+  mega2-rustfs:
+  mega2-data:

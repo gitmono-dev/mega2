@@ -396,7 +396,10 @@ pub async fn git_receive_pack(
             return Err(e);
         }
     };
-    tracing::info!(bytes = receive_request.len(), "receive-pack: request body received");
+    tracing::info!(
+        bytes = receive_request.len(),
+        "receive-pack: request body received"
+    );
 
     // A body of exactly one flush-pkt is git's large-push probe
     // (remote-curl's probe_rpc posts "0000" with Content-Length: 4 before

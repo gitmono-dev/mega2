@@ -1,7 +1,7 @@
 # website → megaui 联调栈改造留痕
 
 日期：2026-09-04  
-范围：`docker-compose.test.yml` web profile（服务名 `website-*` **保留**）
+范围：`docker/docker-compose.test.yml` web profile（服务名 `website-*` **保留**）
 
 ## 为何保留 `website-*` 命名
 

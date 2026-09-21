@@ -62,13 +62,15 @@ pub struct DirEntry {
 /// would rebuild the tree N times). Blob sizes/digests are persisted in
 /// `mst2_verified_object`, so a cache miss after eviction is a bounded,
 /// correctness-identical recomputation.
+/// Page memoization table: (root tree id, scope-relative path) → built page.
+type PageCache = Mutex<HashMap<(String, String), Arc<BuiltDirectory>>>;
+
 pub async fn build_directory_page<T: ApiHandler + ?Sized>(
     handler: &T,
     root_tree: &git_internal::internal::object::tree::Tree,
     rel_path: &str,
 ) -> Result<Arc<BuiltDirectory>, SnapshotError> {
-    static PAGE_CACHE: OnceLock<Mutex<HashMap<(String, String), Arc<BuiltDirectory>>>> =
-        OnceLock::new();
+    static PAGE_CACHE: OnceLock<PageCache> = OnceLock::new();
     // Pages are small (≤16 KiB + entries); 200k pages is far beyond any real
     // view. On overflow the cache clears wholesale — a miss only costs a
     // rebuild, never correctness.
@@ -79,9 +81,7 @@ pub async fn build_directory_page<T: ApiHandler + ?Sized>(
     if let Some(hit) = cache.lock().unwrap().get(&key) {
         return Ok(Arc::clone(hit));
     }
-    let built = Arc::new(
-        build_directory_page_uncached(handler, root_tree, rel_path).await?,
-    );
+    let built = Arc::new(build_directory_page_uncached(handler, root_tree, rel_path).await?);
     let mut cache = cache.lock().unwrap();
     if cache.len() >= PAGE_CACHE_MAX {
         cache.clear();
