@@ -154,6 +154,85 @@ cmp lfs-demo/big.bin /tmp/verify-lfs/big.bin && echo identical
 
 LFS 对象与 Git blob 共用同一套对象存储（本栈为 RustFS），下文关于数据卷、`down -v` 与持久化覆盖文件的说明对它同样适用。
 
+## 案例：用 OCI 仓库托管容器镜像（/v2）
+
+该栈在同一端口的 `/v2` 下内嵌了一个 OCI Distribution 仓库（Compose 文件中通过 `MEGA_OCI__ENABLED=true` 启用；它还要求 storage-only 形态，`MEGA_GIT__PUSH_AUTH` 已隐含满足）。任意 OCI 客户端均可使用——Docker 默认把 `127.0.0.1` 当作 insecure 仓库，所以本地评估用纯 HTTP 即可：
+
+```bash
+docker pull alpine:3.21
+docker tag alpine:3.21 127.0.0.1:9000/project/alpine:quickstart
+docker push 127.0.0.1:9000/project/alpine:quickstart
+
+# 回读验证：删掉本地 tag，从 mega2 拉取
+docker rmi 127.0.0.1:9000/project/alpine:quickstart alpine:3.21
+docker pull 127.0.0.1:9000/project/alpine:quickstart
+docker run --rm 127.0.0.1:9000/project/alpine:quickstart cat /etc/alpine-release
+
+# 或直接查询仓库 API
+curl -s http://127.0.0.1:9000/v2/project/alpine/tags/list
+```
+
+仓库写入与 `git.push_auth` 共用同一道闸门——本评估栈为匿名。blob 与 manifest 与其它数据一样落在 RustFS 对象存储里。若要把仓库暴露给其它机器，默认的 Docker 客户端不再接受纯 HTTP：请在前面加 TLS，或把该主机加入客户端的 `insecure-registries`。
+
+## 案例：用预签名直连管理构建产物
+
+编译产物、发布包等二进制以 **Artifact Set** 的形式存放在 `/api/v1/repos/{repo}/artifacts` 下。流程是 discovery → batch → commit 三步，字节传输走**预签名（presigned）**：mega2 只处理元数据并签发限时（1 小时）的 S3 URL——客户端直接对对象存储（这里是 RustFS）上传/下载字节，不经过 mega2 中转。
+
+```bash
+REPO=project   # 单个 URL 路径段；名字里有 "/" 时用 %2F
+BASE=http://127.0.0.1:9000/api/v1/repos/$REPO/artifacts
+
+# 0. Discovery：协议版本、限额、支持的传输方式
+curl -s $BASE/discovery
+
+# 1. 准备两个发布文件；每个对象 id 是客户端生成的 UUID
+head -c 1048576 /dev/urandom > app-1.0.0.tar.gz
+shasum -a 256 app-1.0.0.tar.gz > SHA256SUMS
+OID1=$(uuidgen | tr 'A-Z' 'a-z'); OID2=$(uuidgen | tr 'A-Z' 'a-z')
+
+# 2. Batch：登记对象清单，为每个对象拿到预签名 PUT URL
+curl -s -X POST -H 'Content-Type: application/json' $BASE/batch --data @- <<EOF
+{"namespace": "releases", "object_type": "snapshot", "intent": "upload",
+ "objects": [
+   {"path": "app-1.0.0.tar.gz", "oid": "$OID1", "size": $(wc -c < app-1.0.0.tar.gz | tr -d ' '), "content_type": "application/gzip"},
+   {"path": "SHA256SUMS", "oid": "$OID2", "size": $(wc -c < SHA256SUMS | tr -d ' '), "content_type": "text/plain"}],
+ "metadata": {"run_id": "quickstart-demo"}}
+EOF
+# → {"transfer":"basic","objects":[{"oid":"...","exists":false,
+#    "actions":{"upload":{"href":"http://<rustfs>/...?X-Amz-Signature=...",
+#    "header":{"Content-Type":"..."},"expires_at":"..."}}}], ...}
+
+# 3. 把字节直接上传到对象存储（不是 mega2）。
+#    请求头按 actions.upload.header 返回的来带：
+curl -X PUT -H 'Content-Type: application/gzip' --data-binary @app-1.0.0.tar.gz "<OID1 的 href>"
+curl -X PUT -H 'Content-Type: text/plain' --data-binary @SHA256SUMS "<OID2 的 href>"
+
+# 4. Commit：把已上传的对象登记为一个 Artifact Set
+curl -s -X POST -H 'Content-Type: application/json' $BASE/commit --data @- <<EOF
+{"namespace": "releases", "object_type": "snapshot",
+ "files": [
+   {"path": "app-1.0.0.tar.gz", "oid": "$OID1", "size": $(wc -c < app-1.0.0.tar.gz | tr -d ' ')},
+   {"path": "SHA256SUMS", "oid": "$OID2", "size": $(wc -c < SHA256SUMS | tr -d ' ')}],
+ "metadata": {"run_id": "quickstart-demo"}}
+EOF
+# → {"artifact_set_id":"...","status":"ok","missing_objects":[]}
+```
+
+`missing_objects` 必须为空——出现在其中的对象说明对象存储里没找到，commit 只登记了其余对象。回读验证；下载同样走预签名，`curl -L` 会跟随 302 直连 RustFS：
+
+```bash
+# 列出集合 / 把文件解析为对象 id
+curl -s "$BASE/sets?namespace=releases&object_type=snapshot"
+curl -s "$BASE/resolve-file?namespace=releases&object_type=snapshot&path=app-1.0.0.tar.gz"
+
+# 下载：302 跳转到预签名 GET，或返回 JSON 链接（?mode=link）
+curl -L -o dl.tar.gz "$BASE/objects/$OID1"
+cmp app-1.0.0.tar.gz dl.tar.gz && echo identical
+curl -s "$BASE/objects/$OID2?mode=link"
+```
+
+产物写入与 `git.push_auth` 共用同一道闸门（本栈为匿名）。`object_type` 词汇表（`snapshot`、`provenance`、`run` 等）与协商限额都由 discovery 响应公布。
+
 ## 观察、停止与清理
 
 ```bash

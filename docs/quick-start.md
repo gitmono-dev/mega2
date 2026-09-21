@@ -154,6 +154,85 @@ cmp lfs-demo/big.bin /tmp/verify-lfs/big.bin && echo identical
 
 LFS objects live in the same object storage as Git blobs (RustFS in this stack), so everything said about volumes, `down -v`, and the persist override below covers them too.
 
+## Case: container images with the OCI registry (/v2)
+
+The stack embeds an OCI Distribution registry at the same port under `/v2` (enabled in the Compose files via `MEGA_OCI__ENABLED=true`; it also requires the storage-only morphology, which `MEGA_GIT__PUSH_AUTH` already implies). Any OCI client works — Docker treats `127.0.0.1` as an insecure registry by default, so plain HTTP is fine for this local evaluation:
+
+```bash
+docker pull alpine:3.21
+docker tag alpine:3.21 127.0.0.1:9000/project/alpine:quickstart
+docker push 127.0.0.1:9000/project/alpine:quickstart
+
+# Read back: wipe the local tags and pull from mega2
+docker rmi 127.0.0.1:9000/project/alpine:quickstart alpine:3.21
+docker pull 127.0.0.1:9000/project/alpine:quickstart
+docker run --rm 127.0.0.1:9000/project/alpine:quickstart cat /etc/alpine-release
+
+# Or query the registry API directly
+curl -s http://127.0.0.1:9000/v2/project/alpine/tags/list
+```
+
+Registry writes share `git.push_auth` — anonymous in this evaluation setup. Blobs and manifests land in the same RustFS object storage as everything else. When you expose the registry to other machines, plain HTTP is no longer accepted by default Docker clients: put TLS in front of it, or add the host to the client's `insecure-registries`.
+
+## Case: build artifacts with presigned direct transfer
+
+Compiled binaries, release tarballs and other build outputs are stored as **Artifact Sets** under `/api/v1/repos/{repo}/artifacts`. The flow is discovery → batch → commit, and the byte transfer is **presigned**: mega2 only handles metadata and signs time-limited (1 h) S3 URLs — the client uploads/downloads the bytes directly to/from the object storage (RustFS here), without proxying through mega2.
+
+```bash
+REPO=project   # single URL path segment; use %2F for "/" inside names
+BASE=http://127.0.0.1:9000/api/v1/repos/$REPO/artifacts
+
+# 0. Discovery: protocol version, limits, supported transfers
+curl -s $BASE/discovery
+
+# 1. Stage two release files; each object id is a client-generated UUID
+head -c 1048576 /dev/urandom > app-1.0.0.tar.gz
+shasum -a 256 app-1.0.0.tar.gz > SHA256SUMS
+OID1=$(uuidgen | tr 'A-Z' 'a-z'); OID2=$(uuidgen | tr 'A-Z' 'a-z')
+
+# 2. Batch: declare the objects, get a presigned PUT URL per object
+curl -s -X POST -H 'Content-Type: application/json' $BASE/batch --data @- <<EOF
+{"namespace": "releases", "object_type": "snapshot", "intent": "upload",
+ "objects": [
+   {"path": "app-1.0.0.tar.gz", "oid": "$OID1", "size": $(wc -c < app-1.0.0.tar.gz | tr -d ' '), "content_type": "application/gzip"},
+   {"path": "SHA256SUMS", "oid": "$OID2", "size": $(wc -c < SHA256SUMS | tr -d ' '), "content_type": "text/plain"}],
+ "metadata": {"run_id": "quickstart-demo"}}
+EOF
+# → {"transfer":"basic","objects":[{"oid":"...","exists":false,
+#    "actions":{"upload":{"href":"http://<rustfs>/...?X-Amz-Signature=...",
+#    "header":{"Content-Type":"..."},"expires_at":"..."}}}], ...}
+
+# 3. Upload the bytes STRAIGHT to the object storage (not to mega2).
+#    Send the headers returned in actions.upload.header:
+curl -X PUT -H 'Content-Type: application/gzip' --data-binary @app-1.0.0.tar.gz "<href for OID1>"
+curl -X PUT -H 'Content-Type: text/plain' --data-binary @SHA256SUMS "<href for OID2>"
+
+# 4. Commit: register the uploaded objects as one Artifact Set
+curl -s -X POST -H 'Content-Type: application/json' $BASE/commit --data @- <<EOF
+{"namespace": "releases", "object_type": "snapshot",
+ "files": [
+   {"path": "app-1.0.0.tar.gz", "oid": "$OID1", "size": $(wc -c < app-1.0.0.tar.gz | tr -d ' ')},
+   {"path": "SHA256SUMS", "oid": "$OID2", "size": $(wc -c < SHA256SUMS | tr -d ' ')}],
+ "metadata": {"run_id": "quickstart-demo"}}
+EOF
+# → {"artifact_set_id":"...","status":"ok","missing_objects":[]}
+```
+
+`missing_objects` must be empty — any object listed there was not found in the object storage and the commit recorded only the rest. Read the set back; downloads are presigned too, so `curl -L` follows the 302 straight to RustFS:
+
+```bash
+# List sets / resolve a file to its object id
+curl -s "$BASE/sets?namespace=releases&object_type=snapshot"
+curl -s "$BASE/resolve-file?namespace=releases&object_type=snapshot&path=app-1.0.0.tar.gz"
+
+# Download: 302 redirect to a presigned GET, or JSON with the link (?mode=link)
+curl -L -o dl.tar.gz "$BASE/objects/$OID1"
+cmp app-1.0.0.tar.gz dl.tar.gz && echo identical
+curl -s "$BASE/objects/$OID2?mode=link"
+```
+
+Artifact writes share the `git.push_auth` gate (anonymous here). The `object_type` vocabulary (`snapshot`, `provenance`, `run`, …) and the negotiated limits are advertised by the discovery payload.
+
 ## Observe, stop, and clean up
 
 ```bash

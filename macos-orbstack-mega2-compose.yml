@@ -157,6 +157,8 @@ services:
       # and from this container (SDK + presigning) alike. Linux has no such
       # DNS — see linux-mega2-compose.yml for the host-networking approach.
       MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: http://mega2-rustfs.orb.local:9000
+      # OCI Distribution surface (/v2): storage-only morphology + this switch.
+      MEGA_OCI__ENABLED: "true"
       MEGA_LOG__PRINT_STD: "true"
     command: ["service", "http", "--host", "0.0.0.0", "-p", "8000"]
     volumes:
