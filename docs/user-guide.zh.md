@@ -52,10 +52,9 @@ storage-only **不暴露 SSH receive-pack**(`git.ssh_receive_pack=false` 是强�
 
 `[monorepo].object_format` 默认 `sha1`(标准 Git)。`sha256` 与 `blake3` 是 **git-internal / Libra 扩展**,不宣称与标准 Git 客户端互通,需配合 Libra 使用;口径见 [`refactoring/protocol.md`](./refactoring/protocol.md) 与 [`refactoring/config.md`](./refactoring/config.md)。
 
-## 3. 大文件:LFS 与 FastCDC Media
+## 3. 大文件:LFS
 
 - **Git LFS(标准)**:端点 `/info/lfs` 与 `/api/v1/lfs`,stock `git-lfs` 客户端直接可用;LFS 写授权与 Git receive-pack 共用 `git.push_auth`(矩阵见 [`deploy-trunk.md`](./deploy-trunk.md) 第 6 节)。
-- **FastCDC Media(Libra 扩展)**:大媒体按内容定义分块上传与复用,需要服务端 `--features fastcdc` 构建且客户端为 Libra;它**不是**标准 Git LFS 扩展,也不宣称与 stock Git 互通。协议契约见 [`refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md)。
 
 ## 4. HTTP API 使用
 
@@ -106,7 +105,7 @@ mega2 自身不提供交互界面。日常浏览与目录 / Tag 操作在 Libra 
 libra mega2 browser
 ```
 
-该 TUI 消费第 4 节的 HTTP 面(tree 读、create / delete / move-entry、tags)。sha256 / blake3 对象格式与 FastCDC Media 同样只在 Libra 客户端下可用(见 2.4 与第 3 节)。
+该 TUI 消费第 4 节的 HTTP 面(tree 读、create / delete / move-entry、tags)。sha256 / blake3 对象格式同样只在 Libra 客户端下可用(见 2.4)。
 
 ## 7. CLI 速查
 
@@ -139,7 +138,6 @@ libra mega2 browser
 | Git 协议兼容性 | [`refactoring/protocol.md`](./refactoring/protocol.md) |
 | trunk 推送设计与 MonoWriteQueue | [`refactoring/trunk-push.md`](./refactoring/trunk-push.md) |
 | 目录 / 文件写与 tag 契约 | [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md) |
-| FastCDC Media | [`refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md) |
 | OCI registry | [`refactoring/oci.md`](./refactoring/oci.md) |
 | Agent Capture | [`refactoring/agent-capture.md`](./refactoring/agent-capture.md) |
 | 错误模型 | [`errors.md`](./errors.md) |

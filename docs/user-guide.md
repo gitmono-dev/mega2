@@ -52,10 +52,9 @@ The write surfaces (Git receive-pack, LFS batch/lock writes, product API writes)
 
 `[monorepo].object_format` defaults to `sha1` (stock Git). `sha256` and `blake3` are **git-internal / Libra extensions** with no claimed interoperability with stock Git clients; they require Libra. See [`refactoring/protocol.md`](./refactoring/protocol.md) and [`refactoring/config.md`](./refactoring/config.md).
 
-## 3. Large files: LFS and FastCDC Media
+## 3. Large files: LFS
 
 - **Git LFS (standard)**: endpoints `/info/lfs` and `/api/v1/lfs`, usable directly by stock `git-lfs` clients; LFS write authorization shares `git.push_auth` with Git receive-pack (matrix: [`deploy-trunk.md`](./deploy-trunk.md) §6).
-- **FastCDC Media (Libra extension)**: large media is uploaded and reused as content-defined chunks; it requires a server built with `--features fastcdc` and Libra as the client. It is **not** a standard Git LFS extension and claims no stock-Git interoperability. Protocol contract: [`refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md).
 
 ## 4. HTTP API usage
 
@@ -106,7 +105,7 @@ mega2 itself serves no interactive interface. Day-to-day browsing and directory 
 libra mega2 browser
 ```
 
-That TUI consumes the HTTP surface of §4 (tree reads, create / delete / move-entry, tags). The sha256 / blake3 object formats and FastCDC Media are likewise only available with the Libra client (see §2.4 and §3).
+That TUI consumes the HTTP surface of §4 (tree reads, create / delete / move-entry, tags). The sha256 / blake3 object formats are likewise only available with the Libra client (see §2.4).
 
 ## 7. CLI quick reference
 
@@ -139,7 +138,6 @@ The full flag list lives in `--help` and `src/commands/`. Compose bootstrap and 
 | Git protocol compatibility | [`refactoring/protocol.md`](./refactoring/protocol.md) |
 | Trunk push design and MonoWriteQueue | [`refactoring/trunk-push.md`](./refactoring/trunk-push.md) |
 | Directory / file write and tag contract | [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md) |
-| FastCDC Media | [`refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md) |
 | OCI registry | [`refactoring/oci.md`](./refactoring/oci.md) |
 | Agent Capture | [`refactoring/agent-capture.md`](./refactoring/agent-capture.md) |
 | Error model | [`errors.md`](./errors.md) |
