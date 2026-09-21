@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
+use futures::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -158,7 +159,7 @@ struct ObjectsRequest {
     encoding: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct ObjectItem {
     path: String,
@@ -195,6 +196,8 @@ pub(super) async fn objects(
         .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
 
     // Verify every member at its fixed path before any 200 is produced.
+    // Members resolve concurrently: a batch is up to 128 files, and a
+    // sequential S3 read per member dominated cold-mount time.
     let handler = state
         .api_handler(std::path::Path::new("/"))
         .await
@@ -204,28 +207,41 @@ pub(super) async fn objects(
         .await
         .map_err(internal)?;
     let scope = ctx.built.descriptor.scope.clone();
+    // Copied references: each per-item future borrows the shared walk state
+    // without moving it (the stream is an FnMut over owned items).
+    let handler_ref = handler.as_ref();
+    let root_ref = &root_tree;
+    let scope_ref = &scope;
+    let resolved: Vec<Result<_, Response>> = futures::stream::iter(req.items.clone())
+        .map(move |item| async move {
+            validate_scope_relative_path(&item.path).map_err(mst2_error_response)?;
+            let f = resolve_file(
+                handler_ref,
+                root_ref,
+                scope_ref,
+                &item.path,
+                Some(&item.expected_digest),
+            )
+            .await?;
+            if f.size > OBJECT_ITEM_MAX {
+                return Err(mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::ScopeInvalid,
+                    format!(
+                        "{} is {} bytes; objects cap is 256KiB per item",
+                        item.path, f.size
+                    ),
+                )));
+            }
+            Ok((item, f))
+        })
+        .buffered(16)
+        .collect()
+        .await;
     let mut unique: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut seen: Vec<[u8; 32]> = Vec::new();
     let mut logical_bytes = 0u64;
-    for item in &req.items {
-        validate_scope_relative_path(&item.path).map_err(mst2_error_response)?;
-        let f = resolve_file(
-            handler.as_ref(),
-            &root_tree,
-            &scope,
-            &item.path,
-            Some(&item.expected_digest),
-        )
-        .await?;
-        if f.size > OBJECT_ITEM_MAX {
-            return Err(mst2_error_response(SnapshotError::new(
-                SnapshotErrorCode::ScopeInvalid,
-                format!(
-                    "{} is {} bytes; objects cap is 256KiB per item",
-                    item.path, f.size
-                ),
-            )));
-        }
+    for pair in resolved {
+        let (_, f) = pair?;
         if !seen.contains(&f.digest) {
             if logical_bytes as usize + f.raw.len() > OBJECT_TOTAL_MAX {
                 return Err(mst2_error_response(SnapshotError::new(
