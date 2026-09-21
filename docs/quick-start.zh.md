@@ -100,6 +100,36 @@ git clone http://127.0.0.1:9000/third-party/your-repo
 - `/third-party/**`（ImportRepo）：多分支、客户端 tag 合法——适合托管第三方依赖源码、迁入已有仓库。
 - 其它路径（Monorepo）：只有公开分支 `main`、Git 客户端禁 tag。已有仓库的多分支历史不能直接推进 monorepo 子路径；规则见 [`monorepo.md`](./monorepo.md)。
 
+## 案例：镜像一个 GitHub 仓库（brewfs）
+
+完整镜像一个已有 GitHub 仓库——全部分支与 tag——只需一次推送。以 <https://github.com/brewfs/brewfs> 为例：
+
+```bash
+git clone --mirror https://github.com/brewfs/brewfs.git
+cd brewfs.git
+git lfs fetch --all origin                # 尽力而为；有一个历史对象在 GitHub 上已 404
+git config lfs.allowincompletepush true   # 推送仍可用的 LFS 对象
+git remote add mega2 http://127.0.0.1:9000/third-party/brewfs
+git -c http.postBuffer=536870912 push --mirror mega2
+```
+
+三点说明：
+
+- `--mirror` 推送**全部** ref（所有分支 + 所有 tag）。上一案例的 `git push mega2 --all` 只推*本地*分支，普通克隆里通常只有 `main`。
+- `-c http.postBuffer=536870912` 是临时绕过：pack 超过 git 默认 1 MiB 的 `http.postBuffer` 后，客户端会改用 chunked 请求体，而当前 receive-pack 端点对 chunked 请求体会直接返回 HTTP 400。调大缓冲可让请求保持 content-length 形式。
+- brewfs 用 Git LFS 管理大型测试固件。旧历史引用的一个对象在 GitHub 上已不存在，所以 `git lfs fetch --all` 会打印 404 错误——属预期；`lfs.allowincompletepush true` 允许推送在缺少该对象的情况下继续。
+
+验证回路——annotated tag 与 LFS 内容都完好：
+
+```bash
+git clone http://127.0.0.1:9000/third-party/brewfs /tmp/verify-brewfs
+cd /tmp/verify-brewfs
+git for-each-ref refs/tags                       # v0.0.1 / v0.1.1 / v0.1.2
+git cat-file -t v0.1.2^{tag}                     # => tag（annotated tag 对象完好）
+ls -la tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz
+# 约 8 MB 的 gzip——从 mega2 的 LFS 对象存储取回的是真实字节，不是指针
+```
+
 ## 案例：用 Git LFS 管理大文件
 
 该栈讲标准 Git LFS 协议（`/info/lfs`），stock `git-lfs` 客户端开箱即用。LFS 写授权与 Git push 共用 `git.push_auth`——本评估栈为匿名。前置条件：宿主机已安装 `git-lfs`（用 `git lfs version` 确认）。

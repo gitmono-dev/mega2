@@ -100,6 +100,36 @@ Do not confuse the two path semantics:
 - `/third-party/**` (ImportRepo): multi-branch and client tags allowed — suited for hosting third-party dependency sources and migrating existing repositories.
 - Everywhere else (Monorepo): `main` is the only public branch and Git-client tags are forbidden. An existing repo's multi-branch history cannot be pushed straight into a monorepo subpath; the rules are in [`monorepo.md`](./monorepo.md).
 
+## Case: mirror a GitHub repository (brewfs)
+
+A full mirror of an existing GitHub repo — every branch and tag — takes one push. Using <https://github.com/brewfs/brewfs> as the example:
+
+```bash
+git clone --mirror https://github.com/brewfs/brewfs.git
+cd brewfs.git
+git lfs fetch --all origin                # best effort; one historic object is 404 on GitHub
+git config lfs.allowincompletepush true   # push the LFS objects that are still available
+git remote add mega2 http://127.0.0.1:9000/third-party/brewfs
+git -c http.postBuffer=536870912 push --mirror mega2
+```
+
+Three things worth knowing:
+
+- `--mirror` pushes **every** ref (all branches + all tags). The `git push mega2 --all` in the previous case only pushes *local* branches, which in a normal clone is usually just `main`.
+- `-c http.postBuffer=536870912` is a temporary workaround: once the pack exceeds git's default 1 MiB `http.postBuffer`, the client switches to a chunked request body, which the current receive-pack endpoint rejects with HTTP 400. Raising the buffer keeps the request content-length'd.
+- brewfs tracks large test fixtures with Git LFS. One object referenced by old history no longer exists on GitHub, so `git lfs fetch --all` prints a 404 error — expected; `lfs.allowincompletepush true` lets the push proceed without it.
+
+Verify the round trip — annotated tags and LFS content both survive:
+
+```bash
+git clone http://127.0.0.1:9000/third-party/brewfs /tmp/verify-brewfs
+cd /tmp/verify-brewfs
+git for-each-ref refs/tags                       # v0.0.1 / v0.1.1 / v0.1.2
+git cat-file -t v0.1.2^{tag}                     # => tag (annotated tag object intact)
+ls -la tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz
+# ~8 MB gzip — the real bytes came back from mega2's LFS object store, not a pointer
+```
+
 ## Case: large files with Git LFS
 
 The stack speaks standard Git LFS (`/info/lfs`), so a stock `git-lfs` client works as-is. LFS write authorization shares `git.push_auth` with Git push — anonymous in this evaluation setup. Prerequisite: `git-lfs` on the host (check with `git lfs version`).
