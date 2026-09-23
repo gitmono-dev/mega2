@@ -79,6 +79,48 @@ pub fn is_import_dir_ancestor(config: &MonoConfig, canonical_path: &str) -> bool
         || (canonical_path != import_dir && is_same_or_under(&import_dir, canonical_path))
 }
 
+/// ADR-FU-06 ImportRepo namespace guard for product writes: every rewritten
+/// operand (`written`) must lie outside `import_dir` (component-level,
+/// `import_dir` itself included); removed operands must additionally not be a
+/// strict ancestor of a nested `import_dir`. Operands are API paths, split on
+/// `/` with empty and `.` segments dropped; names may contain `\`. A `..`
+/// segment is `Invalid`.
+pub fn check_write_operands(
+    config: &MonoConfig,
+    written: &[&str],
+    removed: &[&str],
+) -> Result<(), PathPolicyError> {
+    let operands = written
+        .iter()
+        .map(|path| (*path, false))
+        .chain(removed.iter().map(|path| (*path, true)));
+    for (operand, removal) in operands {
+        let Some(path) = operand_path(operand) else {
+            return Err(invalid(operand, "path must not contain '..' segments"));
+        };
+        let blocked = in_import_namespace(config, &path)
+            || (removal && path != "/" && is_import_dir_ancestor(config, &path));
+        if blocked {
+            return Err(not_allowed(config, &path));
+        }
+    }
+    Ok(())
+}
+
+/// `/`-joined components of an API operand (empty and `.` segments dropped),
+/// or `None` when it has a `..` segment.
+pub fn operand_path(operand: &str) -> Option<String> {
+    let mut components = Vec::new();
+    for segment in operand.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => return None,
+            other => components.push(other),
+        }
+    }
+    Some(format!("/{}", components.join("/")))
+}
+
 /// Component-level prefix match: `/a/b` is under `/a`, `/ab` is not.
 fn is_same_or_under(path: &str, dir: &str) -> bool {
     path == dir
@@ -172,6 +214,61 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn write_operand_guard() {
+        let flat = config(&["third-party", "project"], "/third-party");
+        check_write_operands(
+            &flat,
+            &["/project/x", "project/a\\b", "/project/./y/"],
+            &["/project"],
+        )
+        .expect("monorepo operands");
+        for written in ["/third-party", "/third-party/lib/x", "third-party//lib"] {
+            assert!(matches!(
+                check_write_operands(&flat, &[written], &[]),
+                Err(PathPolicyError::NotAllowed { .. })
+            ));
+        }
+        assert!(matches!(
+            check_write_operands(&flat, &["/project/x"], &["/third-party/lib"]),
+            Err(PathPolicyError::NotAllowed { .. })
+        ));
+        assert!(matches!(
+            check_write_operands(&flat, &["/project/../third-party"], &[]),
+            Err(PathPolicyError::Invalid { .. })
+        ));
+
+        let nested = config(&["third-party", "project"], "/third-party/vendor");
+        check_write_operands(&nested, &["/third-party/tools/a", "/third-party"], &[])
+            .expect("writing next to a nested import dir");
+        check_write_operands(&nested, &[], &["/third-party/tools", "/"])
+            .expect("removing a sibling; `/` itself is never an operand to guard");
+        for removed in [
+            "/third-party",
+            "/third-party/vendor",
+            "/third-party/vendor/lib",
+        ] {
+            assert!(
+                matches!(
+                    check_write_operands(&nested, &[], &[removed]),
+                    Err(PathPolicyError::NotAllowed { .. })
+                ),
+                "{removed}"
+            );
+        }
+        assert!(matches!(
+            check_write_operands(
+                &nested,
+                &["/third-party/vendor/a"],
+                &["/third-party/tools/a"]
+            ),
+            Err(PathPolicyError::NotAllowed { .. })
+        ));
+        assert_eq!(operand_path("a//b/./c/"), Some("/a/b/c".to_owned()));
+        assert_eq!(operand_path(""), Some("/".to_owned()));
+        assert_eq!(operand_path("/a/../b"), None);
     }
 
     #[test]

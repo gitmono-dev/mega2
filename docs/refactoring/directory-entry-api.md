@@ -112,7 +112,7 @@
 - 父目录被删空时，服务端补写一个带时间戳的 `.gitkeep`，父目录保留为**空目录**——与 create-entry 表示新建空目录的方式一致；Git 无法在路径上表示空 tree，这是唯一能保住父目录的做法。
 - 同名的 blob 与 tree 可以并存（create-entry 的重名检查按 mode 区分）。`is_directory=true`（或缺省）只匹配 Tree；`false` 只匹配 Blob 或 BlobExecutable。父 tree **完全没有**该 `name` 才是 **404**；同名但 mode 不符是 **400**（「不是目录」或「不是文件」）。
 - 一次删除 = 一次 commit（父链 tree 改写 + `.gitkeep` 可选 blob），trunk 经 `land_api_tip_push` 前进 tip，Review 走既有 CL 分支（`EditCLMode::TryReuse(None)`，与 create-entry 相同的政策分流）。
-- trunk 上父目录为 `/`（即删除顶层目录）时，B0 拒绝根 tip 经 MonoWriteQueue 前进，返回 **400**（`no non-root path tip under / for trunk API write`）；Review 形态则在 `/` 的 CL 上进行。
+- trunk 上父目录为 `/`（即删除顶层目录）时，产品写从不在 `/` 落地，返回 **400** `MONO_PATH_NOT_ALLOWED: …`（[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-06；此前为 B0 的 `no non-root path tip under / for trunk API write`）；Review 形态则在 `/` 的 CL 上进行。
 - `commit_id` 在 trunk 上是落地后的 tip；`path` 只作回执。
 
 ### `POST /api/v1/move-entry` — `implemented`（LB-03 / FT-03）
@@ -147,7 +147,7 @@
 - 两组 `path`/`name` 都先过 `validate_entry_target`（规则同 delete-entry）；父路径经 `normalize_parent_path` 归一（空串 = `/`，容忍一个尾随 `/`），改名 = 归一后 `from_path == to_path` 且名字不同。
 - 校验顺序：源目标相同 → 移进自己的子树（**仅** `is_directory=true`：目标父 = 源目录或其后代；文件源不做子树检查）→ 目标父落在 ImportRepo 下（router 只按 `from_path` 分派，monorepo handler 自查 `git_repo` 后以 **409** 拒绝）→ 源父不存在 / 源不存在 / 源 mode 不符 → 目标父不存在 → 目标名已存在（**任何 mode** 的同名项都算已存在）。全部检查在任何写入之前完成。省略字段只移目录；`is_directory=false` 移 `Blob` / `BlobExecutable` 并保留同一 oid。
 - 改写 = 源父 tree 去掉该项、目标父 tree 插入**同一 oid 与同一 mode**（改名只改 `TreeItem.name`），两条父链自底向上重算到根，一次 commit；目标父的项按 Git 顺序排序；源父被移空时补写带时间戳的 `.gitkeep`（同 delete-entry）。
-- 落地路径 = 两个父目录的最深公共目录：trunk 上经 `land_api_tip_push` 前进**覆盖该路径的最深非根 path tip**（`resolve_trunk_land_path`，AW-03：落地 `/project/a`（本身无 tip）时前进的是 `/project` 的 tip），因此**跨顶层目录**的移动（公共目录为 `/`）在 trunk 上因 B0 返回 **400**；Review 形态在该公共目录（或 `/`）的 CL 上进行，与 create/delete 相同的政策分流。
+- 落地路径 = 两个父目录的最深公共目录：trunk 上经 `land_api_tip_push` 前进**覆盖该路径的最深非根 path tip**（`resolve_trunk_land_path`，AW-03：落地 `/project/a`（本身无 tip）时前进的是 `/project` 的 tip），因此**跨顶层目录**的移动（公共目录为 `/`）在 trunk 上返回 **400** `MONO_PATH_NOT_ALLOWED`（产品写从不在 `/` 落地，[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-06；此前为 B0 文本 `no non-root path tip …`）；Review 形态在该公共目录（或 `/`）的 CL 上进行，与 create/delete 相同的政策分流。
 - 鉴权：`from_path` 与 `to_path` 各调一次 `trunk_write_requester`，任一失败（401/403）即拒绝，此时尚未读任何 tree。
 
 ### 错误映射
@@ -164,7 +164,7 @@
 | delete-entry：缺父目录 / 缺目标 | **404**，`parent directory <path> not found` / `entry '<name>' not found under <path>` |
 | delete-entry：父路径穿过一个文件 | **400**，`parent path <path> is not a directory` |
 | delete-entry：`path`/`name` 不合规（未 rooted、`.`/`..`/空组件、分隔符、控制字符） | **400**，`validate_entry_target` 的诊断原文 |
-| delete-entry：ImportRepo（`import_dir` 下） | **409**，`import dir does not support delete entry` |
+| delete-entry：ImportRepo（`import_dir` 下） | 目标在**存活** ImportRepo 内部（router 按 `git_repo` 分派给 `ImportApiService`）：**409**，`import dir does not support delete entry`；其余 `import_dir` 命名空间目标（`import_dir` 本身、从父目录删除挂载叶子——不论该仓库是否存活、已无存活 `git_repo` 行的路径；嵌套 `import_dir` 时还包括其严格祖先）：**400** `MONO_PATH_NOT_ALLOWED: …`（plan-20260923 ADR-FU-06，两种形态均适用） |
 | move-entry：源目标相同 | **400**，`source and destination are the same: <path>` |
 | move-entry：目标名已存在（任何 mode） | **400**，`'<to_name>' already exists under <to_path>` |
 | move-entry：移进自己的子树 | **400**，`cannot move <src> into its own subtree <to_path>` |
@@ -173,7 +173,9 @@
 | move-entry：`from_path`/`from_name`/`to_path`/`to_name` 不合规 | **400**，`validate_entry_target` 的诊断原文 |
 | move-entry：源父 / 目标父不存在；源不存在 | **404**，`source parent <path> not found` / `destination parent <path> not found` / `entry '<name>' not found under <path>` |
 | move-entry：源父 / 目标父路径穿过文件 | **400**，`source parent path <path> is not a directory` / `destination parent path <path> is not a directory` |
-| move-entry：源或目标在 ImportRepo 下 | **409**，`import dir does not support move entry` |
+| move-entry：源或目标在 ImportRepo 下 | 源在存活 ImportRepo 内部（分派给 `ImportApiService`）或目标父是存活 ImportRepo：**409**，`import dir does not support move entry`；其余源 / 目标落在 `import_dir` 命名空间（嵌套 `import_dir` 时源还包括其严格祖先）：**400** `MONO_PATH_NOT_ALLOWED: …`（ADR-FU-06，两种形态均适用） |
+| create-entry / edit-save：`import_dir` 命名空间内、无存活 ImportRepo 的路径 | **400** `MONO_PATH_NOT_ALLOWED: …`（ADR-FU-06，两种形态均适用；存活 ImportRepo 内部的写仍由 `ImportApiService` 处理，行为不变） |
+| trunk 全新栈：写路径无非根 tip | 合法路径落在惰性物化的一级根上；首组件不在 `root_dirs` 中（含在 `/` 下新建顶层）→ **400** `MONO_PATH_NOT_ALLOWED`，点名用户写的路径；跨顶层 move 与删除顶层目录（落点只能是 `/`）→ **400** `MONO_PATH_NOT_ALLOWED`，点名 `/`；嵌套 `import_dir` 的严格祖先根 → **409** `MONO_PATH_UNINITIALIZED`，点名写入所在目录（新建目录时为该目录本身）（ADR-FU-06） |
 | 缺目录（delete / move 均已按此落地） | `404`（ADR-LB-03）。注意这**不是** `GET /tree` / create-entry 的今日行为：今日 `GET /tree` 对不存在的 path 返回 **200 + `tree_items: []`**（`search_tree_by_path` 取不到时返回 `Ok(None)`，`get_tree_info` 再把它映射成 `Ok(vec![])`——`tree_ops.rs:93`/`:98`/`:256`），而 `create-entry` 会**自动补建**缺失的父层级而不是 404 |
 | 鉴权失败 | 见「鉴权」 |
 

@@ -92,11 +92,14 @@ use crate::{
             tag::TagInfo,
             third_party::{ThirdPartyClient, ThirdPartyRepoTrait},
         },
-        pack::{api_tip_lander::land_api_tip_push, import_repo::ImportRepo, monorepo::Monorepo},
+        pack::{
+            api_tip_lander::land_api_tip_push, import_repo::ImportRepo, materialize,
+            monorepo::Monorepo, path_policy,
+        },
         protocol::{ServiceType, SmartSession, TransportProtocol},
     },
     common::{
-        errors::{BuckError, MegaError},
+        errors::{BuckError, MegaError, PathPolicyError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID, format_commit_msg},
     },
     config::PushPolicy,
@@ -457,6 +460,12 @@ struct TreeCommitInput {
     blobs: Vec<Blob>,
     /// Path whose subtree the change rewrote; resolves the landing tip.
     repo_path: PathBuf,
+    /// The path the user wrote (entry or move destination); names the path
+    /// in path policy errors when no landing tip exists yet (ADR-FU-06).
+    policy_path: String,
+    /// Whether `policy_path` is a directory this write creates; otherwise a
+    /// provisioning hint names its parent directory.
+    policy_is_dir: bool,
     commit_msg: String,
     author_username: Option<String>,
     skip_build: bool,
@@ -1047,6 +1056,7 @@ impl ApiHandler for MonoApiService {
         requester: Option<String>,
     ) -> Result<EditFileResult, GitError> {
         let file_path = PathBuf::from("/").join(PathBuf::from(&payload.path));
+        self.guard_import_namespace(&[&file_path.to_string_lossy()], &[])?;
         let parent_path = file_path
             .parent()
             .ok_or_else(|| GitError::CustomError("Invalid file path".to_string()))?;
@@ -1070,7 +1080,8 @@ impl ApiHandler for MonoApiService {
         };
 
         let tip_path = if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
-            self.resolve_trunk_land_path(&cl_root_path).await?
+            self.resolve_trunk_land_path(&cl_root_path, &file_path.to_string_lossy(), false)
+                .await?
         } else {
             build_repo_path.clone()
         };
@@ -1241,6 +1252,10 @@ impl ApiHandler for MonoApiService {
         entry_info: CreateEntryInfo,
         requester: Option<String>,
     ) -> Result<CreateEntryResult, GitError> {
+        self.guard_import_namespace(
+            &[&Self::build_entry_path(&entry_info.path, &entry_info.name)],
+            &[],
+        )?;
         let CreateEntryUpdate {
             update_result,
             blob,
@@ -1257,6 +1272,8 @@ impl ApiHandler for MonoApiService {
                     save_trees,
                     blobs: vec![blob],
                     repo_path,
+                    policy_path: entry_path.clone(),
+                    policy_is_dir: entry_info.is_directory,
                     commit_msg: entry_info.commit_msg(),
                     author_username: entry_info.author_username.clone(),
                     skip_build: entry_info.skip_build,
@@ -1286,6 +1303,10 @@ impl ApiHandler for MonoApiService {
     ) -> Result<DeleteEntryResult, GitError> {
         validate_entry_target(&entry_info.path, &entry_info.name)
             .map_err(|reason| GitError::CustomError(format!("[code:400] {reason}")))?;
+        self.guard_import_namespace(
+            &[],
+            &[&Self::build_entry_path(&entry_info.path, &entry_info.name)],
+        )?;
         let parent = PathBuf::from(if entry_info.path.is_empty() {
             "/"
         } else {
@@ -1355,6 +1376,8 @@ impl ApiHandler for MonoApiService {
                     save_trees: vec![new_parent],
                     blobs,
                     repo_path: parent,
+                    policy_path: entry_path.clone(),
+                    policy_is_dir: false,
                     commit_msg: entry_info.commit_msg(),
                     author_username: entry_info.author_username.clone(),
                     skip_build: entry_info.skip_build,
@@ -1422,6 +1445,7 @@ impl ApiHandler for MonoApiService {
                 "[code:409] import dir does not support move entry".to_string(),
             ));
         }
+        self.guard_import_namespace(&[&dest_full], &[&src_full])?;
 
         let src_parent_path = PathBuf::from(&src_parent);
         let mut src_chain = self
@@ -1529,6 +1553,8 @@ impl ApiHandler for MonoApiService {
                     save_trees: Vec::new(),
                     blobs,
                     repo_path: PathBuf::from(landing),
+                    policy_path: dest_full.clone(),
+                    policy_is_dir: false,
                     commit_msg: entry_info.commit_msg(),
                     author_username: entry_info.author_username.clone(),
                     skip_build: entry_info.skip_build,
@@ -2003,6 +2029,8 @@ impl MonoApiService {
             mut save_trees,
             blobs,
             repo_path,
+            policy_path,
+            policy_is_dir,
             commit_msg,
             author_username,
             skip_build,
@@ -2029,7 +2057,8 @@ impl MonoApiService {
         };
 
         let tip_path = if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
-            self.resolve_trunk_land_path(&repo_path_str).await?
+            self.resolve_trunk_land_path(&repo_path_str, &policy_path, policy_is_dir)
+                .await?
         } else {
             build_repo_path.clone()
         };
@@ -2416,7 +2445,12 @@ impl MonoApiService {
 
     /// Deepest existing non-root `mega_refs` tip covering `write_path` (AW-03).
     /// Buck-root resolution returns `/`, which B0 rejects for MonoWriteQueue.
-    async fn resolve_trunk_land_path(&self, write_path: &str) -> Result<String, GitError> {
+    async fn resolve_trunk_land_path(
+        &self,
+        write_path: &str,
+        policy_path: &str,
+        policy_is_dir: bool,
+    ) -> Result<String, GitError> {
         let candidates = MonoServiceLogic::repo_root_candidates(Path::new(write_path));
         for candidate in candidates {
             if candidate == "/" {
@@ -2428,9 +2462,82 @@ impl MonoApiService {
                 Err(e) => return Err(GitError::CustomError(e.to_string())),
             }
         }
-        Err(GitError::CustomError(format!(
-            "[code:400] no non-root path tip under {write_path} for trunk API write"
-        )))
+        self.fallback_trunk_land_path(write_path, policy_path, policy_is_dir)
+            .await
+    }
+
+    /// ADR-FU-06: no non-root tip covers `write_path` (fresh stack). The
+    /// first-level root of `policy_path` (the path the user wrote) is
+    /// classified; errors name that path. Allowed writes land on the root,
+    /// lazily materialized with the same primitive advertise uses. A write
+    /// whose landing directory is `/` (new top-level entry, cross-root move,
+    /// top-level delete) is `MONO_PATH_NOT_ALLOWED`: product writes never land
+    /// on `/`. A root that is a strict ancestor of a nested `import_dir` is
+    /// never materialized (GC-FU-04).
+    async fn fallback_trunk_land_path(
+        &self,
+        write_path: &str,
+        policy_path: &str,
+        policy_is_dir: bool,
+    ) -> Result<String, GitError> {
+        let config = self.storage.config();
+        let monorepo = &config.monorepo;
+        let policy = |err: PathPolicyError| GitError::from(MegaError::from(err));
+        let Some(target) = path_policy::operand_path(policy_path) else {
+            return Err(policy(PathPolicyError::Invalid {
+                path: policy_path.to_owned(),
+                reason: "path must not contain '..' segments".to_owned(),
+            }));
+        };
+        let first = target[1..].split('/').next().unwrap_or_default();
+        if first.is_empty() {
+            return Err(policy(path_policy::not_allowed(monorepo, &target)));
+        }
+        let root = format!("/{first}");
+        // A top-level name that is not a configured root (including one no
+        // root could have, e.g. with `\`) is outside the roots.
+        path_policy::classify_creation_path(monorepo, &root)
+            .map_err(|_| policy(path_policy::not_allowed(monorepo, &target)))?;
+        let lands_under_root = path_policy::operand_path(write_path)
+            .is_some_and(|landing| landing == root || landing.starts_with(&format!("{root}/")));
+        if !lands_under_root {
+            return Err(policy(path_policy::not_allowed(monorepo, "/")));
+        }
+        // Provisioning hint: the directory this write goes into.
+        let provision_path = if policy_is_dir {
+            target.clone()
+        } else {
+            target
+                .rsplit_once('/')
+                .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+                .unwrap_or("/")
+                .to_owned()
+        };
+        let uninitialized = || {
+            policy(PathPolicyError::Uninitialized {
+                path: provision_path.clone(),
+            })
+        };
+        if path_policy::is_import_dir_ancestor(monorepo, &root) {
+            return Err(uninitialized());
+        }
+        let refs = materialize::materialize_path_refs(&self.storage, &root).await?;
+        if refs.iter().any(|r| r.ref_name == MEGA_BRANCH_NAME) {
+            Ok(root)
+        } else {
+            Err(uninitialized())
+        }
+    }
+
+    /// ADR-FU-06: product writes never rewrite the ImportRepo namespace —
+    /// `import_dir` and below, and for removed operands also a strict ancestor
+    /// of a nested `import_dir` — whether or not a repository is attached
+    /// there (paths with a live ImportRepo are dispatched to
+    /// `ImportApiService` before reaching this handler).
+    fn guard_import_namespace(&self, written: &[&str], removed: &[&str]) -> Result<(), GitError> {
+        let config = self.storage.config();
+        path_policy::check_write_operands(&config.monorepo, written, removed)
+            .map_err(|err| GitError::from(MegaError::from(err)))
     }
 
     // helper to convert mega_tag model into TagInfo

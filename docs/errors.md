@@ -110,13 +110,13 @@ use crate::common::errors::{ApiError, MegaError, RvError};
 
 ## PathPolicyError：Monorepo 路径策略（plan-20260923）
 
-`PathPolicyError`（`src/common/errors/mod.rs`）是路径「创建 / 写入」策略的领域错误，经 `MegaError::PathPolicy(#[from])` 包装；包装层用 `#[error("{0}")]`，文本原样透出，没有 `Other error:` 前缀。`NotAllowed` 与 `Invalid` 由唯一的分类函数 `ceres::pack::path_policy::classify_creation_path` 判定（规则见 [`plan/plan-20260923.md`](./plan/plan-20260923.md) ADR-FU-04；同模块的 `in_import_namespace`、`is_import_dir_ancestor`、`not_allowed` 供调用方复用，不得复制判断）；`Uninitialized` 与 `Conflict` 由调用方按树状态产生。客户端 JSON 路径入口先经 `strict_creation_path_input`（拒绝 NUL、`\`，要求原始输入已是规范路径）。
+`PathPolicyError`（`src/common/errors/mod.rs`）是路径「创建 / 写入」策略的领域错误，经 `MegaError::PathPolicy(#[from])` 包装；包装层用 `#[error("{0}")]`，文本原样透出，没有 `Other error:` 前缀。`NotAllowed` 与 `Invalid` 由 `ceres::pack::path_policy` 判定：创建分类走唯一的分类函数 `classify_creation_path`，产品写的 ImportRepo 命名空间守卫走 `check_write_operands`（ADR-FU-06）（规则见 [`plan/plan-20260923.md`](./plan/plan-20260923.md) ADR-FU-04；同模块的 `in_import_namespace`、`is_import_dir_ancestor`、`not_allowed` 供调用方复用，不得复制判断）；`Uninitialized` 与 `Conflict` 由调用方按树状态产生。客户端 JSON 路径入口先经 `strict_creation_path_input`（拒绝 NUL、`\`，要求原始输入已是规范路径）。
 
 | 变体 | 码 | HTTP（`ApiError`） | 含义 |
 |---|---|---|---|
 | `NotAllowed { path, allowed_roots, import_dir }` | `MONO_PATH_NOT_ALLOWED` | 400 | 目标路径不在任何 `root_dirs` 之下，或位于 `import_dir` 之下（import 优先：ImportRepo 由推送创建） |
 | `Uninitialized { path }` | `MONO_PATH_UNINITIALIZED` | 409 | 合法根下的路径尚未开通；消息点名 `mega2 path provision --server <url> <path>` 与 `POST /api/v1/path/provision` |
-| `Invalid { path, reason }` | `MONO_PATH_INVALID` | 400 | 路径非规范（相对、`.` / `..` 段、重复或尾斜杠）、含 NUL / `\`，或为根 `/` |
+| `Invalid { path, reason }` | `MONO_PATH_INVALID` | 400 | 路径非规范（相对、`.` / `..` 段、重复或尾斜杠）、含 NUL / `\`，或为根 `/`（分类原语的判定；产品写落点为 `/` 时按 `NotAllowed` 返回，见 ADR-FU-06） |
 | `Conflict { path, component }` | `MONO_PATH_CONFLICT` | 409 | 路径上的某个组件已存在且不是目录 |
 
 文本格式（Git 面与 API 面同一文本）：`Display` = `"<CODE>: <人读消息>"`，恒为单行——路径以带引号的转义形式出现（`Uninitialized` 开通命令里的路径只转义、不加引号），根名、原因等其余片段中的控制字符（换行、NUL 等）按 `\n` / `\0` 形式转义，保证能放进 Git `ng` 行且无法伪造多行输出。产品写经 `GitError` 返回时，`MegaError::PathPolicy` 转为 `[code:400|409] <文本>`（`PathPolicyError::http_status`），`ApiError` 据此设置状态并剥去标记；裸 `PathPolicyError` 与 `MegaError::PathPolicy` 则按类型映射且原样输出（不再从文本中解析 `[code:…]`，路径里出现该字样也不会截断消息）。三条通道的 `err_message` 都是原文。Git report-status 的 `ng` 行与 API `err_message` 都携带这段原文，客户端可按冒号前的码分支；码是公开契约，改名需 minor 版本并更新本节。`NotAllowed` 只列出允许的根（`/<name>`，排序）与 ImportRepo 目录，任何变体都不包含配置文件路径、`base_dir`、数据库 / Redis / 对象存储地址或凭据。
