@@ -30,7 +30,7 @@ use crate::{
     },
     common::{
         errors::MegaError,
-        utils::{MEGA_BRANCH_NAME, escape_like},
+        utils::{MEGA_BRANCH_NAME, escape_like, format_commit_msg},
     },
     contract::api::common::Pagination,
     jupiter::{
@@ -700,7 +700,7 @@ impl MonoStorage {
                         DescendantCommitStyle::Legacy => Commit::from_tree_id(
                             tree,
                             vec![parent],
-                            "trunk descendant continuation",
+                            &format_commit_msg("trunk descendant continuation", None),
                         ),
                         DescendantCommitStyle::Trunk { plan, sign } => {
                             let prev = self

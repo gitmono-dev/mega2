@@ -97,7 +97,7 @@ use crate::{
     },
     common::{
         errors::{BuckError, MegaError},
-        utils::{MEGA_BRANCH_NAME, ZERO_ID},
+        utils::{MEGA_BRANCH_NAME, ZERO_ID, format_commit_msg},
     },
     config::PushPolicy,
     contract::{
@@ -866,6 +866,9 @@ impl MonoServiceLogic {
         updates: &mut Vec<RefUpdateData>,
         new_commit_id: &mut String,
     ) -> Result<(), GitError> {
+        // Unsigned synthesized commit: frame the header/body blank line once
+        // (plan-20260923 ADR-FU-02).
+        let commit_msg = format_commit_msg(commit_msg, None);
         for update in &result.ref_updates {
             // GAP-07 / ADR-MC-01 coupling — re-review both before changing
             // this lookup: the synthesized trunk commit's parent is the FIRST
@@ -888,7 +891,7 @@ impl MonoServiceLogic {
                         ObjectHash::from_hex_for_kind(get_hash_kind(), &p_ref.ref_commit_hash)
                             .unwrap(),
                     ],
-                    commit_msg,
+                    &commit_msg,
                 );
                 let commit_id = commit.id.to_string();
                 *new_commit_id = commit_id.clone();
@@ -1126,7 +1129,7 @@ impl ApiHandler for MonoApiService {
                         GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id))
                     })?,
             ],
-            &payload.commit_message,
+            &format_commit_msg(&payload.commit_message, None),
         );
         let new_commit_id = dst_commit.id.to_string();
 
@@ -2042,7 +2045,11 @@ impl MonoApiService {
                     "Missing updated tree for build repo root {tip_path}"
                 ))
             })?;
-        let dst_commit = Commit::from_tree_id(target_tree_id, vec![base_commit], &commit_msg);
+        let dst_commit = Commit::from_tree_id(
+            target_tree_id,
+            vec![base_commit],
+            &format_commit_msg(&commit_msg, None),
+        );
         let new_commit_id = dst_commit.id.to_string();
 
         let username = author_username.unwrap_or("Anonymous".to_string());
@@ -10518,6 +10525,129 @@ mod tests {
         );
     }
 
+    /// FU-03 (ADR-FU-02): the review-morph merge constructor and the legacy
+    /// descendant continuation synthesize unsigned commits framed with the
+    /// header/body blank line, so `git fsck --strict` sees no
+    /// `unterminatedHeader`.
+    #[tokio::test]
+    async fn fu03_review_and_legacy_sites_framed() {
+        use git_internal::internal::object::ObjectTrait;
+        use sea_orm::TransactionTrait;
+
+        use crate::jupiter::{storage::base_storage::StorageConnector, tests::test_storage};
+
+        fn assert_framed(commit: &Commit, body: &str) {
+            assert_eq!(commit.message, format!("\n{body}"));
+            let raw = String::from_utf8(commit.to_data().unwrap()).unwrap();
+            let (header, raw_body) = raw.split_once("\n\n").expect("header/body blank line");
+            assert!(header.lines().last().unwrap().starts_with("committer "));
+            assert_eq!(raw_body, body);
+        }
+
+        let tree_id = ObjectHash::from_str("27dd8d4cf39f3868c6eee38b601bc9e9939304f5").unwrap();
+        let result = TreeUpdateResult {
+            updated_trees: vec![],
+            ref_updates: vec![RefUpdate {
+                path: "/fu03".to_string(),
+                tree_id,
+            }],
+        };
+        let refs = vec![mega_refs::Model::new(
+            "/fu03",
+            MEGA_BRANCH_NAME.to_owned(),
+            "0987654321098765432109876543210987654321".to_owned(),
+            "1111111111111111111111111111111111111111".to_owned(),
+            false,
+        )];
+        let (mut commits, mut updates, mut new_commit_id) = (Vec::new(), Vec::new(), String::new());
+        MonoServiceLogic::process_ref_updates(
+            &result,
+            &refs,
+            "cl merge generated commit",
+            &mut commits,
+            &mut updates,
+            &mut new_commit_id,
+        )
+        .unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_framed(&commits[0], "cl merge generated commit");
+        assert_eq!(new_commit_id, commits[0].id.to_string());
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let leaf_old = Tree::from_tree_items(vec![blob_item(
+            "a.txt",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )])
+        .unwrap();
+        let leaf_new = Tree::from_tree_items(vec![blob_item(
+            "a.txt",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )])
+        .unwrap();
+        let dir = |leaf: &Tree| {
+            Tree::from_tree_items(vec![TreeItem::new(
+                TreeItemMode::Tree,
+                leaf.id,
+                "chg".to_string(),
+            )])
+            .unwrap()
+        };
+        let (old_p, new_p) = (dir(&leaf_old), dir(&leaf_new));
+        mono.save_mega_trees(
+            vec![
+                leaf_old.clone(),
+                leaf_new.clone(),
+                old_p.clone(),
+                new_p.clone(),
+            ],
+            ObjectHash::from_str(&"9".repeat(40)).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let c_p = Commit::from_tree_id(old_p.id, vec![], "\np");
+        let c_chg = Commit::from_tree_id(leaf_old.id, vec![], "\nchg");
+        mono.save_mega_commits(vec![c_p.clone(), c_chg.clone()], None)
+            .await
+            .unwrap();
+        for (path, commit, tree) in [("/fu03", &c_p, &old_p), ("/fu03/chg", &c_chg, &leaf_old)] {
+            mono.save_refs(
+                mega_refs::Model::new(
+                    path,
+                    MEGA_BRANCH_NAME.to_owned(),
+                    commit.id.to_string(),
+                    tree.id.to_string(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let txn = mono.get_connection().begin().await.unwrap();
+        mono.advance_descendant_refs(
+            "/fu03",
+            &new_p.id.to_string(),
+            Some(&old_p.id.to_string()),
+            &txn,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        let chg = mono.get_main_ref("/fu03/chg").await.unwrap().unwrap();
+        assert_eq!(chg.ref_tree_hash, leaf_new.id.to_string());
+        let continuation = Commit::from_mega_model(
+            mono.get_commit_by_hash(&chg.ref_commit_hash)
+                .await
+                .unwrap()
+                .expect("continuation commit"),
+        );
+        assert_eq!(continuation.parent_commit_ids, vec![c_chg.id]);
+        assert_framed(&continuation, "trunk descendant continuation");
+    }
+
     #[tokio::test]
     async fn tp16_review_merge_keeps_from_tree_id_shape() {
         let _lock = materialize::lock_materialize_tests().await;
@@ -10540,7 +10670,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let msg = landed.content.as_deref().unwrap_or("");
-        assert_eq!(msg, "cl merge generated commit");
+        // Framed with the header/body blank line since FU-03 (ADR-FU-02).
+        assert_eq!(msg, "\ncl merge generated commit");
         assert!(
             landed
                 .author

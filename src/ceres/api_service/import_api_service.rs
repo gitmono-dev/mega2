@@ -31,7 +31,7 @@ use crate::{
         },
         protocol::repo::Repo,
     },
-    common::errors::MegaError,
+    common::{errors::MegaError, utils::format_commit_msg},
     contract::api::common::Pagination,
     jupiter::{storage::Storage, utils::converter::FromGitModel},
 };
@@ -471,8 +471,11 @@ impl ApiHandler for ImportApiService {
             let parent_id =
                 ObjectHash::from_hex_for_kind(get_hash_kind(), &current_commit.commit_id).unwrap();
 
-            let new_commit =
-                Commit::from_tree_id(new_root_id, vec![parent_id], &payload.commit_message);
+            let new_commit = Commit::from_tree_id(
+                new_root_id,
+                vec![parent_id],
+                &format_commit_msg(&payload.commit_message, None),
+            );
             let new_commit_id = new_commit.id.to_string();
 
             let mut entries: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();

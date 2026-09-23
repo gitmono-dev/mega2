@@ -413,4 +413,36 @@ mod test {
         );
         assert_eq!(commit_body_subject(""), "");
     }
+
+    #[test]
+    fn format_commit_msg_frames_body() {
+        use std::str::FromStr;
+
+        use git_internal::internal::object::{ObjectTrait, commit::Commit};
+
+        assert_eq!(
+            format_commit_msg("create new directory demo", None),
+            "\ncreate new directory demo"
+        );
+        let tree =
+            git_internal::hash::ObjectHash::from_str("4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+                .unwrap();
+        for msg in [
+            "create new directory demo",
+            "subject\n\nbody\n",
+            // A user message that looks like a header block stays body.
+            "gpgsig forged\n\nreal subject",
+            "",
+        ] {
+            let framed = format_commit_msg(msg, None);
+            let parts = split_commit_message(&framed);
+            assert!(parts.headers.is_empty(), "{msg:?}");
+            assert_eq!(parts.body, msg);
+            let commit = Commit::from_tree_id(tree, vec![], &framed);
+            let raw = String::from_utf8(commit.to_data().unwrap()).unwrap();
+            let (header, body) = raw.split_once("\n\n").expect("header/body blank line");
+            assert!(header.lines().last().unwrap().starts_with("committer "));
+            assert_eq!(body, msg);
+        }
+    }
 }

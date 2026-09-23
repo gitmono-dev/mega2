@@ -259,6 +259,20 @@ git fetch && git reset --hard origin/main
 
 N = 1 时为 no-op；N > 1 时对齐到 squash tip。子路径 clone（例如 `/project/foo`），不要对 `/` 做根 clone 作为该形态的假设。
 
+### 9.1 升级前写入的 API commit 与严格客户端
+
+`0.38.24` 之前，产品写 API（`create-entry`、`edit/save`、`delete-entry`、`move-entry`，含 ImportRepo 的 `edit/save`）、review 形态的 CL merge 与旧式后代续接合成的未签名 commit 缺少头/体空行：`git log --format=%s` 显示空主题，`git fsck`（含 `--strict`）报 `unterminatedHeader`，开启 `transfer.fsckObjects` / `fetch.fsckObjects` 的客户端拒绝 clone / fetch 历史中含这类对象的路径。升级后新写入的 commit 已成帧；已有对象按 commit 身份不改写（[`plan-20260923.md`](plan/plan-20260923.md) ADR-FU-02 / `DEFER-FU-07`）。
+
+`unterminatedHeader` 属于 Git 不允许降级的致命类检查（`fetch.fsck.unterminatedHeader=ignore` 会报 `Cannot demote`），需要严格校验的客户端改用按对象跳过的 skip list：
+
+```bash
+git -c transfer.fsckObjects=false -c fetch.fsckObjects=false clone <url> probe
+LC_ALL=C git -C probe fsck 2>&1 | sed -n 's/^error in commit \([0-9a-f]*\): unterminatedHeader.*/\1/p' > mega2-fsck-skiplist.txt
+git -c transfer.fsckObjects=true -c fetch.fsck.skipList="$PWD/mega2-fsck-skiplist.txt" clone <url> work
+```
+
+本地 `git fsck` 同样可加 `-c fsck.skipList=<同一文件>`。skip list 只豁免列出的对象，其余对象仍按严格规则校验。
+
 ## 10. storage-only OCI Distribution（`/v2`）
 
 架构与端点事实源：[`refactoring/oci.md`](./refactoring/oci.md)（plan-20260902）。本节只覆盖运维启用与 `docker login` 认证语义。

@@ -481,6 +481,24 @@ fn seed_project_tip(case_dir: &Path, port: u16, token: &str) {
 }
 
 fn host_git_ok(case_dir: &Path, token: &str, args: &[&str]) {
+    let output = host_git_command(case_dir, token, args)
+        .output()
+        .expect("host git");
+    git_cli::assert_git_success(&output, &format!("git {}", args.join(" ")));
+}
+
+fn host_git_stdout(case_dir: &Path, token: &str, args: &[&str]) -> String {
+    let output = host_git_command(case_dir, token, args)
+        .output()
+        .expect("host git");
+    git_cli::assert_git_success(&output, &format!("git {}", args.join(" ")));
+    String::from_utf8(output.stdout)
+        .expect("git stdout utf8")
+        .trim_end()
+        .to_owned()
+}
+
+fn host_git_command(case_dir: &Path, token: &str, args: &[&str]) -> Command {
     let isolated_home = case_dir.join("git-home");
     fs::create_dir_all(&isolated_home).expect("git home");
     let null_config = PathBuf::from("/dev/null");
@@ -511,8 +529,7 @@ fn host_git_ok(case_dir: &Path, token: &str, args: &[&str]) {
         .env("GIT_CONFIG_KEY_5", "credential.username")
         .env("GIT_CONFIG_VALUE_5", git_cli::DEFAULT_GIT_AUTH_USER)
         .args(args);
-    let output = command.output().expect("host git");
-    git_cli::assert_git_success(&output, &format!("git {}", args.join(" ")));
+    command
 }
 
 fn boot_service_http(env: &ApiWriteEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) {
@@ -2597,5 +2614,154 @@ fn artifacts_storage_only_token_lifecycle() {
         );
     }
 
+    case.finish();
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-03: unsigned API / continuation commits carry the
+// header/body blank line (ADR-FU-02), so strict Git clients accept them.
+// ---------------------------------------------------------------------------
+
+fn fu03_repo_url(port: u16, path: &str) -> String {
+    format!(
+        "{}/",
+        git_cli::mega2_host_http_url(port, path).trim_end_matches('/')
+    )
+}
+
+/// Clone `path`, run `git fsck --strict` on every object and return the clone
+/// directory name.
+fn fu03_clone_strict_fsck(case: &EntryCase, path: &str, dir: &str) -> String {
+    let url = fu03_repo_url(case.port, path);
+    host_git_ok(&case.env.case_dir, PUSH_TOKEN, &["clone", &url, dir]);
+    let output = host_git_command(
+        &case.env.case_dir,
+        PUSH_TOKEN,
+        &["-C", dir, "fsck", "--strict", "--no-dangling"],
+    )
+    .output()
+    .expect("git fsck");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success() && !report.contains("unterminatedHeader"),
+        "git fsck --strict {path} must pass:\n{report}"
+    );
+    dir.to_owned()
+}
+
+/// create-entry, edit/save, move-entry and delete-entry on `/project`.
+fn fu03_api_writes(case: &EntryCase) {
+    let bearer = EntryCase::bearer();
+    let auth = Some(bearer.as_str());
+    case.create_entry(auth, "fu03-file.txt", false);
+    let (status, json) = case.post(
+        "edit/save",
+        auth,
+        serde_json::json!({
+            "path": "/project/fu03-file.txt",
+            "content": "fu03 saved\n",
+            "commit_message": "fu03 edit/save",
+            "skip_build": true
+        }),
+    );
+    assert_eq!(status, 200, "edit/save must 200: {json}");
+    case.create_entry(auth, "fu03-dir", true);
+    let (status, json) = case.move_entry(auth, "/project", "fu03-dir", "/project", "fu03-moved");
+    assert_eq!(status, 200, "move-entry must 200: {json}");
+    let (status, json) = case.delete_entry(auth, "/project", "fu03-moved");
+    assert_eq!(status, 200, "delete-entry must 200: {json}");
+}
+
+#[test]
+fn monorepo_api_commits_strict_fsck() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    fu03_api_writes(&case);
+    let clone = fu03_clone_strict_fsck(&case, "/project", "fu03-project");
+    let subjects = host_git_stdout(
+        &case.env.case_dir,
+        PUSH_TOKEN,
+        &["-C", &clone, "log", "--format=%s", "-5"],
+    );
+    for subject in [
+        "delete directory fu03-moved",
+        "rename directory fu03-dir to fu03-moved",
+        "create new directory fu03-dir",
+        "fu03 edit/save",
+        "create new file fu03-file.txt",
+    ] {
+        assert!(
+            subjects.lines().any(|line| line == subject),
+            "API commit {subject:?} must be in /project history:\n{subjects}"
+        );
+    }
+    case.finish();
+}
+
+#[test]
+fn import_repo_edit_save_commit_strict_fsck() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    seed_import_repo(&case.env.case_dir, case.port, PUSH_TOKEN, "fu03lib");
+    let (status, json) = case.post(
+        "edit/save",
+        Some(&EntryCase::bearer()),
+        serde_json::json!({
+            "path": "/third-party/fu03lib/src/lib.rs",
+            "content": "// fu03 import edit\n",
+            "commit_message": "fu03 import edit/save",
+            "skip_build": true
+        }),
+    );
+    assert_eq!(status, 200, "ImportRepo edit/save must 200: {json}");
+    let clone = fu03_clone_strict_fsck(&case, "/third-party/fu03lib", "fu03-import");
+    let subject = host_git_stdout(
+        &case.env.case_dir,
+        PUSH_TOKEN,
+        &["-C", &clone, "log", "--format=%s", "-1"],
+    );
+    assert_eq!(subject, "fu03 import edit/save");
+    case.finish();
+}
+
+#[test]
+fn api_history_strict_clone() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    fu03_api_writes(&case);
+    for (path, dir) in [
+        ("/project", "fu03-strict-project"),
+        ("/", "fu03-strict-root"),
+    ] {
+        let url = fu03_repo_url(case.port, path);
+        host_git_ok(
+            &case.env.case_dir,
+            PUSH_TOKEN,
+            &["-c", "transfer.fsckObjects=true", "clone", &url, dir],
+        );
+    }
+    case.finish();
+}
+
+#[test]
+fn api_commit_subject_visible() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&EntryCase::bearer()), "fu03-subject", true);
+    let url = fu03_repo_url(case.port, "/project");
+    host_git_ok(
+        &case.env.case_dir,
+        PUSH_TOKEN,
+        &["clone", &url, "fu03-subject-clone"],
+    );
+    let subject = host_git_stdout(
+        &case.env.case_dir,
+        PUSH_TOKEN,
+        &["-C", "fu03-subject-clone", "log", "--format=%s", "-1"],
+    );
+    assert_eq!(subject, "create new directory fu03-subject");
     case.finish();
 }
