@@ -42,6 +42,7 @@ pub mod api_tip_lander;
 pub mod import_repo;
 pub mod materialize;
 pub mod monorepo;
+pub mod path_policy;
 pub mod push_chain;
 pub mod trunk_provenance;
 

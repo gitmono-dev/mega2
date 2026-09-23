@@ -61,6 +61,10 @@ pub enum MegaError {
     StaleMonorepoRootRef,
     #[error("lazy materialize aborted after concurrent root updates; retry the advertise")]
     MaterializeAborted,
+    /// Monorepo path creation policy (plan-20260923 ADR-FU-03); the text is
+    /// the stable `<CODE>: <message>` shared by Git `ng` lines and the API.
+    #[error("{0}")]
+    PathPolicy(#[from] PathPolicyError),
     #[error("Other error: {0}")]
     Other(String),
     /// Process exit with a frozen CLI status code (UN-29 authz-audit table).
@@ -148,12 +152,78 @@ impl From<MegaError> for GitError {
     fn from(val: MegaError) -> Self {
         match val {
             MegaError::NotFound(msg) => GitError::CustomError(format!("[code:404] {msg}")),
+            // Product writes return `GitError`; the marker keeps the API status
+            // and `ApiError` strips it, so `err_message` is the policy text.
+            MegaError::PathPolicy(err) => {
+                GitError::CustomError(format!("[code:{}] {err}", err.http_status().as_u16()))
+            }
             MegaError::ObjStorageNotFound(msg) => {
                 GitError::CustomError(format!("[code:404] ObjStorage not found: {msg}"))
             }
             other => GitError::CustomError(other.to_string()),
         }
     }
+}
+
+/// Why a monorepo path may not be created or written (plan-20260923
+/// ADR-FU-03). `Display` starts with a stable code followed by `: ` and is a
+/// single line (paths, root names and reasons have control characters
+/// escaped) so it can travel in a Git `ng` line; messages never include
+/// config file paths, `base_dir`, service addresses or credentials.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum PathPolicyError {
+    #[error(
+        "MONO_PATH_NOT_ALLOWED: cannot create {path:?}: new paths must be under one of the monorepo roots ({roots}); paths under {import_dir:?} are ImportRepos, created by pushing a repository to them",
+        roots = single_line(&.allowed_roots.join(", "))
+    )]
+    NotAllowed {
+        path: String,
+        allowed_roots: Vec<String>,
+        import_dir: String,
+    },
+    #[error(
+        "MONO_PATH_UNINITIALIZED: {path:?} does not exist yet; provision it with `mega2 path provision --server <url> {command_path}` or `POST /api/v1/path/provision`, then clone it, commit on top and push",
+        command_path = single_line(.path)
+    )]
+    Uninitialized { path: String },
+    #[error("MONO_PATH_INVALID: {path:?}: {}", single_line(.reason))]
+    Invalid { path: String, reason: String },
+    #[error("MONO_PATH_CONFLICT: {path:?}: {component:?} exists and is not a directory")]
+    Conflict { path: String, component: String },
+}
+
+impl PathPolicyError {
+    /// Stable machine-readable code (the `Display` prefix).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotAllowed { .. } => "MONO_PATH_NOT_ALLOWED",
+            Self::Uninitialized { .. } => "MONO_PATH_UNINITIALIZED",
+            Self::Invalid { .. } => "MONO_PATH_INVALID",
+            Self::Conflict { .. } => "MONO_PATH_CONFLICT",
+        }
+    }
+
+    /// HTTP status for the API face (`ApiError` and the `[code:…]` marker the
+    /// `GitError` channel carries).
+    pub fn http_status(&self) -> StatusCode {
+        match self {
+            Self::NotAllowed { .. } | Self::Invalid { .. } => StatusCode::BAD_REQUEST,
+            Self::Uninitialized { .. } | Self::Conflict { .. } => StatusCode::CONFLICT,
+        }
+    }
+}
+
+/// Escape control characters (newline, NUL, …) so the text stays one line.
+fn single_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[derive(Error, Debug)]
@@ -250,6 +320,172 @@ impl IntoResponse for ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn path_policy_samples() -> [PathPolicyError; 4] {
+        [
+            PathPolicyError::NotAllowed {
+                path: "/vendor/lib".to_owned(),
+                allowed_roots: vec!["/project".to_owned(), "/third-party".to_owned()],
+                import_dir: "/third-party".to_owned(),
+            },
+            PathPolicyError::Uninitialized {
+                path: "/project/new".to_owned(),
+            },
+            PathPolicyError::Invalid {
+                path: "/project//x".to_owned(),
+                reason: "path must be canonical".to_owned(),
+            },
+            PathPolicyError::Conflict {
+                path: "/project/a/b".to_owned(),
+                component: "/project/a".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn path_policy_display_codes() {
+        let codes: Vec<&str> = path_policy_samples().iter().map(|err| err.code()).collect();
+        assert_eq!(
+            codes,
+            [
+                "MONO_PATH_NOT_ALLOWED",
+                "MONO_PATH_UNINITIALIZED",
+                "MONO_PATH_INVALID",
+                "MONO_PATH_CONFLICT",
+            ]
+        );
+        for err in path_policy_samples() {
+            let code = err.code();
+            assert!(err.to_string().starts_with(&format!("{code}: ")), "{err}");
+            // Wrapping keeps the text verbatim (no `Other error:` prefix), and
+            // the Git face carries the same line.
+            let mega = MegaError::from(err.clone());
+            assert_eq!(mega.to_string(), err.to_string());
+            let git: GitError = mega.into();
+            assert!(git.to_string().contains(&err.to_string()), "{git}");
+        }
+        let uninitialized = path_policy_samples()[1].to_string();
+        assert!(uninitialized.contains("mega2 path provision --server <url> /project/new"));
+        assert!(uninitialized.contains("POST /api/v1/path/provision"));
+    }
+
+    async fn api_error_body(err: ApiError) -> (StatusCode, String) {
+        let response = err.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        (
+            status,
+            json["err_message"]
+                .as_str()
+                .expect("err_message")
+                .to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn path_policy_api_status() {
+        let expected = [
+            StatusCode::BAD_REQUEST,
+            StatusCode::CONFLICT,
+            StatusCode::BAD_REQUEST,
+            StatusCode::CONFLICT,
+        ];
+        for (err, status) in path_policy_samples().into_iter().zip(expected) {
+            let text = err.to_string();
+            assert_eq!(err.http_status(), status, "{text}");
+            // Typed MegaError channel.
+            let direct = ApiError::from(MegaError::from(err.clone()));
+            assert_eq!(api_error_body(direct).await, (status, text.clone()));
+            // Bare PathPolicyError (e.g. `classify_creation_path(..)?` in a handler).
+            let bare = ApiError::from(err.clone());
+            assert_eq!(api_error_body(bare).await, (status, text.clone()));
+            // GitError channel used by product writes.
+            let git: GitError = MegaError::from(err).into();
+            assert_eq!(api_error_body(ApiError::from(git)).await, (status, text));
+        }
+
+        // A `[code:N]` inside a user path must not truncate the stable text.
+        let tricky = PathPolicyError::NotAllowed {
+            path: "/vendor/[code:1]x".to_owned(),
+            allowed_roots: vec!["/project".to_owned()],
+            import_dir: "/third-party".to_owned(),
+        };
+        let text = tricky.to_string();
+        for err in [
+            ApiError::from(tricky.clone()),
+            ApiError::from(MegaError::from(tricky.clone())),
+            ApiError::from(GitError::from(MegaError::from(tricky))),
+        ] {
+            assert_eq!(
+                api_error_body(err).await,
+                (StatusCode::BAD_REQUEST, text.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn path_policy_message_redaction() {
+        let config = crate::config::testing::isolated_config(
+            std::env::temp_dir().join("mega2-path-policy-redaction"),
+        );
+        let mut monorepo = config.monorepo.clone();
+        monorepo.root_dirs = vec!["project".to_owned(), "third-party".to_owned()];
+        monorepo.import_dir = std::path::PathBuf::from("/third-party");
+        let err = crate::ceres::pack::path_policy::classify_creation_path(&monorepo, "/vendor/lib")
+            .expect_err("outside roots");
+        let text = err.to_string();
+        assert!(
+            text.contains("/project") && text.contains("/third-party"),
+            "{text}"
+        );
+        let base_dir = config.base_dir.to_string_lossy();
+        for single in [
+            PathPolicyError::NotAllowed {
+                path: "/ven\ndor".to_owned(),
+                allowed_roots: vec!["/pro\nject".to_owned(), "/x\r\0y".to_owned()],
+                import_dir: "/third\nparty".to_owned(),
+            },
+            PathPolicyError::Uninitialized {
+                path: "/project/a\nb".to_owned(),
+            },
+            PathPolicyError::Invalid {
+                path: "/p\n".to_owned(),
+                reason: "bad\nreason".to_owned(),
+            },
+            PathPolicyError::Conflict {
+                path: "/p\n".to_owned(),
+                component: "/p\n".to_owned(),
+            },
+        ] {
+            let line = single.to_string();
+            assert!(!line.contains(['\n', '\r', '\0']), "{line:?}");
+            assert!(
+                line.starts_with(&format!("{}: ", single.code())),
+                "{line:?}"
+            );
+        }
+        let escaped = PathPolicyError::NotAllowed {
+            path: "/x".to_owned(),
+            allowed_roots: vec!["/pro\nject".to_owned()],
+            import_dir: "/third-party".to_owned(),
+        }
+        .to_string();
+        assert!(escaped.contains("/pro\\nject"), "{escaped}");
+
+        for leaked in [
+            base_dir.as_ref(),
+            config.database.db_url.as_str(),
+            config.redis.url.as_str(),
+            "config.toml",
+            "http://",
+            "postgres://",
+        ] {
+            assert!(!text.contains(leaked), "{text} leaks {leaked}");
+        }
+    }
 
     #[test]
     fn converts_not_found_to_git_404_marker() {
