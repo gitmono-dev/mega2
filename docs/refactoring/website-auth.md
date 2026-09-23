@@ -6,12 +6,12 @@
 [`website-mail.md`](./website-mail.md)。
 
 > **术语**：本文中 *website* 指 mega2 的**前端 / 认证面实现**，当前为 sibling
-> `../megaui` 的 `apps/web`。Compose 服务名 `website-next` / `website-db-init`、
+> 网站应用 sibling checkout 中的 `apps/web`。Compose 服务名 `website-next` / `website-db-init`、
 > 隔离账户库名 `website`、以及 `MEGA_OAUTH__WEBSITE_*` /
 > `MEGA_NOTIFICATION__WEBSITE_MAIL_*` 配置键**均保持不变**——它们是 Rust 结构体
 > 派生的配置面与 Compose 内部 DNS，改名会让会话路径 fail-closed 成 401。
 
-核对日：**2026-09-04**。前端 / 账户仓库 sibling：`../megaui`（`apps/web`）。IT
+核对日：**2026-09-04**。网站应用 / 账户服务的 sibling checkout 为 `apps/web`。IT
 Postgres schema 初始化使用其 `apps/web/Dockerfile` 的 `db-init` target：先幂等创建
 `website` 数据库，再在 `/app/packages/database` 执行 `pnpm exec drizzle-kit migrate`。
 Compose 中的 Dockerfile target 与命令是此处的实施事实；契约漂移时先改本文再改代码。
@@ -20,8 +20,8 @@ Compose 中的 Dockerfile target 与命令是此处的实施事实；契约漂�
 
 ## 1. 信任路径
 
-浏览器身份**只**信任 megaui Better Auth。mega2 **不签发** session cookie，
-**不**直连读取 megaui 的 user/session 表。
+浏览器身份**只**信任 website frontend Better Auth。mega2 **不签发** session cookie，
+**不**直连读取 website frontend 的 user/session 表。
 
 ```text
 Browser
@@ -131,20 +131,20 @@ website（或显式 `AccessTokenUser`）。
 
 ## 5. Compose 同栈拓扑（ADR-WA-07）
 
-形态对标 Mega demo「前端 + 后端 + 数据面」，资产是 **megaui `apps/web`**，
+形态对标 Mega demo「前端 + 后端 + 数据面」，资产是 **website frontend `apps/web`**，
 **不是** moon/campsite。
 
 | 项 | 值 |
 |---|---|
 | Compose 项目 | `-p mega2-it` |
 | 文件 | `docker/docker-compose.test.yml` |
-| 服务名 | `website-next`（另有 `megaui-collab`） |
+| 服务名 | `website-next`（另有 `website-collab`） |
 | Profile | `web`（默认 `up -d --wait` **不**拉起） |
-| Build | `website-next` / `website-db-init`：context `../megaui`，dockerfile `apps/web/Dockerfile`；`megaui-collab`：`apps/collab-server/Dockerfile` |
+| Build | `website-next` / `website-db-init`：从网站应用 sibling checkout 的 `apps/web/Dockerfile` 构建；`website-collab`：从 `apps/collab-server/Dockerfile` 构建 |
 | 网络 | `mega2-test-network` |
 | 容器端口 | `7001` |
 | 宿主映射 | `127.0.0.1:17001:7001` |
-| 协作 WebSocket | `ws://127.0.0.1:17002` → `megaui-collab:7002` |
+| 协作 WebSocket | `ws://127.0.0.1:17002` → `website-collab:7002` |
 | 账户库 | IT 默认共享 `postgres` 服务上的独立库 **`website`**（`DB_DIALECT=pg`）；与 mega2 业务库 **`mega2` 隔离** |
 | mega2 基址（容器内） | `http://website-next:7001` |
 | 宿主浏览器 origin | `http://127.0.0.1:17001` |
@@ -160,7 +160,7 @@ docker compose -p mega2-it -f docker/docker-compose.test.yml \
 `mega2` 不声明对 `website-next` 的 Compose `depends_on`：两个服务分别属于
 `app` / `web` profile；若仅选择 `app`，该跨 profile 依赖会使 Compose 拒绝配置，
 并破坏既有的无 website 的 app smoke。上述联合命令会等待两者健康。需要保证第一次
-会话请求也发生在 megaui 已就绪后时，按以下顺序启动：
+会话请求也发生在 website frontend 已就绪后时，按以下顺序启动：
 
 ```bash
 docker compose -p mega2-it -f docker/docker-compose.test.yml \
@@ -178,14 +178,14 @@ docker compose -p mega2-it -f docker/docker-compose.test.yml \
   curl -fsS http://website-next:7001/api/auth/get-session
 ```
 
-栈级验收（ITW-03）：megaui sign-up/sign-in → session cookie →
+栈级验收（ITW-03）：website frontend sign-up/sign-in → session cookie →
 `GET http://127.0.0.1:19180/api/v1/user` → 断言 `username` /
 `website_user_id` 与 get-session 一致；无 cookie → 401。
 
 登记与 CI 入口须同步 [`test-infra.md`](./test-infra.md)（ITW-01）。
-前置：sibling checkout `../megaui`；缺失则 ITW blocked。
+前置：网站应用 sibling checkout；缺失则 ITW blocked。
 
-与 Mega demo 差异：IdP/前端是 megaui web + Better Auth，无 MySQL campsite；
+与 Mega demo 差异：IdP/前端是 website frontend web + Better Auth，无 MySQL campsite；
 mega2 业务库仍为本仓 Postgres。
 
 ---

@@ -2,42 +2,41 @@
 
 English · [中文](user-guide.zh.md)
 
-This is the **user guide** for mega2, covering the surfaces you touch day to day: Git clients, the HTTP API, large files, optional service surfaces, and the CLI. It only orients and shows minimal examples; fact values (config keys, tokens, ports, endpoint lists) live in their authoritative docs — product rules in [`monorepo.md`](./monorepo.md), deployment and ops in [`deploy-trunk.md`](./deploy-trunk.md), the configuration contract in [`refactoring/config.md`](./refactoring/config.md) plus the heavily commented sample [`config/config.toml`](../config/config.toml), and the error model in [`errors.md`](./errors.md).
+Use this guide for everyday Git, HTTP API, large-file, optional-service, and CLI workflows. For deployment instructions, see the [Deployment Guide](./deployment.md); the commented [`config.toml`](../config/config.toml) is the authoritative list of configuration keys.
 
-> **Scope**: the mega2 open-source edition ships only the **trunk / storage-only** shape — no Web UI, no Change List (CL). Interactive browsing and directory / tag operations go through Libra's `libra mega2 browser` (see §6).
+> **Scope:** the open-source edition supports only **trunk / storage-only** mode. It has no Web UI or Change List (CL). Use Libra's `libra mega2 browser` for interactive browsing and directory or tag operations (see §6).
 
 ## 1. Product shape and boundaries
 
-Core rules (source of truth: [`monorepo.md`](./monorepo.md)):
+Repository behavior depends on the path you use:
 
-- **Single public branch `main`**: pushing any public head other than `refs/heads/main` is rejected at the protocol layer; `refs/cl/*` belongs to the CL pipeline and is not part of the storage-only delivery.
-- **Git-client tags are forbidden**: `git push --tags` and any other client-side tag write exits non-zero and leaves no residue on the remote; tag creation / query / deletion go through the HTTP API only (see §4.2).
-- **ImportRepo exception**: repositories under `[monorepo].import_dir` (default `/third-party`) follow ordinary Git semantics — multi-branch and client tags are legal there, for hosting third-party dependency sources.
-- **No CL / no Web UI**: storage-only does not register CL / issue / reviewer / OAuth user routes; the OpenAPI document reflects this (they are absent).
-- **Unified write authority**: `git push` and the product write APIs share `MonoWriteQueue` to advance path tips (design: [`refactoring/trunk-push.md`](./refactoring/trunk-push.md)); root-tree writes are globally serialized.
+- **Monorepo paths** (the root path and paths outside `import_dir`) expose only the public branch `main`. Git-client tag writes and pushes to other branches are rejected. Create, list, and delete tags through the HTTP API (§4.2) or Libra's `libra mega2 browser` command (§6).
+- **ImportRepo paths** under `[monorepo].import_dir` (default `/third-party`) follow ordinary Git semantics: they allow multiple branches and Git-client tag operations. Use them when migrating or hosting third-party repositories.
+- The shipped storage-only service has no Web UI or Change List (CL). Its OpenAPI document omits CL, issue, reviewer, and user routes.
+- Git pushes and product API writes share the same write queue and path-tip authority. The [architecture guide](./architecture.md) describes the write path.
 
 ## 2. Git client operations
 
 ### 2.1 Smart HTTP: clone / fetch / push
 
-Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`) is mounted under the repository path and supports sub-path clones (local compose stack ports: [`deploy-trunk.md`](./deploy-trunk.md) §8):
+Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`) is mounted under the repository path and supports sub-path clones. See the [Deployment Guide](./deployment.md) for local Compose endpoints:
 
 ```bash
 git clone http://127.0.0.1:9000/project
 git fetch && git reset --hard origin/main   # client alignment after a trunk push
 ```
 
-Push landing rules (trunk shape):
+Push behavior in trunk mode:
 
-- Only `refs/heads/main` may be pushed; other heads and tags are rejected.
-- An N = 1 (single-commit) push lands as-is; an N > 1 chained push is squashed by the server into one commit advancing `main`, after which you must run `git fetch && git reset --hard origin/main` to align — otherwise the next push is rejected as non-fast-forward (N-split details: [`monorepo.md`](./monorepo.md) §9; agent workflow memo: [`deploy-trunk.md`](./deploy-trunk.md) §9).
-- Sub-path pushes are the norm; pushing the root path `/` is not an assumption of this shape.
+- Push to `refs/heads/main`; pushes to other branches and Git-client tag writes are rejected on Monorepo paths.
+- A single-commit push lands unchanged. A push containing multiple commits is squashed into one commit on `main`. Afterward, run `git fetch && git reset --hard origin/main`; otherwise, the next push may be rejected as non-fast-forward.
+- Push to a repository subpath. Pushing from the root path `/` is unsupported in storage-only mode.
 
-Protocol compatibility and the smoke matrix: [`refactoring/protocol.md`](./refactoring/protocol.md).
+The protocol endpoints and write surfaces are listed in the [Architecture Guide](./architecture.md).
 
 ### 2.2 SSH: read-only fetch
 
-storage-only **does not expose SSH receive-pack** (`git.ssh_receive_pack=false` is mandatory configuration; omitting it refuses startup). SSH is only for clone / fetch / pull. The authentication forms under each `anonymous_access` / `push_auth` combination: [`deploy-trunk.md`](./deploy-trunk.md) §4.
+storage-only **does not expose SSH receive-pack** (`git.ssh_receive_pack=false` is mandatory configuration; omitting it refuses startup). SSH is only for clone, fetch, and pull. See the [Deployment Guide](./deployment.md) for supported authentication modes.
 
 ### 2.3 Push auth: token or none
 
@@ -46,15 +45,15 @@ The write surfaces (Git receive-pack, LFS batch/lock writes, product API writes)
 - `token`: HTTP Basic takes only the password (= the token secret); the username is ignored. `paths` prefixes authorize on component boundaries.
 - `none`: credential-less writes, only for controlled networks (loopback / Unix socket / intranet front).
 
-`[[git.push_tokens]]` configuration, credential injection, and risk warnings: [`deploy-trunk.md`](./deploy-trunk.md) §3; this guide does not copy token values.
+See the [Deployment Guide](./deployment.md) for token setup, credential injection, and security guidance; this guide does not reproduce token values.
 
 ### 2.4 Object format
 
-`[monorepo].object_format` defaults to `sha1` (stock Git). `sha256` and `blake3` are **git-internal / Libra extensions** with no claimed interoperability with stock Git clients; they require Libra. See [`refactoring/protocol.md`](./refactoring/protocol.md) and [`refactoring/config.md`](./refactoring/config.md).
+`[monorepo].object_format` defaults to `sha1`, which works with standard Git clients. The `sha256` and `blake3` formats are Libra extensions and require the Libra client; standard Git interoperability is not supported for those formats. Configuration options are listed in [`config.toml`](../config/config.toml).
 
 ## 3. Large files: LFS
 
-- **Git LFS (standard)**: endpoints `/info/lfs` and `/api/v1/lfs`, usable directly by stock `git-lfs` clients; LFS write authorization shares `git.push_auth` with Git receive-pack (matrix: [`deploy-trunk.md`](./deploy-trunk.md) §6).
+- **Git LFS (standard)**: endpoints `/info/lfs` and `/api/v1/lfs` work with standard `git-lfs` clients. LFS writes use the same `git.push_auth` setting as Git receive-pack; see the [Deployment Guide](./deployment.md) for authentication modes.
 
 ## 4. HTTP API usage
 
@@ -62,7 +61,7 @@ The base URL is the HTTP service listen address. Write endpoints authenticate vi
 
 ### 4.1 Product writes (directories and files)
 
-`POST /api/v1/create-entry`, `POST /api/v1/delete-entry`, `POST /api/v1/move-entry`, `POST /api/v1/edit/save`. Objects are written to storage and the path tip is advanced through MonoWriteQueue — the same tip authority as `git push`. A successful response carries `cl_link: null` (no CL is created), and a same-stack `git clone` / `git pull` sees the new content immediately. Request fields and the authorization contract: [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md).
+`POST /api/v1/create-entry`, `POST /api/v1/delete-entry`, `POST /api/v1/move-entry`, and `POST /api/v1/edit/save` write files and directories. The path tip advances through the same write queue used by `git push`. A successful response carries `cl_link: null` (no CL is created), and a same-stack `git clone` or `git pull` can read the committed content immediately. Index-backed browse results may take a short time to catch up after a write. The runtime OpenAPI document describes request fields and response schemas.
 
 ### 4.2 Tags API
 
@@ -75,7 +74,7 @@ The only entry point now that Git-client tags are forbidden:
 | Get | `GET /api/v1/tags/{name}` |
 | Delete | `DELETE /api/v1/tags/{name}` |
 
-create / delete authenticate via `git.push_auth`; list / get do not require Authorization. Path selectors and authorization details: [`monorepo.md`](./monorepo.md) §2 and [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md).
+Create and delete requests authenticate through `git.push_auth`; list and get requests do not require authorization. The runtime OpenAPI document describes request fields and response schemas.
 
 ### 4.3 Read-only browsing
 
@@ -88,14 +87,14 @@ create / delete authenticate via `git.push_auth`; list / get do not require Auth
 
 ### 4.5 Error contract
 
-Error type ownership and HTTP status mapping are centralized in `crate::common::errors`; the rules: [`errors.md`](./errors.md).
+Error types and HTTP status mapping are centralized in `crate::common::errors`.
 
 ## 5. Optional service surfaces
 
-Both surfaces are **dual-gated** (storage-only shape + their own switch); with either condition missing the whole surface is absent (bare 404), and enabling the switch outside storage-only refuses startup.
+Both surfaces require storage-only mode and their own config switch. If either condition is missing, the route is not mounted and returns 404; enabling either switch outside storage-only mode prevents startup.
 
-- **OCI Distribution `/v2`**: mounted when storage-only and `[oci].enabled=true`; serves as a container registry (`docker login` reuses push tokens — there is no separate token service). Architecture and endpoint source of truth: [`refactoring/oci.md`](./refactoring/oci.md); enablement steps: [`deploy-trunk.md`](./deploy-trunk.md) §10.
-- **Agent Capture `/api/v1/agent-capture`**: mounted when storage-only and `[agent_capture].enabled=true`; captures agent sessions / events / checkpoints / file operations, with its own `[[agent_capture.ingest_tokens]]` authentication surface. Configuration and quota source of truth: [`refactoring/agent-capture.md`](./refactoring/agent-capture.md).
+- **OCI Distribution `/v2`**: mounted when storage-only and `[oci].enabled=true`; serves as a container registry (`docker login` reuses push tokens — there is no separate token service). See the [Deployment Guide](./deployment.md) for enablement and usage.
+- **Agent Capture `/api/v1/agent-capture`**: mounted when storage-only and `[agent_capture].enabled=true`; captures agent sessions, events, checkpoints, and file operations, with its own `[[agent_capture.ingest_tokens]]` authentication surface. The [Architecture Guide](./architecture.md) lists the route and its configuration gate.
 
 ## 6. Using mega2 with Libra
 
@@ -109,7 +108,7 @@ That TUI consumes the HTTP surface of §4 (tree reads, create / delete / move-en
 
 ## 7. CLI quick reference
 
-Global flags: `--config <PATH>` (env `MEGA_CONFIG`) and `--profile <NAME>` (env `MEGA_PROFILE`, loading the sibling `config.<profile>.toml`). Config load order, environment overrides (`MEGA_<SECTION>__<KEY>`), unknown-field rejection, and the hot-reload whitelist: [`refactoring/config.md`](./refactoring/config.md).
+Global flags: `--config <PATH>` (env `MEGA_CONFIG`) and `--profile <NAME>` (env `MEGA_PROFILE`, loading the sibling `config.<profile>.toml`). See the [Configuration Guide](./configuration.md) for load order, environment overrides (`MEGA_<SECTION>__<KEY>`), unknown-field rejection, and hot reload. For a new database, `mega2 service init --yes` creates the initial Monorepo from the configured `root_dirs` and exits without starting listeners; the commented [`config.toml`](../config/config.toml) shows the directory defaults.
 
 | Command | Purpose |
 |---|---|
@@ -123,24 +122,20 @@ Global flags: `--config <PATH>` (env `MEGA_CONFIG`) and `--profile <NAME>` (env 
 | `mega2 config vault backup/restore/rekey/reset` | Vault core-key operations (the last three are destructive and require `--force`) |
 | `mega2 debug storage-smoke [--key ...]` | Hidden command: object-storage read / write / delete smoke; absent from top-level help |
 
-The `authz-audit` subcommand targets authorization auditing in the review morphology; under storage-only `cedar.enforcement` is always `off`, so it is not part of daily use (review-morphology coverage: [`manual/authz.md`](./manual/authz.md)).
+The `authz-audit` subcommand audits authorization in review mode. Under storage-only, `cedar.enforcement` is always `off`, so this command is not part of day-to-day use. The [Architecture Guide](./architecture.md) summarizes the authorization modes.
 
-The full flag list lives in `--help` and `src/commands/`. Compose bootstrap and smoke command samples: [`deploy-trunk.md`](./deploy-trunk.md) §8; local development and test entry points: [`development.md`](./development.md).
+The full flag list lives in `--help` and `src/commands/`. See the [Deployment Guide](./deployment.md) for Compose setup and the [Contributing Guide](./contributing.md) for the development workflow and required checks.
 
 ## 8. Related documents
 
 | Topic | Document |
 |---|---|
-| This documentation set (quick start / config / deployment / architecture / contributing) | [`quick-start.md`](./quick-start.md) · [`configuration.md`](./configuration.md) · [`deployment.md`](./deployment.md) · [`architecture.md`](./architecture.md) · [`contributing.md`](./contributing.md) |
-| Product rules (single branch, tag ban, ImportRepo, trunk invariants) | [`monorepo.md`](./monorepo.md) |
-| Trunk / storage-only deployment and the compose stack | [`deploy-trunk.md`](./deploy-trunk.md) |
-| Config keys and environment variables | [`config/config.toml`](../config/config.toml) (commented sample), [`refactoring/config.md`](./refactoring/config.md) |
-| Git protocol compatibility | [`refactoring/protocol.md`](./refactoring/protocol.md) |
-| Trunk push design and MonoWriteQueue | [`refactoring/trunk-push.md`](./refactoring/trunk-push.md) |
-| Directory / file write and tag contract | [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md) |
-| OCI registry | [`refactoring/oci.md`](./refactoring/oci.md) |
-| Agent Capture | [`refactoring/agent-capture.md`](./refactoring/agent-capture.md) |
-| Error model | [`errors.md`](./errors.md) |
-| Monorepo initialization products | [`manual/monorepo-init.md`](./manual/monorepo-init.md) |
-| Authentication / authorization boundary (review morphology) | [`manual/authz.md`](./manual/authz.md) |
-| Local development and tests | [`development.md`](./development.md) |
+| Guides (quick start / recipes / config / deployment / architecture / contributing) | [`quick-start.md`](./quick-start.md) · [`recipes.md`](./recipes.md) · [`configuration.md`](./configuration.md) · [`deployment.md`](./deployment.md) · [`architecture.md`](./architecture.md) · [`contributing.md`](./contributing.md) |
+| Repository paths, branches, tags, and push behavior | Sections 1–2 of this guide |
+| Trunk / storage-only deployment and the Compose stack | [`deployment.md`](./deployment.md) |
+| Config keys and environment variables | [`config.toml`](../config/config.toml) (commented sample), [`configuration.md`](./configuration.md) |
+| Git protocol surfaces and write path | [`architecture.md`](./architecture.md) |
+| Directory, file, and tag operations | Sections 4.1–4.2 of this guide |
+| OCI registry and Agent Capture routes | [`architecture.md`](./architecture.md) and [`deployment.md`](./deployment.md) |
+| Error handling implementation | `crate::common::errors` |
+| Contribution workflow and required checks | [`contributing.md`](./contributing.md) |

@@ -4,7 +4,7 @@
 
 术语约定：**认证** = website Better Auth 会话与 Mono access token / Bot / SSH 公钥身份；**授权** = mega2 Cedar 三态（`off` / `shadow` / `enforce`）对 HTTP guard 与 Git push 的判定。
 
-本文中 **website** 是角色名（认证面），其实现仓库为 sibling `../megaui` 的 `apps/web`；Compose 服务名 `website-next`、隔离账户库名 `website` 与 `MEGA_OAUTH__WEBSITE_*` 配置键均未改名。
+本文中 **website** 是认证服务的角色名；Compose 服务名 `website-next`、隔离账户库名 `website` 与 `MEGA_OAUTH__WEBSITE_*` 配置键均按现有实现保留。
 
 ---
 
@@ -186,4 +186,4 @@ website `role=admin` 与 mega2 `UserGroup::"admin"` 是**独立系统**。两边
 - [`../refactoring/contract.md`](../refactoring/contract.md) — 授权 / policy / admin / Kill Switch 相关开发契约
 - [`../refactoring/integration.md`](../refactoring/integration.md) — Kill Switch 脚本与集成覆盖
 - [`../plan/plan-20260812.md`](../plan/plan-20260812.md) — 本能力日期计划（含量化发布门与 runbook 权威细则）
-- [`monorepo-init.md`](./monorepo-init.md) — monorepo 初始化（含 `admin` 播种）
+- [`monorepo-init.md`](./monorepo-init.zh.md) — monorepo 初始化（含 `admin` 播种）

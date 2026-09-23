@@ -3,7 +3,7 @@
 > **墓碑：2026-09-19，plan-20260919 RM-01。** mega2 **不再发起产品邮件**。
 > 本仓不是 website 内部邮件 API 的客户端，也不再编排、调用或配置任何发信路径。
 
-认证事务邮件仍由 megaui / website 拥有；本仓不改 sibling。产品决议见
+认证事务邮件仍由 website frontend / website 拥有；本仓不改 sibling。产品决议见
 [`plan-20260919.md`](../plan/plan-20260919.md) ADR-RM-01 / ADR-RM-06。
 
 核对日：**2026-09-19**。本文不再是跨服务发信契约的现行事实源。

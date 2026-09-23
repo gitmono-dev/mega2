@@ -2,44 +2,44 @@ English · [中文](contributing.zh.md)
 
 # Contributing Guide
 
-This is the entry document for contributing code to mega2: process, gates,
-conventions, and how-tos for common tasks. The fact baseline is the current
-checkout plus [`../AGENTS.md`](../AGENTS.md); where the two conflict,
-`AGENTS.md` and the source win — open an Issue to fix this document.
+This guide explains how to contribute code to mega2: how to propose a change,
+prepare the development environment, run the required checks, and follow the
+repository's conventions. The current checkout and [`../AGENTS.md`](../AGENTS.md)
+are the sources of truth. If this guide conflicts with either, follow the
+source and open an issue to correct the documentation.
 
 ## 1. Contribution process
 
-Do not start a large change cold. The order is:
+For a large change, agree on the scope and approach with the maintainers before
+implementation:
 
 1. **Open an Issue first.** State the problem, motivation, scope, and explicit
    non-goals. Wait until maintainers (or the discussion) accept the direction.
-2. **Then write a plan.** Copy the structure from
-   [`plan/plan-template.md`](plan/plan-template.md) (in-repo operational
-   original, Chinese) or [`plan/plan-template.en.md`](plan/plan-template.en.md)
-   (English contributor edition) into `docs/plan/plan-YYYYMMDD.md`. Do not
+2. **Then write a plan.** Start from the English contributor template
+   [`plan/plan-template.en.md`](plan/plan-template.en.md) and save the working
+   plan as `docs/plan/plan-YYYYMMDD.md`. Do not
    delete mandatory sections; write `N/A` and the reason when a section does
-   not apply. Plan rules (naming, fact baseline, task cards, index
-   registration) live in [`plan/README.md`](plan/README.md).
+   not apply. The operational plan archive remains Chinese-first; follow the
+   repository rules in [`../AGENTS.md`](../AGENTS.md).
 3. **Implement only after the plan is reviewed.** Split the work into
    independently executable task cards (clear scope / dependencies / file
    targets / acceptance criteria / verification commands), add tests and docs,
    and pass the three gates in section 3 before merge.
 
-**A plan is not an implementation.** At write time, the fact baseline is the
-current checkout's source, tests, config, and docs; historical plans and
-verbal Issue agreements are clues only and cannot replace the verification
-commands on a task card.
+**A plan is not an implementation.** When drafting a plan, verify its
+assumptions against the current source, tests, config, and docs. Historical
+plans and agreements in issue discussions are useful context, but they do not
+replace the verification commands on a task card.
 
 ## 2. Development environment
 
-Environment setup, the compose data plane, the integration-test stack, and
-troubleshooting all live in [`development.md`](development.md); this document
-does not duplicate them. Prefer the unified entry script
-[`../scripts/dev-test.sh`](../scripts/dev-test.sh) (`up-full` / `basic` /
-`full` / `gates`, etc.) over hand-pasted commands; shared logic is in
-[`../scripts/lib/mega2-it.sh`](../scripts/lib/mega2-it.sh). The test env
-template is [`../.env.test.example`](../.env.test.example) (`dev-test.sh`
-auto-creates a local `.env.test`, which is never committed).
+Use the unified entry script [`../scripts/dev-test.sh`](../scripts/dev-test.sh)
+to prepare the Compose data plane and run tests (`up-full` / `basic` / `full` /
+`gates`, etc.). Its shared logic is in
+[`../scripts/lib/mega2-it.sh`](../scripts/lib/mega2-it.sh). The test
+environment template is [`../.env.test.example`](../.env.test.example);
+`dev-test.sh` creates a local `.env.test` when needed, and that file must not
+be committed. Use `./scripts/dev-test.sh --help` for available workflows.
 
 ## 3. The three submit gates
 
@@ -56,8 +56,9 @@ source .env.test && cargo test --all
 Requirements: fmt reports no diff (nightly toolchain, because `rustfmt.toml`
 may enable unstable options); clippy exits with 0 warnings and 0 errors, with
 no blanket `#[allow(...)]` bypasses; all tests pass — never force green with
-`#[ignore]` or deleted asserts. If `.env.test` is missing, generate it per
-[`development.md`](development.md) first; do not skip the `source`.
+`#[ignore]` or deleted asserts. If `.env.test` is missing, run
+`./scripts/dev-test.sh up-full` to generate and populate the local test
+environment; do not skip the `source`.
 
 ## 4. Code conventions (summary)
 
@@ -82,7 +83,7 @@ listed here:
 - There is no top-level `mod vault`: import Vault types from `libvault::*`
   and `crate::contract::vault::*` (see the Pitfalls section of AGENTS.md).
 
-## 5. Common task how-tos
+## 5. Common implementation tasks
 
 **Adding a CLI subcommand** (step details in [`../AGENTS.md`](../AGENTS.md),
 "Adding a New Subcommand"):
@@ -110,27 +111,43 @@ listed here:
 
 ## 6. Documentation conventions
 
-- **Plan documents:** mandatory template, naming, fact baseline, task-card
-  executability, and index/status sync rules are in
-  [`plan/README.md`](plan/README.md); do not invent your own format.
+- **Plan documents:** use the English contributor template
+  [`plan/plan-template.en.md`](plan/plan-template.en.md); do not invent your
+  own format. The operational plan archive remains Chinese-first.
 - **Fact baseline:** documents only state what is verifiable in the current
   checkout; plan documents never claim an implementation is complete.
 - **Link, don't copy:** content with an authoritative home — full config key
   tables, token values, command flag lists
   ([`../config/config.toml`](../config/config.toml),
-  [`refactoring/config.md`](refactoring/config.md),
-  [`deploy-trunk.md`](deploy-trunk.md), [`monorepo.md`](monorepo.md),
-  [`development.md`](development.md), [`../AGENTS.md`](../AGENTS.md)) — is
+  [`deployment.md`](deployment.md), [`user-guide.md`](user-guide.md),
+  [`../scripts/dev-test.sh`](../scripts/dev-test.sh),
+  [`../AGENTS.md`](../AGENTS.md)) — is
   always linked, never re-printed in a new document.
 - **Bilingual docs:** English is the default file (e.g. `foo.md`); Chinese
-  lives in the same-named `.zh.md` sibling (e.g. `foo.zh.md`). Both versions
-  keep identical structure as faithful translations, with a language-switcher
-  line at the top (same convention as [`../README.md`](../README.md)). This
-  document is maintained under that convention.
+  lives in the same-named `.zh.md` sibling (e.g. `foo.zh.md`). Keep both
+  versions in sync and give them the same structure, while writing the English
+  version naturally rather than translating sentence by sentence. Add a
+  language-switcher line at the top, following [`../README.md`](../README.md).
 - Relative links in docs must resolve to files that exist in the current
   checkout; verify each one before submitting.
 
-## 7. Version control: Libra and the task-card release flow
+## 7. Adapting upstream changes
+
+mega2 ports and refactors selected parts of the upstream Mega project; it is
+not a mirror. Before adopting an upstream change, check that it applies to a
+module and behavior present in this checkout. Compare the actual source and
+tests rather than copying a list of changed files, and classify changes that
+depend on upstream-only services or repository structure as out of scope.
+
+For dependency updates, compare the resolved versions in `Cargo.lock`, inspect
+the release's behavioral changes, and test any affected wire or object-identity
+contracts. In particular, changes to Git object serialization can change
+object IDs even when public APIs stay the same. Record the upstream revision,
+the compatibility decision, and any required regression coverage in the plan
+or change notes. Dependencies owned by a separate repository should be
+evaluated there rather than upgraded through mega2's manifest.
+
+## 8. Version control: Libra and the task-card release flow
 
 This repository uses **Libra** as its VCS (not git; there is no `.git`
 directory): `libra add` / `libra commit` / `libra push`, etc. Interactive
@@ -145,17 +162,17 @@ release"):
 2. `libra add` + `libra commit -m` — commit **that card only**.
 3. `libra push origin main`. **Never `--force`**; if the branch has diverged
    from origin, stop and report instead of resolving it yourself.
-4. Start the next card only after the previous card's commit and push
-   succeed.
+4. Start the next card only after the previous card's commit and push succeed.
 
 ## Related documents
 
+- [`README.md`](README.md) — index of user, operator, and developer guides
 - This documentation set: [`quick-start.md`](quick-start.md) ·
   [`user-guide.md`](user-guide.md) · [`configuration.md`](configuration.md) ·
   [`deployment.md`](deployment.md) · [`architecture.md`](architecture.md)
 - [`../AGENTS.md`](../AGENTS.md) — authoritative home for gates, code
   conventions, common pitfalls, and the task-card release flow
-- [`development.md`](development.md) — local development and testing
-- [`plan/README.md`](plan/README.md) — plan document rules
+- [`../scripts/dev-test.sh`](../scripts/dev-test.sh) — local development and testing entry point
+- [`plan/plan-template.en.md`](plan/plan-template.en.md) — English plan template
 - [`../README.md`](../README.md) — project overview (its Contributing section
   is the English summary of this document)

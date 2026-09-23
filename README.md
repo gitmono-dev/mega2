@@ -2,11 +2,11 @@
 
 English · [中文](README.zh.md)
 
-**mega2** is the successor engine to the same organization's [Mega](https://github.com/web3infra-foundation/mega) project: it continues Mega's shipped monorepo / Git-hosting work as a storage-only code-hosting backend.
+**mega2** is the storage-only successor to [Mega](https://github.com/web3infra-foundation/mega), the monorepo and Git-hosting project from the same organization. It provides a trunk-based Git storage backend.
 
-mega2 supports one deployment mode: trunk / storage-only. It does not include a Web UI or megaui integration. For interactive repository browsing and the corresponding directory / tag operations, use Libra's `libra mega2 browser` command.
+mega2 runs only in **trunk / storage-only** mode and does not provide a Web UI. For interactive repository browsing and supported directory or tag operations, run `libra mega2 browser` from a Libra working copy.
 
-Product rules: [`docs/monorepo.md`](docs/monorepo.md). Quick start: [`docs/quick-start.md`](docs/quick-start.md). Storage-only deploy: [`docs/deploy-trunk.md`](docs/deploy-trunk.md). Local development and tests: [`docs/development.md`](docs/development.md).
+Start with the [Quick Start](docs/quick-start.md), then see the [documentation index](docs/README.md) for user, operator, and contributor guides. Repository and push behavior is covered in the [User Guide](docs/user-guide.md); contribution checks are in the [Contributing Guide](docs/contributing.md).
 
 ## Features
 
@@ -14,33 +14,33 @@ Product rules: [`docs/monorepo.md`](docs/monorepo.md). Quick start: [`docs/quick
 
 - **Monorepo**: only `refs/heads/main` is accepted as a public Git branch. Other heads (for example `refs/heads/dev`) are rejected at protocol validation. The Git client sees `ng <ref> …` (`trunk push rejects ref '…'; the only public branch is refs/heads/main`). This constrains Git receive-pack / `ls-remote` heads only; Agent Capture does not use this protocol (see the Agent Capture entry below).
   - **[Trunk-based development](https://trunkbaseddevelopment.com)**: a monorepo works best with a single trunk, not a tree of long-lived feature branches.
-  - **No Change List in the open-source edition**: The Mega2 open-source edition ships the core monorepo storage capability and does not include Change List. A Change List implementation needs multiple branches, so this edition does not have multi-branch capability.
-- **ImportRepo**: under `[monorepo].import_dir` (default `/third-party`), ordinary Git multi-branch and client tags apply — its structure is identical to a normal Git repository. This Mega2 feature encourages developers to store the source of the open-source third-party dependencies they use: you can modify that source directly during development, then let an Agent maintain the merges with upstream (continuously tracking upstream updates).
-- **Tags**: Monorepo forbids `git push --tags`. Create / list / delete go through the HTTP API only. Mega2 is meant to be used together with Libra as the version-control tool. Use `libra mega2 browser` for an interactive terminal interface to browse repositories and manage directories, tags, and similar operations.
-- **Object storage**: metadata in Postgres; blobs in an object storage service (local filesystem or an S3-compatible cloud service). `object_format` supports `sha1` (default); `sha256` / `blake3` are optional and require [Libra](https://libra.tools) as the version-control tool.
+- **No Change List in the open-source edition**: the open-source edition provides the core monorepo storage layer, without Change List. Change Lists depend on multiple branches, which this edition does not support.
+- **ImportRepo**: repositories under `[monorepo].import_dir` (default `/third-party`) use ordinary Git semantics, including multiple branches and client-managed tags. This is a good place to keep third-party dependency sources that you need to modify locally and periodically sync with upstream.
+- **Tags**: the Monorepo rejects `git push --tags`; create, list, and delete tags through the HTTP API. Libra provides an interactive terminal browser and the supported directory and tag operations.
+- **Object storage**: metadata lives in Postgres, while Git objects live in object storage (local disk or an S3-compatible service). The default `object_format` is `sha1`; the optional `sha256` and `blake3` formats require [Libra](https://libra.tools).
 
 ### Protocols and large files
 
-- **Artifacts repository**: mega2 can serve as a build-artifacts repository for binaries such as build outputs and release bundles. Artifacts are organized per repository into artifact sets and uploaded and downloaded through the `/api/v1/repos/{repo}/artifacts` protocol (a three-step discovery → batch → commit upload; uploads and downloads transfer directly against the object storage via presigned URLs where the backend supports them, with server-proxy fallback otherwise); writes are gated by the same `git.push_auth` tokens as Git push while reads stay anonymous. Artifact blobs share the same object storage as Git blobs, LFS, and OCI images, and `[artifacts_gc]` optionally reclaims unreferenced artifact objects in the background.
-- **Git Smart HTTP and SSH**: Mega2 speaks Smart HTTP and SSH to stock Git clients for clone / fetch / pull / push. In storage-only mode, SSH keeps only read-only fetch (clone / fetch / pull) and receive-pack is disabled: without a user system there is no way to provision per-user credentials such as SSH keys, so routing all pushes through the unified HTTP authentication (token or anonymous `none`) is the best choice — write auth is maintained in exactly one place.
+- **Build artifacts**: store binaries and release bundles as Artifact Sets under `/api/v1/repos/{repo}/artifacts`. Uploads use a discovery → batch → commit flow. When supported by the object-storage backend, clients transfer bytes directly with presigned URLs; otherwise, mega2 proxies the transfer. Writes use the same `git.push_auth` credentials as Git pushes, while reads are anonymous. Artifact blobs share storage with Git, LFS, and OCI objects; `[artifacts_gc]` can reclaim unreferenced artifact data in the background.
+- **Git Smart HTTP and SSH**: standard Git clients can clone, fetch, pull, and push over Smart HTTP or SSH. In storage-only mode, SSH exposes read-only upload-pack; receive-pack is disabled because there is no per-user account system for SSH-key authentication. Route writes through HTTP to use one authentication model for every write surface.
 - **Git LFS**: following the Git LFS standard, large files managed with git-lfs use the standard Git LFS endpoints (`/info/lfs` and `/api/v1/lfs`).
 
 ### OCI Distribution
 
-mega2 ships a built-in standard **OCI container registry** (`/v2` endpoints). With `[oci].enabled=true`, stock clients such as `docker push` / `docker pull` can push and pull images directly, with manifests and blobs served over the standard OCI Distribution interface.
+mega2 includes an **OCI container registry** at `/v2`. Set `[oci].enabled=true` to push and pull images with standard clients such as Docker; manifests and blobs use the OCI Distribution protocol.
 
 Image blobs **share the same object storage** as Git blobs and LFS objects (local filesystem or an S3-compatible cloud service), so there is no separate registry to deploy and operate. Registry authentication reuses the unified HTTP `push_auth` model (token or anonymous `none`) — the same credentials and path-scoped authorization semantics as Git pushes.
 
 ### Deployment
 
-mega2 is deployed exclusively in **trunk / storage-only** mode: `push_policy=trunk`; every push is merged into `main` one at a time through a globally serialized write queue — only one write lands at any moment, keeping the trunk history linear and traceable (this mechanism is called MonoWriteQueue internally).
+mega2 runs exclusively in **trunk / storage-only** mode (`push_policy=trunk`). A global MonoWriteQueue serializes writes to `main`, keeping the trunk history linear.
 
-The product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) and `git push` write to the same `main` branch: whichever you use, the new commit lands on top of the same branch tip and is immediately readable through the other. Writes to the repository root land one at a time and never overwrite each other; a push carrying multiple commits is squashed into `main` per product rules — run `git fetch && git reset --hard origin/main` afterwards to realign.
+Git pushes and product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) update the same `main` branch, so changes are immediately visible through either interface. Multi-commit pushes are squashed according to the product rules; afterward, run `git fetch && git reset --hard origin/main` to align your local checkout.
 
 ### HTTP API
 
 - **Git hosting and Git LFS**: Git clients clone / fetch / push over the Smart HTTP protocol endpoints (`info/refs`, `git-upload-pack`, `git-receive-pack`); large files managed with git-lfs use the standard LFS endpoints (`/info/lfs`, `/api/v1/lfs`).
-- **Files and directories**: read and write monorepo content over plain HTTP, without a Git client — list directory trees, create / delete / move files and directories, and edit files online; the blob / tree / blame endpoints serve file contents, directory structures, and line-by-line change history respectively.
+- **Files and directories**: read and write monorepo content over HTTP without a Git client. List directory trees, create / delete / move files or directories, and edit files online. The blob, tree, and blame endpoints return file contents, directory structures, and line-by-line history.
 - **Tags**: since Git-client tag operations are forbidden in the monorepo, creation, listing, and deletion all go through these endpoints (read-only queries need no credentials).
 - **OCI Distribution `/v2`**: the standard container-registry interface carrying manifest and blob uploads and pulls for `docker push` / `docker pull` (mounted when `[oci].enabled=true`).
 - **Agent Capture**: captures AI coding agents' sessions, events, checkpoints, and file operations for replay and audit of agent activity (mounted when `[agent_capture].enabled=true`).
@@ -53,7 +53,7 @@ The product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) a
 ### Notifications and config
 
 - Webhook notifications only.
-- First-class config module: `config init` / `validate` / secret, Profile, SecretRef, controlled hot reload. Default file `config/config.toml`, overridable with `--config` or `MEGA_CONFIG`. GitHub outbound sync schema: [`docs/refactoring/github-sync.md`](docs/refactoring/github-sync.md).
+- Configuration commands support initialization, validation, profiles, SecretRef, and controlled hot reload. The default file is `config/config.toml`; override it with `--config` or `MEGA_CONFIG`. See the [Configuration Guide](docs/configuration.md) for available settings and validation.
 
 ## Quick start with Compose
 
@@ -66,13 +66,15 @@ docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
 docker compose -f linux-mega2-compose.yml up -d --wait
 ```
 
-HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see [`docs/deployment.md`](docs/deployment.md) and [`docs/deploy-trunk.md`](docs/deploy-trunk.md). A full walkthrough: [`docs/quick-start.md`](docs/quick-start.md).
+HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see the [Deployment Guide](docs/deployment.md). Start with the [`Quick Start`](docs/quick-start.md); for migration, LFS, OCI, and artifact examples, see [`Usage Recipes`](docs/recipes.md).
 
 For interactive browsing, run `libra mega2 browser` in a Libra working copy. It provides the terminal experience for repository navigation and supported directory / tag operations; mega2 itself does not serve a Web UI.
 
-For local development and tests, see [`docs/development.md`](docs/development.md).
+For local development and tests, see the [Contributing Guide](docs/contributing.md).
 
 ### Stop
+
+The `-v` flag deletes data stored in the Docker volumes.
 
 ```bash
 docker compose -f macos-orbstack-mega2-compose.yml down -v   # or linux-mega2-compose.yml
@@ -80,15 +82,15 @@ docker compose -f macos-orbstack-mega2-compose.yml down -v   # or linux-mega2-co
 
 ## Contributing
 
-Do not start a large change cold. The order is:
+For a large change, follow this process:
 
-1. **Open an Issue first.** State the problem, motivation, scope, and explicit non-goals. Wait until maintainers (or the discussion) accept the direction.
-2. **Then write a plan.** Copy the structure from the [Chinese Plan Template](docs/plan/plan-template.md) (in-repo operational original) or the [English Plan Template](docs/plan/plan-template.en.md) into `docs/plan/plan-YYYYMMDD.md`. Do not delete mandatory sections; write `N/A` and the reason when a section does not apply.
+1. **Open an issue.** Describe the problem, motivation, scope, and non-goals. Get agreement on the direction before implementation.
+2. **Then write a plan.** Copy the structure from the [English Plan Template](docs/plan/plan-template.en.md) into `docs/plan/plan-YYYYMMDD.md`. Do not delete mandatory sections; write `N/A` and the reason when a section does not apply.
 3. **Implement only after the plan is reviewed.** Split work into task cards, add tests and docs, and pass the submit gates before merge.
 
-A plan is not an implementation. At write time, the fact baseline is the current checkout: source, tests, config, and docs. Verbal Issue agreements do not replace the verification commands on a task card.
+A plan is not an implementation. When drafting one, verify assumptions against the current source, tests, config, and docs. Agreements in an issue do not replace the task card's verification commands.
 
-Before submit, at least:
+Before submitting code, run:
 
 ```bash
 cargo +nightly fmt --all --check
@@ -96,26 +98,17 @@ cargo clippy --all-targets --all-features -- -D warnings
 source .env.test && cargo test --all
 ```
 
-Details: [`AGENTS.md`](AGENTS.md) and [`docs/plan/README.md`](docs/plan/README.md).
+Details: [`AGENTS.md`](AGENTS.md) and the [Contributing Guide](docs/contributing.md).
 
-## Docs
+## Documentation
 
-| Doc | Contents |
+| Start here | What it covers |
 |---|---|
-| [`README.zh.md`](README.zh.md) | Chinese product README |
-| [`docs/quick-start.md`](docs/quick-start.md) ([中文](docs/quick-start.zh.md)) | Quick start: compose stack, bootstrap, first push |
-| [`docs/user-guide.md`](docs/user-guide.md) ([中文](docs/user-guide.zh.md)) | User guide: git / LFS / HTTP API / Libra usage |
-| [`docs/configuration.md`](docs/configuration.md) ([中文](docs/configuration.zh.md)) | Configuration reference: load order, secrets, hot reload |
-| [`docs/deployment.md`](docs/deployment.md) ([中文](docs/deployment.zh.md)) | Deployment guide: compose, binary, hardening |
-| [`docs/architecture.md`](docs/architecture.md) ([中文](docs/architecture.zh.md)) | Architecture design: modules, storage, write path |
-| [`docs/contributing.md`](docs/contributing.md) ([中文](docs/contributing.zh.md)) | Contributing guide: process, gates, conventions |
-| [`docs/monorepo.md`](docs/monorepo.md) | Monorepo product rules |
-| [`docs/deploy-trunk.md`](docs/deploy-trunk.md) | trunk / storage-only deploy |
-| [`docs/development.md`](docs/development.md) | Local development and tests |
-| [`docs/manual/authz.md`](docs/manual/authz.md) | Authn / authz operations |
-| [`docs/errors.md`](docs/errors.md) | Error contract |
-| [`docs/refactoring/agent-capture.md`](docs/refactoring/agent-capture.md) | Agent Capture HTTP / tables / object namespace |
-| [`docs/refactoring/storage-events.md`](docs/refactoring/storage-events.md) | Post-commit outbound events |
-| [`docs/plan/`](docs/plan/) | Dated plans and the long-term roadmap |
-| [`docs/refactoring/`](docs/refactoring/) | Other module contracts and implementation fact sources |
-| [`docs/plan/plan-template.en.md`](docs/plan/plan-template.en.md) | English Plan Template for contributors |
+| [`docs/README.md`](docs/README.md) | Index of user, operator, and developer documentation |
+| [`docs/quick-start.md`](docs/quick-start.md) | Start the local Compose stack and make your first push |
+| [`docs/recipes.md`](docs/recipes.md) | Repository migration, LFS, OCI, artifacts, and persistent data |
+| [`docs/user-guide.md`](docs/user-guide.md) | Git, HTTP API, Libra, and CLI usage |
+| [`docs/contributing.md`](docs/contributing.md) | Local development and integration tests |
+| [`docs/contributing.md`](docs/contributing.md) | Contribution process and code conventions |
+
+Configuration, deployment, architecture, and subsystem references are linked from the [documentation index](docs/README.md).

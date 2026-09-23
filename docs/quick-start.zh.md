@@ -2,11 +2,13 @@
 
 [English](quick-start.md) · 中文
 
-本文用仓库根对应平台的 compose 文件——macOS + OrbStack 用 [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml)，Linux Docker 用 [`linux-mega2-compose.yml`](../linux-mega2-compose.yml)——在本机拉起 mega2（trunk / storage-only）评估栈，跑通第一个闭环：HTTP clone → push `main` → API 读回。该栈直接从 **Docker Hub 拉取正式发布镜像**（`genedna/mega2:latest`），不构建源码、不需要 bootstrap、不需要 token。产品规则见 [`monorepo.md`](./monorepo.md)。
+在仓库根目录运行适用于当前平台的 Compose 文件，启动本地 mega2 评估栈：macOS + OrbStack 使用 [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml)，Linux 使用 [`linux-mega2-compose.yml`](../linux-mega2-compose.yml)。本指南会带你通过 HTTP 克隆仓库、推送到 `main`，再用 API 读回结果；后续示例还涵盖仓库迁移、Git LFS、OCI 镜像、构建产物和数据持久化。该栈从 **Docker Hub 拉取正式发布镜像**（`genedna/mega2:latest`），不从源码构建，也不需要单独执行初始化命令或提供 token。分支与 Tag 规则见[使用指南](./user-guide.zh.md)。
 
 ## 前置条件
 
-- macOS：需要 OrbStack（macOS 版 compose 依赖其 `*.orb.local` DNS）。Linux：Docker Engine，Linux 版 compose 对 mega2 使用 host networking。两者都需要 Compose plugin（v2）、`git`、`curl`；全程在仓库根目录执行。
+- **macOS：**需要 OrbStack；macOS 版 Compose 文件依赖 `*.orb.local` DNS。
+- **Linux：**需要 Docker Engine；Linux 版 Compose 文件让 mega2 使用 host networking。
+- **两者都需要：**Docker Compose v2、`git` 和 `curl`。以下命令均从仓库根目录运行。
 - 首次 `up` 会拉取 `genedna/mega2:latest`、PostgreSQL、Redis、RustFS 与 RustFS CLI 镜像，耗时取决于网络。
 
 ## 启动栈
@@ -21,13 +23,13 @@ docker compose -f $COMPOSE up -d --wait
 
 `up` 之后无需任何初始化命令：`rustfs-init` 自动创建 `mega2` 桶，mega2 在服务启动时自动初始化空的 Monorepo（`main` 与顶层目录）。就绪探针是 `/api/openapi.json`。
 
-> **这是仅限本机的匿名设置**：栈内 `push_auth=none`，clone / fetch / push 都不需要凭据，因此 9000 端口只绑定 `127.0.0.1`。不要改成 `0.0.0.0` 或经反向代理暴露；共享或公网部署必须改用 token 鉴权，见 [`deployment.zh.md`](./deployment.zh.md) 与 [`deploy-trunk.md`](./deploy-trunk.md)。
+> **仅供本机使用：**该栈将 `push_auth` 设为 `none`，Git clone、fetch 和 push 均无需凭据，因此 9000 端口只绑定到 `127.0.0.1`。不要将其改为 `0.0.0.0`，也不要通过反向代理对外暴露。共享网络或公网部署应配置 token 鉴权，详见[部署指南](./deployment.zh.md)。
 
-## 第一个闭环：clone → push → 读回
+## 克隆、推送并验证
 
 ### 1. HTTP clone 子路径
 
-storage-only 下对子路径 clone（不要对根 `/` 做根 clone，见 [`deploy-trunk.md`](./deploy-trunk.md) §9）：
+在 storage-only 模式下，应克隆仓库子路径；不支持直接克隆根路径 `/`。
 
 ```bash
 git clone http://127.0.0.1:9000/project
@@ -44,7 +46,7 @@ git add hello.md && git commit -m "add hello.md"
 git push origin main
 ```
 
-只能推送到 `main`（推送其它分支会被拒绝）；Git 客户端的 tag 推送同样被拒绝，tag 的创建 / 查看 / 删除走 HTTP API 或 `libra mega2 browser`（[`monorepo.md`](./monorepo.md)）。
+只能推送到 `main`，其它分支以及 Git 客户端发起的 Tag 推送都会被拒绝。请通过 HTTP API 或 Libra 命令 `libra mega2 browser` 创建、查看和删除 Tag；完整操作规则见[使用指南](./user-guide.zh.md)。
 
 ### 3. API 读回与 Swagger UI
 
@@ -53,11 +55,11 @@ git push origin main
 curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 ```
 
-完整 HTTP 表面（Git smart HTTP、LFS、产品写、tags、可选 OCI `/v2`）在 Swagger UI 浏览：`http://127.0.0.1:9000/swagger-ui`（OpenAPI JSON：`/api/openapi.json`）。交互式终端浏览用 Libra 的 `libra mega2 browser`；mega2 本身不提供 Web UI。
+在 Swagger UI 中查看完整 HTTP API，包括 Git Smart HTTP、LFS、产品写入、Tag 和可选 OCI `/v2`：`http://127.0.0.1:9000/swagger-ui`。OpenAPI 文档位于 `/api/openapi.json`。mega2 不提供 Web UI；如需交互式浏览，请在 Libra 工作副本中运行 `libra mega2 browser`。
 
-## 案例：推送嵌套目录（目录层级自动创建）
+## 示例：推送嵌套目录
 
-monorepo 里**不需要预先创建目录**。在 `/project` 的克隆里直接建多级目录再推送，`rust-lang/` 与 `rust-lang/crate/` 两层会随这次 push 一并写入：
+**无需预先创建目录。**在 `/project` 的克隆中直接建立多级目录并推送，`rust-lang/` 和 `rust-lang/crate/` 会随本次 push 一并写入：
 
 ```bash
 git clone http://127.0.0.1:9000/project
@@ -78,9 +80,9 @@ curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/rust-lang/crate/READM
 git clone http://127.0.0.1:9000/project/rust-lang/crate
 ```
 
-## 案例：推送一个已存在的 Git 仓库
+## 示例：迁移现有 Git 仓库
 
-迁入已有仓库（要保留分支与 tag）用 `/third-party` 下的 **ImportRepo**：那里按普通 Git 语义工作——多分支与客户端 tag 均合法（[`monorepo.md`](./monorepo.md)）。推送目标路径不存在时会在 push 中自动建仓，无需事先创建：
+如需迁入已有仓库并保留分支和 Tag，请将它放在 `/third-party` 下的 **ImportRepo** 路径中。该路径遵循常规 Git 语义，允许多个分支和由 Git 客户端管理的 Tag。目标路径不存在时，push 会自动创建仓库，无需预先设置：
 
 ```bash
 cd /path/to/your-repo
@@ -98,11 +100,11 @@ git clone http://127.0.0.1:9000/third-party/your-repo
 两种路径语义不要混淆：
 
 - `/third-party/**`（ImportRepo）：多分支、客户端 tag 合法——适合托管第三方依赖源码、迁入已有仓库。
-- 其它路径（Monorepo）：只有公开分支 `main`、Git 客户端禁 tag。已有仓库的多分支历史不能直接推进 monorepo 子路径；规则见 [`monorepo.md`](./monorepo.md)。
+- 其它路径（Monorepo）：公开分支只有 `main`，Git 客户端不能推送 Tag。已有仓库的多分支历史不能直接推入 Monorepo 子路径；详见[使用指南](./user-guide.zh.md)。
 
-## 案例：镜像一个 GitHub 仓库（brewfs）
+## 示例：镜像 GitHub 仓库（brewfs）
 
-完整镜像一个已有 GitHub 仓库——全部分支与 tag——只需一次推送。以 <https://github.com/brewfs/brewfs> 为例：
+下面以 <https://github.com/brewfs/brewfs> 为例，演示如何通过一次 push 镜像已有 GitHub 仓库的全部分支和 Tag：
 
 ```bash
 git clone --mirror https://github.com/brewfs/brewfs.git
@@ -115,10 +117,10 @@ git push --mirror mega2
 
 两点说明：
 
-- `--mirror` 推送**全部** ref（所有分支 + 所有 tag）。上一案例的 `git push mega2 --all` 只推*本地*分支，普通克隆里通常只有 `main`。
-- brewfs 用 Git LFS 管理大型测试固件。旧历史引用的一个对象在 GitHub 上已不存在，所以 `git lfs fetch --all` 会打印 404 错误——属预期；`lfs.allowincompletepush true` 允许推送在缺少该对象的情况下继续。
+- `--mirror` 会推送**所有** ref，包括全部分支和 Tag。相比之下，前一示例中的 `git push mega2 --all` 只推送本地分支；普通克隆通常只有 `main`。
+- brewfs 使用 Git LFS 存储大型测试文件。其历史中引用的一个对象已从 GitHub 删除，因此 `git lfs fetch --all` 会报告 404，这是预期情况。将 `lfs.allowincompletepush` 设为 `true` 后，仍可推送当前可用的 LFS 对象。
 
-验证回路——annotated tag 与 LFS 内容都完好：
+验证带注释 Tag 和 LFS 文件都已完整往返：
 
 ```bash
 git clone http://127.0.0.1:9000/third-party/brewfs /tmp/verify-brewfs
@@ -129,9 +131,9 @@ ls -la tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz
 # 约 8 MB 的 gzip——从 mega2 的 LFS 对象存储取回的是真实字节，不是指针
 ```
 
-## 案例：用 Git LFS 管理大文件
+## 示例：使用 Git LFS 管理大文件
 
-该栈讲标准 Git LFS 协议（`/info/lfs`），stock `git-lfs` 客户端开箱即用。LFS 写授权与 Git push 共用 `git.push_auth`——本评估栈为匿名。前置条件：宿主机已安装 `git-lfs`（用 `git lfs version` 确认）。
+该栈在 `/info/lfs` 提供标准 Git LFS 协议，可直接使用常规 `git-lfs` 客户端。LFS 写入与 Git push 共用 `git.push_auth`；本评估栈允许匿名写入。请先在宿主机安装 `git-lfs`，并用 `git lfs version` 确认可用。
 
 ```bash
 git clone http://127.0.0.1:9000/project
@@ -145,18 +147,18 @@ git commit -m "add LFS-tracked big.bin"
 git push origin main                          # 先执行 "Uploading LFS objects: 100% (1/1)"
 ```
 
-Git 提交里只存 LFS 指针；2 MiB 字节在 push 时已进入对象存储。从子路径全新克隆验证——检出时会下载真实内容：
+Git 提交中保存的是 LFS 指针；实际的 2 MiB 文件内容会在 push 时上传到对象存储。再克隆该子路径，确认检出时取回的是原始文件：
 
 ```bash
 git clone http://127.0.0.1:9000/project/lfs-demo /tmp/verify-lfs
 cmp lfs-demo/big.bin /tmp/verify-lfs/big.bin && echo identical
 ```
 
-LFS 对象与 Git blob 共用同一套对象存储（本栈为 RustFS），下文关于数据卷、`down -v` 与持久化覆盖文件的说明对它同样适用。
+LFS 对象和 Git blob 共用对象存储（本栈使用 RustFS），因此下文关于数据卷和持久化的说明同样适用。
 
-## 案例：用 OCI 仓库托管容器镜像（/v2）
+## 示例：用 OCI 仓库托管容器镜像
 
-该栈在同一端口的 `/v2` 下内嵌了一个 OCI Distribution 仓库（Compose 文件中通过 `MEGA_OCI__ENABLED=true` 启用；它还要求 storage-only 形态，`MEGA_GIT__PUSH_AUTH` 已隐含满足）。任意 OCI 客户端均可使用——Docker 默认把 `127.0.0.1` 当作 insecure 仓库，所以本地评估用纯 HTTP 即可：
+该栈在同一端口的 `/v2` 路径提供 OCI Distribution 仓库，Compose 文件通过 `MEGA_OCI__ENABLED=true` 启用。OCI 仓库要求 storage-only 模式，本栈已通过 `MEGA_GIT__PUSH_AUTH` 配置满足此条件。任何 OCI 客户端都可连接；Docker 默认将 `127.0.0.1` 视为不安全仓库，因此本机评估可直接使用 HTTP：
 
 ```bash
 docker pull alpine:3.21
@@ -172,11 +174,11 @@ docker run --rm 127.0.0.1:9000/project/alpine:quickstart cat /etc/alpine-release
 curl -s http://127.0.0.1:9000/v2/project/alpine/tags/list
 ```
 
-仓库写入与 `git.push_auth` 共用同一道闸门——本评估栈为匿名。blob 与 manifest 与其它数据一样落在 RustFS 对象存储里。若要把仓库暴露给其它机器，默认的 Docker 客户端不再接受纯 HTTP：请在前面加 TLS，或把该主机加入客户端的 `insecure-registries`。
+仓库写入与 Git push 共用 `git.push_auth`；本评估栈允许匿名写入。Blob 和 manifest 都存放在 RustFS 对象存储中。若要从其它机器访问，请配置 TLS，或将仓库主机添加到相应 Docker 客户端的 `insecure-registries` 列表。
 
-## 案例：用预签名直连管理构建产物
+## 示例：用预签名 URL 上传和下载构建产物
 
-编译产物、发布包等二进制以 **Artifact Set** 的形式存放在 `/api/v1/repos/{repo}/artifacts` 下。流程是 discovery → batch → commit 三步，字节传输走**预签名（presigned）**：mega2 只处理元数据并签发限时（1 小时）的 S3 URL——客户端直接对对象存储（这里是 RustFS）上传/下载字节，不经过 mega2 中转。
+将编译产物、发布包等文件作为 **Artifact Set** 存放在 `/api/v1/repos/{repo}/artifacts` 下。流程分为 discovery、batch、commit 三个请求。mega2 负责处理元数据并签发一小时后过期的 S3 预签名 URL；客户端通过该 URL 直接向对象存储（本例使用 RustFS）传输文件，不经过 mega2 中转。
 
 ```bash
 REPO=project   # 单个 URL 路径段；名字里有 "/" 时用 %2F
@@ -202,8 +204,8 @@ EOF
 #    "actions":{"upload":{"href":"http://<rustfs>/...?X-Amz-Signature=...",
 #    "header":{"Content-Type":"..."},"expires_at":"..."}}}], ...}
 
-# 3. 把字节直接上传到对象存储（不是 mega2）。
-#    请求头按 actions.upload.header 返回的来带：
+# 3. 直接将文件上传到对象存储，不经过 mega2。
+#    使用 actions.upload.header 返回的请求头：
 curl -X PUT -H 'Content-Type: application/gzip' --data-binary @app-1.0.0.tar.gz "<OID1 的 href>"
 curl -X PUT -H 'Content-Type: text/plain' --data-binary @SHA256SUMS "<OID2 的 href>"
 
@@ -218,7 +220,7 @@ EOF
 # → {"artifact_set_id":"...","status":"ok","missing_objects":[]}
 ```
 
-`missing_objects` 必须为空——出现在其中的对象说明对象存储里没找到，commit 只登记了其余对象。回读验证；下载同样走预签名，`curl -L` 会跟随 302 直连 RustFS：
+确认 `missing_objects` 为空；其中列出的对象未能在存储中找到，因此不会加入已提交的 Artifact Set。要读回文件，请使用预签名下载 URL；`curl -L` 会跟随重定向并连接到 RustFS：
 
 ```bash
 # 列出集合 / 把文件解析为对象 id
@@ -233,7 +235,7 @@ curl -s "$BASE/objects/$OID2?mode=link"
 
 产物写入与 `git.push_auth` 共用同一道闸门（本栈为匿名）。`object_type` 词汇表（`snapshot`、`provenance`、`run` 等）与协商限额都由 discovery 响应公布。
 
-## 观察、停止与清理
+## 查看日志、停止和清理
 
 ```bash
 # 跟随 mega2 日志
@@ -246,9 +248,9 @@ docker compose -f $COMPOSE down
 docker compose -f $COMPOSE down -v
 ```
 
-## 重要：把数据持久化到本地目录
+## 示例：将数据保存到宿主机目录
 
-默认栈用的是 Docker 具名卷，`down -v` 会把数据连同卷一起删掉。如果你要**长期使用**这个实例、希望删除栈之后数据还在，就把数据库、对象存储与 mega2 数据目录改成绑定挂载到宿主本地目录——这样**即使容器和卷都被删除，数据仍保留在本地目录里，下次 `up` 直接继续使用**。
+默认栈使用 Docker 具名卷，执行 `down -v` 会删除这些卷及其中的数据。如果要在移除栈后保留数据，请将数据库、对象存储和 mega2 数据目录绑定挂载到宿主机目录。这样即使容器和具名卷被删除，数据仍会留在宿主机上，下一次 `up` 会继续使用这些数据。
 
 在仓库根新建一个覆盖文件 `mega2-compose.persist.yml`：
 
@@ -277,15 +279,15 @@ docker compose -f $COMPOSE -f mega2-compose.persist.yml up -d --wait
 
 之后所有数据都落在 `./mega2-data/` 下：
 
-- `docker compose ... down -v` 只删除具名卷，**不会**触碰 `./mega2-data/`；下次 `up` 从该目录恢复，仓库、推送历史、LFS 对象原样保留。
-- 备份 = 停栈后打包 `./mega2-data/` 即可。
-- 该目录由容器内进程写入（属主是容器内用户，如 postgres），不要提交进版本库，也不要手工改动目录内容。
+- `docker compose ... down -v` 只删除具名卷，**不会删除** `./mega2-data/`。下次启动会从该目录继续使用原有仓库、推送历史和 LFS 对象。
+- 备份前先停止服务，再归档 `./mega2-data/`。
+- 目录由容器内进程写入，文件属主可能是容器中的用户（例如 `postgres`）。不要将其提交到版本库，也不要手工修改目录内容。
 
-## 其它 Compose 文件的定位
+## 区分评估栈与测试栈
 
-仓库里还有两份 Compose，**都面向测试与开发**，不是本评估栈的替代品：
+仓库还提供另外两份 Compose 文件，**用途都是测试和开发**，不能直接替代本评估栈：
 
-- [`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml)（及 `docker/docker-compose-storage-only.auth-none.yml` 覆盖）：从源码**构建**镜像的 trunk 实验栈，token 鉴权、需要 `service init` bootstrap，用于部署演练与 smoke。用法见 [`deployment.zh.md`](./deployment.zh.md) 与 [`deploy-trunk.md`](./deploy-trunk.md) §8。
+- [`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml)（及 `docker/docker-compose-storage-only.auth-none.yml` 覆盖）：从源码**构建**镜像的 trunk 测试栈，使用 token 鉴权，并需先运行 `service init`；适合部署演练和 smoke 测试。用法见[部署指南](./deployment.zh.md)和[`deploy-trunk.md`](./deploy-trunk.md)第 8 节。
 - [`docker/docker-compose.test.yml`](../docker/docker-compose.test.yml)：集成测试（IT）数据面，见 [`development.md`](./development.md)。
 
 ## 下一步

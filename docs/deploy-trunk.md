@@ -1,6 +1,6 @@
 # Trunk / storage-only 部署
 
-本文是 `push_policy=trunk` 与 storage-only HTTP 的运维事实源。产品规则（唯一公开分支、N 分流、不变式、墓碑、索引）见 [`monorepo.md`](./monorepo.md)。设计论证见 [`refactoring/trunk-push.md`](./refactoring/trunk-push.md)。配置键见 `config/config.toml` 与 [`refactoring/config.md`](./refactoring/config.md)。
+本文是 `push_policy=trunk` 与 storage-only HTTP 的运维操作手册。用户可见的路径、分支、Tag 和推送规则见[使用指南](./user-guide.zh.md)；N 分流、不变式、墓碑和路径索引的设计细节见 [`refactoring/trunk-push.md`](./refactoring/trunk-push.md)。配置键以 `config/config.toml` 为准。
 
 > **范围**：不接入 mega2 用户系统、不使用 Issue / Change List、不走评审门控的存储与分发部署。默认形态仍是 `push_policy=review`；未改配置的既有部署行为不变。
 

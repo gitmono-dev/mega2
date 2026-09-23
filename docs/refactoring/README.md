@@ -101,7 +101,7 @@
   - 基础静态 token 认证已于 **4.2a 随阶段 4** 交付（阶段 5 收窄为多 token 运维，DEFER-TP-05）
 - **关键前置**：阶段 1–3 是现有写入路径的缺陷修复，**可独立验收**；生产部署以阶段 2 为前置（阶段 1 删除式后代处理违反 I1）。阶段 4 依赖 1–3 全部完成
 - **阶段范围**：1 - 6（共 6 个阶段，其中阶段 6 为可选优化：group commit、NOTIFY 唤醒、**物化 TTL + 墓碑回收**）
-- **产品规则同步**：反向声明已同步至 [`../monorepo.md`](../monorepo.md)；部署见 [`../deploy-trunk.md`](../deploy-trunk.md)
+- **产品规则同步**：用户可见的路径、分支、Tag 与推送规则见 [`../user-guide.zh.md`](../user-guide.zh.md)；trunk 运行手册见 [`../deploy-trunk.md`](../deploy-trunk.md)
 
 ### 5b. **refactoring/libra.md** — Libra 协作与 Agent 变更证据
 
@@ -126,10 +126,10 @@
 - **边界**：无 webhook CRUD、无 outbox/retry、不复用 review CL webhook 表
 
 ### 6. **其他文档**
-- **[`../monorepo.md`](../monorepo.md)**：Monorepo 产品规则（公开分支仅 `main`、禁止 Git 客户端 tag、初始化、trunk 不变式）
+- **[`../user-guide.zh.md`](../user-guide.zh.md)**：Monorepo 路径、公开分支、Tag 和推送规则；初始化布局见 [`../manual/monorepo-init.zh.md`](../manual/monorepo-init.zh.md)，trunk 不变式见 [`trunk-push.md`](trunk-push.md)
 - **[`../deploy-trunk.md`](../deploy-trunk.md)**：trunk / storage-only 部署（`push_auth`、LFS、SSH、形态切换）
 - **website-auth.md** / **website-mail.md**：Website 会话与产品邮件契约（见 `plan-20260731.md`）
-- **protocol.md**：协议定义相关；分支/tag 产品规则以 `monorepo.md` 为准
+- **protocol.md**：协议定义相关；分支和 Tag 的用户可见规则见 `../user-guide.zh.md`
 - 本仓 Campsite 风格 chat/Notes 产品面已退场；不再维护独立 chat 改进文档
 
 ---

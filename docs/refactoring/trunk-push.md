@@ -4,9 +4,9 @@
 
 > **治理规范**：本文档遵循 **`general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
 
-> **产品规则事实源**：分支/tag/初始化规则以 **[`../monorepo.md`](../monorepo.md)** 为准。本文引入的 `push_policy = "trunk"` 是该文档规则的**部署形态开关**：`review`（默认）形态下 monorepo.md 的既有规则一字不改；`trunk` 形态下 CL 管线不参与推送落地，其余规则（唯一公开分支 `main`、Git 客户端禁 tag、`import_dir` 例外）继续生效。
+> **产品规则入口**：公开分支、Tag 和 ImportRepo 路径规则见[使用指南](../user-guide.zh.md)。本文记录 `push_policy = "trunk"` 下的写入设计与不变式；`review` / `trunk` 的配置差异见 [`../deploy-trunk.md`](../deploy-trunk.md)。
 
-> **产品规则文档的反向声明——已同步（TP-21，2026-09-09）**：按 N 分流的推送语义与 ADR-TP-18 客户端对齐约定、不变式 I1–I6（含 I2a）、墓碑续接语义、文件路径索引的最终一致性已写入 [`../monorepo.md`](../monorepo.md)。部署形态（trunk / storage-only / `push_auth=none` / LFS / SSH）见 [`../deploy-trunk.md`](../deploy-trunk.md)。
+> **用户文档同步记录（TP-21，2026-09-09）**：N 分流推送与客户端对齐规则已摘要到[使用指南](../user-guide.zh.md)；不变式 I1–I6（含 I2a）、墓碑续接和路径索引一致性契约以本文为技术参考。部署形态（trunk / storage-only / `push_auth=none` / LFS / SSH）见 [`../deploy-trunk.md`](../deploy-trunk.md)。
 
 > **协议实现锚点**：**[`protocol.md`](./protocol.md)**（receive-pack 分层、pkt-line、认证上下文）。**权限模型**：Cedar 判定与 `contract::policy` 见 **[`contract.md`](./contract.md)**。
 
@@ -249,7 +249,7 @@
 - **决策**：`traverses_tree_and_update_filepath` 与 authz notify 在 B3 事务提交后执行；索引任务带 `push_queue.id` 保护，序号较小者发现该路径已被更大序号索引过即跳过。
 - **理由**：索引重建成本与子树规模成正比，留在临界区会让大子树推送长时间独占全局写入闸门（硬约束 7）。
 - **Alternatives considered**：保留在临界区内（拒绝——吞吐不可预测）；改为增量索引后留在临界区内（拒绝——增量正确性依赖树 diff，复杂度与收益不匹配，可作为后续独立议题）。
-- **影响**：Web 浏览与挂载消费方的路径查询在推送提交后短暂落后；须提供索引补偿任务，并在 `../monorepo.md` 中声明该最终一致性。序号保护需要新的持久化状态——现状 `mega_blob` 只有 `file_path` 一列（`src/callisto/mega_blob.rs:6-22`），`update_blob_filepath`（`mono_storage.rs:335-352`）是无条件覆盖。交付物：文件路径索引改造为**出现对表** `blob_paths(blob_id, path, indexed_push_id)`（现状 `mega_blob` 每 blob 单 `file_path` 列，`callisto/mega_blob.rs:6-22`，无法表达同一 blob 的多路径出现，而 `traverses_tree_and_update_filepath`（`monorepo.rs:1051-1114`）会遇到；按 `(blob_id, path)` 出现对做 CAS 更新与**精确删除**——删除感知的 reconciliation 只清「本子树内上一代存在、本代不存在」的出现对，不影响该 blob 在其他路径的引用；`mega_blob.file_path` 降级为展示用最新路径或废弃。**已知限制（如实声明，不夸大）**：出现对模型仍允许旧任务把已删除的 `(blob_id, path)` 重插（删除本身没有代际水位，旧任务既无行可比对也无删除标记）——「永不复活」**不被本计划承诺**；收敛是最终一致的：补偿任务周期重扫会把重插行再次清除。持久化删除水位/墓碑列为后续独立议题。配「重插后补偿收敛」回归（而非「永不复活」断言）。**水位必须按行而非按任务**：一次推送的索引任务会写整个子树的行（`traverses_tree_and_update_filepath` 自 tip 递归），若只按触发路径记水位，`/a`（id 5）的滞后任务可以覆盖 `/a/b` 已被 id 6 索引过的行——受保护路径上没有更大的 id，逐行 CAS 是唯一能挡住嵌套覆盖的粒度。**行级 CAS 挡不住删除复活**：索引任务只更新新树中仍存在的 blob（`monorepo.rs:1051-1114`），被新推送删除的 blob 没有新行可写水位，旧任务可以把它的旧路径重新写回。交付物补**删除感知的按代 reconciliation**：索引任务以「本次 tip 子树的全集」为界，除 CAS 更新仍存在的行外，必须清除「上一代索引中存在而新子树中不存在」的 file_path 行（子树范围 diff 清理），使删除与更新以同一代际收敛。补偿任务仍保留，作为 CAS 与 reconciliation 之外的收敛兜底。**版本来源按形态分离（含隔离规则；对 review 形态这是一处登记在案的索引行为变化**——队列轮次打上水位后，其后 review 推送的索引不再无条件覆盖这些行；该索引不在写入判定链上（ADR-TP-11 的原有论据），变化属有意设计，与硬约束 8 的两类豁免并列）：`indexed_push_id` 水位只由队列路径（trunk push 的 C 段、merge/attach 轮次）写入；review 形态的推送不入队，其索引仍走现状同步调用（`run_mono_post_push_pipeline` → `traverses_tree_and_update_filepath`，`monorepo.rs:1012`）。**隔离规则**：`indexed_push_id` 可空；review 更新携带 `WHERE indexed_push_id IS NULL`（只写从未被队列索引过的行，不得覆盖队列已索引行）；队列更新携带 `WHERE indexed_push_id IS NULL OR indexed_push_id < $id`（可覆盖 review 行与更旧队列行）——否则 review 推送的无版本更新会击穿行级 CAS。
+- **影响**：Web 浏览与挂载消费方的路径查询在推送提交后短暂落后；须提供索引补偿任务；用户文档应说明该索引的最终一致性。序号保护需要新的持久化状态——现状 `mega_blob` 只有 `file_path` 一列（`src/callisto/mega_blob.rs:6-22`），`update_blob_filepath`（`mono_storage.rs:335-352`）是无条件覆盖。交付物：文件路径索引改造为**出现对表** `blob_paths(blob_id, path, indexed_push_id)`（现状 `mega_blob` 每 blob 单 `file_path` 列，`callisto/mega_blob.rs:6-22`，无法表达同一 blob 的多路径出现，而 `traverses_tree_and_update_filepath`（`monorepo.rs:1051-1114`）会遇到；按 `(blob_id, path)` 出现对做 CAS 更新与**精确删除**——删除感知的 reconciliation 只清「本子树内上一代存在、本代不存在」的出现对，不影响该 blob 在其他路径的引用；`mega_blob.file_path` 降级为展示用最新路径或废弃。**已知限制（如实声明，不夸大）**：出现对模型仍允许旧任务把已删除的 `(blob_id, path)` 重插（删除本身没有代际水位，旧任务既无行可比对也无删除标记）——「永不复活」**不被本计划承诺**；收敛是最终一致的：补偿任务周期重扫会把重插行再次清除。持久化删除水位/墓碑列为后续独立议题。配「重插后补偿收敛」回归（而非「永不复活」断言）。**水位必须按行而非按任务**：一次推送的索引任务会写整个子树的行（`traverses_tree_and_update_filepath` 自 tip 递归），若只按触发路径记水位，`/a`（id 5）的滞后任务可以覆盖 `/a/b` 已被 id 6 索引过的行——受保护路径上没有更大的 id，逐行 CAS 是唯一能挡住嵌套覆盖的粒度。**行级 CAS 挡不住删除复活**：索引任务只更新新树中仍存在的 blob（`monorepo.rs:1051-1114`），被新推送删除的 blob 没有新行可写水位，旧任务可以把它的旧路径重新写回。交付物补**删除感知的按代 reconciliation**：索引任务以「本次 tip 子树的全集」为界，除 CAS 更新仍存在的行外，必须清除「上一代索引中存在而新子树中不存在」的 file_path 行（子树范围 diff 清理），使删除与更新以同一代际收敛。补偿任务仍保留，作为 CAS 与 reconciliation 之外的收敛兜底。**版本来源按形态分离（含隔离规则；对 review 形态这是一处登记在案的索引行为变化**——队列轮次打上水位后，其后 review 推送的索引不再无条件覆盖这些行；该索引不在写入判定链上（ADR-TP-11 的原有论据），变化属有意设计，与硬约束 8 的两类豁免并列）：`indexed_push_id` 水位只由队列路径（trunk push 的 C 段、merge/attach 轮次）写入；review 形态的推送不入队，其索引仍走现状同步调用（`run_mono_post_push_pipeline` → `traverses_tree_and_update_filepath`，`monorepo.rs:1012`）。**隔离规则**：`indexed_push_id` 可空；review 更新携带 `WHERE indexed_push_id IS NULL`（只写从未被队列索引过的行，不得覆盖队列已索引行）；队列更新携带 `WHERE indexed_push_id IS NULL OR indexed_push_id < $id`（可覆盖 review 行与更旧队列行）——否则 review 推送的无版本更新会击穿行级 CAS。
 
 ### 多 commit 推送
 
@@ -258,7 +258,7 @@
 - **决策**：`N = 1` 时 `main@P = cmd.new_id`，客户端 commit 对象原样落地，不合成；`N > 1` 时 `main@P` 前进**一个**合成的 squash commit（`parent` = 该路径旧 tip，`tree` = `chain.tip.tree_id`）。祖先与根在两种情况下均只前进一个 roll-up（树未变的层不前进，见 ADR-TP-16）。
 - **理由**：主要使用方是 Agent，其常态是每 commit 一推（需求前提），因此 N = 1 是热路径，必须零成本——保住对象 hash 与原始 GPG 签名，且客户端推送后无需任何重新对齐。N > 1 是 Agent 攒批推送的例外，那些中间状态不应进入 `main`；合并为一个使 `main` 的每一步都对应一次完整的推送意图。中间 commit 的 tree 是被推路径的子树，与根 commit 所需的根树形状不同，本就无法逐一嫁接到根（硬约束 3）。
 - **Alternatives considered**：N > 1 时也全量保留（拒绝——Agent 的中间状态进入 `main`，与需求前提第 2 条相悖，且 `main@P` 与祖先的粒度长期不一致）；无论 N 一律 squash（拒绝——热路径 N = 1 白白损失对象 hash 与签名，且强制每次推送后重新对齐，收益为零）；逐 commit 重放为 N 个各层合成 commit（拒绝——N 倍树重算成本，hash 仍与客户端不同，不换来任何保真收益）。
-- **影响**：`main@P` 与祖先的历史粒度**恒定一致**——每次推送在每个受影响的层上恰好前进一个 commit（N = 1 时该 commit 就是客户端对象本身；净零推送时受影响的层只有 `P`，见 ADR-TP-16）。原有的「两个 bisect 粒度」随之消失，bisect 在任一层的最小步长都是一次推送。N > 1 时客户端本地历史与服务端发散，处理方式见 ADR-TP-18。根上只出现推送原子态这一性质不变，须写入 `../monorepo.md`。
+- **影响**：`main@P` 与祖先的历史粒度**恒定一致**——每次推送在每个受影响的层上恰好前进一个 commit（N = 1 时该 commit 就是客户端对象本身；净零推送时受影响的层只有 `P`，见 ADR-TP-16）。原有的「两个 bisect 粒度」随之消失，bisect 在任一层的最小步长都是一次推送。N > 1 时客户端本地历史与服务端发散，处理方式见 ADR-TP-18。根上只出现推送原子态这一性质不变，并在本文档中记录。
 
 **ADR-TP-13：roll-up 的作者身份取链上 tip，其余作者进 `Co-authored-by`**
 
@@ -309,7 +309,7 @@
 - **决策**：N > 1 的推送被接受后，`main@P` 是服务端合成的 squash commit，与客户端本地 tip 不同。客户端下一次推送的 `old_id` 将不等于服务端 tip，会被 non-fast-forward 闸门拒绝。约定的对齐动作是 `git fetch && git reset --hard origin/main`；服务端在两处主动告知：推送成功时经 sideband 返回合成后的 commit id，以及在 non-fast-forward 拒绝信息中直接给出该对齐命令。
 - **理由**：Git 的 receive-pack 没有「服务端把 ref 落到另一个值」的协商机制——客户端会把远程跟踪引用乐观地更新为自己推送的值，发散要到下一次 fetch 才暴露。与其让使用方撞上一次莫名其妙的拒绝，不如在推送成功的当次就告知，并让拒绝信息可直接照做。对 Agent 而言这是一条可脚本化的固定动作，且在 N = 1 的常态路径上是 no-op（服务端 tip 就等于本地 tip），因此「每次推送后执行对齐」可以无条件写进 Agent 的工作流。
 - **Alternatives considered**：服务端记住「上次接受的客户端 tip」并容忍以它为基的后续推送（拒绝——服务端要长期维护一份与自身历史平行的客户端谱系，客户端历史与服务端永久发散且越差越远，排障成本远高于一条 reset）；N > 1 时拒绝推送并要求客户端自己先 squash（拒绝——把服务端能自动完成的事推给每一个使用方，且与需求前提第 2 条相悖）。
-- **影响**：Agent 侧工作流固定为「commit → push → fetch + reset」。该约定须写入 `../monorepo.md` 与部署文档；non-fast-forward 拒绝信息的措辞属阶段 4 的验收项。
+- **影响**：Agent 侧工作流固定为「commit → push → fetch + reset」。该约定须写入[使用指南](../user-guide.zh.md)与部署文档；non-fast-forward 拒绝信息的措辞属阶段 4 的验收项。
 
 **ADR-TP-19：后代 ref 恒与 B3 同事务推进；I3 保持强一致，不分层**
 
@@ -1303,7 +1303,7 @@ N = 1 时不存在 squash，各层 roll-up 的 message 一律取客户端 commit
 
 中间 commit 的树从不被嫁接进任何一层——各层都只从 `chain.tip.tree_id` 采样一次。阶段 2 的后代推进同样只读该值，因此推送 1 个与推送 N 个的后代处理成本完全相同。
 
-由此得到三条性质，需同步写入 `../monorepo.md`：
+由此得到三条性质，需在本文档明确并逐条配套测试：
 
 - **各层历史粒度一致**。任一层的最小步长都是一次推送，bisect 不存在两个粒度。
 - **只出现推送原子态**。N 个 commit 的中间状态从不在任何层的树上出现；若中途 commit 引入的问题已由 tip 修复，`main` 与挂载消费方从未见过该问题状态。
@@ -1374,7 +1374,7 @@ push_policy = "review"          # "review"（默认，CL 管线）| "trunk"（�
 | merge queue、conversation | UN-16 的写入侧钩子（见下） |
 | code review 线程重锚、CLA | MC-03 链校验与链长上限 |
 | `commit_auths` 绑定（无用户系统） | ADR-MC-04 单分支准入 |
-| CL / issue / reviewer router | Git 客户端禁 tag（`../monorepo.md` §2） |
+| CL / issue / reviewer router | Git 客户端禁 tag（见[使用指南](../user-guide.zh.md)） |
 
 router 按 `push_policy` **条件挂载**：trunk 形态下不注册 CL / issue / reviewer router，使 OpenAPI 表面如实反映部署形态，而不是保留一组恒返回空的端点。
 
@@ -1478,7 +1478,7 @@ storage-only 部署可在 B3 提交后发出一份有界、仅元数据、带 HM
 | 阶段 3 | MC-09 `ServerSigningContext` | 前置 | 服务端签名能力已存在，本阶段只新增调用点 |
 | 阶段 3 | 阶段 2 | 协同 | 阶段 3 的归属规则只作用于 trunk 形态与新增的续接 commit；阶段 2 先落地时续接 commit 暂用现状归属，阶段 3 落地后升级，二者靠近落地为宜 |
 | 阶段 4 | 阶段 1 / 2 / 3 全部完成 | 前置 | trunk 形态的正确性完全建立在三者之上 |
-| 阶段 4 | `../monorepo.md` | 协同 | `push_policy` 的形态差异须写入产品规则文档 |
+| 阶段 4 | `../user-guide.zh.md` | 协同 | `push_policy` 的形态差异须同步到用户指南 |
 | 阶段 4 | Cedar 判定（`contract.md`） | 前置 | 互斥校验依赖 `cedar.enforcement` 的既有三态语义 |
 | 阶段 5 | 阶段 4（4.2a 已交付基础静态 token 认证） | 前置 | 阶段 5 为多 token 运维与强化，不承担基础认证 |
 | 阶段 5 | `config.md` 的 SecretRef 与文件挂载机制 | 前置 | token 凭据不得内联明文 |
@@ -1500,11 +1500,11 @@ storage-only 部署可在 B3 提交后发出一份有界、仅元数据、带 HM
 
 - **风险 4：墓碑续接串联语义无关的历史**
   - 影响：同名路径删除后重建时，`git log` 中出现与当前内容无关的前史。
-  - 缓解措施：在 `../monorepo.md` 中显式声明该语义；提供墓碑清理的运维入口，允许在明确知情时切断续接。
+  - 缓解措施：在[使用指南](../user-guide.zh.md)中说明该语义；提供墓碑清理的运维入口，允许在明确知情时切断续接。
 
 - **风险 5：C 段异步化导致索引落后**
   - 影响：文件路径索引在推送提交后短暂落后，Web 浏览与挂载消费方的路径查询可能读到旧值。
-  - 缓解措施：索引行带 `indexed_push_id` 行级水位，旧序号的更新被 `WHERE indexed_push_id < $id` 的 CAS 挡住（ADR-TP-11——按行而非按任务，嵌套路径的交错任务才不会被旧数据覆盖）；提供索引补偿任务；在 `../monorepo.md` 中声明该最终一致性。
+  - 缓解措施：索引行带 `indexed_push_id` 行级水位，旧序号的更新被 `WHERE indexed_push_id < $id` 的 CAS 挡住（ADR-TP-11——按行而非按任务，嵌套路径的交错任务才不会被旧数据覆盖）；提供索引补偿任务；在本文档中声明该最终一致性。
 
 - **风险 6：惰性物化与 B3 的竞态**
   - 影响：物化写入落后于根树的路径 ref，后续推送以它为基线时静默丢失祖先推送的改动（ADR-TP-19 失效链经物化路径复现）。
@@ -1551,7 +1551,7 @@ Monorepo 的每一次落地（trunk 推送、CL merge、attach）都必须改写
 
 ## 附录 A：不变式
 
-写入 `../monorepo.md` 并逐条配套测试：
+在用户指南与本文档中分别记录用户可见规则和技术约束，并逐条配套测试：
 
 - **I1 历史只增不改**：对任一已物化路径 `R`，任何写入之后，`R` 的旧 tip 仍是新 tip 的祖先。**成立时点自阶段 2 起**：阶段 1 的删除式后代处理（`remove_none_cl_refs`，无墓碑）违反本条，故阶段 1 产物不部署生产（见迁移步骤开头）；阶段 2 的续接 + 墓碑使其成立。
 - **I2 内容保真**：`main@P` 的 tip 的 `tree` 恒等于客户端推送 tip 的 `tree`。其中 N = 1 时更强——tip 本身恒等于客户端推送的 commit id（对象保真）。
@@ -1574,7 +1574,7 @@ Monorepo 的每一次落地（trunk 推送、CL merge、attach）都必须改写
 ## 最后一次更新
 
 - **日期**：2026-09-05
-- **内容**：首版发布。定义 trunk 直推形态（storage-only）与 Monorepo 根树写入序列化方案；登记 14 条事实校准、9 条硬约束、20 条决策记录（ADR-TP-01 – ADR-TP-19，另含 ADR-TP-15a；队列约束 11 条、多 commit 推送与签名语义 8 条、一致性模型 1 条）、6 个阶段与 7 条不变式。已登记到 `README.md`（文档概览 5a、执行顺序第 8 阶段、优先级排序）与 `general.md`（分层结构、角色定义、阶段编号约定）。`../monorepo.md` 的反向声明当时待定稿后同步；**已于 2026-09-09 由 TP-21 完成**（头部标记「已同步」）。
+- **内容**：首版发布。定义 trunk 直推形态（storage-only）与 Monorepo 根树写入序列化方案；登记 14 条事实校准、9 条硬约束、20 条决策记录（ADR-TP-01 – ADR-TP-19，另含 ADR-TP-15a；队列约束 11 条、多 commit 推送与签名语义 8 条、一致性模型 1 条）、6 个阶段与 7 条不变式。已登记到 `README.md`（文档概览 5a、执行顺序第 8 阶段、优先级排序）与 `general.md`（分层结构、角色定义、阶段编号约定）。TP-21 于 2026-09-09 完成了用户指南摘要、部署文档和本文反向声明的逐项校对。
   - 首版计数随修订更新（以修订 39 后的正文为准）：事实校准 **17** 条、决策记录 **21** 条（ADR-TP-01 – ADR-TP-20，另含 ADR-TP-15a）、不变式 **7** 条（I1–I6 含 I2a）、阶段 1 交付物 **10** 项。
 - **同日修订 1**：需求前提补入 **Agent 使用场景**（每 commit 一推，N = 1 为常态）；推送落地规则由「被推路径全量保留」改为**按 N 分流**——N = 1 原样落地，N > 1 在被推路径自动合并为一个（ADR-TP-12 重写）。连带修订：硬约束 5 与新增 5a、写入模型表、不变式 I2 改为内容保真并新增 I2a 步长一致、新增 ADR-TP-18（N > 1 后的客户端对齐约定）、阶段 1 B3 伪代码与阶段 3/4 验收标准。
 - **同日修订 66（对齐修订）**：阶段 5 的「现状认证链改造点」标题更正——改造已随 4.2a 于阶段 4 交付，本节保留为规格与验收依据（消除「本阶段的代码交付物」与 4.2a 的表述矛盾）。：C-R5 评审 5 条 MINOR + 2 条 SUGGESTION 全部落实。

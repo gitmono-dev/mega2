@@ -41,7 +41,7 @@ docs/
 | **contract.md** | 边界归并 | API/Git/Vault/Policy 模块路径和边界约束 |
 | **config.md / vault.md / mail.md / notification.md** | 专项规划 | 各模块的现状分析、阶段规划、实施细节 |
 | **orbit.md** | 依赖治理 | 把对 orbit 实现 crate 的 path 引用重构为只依赖 orbit-api 契约 |
-| **trunk-push.md** | 写入路径与部署形态 | Monorepo 根树写入的序列化；`push_policy` 形态开关（`review` / `trunk`）；产品规则以 `../monorepo.md` 为准 |
+| **trunk-push.md** | 写入路径与部署形态 | Monorepo 根树写入的序列化；`push_policy` 形态开关（`review` / `trunk`）；用户可见路径与分支规则见 `../user-guide.zh.md` |
 | **libra.md** | Agent 变更证据 | Libra 摄取、任务／CL 修订、证据授权、精确版本验证与 landing；共用 trunk-push 写入边界 |
 
 ## 所有文档的共同结构规范

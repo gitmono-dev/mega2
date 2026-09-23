@@ -185,7 +185,7 @@
 
 服务层 `MonoApiService` 的 `create_tag` / `list_tags` / `get_tag` / `delete_tag` 已实现；LB-04 起 `storage_only_routers_with`（`src/api/api_router.rs:83`）merge 了 `tag_router::routers()`（`tag_router.rs:20`），四条路由在 storage-only / trunk 与 Review 上都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 与 `tag_router::tag_routes_registered_on_storage_only_routers` 锁定）。trunk 写鉴权见「鉴权」。
 
-Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)）；tag 只能走本节 HTTP。
+Git 客户端 push Tag 仍然**禁止**（见[使用指南](../user-guide.zh.md)）；Tag 只能通过本节 HTTP API 管理。
 
 ### `POST /api/v1/tags` — create — `implemented`（LB-04）
 
@@ -345,7 +345,7 @@ Libra 必须按以下事实实现，不得反向假设：
 
 ## 相关文档
 
-- [`../monorepo.md`](../monorepo.md) —— 产品规则；tag 只能走 HTTP，Git 客户端禁 tag。该文的 API 表已对齐 GET。wire 以本页为准
+- [`../user-guide.zh.md`](../user-guide.zh.md) —— 用户可见规则：Tag 通过 HTTP API 管理，Git 客户端不能推送 Tag。本页以 API 契约和 OpenAPI 定义为准。
 - [`../plan/plan-20260918.md`](../plan/plan-20260918.md) —— 文件删移、GET list、path 级 tag 跟进
 - [`../deploy-trunk.md`](../deploy-trunk.md) —— storage-only 运维手册与产品 API 写契约
 - [`../plan/plan-20260904.md`](../plan/plan-20260904.md) —— create-entry / edit/save + `push_auth` + `land_api_tip_push` 的来源计划

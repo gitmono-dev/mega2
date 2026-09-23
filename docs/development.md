@@ -6,7 +6,7 @@
 [`AGENTS.md`](../AGENTS.md)。
 
 **Monorepo 产品规则**（公开分支仅 `main`、禁止 Git 客户端操作 tag、初始化与目录结构、trunk 不变式）见集中文档
-[`monorepo.md`](./monorepo.md)。Trunk / storage-only 部署见 [`deploy-trunk.md`](./deploy-trunk.md)。
+[使用指南](./user-guide.zh.md)。Trunk / storage-only 部署见 [`deployment.zh.md`](./deployment.zh.md) 与 [`deploy-trunk.md`](./deploy-trunk.md)。
 
 ## 推荐：用脚本代替手贴命令
 
@@ -52,13 +52,13 @@
 | --- | --- |
 | OS | **全量 IT / `git-cli`** 在 **Linux 与 macOS Docker Desktop** 上验收（bridge + `host.docker.internal`）；Windows 未验收 |
 | 工具 | Docker Compose v2、Rust stable、nightly（仅 `rustfmt` 门禁） |
-| 仓库布局 | 对象存储内联于 `src/orbit_api/` + `src/orbit/`；compose 构建 megaui 时仍需 sibling `../megaui` |
+| 仓库布局 | 对象存储代码位于 `src/orbit_api/` + `src/orbit/`；website 会话集成测试使用可选的 Compose `web` profile |
 | 配置 | 从示例生成本地 env（不提交）：`cp .env.test.example .env.test`（`dev-test.sh` 会自动创建） |
 
 公开测试凭据（仅 IT 栈，已写在 compose / example 中）：
 
 - Postgres：用户/库 `mega2`，密码 `mega2_test_password`
-- RustFS：`rustfs` / `rustfs_secret`，桶 **`mega2`**（mega2 IT）与保留名称 **`monoui`**（megaui 上传，FS-ME-01）
+- RustFS：`rustfs` / `rustfs_secret`，桶 **`mega2`**（mega2 IT）与兼容性保留名称 **`monoui`**（website 集成测试，FS-ME-01）
 
 ## 快速开始：普通 / 基础测试
 
@@ -324,13 +324,13 @@ curl -fsS http://127.0.0.1:18025/api/v1/messages
 Mailpit 可用性作为启动或测试门。注意 IT 栈默认注入的是 `EMAIL_PROVIDER=test`
 （进程内内存 provider，**不发 SMTP**），因此 WE-06 通过时 Mailpit 里**本就应当为空**；
 要让邮件真正落到 Mailpit，需把 `website-next` 的 `EMAIL_PROVIDER` 改为 `smtp` 并设置
-`SMTP_HOST=mailpit` / `SMTP_PORT=1025`。前端仓库为 sibling `../megaui`（`apps/web`）。
+`SMTP_HOST=mailpit` / `SMTP_PORT=1025`。该可选测试栈中的网站应用源码位于独立 sibling checkout（`apps/web`）。
 
 **Workspace Code 栈 IT（`WEBSITE_IT=1`）**
 
 `docker/docker-compose.test.yml` 的 `website-next` 服务注入
 `MEGA_CODE_DATA_BACKEND=mega2` 与容器内 `MEGA2_PUBLIC_BASE_URL=http://mega2:8000`，
-使 megaui `/api/mega` Code 读路径经 BFF 转发 mega2。在 megaui 仓执行：
+使网站应用的 `/api/mega` Code 读取路径经 BFF 转发至 mega2。相关检查需在网站应用仓库执行：
 
 ```bash
 WEBSITE_IT=1 pnpm test:api -- tests/api/mega/workspace-code-stack.test.ts
@@ -352,7 +352,7 @@ WEBSITE_IT=1 pnpm test:api -- tests/api/mega/workspace-code-stack.test.ts
 | `S3_ACCESS_KEY_ID` / `S3_ACCESS_KEY_SECRET` | `rustfs` / `rustfs_secret` |
 
 `website-next` 依赖 `rustfs-init: service_healthy`（双桶 **`mega2`** + **`monoui`** 已建）。
-设计细节见 megaui [`docs/implementation/workspace-storage-backend.md`](../megaui/docs/implementation/workspace-storage-backend.md)。
+若同时检出了网站应用的 sibling checkout，设计细节见其中的 `docs/implementation/workspace-storage-backend.md`。
 
 **干净重置**
 

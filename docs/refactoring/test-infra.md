@@ -206,7 +206,7 @@ git-smoke runner git-lfs 固定版本: `git-lfs/3.7.1`
 | profiles | `profiles: ["app"]`：**不**参与默认 `up -d --wait`；显式 `--profile app` |
 | depends_on | `postgres`、`redis`（`service_healthy`）。`MEGA_OAUTH__WEBSITE_API_BASE_URL=http://website-next:7001`；`MEGA_OAUTH__ALLOWED_CORS_ORIGINS` 保留既有 IT origin 并含 `http://127.0.0.1:17001`。不声明对 `website-next` 的 `depends_on`：该服务仅属 `web` profile，而 `mega2` 属 `app`；跨 profile 依赖会使 app-only smoke 无法解析。会话联调使用下方规定的 web-first 启动顺序；不依赖 RustFS。 |
 | 清理 | `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app down -v`（或与 `--profile git` 一并） |
-| CI 入口 | `.github/workflows/config-validation.yml`：先检查并 checkout sibling `../megaui`，在数据面 `up` 后用 `Dockerfile.it-runtime` 打 `mega2:local`，再以 `--profile app --profile web up -d --wait` 同启服务，探测 `19180/api/openapi.json` 与 `17001/api/auth/get-session`；job 运行 `WEBSITE_IT=1 cargo test -p mega2 --test integration_website_auth -- --test-threads=1`，并在 `if: always()` 带两个 profile `down -v`。 |
+| CI 入口 | `.github/workflows/config-validation.yml`：先检查并 checkout sibling website application checkout，在数据面 `up` 后用 `Dockerfile.it-runtime` 打 `mega2:local`，再以 `--profile app --profile web up -d --wait` 同启服务，探测 `19180/api/openapi.json` 与 `17001/api/auth/get-session`；job 运行 `WEBSITE_IT=1 cargo test -p mega2 --test integration_website_auth -- --test-threads=1`，并在 `if: always()` 带两个 profile `down -v`。 |
 | secret | 无注入生产 secret；DB 使用公开测试口令 `mega2_test_password`（用户/库名均为 `mega2`） |
 | 降级 / 黑盒 | 栈级 smoke：`integration_compose_mega2_http_smoke`（端口未监听时 soft-skip）。隔离黑盒仍用 `CARGO_BIN_EXE` |
 
@@ -243,7 +243,7 @@ ScorpioFS（sibling 仓 `../scorpiofs`）是把 monorepo 路径挂载为本地�
 | 项 | 值 |
 |---|---|
 | 服务名 | `scorpiofs` |
-| 镜像 | `scorpiofs:local`（`pull_policy: never`；本地源码构建 `build: context: ../scorpiofs`，sibling checkout，同 `../megaui` 惯例）。builder 基底固定 `rust:1.97-slim-bookworm`，runtime `debian:bookworm-slim`（`fuse3` / `libssl3` / `curl`）；无 `latest`。宿主机（Arch 等新 glibc）二进制无法进 bookworm/noble 镜像，不提供 `it-runtime` 式打包 |
+| 镜像 | `scorpiofs:local`（`pull_policy: never`；本地源码构建 `build: context: ../scorpiofs`，sibling checkout，同外部源码 checkout 惯例）。builder 基底固定 `rust:1.97-slim-bookworm`，runtime `debian:bookworm-slim`（`fuse3` / `libssl3` / `curl`）；无 `latest`。宿主机（Arch 等新 glibc）二进制无法进 bookworm/noble 镜像，不提供 `it-runtime` 式打包 |
 | 固定版本字符串 | 无客户端 pin；镜像内容随 `../scorpiofs` 源码变化，升级为显式 `--build`。smoke 把容器内 `scorpio --version` 写入输出 |
 | 端口 | `127.0.0.1:12725:2725`（高位 + 仅回环）。ScorpioFS HTTP API **无认证**，禁止改为 `0.0.0.0` 或经反向代理公开 |
 | healthcheck | `curl -fsS http://127.0.0.1:2725/health`（`interval 3s` / `retries 40` / `start_period 20s`；`serve` 先挂载 FUSE 工作区再绑定 HTTP，因此 healthy 即代表 FUSE 挂载成功） |
@@ -265,23 +265,23 @@ ScorpioFS（sibling 仓 `../scorpiofs`）是把 monorepo 路径挂载为本地�
 harness 变量 `MEGA2_IT_SCORPIO_WORKDIR`（默认 `/tmp/mega2-scorpiofs`）与 `MEGA2_IT_GIT_WORKDIR` 同规则：
 启栈前由测试 UID 创建、变更后须 `--force-recreate scorpiofs`。运行流程见 `docs/development.md`「ScorpioFS 联调」。
 
-### website-next + website-db-init + megaui-collab（Better Auth IT，profile `web`）
+### website-next + website-db-init + website-collab（Better Auth IT，profile `web`）
 
 | 项 | 值 |
 |---|---|
-| 服务名 | `website-db-init`、`website-next`、`megaui-collab` |
-| 镜像 / 构建 | `website-db-init` 与 `website-next` 从 sibling `../megaui` 的 `apps/web/Dockerfile` 构建，分别使用 `db-init` 与 `runner` target；`db-init` target 携带 `pnpm` / Drizzle / `pg`。`megaui-collab` 从 `apps/collab-server/Dockerfile` 构建。三个镜像均为本地 `pull_policy: never` tag；首次或改指 sibling 后必须带 `--build`，避免复用旧镜像。 |
-| 端口 | `website-next`：`127.0.0.1:17001:7001`；`megaui-collab`：`127.0.0.1:17002:7002`（均仅回环） |
+| 服务名 | `website-db-init`、`website-next`、`website-collab` |
+| 镜像 / 构建 | `website-db-init` 与 `website-next` 从 sibling website application checkout 的 `apps/web/Dockerfile` 构建，分别使用 `db-init` 与 `runner` target；`db-init` target 携带 `pnpm` / Drizzle / `pg`。`website-collab` 从 `apps/collab-server/Dockerfile` 构建。三个镜像均为本地 `pull_policy: never` tag；首次或改指 sibling 后必须带 `--build`，避免复用旧镜像。 |
+| 端口 | `website-next`：`127.0.0.1:17001:7001`；`website-collab`：`127.0.0.1:17002:7002`（均仅回环） |
 | healthcheck | 容器内 Node TCP 连接 `127.0.0.1:7001`；只在 Next 进程已监听时 healthy |
 | 网络 | 默认 `networks.default` → `mega2-test-network`，可由后续 `mega2` profile 通过 `website-next:7001` 访问 |
 | 账户库 | `website-db-init` 与 `website-next` 使用 `DATABASE_URL=postgresql://mega2:mega2_test_password@postgres:5432/website`。前者先经 `DATABASE_ADMIN_URL` 在共享 `postgres` 上幂等 `CREATE DATABASE website`，再运行 `pnpm exec drizzle-kit migrate`。账户数据与 `mega2` 业务库隔离（ADR-WA-07）；**禁止**把 website URL 指到库名 `mega2`。无 named volume（状态在 Postgres 数据卷） |
 | profiles | 两服务均为 `profiles: ["web"]`，不参与默认 `up -d --wait`；显式启动：`docker compose -p mega2-it -f docker/docker-compose.test.yml --profile web up -d --wait website-next` |
-| depends_on / 会话联调顺序 | `website-db-init` → `postgres`（`service_healthy`）；`megaui-collab` 独立健康检查；`website-next` → `postgres` + `website-db-init`（`service_completed_successfully`）+ `megaui-collab`（`service_healthy`）+ **`rustfs-init`（`service_healthy`，FS-02：确保保留名 `monoui` 桶已建）**；初始化失败时 Next 不会启动。没有 `mega2` 跨 profile 依赖 |
-| 对象存储 env（FS-02） | `STORAGE_PROVIDER=s3`，`S3_BUCKET=monoui`，`S3_ENDPOINT=http://rustfs:9000`，`S3_PUBLIC_URL=http://127.0.0.1:19000/monoui`，`S3_FORCE_PATH_STYLE=true`，凭据 `rustfs` / `rustfs_secret`；该 bucket 名为兼容性保留值；见 megaui [`workspace-storage-backend.md`](../../../megaui/docs/implementation/workspace-storage-backend.md) |
+| depends_on / 会话联调顺序 | `website-db-init` → `postgres`（`service_healthy`）；`website-collab` 独立健康检查；`website-next` → `postgres` + `website-db-init`（`service_completed_successfully`）+ `website-collab`（`service_healthy`）+ **`rustfs-init`（`service_healthy`，FS-02：确保保留名 `monoui` 桶已建）**；初始化失败时 Next 不会启动。没有 `mega2` 跨 profile 依赖 |
+| 对象存储 env（FS-02） | `STORAGE_PROVIDER=s3`，`S3_BUCKET=monoui`，`S3_ENDPOINT=http://rustfs:9000`，`S3_PUBLIC_URL=http://127.0.0.1:19000/monoui`，`S3_FORCE_PATH_STYLE=true`，凭据 `rustfs` / `rustfs_secret`；该 bucket 名为兼容性保留值；若检出 sibling 仓库 website application checkout，实现说明位于 `docs/implementation/workspace-storage-backend.md` |
 | 清理 | `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile web down -v`；`-v` 删除 Postgres 数据卷后 `website` 库与 schema 不保留，零残留仍按 compose project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../megaui`。构建 `mega2:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth`，并在 `if: always()` 使用相同 profile `down -v`。 |
+| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling website application checkout。构建 `mega2:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth`，并在 `if: always()` 使用相同 profile `down -v`。 |
 | secret | `BETTER_AUTH_SECRET` 是仅用于本地 IT 的公开固定值；不得替换为或记录生产 secret |
-| 邮件 env（website 侧） | megaui 自管 `EMAIL_PROVIDER=test`（内存记录，无云调用）等；本仓不登记、不启动 SMTP 捕获服务 |
+| 邮件 env（website 侧） | website frontend 自管 `EMAIL_PROVIDER=test`（内存记录，无云调用）等；本仓不登记、不启动 SMTP 捕获服务 |
 | 性能 | 首次 source build 预算 ≤ 20 分钟；默认 profile 不构建、不启动该服务 |
 
 对照锚点：`docker/docker-compose.test.yml` 的 `website-db-init` / `website-next` 服务块；拓扑语义见

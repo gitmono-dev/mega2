@@ -2,7 +2,7 @@
 
 # 部署指南
 
-mega2 开源版只交付一种形态：**trunk / storage-only**——无 Web UI、无 Change List；交互式浏览用 Libra 的 `libra mega2 browser`。本文是该形态的安装与上线指南。运行时行为、鉴权语义与形态切换的运维事实源是 [`deploy-trunk.md`](./deploy-trunk.md)；产品规则见 [`monorepo.md`](./monorepo.md)；配置键见 [`config/config.toml`](../config/config.toml)（重注释样例）与 [`refactoring/config.md`](./refactoring/config.md)。本文不重复这些事实，只做导航与落地步骤。
+mega2 开源版以 **trunk / storage-only** 模式部署，不提供 Web UI；交互式浏览请使用 Libra 命令 `libra mega2 browser`。本文说明安装、运行时行为、鉴权和模式切换。仓库与推送规则见[使用指南](./user-guide.zh.md)，配置项以带注释的 [`config/config.toml`](../config/config.toml) 为准。
 
 ## 1. 部署形态
 
@@ -11,7 +11,7 @@ mega2 开源版只交付一种形态：**trunk / storage-only**——无 Web UI�
 - 唯一公开分支 `main`；所有写（git push 与产品 API 写）经 MonoWriteQueue 全局串行化，共享 tip 权威；不注册 CL / issue / reviewer / OAuth user 路由。
 - HTTP 表面：Git smart HTTP（`info/refs`、`git-upload-pack`、`git-receive-pack`）、LFS（`/info/lfs`、`/api/v1/lfs`）、storage-only `/api/v1/*`（status、file/blob、file/tree、preview 读，create-entry / delete-entry / move-entry / edit/save、tags 写）、可选 OCI `/v2`（`[oci].enabled`）、可选 Agent Capture `/api/v1/agent-capture`（`[agent_capture].enabled`）、Swagger UI `/swagger-ui`、OpenAPI `/api/openapi.json`。
 - SSH 仅 upload-pack（clone / fetch / pull）；`ssh_receive_pack` 必须显式 `false`，省略会拒绝启动。
-- 写鉴权：`git.push_auth = "token"`（推荐）或 `"none"`（仅受控网络）。鉴权语义、fail-closed 清单与 SSH 细节见 [`deploy-trunk.md`](./deploy-trunk.md) §1–§4。
+- 写鉴权：`git.push_auth = "token"`（推荐）或 `"none"`（仅限受控网络）。具体配置与 SSH 规则见本指南第 3–5 节。
 
 ## 2. Compose 部署
 
@@ -145,9 +145,9 @@ cargo build --release -p mega2   # 产物 target/release/mega2
 
 ## 8. 相关文档
 
-- 本套文档：[`quick-start.zh.md`](./quick-start.zh.md) · [`user-guide.zh.md`](./user-guide.zh.md) · [`configuration.zh.md`](./configuration.zh.md) · [`architecture.zh.md`](./architecture.zh.md) · [`contributing.zh.md`](./contributing.zh.md)
+- 使用与开发指南：[`quick-start.zh.md`](./quick-start.zh.md) · [`recipes.zh.md`](./recipes.zh.md) · [`user-guide.zh.md`](./user-guide.zh.md) · [`configuration.zh.md`](./configuration.zh.md) · [`architecture.zh.md`](./architecture.zh.md) · [`contributing.zh.md`](./contributing.zh.md)
 - [`deploy-trunk.md`](./deploy-trunk.md) — trunk / storage-only 运维事实源（鉴权、SSH、LFS、形态切换、OCI、smoke）。
-- [`monorepo.md`](./monorepo.md) — 产品规则（唯一公开分支、不变式、tag 限制）。
+- [`user-guide.zh.md`](./user-guide.zh.md) — 仓库路径、分支和 Tag 规则，以及推送流程。
 - [`development.md`](./development.md) — 本地开发与测试。
 - [`config/config.toml`](../config/config.toml) + [`refactoring/config.md`](./refactoring/config.md) — 配置键与加载 / 校验语义。
 - [`refactoring/orbit.md`](./refactoring/orbit.md)、[`refactoring/vault.md`](./refactoring/vault.md)、[`refactoring/oci.md`](./refactoring/oci.md)、[`refactoring/agent-capture.md`](./refactoring/agent-capture.md) — 各子系统契约。

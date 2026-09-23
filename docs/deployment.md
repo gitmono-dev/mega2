@@ -2,7 +2,7 @@ English · [中文](deployment.zh.md)
 
 # Deployment Guide
 
-The open-source edition of mega2 ships in exactly one shape: **trunk / storage-only** — no Web UI, no Change List; interactive browsing is done via Libra's `libra mega2 browser`. This document is the install and go-live guide for that shape. The operational fact source for runtime behavior, auth semantics, and morphology switching is [`deploy-trunk.md`](./deploy-trunk.md); product rules live in [`monorepo.md`](./monorepo.md); configuration keys live in [`config/config.toml`](../config/config.toml) (heavily commented sample) and [`refactoring/config.md`](./refactoring/config.md). This guide does not restate those facts — it orients and walks you through the concrete steps.
+The open-source edition of mega2 is deployed in **trunk / storage-only** mode. It has no Web UI; use Libra's `libra mega2 browser` for interactive browsing. This guide covers installation, runtime behavior, authentication, and mode changes. Repository and push behavior is summarized in the [User Guide](./user-guide.md). The commented [`config.toml`](../config/config.toml) lists the configuration keys.
 
 ## 1. Deployment shape
 
@@ -11,7 +11,7 @@ The only supported deployment shape is trunk / storage-only:
 - Single public branch `main`; all writes (git push and product API writes) are globally serialized through the MonoWriteQueue and share tip authority; no CL / issue / reviewer / OAuth user routes are registered.
 - HTTP surface: Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`), LFS (`/info/lfs`, `/api/v1/lfs`), storage-only `/api/v1/*` (status, file/blob, file/tree, preview reads; create-entry / delete-entry / move-entry / edit/save, tags writes), optional OCI `/v2` (`[oci].enabled`), optional Agent Capture `/api/v1/agent-capture` (`[agent_capture].enabled`), Swagger UI `/swagger-ui`, OpenAPI `/api/openapi.json`.
 - SSH is upload-pack only (clone / fetch / pull); `ssh_receive_pack` must be explicitly `false` — omitting it refuses startup.
-- Write auth: `git.push_auth = "token"` (recommended) or `"none"` (controlled networks only). Auth semantics, the fail-closed checklist, and SSH details: [`deploy-trunk.md`](./deploy-trunk.md) §1–§4.
+- Write auth: `git.push_auth = "token"` (recommended) or `"none"` (controlled networks only). Configure authentication and SSH as described in sections 3–5 of this guide.
 
 ## 2. Compose deployment
 
@@ -33,7 +33,7 @@ docker compose -f <file> logs -f mega2
 docker compose -f <file> down      # named volumes keep the data; down -v wipes it
 ```
 
-Both stacks are a **local-only, anonymous setup**: `push_auth=none`, anonymous reads and writes, and HTTP is bound to `127.0.0.1:9000` only. Do not rebind to `0.0.0.0` or expose it through a reverse proxy; for shared / public deployments use the token-based stack below or your own orchestration. An end-to-end walkthrough: [`quick-start.md`](./quick-start.md).
+Both stacks are a **local-only, anonymous setup**: `push_auth=none`, anonymous reads and writes, and HTTP bound to `127.0.0.1:9000`. Do not rebind to `0.0.0.0` or expose the service through a reverse proxy. For a shared deployment, start from the token-authenticated lab stack below and configure networking and TLS for your environment; for public deployment, use your own orchestration. Start with the [Quick Start](./quick-start.md), then try the [usage recipes](./recipes.md).
 
 ### 2.2 Source-built test / lab stack: `docker/docker-compose-storage-only.yml`
 
@@ -49,7 +49,7 @@ Services and host ports (authoritative source is the compose file):
 | redis | 6379 | `127.0.0.1:26379` | |
 | rustfs API | 9000 | `127.0.0.1:29000` | default S3-compatible object store |
 | rustfs console | 9001 | `127.0.0.1:29001` | |
-| git-smoke | — | no published ports | `--profile smoke` black-box smoke (see [`deploy-trunk.md`](./deploy-trunk.md) §8.1) |
+| git-smoke | — | no published ports | `--profile smoke` black-box smoke (see [Observability](#7-observability)) |
 
 First start and bootstrap:
 
@@ -65,7 +65,7 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml exec -T 
   mega2 --config /etc/mega2/config.toml service init --yes
 ```
 
-**Push token secret**: compose mounts the token file as `/run/secrets/mega2-push-token`, defaulting to `./secrets/mega2-push-token.local` (`secrets/` is gitignored — create it yourself). For real deployments point `MEGA2_PUSH_TOKEN_FILE=/path/to/secret` at the real secret file; never commit plaintext. Token configuration and `paths` authorization semantics: [`deploy-trunk.md`](./deploy-trunk.md) §3.
+**Push token secret**: compose mounts the token file as `/run/secrets/mega2-push-token`, defaulting to `./secrets/mega2-push-token.local` (`secrets/` is gitignored — create it yourself). For real deployments point `MEGA2_PUSH_TOKEN_FILE=/path/to/secret` at the real secret file; never commit plaintext. See the [User Guide](./user-guide.md) for the write-auth model and path-scoped token behavior.
 
 ### 2.2.1 `push_auth=none` override variant
 
@@ -89,7 +89,7 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
   --env-file config/compose.env.storage-only.local up -d --wait
 ```
 
-Env file contents: [`config/compose.env.storage-only.local`](../config/compose.env.storage-only.local); backend contract: [`refactoring/orbit.md`](./refactoring/orbit.md).
+Env file contents: [`config/compose.env.storage-only.local`](../config/compose.env.storage-only.local); backend contract: [`architecture.md`](./architecture.md).
 
 ## 3. Binary / container deployment
 
@@ -115,39 +115,38 @@ Process management: mega2 is a single long-running process; manage it with syste
 | --- | --- |
 | PostgreSQL | Required. The compose stack uses 18.x. |
 | Redis | Required. The compose stack uses 8.x. |
-| Object storage | Required, one of: local filesystem (`storage_type="local"`, single node only), S3-compatible (default; RustFS / MinIO / cloud S3), GCS. Built via `build_object_storage` per [`refactoring/orbit.md`](./refactoring/orbit.md). |
-| Vault | No external service: the embedded Vault comes from crates.io `libvault` + [`src/contract/vault/`](../src/contract/vault/), see [`refactoring/vault.md`](./refactoring/vault.md). |
+| Object storage | Required, one of: local filesystem (`storage_type="local"`, single node only), S3-compatible (default; RustFS / MinIO / cloud S3), GCS. Built via `build_object_storage` per [`architecture.md`](./architecture.md). |
+| Vault | No external service: the embedded Vault comes from crates.io `libvault` + [`src/contract/vault/`](../src/contract/vault/), see [`architecture.md`](./architecture.md). |
 
-Resource sizing scales with repository size and push concurrency; the write path is globally serialized (MonoWriteQueue), and read-path horizontal scaling is bounded by Postgres / object storage. Validate configuration before deploying with `mega2 --config <path> config validate` (optionally `--show-sources` / `--deny-warnings`); see [`refactoring/config.md`](./refactoring/config.md).
+Resource sizing scales with repository size and push concurrency; the write path is globally serialized (MonoWriteQueue), and read-path horizontal scaling is bounded by Postgres / object storage. Validate configuration before deploying with `mega2 --config <path> config validate` (optionally `--show-sources` / `--deny-warnings`); see [`configuration.md`](./configuration.md).
 
 ## 5. Production hardening checklist
 
-- [ ] `push_auth = "token"`, with `[[git.push_tokens]]` `paths` narrowed to the minimum component boundaries; **never** expose `push_auth=none` publicly (see the §2.1 warning and [`deploy-trunk.md`](./deploy-trunk.md) §3).
+- [ ] `push_auth = "token"`, with `[[git.push_tokens]]` `paths` narrowed to the minimum component boundaries; **never** expose `push_auth=none` publicly (see the §2.1 warning).
 - [ ] Inject credentials via `${file:...}` file mounts or Vault SecretRefs; the committed `config.toml` contains no plaintext (sample: [`config/config.toml`](../config/config.toml)).
-- [ ] Terminate TLS at a reverse proxy; point `MEGA_HTTP__PUBLIC_BASE_URL` and the LFS URLs at the external https address (plaintext HTTP registries need an insecure-registry client config; see [`refactoring/oci.md`](./refactoring/oci.md)).
+- [ ] Terminate TLS at a reverse proxy; point `MEGA_HTTP__PUBLIC_BASE_URL` and the LFS URLs at the external https address (plaintext HTTP registries need an insecure-registry client config; see [`user-guide.md`](./user-guide.md)).
 - [ ] `log.print_std = false` so logs land under `mega_cache()/logs`; the compose stack's `print_std=true` suits containers only.
 - [ ] Bind host ports to loopback / internal addresses; open only what is needed.
-- [ ] Keep `cedar.enforcement` at `off` (a trunk-morphology startup precondition; see [`deploy-trunk.md`](./deploy-trunk.md) §1).
+- [ ] Keep `cedar.enforcement` at `off` (a trunk-mode startup requirement; see the [Deployment shape](#1-deployment-shape)).
 - [ ] Enable OCI `/v2` and Agent Capture explicitly, only when needed (not mounted by default).
 - [ ] Backups, three parts: Postgres dump, object storage bucket, `mega2 --config <path> config vault backup <destination>` (Vault core key; restore with `config vault restore`, see [`src/commands/config.rs`](../src/commands/config.rs)).
 
-## 6. Upgrades & morphology switching
+## 6. Upgrades and mode changes
 
 - Upgrades: swap the image / binary and restart. Config changes marked `restart_required` take effect only after a restart.
-- Morphology switching (`review ↔ trunk`) — startup preconditions (no open CLs, drained `push_queue`, explicit `push_auth`) and index watermark reset: the operational fact source is [`deploy-trunk.md`](./deploy-trunk.md) §5; design rationale in [`refactoring/trunk-push.md`](./refactoring/trunk-push.md).
+- Switching modes (`review ↔ trunk`) requires startup checks (no open CLs, no active rows in `push_queue`, and explicit `push_auth`) and an index watermark reset. See the [Deployment shape](#1-deployment-shape) and this section for the startup prerequisites.
 
 ## 7. Observability
 
 - Health: `GET /api/v1/status`; the compose healthcheck uses `GET /api/openapi.json`.
 - Logs: hourly rolling files under `mega_cache()/logs` (stdout when `log.print_std=true`, as in the compose stack).
 - API catalog: Swagger UI `/swagger-ui`, OpenAPI JSON `/api/openapi.json`.
-- Stack-level smoke: `scripts/git_protocol_smoke_storage_only.sh` (Git protocol) and `scripts/api_write_smoke_storage_only.sh` (API write → Git visibility), usage in [`deploy-trunk.md`](./deploy-trunk.md) §8.1; OCI smoke `scripts/oci_smoke_storage_only.sh` ([`deploy-trunk.md`](./deploy-trunk.md) §10.2).
+- Stack-level smoke: `scripts/git_protocol_smoke_storage_only.sh` (Git protocol) and `scripts/api_write_smoke_storage_only.sh` (API write → Git visibility), Run the smoke scripts from the repository root after bringing up the stack; OCI coverage is included in the deployment stack when enabled.
 
 ## 8. Further reading
 
-- This documentation set: [`quick-start.md`](./quick-start.md) · [`user-guide.md`](./user-guide.md) · [`configuration.md`](./configuration.md) · [`architecture.md`](./architecture.md) · [`contributing.md`](./contributing.md)
-- [`deploy-trunk.md`](./deploy-trunk.md) — operational fact source for trunk / storage-only (auth, SSH, LFS, morphology switching, OCI, smoke).
-- [`monorepo.md`](./monorepo.md) — product rules (single public branch, invariants, tag restrictions).
-- [`development.md`](./development.md) — local development and testing.
-- [`config/config.toml`](../config/config.toml) + [`refactoring/config.md`](./refactoring/config.md) — configuration keys and load / validation semantics.
-- [`refactoring/orbit.md`](./refactoring/orbit.md), [`refactoring/vault.md`](./refactoring/vault.md), [`refactoring/oci.md`](./refactoring/oci.md), [`refactoring/agent-capture.md`](./refactoring/agent-capture.md) — subsystem contracts.
+- Guides for use and development: [`quick-start.md`](./quick-start.md) · [`recipes.md`](./recipes.md) · [`user-guide.md`](./user-guide.md) · [`configuration.md`](./configuration.md) · [`architecture.md`](./architecture.md) · [`contributing.md`](./contributing.md)
+- [`user-guide.md`](./user-guide.md) — repository paths, branch and tag behavior, and push workflows.
+- [`contributing.md`](./contributing.md) — local development and testing.
+- [`config/config.toml`](../config/config.toml) — the commented list of configuration keys and defaults.
+- [`architecture.md`](./architecture.md) — storage, protocol, authorization, and optional service boundaries.

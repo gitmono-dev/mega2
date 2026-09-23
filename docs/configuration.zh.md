@@ -2,7 +2,7 @@
 
 [English](configuration.md) · 中文
 
-本文是 mega2 配置系统的导览与运维参考：加载顺序、密钥管理、热加载、分区说明、启动校验与 `config validate`。逐键的带注释完整样例以 [`config/config.toml`](../config/config.toml) 为权威源，本文不复制键值表；各子系统的契约细节另见 [`refactoring/config.md`](./refactoring/config.md)（object_format / cedar / push_auth / storage_events 等冻结语义）。产品规则见 [`monorepo.md`](./monorepo.md)，trunk 部署运维见 [`deploy-trunk.md`](./deploy-trunk.md)。
+本文是 mega2 配置系统的导览与运维参考，涵盖加载顺序、密钥管理、热加载、配置分区、启动校验与 `config validate`。逐键的带注释样例以 [`config/config.toml`](../config/config.toml) 为准，本文不重复列出所有键值。仓库行为见[使用指南](./user-guide.zh.md)，部署步骤见[部署指南](./deployment.zh.md)。
 
 配置模块在 `src/config/`（loader / model / source / expand / secret / validate / reload）。全局 flag 为 `--config <path>` 与 `--profile <name>`（等价环境变量 `MEGA_CONFIG` / `MEGA_PROFILE`）。
 
@@ -82,7 +82,7 @@ mega2 --config /etc/mega2/config.toml config secret check redis.url \
 - **`base_dir`**（顶层）：数据根目录（日志、本地对象、LFS、缓存），可用 `MEGA_BASE_DIR` 覆盖；样例中 `${base_dir}` 占位符在各路径字段展开。
 - **`[log]`**：tracing 日志。`level`（trace..error）、`print_std`（生产关）、`with_ansi`（仅 stdout）。全部热加载。
 - **`[database]`**：仅支持 PostgreSQL（`db_type = "postgres"`）。`db_url`、连接池 `max_connection` / `min_connection`、`acquire_timeout` / `connect_timeout`、`sqlx_logging`。凭据用 `MEGA_DATABASE__DB_URL` 注入，不走 Vault SecretRef。
-- **`[monorepo]`**：产品规则（权威 [`monorepo.md`](./monorepo.md)）。`import_dir`（默认 `/third-party`，ImportRepo 多分支特例）、`admin`、`root_dirs`（目录初始化）、`object_format`（`sha1` 默认；`sha256` / `blake3` 为 Libra 扩展，见 [`refactoring/config.md`](./refactoring/config.md) 与 [`refactoring/protocol.md`](./refactoring/protocol.md)）、`push_policy`（`review` 默认 / `trunk`）、`max_push_commits`（trunk 链长上界）。bootstrap：`mega2 --config <path> service init --yes`（见 [`manual/monorepo-init.md`](./manual/monorepo-init.md)）。
+- **`[monorepo]`**：`import_dir`（默认 `/third-party`，ImportRepo 多分支例外）、`admin`、`root_dirs`（初始化目录）、`object_format`（默认 `sha1`；`sha256` / `blake3` 为 Libra 扩展）、`push_policy`（默认 `review`，也可设为 `trunk`）和 `max_push_commits`（trunk 推送链上限）。目录生成细节见 [`manual/monorepo-init.zh.md`](./manual/monorepo-init.zh.md)；完整配置项见 [`config/config.toml`](../config/config.toml)。
 - **`[monorepo.rename]`**：diff 分类的移动 / 改名检测：`similarity_threshold`（0-100）、`rename_limit`（0 = 不限制）。
 - **`[pack]`**：receive-pack 解码资源。`pack_decode_mem_size` / `pack_decode_disk_size`（支持 K/M/G、KiB/MiB 与百分比）、`pack_decode_cache_path`、`clean_cache_after_decode`、`channel_message_size`、`save_entry_concurrency`。
 - **`[lfs]`**：`[lfs.ssh].http_url`（SSH 传输的 href 底座，LFS 文件仍走 HTTP）、`[lfs.local].lfs_file_path`。trunk 下 LFS 鉴权随 `git.push_auth`，见 [`deploy-trunk.md`](./deploy-trunk.md) §6。
@@ -103,7 +103,7 @@ mega2 --config /etc/mega2/config.toml config secret check redis.url \
 
 ## 5. 启动期 fail-closed 校验
 
-`Config::validate` / `AppContext::new` 在启动期拒绝不合规配置，而不是带病运行。trunk / storage-only 形态的不变式清单（`cedar.enforcement` 必须为 off、无 open CL、`push_queue` 非终态行、`push_auth` 显式且与形态匹配、`ssh_receive_pack = false` 等 7 条）以 [`deploy-trunk.md`](./deploy-trunk.md) §1 为权威，本文不复述。其余代表性拒绝项：未知 / 已移除字段、`cedar.enforcement` 非法值、`monorepo.admin` 含保留匿名主体、`[oci]` / `[agent_capture]` / `[storage_events]` 在非 storage-only 下开启、`storage_events` 数值越界与非规范过滤器、SecretRef 命名空间不符。错误文本统一走 [`errors.md`](./errors.md) 的约定且不含密值。
+`Config::validate` 和 `AppContext::new` 会在启动时拒绝不合规配置。trunk / storage-only 模式的 7 项不变式清单以 [`deploy-trunk.md`](./deploy-trunk.md) §1 为准，包括 `cedar.enforcement = off`、没有未关闭的 CL、`push_queue` 中没有非终态记录、显式设置且与模式匹配的 `push_auth`，以及 `ssh_receive_pack = false`。其他拒绝项包括未知或已移除字段、非法的 `cedar.enforcement` 值、`monorepo.admin` 中的保留匿名主体、在 storage-only 之外启用 `[oci]` / `[agent_capture]` / `[storage_events]`、越界的 `storage_events` 数值、非规范过滤器和不匹配的 SecretRef 命名空间。错误文本遵循 [`errors.md`](./errors.md) 的约定，不包含密钥值。
 
 ## 6. `config validate`
 

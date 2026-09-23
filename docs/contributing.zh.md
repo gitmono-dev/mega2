@@ -2,13 +2,11 @@
 
 # 贡献指南
 
-本文是向 mega2 提交代码的入口文档：流程、门禁、约定与常见任务 how-to。事实基线是
-当前 checkout 的源码与 [`../AGENTS.md`](../AGENTS.md)；二者冲突时以 `AGENTS.md`
-与源码为准，并提 Issue 修正本文。
+本文说明如何为 mega2 贡献代码，包括如何提出改动、准备开发环境、运行提交检查并遵循仓库约定。当前 checkout 与 [`../AGENTS.md`](../AGENTS.md) 是事实来源；如果本文与源码或 `AGENTS.md` 冲突，请按事实来源执行，并提 Issue 修正文档。
 
 ## 1. 贡献流程
 
-不要冷启动大改动。顺序是：
+大型改动先与维护者确认范围和方案，再开始实现：
 
 1. **先开 Issue。** 写清问题、动机、范围与明确的非目标（non-goals）。等维护者
    （或讨论）认可方向后再往下走。
@@ -20,8 +18,7 @@
 3. **计划过审后才实现。** 把工作拆成可独立执行的任务卡（范围 / 依赖 / 文件落点 /
    验收标准 / 验证命令明确），补测试与文档，过第 3 节的三门禁后合入。
 
-**计划不等于实现。** 落笔时的事实基线是当前 checkout 的源码、测试、配置与文档；
-历史计划与 Issue 里的口头共识只作线索，不能替代任务卡上的验证命令。
+**计划不等于实现。** 编写计划时，应根据当前 checkout 的源码、测试、配置与文档核实假设。历史计划和 Issue 讨论可作参考，但不能替代任务卡上的验证命令。
 
 ## 2. 开发环境
 
@@ -70,7 +67,7 @@ clippy 0 warning 0 error，不得用 blanket `#[allow(...)]` 绕过；测试全�
 - 注意没有顶层 `mod vault`：Vault 类型从 `libvault::*` 与
   `crate::contract::vault::*` 引入（细节见 AGENTS.md 的 Pitfalls）。
 
-## 5. 常见任务 how-to
+## 5. 常见实现任务
 
 **新增 CLI 子命令**（步骤细节见 [`../AGENTS.md`](../AGENTS.md)「Adding a New
 Subcommand」）：
@@ -99,14 +96,27 @@ New DB Entity / Migration」）：
 - **链接而非复制**：配置键表、token 值、命令 flag 列表等有权威出处的内容
   （[`../config/config.toml`](../config/config.toml)、
   [`refactoring/config.md`](refactoring/config.md)、[`deploy-trunk.md`](deploy-trunk.md)、
-  [`monorepo.md`](monorepo.md)、[`development.md`](development.md)、
+  [`user-guide.zh.md`](user-guide.zh.md)、[`development.md`](development.md)、
   [`../AGENTS.md`](../AGENTS.md)）一律链接，不在新文档里复制数值。
 - **中英双语**：英文是默认文件（如 `foo.md`），中文放在同名的 `.zh.md` 旁
-  （如 `foo.zh.md`），两版结构一致、互为翻译；文件顶部放语言切换行（与
-  [`../README.md`](../README.md) 同款）。本文即按此约定维护。
+  （如 `foo.zh.md`）。两版结构保持一致、内容同步；英文应符合英文技术文档的表达习惯，不逐句直译。文件顶部放语言切换行，格式参照
+  [`../README.zh.md`](../README.zh.md)。
 - 文档中的相对链接必须指向当前 checkout 里存在的文件，提交前逐一确认。
 
-## 7. 版本控制：Libra 与任务卡发布
+## 7. 评估并移植上游改动
+
+mega2 只移植并重构上游 Mega 项目的部分功能，并非上游仓库的镜像。移植前先确认
+相关模块和行为在当前 checkout 中确实存在。应对照当前源码和测试评估具体改动，
+不要只按上游的文件变更清单机械复制；依赖上游专有服务或仓库结构的改动应标记为
+不适用。
+
+升级依赖时，先比较 `Cargo.lock` 中实际解析的版本，再检查发布说明中的行为变化，
+并为受影响的协议或对象身份契约补充回归验证。Git 对象序列化变化即使不改公开 API，
+也可能改变对象 ID。请在计划或变更说明中记录上游版本、兼容性判断和所需的回归覆盖。
+由独立仓库维护的依赖，应在其所属仓库评估升级，不要直接通过 mega2 的 manifest
+跟进。
+
+## 8. 版本控制：Libra 与任务卡发布
 
 本仓 VCS 是 **Libra**（不是 git；无 `.git` 目录），命令为 `libra add` /
 `libra commit` / `libra push` 等。交互式浏览 monorepo 用 Libra 的
@@ -124,10 +134,11 @@ New DB Entity / Migration」）：
 
 ## 相关文档
 
+- [`README.zh.md`](README.zh.md) — 用户、运维和开发指南索引
 - 本套文档：[`quick-start.zh.md`](quick-start.zh.md) ·
   [`user-guide.zh.md`](user-guide.zh.md) · [`configuration.zh.md`](configuration.zh.md) ·
   [`deployment.zh.md`](deployment.zh.md) · [`architecture.zh.md`](architecture.zh.md)
 - [`../AGENTS.md`](../AGENTS.md) — 门禁、代码约定、常见陷阱、任务卡发布的权威出处
 - [`development.md`](development.md) — 本地开发与测试
 - [`plan/README.md`](plan/README.md) — 计划文档规则
-- [`../README.md`](../README.md) — 项目总览（Contributing 一节是本文的英文摘要）
+- [`../README.zh.md`](../README.zh.md) — 项目总览（Contributing 一节是本文的英文摘要）

@@ -6,7 +6,7 @@
 
 > **与其他模块的依赖**：Git Protocol 改进与 config/vault 的认证统一相关。当 config.md 阶段 2（CLI LoadMode）完成后，可统一 HTTP/SSH 的认证上下文设计。集成测试参见 **`integration.md`**。
 
-> **Monorepo 产品规则（事实源）**：公开分支仅 `main`、Git 客户端禁止 tag、仓库初始化与目录结构见 **[`../monorepo.md`](../monorepo.md)**。本文 smoke/矩阵描述若与之冲突，以 `monorepo.md` 为准。
+> **用户可见规则**：Monorepo 仅公开 `main`，Git 客户端不能推送 Tag；路径例外和推送行为见[使用指南](../user-guide.zh.md)。本文负责记录 Git 协议行为与 smoke 矩阵。
 
 ## 事实校准（2026-06-14，更新 2026-07-01）
 
@@ -60,7 +60,7 @@
 >
 > **2026-07-01 更新 3**：真实 Git CLI CI 矩阵确认覆盖 HTTP 只读路径（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone、blob:none partial clone）。**2026-07-01 更新 4**：HTTP **CL push**（客户端 `HEAD:refs/heads/<name>` → 服务端 `refs/cl/*`，**不**新增公开分支）已进入 CI 必跑 gate；workflow 在 smoke DB 中生成并 mask 一次性 `access_token`，通过 Basic Auth URL 运行 `scripts/git_protocol_smoke.sh` 的 `MEGA2_GIT_SMOKE_PUSH=1` 分支。为支持该路径，monorepo receive-pack 会在 old-id 为零但新提交带 parent 时以首个 parent 作为 CL base；孤儿提交初始化仍拒绝。
 >
-> **2026-08-03 更新**：Monorepo 规则收口见 `docs/monorepo.md`——公开分支仅 `main`；Git 客户端 tag create/update/delete 由 `Monorepo::update_refs` **拒绝**（tag 仅 Web `/tags` API）；smoke 将原「push and delete tag」改为 **reject Git-client tag push**，并将 branch smoke 改名为 CL push 且断言 `refs/heads/*` 集合不变。
+> **2026-08-03 更新**：Monorepo 公开分支仅 `main`；`Monorepo::update_refs` **拒绝** Git 客户端创建、更新和删除 Tag（Tag 通过 HTTP API 管理）。smoke 将原「push and delete tag」改为 **reject Git-client tag push**，并将 branch smoke 改名为 CL push，断言 `refs/heads/*` 集合不变。
 >
 > **2026-08-29 更新**：Monorepo receive-pack 放开**多 commit 链式 push**（plan-20260827 MC-06，唯一用户可见行为变化）：单次 push 允许 2..=250 个 commit 的线性链（上限为 CL 累计范围口径，ADR-MC-07），新分支 push 的 CL base 按 pack 成员关系沿首父链反走到 fork point（取代单 commit 时代的「取 tip 首个 parent」近似）；含 merge commit 的链、断链/环、tip 与 ref 更新目标不符、累计超限，一律在 finalize 写 ref/CL 之前 fail-closed（MC-03 校验器正式接通主路径）；单次 receive-pack 多于一条非删除 branch 命令时整体拒绝并引导分次 push（ADR-MC-04 收紧生效，删除命令不受影响）。unpack 不再拒绝第二个 commit entry，也不再要求 pack commit 等于 `new_id`（改由 finalize 的「pack 必须携带 ref 更新目标」检查等价兜底）。端到端由 `tests/integration_git_cli.rs` 的 `multicommit` 用例族锁定；trunk merge 语义不变（ADR-MC-01）。
 >
@@ -100,7 +100,7 @@
 
 4. **认证上下文已统一（HTTP/SSH）。** HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，commit binding 绑定到 authenticated actor。receive-pack 尚未做 repo/path 级 push 权限校验。
 
-5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 重新 advertise 已由 HTTP CL delete smoke 覆盖的 `delete-refs`，但不再 advertise 未验证的 atomic、report-status-v2、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag；v2 不再 advertise 未 act-on 的 `server-option`。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format` 落地 SHA-1 默认策略；**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 `.github/workflows/git-protocol-smoke.yml` 在 CI 中自动化执行**。Monorepo tag 规则见 `docs/monorepo.md`。
+5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 重新 advertise 已由 HTTP CL delete smoke 覆盖的 `delete-refs`，但不再 advertise 未验证的 atomic、report-status-v2、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag；v2 不再 advertise 未 act-on 的 `server-option`。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format` 落地 SHA-1 默认策略；**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 `.github/workflows/git-protocol-smoke.yml` 在 CI 中自动化执行**。用户可见的分支与 Tag 规则见 [`../user-guide.zh.md`](../user-guide.zh.md)。
 
 6. **SSH 多 channel 状态已隔离，并已支持 protocol v2。** `SshServer` 按 `ChannelId` 保存独立 `GitSshChannelState`；SSH client 通过 `GIT_PROTOCOL=version=2` 请求 v2 时，server 返回 v2 capability advertisement，并在 upload-pack data 阶段分发 `ls-refs` / `fetch` command。
 
@@ -514,7 +514,7 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 
 - 建立 capability truth table：advertise、parse、act-on、test 四列。
 - 没有行为支持和测试的 capability 先不要 advertise。
-- 已完成首批：`atomic`、`report-status-v2`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；`delete-refs` 已在 HTTP CL delete smoke 覆盖后重新声明（Monorepo tag 走 API，见 `docs/monorepo.md`）。
+- 已完成首批：`atomic`、`report-status-v2`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；`delete-refs` 已在 HTTP CL delete smoke 覆盖后重新声明（Monorepo Tag 通过 API 管理）。
 - ✅ 对 `object-format=sha1` 明确策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；mega2 策略对 SHA-1-only repo 不 advertise），由单测 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 ### pkt-line parser 错误模型已收敛，streaming reader 仍待后续
@@ -623,7 +623,7 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 目标：在修改实现前建立可重复的真实 Git 客户端测试矩阵。
 
-已新增 `scripts/git_protocol_smoke.sh` 作为第一版真实 Git CLI smoke matrix。该脚本面向已经启动的 mega2 HTTP/SSH 服务，默认覆盖只读 HTTP 场景（基础 clone/fetch、shallow clone、protocol v2 fetch、`filter blob:none`）；SSH 通过 `MEGA2_SSH_REPO_URL` 启用同类只读场景；HTTP/SSH **CL push**（断言不新增公开 `refs/heads/*`）与 **Git 客户端 tag 推送拒绝** 通过 `MEGA2_GIT_SMOKE_PUSH=1` 显式启用；HTTP LFS push/clone/locks-list 通过 `MEGA2_GIT_SMOKE_LFS=1` + `MEGA2_GIT_SMOKE_PUSH=1` 显式启用，LFS 用例会从远端默认分支创建普通子提交、显式配置 `<remote>/info/lfs` endpoint，并对实际生成的 `refs/cl/*` 做定向 fetch、checkout、LFS pull 与清理，避免默认修改远端公开分支、不依赖孤儿初始化、全量 clone 或 Git LFS 对根路径 remote 的默认 URL discovery。CI 当前自动启用 HTTP read-only 矩阵、HTTP CL push + tag-reject 和 HTTP LFS round-trip；SSH push 仍保留为手动 opt-in。产品规则见 [`../monorepo.md`](../monorepo.md)。
+已新增 `scripts/git_protocol_smoke.sh` 作为第一版真实 Git CLI smoke matrix。该脚本面向已经启动的 mega2 HTTP/SSH 服务，默认覆盖只读 HTTP 场景（基础 clone/fetch、shallow clone、protocol v2 fetch、`filter blob:none`）；SSH 通过 `MEGA2_SSH_REPO_URL` 启用同类只读场景；HTTP/SSH **CL push**（断言不新增公开 `refs/heads/*`）与 **Git 客户端 Tag 推送拒绝** 通过 `MEGA2_GIT_SMOKE_PUSH=1` 显式启用；HTTP LFS push/clone/locks-list 通过 `MEGA2_GIT_SMOKE_LFS=1` + `MEGA2_GIT_SMOKE_PUSH=1` 显式启用，LFS 用例会从远端默认分支创建普通子提交、显式配置 `<remote>/info/lfs` endpoint，并对实际生成的 `refs/cl/*` 做定向 fetch、checkout、LFS pull 与清理，避免默认修改远端公开分支、不依赖孤儿初始化、全量 clone 或 Git LFS 对根路径 remote 的默认 URL discovery。CI 当前自动启用 HTTP read-only 矩阵、HTTP CL push + tag-reject 和 HTTP LFS round-trip；SSH push 仍保留为手动 opt-in。用户可见规则见 [`../user-guide.zh.md`](../user-guide.zh.md)。
 
 **（2026-06-30）CI 自动化回归 gate 已落地；2026-07-01 扩展 CL push 与 LFS；2026-08-03 对齐 Monorepo 分支/tag 规则）**：`.github/workflows/git-protocol-smoke.yml` 在 PR 和 main push 时自动启动 PostgreSQL + Redis 测试栈、构建 release 二进制、seed mail secret、启动 `service http`，然后以 monorepo 根路径 `http://ci-smoke:<masked-token>@127.0.0.1:9000/` 为目标运行 `scripts/git_protocol_smoke.sh` 的 HTTP 矩阵（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone depth=1、blob:none partial clone、CL push（无新公开分支）、**拒绝** Git-client tag push、LFS push/clone/pull/locks-list）。workflow 直接在 smoke DB 的 `access_token` 表插入一次性 token 并 mask 日志输出，满足 push 所需认证；同时安装 `git-lfs` 并启用 `MEGA2_GIT_SMOKE_LFS=1`，让 LFS round-trip 成为默认 CI gate。该 workflow 在协议路径变更（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/server/http_server.rs`、`scripts/git_protocol_smoke.sh`、`docs/refactoring/protocol.md`）时触发，满足阶段 0 "每个后续阶段都能复用该矩阵防止回归"的验收标准。
 
@@ -642,7 +642,7 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 | push（CL） | cargo:integration_git_cli_http_round_trip | cargo:integration_git_ssh_authenticated_push_creates_cl_ref | cargo:integration_git_cli_auth_push_without_token_returns_401_challenge | N/A+Monorepo不新建refs/heads |
 | CL ref delete（清理） | smoke:HTTP_push_CL | smoke:SSH_push_CL | N/A+删除随push_CL清理；无独立Auth用例 | N/A+仅删除本用例生成的refs/cl；不覆盖公开分支删除 |
 | tag push（拒绝） | cargo:integration_git_cli_http_rejects_git_client_tag_push | smoke:SSH_reject_Git-client_tag_push | N/A+拒绝路径不依赖token形态 | N/A+Monorepo禁客户端tag创建 |
-| tag delete（拒绝） | N/A+本计划未单列tag删除拒绝用例；产品禁tag见monorepo.md | N/A+同HTTP；SSH未单列tag删除拒绝 | N/A+非鉴权矩阵轴 | N/A+公开refs/tags删除非本计划目标 |
+| tag delete（拒绝） | N/A+本计划未单列 tag 删除拒绝用例；Monorepo 禁止 Git 客户端 Tag | N/A+同 HTTP；SSH 未单列 tag 删除拒绝 | N/A+非鉴权矩阵轴 | N/A+公开 refs/tags 删除非本计划目标 |
 | branch delete（公开） | N/A+Monorepo不提供公开refs/heads删除场景 | N/A+同HTTP | N/A+非鉴权矩阵轴 | N/A+公开分支删除非目标 |
 | LFS push | cargo:integration_git_lfs_http_round_trip | DEFER-GM-02 | N/A+LFS往返内token | N/A+Monorepo+显式info/lfs |
 | LFS pull | cargo:integration_git_lfs_http_round_trip | DEFER-GM-02 | N/A+随LFS往返 | N/A+定向CL取回后git_lfs_pull |
@@ -787,7 +787,7 @@ LFS:
 | `agent=mega/0.1.0` | ✅ both | ❌ | ❌ | ❌ | 信息性，不影响协议行为 |
 | `atomic` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现原子 ref 更新，已从 advertise 移除 |
 | `report-status-v2` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现 v2 语义，已从 advertise 移除 |
-| `delete-refs` | ✅ 已声明 | ✅ HTTP CL delete + Monorepo tag-reject smoke | ❌ | N/A | HTTP smoke 已覆盖 CL delete；Monorepo 禁止 Git-client tag（`docs/monorepo.md`）；SSH delete 矩阵仍未补齐 |
+| `delete-refs` | ✅ 已声明 | ✅ HTTP CL delete + Monorepo tag-reject smoke | ❌ | N/A | HTTP smoke 已覆盖 CL delete；Monorepo 禁止 Git-client Tag；SSH delete 矩阵仍未补齐 |
 | `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
 | `no-thin` | ✅ receive-pack（2026-09-16 重新 advertise） | ❌（客户端侧语义，服务端无需 parse） | ✅ 依赖客户端不发送 thin pack；服务端解码器对残余 thin/malformed pack fail-closed 并经 `unpack_stream` 转为 typed 错误（2026-09-16） | ✅ `receive_pack_advertises_only_supported_baseline_capabilities` + RCV-01 端到端回归（默认 delta push） | 移除期间 thin pack 触发解码 panic/断连（RCV-01）；重 advertise 以匹配解码器 fail-closed 契约 |
 | `include-tag` | ❌ 已移除 (upload) | ❌ | ❌ | N/A | pack 生成未按 include-tag 语义验证，已从 advertise 移除 |

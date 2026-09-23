@@ -2,12 +2,14 @@
 
 English · [中文](quick-start.zh.md)
 
-This guide brings up the mega2 (trunk / storage-only) evaluation stack locally with the repository-root compose file for your platform — [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml) on macOS with OrbStack, [`linux-mega2-compose.yml`](../linux-mega2-compose.yml) on Linux Docker — and runs the first closed loop: HTTP clone → push to `main` → read back over the API. The stack pulls the **official release image from Docker Hub** (`genedna/mega2:latest`) — no source build, no bootstrap, no token. Product rules: [`monorepo.md`](./monorepo.md).
+Start the local mega2 evaluation stack with the Compose file for your platform: [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml) on macOS with OrbStack, or [`linux-mega2-compose.yml`](../linux-mega2-compose.yml) on Linux. You will clone a repository over HTTP, push to `main`, and read the result back through the API. The remaining examples cover repository migration, Git LFS, OCI images, build artifacts, and data persistence. The stack pulls the **official release image from Docker Hub** (`genedna/mega2:latest`); it does not build from source and needs no bootstrap command or token. For branch and tag behavior, see the [User Guide](./user-guide.md).
 
 ## Prerequisites
 
-- macOS: OrbStack (the macOS compose file relies on its `*.orb.local` DNS). Linux: Docker Engine; the Linux compose file uses host networking for mega2 instead. Either way: the Compose plugin (v2), `git`, `curl`; run everything from the repository root.
-- The first `up` pulls the `genedna/mega2:latest`, PostgreSQL, Redis, RustFS, and RustFS CLI images; duration depends on your network.
+- **macOS:** OrbStack; the macOS Compose file relies on its `*.orb.local` DNS.
+- **Linux:** Docker Engine; the Linux Compose file uses host networking for mega2.
+- **Both:** Docker Compose v2, `git`, and `curl`. Run the commands below from the repository root.
+- The first `up` pulls `genedna/mega2:latest`, PostgreSQL, Redis, RustFS, and the RustFS CLI images. Pull time depends on your network.
 
 ## Bring up the stack
 
@@ -19,15 +21,15 @@ COMPOSE=linux-mega2-compose.yml            # Linux Docker
 docker compose -f $COMPOSE up -d --wait
 ```
 
-No initialization command is needed after `up`: `rustfs-init` creates the `mega2` bucket automatically, and mega2 initializes the empty Monorepo (`main` and the top-level directories) during service startup. The readiness probe is `/api/openapi.json`.
+No separate initialization step is needed. `rustfs-init` creates the `mega2` bucket, and mega2 initializes the empty Monorepo—with `main` and the top-level directories—when the service starts. The readiness endpoint is `/api/openapi.json`.
 
-> **This is a local-only, anonymous setup**: the stack runs with `push_auth=none`, so clone / fetch / push need no credentials, and port 9000 is bound to `127.0.0.1` for that reason. Do not rebind it to `0.0.0.0` or expose it through a reverse proxy; shared or internet-facing deployments must use token authentication instead — see [`deployment.md`](./deployment.md) and [`deploy-trunk.md`](./deploy-trunk.md).
+> **For local use only:** this stack sets `push_auth=none`, so Git clone, fetch, and push require no credentials. Port 9000 is therefore bound to `127.0.0.1`. Do not bind it to `0.0.0.0` or expose it through a reverse proxy. For shared or internet-facing deployments, configure token authentication; see the [Deployment Guide](./deployment.md).
 
-## First closed loop: clone → push → read back
+## Clone, push, and verify
 
 ### 1. Clone a subpath over HTTP
 
-In storage-only mode you clone a subpath (do not root-clone `/`, see [`deploy-trunk.md`](./deploy-trunk.md) §9):
+In storage-only mode, clone a repository subpath; cloning the root path `/` is unsupported.
 
 ```bash
 git clone http://127.0.0.1:9000/project
@@ -36,7 +38,7 @@ cd project
 
 ### 2. Push to main
 
-`main` is the only public branch of the monorepo. With the anonymous setup the push needs no credentials:
+`main` is the monorepo's only public branch. In this local anonymous setup, the push needs no credentials:
 
 ```bash
 echo "# hello mega2" > hello.md
@@ -44,7 +46,7 @@ git add hello.md && git commit -m "add hello.md"
 git push origin main
 ```
 
-You can only push to `main` (pushes of other branches are rejected); Git-client tag pushes are rejected too — create, list, and delete tags via the HTTP API or `libra mega2 browser` ([`monorepo.md`](./monorepo.md)).
+Pushes to branches other than `main` and tag pushes from Git clients are rejected. Create, list, and delete tags through the HTTP API or the Libra command `libra mega2 browser`; see the [User Guide](./user-guide.md).
 
 ### 3. Read back over the API + Swagger UI
 
@@ -53,11 +55,11 @@ You can only push to `main` (pushes of other branches are rejected); Git-client 
 curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 ```
 
-Browse the full HTTP surface (Git smart HTTP, LFS, product writes, tags, optional OCI `/v2`) in Swagger UI: `http://127.0.0.1:9000/swagger-ui` (OpenAPI JSON: `/api/openapi.json`). For interactive terminal browsing use Libra's `libra mega2 browser`; mega2 itself serves no Web UI.
+Explore the HTTP API—including Git Smart HTTP, LFS, product writes, tags, and optional OCI `/v2`—in Swagger UI at `http://127.0.0.1:9000/swagger-ui`. The OpenAPI document is at `/api/openapi.json`. mega2 has no Web UI; use `libra mega2 browser` for interactive terminal browsing.
 
-## Case: push nested directories (hierarchy is created automatically)
+## Example: push nested directories
 
-You **don't need to create directories in advance** in the monorepo. Just build a multi-level directory inside your `/project` clone and push — both `rust-lang/` and `rust-lang/crate/` are written by that push:
+You **don't need to create directories in advance**. Create a nested directory in your `/project` clone and push; mega2 creates both `rust-lang/` and `rust-lang/crate/` as part of that push:
 
 ```bash
 git clone http://127.0.0.1:9000/project
@@ -68,7 +70,7 @@ git add . && git commit -m "add rust-lang/crate"
 git push origin main
 ```
 
-After the push, the nested path is a subpath you can clone / push independently, and you can read it back over the API:
+After the push, you can clone or push to the nested path independently, or read its files through the API:
 
 ```bash
 # Read back the file under the nested path
@@ -78,9 +80,9 @@ curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/rust-lang/crate/READM
 git clone http://127.0.0.1:9000/project/rust-lang/crate
 ```
 
-## Case: push an existing Git repository into mega2
+## Example: migrate an existing Git repository
 
-To migrate an existing repository (keeping its branches and tags), use an **ImportRepo** under `/third-party`: repos there follow ordinary Git semantics — multi-branch and Git-client tags are both allowed ([`monorepo.md`](./monorepo.md)). If the target path does not exist yet, it is created automatically by the push; no prior setup is needed:
+To preserve an existing repository's branches and tags, migrate it under `/third-party` as an **ImportRepo**. ImportRepo paths follow ordinary Git semantics, so multiple branches and Git-client tags are allowed. The push creates the target path if it does not exist:
 
 ```bash
 cd /path/to/your-repo
@@ -89,20 +91,20 @@ git push mega2 --all     # push all branches
 git push mega2 --tags    # push all tags
 ```
 
-Then clone / fetch as usual:
+You can then clone or fetch it as usual:
 
 ```bash
 git clone http://127.0.0.1:9000/third-party/your-repo
 ```
 
-Do not confuse the two path semantics:
+The two path types have different rules:
 
-- `/third-party/**` (ImportRepo): multi-branch and client tags allowed — suited for hosting third-party dependency sources and migrating existing repositories.
-- Everywhere else (Monorepo): `main` is the only public branch and Git-client tags are forbidden. An existing repo's multi-branch history cannot be pushed straight into a monorepo subpath; the rules are in [`monorepo.md`](./monorepo.md).
+- `/third-party/**` (ImportRepo): multiple branches and client tags are allowed. Use this path for third-party dependencies or repositories you are migrating.
+- All other paths (Monorepo): `main` is the only public branch, and Git-client tag operations are rejected. You cannot push a multi-branch repository directly into a Monorepo subpath.
 
-## Case: mirror a GitHub repository (brewfs)
+## Example: mirror a GitHub repository (brewfs)
 
-A full mirror of an existing GitHub repo — every branch and tag — takes one push. Using <https://github.com/brewfs/brewfs> as the example:
+This example mirrors every branch and tag from <https://github.com/brewfs/brewfs> in a single push:
 
 ```bash
 git clone --mirror https://github.com/brewfs/brewfs.git
@@ -113,12 +115,12 @@ git remote add mega2 http://127.0.0.1:9000/third-party/brewfs
 git push --mirror mega2
 ```
 
-Two things worth knowing:
+Keep these details in mind:
 
-- `--mirror` pushes **every** ref (all branches + all tags). The `git push mega2 --all` in the previous case only pushes *local* branches, which in a normal clone is usually just `main`.
-- brewfs tracks large test fixtures with Git LFS. One object referenced by old history no longer exists on GitHub, so `git lfs fetch --all` prints a 404 error — expected; `lfs.allowincompletepush true` lets the push proceed without it.
+- `--mirror` pushes **every** ref, including all branches and tags. By contrast, `git push mega2 --all` pushes only local branches, which in a standard clone usually means `main`.
+- brewfs stores large test fixtures in Git LFS. One object referenced in its history is no longer available on GitHub, so `git lfs fetch --all` reports a 404. That is expected; setting `lfs.allowincompletepush` to `true` lets you push the objects that are still available.
 
-Verify the round trip — annotated tags and LFS content both survive:
+Verify that annotated tags and LFS content made the round trip:
 
 ```bash
 git clone http://127.0.0.1:9000/third-party/brewfs /tmp/verify-brewfs
@@ -129,9 +131,9 @@ ls -la tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz
 # ~8 MB gzip — the real bytes came back from mega2's LFS object store, not a pointer
 ```
 
-## Case: large files with Git LFS
+## Example: store large files with Git LFS
 
-The stack speaks standard Git LFS (`/info/lfs`), so a stock `git-lfs` client works as-is. LFS write authorization shares `git.push_auth` with Git push — anonymous in this evaluation setup. Prerequisite: `git-lfs` on the host (check with `git lfs version`).
+The stack supports standard Git LFS at `/info/lfs`, so the standard `git-lfs` client works without extra configuration. LFS writes use the same `git.push_auth` setting as Git pushes; this evaluation stack allows anonymous writes. Install `git-lfs` on the host and confirm it is available with `git lfs version`.
 
 ```bash
 git clone http://127.0.0.1:9000/project
@@ -145,18 +147,18 @@ git commit -m "add LFS-tracked big.bin"
 git push origin main                          # "Uploading LFS objects: 100% (1/1)" runs first
 ```
 
-The Git commit stores only an LFS pointer; the 2 MiB of bytes went to the object store during the push. Verify from a fresh clone of the subpath — checkout downloads the real content:
+The Git commit contains an LFS pointer; the 2 MiB file itself is uploaded to object storage during the push. Clone the subpath into a fresh directory to verify that checkout downloads the actual file:
 
 ```bash
 git clone http://127.0.0.1:9000/project/lfs-demo /tmp/verify-lfs
 cmp lfs-demo/big.bin /tmp/verify-lfs/big.bin && echo identical
 ```
 
-LFS objects live in the same object storage as Git blobs (RustFS in this stack), so everything said about volumes, `down -v`, and the persist override below covers them too.
+LFS objects share object storage with Git blobs (RustFS in this stack). The volume and persistence guidance below applies to both.
 
-## Case: container images with the OCI registry (/v2)
+## Example: store container images in the OCI registry
 
-The stack embeds an OCI Distribution registry at the same port under `/v2` (enabled in the Compose files via `MEGA_OCI__ENABLED=true`; it also requires the storage-only morphology, which `MEGA_GIT__PUSH_AUTH` already implies). Any OCI client works — Docker treats `127.0.0.1` as an insecure registry by default, so plain HTTP is fine for this local evaluation:
+The stack exposes an OCI Distribution registry at `/v2`; the Compose files enable it with `MEGA_OCI__ENABLED=true`. The registry requires storage-only mode, which is already selected by `MEGA_GIT__PUSH_AUTH`. Any OCI client can use it. Docker treats `127.0.0.1` as an insecure registry by default, so HTTP works for this local evaluation:
 
 ```bash
 docker pull alpine:3.21
@@ -172,11 +174,11 @@ docker run --rm 127.0.0.1:9000/project/alpine:quickstart cat /etc/alpine-release
 curl -s http://127.0.0.1:9000/v2/project/alpine/tags/list
 ```
 
-Registry writes share `git.push_auth` — anonymous in this evaluation setup. Blobs and manifests land in the same RustFS object storage as everything else. When you expose the registry to other machines, plain HTTP is no longer accepted by default Docker clients: put TLS in front of it, or add the host to the client's `insecure-registries`.
+Registry writes use the same `git.push_auth` setting as Git pushes; this evaluation stack allows anonymous writes. Blobs and manifests share the RustFS object store. For access from other machines, configure TLS or add the registry host to each Docker client's `insecure-registries` list.
 
-## Case: build artifacts with presigned direct transfer
+## Example: transfer build artifacts with presigned URLs
 
-Compiled binaries, release tarballs and other build outputs are stored as **Artifact Sets** under `/api/v1/repos/{repo}/artifacts`. The flow is discovery → batch → commit, and the byte transfer is **presigned**: mega2 only handles metadata and signs time-limited (1 h) S3 URLs — the client uploads/downloads the bytes directly to/from the object storage (RustFS here), without proxying through mega2.
+Store binaries, release archives, and other build outputs as **Artifact Sets** under `/api/v1/repos/{repo}/artifacts`. The workflow uses three requests: discovery, batch, and commit. mega2 handles metadata and issues S3 URLs that expire after one hour. Clients upload and download file bytes directly to object storage (RustFS in this example).
 
 ```bash
 REPO=project   # single URL path segment; use %2F for "/" inside names
@@ -218,7 +220,7 @@ EOF
 # → {"artifact_set_id":"...","status":"ok","missing_objects":[]}
 ```
 
-`missing_objects` must be empty — any object listed there was not found in the object storage and the commit recorded only the rest. Read the set back; downloads are presigned too, so `curl -L` follows the 302 straight to RustFS:
+Confirm that `missing_objects` is empty. Any object listed there was missing from storage and was left out of the committed set. To download a file, use its presigned URL; `curl -L` follows the redirect to RustFS:
 
 ```bash
 # List sets / resolve a file to its object id
@@ -231,9 +233,9 @@ cmp app-1.0.0.tar.gz dl.tar.gz && echo identical
 curl -s "$BASE/objects/$OID2?mode=link"
 ```
 
-Artifact writes share the `git.push_auth` gate (anonymous here). The `object_type` vocabulary (`snapshot`, `provenance`, `run`, …) and the negotiated limits are advertised by the discovery payload.
+Artifact writes use the same `git.push_auth` setting as Git pushes; this stack allows anonymous writes. The discovery response lists supported `object_type` values (such as `snapshot`, `provenance`, and `run`) and negotiated limits.
 
-## Observe, stop, and clean up
+## Check logs, stop, and clean up
 
 ```bash
 # Follow the mega2 logs
@@ -246,9 +248,9 @@ docker compose -f $COMPOSE down
 docker compose -f $COMPOSE down -v
 ```
 
-## Important: persist data to a local directory
+## Example: persist data on the host
 
-The default stack uses Docker named volumes, so `down -v` deletes your data together with the volumes. If you plan to **use this instance long-term and want the data to outlive the stack itself**, switch the database, object storage, and mega2 data directories to bind mounts on the host — then **even if the containers and volumes are deleted, the data stays in the local directory and is picked up again on the next `up`**.
+The default stack stores data in Docker named volumes, which `down -v` removes. To keep data after removing the stack, bind-mount the database, object store, and mega2 data directory to host paths. Those files remain after the containers and volumes are removed, and the next `up` reuses them.
 
 Create an override file `mega2-compose.persist.yml` in the repository root:
 
@@ -269,28 +271,28 @@ services:
       - ./mega2-data/mega2:/var/lib/mega2
 ```
 
-Start with both `-f` flags (use the same two `-f` flags for stop and cleanup commands):
+Start the stack with both `-f` flags. Use the same flags when stopping or cleaning it up:
 
 ```bash
 docker compose -f $COMPOSE -f mega2-compose.persist.yml up -d --wait
 ```
 
-From then on all data lives under `./mega2-data/`:
+All persistent data now lives under `./mega2-data/`:
 
-- `docker compose ... down -v` only removes named volumes — it **does not** touch `./mega2-data/`; the next `up` resumes from that directory with repositories, push history, and LFS objects intact.
-- Backup = stop the stack and archive `./mega2-data/`.
-- The directory is written by in-container processes (owned by container users such as postgres); do not commit it to version control and do not edit its contents by hand.
+- `docker compose ... down -v` removes named volumes but **does not** touch `./mega2-data/`. The next `up` reuses that directory, including its repositories, push history, and LFS objects.
+- To back up the instance, stop the stack and archive `./mega2-data/`.
+- Container processes own and write these files. Do not commit the directory or edit its contents by hand.
 
-## The other Compose files
+## Choose between the evaluation and test stacks
 
 The repository ships two more Compose files, **both aimed at testing and development** — neither replaces this evaluation stack:
 
-- [`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml) (plus the `docker/docker-compose-storage-only.auth-none.yml` override): a trunk lab stack that **builds** the image from source, uses token authentication, and needs a `service init` bootstrap — used for deployment rehearsals and smoke tests. Usage: [`deployment.md`](./deployment.md) and [`deploy-trunk.md`](./deploy-trunk.md) §8.
-- [`docker/docker-compose.test.yml`](../docker/docker-compose.test.yml): the integration-test (IT) data plane, see [`development.md`](./development.md).
+- [`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml) (plus the `docker/docker-compose-storage-only.auth-none.yml` override): a trunk lab stack that **builds** the image from source, uses token authentication, and needs a `service init` bootstrap — used for deployment rehearsals and smoke tests. See the [Deployment Guide](./deployment.md).
+- [`docker/docker-compose.test.yml`](../docker/docker-compose.test.yml): the integration-test (IT) data plane, see the [Contributing Guide](./contributing.md) for the local development workflow.
 
 ## Next steps
 
 - Day-to-day usage (clone / push / API / tags / LFS): [`user-guide.md`](./user-guide.md)
 - Config keys, Profile, SecretRef, hot reload: [`configuration.md`](./configuration.md); commented sample at `config/config.toml`
-- Deployment and operations (token management, morphology invariants, OCI, Agent Capture): [`deployment.md`](./deployment.md), [`deploy-trunk.md`](./deploy-trunk.md)
-- Local development and tests: [`development.md`](./development.md)
+- Deployment and operations (token management, mode invariants, OCI, Agent Capture): [`deployment.md`](./deployment.md)
+- Contribution workflow and required checks: [`contributing.md`](./contributing.md)

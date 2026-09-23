@@ -6,7 +6,7 @@ generic webhook under `[notification.webhook]`. Unrelated
 `[storage_events]` is not part of this surface.
 
 It does not own email rendering, queues, SMTP, Slack, or an in-app
-inbox. Product email, if any, lives in megaui / website. The retired
+inbox. Product email, if any, lives in website frontend / website. The retired
 client contract is the tombstone in [`website-mail.md`](./website-mail.md).
 
 ## Outbound boundary

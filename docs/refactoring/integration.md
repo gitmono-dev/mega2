@@ -166,7 +166,7 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 `.github/workflows/config-validation.yml` runs formatting, Clippy, the
 compose-backed integration targets (including `integration_website_auth`
 under `WEBSITE_IT=1`), and the real website session check after checking
-out the `megaui` sibling. Mega2 notification paths do not require a local
+out the `website frontend` sibling. Mega2 notification paths do not require a local
 SMTP dependency.
 
 ## 只读装配的零副作用比对（UN-30 / UN-43）

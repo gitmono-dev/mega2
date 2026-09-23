@@ -187,8 +187,10 @@ concrete backend is built through `crate::jupiter::storage::object_storage::buil
   within the same language (zh → `.zh.md`, en → `.md`). When you change
   one language version of a guide, update the other in the same change.
 - **Link, don't copy:** facts that have an authoritative home
-  (`config/config.toml`, `docs/monorepo.md`, `docs/deploy-trunk.md`,
-  `docs/refactoring/*.md`) are linked, not duplicated. Every relative link
+  (`config/config.toml`, `docs/user-guide.md` for repository and push
+  behavior, `docs/manual/monorepo-init.md` for initialization layout,
+  `docs/deploy-trunk.md` for trunk operations, and `docs/refactoring/*.md`
+  for subsystem contracts) are linked, not duplicated. Every relative link
   in a doc must resolve to a file in the current checkout.
 - **Plan docs** under `docs/plan/` follow `docs/plan/README.md` and the
   plan templates; they are Chinese-first and unchanged by the bilingual

@@ -4,11 +4,11 @@
 
 本文描述 mega2 的整体架构：模块划分、存储分层、写入路径、认证授权与机密管理、协议面挂载、配置与热加载。事实基线是当前 checkout 的源码；代码引用以 `src/...` 内联路径标注。
 
-> **范围**：开源版 mega2 只交付 trunk / storage-only 形态——无 Web UI、无 Change List 产品面，交互式浏览走 Libra 的 `libra mega2 browser`。产品规则（唯一公开分支 `main`、N 分流、不变式）以 [`monorepo.md`](./monorepo.md) 为准；部署运维以 [`deploy-trunk.md`](./deploy-trunk.md) 为准。本文不复制这两份文档的事实值，只做架构导览与导航。
+> **范围：**开源版 mega2 以 trunk / storage-only 模式部署，不提供 Web UI；交互式浏览请使用 Libra 命令 `libra mega2 browser`。[使用指南](./user-guide.zh.md)介绍仓库路径、分支、Tag 和推送行为；[部署指南](./deployment.zh.md)介绍安装与运维。本文概述架构并链接到实现参考。
 
 ## 1. 总览与依赖流向
 
-mega2 是单 Cargo package（lib `mega2_core` + 二进制；见 [`../Cargo.toml`](../Cargo.toml)）。入口 `src/main.rs` → `cli::parse` → `src/commands/mod.rs` 的子命令注册表。运行期依赖流向是单向的：上层组装下层，下层不反向引用上层。
+mega2 是单 Cargo package（lib `mega2_core` + 二进制；见 [`../Cargo.toml`](../Cargo.toml)）。它移植并重构了上游 Mega 项目的部分功能，不是上游仓库的镜像；两边的模块边界也不完全相同。评估上游改动时，应以本仓库源码和依赖锁文件为依据，再判断是否适用。入口 `src/main.rs` → `cli::parse` → `src/commands/mod.rs` 的子命令注册表。运行期依赖流向是单向的：上层组装下层，下层不反向引用上层。
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -90,9 +90,9 @@ mega2 是单 Cargo package（lib `mega2_core` + 二进制；见 [`../Cargo.toml`
 
 **所有对 `main` 的写入由 MonoWriteQueue 全局序列化**（`src/jupiter/service/push_queue_service.rs`，载体是 Postgres `push_queue` 表 + `PushQueueService`）。Git push、产品 API 写（`create-entry` / `delete-entry` / `move-entry` / `edit/save`）、CL merge、import attach 共用同一个 tip 权威——队列序就是 `main` 的推进序，不存在第二条能绕过它的写路径。序列化带来的直接后果：并发推送按入队序逐个落地，冲突在执行期以「当前 tip」重查而非入队时快照判定。
 
-**review 与 trunk 两种形态共用同一条队列，差别在推送进入队列前是否经过 CL 管线**：review（默认形态）下分支推送先落成 CL（`refs/cl/*`），经评审后由 merge 入队落地；trunk（本仓交付形态）下推送与产品 API 写直接入队前进 path tip，不创建 CL。形态切换的启动期 fail-closed 检查（cedar 必须为 off、无 open CL、队列须排空、`push_auth` 必须显式等）是启动错误而非警告，完整清单见 [`deploy-trunk.md`](./deploy-trunk.md) 第 1 节；校验执行点是 `Config::validate` 与 `AppContext::new`（`src/context/mod.rs:128`），不经 CLI 的服务路径同样被拦截。
+**review 与 trunk 模式共用同一条队列，区别在于推送入队前是否经过 CL 管线。**在 review（默认模式）下，分支推送先生成 CL（`refs/cl/*`），评审并 merge 后再入队。在 trunk 模式下（本仓库交付的模式），推送和产品 API 写直接入队以推进 path tip，不创建 CL。切换模式时会执行 fail-closed 启动检查：Cedar 必须为 off、不能有未关闭的 CL、队列必须排空，且必须显式设置 `push_auth`。检查失败会阻止启动，不只是发出警告。完整清单见 [`deploy-trunk.md`](./deploy-trunk.md) 第 1 节。`Config::validate` 和 `AppContext::new` 都会执行检查（`src/context/mod.rs:128`），因此绕过 CLI 启动服务也会受到同样的校验。
 
-深入阅读：[`refactoring/trunk-push.md`](./refactoring/trunk-push.md)（队列设计、N 分流、不变式）、[`deploy-trunk.md`](./deploy-trunk.md)（形态开关与运维）。
+深入阅读：[`refactoring/trunk-push.md`](./refactoring/trunk-push.md)（队列设计、单 commit 与多 commit 推送规则、不变式）、[`deploy-trunk.md`](./deploy-trunk.md)（模式切换与运维）。
 
 ## 5. 认证、授权与机密
 
@@ -137,7 +137,7 @@ HTTP router 在 `server::http_server::app`（`src/server/http_server.rs:681`）�
 ## 8. 延伸阅读
 
 - 本套文档：[`quick-start.zh.md`](./quick-start.zh.md) · [`user-guide.zh.md`](./user-guide.zh.md) · [`configuration.zh.md`](./configuration.zh.md) · [`deployment.zh.md`](./deployment.zh.md) · [`contributing.zh.md`](./contributing.zh.md)
-- 产品规则：[`monorepo.md`](./monorepo.md)；初始化操作：[`manual/monorepo-init.md`](./manual/monorepo-init.md)
+- 仓库路径、分支、Tag 与推送行为：[`user-guide.zh.md`](./user-guide.zh.md)；trunk 写入不变式：[`refactoring/trunk-push.md`](./refactoring/trunk-push.md)
 - 部署运维：[`deploy-trunk.md`](./deploy-trunk.md)；本地开发与测试：[`development.md`](./development.md)
 - 错误目录：[`errors.md`](./errors.md)；计划文档规范：[`plan/README.md`](./plan/README.md)
 - 贡献流程与代码约定：[`contributing.zh.md`](./contributing.zh.md)、[`../AGENTS.md`](../AGENTS.md)
