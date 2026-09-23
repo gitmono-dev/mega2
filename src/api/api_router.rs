@@ -77,6 +77,7 @@ pub fn storage_only_routers_with(
         .route("/file/tree", get(get_tree_file))
         .merge(preview_router::readonly_routers())
         .merge(preview_router::write_routers())
+        .merge(preview_router::storage_only_write_routers())
         .merge(tag_router::routers())
         .merge(artifacts_router::routers());
     if include_agent_capture {

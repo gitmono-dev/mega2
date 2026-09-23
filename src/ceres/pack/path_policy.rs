@@ -39,9 +39,9 @@ pub fn classify_creation_path(
     Ok(())
 }
 
-/// Strict entry for client JSON input: rejects NUL and `\` explicitly, then
-/// requires the raw input to already be canonical (no relative path, `.` /
-/// `..` segment, repeated or trailing slash). Git protocol URL paths keep the
+/// Strict entry for client JSON input: rejects NUL, `\` and other control
+/// characters explicitly, then requires the raw input to already be canonical
+/// (no relative path, `.` / `..` segment, repeated or trailing slash). Git protocol URL paths keep the
 /// canonicalize-then-use rule (TP-08) and do not go through this function.
 pub fn strict_creation_path_input(input: &str) -> Result<String, PathPolicyError> {
     if input.contains('\0') {
@@ -49,6 +49,9 @@ pub fn strict_creation_path_input(input: &str) -> Result<String, PathPolicyError
     }
     if input.contains('\\') {
         return Err(invalid(input, "path must use '/' as the separator"));
+    }
+    if input.contains(char::is_control) {
+        return Err(invalid(input, "path must not contain control characters"));
     }
     match canonicalize_mono_ref_path(input) {
         Ok(canonical) if canonical == input => Ok(canonical),
@@ -321,6 +324,9 @@ mod tests {
             "/project/./x",
             "/project/x\0",
             "/project\\x",
+            "/project/a\nb",
+            "/project/a\tb",
+            "/project/\u{7f}",
             "",
         ] {
             assert_invalid(strict_creation_path_input(input), input);

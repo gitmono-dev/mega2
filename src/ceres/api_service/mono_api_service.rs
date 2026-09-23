@@ -87,7 +87,8 @@ use crate::{
             git::{
                 CreateEntryInfo, CreateEntryResult, DeleteEntryInfo, DeleteEntryResult, EditCLMode,
                 EditFilePayload, EditFileResult, MoveEntryInfo, MoveEntryResult,
-                common_parent_path, join_entry_path, normalize_parent_path, validate_entry_target,
+                PathProvisionResult, common_parent_path, join_entry_path, normalize_parent_path,
+                validate_entry_target,
             },
             tag::TagInfo,
             third_party::{ThirdPartyClient, ThirdPartyRepoTrait},
@@ -466,10 +467,147 @@ struct TreeCommitInput {
     /// Whether `policy_path` is a directory this write creates; otherwise a
     /// provisioning hint names its parent directory.
     policy_is_dir: bool,
+    /// Path provisioning (ADR-FU-05): tree ids of the snapshot the update was
+    /// built from, keyed by directory path. When the landing tip's tree
+    /// differs, the round is stale ([`PROVISION_STALE_SNAPSHOT`]).
+    expected_bases: Option<HashMap<String, ObjectHash>>,
     commit_msg: String,
     author_username: Option<String>,
     skip_build: bool,
     mode: EditCLMode,
+}
+
+/// Plan of one path provisioning round (plan-20260923 ADR-FU-05).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvisionPlan {
+    /// Canonical target path.
+    pub path: String,
+    /// Highest component this request would create; `None` when the whole
+    /// path already is a directory.
+    pub highest_new: Option<String>,
+}
+
+const PROVISION_ATTEMPTS: u32 = 10;
+
+/// Marker of a provisioning round whose snapshot no longer matches the
+/// landing tip; the round is re-planned.
+const PROVISION_STALE_SNAPSHOT: &str = "path provision snapshot is stale";
+
+/// Queue refusals of a provisioning round that mean the tree or the queue
+/// moved underneath it; fixed server texts (no user path), matched at the
+/// start of the landing error after its fixed prefixes.
+const PROVISION_QUEUE_RETRY: [&str; 5] = [
+    "another push for this path is already Queued/Running (ADR-TP-10)",
+    "non-fast-forward: new_id does not match current tip",
+    "non-fast-forward: ref_commit_hash does not match old_id",
+    "tombstone exists; advertise then fetch",
+    "cannot update missing path; create requires old_id=ZERO_ID",
+];
+
+/// Why a failed provisioning landing should be re-planned, if it should.
+/// Coded errors (`[code:…]`, path policy) never are.
+fn provision_retry_reason(err: &GitError) -> Option<String> {
+    let GitError::CustomError(text) = err else {
+        return None;
+    };
+    if text.starts_with("[code:") {
+        return None;
+    }
+    if text == PROVISION_STALE_SNAPSHOT {
+        return Some(text.clone());
+    }
+    let mut body = text.strip_prefix("Other error: ").unwrap_or(text);
+    if let Some(rest) = body.strip_prefix("push rejected for push_queue id ")
+        && let Some((id, message)) = rest.split_once(": ")
+        && id.bytes().all(|b| b.is_ascii_digit())
+    {
+        body = message;
+    }
+    PROVISION_QUEUE_RETRY
+        .iter()
+        .any(|refusal| body.starts_with(refusal))
+        .then(|| text.clone())
+}
+
+/// Result of applying one provisioning round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApplyOutcome {
+    /// Landed commit id.
+    Landed(String),
+    /// The tree or the queue changed since the plan (a changed highest new
+    /// component, a stale snapshot, a same-path queue conflict or a
+    /// non-fast-forward): re-plan and re-authorize.
+    Retry(String),
+}
+
+/// The two halves of one provisioning round (plan-20260923 ADR-FU-05),
+/// implemented by [`MonoApiService`]; a trait so the retry loop can be tested
+/// without a stack.
+#[async_trait]
+pub(crate) trait PathProvisioner: Sync {
+    async fn plan_provision(&self, path: &str) -> Result<ProvisionPlan, GitError>;
+    async fn apply_provision(
+        &self,
+        plan: &ProvisionPlan,
+        requester: Option<String>,
+    ) -> Result<ApplyOutcome, GitError>;
+}
+
+/// ADR-FU-05 items 2–3: authorize the target (401/403 before any tree
+/// read), then per round plan, authorize the highest new component and
+/// apply. An apply that reports [`ApplyOutcome::Retry`] is re-planned and
+/// re-authorized (at most [`PROVISION_ATTEMPTS`] rounds); every error is
+/// returned at once. `path` must already be canonical.
+pub(crate) async fn run_path_provision<E, P, Auth>(
+    provisioner: &P,
+    path: &str,
+    mut authorize: Auth,
+) -> Result<PathProvisionResult, E>
+where
+    E: From<GitError>,
+    P: PathProvisioner + ?Sized,
+    Auth: FnMut(&str) -> Result<Option<String>, E>,
+{
+    authorize(path)?;
+    let mut last_reason = String::new();
+    for attempt in 0..PROVISION_ATTEMPTS {
+        let current = provisioner.plan_provision(path).await?;
+        let scope = current
+            .highest_new
+            .clone()
+            .unwrap_or_else(|| current.path.clone());
+        let requester = authorize(&scope)?;
+        if current.highest_new.is_none() {
+            return Ok(PathProvisionResult {
+                path: current.path,
+                created: false,
+                commit_id: None,
+            });
+        }
+        match provisioner.apply_provision(&current, requester).await? {
+            ApplyOutcome::Landed(commit_id) => {
+                return Ok(PathProvisionResult {
+                    path: current.path,
+                    created: true,
+                    commit_id: Some(commit_id),
+                });
+            }
+            ApplyOutcome::Retry(reason) => {
+                tracing::info!(path, attempt, reason = %reason, "path provision round is stale; re-planning");
+                last_reason = reason;
+                if attempt + 1 < PROVISION_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (u64::from(attempt) + 1),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(GitError::CustomError(format!(
+        "path provision of {path} did not converge after {PROVISION_ATTEMPTS} rounds: {last_reason}"
+    ))
+    .into())
 }
 
 /// What [`MonoApiService::commit_tree_update`] landed.
@@ -1274,6 +1412,7 @@ impl ApiHandler for MonoApiService {
                     repo_path,
                     policy_path: entry_path.clone(),
                     policy_is_dir: entry_info.is_directory,
+                    expected_bases: None,
                     commit_msg: entry_info.commit_msg(),
                     author_username: entry_info.author_username.clone(),
                     skip_build: entry_info.skip_build,
@@ -1378,6 +1517,7 @@ impl ApiHandler for MonoApiService {
                     repo_path: parent,
                     policy_path: entry_path.clone(),
                     policy_is_dir: false,
+                    expected_bases: None,
                     commit_msg: entry_info.commit_msg(),
                     author_username: entry_info.author_username.clone(),
                     skip_build: entry_info.skip_build,
@@ -1555,6 +1695,7 @@ impl ApiHandler for MonoApiService {
                     repo_path: PathBuf::from(landing),
                     policy_path: dest_full.clone(),
                     policy_is_dir: false,
+                    expected_bases: None,
                     commit_msg: entry_info.commit_msg(),
                     author_username: entry_info.author_username.clone(),
                     skip_build: entry_info.skip_build,
@@ -2031,6 +2172,7 @@ impl MonoApiService {
             repo_path,
             policy_path,
             policy_is_dir,
+            expected_bases,
             commit_msg,
             author_username,
             skip_build,
@@ -2064,6 +2206,11 @@ impl MonoApiService {
         };
 
         let src_commit = edit_utils::get_repo_main_latest_commit(&self.storage, &tip_path).await?;
+        if let Some(bases) = &expected_bases
+            && bases.get(&tip_path) != Some(&src_commit.tree_id)
+        {
+            return Err(GitError::CustomError(PROVISION_STALE_SNAPSHOT.to_owned()));
+        }
         let base_commit =
             ObjectHash::from_hex_for_kind(get_hash_kind(), &src_commit.id.to_string()).map_err(
                 |e| GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id)),
@@ -5558,6 +5705,201 @@ fn collect_page_blobs(
         }
     }
 }
+
+#[async_trait]
+impl PathProvisioner for MonoApiService {
+    /// ADR-FU-05 item 1, plan half: import namespace guard and creation
+    /// classification, then walk the tree to the first missing component. An
+    /// existing component that is not a directory is `MONO_PATH_CONFLICT`.
+    async fn plan_provision(&self, path: &str) -> Result<ProvisionPlan, GitError> {
+        let config = self.storage.config();
+        let monorepo = &config.monorepo;
+        let policy = |err: PathPolicyError| GitError::from(MegaError::from(err));
+        path_policy::check_write_operands(monorepo, &[path], &[]).map_err(policy)?;
+        path_policy::classify_creation_path(monorepo, path).map_err(policy)?;
+        let root = self
+            .storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await?
+            .ok_or_else(|| GitError::CustomError("monorepo root ref is missing".to_owned()))?;
+        let mut tree = self.get_tree_by_hash(&root.ref_tree_hash).await?;
+        let mut prefix = String::new();
+        for component in path[1..].split('/') {
+            prefix.push('/');
+            prefix.push_str(component);
+            let dir = tree
+                .tree_items
+                .iter()
+                .find(|item| item.name == component && item.mode == TreeItemMode::Tree)
+                .map(|item| item.id.to_string());
+            match dir {
+                Some(id) => tree = self.get_tree_by_hash(&id).await?,
+                None if tree.tree_items.iter().any(|item| item.name == component) => {
+                    return Err(policy(PathPolicyError::Conflict {
+                        path: path.to_owned(),
+                        component: prefix,
+                    }));
+                }
+                None => {
+                    return Ok(ProvisionPlan {
+                        path: path.to_owned(),
+                        highest_new: Some(prefix),
+                    });
+                }
+            }
+        }
+        Ok(ProvisionPlan {
+            path: path.to_owned(),
+            highest_new: None,
+        })
+    }
+
+    /// ADR-FU-05 item 1, apply half: from one snapshot of the root tree,
+    /// re-derive the highest missing component and build the new levels (the
+    /// leaf holds a `.gitkeep`) in one commit landed with `commit_tree_update`
+    /// (MonoWriteQueue on trunk). A snapshot whose highest new component
+    /// differs from the authorized plan, or whose landing tip moved before
+    /// landing, is a [`ApplyOutcome::Retry`] (nothing persisted in the first
+    /// case); a same-name entry of any kind at a level to create is
+    /// `MONO_PATH_CONFLICT`.
+    async fn apply_provision(
+        &self,
+        plan: &ProvisionPlan,
+        requester: Option<String>,
+    ) -> Result<ApplyOutcome, GitError> {
+        let policy = |err: PathPolicyError| GitError::from(MegaError::from(err));
+        if plan.highest_new.is_none() {
+            return Ok(ApplyOutcome::Retry("plan has nothing to create".to_owned()));
+        }
+        let root = self
+            .storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await?
+            .ok_or_else(|| GitError::CustomError("monorepo root ref is missing".to_owned()))?;
+        let components: Vec<&str> = plan.path[1..].split('/').collect();
+        let mut chain = vec![Arc::new(self.get_tree_by_hash(&root.ref_tree_hash).await?)];
+        let mut bases = HashMap::from([("/".to_owned(), chain[0].id)]);
+        let mut deepest = String::new();
+        let mut missing_from = components.len();
+        for (index, component) in components.iter().enumerate() {
+            let parent = chain
+                .last()
+                .cloned()
+                .ok_or_else(|| GitError::CustomError("empty provisioning chain".to_owned()))?;
+            let dir = parent
+                .tree_items
+                .iter()
+                .find(|item| item.name == *component && item.mode == TreeItemMode::Tree)
+                .map(|item| item.id.to_string());
+            let path = format!("{deepest}/{component}");
+            match dir {
+                Some(id) => {
+                    let tree = self.get_tree_by_hash(&id).await?;
+                    bases.insert(path.clone(), tree.id);
+                    chain.push(Arc::new(tree));
+                    deepest = path;
+                }
+                None if parent.tree_items.iter().any(|item| item.name == *component) => {
+                    return Err(policy(PathPolicyError::Conflict {
+                        path: plan.path.clone(),
+                        component: path,
+                    }));
+                }
+                None => {
+                    missing_from = index;
+                    break;
+                }
+            }
+        }
+        let highest_new = components
+            .get(missing_from)
+            .map(|component| format!("{deepest}/{component}"));
+        if highest_new != plan.highest_new {
+            return Ok(ApplyOutcome::Retry(format!(
+                "highest new component changed from {:?} to {highest_new:?}",
+                plan.highest_new
+            )));
+        }
+
+        // New levels, bottom-up: the leaf holds a `.gitkeep` whose content is
+        // unique per attempt, so two concurrent rounds never build the same
+        // commit (the queue replays an identical (old_id, new_id) pair).
+        let blob = Blob::from_content(&format!(
+            "This file was used to maintain the git tree, provisioned {} ({})",
+            plan.path,
+            uuid::Uuid::new_v4()
+        ));
+        let keep = TreeItem {
+            mode: TreeItemMode::Blob,
+            id: blob.id,
+            name: String::from(".gitkeep"),
+        };
+        let mut child = Tree::from_tree_items(vec![keep])
+            .map_err(|_| GitError::CustomError("Invalid tree".to_owned()))?;
+        let mut save_trees = vec![child.clone()];
+        for index in (missing_from..components.len() - 1).rev() {
+            child = Tree::from_tree_items(vec![TreeItem {
+                mode: TreeItemMode::Tree,
+                id: child.id,
+                name: components[index + 1].to_owned(),
+            }])
+            .map_err(|_| GitError::CustomError("Invalid tree".to_owned()))?;
+            save_trees.push(child.clone());
+        }
+        let deepest_tree = chain
+            .pop()
+            .ok_or_else(|| GitError::CustomError("empty provisioning chain".to_owned()))?;
+        let mut items = deepest_tree.tree_items.clone();
+        items.push(TreeItem {
+            mode: TreeItemMode::Tree,
+            id: child.id,
+            name: components[missing_from].to_owned(),
+        });
+        sort_git_tree_items(&mut items);
+        let new_deepest = Tree::from_tree_items(items)
+            .map_err(|_| GitError::CustomError("Invalid tree".to_owned()))?;
+        let deepest_path = if deepest.is_empty() {
+            "/".to_owned()
+        } else {
+            deepest
+        };
+        let update_result = MonoServiceLogic::build_result_by_chain(
+            PathBuf::from(&deepest_path),
+            chain,
+            new_deepest.id,
+        )?;
+        save_trees.push(new_deepest);
+
+        let landed = self
+            .commit_tree_update(
+                TreeCommitInput {
+                    update_result,
+                    save_trees,
+                    blobs: vec![blob],
+                    repo_path: PathBuf::from(&deepest_path),
+                    policy_path: plan.path.clone(),
+                    policy_is_dir: true,
+                    expected_bases: Some(bases),
+                    commit_msg: format!("provision {}", plan.path),
+                    author_username: None,
+                    skip_build: true,
+                    mode: EditCLMode::TryReuse(None),
+                },
+                requester,
+            )
+            .await;
+        match landed {
+            Ok(outcome) => Ok(ApplyOutcome::Landed(outcome.commit_id)),
+            Err(err) => match provision_retry_reason(&err) {
+                Some(reason) => Ok(ApplyOutcome::Retry(reason)),
+                None => Err(err),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::{path::PathBuf, str::FromStr, sync::Arc};
@@ -10629,6 +10971,387 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Alice <alice@example.com>")
+        );
+    }
+
+    async fn fu07_storage(temp: &std::path::Path) -> Storage {
+        use crate::jupiter::{
+            service::{git_service::GitService, mono_service::MonoService},
+            storage::object_storage::mock_object_storage,
+        };
+
+        let mut storage = crate::jupiter::tests::test_storage(temp).await;
+        let git_service = GitService {
+            obj_storage: mock_object_storage(),
+        };
+        storage.git_service = git_service.clone();
+        storage.mono_service = MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service,
+        };
+        storage
+            .mono_service
+            .init_monorepo(&storage.config().monorepo)
+            .await
+            .expect("init monorepo");
+        storage
+    }
+
+    #[tokio::test]
+    async fn fu07_plan_highest_new_component() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = fu07_storage(temp.path()).await;
+        let service = test_service(&storage);
+        let plan = |highest: Option<&str>, path: &str| ProvisionPlan {
+            path: path.to_owned(),
+            highest_new: highest.map(str::to_owned),
+        };
+        assert_eq!(
+            service.plan_provision("/project/a/b").await.unwrap(),
+            plan(Some("/project/a"), "/project/a/b")
+        );
+        assert_eq!(
+            service.plan_provision("/project").await.unwrap(),
+            plan(None, "/project")
+        );
+        let conflict = service
+            .plan_provision("/project/.gitkeep/x")
+            .await
+            .expect_err("file component");
+        assert!(
+            conflict
+                .to_string()
+                .contains("MONO_PATH_CONFLICT: \"/project/.gitkeep/x\": \"/project/.gitkeep\""),
+            "{conflict}"
+        );
+        for (path, code) in [
+            ("/fu07-vendor/x", "MONO_PATH_NOT_ALLOWED"),
+            ("/third-party/x", "MONO_PATH_NOT_ALLOWED"),
+            ("/", "MONO_PATH_INVALID"),
+        ] {
+            let err = service.plan_provision(path).await.expect_err(path);
+            assert!(err.to_string().contains(code), "{path}: {err}");
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Fu07Err(String);
+
+    impl From<GitError> for Fu07Err {
+        fn from(err: GitError) -> Self {
+            Fu07Err(err.to_string())
+        }
+    }
+
+    /// Scripted provisioner: one plan per round, one apply result per apply.
+    struct Fu07Script {
+        plans: std::sync::Mutex<Vec<Option<&'static str>>>,
+        applies: std::sync::Mutex<Vec<Result<ApplyOutcome, String>>>,
+        plan_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PathProvisioner for Fu07Script {
+        async fn plan_provision(&self, path: &str) -> Result<ProvisionPlan, GitError> {
+            self.plan_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let highest = self.plans.lock().unwrap().remove(0);
+            Ok(ProvisionPlan {
+                path: path.to_owned(),
+                highest_new: highest.map(str::to_owned),
+            })
+        }
+
+        async fn apply_provision(
+            &self,
+            _plan: &ProvisionPlan,
+            _requester: Option<String>,
+        ) -> Result<ApplyOutcome, GitError> {
+            self.applies
+                .lock()
+                .unwrap()
+                .remove(0)
+                .map_err(GitError::CustomError)
+        }
+    }
+
+    fn fu07_script(
+        plans: Vec<Option<&'static str>>,
+        applies: Vec<Result<ApplyOutcome, String>>,
+    ) -> Fu07Script {
+        Fu07Script {
+            plans: std::sync::Mutex::new(plans),
+            applies: std::sync::Mutex::new(applies),
+            plan_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn fu07_reprepare_reauthorizes() {
+        // Round 1 creates /project/a but loses the queue race; round 2 finds
+        // the path already provisioned and re-authorizes against the target.
+        let script = fu07_script(
+            vec![Some("/project/a"), None],
+            vec![Ok(ApplyOutcome::Retry(
+                "another push for this path is already Queued/Running (ADR-TP-10)".to_owned(),
+            ))],
+        );
+        let mut scopes = Vec::new();
+        let result = run_path_provision::<Fu07Err, _, _>(&script, "/project/a/b", |scope: &str| {
+            scopes.push(scope.to_owned());
+            Ok(Some("tester".to_owned()))
+        })
+        .await
+        .expect("converges");
+        assert_eq!(
+            scopes,
+            ["/project/a/b", "/project/a", "/project/a/b"],
+            "target pre-check, then one authorization per prepare"
+        );
+        assert_eq!(
+            result,
+            PathProvisionResult {
+                path: "/project/a/b".to_owned(),
+                created: false,
+                commit_id: None,
+            }
+        );
+
+        // A narrower scope on a later round is refused even though an
+        // earlier round was allowed (no widening between prepare rounds).
+        let script = fu07_script(
+            vec![Some("/project/a/b"), Some("/project/a")],
+            vec![Ok(ApplyOutcome::Retry(
+                "highest new component changed".to_owned(),
+            ))],
+        );
+        let err = run_path_provision::<Fu07Err, _, _>(&script, "/project/a/b", |scope: &str| {
+            if scope == "/project/a" {
+                Err(Fu07Err("403".to_owned()))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .expect_err("second round needs a wider scope");
+        assert_eq!(err, Fu07Err("403".to_owned()));
+    }
+
+    /// Plans once from a stale view (as if a container was deleted after the
+    /// plan), then delegates to the real service.
+    struct Fu07StaleFirst<'a> {
+        inner: &'a MonoApiService,
+        stale: std::sync::Mutex<Option<ProvisionPlan>>,
+    }
+
+    #[async_trait]
+    impl PathProvisioner for Fu07StaleFirst<'_> {
+        async fn plan_provision(&self, path: &str) -> Result<ProvisionPlan, GitError> {
+            let stale = self.stale.lock().unwrap().take();
+            match stale {
+                Some(plan) => Ok(plan),
+                None => self.inner.plan_provision(path).await,
+            }
+        }
+
+        async fn apply_provision(
+            &self,
+            plan: &ProvisionPlan,
+            requester: Option<String>,
+        ) -> Result<ApplyOutcome, GitError> {
+            self.inner.apply_provision(plan, requester).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fu07_apply_bound_to_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = fu07_storage(temp.path()).await;
+        let service = test_service(&storage);
+        let root_before = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // /project/team does not exist: a plan that authorized only
+        // /project/team/x is stale, so apply writes nothing and asks to re-plan.
+        let stale = ProvisionPlan {
+            path: "/project/team/x".to_owned(),
+            highest_new: Some("/project/team/x".to_owned()),
+        };
+        assert!(matches!(
+            service.apply_provision(&stale, None).await.unwrap(),
+            ApplyOutcome::Retry(_)
+        ));
+
+        // The loop re-plans and re-authorizes: the narrow token that covers
+        // only /project/team/x is refused for the container.
+        let racing = Fu07StaleFirst {
+            inner: &service,
+            stale: std::sync::Mutex::new(Some(stale)),
+        };
+        let mut scopes = Vec::new();
+        let err = run_path_provision::<Fu07Err, _, _>(&racing, "/project/team/x", |scope: &str| {
+            scopes.push(scope.to_owned());
+            if scope.starts_with("/project/team/x") {
+                Ok(Some("narrow".to_owned()))
+            } else {
+                Err(Fu07Err("403".to_owned()))
+            }
+        })
+        .await
+        .expect_err("container needs a wider token");
+        assert_eq!(err, Fu07Err("403".to_owned()));
+        assert_eq!(
+            scopes,
+            ["/project/team/x", "/project/team/x", "/project/team"]
+        );
+
+        // A file where a directory must be created is a conflict, not a
+        // second same-name tree entry.
+        let file = ProvisionPlan {
+            path: "/project/.gitkeep/x".to_owned(),
+            highest_new: Some("/project/.gitkeep".to_owned()),
+        };
+        let conflict = service
+            .apply_provision(&file, None)
+            .await
+            .expect_err("file component");
+        assert!(
+            conflict.to_string().contains("MONO_PATH_CONFLICT"),
+            "{conflict}"
+        );
+
+        let root_after = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_after.ref_commit_hash, root_before.ref_commit_hash);
+        assert_eq!(root_after.ref_tree_hash, root_before.ref_tree_hash);
+    }
+
+    #[test]
+    fn fu07_retry_reasons_are_typed() {
+        let retry = |text: &str| provision_retry_reason(&GitError::CustomError(text.to_owned()));
+        assert!(retry(PROVISION_STALE_SNAPSHOT).is_some());
+        assert!(
+            retry("Other error: another push for this path is already Queued/Running (ADR-TP-10)")
+                .is_some()
+        );
+        assert!(
+            retry(
+                "Other error: non-fast-forward: new_id does not match current tip; align with `git fetch && git reset --hard origin/main`"
+            )
+            .is_some()
+        );
+        assert!(
+            retry("Other error: push rejected for push_queue id 17: cannot update missing path; create requires old_id=ZERO_ID")
+                .is_some()
+        );
+        // Coded errors are final even when a user path spells a retry text.
+        assert!(
+            retry("[code:409] MONO_PATH_UNINITIALIZED: \"/third-party/non-fast-forward\" does not exist yet")
+                .is_none()
+        );
+        assert!(retry("Other error: some unknown landing failure").is_none());
+        assert!(
+            retry("Other error: see non-fast-forward: new_id does not match current tip").is_none()
+        );
+    }
+
+    async fn fu07_trunk_storage(temp: &std::path::Path) -> Storage {
+        use crate::jupiter::{
+            service::{git_service::GitService, mono_service::MonoService},
+            storage::object_storage::mock_object_storage,
+        };
+
+        let mut storage = tp11_storage(temp).await;
+        let git_service = GitService {
+            obj_storage: mock_object_storage(),
+        };
+        storage.git_service = git_service.clone();
+        storage.mono_service = MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service,
+        };
+        storage
+            .mono_service
+            .init_monorepo(&storage.config().monorepo)
+            .await
+            .expect("init monorepo");
+        storage
+    }
+
+    /// Two rounds planned from the same snapshot race to land: exactly one
+    /// lands, the other is told to re-plan (never a second `created:true`).
+    #[tokio::test]
+    async fn fu07_concurrent_apply_one_lands() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = fu07_trunk_storage(temp.path()).await;
+        let service = MonoApiService {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: crate::jupiter::tests::test_redis_manager().await,
+                prefix: String::new(),
+            }),
+        };
+        let plan = service.plan_provision("/project/fu07-race").await.unwrap();
+        assert_eq!(plan.highest_new.as_deref(), Some("/project/fu07-race"));
+        let (a, b) = tokio::join!(
+            service.apply_provision(&plan, Some("a".to_owned())),
+            service.apply_provision(&plan, Some("b".to_owned()))
+        );
+        let outcomes = [a.expect("apply a"), b.expect("apply b")];
+        let landed = outcomes
+            .iter()
+            .filter(|o| matches!(o, ApplyOutcome::Landed(_)))
+            .count();
+        assert_eq!(landed, 1, "{outcomes:?}");
+        assert!(
+            outcomes.iter().any(|o| matches!(o, ApplyOutcome::Retry(_))),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            service
+                .plan_provision("/project/fu07-race")
+                .await
+                .unwrap()
+                .highest_new,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn fu07_client_errors_are_not_retried() {
+        let script = fu07_script(
+            vec![Some("/project/a")],
+            vec![Err("[code:409] MONO_PATH_UNINITIALIZED: \"/x\"".to_owned())],
+        );
+        let err = run_path_provision::<Fu07Err, _, _>(&script, "/project/a", |_: &str| Ok(None))
+            .await
+            .expect_err("client error");
+        assert!(err.0.contains("MONO_PATH_UNINITIALIZED"), "{err:?}");
+        assert_eq!(
+            script.plan_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // An unauthorized caller is refused before any plan (no tree read).
+        let script = fu07_script(Vec::new(), Vec::new());
+        let err = run_path_provision::<Fu07Err, _, _>(&script, "/project/a", |_: &str| {
+            Err(Fu07Err("401".to_owned()))
+        })
+        .await
+        .expect_err("unauthorized");
+        assert_eq!(err, Fu07Err("401".to_owned()));
+        assert_eq!(
+            script.plan_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
         );
     }
 

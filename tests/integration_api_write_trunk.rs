@@ -3160,3 +3160,266 @@ fn import_attach_after_import_dir_api_write() {
     );
     case.finish();
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-07: `POST /api/v1/path/provision` — idempotent `mkdir -p`
+// through MonoWriteQueue, authorized by the highest component it creates
+// (ADR-FU-05).
+// ---------------------------------------------------------------------------
+
+const FU07_NARROW_TOKEN: &str = "fu07-narrow-token";
+const FU07_WIDE_TOKEN: &str = "fu07-wide-token";
+
+fn fu07_provision(case: &EntryCase, auth: Option<&str>, path: &str) -> (u16, Value) {
+    case.post("path/provision", auth, serde_json::json!({ "path": path }))
+}
+
+fn fu07_expect(json: &Value, path: &str, created: bool) -> Option<String> {
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    let data = &json["data"];
+    assert_eq!(data["path"], Value::String(path.to_owned()), "{json}");
+    assert_eq!(data["created"], Value::Bool(created), "{json}");
+    let commit = data["commit_id"].as_str().map(str::to_owned);
+    assert_eq!(commit.is_some(), created, "{json}");
+    commit
+}
+
+#[test]
+fn path_provision_creates_missing_levels() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let (status, json) = fu07_provision(&case, Some(&EntryCase::bearer()), "/project/fu07/a/b");
+    assert_eq!(status, 200, "{json}");
+    let commit = fu07_expect(&json, "/project/fu07/a/b", true).expect("commit");
+    assert_eq!(path_tip(case.db_url(), "/project"), commit);
+    assert_eq!(case.tree_names("/project/fu07/a/b"), [".gitkeep"]);
+
+    let url = fu03_repo_url(case.port, "/project");
+    host_git_ok(
+        &case.env.case_dir,
+        PUSH_TOKEN,
+        &["clone", &url, "fu07-clone"],
+    );
+    let git = |args: &[&str]| {
+        let mut all = vec!["-C", "fu07-clone"];
+        all.extend_from_slice(args);
+        host_git_stdout(&case.env.case_dir, PUSH_TOKEN, &all)
+    };
+    assert_eq!(git(&["rev-list", "--count", "HEAD"]), "2", "one commit");
+    assert_eq!(
+        git(&["log", "--format=%s", "-1"]),
+        "provision /project/fu07/a/b"
+    );
+    assert_eq!(git(&["ls-files", "fu07"]), "fu07/a/b/.gitkeep");
+
+    // Component names that repeat or are substrings of their parents.
+    for path in [
+        "/project/pro/x",
+        "/project/fu07/fu07/x",
+        "/project/c/project/c",
+    ] {
+        let (status, json) = fu07_provision(&case, Some(&EntryCase::bearer()), path);
+        assert_eq!(status, 200, "{path}: {json}");
+        fu07_expect(&json, path, true);
+        assert_eq!(case.tree_names(path), [".gitkeep"], "{path}");
+    }
+    case.finish();
+}
+
+#[test]
+fn path_provision_is_idempotent() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let bearer = EntryCase::bearer();
+    let (status, json) = fu07_provision(&case, Some(&bearer), "/project/fu07-idem");
+    assert_eq!(status, 200, "{json}");
+    let commit = fu07_expect(&json, "/project/fu07-idem", true).expect("commit");
+    for path in ["/project/fu07-idem", "/project"] {
+        let (status, json) = fu07_provision(&case, Some(&bearer), path);
+        assert_eq!(status, 200, "{json}");
+        fu07_expect(&json, path, false);
+    }
+    assert_eq!(path_tip(case.db_url(), "/project"), commit, "no write");
+    case.finish();
+}
+
+#[test]
+fn path_provision_rejects_policy_violations() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    let bearer = EntryCase::bearer();
+    let root_before = path_tip(case.db_url(), "/");
+    for (path, code) in [
+        ("/fu07-vendor/x", "MONO_PATH_NOT_ALLOWED"),
+        ("/third-party", "MONO_PATH_NOT_ALLOWED"),
+        ("/third-party/x", "MONO_PATH_NOT_ALLOWED"),
+        ("/", "MONO_PATH_INVALID"),
+        ("project/x", "MONO_PATH_INVALID"),
+        ("/project//x", "MONO_PATH_INVALID"),
+        ("/project/x/", "MONO_PATH_INVALID"),
+        ("/project/./x", "MONO_PATH_INVALID"),
+        ("/project/../x", "MONO_PATH_INVALID"),
+        ("/project/x\\y", "MONO_PATH_INVALID"),
+        ("/project/a\nb", "MONO_PATH_INVALID"),
+        ("/project/a\tb", "MONO_PATH_INVALID"),
+    ] {
+        let (status, json) = fu07_provision(&case, Some(&bearer), path);
+        assert_eq!(status, 400, "{path}: {json}");
+        assert!(
+            err_message(&json).starts_with(&format!("{code}: ")),
+            "{path}: {json}"
+        );
+    }
+    assert_eq!(path_tip(case.db_url(), "/"), root_before);
+    assert_eq!(fu06_main_rows_under(case.db_url(), "/third-party"), 0);
+    assert_eq!(fu06_main_rows_under(case.db_url(), "/fu07-vendor"), 0);
+    case.finish();
+
+    let custom = EntryCase::boot(
+        ApiWriteEnv::with_token_config_paths(None)
+            .with_env("MEGA_MONOREPO__ROOT_DIRS", "apps,third-party"),
+    );
+    let (status, json) = fu07_provision(&custom, Some(&bearer), "/apps/fu07");
+    assert_eq!(status, 200, "{json}");
+    fu07_expect(&json, "/apps/fu07", true);
+    let (status, json) = fu07_provision(&custom, Some(&bearer), "/project/fu07");
+    assert_eq!(status, 400, "{json}");
+    assert!(
+        err_message(&json).starts_with("MONO_PATH_NOT_ALLOWED: "),
+        "{json}"
+    );
+    custom.finish();
+
+    // A coded 409 stays a 409 even when the path spells a retryable queue
+    // text (nested import_dir ancestors are never materialized).
+    let nested = EntryCase::boot(
+        ApiWriteEnv::with_token_config_paths(None)
+            .with_env("MEGA_MONOREPO__IMPORT_DIR", "/third-party/vendor"),
+    );
+    let (status, json) = fu07_provision(
+        &nested,
+        Some(&bearer),
+        "/third-party/non-fast-forward: new_id does not match current tip",
+    );
+    assert_eq!(status, 409, "{json}");
+    assert!(
+        err_message(&json).starts_with("MONO_PATH_UNINITIALIZED: "),
+        "{json}"
+    );
+    nested.finish();
+}
+
+#[test]
+fn path_provision_conflict_on_file_component() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.create_entry(Some(&EntryCase::bearer()), "fu07.txt", false);
+    let tip = path_tip(case.db_url(), "/project");
+    let (status, json) = fu07_provision(&case, Some(&EntryCase::bearer()), "/project/fu07.txt/sub");
+    assert_eq!(status, 409, "{json}");
+    assert!(
+        err_message(&json)
+            .starts_with("MONO_PATH_CONFLICT: \"/project/fu07.txt/sub\": \"/project/fu07.txt\""),
+        "{json}"
+    );
+    assert_eq!(path_tip(case.db_url(), "/project"), tip);
+    case.finish();
+}
+
+#[test]
+fn path_provision_token_scope() {
+    let env = ApiWriteEnv::with_git_append(
+        "trunk",
+        &format!(
+            r#"
+[git]
+anonymous_access = true
+push_auth = "token"
+ssh_receive_pack = false
+[[git.push_tokens]]
+name = "fu07-narrow"
+token = "{FU07_NARROW_TOKEN}"
+paths = ["/project/team/x"]
+[[git.push_tokens]]
+name = "fu07-wide"
+token = "{FU07_WIDE_TOKEN}"
+paths = ["/project/team"]
+"#
+        ),
+    );
+    let case = EntryCase::boot(env);
+    let narrow = format!("Bearer {FU07_NARROW_TOKEN}");
+    let wide = format!("Bearer {FU07_WIDE_TOKEN}");
+    let root_before = path_tip(case.db_url(), "/");
+
+    let (status, json) = fu07_provision(&case, None, "/project/team/x");
+    assert_eq!(status, 401, "{json}");
+    // The narrow token covers the target but not the container it would
+    // create (the highest new component, /project/team).
+    let (status, json) = fu07_provision(&case, Some(&narrow), "/project/team/x");
+    assert_eq!(status, 403, "{json}");
+    let (status, json) = fu07_provision(&case, Some(&narrow), "/project/other");
+    assert_eq!(status, 403, "{json}");
+    assert_eq!(path_tip(case.db_url(), "/"), root_before, "no write yet");
+
+    let (status, json) = fu07_provision(&case, Some(&wide), "/project/team");
+    assert_eq!(status, 200, "{json}");
+    fu07_expect(&json, "/project/team", true);
+    // Now the highest new component is the target itself.
+    let (status, json) = fu07_provision(&case, Some(&narrow), "/project/team/x");
+    assert_eq!(status, 200, "{json}");
+    fu07_expect(&json, "/project/team/x", true);
+    let (status, json) = fu07_provision(&case, Some(&narrow), "/project/team/x");
+    assert_eq!(status, 200, "{json}");
+    fu07_expect(&json, "/project/team/x", false);
+    case.finish();
+}
+
+#[test]
+fn path_provision_concurrent_same_path() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let bearer = EntryCase::bearer();
+    let start = std::sync::Barrier::new(2);
+    let results: Vec<(u16, Value)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    start.wait();
+                    fu07_provision(&case, Some(&bearer), "/project/fu07-race")
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("provision thread"))
+            .collect()
+    });
+    let mut created = 0;
+    for (status, json) in &results {
+        assert_eq!(*status, 200, "{json}");
+        if json["data"]["created"] == Value::Bool(true) {
+            created += 1;
+        }
+    }
+    assert_eq!(
+        created, 1,
+        "exactly one request creates the path: {results:?}"
+    );
+    assert_eq!(case.tree_names("/project/fu07-race"), [".gitkeep"]);
+    case.finish();
+}
+
+#[test]
+fn path_provision_openapi() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let (status, doc) = case.exchange(
+        case.client
+            .get(format!("http://127.0.0.1:{}/api/openapi.json", case.port)),
+        None,
+        "GET /api/openapi.json",
+    );
+    assert_eq!(status, 200, "GET /api/openapi.json");
+    let responses = doc["paths"]["/api/v1/path/provision"]["post"]["responses"]
+        .as_object()
+        .expect("path/provision POST responses");
+    for code in ["200", "400", "401", "403", "409"] {
+        assert!(responses.contains_key(code), "{code}: {responses:?}");
+    }
+    case.finish();
+}

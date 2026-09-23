@@ -24,6 +24,7 @@
 | `GET /api/v1/tags/list` | `implemented` | FT-04 | 唯一 list：必填 query `page`、`per_page`、`path` |
 | `GET /api/v1/tags/{name}` | `implemented` | LB-04 / FT-06 | 可用（读，不要求 Authorization）。可选 `?path=`（省略或空 = `/`） |
 | `DELETE /api/v1/tags/{name}` | `implemented` | LB-04 / FT-06 | 可用：鉴权 path = 选择器 `path`（省略或空 = `/`） |
+| `POST /api/v1/path/provision` | `implemented` | plan-20260923 FU-07 | 可用：**只挂 storage-only**（`storage_only_write_routers`）；Review 形态 404 |
 
 公共前缀 `/api/v1` 由外层 nest 施加。
 
@@ -150,6 +151,42 @@
 - 落地路径 = 两个父目录的最深公共目录：trunk 上经 `land_api_tip_push` 前进**覆盖该路径的最深非根 path tip**（`resolve_trunk_land_path`，AW-03：落地 `/project/a`（本身无 tip）时前进的是 `/project` 的 tip），因此**跨顶层目录**的移动（公共目录为 `/`）在 trunk 上返回 **400** `MONO_PATH_NOT_ALLOWED`（产品写从不在 `/` 落地，[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-06；此前为 B0 文本 `no non-root path tip …`）；Review 形态在该公共目录（或 `/`）的 CL 上进行，与 create/delete 相同的政策分流。
 - 鉴权：`from_path` 与 `to_path` 各调一次 `trunk_write_requester`，任一失败（401/403）即拒绝，此时尚未读任何 tree。
 
+### `POST /api/v1/path/provision` — `implemented`（plan-20260923 FU-07）
+
+幂等的路径开通（`mkdir -p`）：一次 commit 补齐目标路径上全部缺失的目录层级（叶子目录放一个内容每次唯一的 `.gitkeep`），由开通专用、绑定单一根树快照的建树逻辑构建，经 `commit_tree_update` 与 MonoWriteQueue 落地；整条路径已是目录时零写（[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-05）。**只挂在 storage-only 表面**（`preview_router::storage_only_write_routers`，由 `api_router::storage_only_routers_with` 合并）；Review 形态不挂（`path_provision_is_storage_only`）。
+
+```json
+{ "path": "/project/workbuddy/demo" }
+```
+
+| 字段 | 规则 |
+|---|---|
+| `path` | **必填**。规范绝对路径，原样必须等于其规范形态（`strict_creation_path_input`：拒绝相对路径、`.` / `..` 段、重复或尾斜杠、NUL、`\` 与其它控制字符如换行 / 制表）|
+
+成功（HTTP **200**）：
+
+```json
+{ "req_result": true, "data": { "path": "/project/workbuddy/demo", "created": true, "commit_id": "<hex>" }, "err_message": "" }
+```
+
+`created: false` 且 `commit_id: null` 表示路径已是目录，没有写入（重复调用恒返回该结果）。commit message 为 `provision <path>`；全新栈上与其它产品写一样落在惰性物化的一级根上（ADR-FU-06）。
+
+判定顺序：
+
+1. 严格输入校验（400 `MONO_PATH_INVALID`）。
+2. 鉴权预检：以目标路径调用 `authorize_trunk_api_write`（401 / 403），此前不读树。
+3. 每轮：import 命名空间守卫与创建分类（400 `MONO_PATH_NOT_ALLOWED` / `MONO_PATH_INVALID`；`/` 为 `MONO_PATH_INVALID`）→ 逐级遍历，已存在的组件不是目录 → 409 `MONO_PATH_CONFLICT`（点名该组件）→ 求出**最高新建组件**（第一个缺失组件；无缺失时即目标）→ 以它再次鉴权（403）→ 落地。
+4. 落地（apply）从**同一份**根树快照重新推导最高新建组件并在该快照上建树：推导结果与已鉴权的计划不同（例如计划之后某个容器被删除）→ 不写入、重新规划并重新鉴权；新建层级的位置出现任何同名条目（包括计划之后才出现的文件）→ 409 `MONO_PATH_CONFLICT`；落点 tip 的 tree 与快照不一致（期间有别的写落地），或队列以固定文本拒绝（ADR-TP-10 同路径冲突、non-fast-forward、墓碑、缺失路径）→ 重新规划并重新鉴权。带 `[code:…]` 的错误（路径策略、4xx）与其它错误立即返回，重试判定不对用户路径做子串匹配。至多 10 轮（线性退避，末轮不等待）。每次尝试的 `.gitkeep` 内容唯一，两个并发尝试不会构造出相同的 commit 而被队列当作同一操作重放。由此，一次开通创建的层级恒为某一轮已鉴权的最高新建组件及其下层；并发开通同一路径时恰有一个请求 `created: true`，其余在重新规划后得到 `created: false`。
+
+鉴权按最高新建组件：只覆盖 `/project/team/x` 的 token 不能顺带创建尚不存在的容器 `/project/team`（403）；容器由覆盖它的 token 开通之后，同一 token 即可开通 `/project/team/x`。每轮重新鉴权，且落地与本轮计划绑定（见上），落地重试不会扩大写范围。
+
+错误：400 `MONO_PATH_NOT_ALLOWED`（根外路径、`import_dir` 命名空间）/ `MONO_PATH_INVALID`；401 / 403（token）；409 `MONO_PATH_CONFLICT`（组件是文件）/ `MONO_PATH_UNINITIALIZED`。错误文本即 `PathPolicyError` 原文（[`../errors.md`](../errors.md)），经 `CommonResult` 返回。运行时 OpenAPI 声明 200 / 400 / 401 / 403 / 409（`path_provision_openapi`）。请求体本身无法解析时（缺 `path`、非 JSON、`Content-Type` 不是 `application/json`）由 axum 的 `Json` 提取器直接返回纯文本 4xx（422 / 400 / 415），不是 `CommonResult`，也不在 OpenAPI 中声明。
+
+已知限制（登记于 [`plan-20260923.md`](../plan/plan-20260923.md)）：
+
+- 嵌套 `import_dir`（如 `/third-party/vendor`）时，在其严格祖先根（`/third-party`）之下开通返回 409 `MONO_PATH_UNINITIALIZED`；该消息提示的开通动作正是本端点，此时提示是循环的——祖先根永不物化（GC-FU-04），目前只能用 `git push` 直接创建更深的路径（`DEFER-FU-13`）。
+- `root_dirs` 中新增、但初始化时尚未创建的一级根（改 `root_dirs` 并重启之后）无法经本端点开通：唯一可能的落点是 `/`，产品写从不在 `/` 落地，返回 400 `MONO_PATH_NOT_ALLOWED`（点名 `/`）。新增根需先经 `git push` 创建（`DEFER-FU-14`）。
+
 ### 错误映射
 
 | 情况 | 今日实况 / 落地要求 |
@@ -252,6 +289,7 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 | `POST /create-entry` | `implemented`——今日确实鉴权（`preview_router.rs:114-117` 取 `HeaderMap` 并调 `trunk_write_requester`） |
 | `POST /delete-entry` | `implemented`（LB-02）——`delete_entry`（`preview_router.rs:138`）取 `HeaderMap` 并调 `trunk_write_requester(path = 父目录)`，鉴权先于任何存储访问 |
 | `POST /move-entry` | `implemented`（LB-03）——`move_entry`（`preview_router.rs:166`）对 `from_path` 与 `to_path` 各调一次 `trunk_write_requester`，任一失败即拒绝，先于任何存储访问 |
+| `POST /path/provision` | `implemented`（plan-20260923 FU-07）——先以目标路径调用 `authorize_trunk_api_write`（先于任何树读取），再每轮以**最高新建组件**重新鉴权，见该小节 |
 | `POST /tags` / `DELETE /tags/{name}` | `implemented`（LB-04 / FT-06）——`create_tag` 以 `path_context.unwrap_or("/")`、`delete_tag` 以选择器 `path`（省略或空 = `/`）各调一次 `trunk_write_requester`，先于任何存储访问 |
 
 > **落地状态（LB-04，安全相关）：** `create_tag`（`tag_router.rs:162`）与 `delete_tag`（`:321`）都接收 `HeaderMap`，并在任何存储访问之前调用 `trunk_write_requester`；这关闭了计划里的 `GAP-LB-04`（裸挂会让 `token` 部署匿名写 `refs/tags`）。Review 形态该函数返回 `Ok(None)`，tag 写沿用 Review 既有面（cedar_guard 只覆盖 `/cl`，不覆盖 `/tags`）——本卡不为 Review 新增 401（IT `tag_review_form_no_trunk_gate`）。
@@ -296,7 +334,7 @@ tag 写的鉴权 path 不是你操作的业务路径：
 | trunk / storage-only | `land_api_tip_push` | 必为 `null` |
 | Review | 既有 `find_or_create_cl_for_edit` CL 分支 | 可为非 null |
 
-`write_routers`（`preview_router.rs:57-63`）同时挂在 Review 与 trunk；LB-02 / LB-03 已把 `delete-entry` 与 `move-entry` 登记进同一函数，因此两者在两种形态下都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 锁定）。`tag_router::routers()` 同样两边都挂：Review 的 `routers()` 原本就有，LB-04 把它 merge 进 `storage_only_routers_with`（`api_router.rs:83`）；三份 OpenAPI 锁（storage-only / trunk / OAuth）都断言 `/tags`、`/tags/list`、`/tags/{name}`。
+`POST /path/provision` 只挂 storage-only（`preview_router::storage_only_write_routers`，由 `storage_only_routers_with` 合并；单测 `path_provision_is_storage_only` 锁定 Review 的 `routers()` 不含它）。`write_routers`（`preview_router.rs:57-63`）同时挂在 Review 与 trunk；LB-02 / LB-03 已把 `delete-entry` 与 `move-entry` 登记进同一函数，因此两者在两种形态下都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 锁定）。`tag_router::routers()` 同样两边都挂：Review 的 `routers()` 原本就有，LB-04 把它 merge 进 `storage_only_routers_with`（`api_router.rs:83`）；三份 OpenAPI 锁（storage-only / trunk / OAuth）都断言 `/tags`、`/tags/list`、`/tags/{name}`。
 
 `ImportRepo`（`import_dir` 下）对 delete/move 必须返回 **409**（计划门 `delete_entry_reject_import_repo_409`，见 plan-20260917 LB-02 卡「判据规范 — EX-LB-01」门 11；该门只规定状态码）。LB-02 的 `delete_monorepo_entry`（`import_api_service.rs`）返回 `[code:409] import dir does not support delete entry`，wire 上 `err_message` = `import dir does not support delete entry`；LB-03 的 move 同样：源在 ImportRepo 下由 `ImportApiService` 返回 `[code:409] import dir does not support move entry`，目标在 ImportRepo 下由 monorepo handler 自查 `git_repo` 后返回同一文本。实现上**必须**带 `[code:409]` 前缀——这是推导出来的必要条件，不是计划原文：`GitError::CustomError` 只有带该前缀才会被 `common/errors/api.rs:175` 映射成 `StatusCode::CONFLICT`。**另有一个陷阱：** `map_ceres_error`（`common/errors/api.rs:194-208`）只识别 `400` 与 `404`，其余一律 `_ => ApiError::internal` → **500**，而它正是 `tag_router.rs` 的惯用写法。因此 delete/move 必须走裸 `?`（`From<E> for ApiError`，如 `preview_router.rs:121`）那条路径；若用 `map_ceres_error` 包装，即使带了 `[code:409]` 仍会落成 500 并使该门失败。今日 create-entry 的同类拒绝（`import_api_service.rs:56-64` 的 `CustomError("import dir does not support create entry")`）**没有**前缀，因而落成 500 + `"Internal server error"`——见「错误映射」，delete/move 不得复制该缺陷。其 Git 多分支与客户端 tag 语义不受本计划影响。
 
