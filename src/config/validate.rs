@@ -14,7 +14,12 @@ use super::{
     normalize_token_path,
     secret::{SecretRef, SecretResolver, is_secret_ref_value},
 };
-use crate::common::{errors::MegaError, oci_name::valid_repository_name};
+use crate::{
+    common::{
+        errors::MegaError, oci_name::valid_repository_name, utils::canonicalize_mono_ref_path,
+    },
+    jupiter::utils::converter::INIT_ROOT_RESERVED_NAMES,
+};
 #[rustfmt::skip]
 use crate::orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig};
 
@@ -456,6 +461,7 @@ pub(crate) fn validate_monorepo_config(mono_config: &MonoConfig) -> Result<(), M
         ));
     }
     require_non_empty_list_entries("monorepo.root_dirs", &mono_config.root_dirs)?;
+    validate_monorepo_path_shape(&mono_config.root_dirs, &mono_config.import_dir)?;
     require_non_empty_list_entries("monorepo.admin", &mono_config.admin)?;
 
     // ADR-UN-06 ⑤: the anonymous fallback principal is a reserved literal; it
@@ -482,6 +488,59 @@ pub(crate) fn validate_monorepo_config(mono_config: &MonoConfig) -> Result<(), M
         return Err(MegaError::Other(
             "monorepo.max_push_commits must be greater than 0".to_string(),
         ));
+    }
+
+    Ok(())
+}
+
+/// Shape of the path-policy settings (plan-20260923 ADR-FU-04): every
+/// `root_dirs` entry becomes a root tree item name verbatim (next to the
+/// entries `init_trees` reserves), and `import_dir` must live under one of
+/// those roots so ImportRepo attach never creates a new top-level tree.
+fn validate_monorepo_path_shape(root_dirs: &[String], import_dir: &Path) -> Result<(), MegaError> {
+    let mut seen = BTreeSet::new();
+    for (index, name) in root_dirs.iter().enumerate() {
+        let field = format!("monorepo.root_dirs[{index}]");
+        if name.contains(['/', '\\', '\0']) || name == "." || name == ".." {
+            return Err(MegaError::Other(format!(
+                "{field} must be a single path component (no '/', '\\', NUL, '.' or '..'); got {name:?}"
+            )));
+        }
+        if name.trim() != name {
+            return Err(MegaError::Other(format!(
+                "{field} must not have leading or trailing whitespace; got {name:?}"
+            )));
+        }
+        if INIT_ROOT_RESERVED_NAMES.contains(&name.as_str()) || name.eq_ignore_ascii_case(".git") {
+            return Err(MegaError::Other(format!(
+                "{field} {name:?} is reserved for the root tree"
+            )));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(MegaError::Other(format!("{field} {name:?} is duplicated")));
+        }
+    }
+
+    let field = "monorepo.import_dir";
+    let Some(import_dir) = import_dir.to_str() else {
+        return Err(MegaError::Other(format!("{field} must be valid UTF-8")));
+    };
+    if import_dir.contains(['\\', '\0']) {
+        return Err(MegaError::Other(format!(
+            "{field} must not contain '\\' or NUL; got {import_dir:?}"
+        )));
+    }
+    let canonical = canonicalize_mono_ref_path(import_dir).ok();
+    if import_dir == "/" || canonical.as_deref() != Some(import_dir) {
+        return Err(MegaError::Other(format!(
+            "{field} must be a canonical absolute non-root path such as \"/third-party\"; got {import_dir:?}"
+        )));
+    }
+    let first = import_dir[1..].split('/').next().unwrap_or_default();
+    if !root_dirs.iter().any(|name| name == first) {
+        return Err(MegaError::Other(format!(
+            "{field} first component {first:?} must be listed in monorepo.root_dirs"
+        )));
     }
 
     Ok(())
@@ -2608,6 +2667,189 @@ mod tests {
         );
     }
 
+    const SHIPPED_CONFIGS: [(&str, &str); 3] = [
+        (
+            "config/config.toml",
+            include_str!("../../config/config.toml"),
+        ),
+        (
+            "config/config-storage-only.toml",
+            include_str!("../../config/config-storage-only.toml"),
+        ),
+        (
+            "config/config-storage-only.none.toml",
+            include_str!("../../config/config-storage-only.none.toml"),
+        ),
+    ];
+
+    fn monorepo_shape_error(root_dirs: &[&str], import_dir: &str) -> String {
+        let mut config = valid_config();
+        config.monorepo.root_dirs = root_dirs.iter().map(|name| name.to_string()).collect();
+        config.monorepo.import_dir = PathBuf::from(import_dir);
+        config
+            .validate()
+            .map(|()| format!("accepted {root_dirs:?} / {import_dir:?}"))
+            .unwrap_or_else(|err| err.to_string())
+    }
+
+    #[test]
+    fn monorepo_root_dirs_rejects_invalid_entries() {
+        for (root_dirs, field) in [
+            (
+                vec!["third-party", "project", "project"],
+                "monorepo.root_dirs[2]",
+            ),
+            (vec!["third-party", "a/b"], "monorepo.root_dirs[1]"),
+            (vec!["third-party", "/project"], "monorepo.root_dirs[1]"),
+            (vec!["third-party", "a\\b"], "monorepo.root_dirs[1]"),
+            (vec!["third-party", "."], "monorepo.root_dirs[1]"),
+            (vec!["third-party", ".."], "monorepo.root_dirs[1]"),
+            (vec!["third-party", ""], "monorepo.root_dirs[1]"),
+            (vec!["third-party", "a\0b"], "monorepo.root_dirs[1]"),
+            (vec!["third-party", " project"], "monorepo.root_dirs[1]"),
+            (vec!["third-party", "project "], "monorepo.root_dirs[1]"),
+            (vec!["third-party", ".GIT"], "monorepo.root_dirs[1]"),
+            (vec!["third-party", ".cedar"], "monorepo.root_dirs[1]"),
+            (
+                vec!["third-party", ".mega_cedar.json"],
+                "monorepo.root_dirs[1]",
+            ),
+            (vec!["third-party", ".buckroot"], "monorepo.root_dirs[1]"),
+            (vec!["third-party", ".buckconfig"], "monorepo.root_dirs[1]"),
+        ] {
+            let err = monorepo_shape_error(&root_dirs, "/third-party");
+            assert!(err.contains(field), "{root_dirs:?}: {err}");
+        }
+
+        let mut config = valid_config();
+        config.monorepo.root_dirs = ["third-party", ".config", "v1.2", "my project"]
+            .map(str::to_string)
+            .to_vec();
+        validate_monorepo_config(&config.monorepo)
+            .expect("single-component names with dots or inner spaces are valid");
+
+        // The reserved list must match what init_trees actually adds.
+        let (_, _, root) = crate::jupiter::utils::converter::init_trees(&config.monorepo);
+        for item in &root.tree_items {
+            assert!(
+                config.monorepo.root_dirs.contains(&item.name)
+                    || INIT_ROOT_RESERVED_NAMES.contains(&item.name.as_str()),
+                "init_trees root entry {:?} is neither a root dir nor reserved",
+                item.name
+            );
+        }
+        for reserved in INIT_ROOT_RESERVED_NAMES {
+            assert!(
+                root.tree_items.iter().any(|item| item.name == reserved),
+                "reserved name {reserved:?} is not added by init_trees"
+            );
+        }
+    }
+
+    #[test]
+    fn monorepo_import_dir_shape() {
+        for import_dir in [
+            "/",
+            "third-party",
+            "/third-party/",
+            "//third-party",
+            "/third-party/./vendor",
+            "/third-party/../project",
+            " /third-party",
+            "/third\\party",
+            "/third-party\0",
+        ] {
+            let err = monorepo_shape_error(&["third-party", "project"], import_dir);
+            assert!(err.contains("monorepo.import_dir"), "{import_dir:?}: {err}");
+        }
+        let err = monorepo_shape_error(&["third-party"], "/third-party/ven\0dor");
+        assert!(
+            err.contains("monorepo.import_dir") && err.contains("NUL"),
+            "{err}"
+        );
+
+        let err = monorepo_shape_error(&["project"], "/vendor");
+        assert!(
+            err.contains("monorepo.import_dir") && err.contains("monorepo.root_dirs"),
+            "{err}"
+        );
+
+        for import_dir in ["/third-party", "/third-party/vendor"] {
+            let mut config = valid_config();
+            config.monorepo.root_dirs = vec!["third-party".to_string(), "project".to_string()];
+            config.monorepo.import_dir = PathBuf::from(import_dir);
+            validate_monorepo_config(&config.monorepo)
+                .unwrap_or_else(|err| panic!("{import_dir:?} must validate: {err}"));
+        }
+    }
+
+    #[test]
+    fn monorepo_shape_error_names_field_without_secret() {
+        const SECRET: &str = "fu04-shape-secret-token-value";
+        let mut config = valid_config();
+        config.git.push_tokens = vec![PushTokenConfig {
+            name: "fu04".to_string(),
+            token: SECRET.to_string(),
+            paths: None,
+        }];
+        config.monorepo.root_dirs = vec!["third-party".to_string(), "a/b".to_string()];
+        let err = config.validate().expect_err("invalid root dir").to_string();
+        assert!(err.contains("monorepo.root_dirs[1]"), "{err}");
+        assert!(!err.contains(SECRET), "{err}");
+        assert!(!err.contains(&config.database.db_url), "{err}");
+    }
+
+    #[test]
+    fn shipped_configs_pass_monorepo_shape() {
+        for (name, raw) in SHIPPED_CONFIGS {
+            let doc: Value = toml::from_str(raw).unwrap_or_else(|err| panic!("{name}: {err}"));
+            let monorepo: MonoConfig = doc
+                .get("monorepo")
+                .unwrap_or_else(|| panic!("{name}: [monorepo] section"))
+                .clone()
+                .try_into()
+                .unwrap_or_else(|err| panic!("{name}: [monorepo]: {err}"));
+            validate_monorepo_path_shape(&monorepo.root_dirs, &monorepo.import_dir)
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+        }
+    }
+
+    #[test]
+    fn monorepo_shipped_config_comments() {
+        fn comment_block(name: &str, raw: &str, key: &str) -> String {
+            let lines: Vec<&str> = raw.lines().collect();
+            let index = lines
+                .iter()
+                .position(|line| line.starts_with(&format!("{key} =")))
+                .unwrap_or_else(|| panic!("{name}: {key}"));
+            let mut block: Vec<&str> = lines[..index]
+                .iter()
+                .rev()
+                .take_while(|line| line.trim_start().starts_with('#'))
+                .copied()
+                .collect();
+            block.reverse();
+            block.join("\n")
+        }
+
+        for (name, raw) in SHIPPED_CONFIGS {
+            let roots = comment_block(name, raw, "root_dirs");
+            for phrase in ["单组件", "唯一", "'\\'", "NUL"] {
+                assert!(
+                    roots.contains(phrase),
+                    "{name} root_dirs comment lacks {phrase}"
+                );
+            }
+            let import = comment_block(name, raw, "import_dir");
+            for phrase in ["import 优先", "root_dirs", "'\\'", "NUL", "'..'"] {
+                assert!(
+                    import.contains(phrase),
+                    "{name} import_dir comment lacks {phrase}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn config_validate_accepts_blake3_bootstrap_object_format() {
         let mut config = valid_config();
@@ -4242,15 +4484,25 @@ mod tests {
         imported.monorepo.import_dir = PathBuf::from("/project/vendor");
         imported.github_sync.bindings[0].path = "/project/vendor/lib".to_string();
         let err = imported.validate().expect_err("path under import_dir");
-        assert!(err.to_string().contains("monorepo.import_dir"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("path must not be under monorepo.import_dir"),
+            "{err}"
+        );
 
+        // A noncanonical import_dir no longer reaches the binding check: the
+        // monorepo shape check rejects it first (plan-20260923 FU-04).
         let mut dotted_import = github_sync_enabled_base();
         dotted_import.monorepo.import_dir = PathBuf::from("/project/./vendor");
         dotted_import.github_sync.bindings[0].path = "/project/vendor/lib".to_string();
         let err = dotted_import
             .validate()
-            .expect_err("noncanonical import_dir still covers the subtree");
-        assert!(err.to_string().contains("monorepo.import_dir"), "{err}");
+            .expect_err("noncanonical import_dir is rejected");
+        assert!(
+            err.to_string()
+                .contains("monorepo.import_dir must be a canonical absolute non-root path"),
+            "{err}"
+        );
 
         let mut duplicate = github_sync_enabled_base();
         duplicate.github_sync.bindings = vec![

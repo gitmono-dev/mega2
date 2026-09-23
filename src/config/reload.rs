@@ -1036,7 +1036,7 @@ mod tests {
         let handle = ConfigHandle::new(current);
 
         let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        candidate.monorepo.root_dirs = vec!["changed-root".to_string()];
+        candidate.monorepo.root_dirs = vec!["third-party".to_string(), "changed-root".to_string()];
         candidate.monorepo.object_format = crate::config::MonoObjectFormat::Sha256;
         candidate.monorepo.push_policy = crate::config::PushPolicy::Trunk;
         candidate.git.push_auth = Some(crate::config::PushAuth::None);

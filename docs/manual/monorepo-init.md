@@ -20,16 +20,16 @@
 | 字段 | 作用 | 对目录结构的影响 |
 |---|---|---|
 | `root_dirs` | 根树下一层目录名列表 | 每个名字生成一个一级目录，内含独立 `.gitkeep` 占位 |
-| `import_dir` | ImportRepo 根（默认 `/third-party`） | 不改变树的生成，只决定其下路径按 ImportRepo 语义工作（多分支、客户端 tag 合法）；通常与 `root_dirs` 中某项对齐 |
+| `import_dir` | ImportRepo 根（默认 `/third-party`） | 不改变树的生成，只决定其下路径按 ImportRepo 语义工作（多分支、客户端 tag 合法）；首组件必须列在 `root_dirs` 中（校验强制） |
 | `admin` | 系统管理员列表 | 写入根级 `.mega_cedar.json` 实体，并成为 `.cedar/policies.cedar` 的全库默认 reviewer |
 | `rename.*` | diff 重命名检测参数 | 与初始化布局无关 |
 
 约束与生效方式：
 
-- `import_dir` / `root_dirs` / `admin` 均校验非空（`src/config/validate.rs`），配置错误会导致启动失败。
+- `import_dir` / `root_dirs` / `admin` 均校验非空；`root_dirs` 与 `import_dir` 另有形状校验（`src/config/validate.rs`，规则见 [`../configuration.zh.md`](../configuration.zh.md) 的 `[monorepo]` 条目）：`root_dirs` 每项为唯一的单组件目录名且不占用根树保留项，`import_dir` 为规范绝对非根路径且首组件列在 `root_dirs` 中。`config validate`、服务启动与热重载候选同一校验，配置错误会导致启动失败并点名字段。
 - 这些字段属于热加载的 `restart_required_fields`：修改后必须**重启进程**。
 - 配置变更只影响**尚未初始化**的新库；已初始化库不会随配置变更自动重建树。
-- **目录层级限制**：`root_dirs` 只支持**一级目录名**，条目含 `/` 不会分段建树，且会产生非法树（详见第 5 节「目录层级限制」）。
+- **目录层级限制**：`root_dirs` 只支持**一级目录名**，含 `/` 的条目在校验阶段即被拒绝（详见第 5 节「目录层级限制」）。
 
 ## 3. 目录结构的生成规则
 
@@ -54,11 +54,11 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 
 ### 各目录的作用
 
-先说边界：引擎只对 **`import_dir` 对齐**与 **`toolchains` 的 BUCK 注入**做特殊处理；其余目录的用途是**产品约定**，引擎不强制——初始化时对每个目录一律只写入 `.gitkeep` 占位，目录的真正语义由团队使用习惯承载。
+先说边界：引擎只对 **`import_dir` 对齐**（校验强制 `import_dir` 首组件列在 `root_dirs` 中）与 **`toolchains` 的 BUCK 注入**做特殊处理；其余目录的用途是**产品约定**，引擎不强制——初始化时对每个目录一律只写入 `.gitkeep` 占位，目录的真正语义由团队使用习惯承载。
 
 | 目录 | 作用 |
 |---|---|
-| `third-party/` | 第三方导入仓库的归放根，**应与 `import_dir` 对齐**（引擎不强制，脱节后果见下文）；其下每个子路径是一个 ImportRepo，按普通 Git 语义工作（多分支、客户端 tag 合法），Monorepo 的单分支/禁客户端 tag 规则不适用。详见下文「`import_dir` 的作用」 |
+| `third-party/` | 第三方导入仓库的归放根，**与 `import_dir` 对齐**（默认配置；校验要求 `import_dir` 的首组件列在 `root_dirs` 中）；其下每个子路径是一个 ImportRepo，按普通 Git 语义工作（多分支、客户端 tag 合法），Monorepo 的单分支/禁客户端 tag 规则不适用。详见下文「`import_dir` 的作用」 |
 | `project/` | 业务工程源码主目录：团队的日常开发代码按子项目组织于此 |
 | `doc/` | 文档目录：设计文档、规范、评审材料等与代码同仓管理的文档 |
 | `artifact/` | 构建/打包产物的归放约定（如发布包、产物清单）。注意引擎另有独立的 artifact 存储子系统（buck/artifacts API 与 `artifact_objects` 表，经对象存储承载），与本目录的约定不是同一物 |
@@ -101,30 +101,28 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 
 - **路径分类**：协议层按请求路径是否落在 `import_dir` 之下，把仓库判定为 ImportRepo 或 Monorepo（`GitProtocolPath`，见 [`../refactoring/protocol.md`](../refactoring/protocol.md)）。分类按路径前缀判定，与该目录是否已存在于树中无关。
 - **规则豁免**：`import_dir` 下的 ImportRepo 允许普通 Git 多分支语义、允许客户端推送/删除 tag；Monorepo 区域则只有公开 `main` 分支、tag 仅经 Web/API、非 `main` 推送进入 `refs/cl/*` 管线（规则全文见 [`../monorepo.md`](../monorepo.md)）。
-- **不参与树的生成**：`import_dir` 本身不产生目录——目录来自 `root_dirs`。若 `root_dirs` 没有对应项，初始化后该路径在树中不存在，但路径分类规则依然生效。
-- **保持对齐**：建议 `root_dirs` 含 `third-party` 且 `import_dir = "/third-party"`（引擎不强制）。二者脱节会导致「目录可见但按 Monorepo 规则工作」或「按 ImportRepo 规则工作但布局中无对应目录」的混乱。修改 `import_dir` 属 `restart_required`，且只影响路径分类，不影响已生成的树。
+- **不参与树的生成**：`import_dir` 本身不产生目录——目录来自 `root_dirs`。因此校验要求 `import_dir` 的首组件必须列在 `root_dirs` 中（例如 `root_dirs = ["project"]` 配 `import_dir = "/vendor"` 会被拒绝），保证 ImportRepo 首次挂载不会新建顶层目录。
+- **import 优先**：`import_dir` 之下的路径一律按 ImportRepo 处理（由 Git 推送创建），即使 `root_dirs` 含同名项。默认 `root_dirs` 含 `third-party` 且 `import_dir = "/third-party"`。修改 `import_dir` 属 `restart_required`，且只影响路径分类，不影响已生成的树。
 
 注意默认值差异：`config init` 生成的模板（`src/config/template.rs`）与 `MonoConfig::default`（`src/config/model.rs`）的 `root_dirs` 都不含 `artifact` / `data`（模板也不含 `model`）。如需本文建议的八目录布局，请在首次初始化前于 `config.toml` 显式设置 `root_dirs`；**实际布局以运行配置为准**。
 
 ## 5. 如何定制目录结构
 
 1. **在首次启动前**编辑 `config/config.toml` 的 `[monorepo].root_dirs`，增删一级目录名。
-2. 若把 `third-party` 改名或移除，必须同步调整 `import_dir`，保持二者对齐，否则 ImportRepo 路径判定与目录布局会脱节。
+2. 若把 `third-party` 改名或移除，必须同步调整 `import_dir`，使其首组件仍列在 `root_dirs` 中，否则 `config validate` 与启动都会失败。
 3. 设置 `admin` 为真实的系统管理员账号列表（写入 Cedar 实体与默认 reviewer）。
 4. 用 `cargo run -p mega2 -- --config config/config.toml config validate` 预检配置合法性。
 5. 以**空数据库**（或未初始化过的库）启动服务，初始化自动完成；可用 `git ls-remote` 或 clone 后 `git ls-tree` 核对根树与本文第 4 节一致。
 
 ### 目录层级限制：只初始化一级目录
 
-`init_trees` 把 `root_dirs` 的每个字符串**原样**作为根树中单个条目的名字（`src/jupiter/utils/converter.rs`），不按 `/` 分段递归建树；配置校验（`src/config/validate.rs::validate_monorepo_config`）目前也只检查条目非空，不检查斜杠。因此：
+`init_trees` 把 `root_dirs` 的每个字符串**原样**作为根树中单个条目的名字（`src/jupiter/utils/converter.rs`），不按 `/` 分段递归建树。因此配置校验（`src/config/validate.rs`）要求每项是单组件名：
 
-- `root_dirs = ["a/b"]` **能通过校验**，但初始化会把 `a/b` 当作字面条目名写进根树，而不是构建 `a/` → `b/` 的层级；
-- Git tree 条目名含 `/` 是非法的：`git fsck` 报错、客户端 checkout 拒绝；mega2 的路径导航按 `/` 分段逐级查找（`normalize_repo_path`），请求 `/a/b` 会查找根下名为 `a` 的条目——不存在，该条目对客户端与 API 均不可达；
-- `toolchains` 的 BUCK 注入特判只 trim 首尾斜杠，`foo/toolchains` 这类嵌套名不会命中，不会注入 `BUCK`。
+- `root_dirs = ["a/b"]`、含 `\`、NUL、首尾空格，或为 `.`、`..`、空串的条目**在校验阶段即被拒绝**，不会生成含非法条目名的根树；
+- 与 `init_trees` 自带根条目同名（`.cedar`、`.mega_cedar.json`、`.buckroot`、`.buckconfig`）或为 `.git`（不区分大小写）的条目同样被拒绝，避免根树重复条目或客户端拒绝 checkout；
+- `toolchains` 的 BUCK 注入按条目名 `toolchains` 精确匹配。
 
 **多级目录的正确做法**：初始化只铺设一级骨架；更深层级由客户端正常提交产生——clone 后 `mkdir -p a/b && git add && git commit && git push`（非 `main` 推送进入 CL 管线，合并后落地 `main`）。
-
-> **已知缺口**：`validate_monorepo_config` 尚未对 `root_dirs` 条目做字符校验（应拒绝 `/` / `\`），当前属于「配置合法但产物损坏」的 fail-open 点；修复落地前请以本节约束为准。
 
 已初始化库要变更布局：不支持自动重建；只能由客户端正常提交目录变更，或在明确接受数据重置的前提下清空数据面后重新初始化（属破坏性操作，本文不提供步骤）。
 

@@ -417,6 +417,11 @@ pub fn generate_git_keep_with_timestamp() -> Blob {
     Blob::from_content(&git_keep_content)
 }
 
+/// Root tree entries `init_trees` adds besides `root_dirs`; a `root_dirs`
+/// entry with one of these names would duplicate a root tree item.
+pub const INIT_ROOT_RESERVED_NAMES: [&str; 4] =
+    [".mega_cedar.json", ".cedar", ".buckroot", ".buckconfig"];
+
 pub fn init_trees(
     mono_config: &MonoConfig,
 ) -> (HashMap<ObjectHash, Tree>, HashMap<ObjectHash, Blob>, Tree) {

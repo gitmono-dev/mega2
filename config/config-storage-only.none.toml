@@ -125,6 +125,13 @@ url = "redis://127.0.0.1:6379"
 # a single public branch `main`.
 # 场景:该目录下的路径按导入仓库处理(可保留多分支与客户端 tag);其余一律按
 # monorepo 管理,只有 `main` 一个公开分支.
+# Shape / 形状: canonical absolute non-root path (no trailing '/', no '//', '.'
+# or '..' segments, no '\' or NUL) whose first component is listed in
+# `root_dirs`. Import first: a path under import_dir is always an ImportRepo
+# (created by Git push), even if `root_dirs` has the same name.
+# 规范绝对非根路径(无尾 '/'、无 '//'、'.'、'..' 段,不含 '\' 或 NUL),首组件
+# 必须列在 root_dirs 中;import 优先:该目录下的路径一律按 ImportRepo 处理(由
+# Git 推送创建),即使 root_dirs 含同名项.
 import_dir = "/third-party"
 
 # System admins at `service init` / 初始化时的系统管理员.
@@ -140,6 +147,13 @@ admin = ["mega2"]
 # data migration, not a config edit.
 # 场景:monorepo 树的固定命名空间,下文 token 的 `paths` 授权就写这些根.
 # 重组它们属于数据迁移,不是改配置能解决的.
+# Shape / 形状: each entry is a unique single path component: no '/', '\' or
+# NUL; not '.', '..' or empty; no leading/trailing spaces; not a reserved root
+# entry (.cedar, .mega_cedar.json, .buckroot, .buckconfig, .git). `config
+# validate` and startup reject anything else.
+# 每项为唯一的单组件目录名:不含 '/'、'\' 或 NUL,不能是 '.'、'..' 或空串,无首尾
+# 空格,且不能是根树保留项(.cedar、.mega_cedar.json、.buckroot、.buckconfig、.git),
+# 否则校验失败.
 root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
 
 # Object-ID hash for the repo graph / 仓库图的 Object-ID 哈希.
