@@ -72,20 +72,93 @@ pub fn format_commit_msg(msg: &str, gpg_sig: Option<&str>) -> String {
     }
 }
 
-/// parse commit message
-pub fn parse_commit_msg(msg_gpg: &str) -> (&str, Option<&str>) {
-    const SIG_PATTERN: &str = r"^gpgsig (-----BEGIN (?:PGP|SSH) SIGNATURE-----[\s\S]*?-----END (?:PGP|SSH) SIGNATURE-----)";
-    const GPGSIG_PREFIX_LEN: usize = 7; // length of "gpgsig "
+/// A git-internal `Commit::message` split into its extra header fields and
+/// its message body (plan-20260923 ADR-FU-01).
+///
+/// git-internal stores everything after the `committer` line in `message`:
+/// extra headers such as `gpgsig` / `gpgsig-sha256` (with space-prefixed
+/// continuation lines), the header/body blank line, and the body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMessageParts<'a> {
+    /// Extra header fields in order; continuation lines are joined with `\n`
+    /// (without their leading space).
+    pub headers: Vec<(&'a str, String)>,
+    /// Message body bytes exactly as stored (never trimmed).
+    pub body: &'a str,
+}
 
-    let sig_regex = Regex::new(SIG_PATTERN).unwrap();
-    if let Some(caps) = sig_regex.captures(msg_gpg) {
-        let signature = caps.get(1).unwrap().as_str();
-
-        let msg = &msg_gpg[signature.len() + GPGSIG_PREFIX_LEN..].trim_start();
-        (msg, Some(signature))
-    } else {
-        (msg_gpg.trim_start(), None)
+impl CommitMessageParts<'_> {
+    /// Whether any extra header is a commit signature.
+    pub fn has_signature(&self) -> bool {
+        self.headers.iter().any(|(key, _)| is_signature_header(key))
     }
+}
+
+/// Commit header keys that carry a detached signature.
+pub fn is_signature_header(key: &str) -> bool {
+    matches!(key, "gpgsig" | "gpgsig-sha256")
+}
+
+/// Split a git-internal commit `message` into extra headers and body using
+/// Git's header grammar: `key SP value` lines (key `[A-Za-z0-9-]+`) and
+/// space-prefixed continuation lines, terminated by an empty line.
+///
+/// A message that starts with `\n` has no extra headers. Anything that does
+/// not parse as a complete header block (including historical unframed
+/// messages such as `create new directory demo`) is returned whole as the
+/// body. Bytes are never trimmed and CRLF is preserved.
+pub fn split_commit_message(message: &str) -> CommitMessageParts<'_> {
+    let whole = || CommitMessageParts {
+        headers: Vec::new(),
+        body: message,
+    };
+    if let Some(body) = message.strip_prefix('\n') {
+        return CommitMessageParts {
+            headers: Vec::new(),
+            body,
+        };
+    }
+    let mut headers: Vec<(&str, String)> = Vec::new();
+    let mut rest = message;
+    loop {
+        let Some(newline) = rest.find('\n') else {
+            return whole();
+        };
+        let line = &rest[..newline];
+        let after = &rest[newline + 1..];
+        if line.is_empty() {
+            return CommitMessageParts {
+                headers,
+                body: after,
+            };
+        }
+        if let Some(continuation) = line.strip_prefix(' ') {
+            let Some((_, value)) = headers.last_mut() else {
+                return whole();
+            };
+            value.push('\n');
+            value.push_str(continuation);
+        } else {
+            match line.split_once(' ') {
+                Some((key, value))
+                    if !key.is_empty()
+                        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
+                {
+                    headers.push((key, value.to_owned()));
+                }
+                _ => return whole(),
+            }
+        }
+        rest = after;
+    }
+}
+
+/// First non-empty line of a commit message body, trimmed (display only).
+pub fn commit_body_subject(body: &str) -> &str {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
 }
 
 // check if the commit message is conventional commit
@@ -271,5 +344,73 @@ mod test {
         assert_eq!(escape_like(r"a\b"), r"a\\b");
         assert_eq!(escape_like(r"%_\"), r"\%\_\\");
         assert_eq!(escape_like(r"foo\%bar"), r"foo\\\%bar");
+    }
+
+    const PGP_ARMOR: &str = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n wsBcBAABCAAQBQJ\n =abcd\n -----END PGP SIGNATURE-----\n";
+
+    #[test]
+    fn split_commit_message_grammar() {
+        // PGP `gpgsig` with multi-line continuations, then body.
+        let msg = format!("{PGP_ARMOR}\nfeat: subject\n\nbody\n");
+        let parts = split_commit_message(&msg);
+        assert_eq!(parts.body, "feat: subject\n\nbody\n");
+        assert!(parts.has_signature());
+        assert_eq!(parts.headers.len(), 1);
+        assert!(parts.headers[0].1.ends_with("-----END PGP SIGNATURE-----"));
+
+        // `gpgsig-sha256` is a signature header too.
+        let msg = "gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n x\n -----END PGP SIGNATURE-----\n\nsha256 subject\n";
+        let parts = split_commit_message(msg);
+        assert_eq!(parts.body, "sha256 subject\n");
+        assert!(parts.has_signature());
+
+        // SSH armor.
+        let msg = "gpgsig -----BEGIN SSH SIGNATURE-----\n U1NIU0lH\n -----END SSH SIGNATURE-----\n\nssh subject\n";
+        assert_eq!(split_commit_message(msg).body, "ssh subject\n");
+
+        // Truncated armor still parses deterministically by the continuation grammar.
+        let msg = "gpgsig -----BEGIN PGP SIGNATURE-----\n wsBc\n\ntruncated subject\n";
+        let parts = split_commit_message(msg);
+        assert_eq!(parts.body, "truncated subject\n");
+        assert!(parts.has_signature());
+
+        // No extra headers: git-internal keeps the separator as a leading newline.
+        let parts = split_commit_message("\nplain subject\n");
+        assert_eq!(parts.body, "plain subject\n");
+        assert!(parts.headers.is_empty());
+
+        // A body whose first line starts with `gpgsig` stays body.
+        let parts = split_commit_message("\ngpgsig is a word here\n");
+        assert_eq!(parts.body, "gpgsig is a word here\n");
+        assert!(!parts.has_signature());
+
+        // Unknown header plus signature.
+        let msg = format!("encoding ISO-8859-1\n{PGP_ARMOR}\nmixed subject\n");
+        let parts = split_commit_message(&msg);
+        assert_eq!(parts.body, "mixed subject\n");
+        assert_eq!(parts.headers[0], ("encoding", "ISO-8859-1".to_owned()));
+        assert!(parts.has_signature());
+
+        // Historical unframed message (no header/body separator) is all body.
+        let parts = split_commit_message("create new directory demo");
+        assert_eq!(parts.body, "create new directory demo");
+        assert!(parts.headers.is_empty());
+
+        // CRLF body bytes are preserved exactly.
+        let msg = format!("{PGP_ARMOR}\ncrlf subject\r\n\r\nbody\r\n");
+        assert_eq!(
+            split_commit_message(&msg).body,
+            "crlf subject\r\n\r\nbody\r\n"
+        );
+
+        // Empty body.
+        let msg = format!("{PGP_ARMOR}\n");
+        assert_eq!(split_commit_message(&msg).body, "");
+
+        assert_eq!(
+            commit_body_subject("\n\n  first line  \nsecond\n"),
+            "first line"
+        );
+        assert_eq!(commit_body_subject(""), "");
     }
 }

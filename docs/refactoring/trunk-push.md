@@ -1236,7 +1236,7 @@ CREATE INDEX mega_refs_path_pattern
 
 **3.2 message 与 trailer**
 
-链长为 1 时退化为 tip 的 message 原样，零损失。链长 N > 1 时（`ordered_commits` 是 tip 在前，枚举时反转为拓扑升序）：
+链长为 1 时退化为 tip 的 message **正文**原样（`gpgsig` 等额外头剥离，见下文），零损失。链长 N > 1 时（`ordered_commits` 是 tip 在前，枚举时反转为拓扑升序）：
 
 ```
 Squash 3 commits at /project/foo
@@ -1276,7 +1276,7 @@ Mono-Squash-Range: 9f8e7d6..i7j8k9l0m1n2
 Mono-Squash-Count: 3
 ```
 
-N = 1 时不存在 squash，各层 roll-up 的 message 一律取客户端 commit 的 message 原样，无 `Mono-Squash-*` trailer。
+N = 1 时不存在 squash，各层 roll-up 的 message 一律取客户端 commit 的 message **正文**原样，无 `Mono-Squash-*` trailer。「正文」指 commit 对象中头/体空行之后的字节：git-internal 把 `gpgsig` / `gpgsig-sha256` 等额外头放在 `Commit.message` 里，合成层 commit 必须先按 Git 头文法剥离这些头（`src/common/utils.rs` 的 `split_commit_message`），否则客户端签名块会落进合成 commit 的正文、`git log --oneline` 显示为 `gpgsig -----BEGIN PGP SIGNATURE-----`（issue #28；[`plan-20260923.md`](../plan/plan-20260923.md) FU-01）。合成层 commit 只带服务端签名；客户端签名只保留在被推路径逐字落地的 commit 上。squash 清单中的逐条主题同样取正文首个非空行。
 
 这条规则同时限定了体积：**一次推送只产生一份完整枚举**，与已物化祖先/后代的层数无关。若各层都带完整枚举，体积会是「枚举 × 层数」，而层数随 `ls-remote` 这类只读操作单调增长（见写入模型一节对物化的说明），代价将不可控。`Mono-Squash-Commit` 是**不可变的 commit id**（被推路径 squash commit 的对象 id）——不是「当前 tip」这类活引用表述：后续推送推进 `main@P` 后，该 id 仍精确指向那份完整清单，`git show <id>` 一跳可达。
 

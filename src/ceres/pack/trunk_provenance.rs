@@ -12,7 +12,10 @@ use git_internal::{
     },
 };
 
-use crate::common::errors::MegaError;
+use crate::common::{
+    errors::MegaError,
+    utils::{commit_body_subject, split_commit_message},
+};
 
 /// Server-sign a trunk synthetic commit without rewriting identity.
 pub type TrunkMegaSign = std::sync::Arc<dyn Fn(&Commit) -> Result<Commit, MegaError> + Send + Sync>;
@@ -52,7 +55,10 @@ impl TrunkProvenance {
             squash_commit_id,
             range,
             land_ts,
-            n1_message: tip.message.clone(),
+            // git-internal keeps extra headers (e.g. the client's `gpgsig`) in
+            // `message`; a synthesized layer commit carries only the body, and
+            // the server signature is embedded separately (ADR-FU-01).
+            n1_message: split_commit_message(&tip.message).body.to_owned(),
         }
     }
 
@@ -214,12 +220,7 @@ fn identity_key(sig: &Signature) -> String {
 }
 
 fn commit_subject(message: &str) -> String {
-    message
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim()
-        .to_owned()
+    commit_body_subject(split_commit_message(message).body).to_owned()
 }
 
 fn author_date_range_trailer(topo_asc: &[Commit]) -> Option<String> {
@@ -426,11 +427,30 @@ mod tests {
         assert_eq!(land.timezone, "+0000");
     }
 
+    const SIGNED_TIP_MESSAGE: &str = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n wsBcBAABCAAQBQJ\n =abcd\n -----END PGP SIGNATURE-----\n\nfeat: signed subject\n\nbody\n";
+
     #[test]
-    fn n1_layer_message_is_verbatim() {
-        let tip = commit("feat: keep me\n\nbody\n", alice(9), None);
+    fn n1_layer_message_is_body() {
+        // Unsigned tip as git-internal parses it: leading header/body newline.
+        let tip = commit("\nfeat: keep me\n\nbody\n", alice(9), None);
         let plan = TrunkProvenance::from_tip(&tip, 1, "/p", tip.id.to_string(), None, 99);
-        assert_eq!(plan.layer_message("/"), tip.message);
+        assert_eq!(plan.layer_message("/"), "feat: keep me\n\nbody\n");
         assert!(!plan.layer_message("/").contains("Mono-Squash"));
+
+        // Signed tip: the client's signature header never reaches the layer body.
+        let signed = commit(SIGNED_TIP_MESSAGE, alice(10), None);
+        let plan = TrunkProvenance::from_tip(&signed, 1, "/p", signed.id.to_string(), None, 99);
+        assert_eq!(plan.layer_message("/"), "feat: signed subject\n\nbody\n");
+        assert!(!plan.layer_message("/").contains("BEGIN PGP SIGNATURE"));
+    }
+
+    #[test]
+    fn squash_subject_skips_signature() {
+        let a = commit(SIGNED_TIP_MESSAGE, alice(10), None);
+        let b = commit("\nfix: second\n", bob(11), Some(a.id));
+        let msg = squash_message("/p", &[a, b.clone()], None, &b.author);
+        assert!(msg.contains("feat: signed subject"), "{msg}");
+        assert!(msg.contains("fix: second"), "{msg}");
+        assert!(!msg.contains("gpgsig"), "{msg}");
     }
 }

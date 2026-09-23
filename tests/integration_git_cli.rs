@@ -2104,6 +2104,182 @@ fn integration_git_cli_trunk_n_gt1_squash_sideband_and_nff_align() {
     );
 }
 
+/// Armored `gpgsig` continuation lines of the crafted client signature
+/// (plan-20260923 FU-01). The signature is fake: these tests exercise message
+/// framing, not signature verification.
+const FU01_CLIENT_ARMOR: [&str; 4] = [
+    "",
+    "wsBcBAABCAAQBQJqs4Y2AAoJEL3O4XUlXQv8ziAIALYndD",
+    "=fu01",
+    "-----END PGP SIGNATURE-----",
+];
+
+/// Create a commit on top of `repo`'s HEAD whose raw bytes carry a multi-line
+/// armored `gpgsig` header, point `main` at it, and return its id.
+fn craft_signed_commit(case_dir: &Path, repo: &str, subject: &str) -> String {
+    git_ok_no_auth(case_dir, &["-C", repo, "add", "-A"]);
+    let tree = git_stdout_no_auth(case_dir, &["-C", repo, "write-tree"]);
+    let parent = git_stdout_no_auth(case_dir, &["-C", repo, "rev-parse", "HEAD"]);
+    let mut raw = format!(
+        "tree {tree}\nparent {parent}\n\
+         author IT Signed <it-signed@example.invalid> 1790000000 +0000\n\
+         committer IT Signed <it-signed@example.invalid> 1790000000 +0000\n\
+         gpgsig -----BEGIN PGP SIGNATURE-----\n"
+    );
+    for line in FU01_CLIENT_ARMOR {
+        raw.push(' ');
+        raw.push_str(line);
+        raw.push('\n');
+    }
+    raw.push_str(&format!("\n{subject}\n\nsigned body\n"));
+    let raw_path = case_dir.join(format!("{repo}-signed-commit.txt"));
+    fs::write(&raw_path, raw).expect("write crafted commit");
+    let raw_arg = raw_path.to_str().expect("utf8 path");
+    let id = git_stdout_no_auth(
+        case_dir,
+        &["-C", repo, "hash-object", "-t", "commit", "-w", raw_arg],
+    );
+    git_ok_no_auth(case_dir, &["-C", repo, "reset", "--hard", &id]);
+    id
+}
+
+/// Clone `url` and assert that its tip is a Mega2-synthesized layer commit
+/// whose message is the signed tip's body: exactly one (server) `gpgsig`
+/// header, no armor in the body, the expected subject, and strict fsck.
+fn assert_layer_commit_body_clean(case_dir: &Path, url: &str, clone: &str, subject: &str) {
+    git_ok_no_auth(case_dir, &["clone", url, clone]);
+    let raw = git_stdout_no_auth(case_dir, &["-C", clone, "cat-file", "-p", "HEAD"]);
+    let (headers, body) = raw
+        .split_once("\n\n")
+        .unwrap_or_else(|| panic!("{url}: layer commit has no header/body separator:\n{raw}"));
+    let gpgsig_headers = headers.lines().filter(|l| l.starts_with("gpgsig ")).count();
+    assert_eq!(
+        gpgsig_headers, 1,
+        "{url}: layer commit must carry exactly one (server) gpgsig header:\n{raw}"
+    );
+    assert!(
+        !headers.contains(FU01_CLIENT_ARMOR[1]),
+        "{url}: the client gpgsig must not be copied into the layer headers:\n{raw}"
+    );
+    assert!(
+        !body.contains("-----BEGIN PGP SIGNATURE-----") && !body.contains("gpgsig"),
+        "{url}: client signature leaked into the layer body:\n{raw}"
+    );
+    let shown = git_stdout_no_auth(case_dir, &["-C", clone, "log", "-1", "--format=%s"]);
+    assert_eq!(shown, subject, "{url}: layer subject");
+    git_ok_no_auth(case_dir, &["-C", clone, "fsck", "--strict"]);
+}
+
+/// Assert the pushed path P kept the client commit byte-for-byte.
+fn assert_client_commit_landed_verbatim(case_dir: &Path, url: &str, clone: &str, id: &str) {
+    assert_eq!(
+        ls_remote_main(case_dir, url),
+        id,
+        "{url}: main must be the client tip"
+    );
+    git_ok_no_auth(case_dir, &["clone", url, clone]);
+    let raw = git_stdout_no_auth(case_dir, &["-C", clone, "cat-file", "-p", "HEAD"]);
+    assert!(
+        raw.contains(FU01_CLIENT_ARMOR[1]),
+        "{url}: client gpgsig header must be preserved:\n{raw}"
+    );
+}
+
+/// plan-20260923 FU-01 / issue #28 subpath control: a signed commit pushed to
+/// `/project/foo` lands verbatim, and the ancestor layers `/project` and `/`
+/// that Mega2 synthesizes show the real subject, not `gpgsig -----BEGIN…`.
+#[test]
+fn signed_push_subpath_control() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+
+    seed_project_foo(&env.case_dir, port);
+    let foo_url = trunk_subpath_url(port, "/project/foo");
+    git_ok_no_auth(&env.case_dir, &["clone", &foo_url, "foo-signed"]);
+    configure_git_identity_no_auth(&env.case_dir, "foo-signed");
+    fs::write(
+        env.case_dir.join("foo-signed").join("signed.txt"),
+        "signed\n",
+    )
+    .expect("write signed.txt");
+    let subject = "feat: signed subpath subject";
+    let id = craft_signed_commit(&env.case_dir, "foo-signed", subject);
+    git_cli::assert_git_success(
+        &trunk_push(&env.case_dir, "foo-signed"),
+        "signed subpath push",
+    );
+
+    assert_client_commit_landed_verbatim(&env.case_dir, &foo_url, "foo-verify", &id);
+    assert_layer_commit_body_clean(
+        &env.case_dir,
+        &trunk_subpath_url(port, "/project"),
+        "project-layer",
+        subject,
+    );
+    assert_layer_commit_body_clean(
+        &env.case_dir,
+        &trunk_subpath_url(port, "/"),
+        "root-layer",
+        subject,
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+/// plan-20260923 FU-01 / issue #28 first-level root control: the same shape
+/// pushed to `/project` lands verbatim and only the `/` layer is synthesized.
+#[test]
+fn signed_push_first_level_root_control() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+
+    assert_upload_pack_advertises_main(port, "/project");
+    let project_url = trunk_subpath_url(port, "/project");
+    git_ok_no_auth(&env.case_dir, &["clone", &project_url, "project-signed"]);
+    configure_git_identity_no_auth(&env.case_dir, "project-signed");
+    fs::write(
+        env.case_dir.join("project-signed").join("root-signed.txt"),
+        "root signed\n",
+    )
+    .expect("write root-signed.txt");
+    let subject = "feat: signed first-level subject";
+    let id = craft_signed_commit(&env.case_dir, "project-signed", subject);
+    git_cli::assert_git_success(
+        &trunk_push(&env.case_dir, "project-signed"),
+        "signed first-level push",
+    );
+
+    assert_client_commit_landed_verbatim(&env.case_dir, &project_url, "project-verify", &id);
+    assert_layer_commit_body_clean(
+        &env.case_dir,
+        &trunk_subpath_url(port, "/"),
+        "root-layer",
+        subject,
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
 #[test]
 fn integration_git_cli_trunk_requester_token_name() {
     if git_cli::git_cli_skip_requested() {
