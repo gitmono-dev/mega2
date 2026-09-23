@@ -17,7 +17,9 @@ use crate::{
     },
     common::{
         errors::MegaError,
-        utils::{MEGA_BRANCH_NAME, ZERO_ID},
+        utils::{
+            MEGA_BRANCH_NAME, ZERO_ID, commit_body_subject, format_commit_msg, split_commit_message,
+        },
     },
     config::{DEFAULT_MAX_PUSH_COMMITS, PushPolicy},
     jupiter::storage::{
@@ -42,6 +44,17 @@ pub fn push_operation_id(old_id: &str, new_id: &str) -> String {
 
 pub fn merge_operation_id(cl_link: &str) -> String {
     cl_link.to_owned()
+}
+
+/// Message of the monorepo root commit that mounts an ImportRepo leaf: the
+/// imported tip's subject taken from its body, so signature headers of any
+/// kind (`gpgsig`, `gpgsig-sha256`, PGP or SSH) never leak (plan-20260923
+/// FU-02). Framed with the header/body blank line.
+fn attach_root_message(tip_message: &str) -> String {
+    format_commit_msg(
+        commit_body_subject(split_commit_message(tip_message).body),
+        None,
+    )
 }
 
 pub fn attach_operation_id(repo_id: &str, normalized_commands: &str) -> String {
@@ -1434,7 +1447,7 @@ impl PushQueueService {
                 .await?
                 .ok_or_else(|| MegaError::Other(format!("commit {tip_commit_id} not found")))?,
         );
-        let commit_msg = latest_commit.format_message();
+        let commit_msg = attach_root_message(&latest_commit.message);
 
         let new_commit = Commit::from_tree_id(
             save_trees
@@ -1445,7 +1458,7 @@ impl PushQueueService {
                 ObjectHash::from_hex_for_kind(get_hash_kind(), &expected_commit)
                     .map_err(|e| MegaError::Other(format!("invalid expected commit hash: {e}")))?,
             ],
-            &format!("\n{commit_msg}"),
+            &commit_msg,
         );
         let new_root_tree_hash = new_commit.tree_id.to_string();
         let landed_commit_id = new_commit.id.to_string();
@@ -2742,6 +2755,18 @@ mod tests {
             tests::test_db_connection,
         },
     };
+
+    #[test]
+    fn attach_root_message_uses_body_subject() {
+        let ssh_signed = "gpgsig -----BEGIN SSH SIGNATURE-----\n U1NIU0lHAAAAAQ\n -----END SSH SIGNATURE-----\n\nimport: vendored subject\n\nbody\n";
+        assert_eq!(
+            attach_root_message(ssh_signed),
+            "\nimport: vendored subject"
+        );
+        let pgp_sha256 = "gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n x\n -----END PGP SIGNATURE-----\n\nsha256 subject\n";
+        assert_eq!(attach_root_message(pgp_sha256), "\nsha256 subject");
+        assert_eq!(attach_root_message("\nplain subject\n"), "\nplain subject");
+    }
 
     async fn service(policy: PushPolicy) -> (tempfile::TempDir, PushQueueService) {
         let temp = tempfile::TempDir::new().unwrap();

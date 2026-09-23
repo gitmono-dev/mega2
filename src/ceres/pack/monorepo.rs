@@ -1364,7 +1364,7 @@ mod tests {
         },
         common::{
             errors::{MegaError, ProtocolError},
-            utils::{MEGA_BRANCH_NAME, ZERO_ID},
+            utils::{MEGA_BRANCH_NAME, ZERO_ID, commit_body_subject, split_commit_message},
         },
         config::{PushPolicy, testing::isolated_config},
         jupiter::{
@@ -1950,6 +1950,14 @@ mod tests {
     }
 
     async fn seed_root_with_dir(storage: &Storage, dir: &str) -> (String, String) {
+        seed_root_with_dir_message(storage, dir, &test_commit("root with dir").message).await
+    }
+
+    async fn seed_root_with_dir_message(
+        storage: &Storage,
+        dir: &str,
+        message: &str,
+    ) -> (String, String) {
         let blob_id = storage
             .git_service
             .save_object_from_raw(bytes::Bytes::from_static(b"keep"))
@@ -1967,14 +1975,8 @@ mod tests {
             dir.to_string(),
         )])
         .expect("root");
-        let commit = test_commit("root with dir");
-        let commit = Commit::new(
-            commit.author,
-            commit.committer,
-            root.id,
-            vec![],
-            &commit.message,
-        );
+        let commit = test_commit(message);
+        let commit = Commit::new(commit.author, commit.committer, root.id, vec![], message);
         let commit_id = commit.id.to_string();
         let tree_id = root.id.to_string();
         storage
@@ -2006,6 +2008,77 @@ mod tests {
             .await
             .expect("root ref");
         (commit_id, tree_id)
+    }
+
+    const FU02_SIGNED_ROOT_MESSAGE: &str = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQFU02ServerArmor\n -----END PGP SIGNATURE-----\n\nsigned root subject\n\nroot body\n";
+
+    async fn fu02_materialized_commit(storage: &Storage, path: &str) -> Commit {
+        let head = crate::ceres::code_edit::utils::create_repo_commit(storage, path)
+            .await
+            .expect("materialize");
+        assert_ne!(head, ZERO_ID);
+        Commit::from_mega_model(
+            storage
+                .mono_storage()
+                .get_commit_by_hash(&head)
+                .await
+                .expect("load commit")
+                .expect("materialized commit row"),
+        )
+    }
+
+    #[tokio::test]
+    async fn fu02_materialize_strips_root_signature() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        seed_root_with_dir_message(&storage, "foo", FU02_SIGNED_ROOT_MESSAGE).await;
+        let commit = fu02_materialized_commit(&storage, "/foo").await;
+        let parts = split_commit_message(&commit.message);
+        assert!(
+            parts.headers.is_empty(),
+            "materialized commit must not copy root headers: {:?}",
+            parts.headers
+        );
+        assert_eq!(parts.body, "signed root subject\n\nroot body\n");
+        assert_eq!(commit_body_subject(parts.body), "signed root subject");
+        assert!(!commit.message.contains("PGP SIGNATURE"));
+        assert!(!commit.message.contains("iQFU02ServerArmor"));
+    }
+
+    #[tokio::test]
+    async fn fu02_materialize_message_framed() {
+        use git_internal::internal::object::ObjectTrait;
+
+        let _lock = materialize::lock_materialize_tests().await;
+        for (root_message, body) in [
+            (
+                FU02_SIGNED_ROOT_MESSAGE,
+                "signed root subject\n\nroot body\n",
+            ),
+            ("\nunsigned root subject\n", "unsigned root subject\n"),
+            ("root with dir", "root with dir"),
+            ("\n", ""),
+        ] {
+            let temp = TempDir::new().expect("temp");
+            let storage = test_storage(temp.path()).await;
+            seed_root_with_dir_message(&storage, "foo", root_message).await;
+            let commit = fu02_materialized_commit(&storage, "/foo").await;
+            assert_eq!(commit.message, format!("\n{body}"));
+            let raw = String::from_utf8(commit.to_data().expect("commit bytes")).expect("utf8");
+            let (header, raw_body) = raw.split_once("\n\n").expect("header/body blank line");
+            assert!(
+                header
+                    .lines()
+                    .last()
+                    .expect("committer")
+                    .starts_with("committer ")
+            );
+            assert!(!header.contains("gpgsig"));
+            assert_eq!(raw_body, body);
+            let reparsed = Commit::from_bytes(raw.as_bytes(), commit.id).expect("reparse");
+            assert_eq!(reparsed.message, commit.message);
+        }
     }
 
     #[tokio::test]

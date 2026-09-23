@@ -14,7 +14,10 @@ use sea_orm::{IntoActiveModel, TransactionTrait};
 
 use crate::{
     callisto::mega_refs,
-    common::errors::MegaError,
+    common::{
+        errors::MegaError,
+        utils::{format_commit_msg, split_commit_message},
+    },
     jupiter::{
         storage::{
             Storage, base_storage::StorageConnector, mono_storage::MonoStorage,
@@ -256,12 +259,16 @@ async fn persist_walked_refs(
             .materialize_parents_in_txn(path, &w.ref_name, txn)
             .await?;
         let continued = !parents.is_empty();
+        // The root commit's raw message may carry its (server) `gpgsig`
+        // header; a materialized path commit is unsigned, so it takes only
+        // the body, framed with the header/body blank line (FU-02).
+        let message = format_commit_msg(split_commit_message(&w.message).body, None);
         let c = Commit::new(
             w.author.clone(),
             w.committer.clone(),
             w.subtree.id,
             parents,
-            &w.message,
+            &message,
         );
         let commit_id = c.id.to_string();
         let tree_id = c.tree_id.to_string();

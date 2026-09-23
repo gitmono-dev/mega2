@@ -833,6 +833,14 @@ mod tests {
         storage: &Storage,
         path: &str,
     ) -> (Repo, Commit, RefCommand) {
+        seed_import_repo_with_tip_message(storage, path, "\nimport commit").await
+    }
+
+    async fn seed_import_repo_with_tip_message(
+        storage: &Storage,
+        path: &str,
+        message: &str,
+    ) -> (Repo, Commit, RefCommand) {
         let repo = Repo::new(PathBuf::from(path), false).unwrap();
         let repo_id = repo.repo_id;
         let readme = Blob::from_content("hello from import repo");
@@ -842,7 +850,7 @@ mod tests {
             name: "README.md".to_string(),
         }])
         .unwrap();
-        let commit = Commit::from_tree_id(tree.id, vec![], "\nimport commit");
+        let commit = Commit::from_tree_id(tree.id, vec![], message);
         storage
             .import_service
             .save_entry(
@@ -1318,6 +1326,45 @@ mod tests {
             row.landed_commit_id.as_deref(),
             Some(root_ref.ref_commit_hash.as_str())
         );
+    }
+
+    /// FU-02 (#28): the attach root commit takes the imported tip's subject
+    /// from its body for any signature kind, framed with the blank line.
+    #[tokio::test]
+    async fn fu02_attach_root_commit_uses_signed_tip_subject() {
+        use git_internal::internal::object::ObjectTrait;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, _commit, command) = seed_import_repo_with_tip_message(
+            &storage,
+            "/third-party/fu02-signed",
+            "gpgsig -----BEGIN SSH SIGNATURE-----\n U1NIU0lHAAAAAQFU02\n -----END SSH SIGNATURE-----\n\nimport: ssh signed subject\n\nimport body line\n",
+        )
+        .await;
+        let import_repo = ImportRepo {
+            storage: storage.clone(),
+            repo,
+            command_list: Mutex::new(vec![command]),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        };
+        import_repo.attach_to_monorepo_parent().await.unwrap();
+
+        let mono = storage.mono_storage();
+        let root_ref = mono.get_main_ref("/").await.unwrap().unwrap();
+        let root_commit = Commit::from_mega_model(
+            mono.get_commit_by_hash(&root_ref.ref_commit_hash)
+                .await
+                .unwrap()
+                .expect("attach root commit row"),
+        );
+        assert_eq!(root_commit.message, "\nimport: ssh signed subject");
+        let raw = String::from_utf8(root_commit.to_data().unwrap()).unwrap();
+        let (header, body) = raw.split_once("\n\n").expect("header/body blank line");
+        assert!(!header.contains("gpgsig"));
+        assert!(!raw.contains("SSH SIGNATURE"));
+        assert_eq!(body, "import: ssh signed subject");
     }
 
     /// Prior queue round advances the root while attach is waiting; lock-held
