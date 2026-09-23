@@ -5078,3 +5078,218 @@ fn read_log(path: &Path) -> String {
     let _ = file.read_to_string(&mut buf);
     buf
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-08: `mega2 path provision` — the thin CLI client of
+// `POST /api/v1/path/provision`, run as the real binary without `--config`;
+// the token comes only from MEGA2_TOKEN (ADR-FU-05 item 4).
+// ---------------------------------------------------------------------------
+
+const FU08_TOKEN: &str = "fu08-cli-token-value";
+
+fn fu08_cli(env: &GitCliEnv, port: u16, path: &str, token: Option<&str>) -> std::process::Output {
+    let mut command = isolated_command(env.temp_dir.path(), &env.base_dir, &env.cache_dir);
+    command.args([
+        "path",
+        "provision",
+        "--server",
+        &format!("http://{}:{port}", git_cli::HOST_LOOPBACK),
+        path,
+    ]);
+    if let Some(token) = token {
+        command.env("MEGA2_TOKEN", token);
+    }
+    command.output().expect("run mega2 path provision")
+}
+
+fn fu08_stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn fu08_stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_owned()
+}
+
+fn fu08_trunk_none() -> (GitCliEnv, ServiceProcess, u16) {
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, _stderr) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    (env, service, port)
+}
+
+#[test]
+fn path_provision_cli_created() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let (env, mut service, port) = fu08_trunk_none();
+    let output = fu08_cli(&env, port, "/project/fu08-created", None);
+    assert!(output.status.success(), "{}", fu08_stderr(&output));
+    let line = fu08_stdout(&output);
+    assert!(
+        line.starts_with("created /project/fu08-created (") && line.ends_with(')'),
+        "{line}"
+    );
+
+    // The command reads no config: a missing MEGA_CONFIG and an empty base
+    // dir are fine, and nothing (no default etc/config.toml) is created there.
+    let fresh = tempfile::tempdir().expect("fresh base dir");
+    let base = fresh.path().join("base");
+    let cache = fresh.path().join("cache");
+    let output = isolated_command(fresh.path(), &base, &cache)
+        .env("MEGA_CONFIG", fresh.path().join("nonexistent/config.toml"))
+        .args([
+            "path",
+            "provision",
+            "--server",
+            &format!("http://{}:{port}", git_cli::HOST_LOOPBACK),
+            "/project/fu08-created",
+        ])
+        .output()
+        .expect("run mega2 path provision without config");
+    assert!(output.status.success(), "{}", fu08_stderr(&output));
+    assert_eq!(fu08_stdout(&output), "already exists /project/fu08-created");
+    assert!(!base.exists(), "no base dir content may be created");
+    assert!(!fresh.path().join("nonexistent").exists());
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(60))
+            .success()
+    );
+}
+
+#[test]
+fn path_provision_cli_exists() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let (env, mut service, port) = fu08_trunk_none();
+    let first = fu08_cli(&env, port, "/project/fu08-exists", None);
+    assert!(first.status.success(), "{}", fu08_stderr(&first));
+    let second = fu08_cli(&env, port, "/project/fu08-exists", None);
+    assert!(second.status.success(), "{}", fu08_stderr(&second));
+    assert_eq!(fu08_stdout(&second), "already exists /project/fu08-exists");
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(60))
+            .success()
+    );
+}
+
+#[test]
+fn path_provision_cli_rejects() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let (env, mut service, port) = fu08_trunk_none();
+    let output = fu08_cli(&env, port, "/vendor/fu08", None);
+    assert_eq!(output.status.code(), Some(1), "{}", fu08_stderr(&output));
+    assert!(
+        fu08_stderr(&output).starts_with("MONO_PATH_NOT_ALLOWED: "),
+        "{}",
+        fu08_stderr(&output)
+    );
+    assert!(fu08_stdout(&output).is_empty());
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(60))
+            .success()
+    );
+}
+
+#[test]
+fn path_provision_cli_token_env_only() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::with_config_append(&format!(
+        r#"
+[git]
+push_auth = "token"
+ssh_receive_pack = false
+[[git.push_tokens]]
+name = "fu08"
+token = "{FU08_TOKEN}"
+"#
+    ));
+    let (mut service, port, _stdout, _stderr) =
+        boot_service_http_with_env(&env, None, None, &[("MEGA_MONOREPO__PUSH_POLICY", "trunk")]);
+    let denied = fu08_cli(&env, port, "/project/fu08-token", None);
+    assert_eq!(denied.status.code(), Some(1), "{}", fu08_stderr(&denied));
+    assert!(
+        fu08_stderr(&denied).contains("authentication required"),
+        "{}",
+        fu08_stderr(&denied)
+    );
+    let wrong = fu08_cli(&env, port, "/project/fu08-token", Some("not-the-token"));
+    assert_eq!(wrong.status.code(), Some(1), "{}", fu08_stderr(&wrong));
+    let allowed = fu08_cli(&env, port, "/project/fu08-token", Some(FU08_TOKEN));
+    assert!(allowed.status.success(), "{}", fu08_stderr(&allowed));
+    assert!(fu08_stdout(&allowed).starts_with("created /project/fu08-token ("));
+    for output in [&denied, &wrong, &allowed] {
+        let all = format!("{}{}", fu08_stdout(output), fu08_stderr(output));
+        assert!(!all.contains(FU08_TOKEN), "token must not be echoed: {all}");
+        assert!(
+            !all.contains("not-the-token"),
+            "token must not be echoed: {all}"
+        );
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(60))
+            .success()
+    );
+}
+
+#[test]
+fn path_provision_cli_then_two_pushes() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let (env, mut service, port) = fu08_trunk_none();
+    let case_dir = env.case_dir.as_path();
+    let path = "/project/fu08/journey";
+    let output = fu08_cli(&env, port, path, None);
+    assert!(output.status.success(), "{}", fu08_stderr(&output));
+
+    let url = trunk_subpath_url(port, path);
+    git_ok_no_auth(case_dir, &["clone", &url, "fu08-journey"]);
+    configure_git_identity_no_auth(case_dir, "fu08-journey");
+    for (n, subject) in [(1, "fu08 first push"), (2, "fu08 second push")] {
+        fs::write(
+            case_dir.join("fu08-journey").join(format!("file{n}.txt")),
+            format!("{n}\n"),
+        )
+        .expect("write journey file");
+        git_ok_no_auth(case_dir, &["-C", "fu08-journey", "add", "."]);
+        git_ok_no_auth(case_dir, &["-C", "fu08-journey", "commit", "-m", subject]);
+        let pushed = trunk_push(case_dir, "fu08-journey");
+        git_cli::assert_git_success(&pushed, subject);
+    }
+
+    git_ok_no_auth(case_dir, &["clone", &url, "fu08-journey-reclone"]);
+    let subjects = git_stdout_no_auth(
+        case_dir,
+        &["-C", "fu08-journey-reclone", "log", "--format=%s"],
+    );
+    let lines: Vec<&str> = subjects.lines().collect();
+    assert_eq!(
+        &lines[..2],
+        ["fu08 second push", "fu08 first push"],
+        "{subjects}"
+    );
+    let files = git_stdout_no_auth(case_dir, &["-C", "fu08-journey-reclone", "ls-files"]);
+    for file in ["file1.txt", "file2.txt", ".gitkeep"] {
+        assert!(files.lines().any(|f| f == file), "{file} in {files}");
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(60))
+            .success()
+    );
+}

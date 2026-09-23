@@ -393,6 +393,52 @@ mod tests {
         );
     }
 
+    /// plan-20260923 FU-08: `path provision --server <URL> <PATH>` parses
+    /// without `--config`, and there is no argv option for the token.
+    #[test]
+    fn path_provision_parses() {
+        let matches = cli()
+            .no_binary_name(true)
+            .try_get_matches_from([
+                "path",
+                "provision",
+                "--server",
+                "http://127.0.0.1:9000",
+                "/project/team/demo",
+            ])
+            .expect("path provision parses");
+        let (cmd, args) = matches.subcommand().expect("path");
+        assert_eq!(cmd, "path");
+        let (sub, provision) = args.subcommand().expect("provision");
+        assert_eq!(sub, "provision");
+        assert_eq!(
+            provision.get_one::<String>("server").map(String::as_str),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(
+            provision.get_one::<String>("path").map(String::as_str),
+            Some("/project/team/demo")
+        );
+        for extra in [["--token", "t"], ["--password", "t"]] {
+            let mut argv = vec!["path", "provision", "--server", "http://s", "/p"];
+            argv.extend(extra);
+            assert!(
+                cli()
+                    .no_binary_name(true)
+                    .try_get_matches_from(argv)
+                    .is_err(),
+                "{extra:?} must not be accepted"
+            );
+        }
+        assert!(
+            cli()
+                .no_binary_name(true)
+                .try_get_matches_from(["path", "provision", "/p"])
+                .is_err(),
+            "--server is required"
+        );
+    }
+
     #[test]
     fn cli_accepts_config_path() {
         let matches = cli()
