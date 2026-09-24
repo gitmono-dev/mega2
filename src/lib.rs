@@ -36,6 +36,13 @@ pub mod readonly_ops {
     };
 }
 
+/// Internal seam for the ImportRepo detach IT (plan-20260923 FU-16) until the
+/// cleanup entry lands (FU-17 / FU-20). Not a supported API.
+#[doc(hidden)]
+pub mod import_repo_ops {
+    pub use crate::ceres::pack::import_repo::detach_for_integration_test;
+}
+
 /// Internal seam for IT bridging promote (UN-35) until `authz-audit promote`
 /// lands in UN-37. Not a supported API.
 #[doc(hidden)]

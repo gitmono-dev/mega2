@@ -111,6 +111,57 @@ pub fn is_gitkeep_only(tree: &Tree) -> bool {
     )
 }
 
+/// New trees for removing an ImportRepo leaf (plan-20260923 ADR-FU-09 item 2).
+///
+/// `chain` runs from the root tree down to the leaf's parent, and `names[i]`
+/// is the entry of `chain[i]` that leads one level down (the last one is the
+/// leaf). Directories strictly below `chain[floor]`, the import root, that
+/// become empty are removed as well; the import root itself keeps a
+/// `.gitkeep` instead of becoming empty. Returns the new trees, root last,
+/// and the `.gitkeep` blob the caller must store when one was added.
+pub fn remove_import_leaf(
+    chain: &[Tree],
+    names: &[&str],
+    floor: usize,
+) -> Result<(Vec<Tree>, Option<Blob>), MegaError> {
+    if chain.is_empty() || chain.len() != names.len() || floor >= chain.len() {
+        return Err(MegaError::Other("invalid ImportRepo leaf chain".into()));
+    }
+    let mut trees = Vec::with_capacity(chain.len());
+    let mut gitkeep = None;
+    let mut child = None;
+    for (idx, (tree, name)) in chain.iter().zip(names).enumerate().rev() {
+        let mut items = tree.tree_items.clone();
+        let pos = items
+            .iter()
+            .position(|item| item.name == *name)
+            .ok_or_else(|| MegaError::Other(format!("tree entry {name:?} not found")))?;
+        match child {
+            Some(id) => items[pos].id = id,
+            None => {
+                items.remove(pos);
+            }
+        }
+        if items.is_empty() {
+            if idx > floor {
+                child = None;
+                continue;
+            }
+            let blob = generate_git_keep_with_timestamp();
+            items.push(TreeItem {
+                mode: TreeItemMode::Blob,
+                id: blob.id,
+                name: String::from(".gitkeep"),
+            });
+            gitkeep = Some(blob);
+        }
+        let tree = Tree::from_tree_items(items).map_err(|e| MegaError::Other(e.to_string()))?;
+        child = Some(tree.id);
+        trees.push(tree);
+    }
+    Ok((trees, gitkeep))
+}
+
 /// Searches for a tree in the Git repository by its path, creating intermediate trees if necessary,
 /// and returns the trees involved in the update process.
 ///
@@ -509,7 +560,7 @@ mod tests {
 
     use git_internal::internal::object::tree::{TreeItem, TreeItemMode};
 
-    use super::{search_and_create_tree, search_tree_for_update_or_create};
+    use super::{remove_import_leaf, search_and_create_tree, search_tree_for_update_or_create};
     use crate::{
         ceres::api_service::{
             cache::GitObjectCache,
@@ -524,6 +575,92 @@ mod tests {
             utils::converter::generate_git_keep_with_timestamp,
         },
     };
+
+    fn dir(items: Vec<(&str, git_internal::internal::object::tree::Tree)>) -> super::Tree {
+        super::Tree::from_tree_items(
+            items
+                .into_iter()
+                .map(|(name, tree)| TreeItem {
+                    mode: TreeItemMode::Tree,
+                    id: tree.id,
+                    name: name.to_owned(),
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn file(name: &str) -> super::Tree {
+        let blob = generate_git_keep_with_timestamp();
+        super::Tree::from_tree_items(vec![TreeItem {
+            mode: TreeItemMode::Blob,
+            id: blob.id,
+            name: name.to_owned(),
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn fu16_remove_import_leaf_prunes_below_the_import_root() {
+        // /third-party/org/repo with a sibling /project: removing repo empties
+        // org (pruned) and then /third-party, which keeps a `.gitkeep`.
+        let repo = file("README");
+        let org = dir(vec![("repo", repo)]);
+        let third_party = dir(vec![("org", org.clone())]);
+        let root = dir(vec![
+            ("project", file("main.rs")),
+            ("third-party", third_party.clone()),
+        ]);
+        let (trees, gitkeep) = remove_import_leaf(
+            &[root.clone(), third_party.clone(), org.clone()],
+            &["third-party", "org", "repo"],
+            1,
+        )
+        .unwrap();
+        let gitkeep = gitkeep.expect("the emptied import root keeps a .gitkeep");
+        assert_eq!(trees.len(), 2, "org is pruned, not rewritten");
+        assert_eq!(trees[0].tree_items.len(), 1);
+        assert_eq!(trees[0].tree_items[0].name, ".gitkeep");
+        assert_eq!(trees[0].tree_items[0].id, gitkeep.id);
+        let new_root = trees.last().unwrap();
+        assert_eq!(new_root.tree_items.len(), 2);
+        let project = new_root
+            .tree_items
+            .iter()
+            .find(|i| i.name == "project")
+            .unwrap();
+        assert_eq!(project.id, root.tree_items[0].id, "siblings are kept");
+        assert_eq!(
+            new_root
+                .tree_items
+                .iter()
+                .find(|i| i.name == "third-party")
+                .unwrap()
+                .id,
+            trees[0].id
+        );
+
+        // A sibling under org keeps org, and no `.gitkeep` is added.
+        let org = dir(vec![("repo", file("README")), ("other", file("LICENSE"))]);
+        let third_party = dir(vec![("org", org.clone())]);
+        let root = dir(vec![("third-party", third_party.clone())]);
+        let (trees, gitkeep) = remove_import_leaf(
+            &[root, third_party, org],
+            &["third-party", "org", "repo"],
+            1,
+        )
+        .unwrap();
+        assert!(gitkeep.is_none());
+        assert_eq!(trees.len(), 3);
+        assert_eq!(
+            trees[0]
+                .tree_items
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
+            ["other"]
+        );
+    }
 
     /// Regression coverage for mega@f5d22b9 (#2152): `search_and_create_tree`
     /// returns the placeholder `.gitkeep` blob so callers can persist it together

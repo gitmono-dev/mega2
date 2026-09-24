@@ -41,8 +41,9 @@ use crate::{
         service::{
             git_service::GitService,
             push_queue_service::{
-                AttachCommand, AttachExecContext, AttachPayload, EnqueueRequest, ExecuteOutcome,
-                ExecuteRequest, QueueWaitResult, attach_operation_id, normalize_attach_commands,
+                AttachCommand, AttachExecContext, AttachOp, AttachPayload, EnqueueRequest,
+                ExecuteOutcome, ExecuteRequest, QueueWaitResult, attach_operation_id,
+                detach_operation_id, normalize_attach_commands,
             },
         },
         storage::{Storage, base_storage::StorageConnector, git_db_storage::GitDbStorage},
@@ -580,6 +581,7 @@ impl ImportRepo {
             })
             .collect();
         let payload = AttachPayload {
+            op: AttachOp::Attach,
             repo_id: self.repo.repo_id,
             repo_path: path.clone(),
             commands: attach_cmds.clone(),
@@ -684,6 +686,200 @@ impl ImportRepo {
             }
         }
     }
+}
+
+/// Detach ImportRepo `repo_id` from `repo_path` through the write queue
+/// (plan-20260923 ADR-FU-09 items 1 and 2) and return its cleanup id: the id
+/// of the ledger row the detach wrote, or of the one an earlier detach of the
+/// same repository wrote. `None` means there was nothing to detach and no
+/// cleanup is pending. A repeat of a finished detach replays its row. There
+/// is no product entry yet; FU-17's cleanup entry builds on this.
+pub(crate) async fn detach_import_repo(
+    storage: &Storage,
+    git_object_cache: Arc<GitObjectCache>,
+    repo_id: i64,
+    repo_path: &str,
+    requester: Option<String>,
+) -> Result<Option<i64>, MegaError> {
+    let path = crate::common::utils::canonicalize_mono_ref_path(repo_path)?;
+    let payload = AttachPayload {
+        repo_id,
+        repo_path: path.clone(),
+        commands: Vec::new(),
+        op: AttachOp::Detach,
+    };
+    let old_id = storage
+        .mono_storage()
+        .get_main_ref("/")
+        .await?
+        .map(|r| r.ref_commit_hash)
+        .unwrap_or_else(|| ZERO_ID.to_owned());
+    let payload_json = serde_json::to_value(&payload)
+        .map_err(|e| MegaError::Other(format!("detach payload encode: {e}")))?;
+    // A `Done` row is a permanent replay key for its operation id, and a row
+    // that never detached can carry it (a pre-FU-16 binary runs a detach row
+    // as a delete-only attach). A replay therefore only counts once the
+    // repository is gone; otherwise the detach is enqueued once more under a
+    // salted id, as attach does for its replays.
+    let mut operation_id = detach_operation_id(repo_id, &path);
+    let mut replayed_live = false;
+    let wait = loop {
+        let wait = storage
+            .push_queue_service
+            .enqueue_and_wait(EnqueueRequest {
+                kind: crate::callisto::sea_orm_active_enums::PushQueueKindEnum::Attach,
+                operation_id: operation_id.clone(),
+                path: path.clone(),
+                old_id: old_id.clone(),
+                new_id: ZERO_ID.to_owned(),
+                requester: requester.clone(),
+                payload: payload_json.clone(),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await?;
+        match wait {
+            QueueWaitResult::Replayed { id, .. }
+                if import_repo_is_live(storage, repo_id, &path).await? =>
+            {
+                if replayed_live {
+                    return Err(MegaError::Other(format!(
+                        "ImportRepo detach replayed push_queue id {id} but the repository is still registered; retry"
+                    )));
+                }
+                replayed_live = true;
+                operation_id =
+                    detach_operation_id(repo_id, &format!("{path}#{}", uuid::Uuid::new_v4()));
+            }
+            wait => break wait,
+        }
+    };
+    let id = match wait {
+        QueueWaitResult::Replayed { id, .. } => {
+            return resolve_cleanup_id(storage, id, repo_id, &path).await;
+        }
+        QueueWaitResult::Abandoned { id } => {
+            return Err(MegaError::Other(format!(
+                "ImportRepo detach wait abandoned for push_queue id {id}"
+            )));
+        }
+        QueueWaitResult::Rejected { id, message } => {
+            return Err(detach_refusal(&path, id, &message));
+        }
+        QueueWaitResult::Ready { id } => id,
+    };
+    let ctx = AttachExecContext {
+        storage: storage.clone(),
+        git_object_cache,
+    };
+    match storage
+        .push_queue_service
+        .execute_b3(
+            ExecuteRequest {
+                id,
+                ..Default::default()
+            },
+            Some(&ctx),
+            None,
+            None,
+        )
+        .await?
+    {
+        ExecuteOutcome::Done { id, .. } => resolve_cleanup_id(storage, id, repo_id, &path).await,
+        ExecuteOutcome::Failed { id, message, .. } => Err(detach_refusal(&path, id, &message)),
+        _ => Err(MegaError::Other(format!(
+            "ImportRepo detach for push_queue id {id} did not complete; retry"
+        ))),
+    }
+}
+
+/// The cleanup id behind a finished detach round `id`: its own ledger row, or
+/// else the latest ledger row an earlier detach of `repo_id` at `path` wrote
+/// (a `Done` row without a ledger row detached nothing: the repository was
+/// already gone, or the row predates FU-16). Ledger reads move to a storage
+/// primitive with FU-17, which owns the ledger's read side.
+async fn resolve_cleanup_id(
+    storage: &Storage,
+    id: i64,
+    repo_id: i64,
+    path: &str,
+) -> Result<Option<i64>, MegaError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+
+    use crate::callisto::import_repo_cleanups;
+
+    let git_db = storage.git_db_storage();
+    let conn = git_db.get_connection();
+    if import_repo_cleanups::Entity::find_by_id(id)
+        .one(conn)
+        .await?
+        .is_some()
+    {
+        return Ok(Some(id));
+    }
+    Ok(import_repo_cleanups::Entity::find()
+        .filter(import_repo_cleanups::Column::RepoId.eq(repo_id))
+        .filter(import_repo_cleanups::Column::Path.eq(path))
+        .order_by_desc(import_repo_cleanups::Column::Id)
+        .one(conn)
+        .await?
+        .map(|row| row.id))
+}
+
+/// Whether `repo_id` is still registered at `path` (exact canonical lookup).
+async fn import_repo_is_live(
+    storage: &Storage,
+    repo_id: i64,
+    path: &str,
+) -> Result<bool, MegaError> {
+    Ok(storage
+        .git_db_storage()
+        .find_git_repo_exact_match(path)
+        .await?
+        .is_some_and(|row| row.id == repo_id))
+}
+
+/// Client text for a refused detach round: the typed `HAS_CHILDREN` error,
+/// or a fixed sentence (the reason stays in the queue row).
+fn detach_refusal(path: &str, id: i64, message: &str) -> MegaError {
+    let children = ImportRepoError::HasChildren {
+        path: path.to_owned(),
+    };
+    if children.to_string() == message {
+        return children.into();
+    }
+    MegaError::Other(format!(
+        "ImportRepo detach failed (push_queue id {id}); retry"
+    ))
+}
+
+/// Integration-test hook (plan-20260923 FU-16): detach the ImportRepo at
+/// `repo_path` through the write queue from a process other than the service,
+/// using `config` for the service's database, Redis and object store. No
+/// product entry calls it.
+#[doc(hidden)]
+pub async fn detach_for_integration_test(
+    config: crate::config::Config,
+    repo_path: &str,
+) -> Result<Option<i64>, MegaError> {
+    let config = Arc::new(config);
+    let connection = crate::jupiter::redis::init_connection(&config.redis).await?;
+    let db = crate::jupiter::storage::init::database_connection(&config.database).await?;
+    let object_store =
+        crate::jupiter::storage::object_storage::build_object_storage(&config.object_storage)
+            .await?;
+    let storage = Storage::new_with_connection(config, Arc::new(db), object_store).await?;
+    let path = crate::common::utils::canonicalize_mono_ref_path(repo_path)?;
+    let repo = storage
+        .git_db_storage()
+        .find_git_repo_exact_match(&path)
+        .await?
+        .ok_or_else(|| MegaError::Other(format!("no ImportRepo at {path:?}")))?;
+    let cache = Arc::new(GitObjectCache {
+        connection,
+        prefix: "git-object-rkyv:v1".to_owned(),
+    });
+    detach_import_repo(&storage, cache, repo.id, &path, None).await
 }
 
 /// Client text for a refused attach round (plan-20260923 ADR-FU-08 item 5).
@@ -855,7 +1051,7 @@ mod tests {
                 import_service::ImportService,
                 mono_service::MonoService,
                 push_queue_service::{
-                    AttachCommand, AttachExecContext, AttachPayload, EnqueueRequest,
+                    AttachCommand, AttachExecContext, AttachOp, AttachPayload, EnqueueRequest,
                     ExecuteOutcome, ExecuteRequest, QueueWaitResult, attach_operation_id,
                     normalize_attach_commands,
                 },
@@ -1468,6 +1664,7 @@ mod tests {
     fn fu13_attach_refusal_rebuilds_typed_errors() {
         use crate::common::errors::{ImportRepoError, MegaError};
         let payload = AttachPayload {
+            op: AttachOp::Attach,
             repo_id: 1,
             repo_path: "/third-party/x".to_owned(),
             commands: vec![AttachCommand {
@@ -1813,6 +2010,7 @@ mod tests {
                 default_branch: command.default_branch,
             }];
             let payload = AttachPayload {
+                op: AttachOp::Attach,
                 repo_id: repo.repo_id,
                 repo_path: path.clone(),
                 commands: attach_cmds.clone(),
@@ -1971,6 +2169,7 @@ mod tests {
         let root = mono.get_main_ref("/").await.unwrap().unwrap();
 
         let payload = AttachPayload {
+            op: AttachOp::Attach,
             repo_id: repo.repo_id,
             repo_path: path.clone(),
             commands: vec![AttachCommand {
@@ -2153,5 +2352,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, PushQueueStatusEnum::Failed);
+    }
+
+    #[test]
+    fn attach_payload_default_op() {
+        // Rows written before FU-16 carry no `op` and are all attaches.
+        let legacy = serde_json::json!({
+            "repo_id": 7,
+            "repo_path": "/third-party/x",
+            "commands": [],
+        });
+        let payload: AttachPayload = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(payload.op, AttachOp::Attach);
+        // An attach still serializes without the field.
+        assert_eq!(serde_json::to_value(&payload).unwrap(), legacy);
+        let detach = AttachPayload {
+            op: AttachOp::Detach,
+            ..payload
+        };
+        assert_eq!(serde_json::to_value(&detach).unwrap()["op"], "detach");
     }
 }

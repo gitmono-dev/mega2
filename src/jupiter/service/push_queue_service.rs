@@ -24,7 +24,7 @@ use crate::{
     },
     config::{DEFAULT_MAX_PUSH_COMMITS, PushPolicy},
     jupiter::storage::{
-        audit_storage::AuditStorage,
+        audit_storage::{AuditStorage, IMPORT_REPO_REMOVE_KIND},
         base_storage::{BaseStorage, StorageConnector},
         blob_path_index::BlobPathIndexMode,
         git_db_storage::GitDbStorage,
@@ -68,6 +68,18 @@ pub fn attach_operation_id(repo_id: &str, normalized_commands: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Queue identity of detaching ImportRepo `repo_id` from `canonical_path`
+/// (plan-20260923 ADR-FU-09 item 1). The domain prefix keeps it apart from
+/// every attach id; a re-import gets a new `repo_id` and so a new id.
+pub fn detach_operation_id(repo_id: i64, canonical_path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"import_repo.detach\0");
+    hasher.update(repo_id.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(canonical_path.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Deterministic attach command fingerprint input (Branch commands only).
 ///
 /// Fingerprint covers wire intent (ref + tip ids), not derived `default_branch`
@@ -82,12 +94,32 @@ pub fn normalize_attach_commands(cmds: &[(String, String, String, String)]) -> S
         .join("\n")
 }
 
+/// What an ImportRepo row of the attach queue does (plan-20260923 ADR-FU-09
+/// item 1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachOp {
+    #[default]
+    Attach,
+    Detach,
+}
+
+impl AttachOp {
+    fn is_attach(&self) -> bool {
+        *self == AttachOp::Attach
+    }
+}
+
 /// Serializable attach payload (trunk-push 1.4 / 1.9).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AttachPayload {
     pub repo_id: i64,
     pub repo_path: String,
     pub commands: Vec<AttachCommand>,
+    /// Absent from rows written before FU-16, which are all attaches; an
+    /// attach still serializes without it.
+    #[serde(default, skip_serializing_if = "AttachOp::is_attach")]
+    pub op: AttachOp,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -237,6 +269,103 @@ async fn import_leaf_in_txn(
             ImportLeaf::Directory
         },
     )
+}
+
+/// Whether ImportRepo `repo_id` has at least one branch ref, without reading
+/// them (the legacy-mount rule of plan-20260923 ADR-FU-08 item 1).
+async fn has_branch_ref_in_txn(txn: &DatabaseTransaction, repo_id: i64) -> Result<bool, MegaError> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+    let row = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM import_refs WHERE repo_id = $1 AND ref_type = 'branch') AS v",
+            [repo_id.into()],
+        ))
+        .await?;
+    Ok(row
+        .map(|row| row.try_get::<bool>("", "v"))
+        .transpose()?
+        .unwrap_or(false))
+}
+
+/// Rows of the child check read at most (plan-20260923 ADR-FU-10 item 3).
+const CHILD_CHECK_PAGE: usize = 64;
+
+/// Whether other ImportRepos live below `path` (plan-20260923 ADR-FU-10 item
+/// 3). A row whose canonical form is `path` itself, such as a `path/` alias
+/// the FU-15 migration left in place, is the same split identity and not a
+/// child. A full page of such aliases leaves the rest unknown, so it counts as
+/// having children.
+async fn import_repo_has_children_in_txn(
+    txn: &DatabaseTransaction,
+    repo_id: i64,
+    path: &str,
+) -> Result<bool, MegaError> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+    use crate::common::utils::{canonicalize_mono_ref_path, escape_like};
+
+    let rows = txn
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT repo_path FROM git_repo WHERE repo_path LIKE $1 ESCAPE '\\' AND id <> $2 LIMIT $3",
+            [
+                format!("{}/%", escape_like(path)).into(),
+                repo_id.into(),
+                (CHILD_CHECK_PAGE as i64).into(),
+            ],
+        ))
+        .await?;
+    for row in &rows {
+        let below: String = row.try_get("", "repo_path")?;
+        if canonicalize_mono_ref_path(&below).ok().as_deref() != Some(path) {
+            return Ok(true);
+        }
+    }
+    Ok(rows.len() == CHILD_CHECK_PAGE)
+}
+
+/// Trees from `root_tree` down to the parent of the leaf at `path`, read in
+/// the B3 transaction, with the name of each step down.
+async fn import_leaf_chain_in_txn(
+    mono: &MonoStorage,
+    root_tree: &str,
+    path: &str,
+    txn: &DatabaseTransaction,
+) -> Result<(Vec<git_internal::internal::object::tree::Tree>, Vec<String>), MegaError> {
+    use git_internal::internal::object::tree::{Tree, TreeItemMode};
+
+    use crate::jupiter::utils::converter::FromMegaModel;
+
+    let load = |hash: String| async move {
+        mono.get_tree_by_hash_in_txn(&hash, txn)
+            .await?
+            .map(Tree::from_mega_model)
+            .ok_or_else(|| MegaError::Other(format!("tree {hash} not found")))
+    };
+    let names: Vec<String> = path
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let (_, down) = names
+        .split_last()
+        .ok_or_else(|| MegaError::Other("ImportRepo path has no leaf".into()))?;
+    let mut chain = Vec::with_capacity(names.len());
+    let mut tree = load(root_tree.to_owned()).await?;
+    for name in down {
+        let next = tree
+            .tree_items
+            .iter()
+            .find(|item| item.name == *name && item.mode == TreeItemMode::Tree)
+            .map(|item| item.id.to_string())
+            .ok_or_else(|| MegaError::Other(format!("tree entry {name:?} not found")))?;
+        chain.push(tree);
+        tree = load(next).await?;
+    }
+    chain.push(tree);
+    Ok((chain, names))
 }
 
 /// Keep exactly one default branch after a batch that deleted the old one
@@ -1410,8 +1539,14 @@ impl PushQueueService {
         {
             Ok(outcome) => Ok(outcome),
             Err(e) => {
+                let op = row
+                    .payload
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("attach");
                 tracing::error!(
                     id,
+                    op,
                     error = %e,
                     "B3 attach aborted with Err; terminalizing AttachFailure"
                 );
@@ -1441,6 +1576,291 @@ impl PushQueueService {
             id,
             failure: "AttachFailure".into(),
             message,
+        })
+    }
+
+    /// B3 detach of an ImportRepo (plan-20260923 ADR-FU-09 items 2 and 3),
+    /// inside the attach SAVEPOINT: lock the repository's own row, refuse
+    /// while other ImportRepos live below it, remove the mount when this
+    /// repository owns it, then delete its refs and row and record the detach
+    /// in the audit log and the cleanup ledger. Its objects stay for the
+    /// out-of-lock sweep (FU-17).
+    async fn b3_execute_detach(
+        &self,
+        txn: DatabaseTransaction,
+        row: &push_queue::Model,
+        ctx: &AttachExecContext,
+        payload: &AttachPayload,
+        repo_path: &str,
+        root: &crate::callisto::mega_refs::Model,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        use git_internal::{
+            hash::{ObjectHash, get_hash_kind},
+            internal::object::commit::Commit,
+        };
+        use sea_orm::{
+            ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement,
+        };
+
+        use crate::{
+            callisto::{
+                git_repo, import_refs,
+                sea_orm_active_enums::{ActorTypeEnum, AuditActionEnum, TargetTypeEnum},
+            },
+            ceres::api_service::tree_ops,
+            common::utils::canonicalize_mono_ref_path,
+        };
+
+        let expected_commit = root.ref_commit_hash.clone();
+        let expected_tree = root.ref_tree_hash.clone();
+        PushQueueStorage::savepoint(&txn, "b3_kind").await?;
+
+        // The repository's own row first, then its children (ADR-FU-09 item 2).
+        let live = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT repo_path FROM git_repo WHERE id = $1 FOR UPDATE",
+                [payload.repo_id.into()],
+            ))
+            .await?
+            .map(|live| live.try_get::<String>("", "repo_path"))
+            .transpose()?;
+        if live
+            .and_then(|live| canonicalize_mono_ref_path(&live).ok())
+            .as_deref()
+            != Some(repo_path)
+        {
+            // Already detached, or the path is another import now: no writes.
+            PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+            return self
+                .b3_detach_finish(txn, row, ctx, &expected_commit, None)
+                .await;
+        }
+        if import_repo_has_children_in_txn(&txn, payload.repo_id, repo_path).await? {
+            let refused = ImportRepoError::HasChildren {
+                path: repo_path.to_owned(),
+            };
+            return self.b3_attach_fail(txn, row.id, refused.to_string()).await;
+        }
+
+        // The mount goes only when it is this repository's (a provenance
+        // record, or the legacy `.gitkeep`-only shape of a repository with
+        // branches); an ordinary directory or a missing leaf stays as it is.
+        // Only a strict descendant of `import_dir` has a mount at all: a
+        // legacy row at `import_dir` itself, or outside it, loses its rows
+        // and nothing else (the import root is never removed).
+        let git_db = ctx.storage.git_db_storage();
+        let import_dir = canonicalize_mono_ref_path(
+            &ctx.storage.config().monorepo.import_dir.to_string_lossy(),
+        )?;
+        let under_import_dir =
+            repo_path.starts_with(&format!("{}/", import_dir.trim_end_matches('/')));
+        let owned = under_import_dir
+            && match import_leaf_in_txn(&self.mono_storage, &expected_tree, repo_path, &txn).await?
+            {
+                ImportLeaf::Absent | ImportLeaf::NotDirectory => false,
+                leaf @ (ImportLeaf::GitkeepOnly | ImportLeaf::Directory) => {
+                    AuditStorage::has_import_repo_attach_in_txn(&txn, payload.repo_id, repo_path)
+                        .await?
+                        || (leaf == ImportLeaf::GitkeepOnly
+                            && has_branch_ref_in_txn(&txn, payload.repo_id).await?)
+                }
+            };
+        let mut landed_commit_id = expected_commit.clone();
+        let mut new_root_tree = None;
+        if owned {
+            let (chain, names) =
+                import_leaf_chain_in_txn(&self.mono_storage, &expected_tree, repo_path, &txn)
+                    .await?;
+            let floor = import_dir.split('/').filter(|c| !c.is_empty()).count();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let (trees, gitkeep) = tree_ops::remove_import_leaf(&chain, &names, floor)?;
+            let new_root = trees
+                .last()
+                .ok_or_else(|| MegaError::Other("no tree generated".into()))?;
+            let new_commit = Commit::from_tree_id(
+                new_root.id,
+                vec![
+                    ObjectHash::from_hex_for_kind(get_hash_kind(), &expected_commit).map_err(
+                        |e| MegaError::Other(format!("invalid expected commit hash: {e}")),
+                    )?,
+                ],
+                &format_commit_msg(&format!("Remove ImportRepo {repo_path}"), None),
+            );
+            landed_commit_id = new_commit.id.to_string();
+            new_root_tree = Some(new_commit.tree_id.to_string());
+            if let Some(blob) = gitkeep {
+                use git_internal::internal::metadata::EntryMeta;
+                use sea_orm::IntoActiveModel;
+
+                use crate::{callisto::mega_blob, jupiter::utils::converter::IntoMegaModel};
+
+                // The bytes go to the object store outside the SAVEPOINT (as in
+                // attach); the `mega_blob` row rides the transaction, so a
+                // refused round leaves no row behind.
+                ctx.storage
+                    .git_service
+                    .put_objects(vec![blob.clone()])
+                    .await?;
+                let mut model: mega_blob::Model = blob.into_mega_model(EntryMeta::default());
+                model.commit_id = landed_commit_id.clone();
+                mega_blob::Entity::insert(model.into_active_model())
+                    .exec(&txn)
+                    .await?;
+            }
+            match self
+                .mono_storage
+                .attach_to_monorepo_parent_in_txn(
+                    &txn,
+                    root.id,
+                    &expected_commit,
+                    &expected_tree,
+                    new_commit,
+                    trees,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(MegaError::StaleMonorepoRootRef) => {
+                    // Under the queue this is a bypass tripwire, not a retry signal.
+                    self.note_cas_assert_failure();
+                    PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+                    PushQueueStorage::set_hard_stopped_in_txn(&txn, true).await?;
+                    let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                        &txn,
+                        row.id,
+                        "QueueBypassDetected",
+                        "detach root CAS affected 0 rows",
+                    )
+                    .await?;
+                    if !updated {
+                        tracing::error!(
+                            id = row.id,
+                            "B3 detach CAS fail-closed: Failed update hit 0 rows"
+                        );
+                    }
+                    PushQueueStorage::notify_mono_write_queue(&txn).await?;
+                    txn.commit().await?;
+                    return Ok(ExecuteOutcome::BypassDetected { id: row.id });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        import_refs::Entity::delete_many()
+            .filter(import_refs::Column::RepoId.eq(payload.repo_id))
+            .exec(&txn)
+            .await?;
+        git_repo::Entity::delete_by_id(payload.repo_id)
+            .exec(&txn)
+            .await?;
+        let requester = row
+            .requester
+            .clone()
+            .unwrap_or_else(|| "anonymous".to_owned());
+        AuditStorage::log_audit_in_txn(
+            &txn,
+            // Reserved actor: storage-only has no numeric user id.
+            0,
+            ActorTypeEnum::Human,
+            AuditActionEnum::Delete,
+            TargetTypeEnum::Repository,
+            payload.repo_id,
+            Some(serde_json::json!({
+                "kind": IMPORT_REPO_REMOVE_KIND,
+                "cleanup_id": row.id,
+                "path": repo_path,
+                "requester": requester,
+                "phase": "detached",
+            })),
+        )
+        .await?;
+        git_db
+            .insert_cleanup_in_txn(row.id, repo_path, payload.repo_id, &requester, &txn)
+            .await?;
+        self.b3_detach_finish(
+            txn,
+            row,
+            ctx,
+            &landed_commit_id,
+            new_root_tree.map(|new_tree| (expected_tree, new_tree)),
+        )
+        .await
+    }
+
+    /// `Done` for a detach round. `root_trees` is `(old, new)` when the round
+    /// moved the root, which then gets the same post-commit steps as attach.
+    async fn b3_detach_finish(
+        &self,
+        txn: DatabaseTransaction,
+        row: &push_queue::Model,
+        ctx: &AttachExecContext,
+        landed_commit_id: &str,
+        root_trees: Option<(String, String)>,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        use git_internal::internal::object::tree::Tree;
+
+        use crate::{
+            contract::policy::notify::{
+                after_b3_commit_authz, authz_blob_id, insert_b3_authz_outbox_if_builds,
+            },
+            jupiter::utils::converter::FromMegaModel,
+        };
+
+        let updated =
+            PushQueueStorage::mark_done_if_running_in_txn(&txn, row.id, landed_commit_id).await?;
+        if !updated {
+            txn.rollback().await?;
+            tracing::error!(
+                id = row.id,
+                "B3 detach Done update hit 0 rows after fencing"
+            );
+            return Ok(self.outcome_claim_lost(row.id));
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        let Some((old_tree, new_tree)) = root_trees else {
+            txn.commit().await?;
+            return Ok(ExecuteOutcome::Done {
+                id: row.id,
+                landed_commit_id: landed_commit_id.to_owned(),
+                root_cas_writes: 0,
+            });
+        };
+        insert_b3_authz_outbox_if_builds(&ctx.storage, &txn, row.id).await?;
+        txn.commit().await?;
+        let blob_ids = async {
+            let old_blob_id = self
+                .mono_storage
+                .get_tree_by_hash(&old_tree)
+                .await?
+                .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+            let new_blob_id = self
+                .mono_storage
+                .get_tree_by_hash(&new_tree)
+                .await?
+                .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+            Ok::<_, MegaError>((old_blob_id, new_blob_id))
+        }
+        .await;
+        match blob_ids {
+            Ok((old_blob_id, new_blob_id)) => {
+                after_b3_commit_authz(&ctx.storage, old_blob_id.as_deref(), new_blob_id.as_deref())
+                    .await;
+            }
+            Err(e) => {
+                ctx.storage.entity_store().mark_dirty();
+                tracing::error!(
+                    id = row.id,
+                    error = %e,
+                    "detach authz blob resolve failed after Done; marked entity store dirty"
+                );
+            }
+        }
+        self.run_c_segment_index(row.id, &row.path).await;
+        Ok(ExecuteOutcome::Done {
+            id: row.id,
+            landed_commit_id: landed_commit_id.to_owned(),
+            root_cas_writes: 1,
         })
     }
 
@@ -1573,6 +1993,11 @@ impl PushQueueService {
         let expected_tree = cur_tree
             .ok_or_else(|| MegaError::Other("attach root tree missing".into()))?
             .to_owned();
+        if payload.op == AttachOp::Detach {
+            return self
+                .b3_execute_detach(txn, row, ctx, &payload, &repo_path, root)
+                .await;
+        }
 
         // A delete-only batch never touches the mount, so neither the
         // materialization precheck nor the ownership gate below protects
@@ -1636,10 +2061,7 @@ impl PushQueueService {
                         .await?;
                 let legacy = !recorded
                     && leaf == ImportLeaf::GitkeepOnly
-                    && !git_db
-                        .list_branch_refs_in_txn(payload.repo_id, &txn)
-                        .await?
-                        .is_empty();
+                    && has_branch_ref_in_txn(&txn, payload.repo_id).await?;
                 if !recorded && !legacy {
                     let occupied = ImportRepoError::PathOccupied { path: repo_path };
                     return self.b3_attach_fail(txn, row.id, occupied.to_string()).await;
@@ -5254,6 +5676,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let payload = AttachPayload {
+            op: AttachOp::Attach,
             repo_id: repo.repo_id,
             repo_path: repo.repo_path.clone(),
             commands: vec![AttachCommand {
@@ -5723,6 +6146,7 @@ mod tests {
         ];
         for commands in batches {
             let payload = AttachPayload {
+                op: AttachOp::Attach,
                 repo_id: repo.repo_id,
                 repo_path: repo.repo_path.clone(),
                 commands,
@@ -5849,6 +6273,7 @@ mod tests {
         tip: &str,
     ) -> ExecuteOutcome {
         let payload = AttachPayload {
+            op: AttachOp::Attach,
             repo_id: repo.repo_id,
             repo_path: repo.repo_path.clone(),
             commands,
@@ -6604,5 +7029,1044 @@ mod tests {
             fu12_ref_id(&git_db, repo.repo_id, "refs/heads/main").await,
             Some(c1_id)
         );
+    }
+
+    /// Register `path` as an ImportRepo (`git_repo` row plus one commit), the
+    /// way the protocol dispatch does before the first attach.
+    async fn fu16_register(
+        storage: &crate::jupiter::storage::Storage,
+        path: &str,
+    ) -> (crate::ceres::protocol::repo::Repo, String) {
+        let (repo, c1, _) = wh03_seed_import_repo(storage, path).await;
+        storage
+            .git_db_storage()
+            .save_git_repo(repo.clone().into())
+            .await
+            .unwrap();
+        (repo, c1.id.to_string())
+    }
+
+    async fn fu16_mount(
+        storage: &crate::jupiter::storage::Storage,
+        path: &str,
+    ) -> (crate::ceres::protocol::repo::Repo, String) {
+        let (repo, c1) = fu16_register(storage, path).await;
+        let mounted = fu13_attach(
+            storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/main", "Create", ZERO_ID, &c1)],
+            &c1,
+        )
+        .await;
+        assert!(
+            matches!(mounted, ExecuteOutcome::Done { .. }),
+            "{mounted:?}"
+        );
+        (repo, c1)
+    }
+
+    async fn fu16_enqueue_detach(
+        storage: &crate::jupiter::storage::Storage,
+        repo: &crate::ceres::protocol::repo::Repo,
+        requester: Option<&str>,
+    ) -> EnqueueOutcome {
+        let payload = AttachPayload {
+            op: AttachOp::Detach,
+            repo_id: repo.repo_id,
+            repo_path: repo.repo_path.clone(),
+            commands: Vec::new(),
+        };
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Attach,
+                operation_id: detach_operation_id(repo.repo_id, &repo.repo_path),
+                path: repo.repo_path.clone(),
+                old_id: root.ref_commit_hash,
+                new_id: ZERO_ID.to_owned(),
+                requester: requester.map(str::to_owned),
+                payload: serde_json::to_value(&payload).unwrap(),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn fu16_execute(storage: &crate::jupiter::storage::Storage, id: i64) -> ExecuteOutcome {
+        assert_eq!(
+            storage
+                .push_queue_service
+                .storage()
+                .claim_for_execution(id)
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed
+        );
+        let ctx = AttachExecContext {
+            storage: storage.clone(),
+            git_object_cache: std::sync::Arc::new(
+                crate::ceres::api_service::cache::GitObjectCache {
+                    connection: crate::jupiter::tests::test_redis_manager().await,
+                    prefix: String::new(),
+                },
+            ),
+        };
+        storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                Some(&ctx),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn fu16_detach(
+        storage: &crate::jupiter::storage::Storage,
+        repo: &crate::ceres::protocol::repo::Repo,
+    ) -> (i64, ExecuteOutcome) {
+        let EnqueueOutcome::Inserted { id } = fu16_enqueue_detach(storage, repo, None).await else {
+            panic!("detach insert");
+        };
+        (id, fu16_execute(storage, id).await)
+    }
+
+    async fn fu16_leaf(storage: &crate::jupiter::storage::Storage, path: &str) -> ImportLeaf {
+        let mono = storage.mono_storage();
+        let root = mono.get_main_ref("/").await.unwrap().unwrap();
+        let txn = mono.get_connection().begin().await.unwrap();
+        let leaf = import_leaf_in_txn(&mono, &root.ref_tree_hash, path, &txn)
+            .await
+            .unwrap();
+        txn.rollback().await.unwrap();
+        leaf
+    }
+
+    async fn fu16_count(storage: &crate::jupiter::storage::Storage, sql: String) -> i64 {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        storage
+            .mono_storage()
+            .get_connection()
+            .query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap()
+    }
+
+    async fn fu16_rows(storage: &crate::jupiter::storage::Storage, repo_id: i64) -> (i64, i64) {
+        (
+            fu16_count(
+                storage,
+                format!("SELECT count(*) AS n FROM git_repo WHERE id = {repo_id}"),
+            )
+            .await,
+            fu16_count(
+                storage,
+                format!("SELECT count(*) AS n FROM import_refs WHERE repo_id = {repo_id}"),
+            )
+            .await,
+        )
+    }
+
+    #[tokio::test]
+    async fn fu16_detach_removes_leaf_and_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (a, _) = fu16_mount(&storage, "/third-party/org/fu16-a").await;
+        let (b, _) = fu16_mount(&storage, "/third-party/org/fu16-b").await;
+        assert_eq!(fu16_rows(&storage, a.repo_id).await, (1, 1));
+
+        // A sibling keeps the shared parent.
+        let before = fu13_root(&storage).await;
+        let (_, detached) = fu16_detach(&storage, &a).await;
+        let ExecuteOutcome::Done {
+            landed_commit_id,
+            root_cas_writes: 1,
+            ..
+        } = detached
+        else {
+            panic!("{detached:?}");
+        };
+        let after = fu13_root(&storage).await;
+        assert_eq!(after.0, landed_commit_id);
+        let commit = storage
+            .mono_storage()
+            .get_commit_by_hash(&landed_commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            commit.parents_id,
+            serde_json::json!([before.0]),
+            "the detach commit follows the old root"
+        );
+        assert_eq!(
+            commit.content.as_deref(),
+            Some(format_commit_msg("Remove ImportRepo /third-party/org/fu16-a", None).as_str()),
+            "the detach commit names the path and is framed"
+        );
+        assert_eq!(fu16_leaf(&storage, &a.repo_path).await, ImportLeaf::Absent);
+        assert_eq!(
+            fu16_leaf(&storage, &b.repo_path).await,
+            ImportLeaf::GitkeepOnly
+        );
+        assert_eq!(fu16_rows(&storage, a.repo_id).await, (0, 0));
+        assert_eq!(fu16_rows(&storage, b.repo_id).await, (1, 1));
+
+        // The last repository under org takes the emptied org with it; the
+        // import root stays.
+        let (_, detached) = fu16_detach(&storage, &b).await;
+        assert!(
+            matches!(
+                detached,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 1,
+                    ..
+                }
+            ),
+            "{detached:?}"
+        );
+        assert_eq!(
+            fu16_leaf(&storage, "/third-party/org").await,
+            ImportLeaf::Absent
+        );
+        assert_ne!(
+            fu16_leaf(&storage, "/third-party").await,
+            ImportLeaf::Absent,
+            "the import root is never removed"
+        );
+        assert_eq!(fu16_rows(&storage, b.repo_id).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn fu16_detach_fault_injection_rolls_back() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, _) = fu16_mount(&storage, "/third-party/fu16-fault").await;
+        let before = fu13_root(&storage).await;
+        let EnqueueOutcome::Inserted { id } = fu16_enqueue_detach(&storage, &repo, None).await
+        else {
+            panic!("detach insert");
+        };
+        // The ledger insert is the last write of the round; a row already
+        // holding this cleanup id makes it fail after every other write.
+        storage
+            .git_db_storage()
+            .insert_cleanup_in_txn(
+                id,
+                "/elsewhere",
+                1,
+                "anonymous",
+                storage.mono_storage().get_connection(),
+            )
+            .await
+            .unwrap();
+        let outcome = fu16_execute(&storage, id).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, before, "tree unchanged");
+        assert_eq!(
+            fu16_leaf(&storage, &repo.repo_path).await,
+            ImportLeaf::GitkeepOnly
+        );
+        assert_eq!(fu16_rows(&storage, repo.repo_id).await, (1, 1));
+        assert_eq!(
+            fu16_count(
+                &storage,
+                format!(
+                    "SELECT count(*) AS n FROM audit_logs WHERE target_id = {} \
+                     AND metadata->>'kind' = '{IMPORT_REPO_REMOVE_KIND}'",
+                    repo.repo_id
+                )
+            )
+            .await,
+            0,
+            "no audit row"
+        );
+        let row = storage
+            .push_queue_service
+            .storage()
+            .get_by_id(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, PushQueueStatusEnum::Failed);
+
+        // The generated `.gitkeep` of an emptied import root: its `mega_blob`
+        // row rides the transaction, so a refused round leaves none behind.
+        fu16_strip_import_root_gitkeep(&storage).await;
+        let before = fu13_root(&storage).await;
+        let blob_rows =
+            fu16_count(&storage, "SELECT count(*) AS n FROM mega_blob".to_owned()).await;
+        let EnqueueOutcome::Inserted { id } = fu16_enqueue_detach(&storage, &repo, None).await
+        else {
+            panic!("detach insert");
+        };
+        storage
+            .git_db_storage()
+            .insert_cleanup_in_txn(
+                id,
+                "/elsewhere",
+                1,
+                "anonymous",
+                storage.mono_storage().get_connection(),
+            )
+            .await
+            .unwrap();
+        let outcome = fu16_execute(&storage, id).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, before);
+        assert_eq!(
+            fu16_leaf(&storage, "/third-party").await,
+            ImportLeaf::Directory,
+            "still without .gitkeep"
+        );
+        assert_eq!(
+            fu16_count(&storage, "SELECT count(*) AS n FROM mega_blob".to_owned()).await,
+            blob_rows,
+            "no mega_blob row from the refused round"
+        );
+        assert_eq!(fu16_rows(&storage, repo.repo_id).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn fu16_detach_writes_audit_in_txn() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        use crate::callisto::{
+            audit_logs, import_repo_cleanups,
+            sea_orm_active_enums::{ActorTypeEnum, AuditActionEnum},
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, _) = fu16_mount(&storage, "/third-party/fu16-audit").await;
+        let EnqueueOutcome::Inserted { id } =
+            fu16_enqueue_detach(&storage, &repo, Some("ci-token")).await
+        else {
+            panic!("detach insert");
+        };
+        let outcome = fu16_execute(&storage, id).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Done { .. }),
+            "{outcome:?}"
+        );
+        let conn = storage.mono_storage().get_connection().clone();
+        let removed: Vec<_> = audit_logs::Entity::find()
+            .filter(audit_logs::Column::TargetId.eq(repo.repo_id))
+            .filter(audit_logs::Column::Action.eq(AuditActionEnum::Delete))
+            .all(&conn)
+            .await
+            .unwrap();
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        let audit = &removed[0];
+        assert_eq!(audit.actor_id, 0);
+        assert_eq!(audit.actor_type, ActorTypeEnum::Human);
+        assert_eq!(
+            audit.metadata,
+            Some(serde_json::json!({
+                "kind": IMPORT_REPO_REMOVE_KIND,
+                "cleanup_id": id,
+                "path": repo.repo_path,
+                "requester": "ci-token",
+                "phase": "detached",
+            }))
+        );
+        let ledger = import_repo_cleanups::Entity::find_by_id(id)
+            .one(&conn)
+            .await
+            .unwrap()
+            .expect("ledger row keyed by the queue row id");
+        assert_eq!(ledger.state, import_repo_cleanups::CleanupState::Detached);
+        assert_eq!(
+            (
+                ledger.path.as_str(),
+                ledger.repo_id,
+                ledger.requester.as_str()
+            ),
+            (repo.repo_path.as_str(), repo.repo_id, "ci-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn fu16_detach_without_provenance_keeps_tree() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        // An ordinary directory at the path, never mounted by this repository.
+        fu13_plant(&storage, "third-party", "fu16-plain", false).await;
+        let (repo, _) = fu16_register(&storage, "/third-party/fu16-plain").await;
+        let before = fu13_root(&storage).await;
+        let (id, outcome) = fu16_detach(&storage, &repo).await;
+        assert!(
+            matches!(
+                outcome,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, before, "the directory stays");
+        assert_eq!(
+            fu16_leaf(&storage, &repo.repo_path).await,
+            ImportLeaf::Directory
+        );
+        assert_eq!(fu16_rows(&storage, repo.repo_id).await, (0, 0));
+        assert_eq!(
+            fu16_count(
+                &storage,
+                format!("SELECT count(*) AS n FROM import_repo_cleanups WHERE id = {id}")
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn fu16_detach_operation_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, c1) = fu16_mount(&storage, "/third-party/fu16-id").await;
+        let attach_id = attach_operation_id(
+            &repo.repo_id.to_string(),
+            &normalize_attach_commands(&[(
+                "refs/heads/main".to_owned(),
+                "Create".to_owned(),
+                ZERO_ID.to_owned(),
+                c1,
+            )]),
+        );
+        let detach_id = detach_operation_id(repo.repo_id, &repo.repo_path);
+        // sha256("import_repo.detach\0" ‖ repo_id ‖ "\0" ‖ canonical path).
+        assert_eq!(
+            detach_operation_id(7, "/third-party/x"),
+            "875bdce235a6670d1956abc3e623debc820a565c74d237ec98373be08b8d886c"
+        );
+        assert_eq!(
+            detach_operation_id(7, "/third-party/y"),
+            "4643611487ddfbec1e7cb7d628027323d604c602b41f83be88c2530ab0055b54"
+        );
+        assert_ne!(detach_id, attach_id);
+        assert_ne!(
+            detach_id,
+            attach_operation_id(&repo.repo_id.to_string(), "")
+        );
+        assert_ne!(
+            detach_id,
+            detach_operation_id(repo.repo_id + 1, &repo.repo_path),
+            "a re-import has a new repo_id and so a new id"
+        );
+
+        let cache = std::sync::Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+            connection: crate::jupiter::tests::test_redis_manager().await,
+            prefix: String::new(),
+        });
+        let first = crate::ceres::pack::import_repo::detach_import_repo(
+            &storage,
+            cache.clone(),
+            repo.repo_id,
+            &repo.repo_path,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("a detach that removed the repository has a cleanup id");
+        let root = fu13_root(&storage).await;
+        // Retrying the same detach replays its Done row and writes nothing.
+        let again = crate::ceres::pack::import_repo::detach_import_repo(
+            &storage,
+            cache,
+            repo.repo_id,
+            &repo.repo_path,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, Some(first));
+        assert_eq!(fu13_root(&storage).await, root);
+        assert_eq!(
+            fu16_count(
+                &storage,
+                format!(
+                    "SELECT count(*) AS n FROM import_repo_cleanups WHERE repo_id = {}",
+                    repo.repo_id
+                )
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn fu16_detach_child_orderings() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let has_children = |path: &str| {
+            ImportRepoError::HasChildren {
+                path: path.to_owned(),
+            }
+            .to_string()
+        };
+        let refused_with = |outcome: &ExecuteOutcome, path: &str| matches!(outcome, ExecuteOutcome::Failed { message, .. } if *message == has_children(path));
+
+        // A child registered below a mounted parent refuses the parent's
+        // detach, before and after the child's own attach ran; neither side
+        // changes.
+        let (parent, _) = fu16_mount(&storage, "/third-party/fu16-parent").await;
+        let (child, child_c1) = fu16_register(&storage, "/third-party/fu16-parent/child").await;
+        let before = fu13_root(&storage).await;
+        let (_, refused) = fu16_detach(&storage, &parent).await;
+        assert!(refused_with(&refused, &parent.repo_path), "{refused:?}");
+        assert_eq!(fu13_root(&storage).await, before);
+        assert_eq!(fu16_rows(&storage, parent.repo_id).await, (1, 1));
+        assert_eq!(fu16_rows(&storage, child.repo_id).await, (1, 0));
+
+        let mounted = fu13_attach(
+            &storage,
+            &child,
+            vec![fu12_cmd("refs/heads/main", "Create", ZERO_ID, &child_c1)],
+            &child_c1,
+        )
+        .await;
+        assert!(
+            matches!(mounted, ExecuteOutcome::Done { .. }),
+            "{mounted:?}"
+        );
+        let before = fu13_root(&storage).await;
+        // A retry of the refused detach is a new row with the same identity.
+        let EnqueueOutcome::Inserted { id } = fu16_enqueue_detach(&storage, &parent, None).await
+        else {
+            panic!("detach retry insert");
+        };
+        let refused = fu16_execute(&storage, id).await;
+        assert!(refused_with(&refused, &parent.repo_path), "{refused:?}");
+        assert_eq!(fu13_root(&storage).await, before);
+        assert_eq!(fu16_rows(&storage, parent.repo_id).await, (1, 1));
+        assert_eq!(fu16_rows(&storage, child.repo_id).await, (1, 1));
+
+        // The detach locks its own row before it looks for children: a child
+        // registration still holding the parent's row (FU-18's ancestor
+        // fence) makes it wait, and it then sees the child.
+        let (p2, _) = fu16_mount(&storage, "/third-party/fu16-p2").await;
+        let EnqueueOutcome::Inserted { id } = fu16_enqueue_detach(&storage, &p2, None).await else {
+            panic!("detach insert");
+        };
+        let conn = storage.mono_storage().get_connection().clone();
+        let registering = conn.begin().await.unwrap();
+        registering
+            .execute_unprepared(&format!(
+                "SELECT id FROM git_repo WHERE id = {} FOR SHARE",
+                p2.repo_id
+            ))
+            .await
+            .unwrap();
+        registering
+            .execute_unprepared(&format!(
+                "INSERT INTO git_repo (id, repo_path, repo_name, created_at, updated_at) \
+                 VALUES ({}, '/third-party/fu16-p2/late', 'late', now(), now())",
+                crate::common::utils::generate_id()
+            ))
+            .await
+            .unwrap();
+        let detach_storage = storage.clone();
+        let detaching = tokio::spawn(async move { fu16_execute(&detach_storage, id).await });
+        let mut waiting = false;
+        for _ in 0..200 {
+            let row = registering
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    // Only this test's detach can be blocked by this backend: the
+                    // rows it locks live in this test's own schema.
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                     AND pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS v",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            if row.try_get::<bool>("", "v").unwrap() {
+                waiting = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(waiting, "the detach waits on the parent's row");
+        registering.commit().await.unwrap();
+        let refused = detaching.await.unwrap();
+        assert!(refused_with(&refused, &p2.repo_path), "{refused:?}");
+        assert_eq!(fu16_rows(&storage, p2.repo_id).await, (1, 1));
+
+        // A `P/` alias of the repository itself (left by the FU-15 migration)
+        // is the same split identity, not a child; it is not deleted either.
+        let (p3, _) = fu16_mount(&storage, "/third-party/fu16-p3").await;
+        conn.execute_unprepared(&format!(
+            "INSERT INTO git_repo (id, repo_path, repo_name, created_at, updated_at) \
+             VALUES ({}, '/third-party/fu16-p3/', 'alias', now(), now())",
+            crate::common::utils::generate_id()
+        ))
+        .await
+        .unwrap();
+        let (_, detached) = fu16_detach(&storage, &p3).await;
+        assert!(
+            matches!(
+                detached,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 1,
+                    ..
+                }
+            ),
+            "{detached:?}"
+        );
+        assert_eq!(fu16_rows(&storage, p3.repo_id).await, (0, 0));
+        assert_eq!(
+            fu16_count(
+                &storage,
+                "SELECT count(*) AS n FROM git_repo WHERE repo_path = '/third-party/fu16-p3/'"
+                    .to_owned()
+            )
+            .await,
+            1
+        );
+
+        // A repository whose first push never mounted it has no leaf and can
+        // still be detached.
+        let (orphan, _) = fu16_register(&storage, "/third-party/fu16-orphan").await;
+        let before = fu13_root(&storage).await;
+        let (_, detached) = fu16_detach(&storage, &orphan).await;
+        assert!(
+            matches!(
+                detached,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{detached:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, before);
+        assert_eq!(fu16_rows(&storage, orphan.repo_id).await, (0, 0));
+    }
+
+    /// Take the `.gitkeep` out of `/third-party`, leaving only its mounts:
+    /// the shape of an import root that the first attach created lazily.
+    async fn fu16_strip_import_root_gitkeep(storage: &crate::jupiter::storage::Storage) {
+        use std::str::FromStr;
+
+        use git_internal::{
+            hash::ObjectHash,
+            internal::object::{
+                commit::Commit,
+                tree::{Tree, TreeItem, TreeItemMode},
+            },
+        };
+
+        use crate::jupiter::utils::converter::FromMegaModel;
+
+        let mono = storage.mono_storage();
+        let root_ref = mono.get_main_ref("/").await.unwrap().unwrap();
+        let root = Tree::from_mega_model(
+            mono.get_tree_by_hash(&root_ref.ref_tree_hash)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let import_item = root
+            .tree_items
+            .iter()
+            .find(|item| item.name == "third-party")
+            .unwrap()
+            .clone();
+        let import_tree = Tree::from_mega_model(
+            mono.get_tree_by_hash(&import_item.id.to_string())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let items: Vec<TreeItem> = import_tree
+            .tree_items
+            .into_iter()
+            .filter(|item| item.name != ".gitkeep")
+            .collect();
+        assert!(!items.is_empty(), "strip after a mount, not before");
+        let new_import = Tree::from_tree_items(items).unwrap();
+        let mut root_items: Vec<TreeItem> = root
+            .tree_items
+            .iter()
+            .filter(|item| item.name != "third-party")
+            .cloned()
+            .collect();
+        root_items.push(TreeItem::new(
+            TreeItemMode::Tree,
+            new_import.id,
+            "third-party".to_owned(),
+        ));
+        let new_root = Tree::from_tree_items(root_items).unwrap();
+        let commit = Commit::from_tree_id(
+            new_root.id,
+            vec![ObjectHash::from_str(&root_ref.ref_commit_hash).unwrap()],
+            "fu16 strip import root gitkeep",
+        );
+        mono.save_mega_trees(vec![new_import, new_root.clone()], commit.id, None)
+            .await
+            .unwrap();
+        mono.save_mega_commits(vec![commit.clone()], None)
+            .await
+            .unwrap();
+        let mut updated = root_ref;
+        updated.ref_commit_hash = commit.id.to_string();
+        updated.ref_tree_hash = new_root.id.to_string();
+        mono.update_ref(updated, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fu16_detach_restores_import_root_gitkeep() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, _) = fu16_mount(&storage, "/third-party/fu16-only").await;
+        fu16_strip_import_root_gitkeep(&storage).await;
+        assert_eq!(
+            fu16_leaf(&storage, "/third-party").await,
+            ImportLeaf::Directory
+        );
+        let (_, detached) = fu16_detach(&storage, &repo).await;
+        let ExecuteOutcome::Done {
+            landed_commit_id,
+            root_cas_writes: 1,
+            ..
+        } = detached
+        else {
+            panic!("{detached:?}");
+        };
+        // The emptied import root keeps a `.gitkeep`, and its blob is stored
+        // under the detach commit like the attach placeholder is.
+        assert_eq!(
+            fu16_leaf(&storage, "/third-party").await,
+            ImportLeaf::GitkeepOnly
+        );
+        assert_eq!(
+            fu16_count(
+                &storage,
+                format!(
+                    "SELECT count(*) AS n FROM mega_blob WHERE commit_id = '{landed_commit_id}'"
+                )
+            )
+            .await,
+            1
+        );
+        assert_eq!(fu16_rows(&storage, repo.repo_id).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn fu16_detach_replay_rechecks_live_repo() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, _) = fu16_mount(&storage, "/third-party/fu16-replay").await;
+        // A `Done` row under the detach identity that did not detach: what a
+        // pre-FU-16 binary leaves when it runs a detach row as a delete-only
+        // attach (the payload has no `op`).
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let EnqueueOutcome::Inserted { id: poisoned } = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Attach,
+                operation_id: detach_operation_id(repo.repo_id, &repo.repo_path),
+                path: repo.repo_path.clone(),
+                old_id: root.ref_commit_hash,
+                new_id: ZERO_ID.to_owned(),
+                requester: None,
+                payload: serde_json::json!({
+                    "repo_id": repo.repo_id,
+                    "repo_path": repo.repo_path,
+                    "commands": [],
+                }),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("poison insert");
+        };
+        let ran = fu16_execute(&storage, poisoned).await;
+        assert!(
+            matches!(
+                ran,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{ran:?}"
+        );
+        assert_eq!(fu16_rows(&storage, repo.repo_id).await, (1, 1));
+
+        // The detach does not take that replay for an answer.
+        let cache = std::sync::Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+            connection: crate::jupiter::tests::test_redis_manager().await,
+            prefix: String::new(),
+        });
+        let cleanup_id = crate::ceres::pack::import_repo::detach_import_repo(
+            &storage,
+            cache.clone(),
+            repo.repo_id,
+            &repo.repo_path,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("a cleanup id");
+        assert_ne!(cleanup_id, poisoned);
+        assert_eq!(fu16_rows(&storage, repo.repo_id).await, (0, 0));
+        assert_eq!(
+            fu16_leaf(&storage, &repo.repo_path).await,
+            ImportLeaf::Absent
+        );
+        assert_eq!(
+            fu16_count(
+                &storage,
+                format!("SELECT count(*) AS n FROM import_repo_cleanups WHERE id = {cleanup_id}")
+            )
+            .await,
+            1
+        );
+        // Once the repository is gone the poisoned row replays, but the
+        // cleanup id handed out is the ledger row's, never the bare queue id.
+        let again = crate::ceres::pack::import_repo::detach_import_repo(
+            &storage,
+            cache,
+            repo.repo_id,
+            &repo.repo_path,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, Some(cleanup_id));
+    }
+
+    #[tokio::test]
+    async fn fu16_detach_import_root_row_keeps_tree() {
+        use sea_orm::ConnectionTrait;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let cache = std::sync::Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+            connection: crate::jupiter::tests::test_redis_manager().await,
+            prefix: String::new(),
+        });
+        // Legacy rows at `import_dir` itself and outside it (DEFER-FU-09): the
+        // detach unregisters them and never touches the tree, even with a
+        // provenance record claiming the path.
+        for path in ["/third-party", "/project/fu16-outside"] {
+            let (repo, _) = fu16_register(&storage, path).await;
+            AuditStorage::log_import_repo_attach_in_txn(
+                storage.mono_storage().get_connection(),
+                repo.repo_id,
+                path,
+            )
+            .await
+            .unwrap();
+            let before = fu13_root(&storage).await;
+            let (_, detached) = fu16_detach(&storage, &repo).await;
+            assert!(
+                matches!(
+                    detached,
+                    ExecuteOutcome::Done {
+                        root_cas_writes: 0,
+                        ..
+                    }
+                ),
+                "{path}: {detached:?}"
+            );
+            assert_eq!(fu13_root(&storage).await, before, "{path}");
+            assert_eq!(fu16_rows(&storage, repo.repo_id).await, (0, 0), "{path}");
+        }
+        assert_eq!(
+            fu16_leaf(&storage, "/third-party").await,
+            ImportLeaf::GitkeepOnly,
+            "the import root stays"
+        );
+        // A detach that had nothing to detach and left no ledger row hands
+        // out no cleanup id.
+        let (gone, _) = fu16_register(&storage, "/third-party/fu16-gone").await;
+        storage
+            .git_db_storage()
+            .get_connection()
+            .execute_unprepared(&format!("DELETE FROM git_repo WHERE id = {}", gone.repo_id))
+            .await
+            .unwrap();
+        let none = crate::ceres::pack::import_repo::detach_import_repo(
+            &storage,
+            cache,
+            gone.repo_id,
+            &gone.repo_path,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(none, None);
+    }
+
+    /// The two lookups a detach makes while holding the global write lock,
+    /// at scale (GC-10): the child check reads `git_repo`, one row per
+    /// ImportRepo (never per object), and the branch check is driven by the
+    /// `repo_id` index, so it touches one repository's refs at most.
+    #[tokio::test]
+    async fn fu16_lookups_bounded_at_scale() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let conn = storage.mono_storage().get_connection().clone();
+        let (repo, _) = fu16_register(&storage, "/third-party/fu16-scale").await;
+        let (decoy, _) = fu16_register(&storage, "/third-party/fu16-scale-decoy").await;
+        // 1000 other repositories, none below the path, and 1000 tags on a
+        // decoy repository, so that the planner picks the repo_id index for
+        // the subject on its own (a table made of one repository's refs
+        // would be scanned).
+        let mut rows = Vec::new();
+        for i in 0..1000 {
+            rows.push(format!(
+                "({}, '/third-party/other-{i}', 'r', now(), now())",
+                crate::common::utils::generate_id()
+            ));
+        }
+        conn.execute_unprepared(&format!(
+            "INSERT INTO git_repo (id, repo_path, repo_name, created_at, updated_at) VALUES {}",
+            rows.join(",")
+        ))
+        .await
+        .unwrap();
+        let mut tags = Vec::new();
+        for i in 0..1000 {
+            tags.push(format!(
+                "({}, {}, 'refs/tags/v{i}', '{:040}', 'tag', false, now(), now())",
+                crate::common::utils::generate_id(),
+                decoy.repo_id,
+                i
+            ));
+        }
+        conn.execute_unprepared(&format!(
+            "INSERT INTO import_refs (id, repo_id, ref_name, ref_git_id, ref_type, default_branch, created_at, updated_at) VALUES {}",
+            tags.join(",")
+        ))
+        .await
+        .unwrap();
+        conn.execute_unprepared("ANALYZE git_repo; ANALYZE import_refs")
+            .await
+            .unwrap();
+
+        let txn = conn.begin().await.unwrap();
+        assert!(
+            !import_repo_has_children_in_txn(&txn, repo.repo_id, &repo.repo_path)
+                .await
+                .unwrap()
+        );
+        assert!(!has_branch_ref_in_txn(&txn, repo.repo_id).await.unwrap());
+        assert!(!has_branch_ref_in_txn(&txn, decoy.repo_id).await.unwrap());
+        // The branch check is served through the repo_id index, not a scan
+        // of the whole table.
+        let plan: Vec<String> = txn
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "EXPLAIN SELECT EXISTS (SELECT 1 FROM import_refs WHERE repo_id = $1 AND ref_type = 'branch')",
+                [repo.repo_id.into()],
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
+            .collect();
+        assert!(
+            plan.iter().any(|line| line.contains("repo_id = ")
+                && (line.contains("Index Cond") || line.contains("Recheck Cond"))),
+            "{plan:?}"
+        );
+        txn.rollback().await.unwrap();
+
+        // One real child, and one branch, flip both answers.
+        let (child, _) = fu16_register(&storage, "/third-party/fu16-scale/child").await;
+        storage
+            .git_db_storage()
+            .save_ref(
+                repo.repo_id,
+                fu12_ref(repo.repo_id, "refs/heads/main", &"a".repeat(40)),
+            )
+            .await
+            .unwrap();
+        let txn = conn.begin().await.unwrap();
+        assert!(
+            import_repo_has_children_in_txn(&txn, repo.repo_id, &repo.repo_path)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !import_repo_has_children_in_txn(&txn, child.repo_id, &child.repo_path)
+                .await
+                .unwrap()
+        );
+        assert!(has_branch_ref_in_txn(&txn, repo.repo_id).await.unwrap());
+        txn.rollback().await.unwrap();
+
+        // The detach's ref deletion is one statement served through the same
+        // repo_id index, so it touches this repository's refs only: the
+        // branchless decoy with its 1000 tags detaches in one round and
+        // leaves none of them behind.
+        let txn = conn.begin().await.unwrap();
+        let plan: Vec<String> = txn
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "EXPLAIN DELETE FROM import_refs WHERE repo_id = $1",
+                [repo.repo_id.into()],
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
+            .collect();
+        assert!(
+            plan.iter().any(|line| line.contains("repo_id = ")
+                && (line.contains("Index Cond") || line.contains("Recheck Cond"))),
+            "{plan:?}"
+        );
+        txn.rollback().await.unwrap();
+        let (_, detached) = fu16_detach(&storage, &decoy).await;
+        assert!(
+            matches!(
+                detached,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{detached:?}"
+        );
+        assert_eq!(fu16_rows(&storage, decoy.repo_id).await, (0, 0));
     }
 }

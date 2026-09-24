@@ -405,6 +405,7 @@ C 段移出临界区（硬约束 7）后，文件路径索引变为最终一致�
   - 空 pack 且 `old_id != new_id`：对象全部已持久化，`n` 按基线距离计算（可 > 0），B3 N 分支据此快进落地。
 - merge：`{cl_link}`（CL 状态仍在库中可查，无需快照）。
 - attach：`{repo 上下文, 完整命令描述符}`——**分支 create/update/delete 的完整列表**（`import_repo.rs:450-475/550-573` 应用的是完整快照，仅存仓库上下文无法在崩溃后重放分支级变更）。操作标识为**确定性导出**而非调用方令牌：attach 由 receive-pack 自动触发（`protocol/mod.rs:175-216` 构造 `ImportRepo`，`RefCommand` 无请求 id，`import_refs.rs:50-59`；git 重试也无法携带令牌），故 `operation_id = hash(仓库标识 ‖ 规范化命令描述符)`——git 重试发送相同命令序列，导出值自然一致，收养/回放由此闭合。
+  - **`op`：attach 或 detach**（[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-09 第 1–3 条，FU-16）：载荷的可选字段 `op` 取 `attach`（缺省；FU-16 之前写入的行都没有该字段，反序列化为 `attach`，attach 行序列化时也省略它，与既有行逐字节一致）或 `detach`。detach 行复用 `kind = attach`，载荷只含 `{repo_id, repo_path, commands: [], op: "detach"}`，操作标识为域分离的 `sha256("import_repo.detach\0" ‖ repo_id ‖ "\0" ‖ 规范路径)`，与任何 attach 标识不同；同一仓库重复 detach 按 `(kind, path, operation_id)` 回放 `Done`，重新导入得到新 `repo_id`、因而是新标识。
 
 执行逻辑仍由调用方在 B3 内按 kind 分派（ADR-TP-04 的同步模型）；载荷的持久化使崩溃后的两种恢复路径成为可能：行仍活跃（`Queued/Running`）时重试**收养**（1.11）；行已被 reaper 终态化（`Failed`，无继任）时重试**以原行持久化载荷新建队列行**——描述符完全可执行，无需原连接。这是 ADR-TP-04「同步阻塞、真实结果」的直接推论。
 
@@ -807,7 +808,8 @@ B3. 执行轮次（单事务；B3 首句是 fencing，见下）
 
       kind = attach:
         -- operation_id 为内容寻址指纹（hash(仓库标识 ‖ 命令描述符)）。
-        -- 仅含分支命令的 attach 到达本分支（纯删除式 attach 不入队）。
+        -- **`op = attach`（缺省）**：分支命令批到达本分支；只含删除的批同样入队、只做 ref CAS
+        -- （FU-13 起，plan-20260923 ADR-FU-08 第 1 条）。
         -- **目标路径、其严格非根祖先、或其任何已物化后代 → 拒绝**：
         -- attach 只更新根 ref 与对象，不更新 `main@P`、祖先 main 行、
         -- 也不推进/墓碑化后代 main 行（`attach_to_monorepo_parent_in_txn`
@@ -823,6 +825,19 @@ B3. 执行轮次（单事务；B3 首句是 fencing，见下）
         -- 报错可诊断：「目标路径或其祖先已物化，内容变更请经 CL 管线
         -- （review）或先解除物化」。目标与严格非根祖先全程无 main 行才是
         -- attach 的正常前提（reaper 的 I3 语义按此定义，1.6）
+        -- **`op = detach`（FU-16，ADR-FU-09 第 2、3 条）**：SAVEPOINT 内先
+        -- `SELECT … FROM git_repo WHERE id = $1 FOR UPDATE` 锁住仓库自身行，
+        -- 行不存在或其规范路径不等于载荷路径 → 无写 `Done`；再查子仓
+        -- （`repo_path LIKE escape_like(P) || '/%'`，排除规范形式等于 P 的
+        -- 行，ADR-FU-10 第 3 条），有 → `IMPORT_REPO_HAS_CHILDREN` 终态
+        -- `Failed`、无写；叶子属本仓库（有挂载来源记录，或 `.gitkeep`-only
+        -- 且仓库有分支）时从根树移除叶子、剪掉 `import_dir` 之下因此变空的
+        -- 父目录（`import_dir` 本身变空时留 `.gitkeep`），合成
+        -- `Remove ImportRepo <P>` 根 commit 并做同一根 CAS；普通目录、文件
+        -- 或缺失的叶子不动根树；随后删 `import_refs` 与 `git_repo` 行、同事务
+        -- 写 `import_repo.remove` / `phase: "detached"` 审计与 `state =
+        -- detached` 清理台账行（主键 = 本队列行 id）。对象行留给锁外清扫
+        -- （FU-17）。任一步出错整轮回滚、行终态化 `Failed`。
         -- 准备（根快照读取、树拼装、根 commit 合成）必须在锁内、
         -- 即本分支内进行：队列等待期间根可能已被前序轮次推进，
         -- 入队时预计算的快照一律作废（1.9）

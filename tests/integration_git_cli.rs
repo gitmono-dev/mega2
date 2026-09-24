@@ -6077,3 +6077,60 @@ fn import_repo_alias_row_served_after_migration() {
     });
     fu10_shutdown(service, &stderr_path);
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-16: the atomic detach primitive (no product entry yet,
+// driven here through the service-layer test hook) removes an ImportRepo, and
+// the service then answers 404 for it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn import_repo_detach_then_clone_404() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    let path = "/third-party/fu16-detach";
+    let url = trunk_subpath_url(port, path);
+    git_ok_no_auth(case_dir, &["init", "-b", "main", "fu16-detach"]);
+    configure_git_identity_no_auth(case_dir, "fu16-detach");
+    fu13_commit(case_dir, "fu16-detach", "v1\n", "v1");
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu16-detach", &url, &["HEAD:refs/heads/main"]),
+        "push",
+    );
+    git_ok_no_auth(case_dir, &["clone", &url, "fu16-before"]);
+
+    // The same database, Redis and object store as the service.
+    let mut config =
+        mega2_core::config::Config::new(env.full_config_path.to_str().expect("utf-8 config path"))
+            .expect("load config");
+    config.database.db_type = "postgres".to_owned();
+    config.database.db_url = env.database.db_url.clone();
+    config.redis.url = integration_redis_url();
+    config.object_storage.storage_type =
+        mega2_core::orbit_api::factory::ObjectStorageBackend::Local;
+    config.object_storage.local.root_dir = env.object_root.to_string_lossy().into_owned();
+    config.monorepo.push_policy = mega2_core::config::PushPolicy::Trunk;
+    let cleanup_id = with_runtime(mega2_core::import_repo_ops::detach_for_integration_test(
+        config, path,
+    ))
+    .expect("detach")
+    .expect("a cleanup id");
+    assert!(cleanup_id > 0);
+
+    let (headers, body) = probe_upload_pack_body(port, path);
+    assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
+    assert!(body.contains("Repository not found."), "{body}");
+    let clone = trunk_host_git(case_dir, &["clone", &url, "fu16-after"]);
+    assert!(
+        !clone.status.success(),
+        "clone after detach must fail: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    fu10_shutdown(service, &stderr_path);
+}

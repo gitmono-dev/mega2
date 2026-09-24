@@ -145,6 +145,9 @@ impl AuditStorage {
 
 /// `metadata.kind` of an ImportRepo mount provenance record.
 pub const IMPORT_REPO_ATTACH_KIND: &str = "import_repo.attach";
+/// `audit_logs.metadata.kind` of an ImportRepo cleanup (plan-20260923
+/// ADR-FU-09 item 3); `phase` tells `detached` from `swept`.
+pub const IMPORT_REPO_REMOVE_KIND: &str = "import_repo.remove";
 
 #[cfg(test)]
 mod tests {
