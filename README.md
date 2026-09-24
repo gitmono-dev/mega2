@@ -2,59 +2,40 @@
 
 English · [中文](README.zh.md)
 
-**mega2** is the storage-only successor to [Mega](https://github.com/web3infra-foundation/mega), the monorepo and Git-hosting project from the same organization. It provides a trunk-based Git storage backend.
+The first-generation [Mega](https://github.com/web3infra-foundation/mega) established the foundation for our monorepo and Git-hosting platform. **Mega2 is the second-generation engine built for AI agents**, with two core capabilities: a **Monorepo engine** and **Agent Session Capture**.
 
-mega2 runs only in **trunk / storage-only** mode and does not provide a Web UI. For interactive repository browsing and supported directory or tag operations, run `libra mega2 browser` from a Libra working copy.
+The open-source edition of Mega2 runs in **trunk / storage-only** mode and does not include a Web UI or Change List. Mega2 provides the server-side monorepo storage and APIs; Libra provides a terminal interface for interactive browsing.
 
 Start with the [Quick Start](docs/quick-start.md), then see the [documentation index](docs/README.md) for user, operator, and contributor guides. Repository and push behavior is covered in the [User Guide](docs/user-guide.md); contribution checks are in the [Contributing Guide](docs/contributing.md).
 
-## Features
+## Recommended Agent setup
 
-### Git hosting and monorepo
+The best practice for agent-oriented monorepo development is to use **Mega2 + ScorpioFS + Libra** together:
 
-- **Monorepo**: only `refs/heads/main` is accepted as a public Git branch. Other heads (for example `refs/heads/dev`) are rejected at protocol validation. The Git client sees `ng <ref> …` (`trunk push rejects ref '…'; the only public branch is refs/heads/main`). This constrains Git receive-pack / `ls-remote` heads only; Agent Capture does not use this protocol (see the Agent Capture entry below).
-  - **[Trunk-based development](https://trunkbaseddevelopment.com)**: a monorepo works best with a single trunk, not a tree of long-lived feature branches.
-- **No Change List in the open-source edition**: the open-source edition provides the core monorepo storage layer, without Change List. Change Lists depend on multiple branches, which this edition does not support.
-- **ImportRepo**: repositories under `[monorepo].import_dir` (default `/third-party`) use ordinary Git semantics, including multiple branches and client-managed tags. This is a good place to keep third-party dependency sources that you need to modify locally and periodically sync with upstream.
-- **Tags**: the Monorepo rejects `git push --tags`; create, list, and delete tags through the HTTP API. Libra provides an interactive terminal browser and the supported directory and tag operations.
-- **New paths**: new paths can only be created under the roots listed in `[monorepo].root_dirs`; a Git push to a path outside them, or of history that starts from nothing (e.g. a `git init` repository) to a path that does not exist yet, is rejected with a message that starts with a `MONO_PATH_*` code. Provision the path with `mega2 path provision`, then clone and push; see [Monorepo path policy and first use](docs/user-guide.md#25-monorepo-path-policy-and-first-use).
-- **Object storage**: metadata lives in Postgres, while Git objects live in object storage (local disk or an S3-compatible service). The default `object_format` is `sha1`; the optional `sha256` and `blake3` formats require [Libra](https://libra.tools).
+- **Mega2** provides centralized monorepo storage and hosting, with optional Agent Session Capture.
+- **[ScorpioFS](https://github.com/gitmono-dev/scorpiofs)** mounts remote monorepo paths as a local filesystem for development tools and agents to browse.
+- **[Libra](https://libra.tools)** provides agent-side version-control workflows and a terminal browser for Mega2.
 
-### Protocols and large files
+Use `libra mega2 browser --server https://mega2.example.com` to browse a remote monorepo. The terminal interface displays one directory level at a time, supports creating, deleting, moving, and renaming directories, and has a Tag panel for listing, creating, and deleting root tags; write credentials are required to create or delete tags. This command reads remote tree data; it does not run Git clone, fetch, or push. See [Using Mega2 with Libra](docs/user-guide.md#6-using-mega2-with-libra).
 
-- **Build artifacts**: store binaries and release bundles as Artifact Sets under `/api/v1/repos/{repo}/artifacts`. Uploads use a discovery → batch → commit flow. When supported by the object-storage backend, clients transfer bytes directly with presigned URLs; otherwise, mega2 proxies the transfer. Writes use the same `git.push_auth` credentials as Git pushes, while reads are anonymous. Artifact blobs share storage with Git, LFS, and OCI objects; `[artifacts_gc]` can reclaim unreferenced artifact data in the background.
-- **Git Smart HTTP and SSH**: standard Git clients can clone, fetch, pull, and push over Smart HTTP or SSH. In storage-only mode, SSH exposes read-only upload-pack; receive-pack is disabled because there is no per-user account system for SSH-key authentication. Route writes through HTTP to use one authentication model for every write surface.
-- **Git LFS**: following the Git LFS standard, large files managed with git-lfs use the standard Git LFS endpoints (`/info/lfs` and `/api/v1/lfs`).
+## Core capabilities
 
-### OCI Distribution
+### Monorepo engine
 
-mega2 includes an **OCI container registry** at `/v2`. Set `[oci].enabled=true` to push and pull images with standard clients such as Docker; manifests and blobs use the OCI Distribution protocol.
+Mega2 provides trunk-based Git storage and hosting for monorepos. Regular Monorepo paths expose `refs/heads/main` as the public trunk; Git clients cannot push other branches or tags. Use the HTTP API or Libra's terminal browser for supported Tag and directory operations. The open-source edition does not include the multi-branch Change List feature.
 
-Image blobs **share the same object storage** as Git blobs and LFS objects (local filesystem or an S3-compatible cloud service), so there is no separate registry to deploy and operate. Registry authentication reuses the unified HTTP `push_auth` model (token or anonymous `none`) — the same credentials and path-scoped authorization semantics as Git pushes.
+Git metadata is stored in Postgres, while Git objects live in local or S3-compatible object storage. ImportRepos under `[monorepo].import_dir` (default `/third-party`) follow ordinary Git semantics, including multiple branches and client-managed tags, and can hold third-party repositories that need independent synchronization. See [Monorepo path policy and first use](docs/user-guide.md#25-monorepo-path-policy-and-first-use) for path provisioning and push rules.
 
-### Deployment
+### Agent Session Capture
 
-mega2 runs exclusively in **trunk / storage-only** mode (`push_policy=trunk`). A global MonoWriteQueue serializes writes to `main`, keeping the trunk history linear.
+Agent Session Capture is an optional HTTP capability, separate from Git push. When enabled with `[agent_capture].enabled=true` and an ingest token in a storage-only deployment, Mega2 can capture agent sessions, events, checkpoints, file operations, and transcript data for later querying, review, and audit. Git branch and receive-pack rules do not govern this API. See the [Configuration Guide](docs/configuration.md) for setup.
 
-Git pushes and product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) update the same `main` branch, so changes are immediately visible through either interface. Multi-commit pushes are squashed according to the product rules; afterward, run `git fetch && git reset --hard origin/main` to align your local checkout.
+## Other capabilities
 
-### HTTP API
-
-- **Git hosting and Git LFS**: Git clients clone / fetch / push over the Smart HTTP protocol endpoints (`info/refs`, `git-upload-pack`, `git-receive-pack`); large files managed with git-lfs use the standard LFS endpoints (`/info/lfs`, `/api/v1/lfs`).
-- **Files and directories**: read and write monorepo content over HTTP without a Git client. List directory trees, create / delete / move files or directories, and edit files online. The blob, tree, and blame endpoints return file contents, directory structures, and line-by-line history.
-- **Tags**: since Git-client tag operations are forbidden in the monorepo, creation, listing, and deletion all go through these endpoints (read-only queries need no credentials).
-- **OCI Distribution `/v2`**: the standard container-registry interface carrying manifest and blob uploads and pulls for `docker push` / `docker pull` (mounted when `[oci].enabled=true`).
-- **Agent Capture**: captures AI coding agents' sessions, events, checkpoints, and file operations for replay and audit of agent activity (mounted when `[agent_capture].enabled=true`).
-
-### Access control and secrets
-
-- Storage-only writes use the configured `git.push_auth`: a static push token (`token`) or an explicitly network-restricted anonymous mode (`none`). Reads follow the Git and object-storage configuration.
-- Embedded **Vault** (crates.io `libvault` + `src/contract/vault/`): PKI / KV, SecretRef, fail-closed bootstrap.
-
-### Notifications and config
-
-- Webhook notifications only.
-- Configuration commands support initialization, validation, profiles, SecretRef, and controlled hot reload. The default file is `config/config.toml`; override it with `--config` or `MEGA_CONFIG`. See the [Configuration Guide](docs/configuration.md) for available settings and validation.
+- **Git and large files**: Git Smart HTTP supports clone, fetch, pull, and push; SSH is read-only in storage-only mode; Git LFS is supported.
+- **Build artifacts and OCI**: Artifact Sets store build outputs. When `[oci].enabled=true`, the `/v2` endpoint provides an OCI container registry. Git, LFS, Artifact, and OCI data can share object storage.
+- **HTTP API**: Read and write monorepo files, directories, and tags. See the [User Guide](docs/user-guide.md) for the API and workflows.
+- **Security and operations**: Push-token authentication, embedded Vault and SecretRef, webhook notifications, and configuration validation, profiles, and controlled hot reload. See the [Configuration Guide](docs/configuration.md) and [Deployment Guide](docs/deployment.md).
 
 ## Quick start with Compose
 
@@ -68,8 +49,6 @@ docker compose -f linux-mega2-compose.yml up -d --wait
 ```
 
 HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see the [Deployment Guide](docs/deployment.md). Start with the [`Quick Start`](docs/quick-start.md); for migration, LFS, OCI, and artifact examples, see [`Usage Recipes`](docs/recipes.md).
-
-For interactive browsing, run `libra mega2 browser` in a Libra working copy. It provides the terminal experience for repository navigation and supported directory / tag operations; mega2 itself does not serve a Web UI.
 
 For local development and tests, see the [Contributing Guide](docs/contributing.md).
 
@@ -109,7 +88,6 @@ Details: [`AGENTS.md`](AGENTS.md) and the [Contributing Guide](docs/contributing
 | [`docs/quick-start.md`](docs/quick-start.md) | Start the local Compose stack and make your first push |
 | [`docs/recipes.md`](docs/recipes.md) | Repository migration, LFS, OCI, artifacts, and persistent data |
 | [`docs/user-guide.md`](docs/user-guide.md) | Git, HTTP API, Libra, and CLI usage |
-| [`docs/contributing.md`](docs/contributing.md) | Local development and integration tests |
-| [`docs/contributing.md`](docs/contributing.md) | Contribution process and code conventions |
+| [`docs/contributing.md`](docs/contributing.md) | Local development, contribution process, code conventions, and integration tests |
 
 Configuration, deployment, architecture, and subsystem references are linked from the [documentation index](docs/README.md).
