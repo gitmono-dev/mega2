@@ -136,6 +136,7 @@ pub(crate) mod m20260919_000700_drop_label_tables;
 pub(crate) mod m20260919_000800_delete_cla_sign_check_rows;
 pub(crate) mod m20260919_000900_drop_cla_status;
 mod m20260921_000100_fix_git_tag_unique;
+mod m20260923_000100_import_repo_cleanups;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -260,6 +261,139 @@ impl MigratorTrait for Migrator {
             Box::new(m20260919_000800_delete_cla_sign_check_rows::Migration),
             Box::new(m20260919_000900_drop_cla_status::Migration),
             Box::new(m20260921_000100_fix_git_tag_unique::Migration),
+            Box::new(m20260923_000100_import_repo_cleanups::Migration),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+    use sea_orm_migration::prelude::*;
+
+    use super::{Migrator, m20260923_000100_import_repo_cleanups};
+    use crate::jupiter::{migration::apply_migrations, tests::test_db_connection};
+
+    async fn scalar_bool(db: &sea_orm::DatabaseConnection, sql: &str) -> bool {
+        db.query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "v")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn import_repo_cleanups_migration_applies() {
+        assert_eq!(
+            Migrator::migrations().last().map(|m| m.name().to_owned()),
+            Some("m20260923_000100_import_repo_cleanups".to_owned()),
+            "registered at the end of migrations()"
+        );
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        assert!(
+            scalar_bool(
+                &db,
+                "SELECT to_regclass('import_repo_cleanups') IS NOT NULL AS v"
+            )
+            .await
+        );
+        let index: String = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() \
+                 AND tablename = 'import_repo_cleanups' \
+                 AND indexname = 'idx_import_repo_cleanups_path_state_id'",
+            ))
+            .await
+            .unwrap()
+            .expect("the (path, state, id) index exists")
+            .try_get("", "indexdef")
+            .unwrap();
+        assert!(index.ends_with("(path, state, id)"), "{index}");
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO import_repo_cleanups (id, path, repo_id, state, requester) \
+                 VALUES (1, '/third-party/x', 1, 'pending', 'anonymous')"
+            )
+            .await
+            .is_err(),
+            "state is only detached or swept"
+        );
+
+        // Re-running `up` over the existing table and index is a no-op.
+        let manager = SchemaManager::new(&db);
+        m20260923_000100_import_repo_cleanups::Migration
+            .up(&manager)
+            .await
+            .unwrap();
+
+        // `down` keeps a ledger that still has rows, including one whose
+        // insert is still in flight on another connection when `down` starts.
+        let exists = "SELECT to_regclass('import_repo_cleanups') IS NOT NULL AS v";
+        let insert = "INSERT INTO import_repo_cleanups (id, path, repo_id, state, requester) \
+                      VALUES (1, '/third-party/x', 1, 'detached', 'anonymous')";
+        let txn = db.begin().await.unwrap();
+        txn.execute_unprepared(insert).await.unwrap();
+        let down_db = db.clone();
+        let down = tokio::spawn(async move {
+            m20260923_000100_import_repo_cleanups::Migration
+                .down(&SchemaManager::new(&down_db))
+                .await
+        });
+        // Commit only once `down` is queued on the table lock.
+        let mut waiting = false;
+        for _ in 0..200 {
+            let row = txn
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks \
+                     WHERE relation = 'import_repo_cleanups'::regclass AND NOT granted) AS v",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            if row.try_get::<bool>("", "v").unwrap() {
+                waiting = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(waiting, "down waits for the open insert");
+        txn.commit().await.unwrap();
+        assert!(
+            down.await.unwrap().is_err(),
+            "down sees the committed row and refuses"
+        );
+        assert!(scalar_bool(&db, exists).await);
+        assert!(
+            scalar_bool(
+                &db,
+                "SELECT EXISTS (SELECT 1 FROM import_repo_cleanups) AS v"
+            )
+            .await
+        );
+
+        // An empty ledger is dropped, and `up` recreates it.
+        db.execute_unprepared("DELETE FROM import_repo_cleanups")
+            .await
+            .unwrap();
+        m20260923_000100_import_repo_cleanups::Migration
+            .down(&manager)
+            .await
+            .unwrap();
+        assert!(!scalar_bool(&db, exists).await);
+        m20260923_000100_import_repo_cleanups::Migration
+            .down(&manager)
+            .await
+            .unwrap();
+        m20260923_000100_import_repo_cleanups::Migration
+            .up(&manager)
+            .await
+            .unwrap();
+        assert!(scalar_bool(&db, exists).await);
     }
 }

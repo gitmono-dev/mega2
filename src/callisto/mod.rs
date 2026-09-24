@@ -36,6 +36,7 @@ pub mod git_tag;
 pub mod git_tree;
 pub mod gpg_key;
 pub mod import_refs;
+pub mod import_repo_cleanups;
 pub mod issue_cl_references;
 pub mod lfs_locks;
 pub mod lfs_objects;

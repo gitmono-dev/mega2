@@ -3,14 +3,15 @@ use std::{collections::HashMap, ops::Deref};
 use futures::Stream;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr,
-    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait, Set,
-    Statement, TransactionTrait,
+    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+    Set, Statement, TransactionTrait,
     sea_query::{CaseStatement, Expr, ExprTrait, OnConflict},
 };
 
 use crate::{
     callisto::{
         git_blob, git_commit, git_repo, git_tag, git_tree, import_refs,
+        import_repo_cleanups::{self, CleanupState},
         sea_orm_active_enums::RefTypeEnum,
     },
     common::{errors::MegaError, utils::generate_id},
@@ -755,6 +756,79 @@ impl GitDbStorage {
             .try_into()
             .unwrap()
     }
+
+    /// Records a detach in the cleanup ledger (plan-20260923 ADR-FU-09 item
+    /// 6) inside the detach transaction, so it rolls back with it.
+    pub async fn insert_cleanup_in_txn<C: ConnectionTrait>(
+        &self,
+        cleanup_id: i64,
+        path: &str,
+        repo_id: i64,
+        requester: &str,
+        conn: &C,
+    ) -> Result<import_repo_cleanups::Model, MegaError> {
+        let row = import_repo_cleanups::ActiveModel {
+            id: Set(cleanup_id),
+            path: Set(path.to_owned()),
+            repo_id: Set(repo_id),
+            state: Set(CleanupState::Detached),
+            requester: Set(requester.to_owned()),
+            rows_deleted: Set(None),
+            created_at: Set(chrono::Utc::now().fixed_offset()),
+            swept_at: Set(None),
+        };
+        Ok(row.insert(conn).await?)
+    }
+
+    /// The oldest detached ledger rows for `path`, at most
+    /// [`CLEANUP_RESUME_BATCH`], read in `(path, state, id)` index order.
+    pub async fn pending_cleanups_by_path<C: ConnectionTrait>(
+        &self,
+        path: &str,
+        conn: &C,
+    ) -> Result<Vec<import_repo_cleanups::Model>, MegaError> {
+        Ok(pending_cleanups_query(path).all(conn).await?)
+    }
+
+    /// Moves a cleanup from `detached` to `swept` (`WHERE id = $1 AND state =
+    /// 'detached'`). Returns whether this call moved it; repeating it is a
+    /// no-op that keeps the first counts.
+    pub async fn mark_cleanup_swept<C: ConnectionTrait>(
+        &self,
+        cleanup_id: i64,
+        rows_deleted: serde_json::Value,
+        conn: &C,
+    ) -> Result<bool, MegaError> {
+        let result = import_repo_cleanups::Entity::update_many()
+            .col_expr(
+                import_repo_cleanups::Column::State,
+                Expr::value(CleanupState::Swept),
+            )
+            .col_expr(
+                import_repo_cleanups::Column::RowsDeleted,
+                Expr::value(rows_deleted),
+            )
+            .col_expr(
+                import_repo_cleanups::Column::SweptAt,
+                Expr::value(chrono::Utc::now().fixed_offset()),
+            )
+            .filter(import_repo_cleanups::Column::Id.eq(cleanup_id))
+            .filter(import_repo_cleanups::Column::State.eq(CleanupState::Detached))
+            .exec(conn)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+}
+
+/// Ledger rows one cleanup request resumes at most (ADR-FU-09 item 6).
+pub const CLEANUP_RESUME_BATCH: u64 = 16;
+
+fn pending_cleanups_query(path: &str) -> sea_orm::Select<import_repo_cleanups::Entity> {
+    import_repo_cleanups::Entity::find()
+        .filter(import_repo_cleanups::Column::Path.eq(path))
+        .filter(import_repo_cleanups::Column::State.eq(CleanupState::Detached))
+        .order_by_asc(import_repo_cleanups::Column::Id)
+        .limit(CLEANUP_RESUME_BATCH)
 }
 
 fn last_wins_filepaths(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
@@ -1101,5 +1175,230 @@ mod tests {
             .unwrap();
         let model = git_db.insert_tag(tag_row(2, tag_id, "v1.0")).await.unwrap();
         assert_eq!(model.repo_id, 2);
+    }
+
+    fn cleanup_row(id: i64, path: &str, state: CleanupState) -> import_repo_cleanups::ActiveModel {
+        import_repo_cleanups::Model {
+            id,
+            path: path.to_owned(),
+            repo_id: id,
+            state,
+            requester: "anonymous".to_owned(),
+            rows_deleted: None,
+            created_at: chrono::Utc::now().fixed_offset(),
+            swept_at: None,
+        }
+        .into_active_model()
+    }
+
+    #[tokio::test]
+    async fn cleanup_ledger_insert_in_txn_rolls_back() {
+        let git_db = storage().await;
+        let conn = git_db.get_connection();
+        let path = "/third-party/gone";
+
+        let txn = conn.begin().await.unwrap();
+        let row = git_db
+            .insert_cleanup_in_txn(101, path, 7, "ci-token", &txn)
+            .await
+            .unwrap();
+        assert_eq!(row.state, CleanupState::Detached);
+        assert_eq!(
+            git_db.pending_cleanups_by_path(path, &txn).await.unwrap(),
+            vec![row]
+        );
+        txn.rollback().await.unwrap();
+        assert!(
+            git_db
+                .pending_cleanups_by_path(path, conn)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the ledger row rolls back with its transaction"
+        );
+
+        let txn = conn.begin().await.unwrap();
+        git_db
+            .insert_cleanup_in_txn(101, path, 7, "ci-token", &txn)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let pending = git_db.pending_cleanups_by_path(path, conn).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(
+            (
+                row.id,
+                row.path.as_str(),
+                row.repo_id,
+                row.requester.as_str()
+            ),
+            (101, path, 7, "ci-token")
+        );
+        assert_eq!(row.state, CleanupState::Detached);
+        assert_eq!(row.rows_deleted, None);
+        assert_eq!(row.swept_at, None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_ledger_pending_by_path_uses_index() {
+        let git_db = storage().await;
+        let conn = git_db.get_connection();
+        let path = "/third-party/busy";
+        // 1000 detached rows on the path, inserted newest first, plus swept
+        // rows on the same path and detached rows on other paths.
+        let mut rows: Vec<_> = (1..=1000i64)
+            .rev()
+            .map(|id| cleanup_row(id, path, CleanupState::Detached))
+            .collect();
+        rows.extend((1001..=1200i64).map(|id| cleanup_row(id, path, CleanupState::Swept)));
+        rows.extend((1201..=1400i64).map(|id| {
+            cleanup_row(
+                id,
+                &format!("/third-party/other-{id}"),
+                CleanupState::Detached,
+            )
+        }));
+        for chunk in rows.chunks(500) {
+            import_repo_cleanups::Entity::insert_many(chunk.to_vec())
+                .exec(conn)
+                .await
+                .unwrap();
+        }
+        conn.execute_unprepared("ANALYZE import_repo_cleanups")
+            .await
+            .unwrap();
+
+        let pending = git_db.pending_cleanups_by_path(path, conn).await.unwrap();
+        // ADR-FU-09 item 6 fixes the page at 16 rows.
+        assert_eq!(
+            pending.iter().map(|row| row.id).collect::<Vec<_>>(),
+            (1..=16i64).collect::<Vec<_>>(),
+            "the 16 oldest detached rows, oldest first"
+        );
+
+        let stmt = pending_cleanups_query(path).build(DbBackend::Postgres);
+        let txn = conn.begin().await.unwrap();
+        txn.execute_unprepared("SET LOCAL enable_seqscan = off")
+            .await
+            .unwrap();
+        let plan: Vec<String> = txn
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                format!("EXPLAIN {}", stmt.sql),
+                stmt.values.map(|v| v.0).unwrap_or_default(),
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
+            .collect();
+        txn.rollback().await.unwrap();
+        assert!(
+            plan.iter().any(|line| line.contains("Index Scan")
+                && line.contains("idx_import_repo_cleanups_path_state_id")),
+            "the resume query reads the (path, state, id) index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("Sort")),
+            "index order needs no sort step: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_ledger_mark_swept_idempotent() {
+        let git_db = storage().await;
+        let conn = git_db.get_connection();
+        let path = "/third-party/swept";
+        git_db
+            .insert_cleanup_in_txn(201, path, 9, "anonymous", conn)
+            .await
+            .unwrap();
+        let counts =
+            serde_json::json!({ "git_commit": 3, "git_tree": 5, "git_blob": 8, "git_tag": 0 });
+
+        assert!(
+            git_db
+                .mark_cleanup_swept(201, counts.clone(), conn)
+                .await
+                .unwrap()
+        );
+        let row = import_repo_cleanups::Entity::find_by_id(201)
+            .one(conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, CleanupState::Swept);
+        assert_eq!(row.rows_deleted, Some(counts.clone()));
+        let swept_at = row.swept_at.expect("swept_at is set");
+        assert!(
+            git_db
+                .pending_cleanups_by_path(path, conn)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A repeat (e.g. a resumed request racing the first) changes nothing.
+        assert!(
+            !git_db
+                .mark_cleanup_swept(201, serde_json::json!({ "git_commit": 0 }), conn)
+                .await
+                .unwrap()
+        );
+        let again = import_repo_cleanups::Entity::find_by_id(201)
+            .one(conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.rows_deleted, Some(counts));
+        assert_eq!(again.swept_at, Some(swept_at));
+        // An unknown id is not an error either.
+        assert!(
+            !git_db
+                .mark_cleanup_swept(999, serde_json::json!({}), conn)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_ledger_primary_key_is_cleanup_id() {
+        let git_db = storage().await;
+        let conn = git_db.get_connection();
+        // The key is the detach queue row id as given, not a generated id.
+        let row = git_db
+            .insert_cleanup_in_txn(4242, "/third-party/a", 1, "anonymous", conn)
+            .await
+            .unwrap();
+        assert_eq!(row.id, 4242);
+        assert!(
+            import_repo_cleanups::Entity::find_by_id(4242)
+                .one(conn)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // One row per detach: the same cleanup id cannot be recorded twice,
+        // even for another path.
+        assert!(
+            git_db
+                .insert_cleanup_in_txn(4242, "/third-party/b", 2, "anonymous", conn)
+                .await
+                .is_err()
+        );
+        let key: Vec<String> = conn
+            .query_all_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT a.attname AS name FROM pg_index i \
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                 WHERE i.indrelid = 'import_repo_cleanups'::regclass AND i.indisprimary",
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get::<String>("", "name").unwrap())
+            .collect();
+        assert_eq!(key, vec!["id".to_owned()]);
     }
 }
