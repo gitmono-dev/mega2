@@ -2779,6 +2779,27 @@ fn api_commit_subject_visible() {
 }
 
 // ---------------------------------------------------------------------------
+// plan-20260923 FU-04A: blame reads commit_message / commit_summary from the
+// commit body, so a framed unsigned commit pushed by a Git client shows its
+// subject instead of the empty line before it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn import_repo_blame_summary_framed() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    seed_import_repo(&case.env.case_dir, case.port, PUSH_TOKEN, "fu04alib");
+    let (status, json) = case.get(
+        "blame?path=/third-party/fu04alib/src/lib.rs",
+        Some(&EntryCase::bearer()),
+    );
+    assert_eq!(status, 200, "ImportRepo blame must 200: {json}");
+    let info = &json["data"]["blocks"][0]["blame_info"];
+    assert_eq!(info["commit_summary"], "lb02 import seed", "{json}");
+    assert_eq!(info["commit_message"], "lb02 import seed\n", "{json}");
+    case.finish();
+}
+
+// ---------------------------------------------------------------------------
 // plan-20260923 FU-06: product writes on a fresh stack (no non-root tip) land
 // on the lazily materialized first-level root; paths outside the roots and
 // the ImportRepo namespace return MONO_PATH_NOT_ALLOWED (ADR-FU-06).

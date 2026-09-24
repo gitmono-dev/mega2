@@ -16,9 +16,12 @@ use git_internal::{
     internal::object::{commit::Commit, tree::TreeItemMode},
 };
 
-use crate::ceres::{
-    api_service::ApiHandler,
-    model::blame::{BlameBlock, BlameInfo, BlameQuery, BlameResult, Contributor},
+use crate::{
+    ceres::{
+        api_service::ApiHandler,
+        model::blame::{BlameBlock, BlameInfo, BlameQuery, BlameResult, Contributor},
+    },
+    common::utils::{commit_body_subject, split_commit_message},
 };
 
 /// Internal structure to track line attribution during history traversal
@@ -720,9 +723,8 @@ async fn create_single_block<T: ApiHandler + ?Sized>(
         Some(extract_username_from_email(&commit.author.email))
     };
 
-    // Clean GPG signature from commit message (applied at presentation layer)
-    let clean_message = clean_commit_message(&commit.message);
-    let commit_summary = clean_message.lines().next().unwrap_or("").to_string();
+    // Strip extra headers (e.g. signatures) at the presentation layer
+    let (clean_message, commit_summary) = blame_commit_text(&commit.message);
 
     // Use final_line_number as the original line number since we track from there
     let blame_info = BlameInfo {
@@ -846,37 +848,65 @@ fn extract_username_from_email(email: &str) -> String {
     local_part.to_string()
 }
 
-/// Remove GPG signature header from commit message if present.
+/// Derive the blame `(commit_message, commit_summary)` from a stored
+/// git-internal commit message.
 ///
-/// Git commit objects may contain a `gpgsig` header with PGP signature data.
-/// This function removes the signature block and returns only the actual
-/// commit message content.
-fn clean_commit_message(raw_message: &str) -> String {
-    if !raw_message.starts_with("gpgsig ") {
-        return raw_message.to_string();
+/// The message is the body with extra headers (`gpgsig` / `gpgsig-sha256`,
+/// PGP or SSH armor) and the header/body blank line removed; the summary is
+/// the first non-empty body line.
+fn blame_commit_text(raw_message: &str) -> (String, String) {
+    let body = split_commit_message(raw_message).body;
+    (body.to_owned(), commit_body_subject(body).to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blame_commit_text_framed_unsigned() {
+        let (message, summary) = blame_commit_text("\nsubject\n\nbody\n");
+        assert_eq!(message, "subject\n\nbody\n");
+        assert_eq!(summary, "subject");
     }
 
-    let mut lines = raw_message.lines().peekable();
-    let mut in_signature = true;
-    let mut message_lines = Vec::new();
-
-    while let Some(line) = lines.next() {
-        if in_signature {
-            if line.contains("-----END PGP SIGNATURE-----") {
-                in_signature = false;
-                // Skip empty lines after signature block
-                while let Some(&next_line) = lines.peek() {
-                    if next_line.trim().is_empty() || next_line.starts_with(' ') {
-                        lines.next();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        message_lines.push(line);
+    #[test]
+    fn blame_commit_text_strips_pgp_signature() {
+        let raw = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQFBlame\n -----END PGP SIGNATURE-----\n\npgp subject\n\npgp body\n";
+        let (message, summary) = blame_commit_text(raw);
+        assert_eq!(message, "pgp subject\n\npgp body\n");
+        assert_eq!(summary, "pgp subject");
     }
 
-    message_lines.join("\n")
+    #[test]
+    fn blame_commit_text_strips_ssh_signature() {
+        let raw = "gpgsig -----BEGIN SSH SIGNATURE-----\n U1NIU0lH\n -----END SSH SIGNATURE-----\n\nssh subject\n";
+        let (message, summary) = blame_commit_text(raw);
+        assert_eq!(message, "ssh subject\n");
+        assert_eq!(summary, "ssh subject");
+    }
+
+    #[test]
+    fn blame_commit_text_strips_gpgsig_sha256() {
+        let raw = "gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n x\n -----END PGP SIGNATURE-----\n\nsha256 subject\n";
+        let (message, summary) = blame_commit_text(raw);
+        assert_eq!(message, "sha256 subject\n");
+        assert_eq!(summary, "sha256 subject");
+    }
+
+    #[test]
+    fn blame_commit_text_unframed_legacy() {
+        let (message, summary) = blame_commit_text("create new directory x");
+        assert_eq!(message, "create new directory x");
+        assert_eq!(summary, "create new directory x");
+    }
+
+    #[test]
+    fn blame_commit_text_unframed_multiline_legacy() {
+        // Without the leading header/body newline the first line parses as a
+        // header, the way Git itself reads the stored object (ADR-FU-01).
+        let (message, summary) = blame_commit_text("Update README.md\n\nMore details");
+        assert_eq!(message, "More details");
+        assert_eq!(summary, "More details");
+    }
 }
