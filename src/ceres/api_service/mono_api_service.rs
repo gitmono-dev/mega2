@@ -10307,6 +10307,8 @@ mod tests {
         let _lock = materialize::lock_materialize_tests().await;
         let temp = tempfile::tempdir().unwrap();
         let storage = tp11_storage(temp.path()).await;
+        // Creations stay under a `root_dirs` root: B3 re-classifies a true
+        // creation (plan-20260923 FU-10), so a new top-level path is refused.
         let keep = Tree::from_tree_items(vec![blob_item(
             ".gitkeep",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -10346,8 +10348,14 @@ mod tests {
             fork_base: Some(ZERO_ID.to_string()),
             n: 1,
         };
-        let id =
-            tp12_enqueue_claim(&storage, "/p12c1", ZERO_ID, &n1.id.to_string(), &payload).await;
+        let id = tp12_enqueue_claim(
+            &storage,
+            "/project/p12c1",
+            ZERO_ID,
+            &n1.id.to_string(),
+            &payload,
+        )
+        .await;
         let exec = tp12_exec(&storage, id).await;
         let ExecuteOutcome::Done {
             landed_commit_id, ..
@@ -10358,7 +10366,7 @@ mod tests {
         assert_eq!(landed_commit_id, n1.id.to_string());
         let pref = storage
             .mono_storage()
-            .get_main_ref("/p12c1")
+            .get_main_ref("/project/p12c1")
             .await
             .unwrap()
             .unwrap();
@@ -10391,8 +10399,14 @@ mod tests {
             fork_base: Some(ZERO_ID.to_string()),
             n: 2,
         };
-        let id =
-            tp12_enqueue_claim(&storage, "/p12c2", ZERO_ID, &tip.id.to_string(), &payload).await;
+        let id = tp12_enqueue_claim(
+            &storage,
+            "/project/p12c2",
+            ZERO_ID,
+            &tip.id.to_string(),
+            &payload,
+        )
+        .await;
         let exec = tp12_exec(&storage, id).await;
         let ExecuteOutcome::Done {
             landed_commit_id, ..
@@ -10443,7 +10457,7 @@ mod tests {
         };
         let id = tp12_enqueue_claim(
             &storage,
-            "/a/b/c",
+            "/project/a/b/c",
             ZERO_ID,
             &deep_c.id.to_string(),
             &payload,
@@ -10459,7 +10473,7 @@ mod tests {
         assert_eq!(landed_commit_id, deep_c.id.to_string());
         let pref = storage
             .mono_storage()
-            .get_main_ref("/a/b/c")
+            .get_main_ref("/project/a/b/c")
             .await
             .unwrap()
             .unwrap();

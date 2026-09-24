@@ -1939,6 +1939,19 @@ impl PushQueueService {
                 )
                 .await;
         }
+        // plan-20260923 ADR-FU-04 item 5: a true creation (no row, absent
+        // from the root tree) is classified again under the lock.
+        if creating
+            && resolved.is_none()
+            && let Err(err) = crate::ceres::pack::path_policy::classify_creation_path(
+                &ctx.storage.config().monorepo,
+                &row.path,
+            )
+        {
+            return self
+                .b3_fail_merge(txn, row.id, "PushFailure", err.to_string())
+                .await;
+        }
 
         let mono_api = MonoApiService {
             storage: ctx.storage.clone(),

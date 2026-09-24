@@ -18,7 +18,7 @@ use git_internal::{
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
-use sea_orm::DatabaseTransaction;
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -32,12 +32,13 @@ use crate::{
         pack::{
             RepoHandler,
             api_tip_lander::{land_api_tip_push, trunk_nff_align_message},
+            path_policy,
             push_chain::{self, PushChain, PushChainResolution},
         },
         protocol::import_refs::{CommandType, RefCommand, Refs},
     },
     common::{
-        errors::MegaError,
+        errors::{MegaError, PathPolicyError},
         utils::{self, MEGA_BRANCH_NAME, is_protocol_zero_id},
     },
     config::PushPolicy,
@@ -1065,7 +1066,13 @@ impl Monorepo {
     ///    already `ng`'d in the protocol layer (FC-08 / Mega mixed report-status).
     ///    This gate remains a fail-closed safety net if two `ok` branch updates
     ///    still reach finalize. Delete commands do not count.
-    /// 2. MC-03 chain validation — the primary branch command's resolved
+    /// 2. Trunk path creation (plan-20260923 ADR-FU-04 item 3), before the
+    ///    chain is resolved: a new-branch push to a path with no `main` row,
+    ///    no tombstone and no tree in the root is classified (`NotAllowed` /
+    ///    `Invalid` reject whatever the history), and an orphan chain on an
+    ///    allowed path becomes `MONO_PATH_UNINITIALIZED`. A fork-type creation
+    ///    keeps the B3 create semantics.
+    /// 3. MC-03 chain validation — the primary branch command's resolved
     ///    [`PushChain`] is validated against storage, with the path's existing
     ///    open CL (queried on the same path as `fetch_or_new_cl_link` /
     ///    `update_or_create_cl`) supplying the ADR-MC-07 cumulative boundary.
@@ -1108,8 +1115,21 @@ impl Monorepo {
         let Some(cmd) = push_chain::primary_branch_command(&cmds) else {
             return Ok(());
         };
+        let creation = self.trunk_creation_path(&cmd).await?;
+        if let Some(path) = creation.as_deref() {
+            path_policy::classify_creation_path(&self.storage.config().monorepo, path)?;
+        }
+        let chain = match self.build_push_chain(&cmd).await {
+            Err(err) if push_chain::is_orphan_chain_error(&err) => {
+                return Err(match creation {
+                    Some(path) => PathPolicyError::Uninitialized { path }.into(),
+                    None => err,
+                });
+            }
+            chain => chain?,
+        };
         // ADR-MC-05 no-op: nothing to validate.
-        let Some(chain) = self.build_push_chain(&cmd).await? else {
+        let Some(chain) = chain else {
             return Ok(());
         };
         let open_cl = self
@@ -1125,6 +1145,48 @@ impl Monorepo {
                 self.chain_commit_limit(),
             )
             .await
+    }
+
+    /// The path a trunk new-branch push would create (ADR-FU-04 item 3):
+    /// `old_id` is zero, `P` has no `main` row and no tombstone (tombstones
+    /// keep their own rejection), and `P` does not resolve to a tree in the
+    /// root. `None` in review morphology or when any of these fails.
+    async fn trunk_creation_path(&self, cmd: &RefCommand) -> Result<Option<String>, MegaError> {
+        if self.storage.config().monorepo.push_policy != PushPolicy::Trunk
+            || !is_protocol_zero_id(&cmd.old_id)
+        {
+            return Ok(None);
+        }
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| MegaError::Other("repository path is not valid UTF-8".into()))?;
+        let mono = self.storage.mono_storage();
+        if mono.get_main_ref(path).await?.is_some()
+            || mono.get_tombstone(path, MEGA_BRANCH_NAME).await?.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(root) = mono.get_main_ref("/").await? else {
+            return Ok(None);
+        };
+        let txn = mono.get_connection().begin().await?;
+        let resolved = mono
+            .resolve_path_tree_hash_in_txn(&root.ref_tree_hash, path, &txn)
+            .await?;
+        txn.rollback().await?;
+        Ok(resolved.is_none().then(|| path.to_owned()))
+    }
+
+    /// B3 classifies a true creation again under its lock (ADR-FU-04 item 5)
+    /// and reports a refusal as a queue failure message, which comes back as
+    /// `MegaError::Other`. Give it back its typed error so the `ng` line still
+    /// starts with the code.
+    fn typed_creation_rejection(&self, path: &str, err: MegaError) -> MegaError {
+        match path_policy::classify_creation_path(&self.storage.config().monorepo, path) {
+            Err(policy) if err.to_string() == format!("Other error: {policy}") => policy.into(),
+            _ => err,
+        }
     }
 
     fn chain_commit_limit(&self) -> usize {
@@ -1286,7 +1348,8 @@ impl Monorepo {
             self.username.clone(),
             &payload,
         )
-        .await?;
+        .await
+        .map_err(|err| self.typed_creation_rejection(path, err))?;
         if payload.n > 1 {
             *self
                 .no_op_notice
@@ -1355,7 +1418,7 @@ mod tests {
     use crate::{
         callisto::{
             commit_auths, mega_cl, mega_commit, mega_refs, mega_tree, push_queue,
-            sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
+            sea_orm_active_enums::{PushQueueFailureEnum, PushQueueKindEnum, PushQueueStatusEnum},
         },
         ceres::{
             api_service::cache::GitObjectCache,
@@ -1363,7 +1426,7 @@ mod tests {
             protocol::import_refs::RefCommand,
         },
         common::{
-            errors::{MegaError, ProtocolError},
+            errors::{MegaError, PathPolicyError, ProtocolError},
             utils::{MEGA_BRANCH_NAME, ZERO_ID, commit_body_subject, split_commit_message},
         },
         config::{PushPolicy, testing::isolated_config},
@@ -2122,6 +2185,320 @@ mod tests {
                 "Other error: Can not init directory under monorepo directory!"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn fu10_trunk_creation_path_cases() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (temp, storage, _rt, _rc, _child, path_commit, _path) =
+            trunk_path_fixture("project", "path tip").await;
+        let tip = path_commit.id.to_string();
+        storage
+            .mono_storage()
+            .upsert_tombstone("/project/gone", MEGA_BRANCH_NAME, &tip, &"b".repeat(40))
+            .await
+            .expect("tombstone");
+        let zero = RefCommand::new(
+            ZERO_ID.to_string(),
+            tip.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let update = RefCommand::new(tip.clone(), tip.clone(), MEGA_BRANCH_NAME.to_string());
+        let cases = [
+            ("/project/new", &zero, Some("/project/new")),
+            ("/project", &zero, None),
+            ("/project/gone", &zero, None),
+            ("/project/new", &update, None),
+        ];
+        for (repo_path, cmd, expected) in cases {
+            let repo = trunk_monorepo(
+                &storage,
+                repo_path,
+                vec![cmd.clone()],
+                HashSet::new(),
+                HashSet::new(),
+                None,
+            )
+            .await;
+            let creation = repo.trunk_creation_path(cmd).await.expect("creation path");
+            assert_eq!(creation.as_deref(), expected, "{repo_path}");
+        }
+
+        // Without a row, a path that resolves to a tree is not a creation; a
+        // blob at the path does not count as a tree.
+        mega_refs::Entity::delete_many()
+            .filter(mega_refs::Column::Path.eq("/project"))
+            .exec(storage.mono_storage().get_connection())
+            .await
+            .expect("drop /project row");
+        for (repo_path, expected) in [
+            ("/project", None),
+            ("/project/x.txt", Some("/project/x.txt")),
+        ] {
+            let repo = trunk_monorepo(
+                &storage,
+                repo_path,
+                vec![zero.clone()],
+                HashSet::new(),
+                HashSet::new(),
+                None,
+            )
+            .await;
+            let creation = repo
+                .trunk_creation_path(&zero)
+                .await
+                .expect("creation path");
+            assert_eq!(creation.as_deref(), expected, "{repo_path}");
+        }
+
+        let review = test_storage(&temp.path().join("review")).await;
+        let repo = trunk_monorepo(
+            &review,
+            "/project/new",
+            vec![zero.clone()],
+            HashSet::new(),
+            HashSet::new(),
+            None,
+        )
+        .await;
+        let creation = repo.trunk_creation_path(&zero).await.expect("review");
+        assert_eq!(creation, None, "review morphology never classifies");
+    }
+
+    #[tokio::test]
+    async fn fu10_outside_roots_rejected_before_chain() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _rt, _rc, child, path_commit, _path) =
+            trunk_path_fixture("project", "path tip").await;
+        let orphan = Commit::from_tree_id(child.id, vec![], "fu10 orphan");
+        let fork = Commit::from_tree_id(child.id, vec![path_commit.id], "fu10 fork");
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![orphan.clone(), fork.clone()], None)
+            .await
+            .expect("commits");
+        for tip in [orphan.id.to_string(), fork.id.to_string()] {
+            let cmd = RefCommand::new(
+                ZERO_ID.to_string(),
+                tip.clone(),
+                MEGA_BRANCH_NAME.to_string(),
+            );
+            let repo = trunk_monorepo(
+                &storage,
+                "/outside/fu10",
+                vec![cmd],
+                id_set(&[&tip]),
+                id_set(&[&tip]),
+                None,
+            )
+            .await;
+            let err = repo
+                .validate_incoming_push()
+                .await
+                .expect_err("outside the roots");
+            assert!(
+                matches!(
+                    &err,
+                    MegaError::PathPolicy(PathPolicyError::NotAllowed { path, .. })
+                        if path == "/outside/fu10"
+                ),
+                "{err}"
+            );
+            assert!(
+                err.to_string().starts_with("MONO_PATH_NOT_ALLOWED: "),
+                "{err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fu10_orphan_allowed_root_uninitialized() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _rt, _rc, child, _path_commit, _path) =
+            trunk_path_fixture("project", "path tip").await;
+        let orphan = Commit::from_tree_id(child.id, vec![], "fu10 orphan");
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![orphan.clone()], None)
+            .await
+            .expect("orphan");
+        let tip = orphan.id.to_string();
+        let cmd = RefCommand::new(
+            ZERO_ID.to_string(),
+            tip.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let mut texts = Vec::new();
+        // First push (tip new) and verbatim retry (tip already stored).
+        for new_ids in [id_set(&[&tip]), HashSet::new()] {
+            let repo = trunk_monorepo(
+                &storage,
+                "/project/fresh",
+                vec![cmd.clone()],
+                id_set(&[&tip]),
+                new_ids,
+                None,
+            )
+            .await;
+            let err = repo
+                .validate_incoming_push()
+                .await
+                .expect_err("orphan on an allowed root");
+            assert!(
+                matches!(
+                    &err,
+                    MegaError::PathPolicy(PathPolicyError::Uninitialized { path })
+                        if path == "/project/fresh"
+                ),
+                "{err}"
+            );
+            texts.push(err.to_string());
+        }
+        assert_eq!(texts[0], texts[1]);
+
+        // Not a creation (tombstone; tree without a row): the orphan keeps
+        // its own rejection.
+        storage
+            .mono_storage()
+            .upsert_tombstone("/project/gone", MEGA_BRANCH_NAME, &tip, &"b".repeat(40))
+            .await
+            .expect("tombstone");
+        mega_refs::Entity::delete_many()
+            .filter(mega_refs::Column::Path.eq("/project"))
+            .exec(storage.mono_storage().get_connection())
+            .await
+            .expect("drop /project row");
+        for repo_path in ["/project/gone", "/project"] {
+            let repo = trunk_monorepo(
+                &storage,
+                repo_path,
+                vec![cmd.clone()],
+                id_set(&[&tip]),
+                HashSet::new(),
+                None,
+            )
+            .await;
+            let err = repo
+                .validate_incoming_push()
+                .await
+                .expect_err("orphan outside a creation");
+            assert!(matches!(err, MegaError::OrphanChain), "{repo_path}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fu10_fork_creation_allowed_root_lands() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _rt, _rc, _child, path_commit, _path) =
+            trunk_path_fixture("project", "path tip").await;
+        let tree = Tree::from_tree_items(vec![blob_item(
+            "f.txt",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )])
+        .unwrap();
+        let fork = Commit::from_tree_id(tree.id, vec![path_commit.id], "fu10 fork");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![tree], fork.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![fork.clone()], None)
+            .await
+            .unwrap();
+        let tip = fork.id.to_string();
+        let cmd = RefCommand::new(
+            ZERO_ID.to_string(),
+            tip.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = trunk_monorepo(
+            &storage,
+            "/project/forked",
+            vec![cmd],
+            id_set(&[&tip]),
+            id_set(&[&tip]),
+            None,
+        )
+        .await;
+        repo.finalize_receive_pack()
+            .await
+            .expect("fork-type creation under an allowed root");
+        let pref = storage
+            .mono_storage()
+            .get_main_ref("/project/forked")
+            .await
+            .unwrap()
+            .expect("created row");
+        assert_eq!(pref.ref_commit_hash, tip);
+    }
+
+    #[tokio::test]
+    async fn fu10_b3_creation_reclassifies_under_lock() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _rt, _rc, child, path_commit, _path) =
+            trunk_path_fixture("project", "path tip").await;
+        let fork = Commit::from_tree_id(child.id, vec![path_commit.id], "fu10 b3");
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![fork.clone()], None)
+            .await
+            .expect("fork");
+        let tip = fork.id.to_string();
+        let cmd = RefCommand::new(
+            ZERO_ID.to_string(),
+            tip.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = trunk_monorepo(
+            &storage,
+            "/outside/b3",
+            vec![cmd.clone()],
+            id_set(&[&tip]),
+            id_set(&[&tip]),
+            None,
+        )
+        .await;
+        // Skip the admission gate: finalize_trunk_push lands the chain through
+        // MonoWriteQueue, whose B3 re-check refuses the creation; the queue
+        // message comes back as the typed error.
+        let mono = storage.mono_storage();
+        let root_before = mono.get_main_ref("/").await.unwrap().unwrap();
+        let err = repo
+            .finalize_trunk_push()
+            .await
+            .expect_err("B3 must reclassify the creation");
+        assert!(
+            matches!(
+                &err,
+                MegaError::PathPolicy(PathPolicyError::NotAllowed { path, .. })
+                    if path == "/outside/b3"
+            ),
+            "{err}"
+        );
+        let root_after = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(root_after.ref_commit_hash, root_before.ref_commit_hash);
+        assert_eq!(root_after.ref_tree_hash, root_before.ref_tree_hash);
+        assert!(mono.get_main_ref("/outside/b3").await.unwrap().is_none());
+        let row = push_queue::Entity::find()
+            .filter(push_queue::Column::Path.eq("/outside/b3"))
+            .one(mono.get_connection())
+            .await
+            .unwrap()
+            .expect("push_queue row");
+        assert_eq!(row.status, PushQueueStatusEnum::Failed);
+        assert_eq!(row.failure_type, Some(PushQueueFailureEnum::PushFailure));
+        assert!(
+            row.error_message.as_deref().is_some_and(
+                |m| m.starts_with("MONO_PATH_NOT_ALLOWED: cannot create \"/outside/b3\"")
+            ),
+            "{:?}",
+            row.error_message
+        );
+        let other = MegaError::Other("non-fast-forward".into());
+        let kept = repo.typed_creation_rejection("/outside/b3", other);
+        assert!(matches!(kept, MegaError::Other(_)), "{kept}");
     }
 
     #[tokio::test]

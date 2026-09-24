@@ -158,7 +158,15 @@
 
 **墓碑优先于创建**：`P` 无行但存在墓碑时，创建语义**不得**生效——直接 INSERT 会让新 tip 与墓碑记录的历史断开（I1 破损）。B0 拒绝这类推送并提示：先经 advertise 从墓碑续接重新物化，`fetch && reset` 对齐后基于续接 tip 正常推送。
 
-**孤儿链拒绝具有黏性**（[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-07，issue #25 E3/E4）：`old_id = ZERO_ID` 的推送，若其第一父链沿 pack 内容走到无父根——新 tip 时途中没有可作 fork 基线的已知 commit；已知 tip 时只要 pack 链走到根即是，哪怕该历史已被其它 ref 引用（例如把另一路径的 clone 原样推到新路径，此前经 `validate` 以 `push chain is broken` 拒绝；因此孤儿拒绝不能证明历史未被引用）——`PushChain::resolve` 返回孤儿拒绝 `Can not init directory under monorepo directory!`；首推失败后对象已入库，原样重试时整条链变为「已知」——此前已知 tip 分支把根当作 fork 基线，重试漂移为 `push chain is broken: base X is not on the first-parent chain of tip X`。现在不论 tip 新旧都返回同一孤儿拒绝（类型化为 `MegaError::OrphanChain`，显示文本仍为 `Other error: Can not init directory under monorepo directory!`；`push_chain::orphan_chain_error` / `is_orphan_chain_error`）；trunk Noop 桥的 `PushChain::from_known_tip` 在 `old_id = ZERO_ID` 走到根时同样返回它。`old_id ≠ ZERO_ID` 的拒绝文案与对齐提示不变。trunk 形态下该拒绝将由 FU-10 映射为路径策略码。
+**孤儿链拒绝具有黏性**（[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-07，issue #25 E3/E4）：`old_id = ZERO_ID` 的推送，若其第一父链沿 pack 内容走到无父根——新 tip 时途中没有可作 fork 基线的已知 commit；已知 tip 时只要 pack 链走到根即是，哪怕该历史已被其它 ref 引用（例如把另一路径的 clone 原样推到新路径，此前经 `validate` 以 `push chain is broken` 拒绝；因此孤儿拒绝不能证明历史未被引用）——`PushChain::resolve` 返回孤儿拒绝 `Can not init directory under monorepo directory!`；首推失败后对象已入库，原样重试时整条链变为「已知」——此前已知 tip 分支把根当作 fork 基线，重试漂移为 `push chain is broken: base X is not on the first-parent chain of tip X`。现在不论 tip 新旧都返回同一孤儿拒绝（类型化为 `MegaError::OrphanChain`，显示文本仍为 `Other error: Can not init directory under monorepo directory!`；`push_chain::orphan_chain_error` / `is_orphan_chain_error`）；trunk Noop 桥的 `PushChain::from_known_tip` 在 `old_id = ZERO_ID` 走到根时同样返回它。`old_id ≠ ZERO_ID` 的拒绝文案与对齐提示不变。trunk 形态下，创建路径上的孤儿拒绝映射为 `MONO_PATH_UNINITIALIZED`（见下）。
+
+**创建的路径策略**（[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-03 / ADR-FU-04，issue #29、#25 E1/E2）：trunk 下 `old_id = ZERO_ID`、`P` 无 `main` 行、无墓碑且在根树中不可解析为目录的推送是一次**创建**。准入门 `Monorepo::validate_incoming_push` 先调用唯一的分类函数 `path_policy::classify_creation_path`：
+
+- `P` 不在任何 `root_dirs` 根之下 → `MONO_PATH_NOT_ALLOWED`，列出允许的根。不论历史是孤儿还是 fork 型都拒绝，关闭此前未文档化的「fork 型创建新顶层」。（`import_dir` 之下的路径由协议分派给 ImportRepo，不经过这道门。）
+- `P` 在允许的根下且链为孤儿 → `MONO_PATH_UNINITIALIZED`，点名 `mega2 path provision` 与 `POST /api/v1/path/provision`；首推与原样重试同一文本。
+- `P` 在允许的根下且为 fork 型（链经 pack 到达已知 commit）→ 沿用上表的创建语义。
+
+已有 `main` 行、已能在根树中解析（例如尚未物化的一级根）或存在墓碑的路径不做分类，拒绝与创建规则不变，孤儿推送到这类路径仍得到孤儿拒绝。`root_dirs` 因此是「创建」白名单：新增一级根要改配置并重启，之后只有 fork 型推送能创建它——孤儿推送到新根得到 `MONO_PATH_UNINITIALIZED`，但开通 API 不在 `/` 落地，照提示开通会得到点名 `/` 的 `MONO_PATH_NOT_ALLOWED`（`DEFER-FU-14`）。B3 在锁内对真创建分支（无行且根树不可解析）再分类一次，作为纵深防御，覆盖准入与落地之间根树变化的竞态；这一拒绝经队列失败消息返回，`finalize_trunk_push` 把它还原为类型化的路径策略错误，`ng` 行同样以码开头。
 
 已有行的写入走同一条合成规则——`parent` 取该 ref 自身的旧 tip，`tree` 取该层的新子树——差别仅在新子树从哪里来。两个例外：N = 1 的被推路径（客户端 commit 的 tree 恰好就是该层所需的 tree，无需合成，直接 fast-forward）与被推路径无已物化行的创建语义（上表首行）。祖先方向的合成已经实现（事实校准 10），后代方向是阶段 2 的内容，被推路径的 N > 1 分支是阶段 4 的内容。
 

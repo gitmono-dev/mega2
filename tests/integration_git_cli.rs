@@ -1517,13 +1517,27 @@ fn post_packless_receive_pack(
     new_id: &str,
     ref_name: &str,
 ) -> String {
+    post_packless_receive_pack_at(port, "/", token, old_id, new_id, ref_name)
+}
+
+fn post_packless_receive_pack_at(
+    port: u16,
+    repo_path: &str,
+    token: &str,
+    old_id: &str,
+    new_id: &str,
+    ref_name: &str,
+) -> String {
     let mut line = format!("{old_id} {new_id} {ref_name}");
     line.push('\0');
     line.push_str("report-status\n");
     let mut body = pkt_line(&line);
     body.extend_from_slice(b"0000");
 
-    let url = format!("http://127.0.0.1:{port}/git-receive-pack");
+    let url = format!(
+        "http://127.0.0.1:{port}{}/git-receive-pack",
+        repo_path.trim_end_matches('/')
+    );
     let mut child = Command::new("curl")
         .args([
             "-sS",
@@ -2082,6 +2096,10 @@ fn integration_git_cli_trunk_n_gt1_squash_sideband_and_nff_align() {
     assert!(
         nff.contains("git fetch && git reset --hard origin/main"),
         "NFF must include the align command:\n{nff}"
+    );
+    assert!(
+        !nff.contains("MONO_PATH_"),
+        "an NFF on an existing path is not a path-policy rejection:\n{nff}"
     );
 
     git_ok_no_auth(&env.case_dir, &["-C", "foo-batch", "fetch", "origin"]);
@@ -5353,8 +5371,10 @@ fn orphan_retry_same_rejection() {
         reasons[0], reasons[1],
         "retry must repeat the first rejection"
     );
+    // FU-10: on trunk an orphan chain under an allowed root is a path that
+    // has not been provisioned yet.
     assert!(
-        reasons[0].contains("Can not init directory under monorepo directory!"),
+        reasons[0].starts_with("MONO_PATH_UNINITIALIZED: \"/project/fu09\""),
         "{reasons:?}"
     );
     for reason in &reasons {
@@ -5371,4 +5391,256 @@ fn orphan_retry_same_rejection() {
         "shutdown failed\n{}",
         read_log(&stderr_path)
     );
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-10: trunk first-push path policy (ADR-FU-03, ADR-FU-04):
+// creating a path outside `root_dirs` is MONO_PATH_NOT_ALLOWED whatever the
+// history; an orphan chain under an allowed root is MONO_PATH_UNINITIALIZED;
+// a fork-type creation under an allowed root keeps the B3 create semantics.
+// ---------------------------------------------------------------------------
+
+/// A one-commit repository whose commit has no parent.
+fn fu10_orphan_repo(case_dir: &Path, name: &str) {
+    git_ok_no_auth(case_dir, &["init", "-b", "main", name]);
+    configure_git_identity_no_auth(case_dir, name);
+    fs::write(case_dir.join(name).join("orphan.txt"), format!("{name}\n")).expect("write");
+    git_ok_no_auth(case_dir, &["-C", name, "add", "orphan.txt"]);
+    git_ok_no_auth(case_dir, &["-C", name, "commit", "-m", name]);
+}
+
+/// Push `repo`'s HEAD to `url` twice (first push and verbatim retry); both
+/// must be rejected with the same reason, which is returned.
+fn fu10_rejected_twice(case_dir: &Path, repo: &str, url: &str) -> String {
+    let mut reasons = Vec::new();
+    for attempt in 0..2 {
+        let output = trunk_host_git(
+            case_dir,
+            &["-C", repo, "push", "--no-thin", url, "HEAD:refs/heads/main"],
+        );
+        assert!(
+            !output.status.success(),
+            "attempt {attempt} to {url} must be rejected"
+        );
+        reasons.push(fu09_rejection_reason(&output));
+    }
+    assert_eq!(
+        reasons[0], reasons[1],
+        "retry must repeat the first rejection"
+    );
+    reasons.swap_remove(0)
+}
+
+fn fu10_shutdown(mut service: ServiceProcess, stderr_path: &Path) {
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(60))
+            .success(),
+        "shutdown failed\n{}",
+        read_log(stderr_path)
+    );
+}
+
+#[test]
+fn path_policy_outside_roots_not_allowed() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    fu10_orphan_repo(case_dir, "fu10-outside");
+    let reason = fu10_rejected_twice(
+        case_dir,
+        "fu10-outside",
+        &trunk_subpath_url(port, "/outside/fu10"),
+    );
+    assert!(
+        reason.starts_with("MONO_PATH_NOT_ALLOWED: cannot create \"/outside/fu10\""),
+        "{reason}"
+    );
+    for root in ["/project", "/third-party"] {
+        assert!(reason.contains(root), "roots must be listed: {reason}");
+    }
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn path_policy_uninitialized_child() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    fu10_orphan_repo(case_dir, "fu10-child");
+    // The remote URL carries a trailing slash (Libra's default form); the
+    // client drops it when it builds the receive-pack URL, so the canonical
+    // path is classified.
+    let url = trunk_subpath_url(port, "/project/fu10-new");
+    assert!(url.ends_with('/'), "{url}");
+    let reason = fu10_rejected_twice(case_dir, "fu10-child", &url);
+    assert!(
+        reason.starts_with("MONO_PATH_UNINITIALIZED: \"/project/fu10-new\""),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("mega2 path provision --server <url> /project/fu10-new"),
+        "{reason}"
+    );
+    assert!(reason.contains("POST /api/v1/path/provision"), "{reason}");
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn path_policy_custom_root_dirs() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let mut extra = trunk_boot_env().to_vec();
+    extra.push(("MEGA_MONOREPO__ROOT_DIRS", "apps,third-party"));
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &extra);
+    let case_dir = env.case_dir.as_path();
+    fu10_orphan_repo(case_dir, "fu10-custom");
+    let apps = fu10_rejected_twice(
+        case_dir,
+        "fu10-custom",
+        &trunk_subpath_url(port, "/apps/fu10"),
+    );
+    assert!(
+        apps.starts_with("MONO_PATH_UNINITIALIZED: \"/apps/fu10\""),
+        "{apps}"
+    );
+    let project = fu10_rejected_twice(
+        case_dir,
+        "fu10-custom",
+        &trunk_subpath_url(port, "/project/fu10"),
+    );
+    assert!(
+        project.starts_with("MONO_PATH_NOT_ALLOWED: cannot create \"/project/fu10\""),
+        "{project}"
+    );
+    assert!(
+        project.contains("(/apps, /third-party)"),
+        "only the configured roots are listed: {project}"
+    );
+    fu10_shutdown(service, &stderr_path);
+}
+
+/// Clone `/project` into `name` and add one commit: a fork-type history for
+/// any new path (its parent is a known commit).
+fn fu10_fork_clone(case_dir: &Path, port: u16, name: &str) {
+    git_ok_no_auth(
+        case_dir,
+        &["clone", &trunk_subpath_url(port, "/project"), name],
+    );
+    configure_git_identity_no_auth(case_dir, name);
+    fs::write(case_dir.join(name).join("fu10-fork.txt"), "fork\n").expect("write");
+    git_ok_no_auth(case_dir, &["-C", name, "add", "fu10-fork.txt"]);
+    git_ok_no_auth(case_dir, &["-C", name, "commit", "-m", "fu10 fork"]);
+}
+
+#[test]
+fn path_policy_fork_creation_valid_root_lands() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    fu10_fork_clone(case_dir, port, "fu10-fork");
+    let tip = git_stdout_no_auth(case_dir, &["-C", "fu10-fork", "rev-parse", "HEAD"]);
+    let url = trunk_subpath_url(port, "/project/fu10-fork");
+    let push = trunk_host_git(
+        case_dir,
+        &[
+            "-C",
+            "fu10-fork",
+            "push",
+            "--no-thin",
+            &url,
+            "HEAD:refs/heads/main",
+        ],
+    );
+    git_cli::assert_git_success(&push, "fork-type creation under /project");
+    assert_eq!(ls_remote_main(case_dir, &url), tip);
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn path_policy_fork_creation_outside_roots_rejected() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    fu10_fork_clone(case_dir, port, "fu10-fork-out");
+    let root_url = trunk_subpath_url(port, "/");
+    let root_before = ls_remote_main(case_dir, &root_url);
+    let url = trunk_subpath_url(port, "/outside/fu10-fork");
+    let reason = fu10_rejected_twice(case_dir, "fu10-fork-out", &url);
+    assert!(
+        reason.starts_with("MONO_PATH_NOT_ALLOWED: cannot create \"/outside/fu10-fork\""),
+        "{reason}"
+    );
+    assert_eq!(ls_remote_main(case_dir, &root_url), root_before);
+    assert_eq!(
+        ls_remote_main(case_dir, &url),
+        "",
+        "no ref at the rejected path"
+    );
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn path_policy_raw_nonzero_old_id_unresolved_root_rejected() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    let root_url = trunk_subpath_url(port, "/");
+    // A known first-parent step (seed commit on /project and its parent), so
+    // the chain is valid and only the missing path can refuse the update.
+    seed_project_foo(case_dir, port);
+    let tip = git_stdout_no_auth(case_dir, &["-C", "project-seed", "rev-parse", "HEAD"]);
+    let base = git_stdout_no_auth(case_dir, &["-C", "project-seed", "rev-parse", "HEAD^"]);
+    let root_before = ls_remote_main(case_dir, &root_url);
+    // A hand-built receive-pack with a known, non-zero old_id: Git would never
+    // send one for a path that advertises no refs.
+    let report = post_packless_receive_pack_at(
+        port,
+        "/outside/fu10-raw",
+        "unused",
+        &base,
+        &tip,
+        "refs/heads/main",
+    );
+    assert!(
+        report.contains("ng refs/heads/main"),
+        "raw non-zero old_id push must be rejected:\n{report}"
+    );
+    // The B3 guard ADR-FU-04 item 5 relies on, not some other refusal.
+    assert!(report.contains("cannot update missing path"), "{report}");
+    assert_eq!(ls_remote_main(case_dir, &root_url), root_before);
+    assert_eq!(
+        ls_remote_main(case_dir, &trunk_subpath_url(port, "/outside/fu10-raw")),
+        ""
+    );
+    fu10_shutdown(service, &stderr_path);
 }
