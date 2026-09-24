@@ -36,14 +36,16 @@ Initialization is driven by `[monorepo]` in the config file. The commented
 | Setting | Initialization behavior |
 |---|---|
 | `root_dirs` | Creates one top-level directory per entry, each with its own `.gitkeep` placeholder. |
-| `import_dir` | Defaults to `/third-party`. It does not create a directory; it marks paths below it as ImportRepos. Keep it aligned with an entry in `root_dirs`. |
+| `import_dir` | Defaults to `/third-party`. It does not create a directory; it marks paths below it as ImportRepos. Its first path component must be listed in `root_dirs`. |
 | `admin` | Seeds the root `.mega_cedar.json` entity and the default repository reviewer policy. |
 | `rename.*` | Controls diff rename detection; it does not affect the initial tree. |
 
-`import_dir`, `root_dirs`, and `admin` must be non-empty. They are restart-
-required settings, and changing them affects only a database that has not yet
-been initialized. Existing trees are not rebuilt. `root_dirs` supports only
-single path components; do not include `/` in an entry (see section 5).
+`import_dir`, `root_dirs`, and `admin` must be non-empty. The validator also
+checks the shape of `root_dirs` and `import_dir`; `config validate`, service
+startup, and hot-reload candidates use the same checks and name the invalid
+field. See the [Configuration Reference](../configuration.md) for the full
+rules. These settings require a restart, and changes affect only a database
+that has not yet been initialized. Existing trees are not rebuilt.
 
 ## 3. What the initial commit contains
 
@@ -80,7 +82,7 @@ an empty directory containing `.gitkeep`.
 
 | Directory | Suggested use |
 |---|---|
-| `third-party/` | Root for imported repositories. Keep it aligned with `import_dir`. |
+| `third-party/` | Root for imported repositories. The default config aligns it with `import_dir`; validation requires the first component of `import_dir` to be listed in `root_dirs`. |
 | `project/` | Application and service source code. |
 | `doc/` | Design notes, specifications, and review material. |
 | `artifact/` | Optional repository convention for release files; separate from mega2's artifact storage API. |
@@ -117,18 +119,20 @@ The actual tree always follows the running config's `root_dirs`. The sample
 and `MonoConfig::default` do not necessarily include all eight suggested
 directories. Set the desired list before the first initialization.
 
-`import_dir` defaults to `/third-party` and classifies paths by prefix,
-regardless of whether the directory exists in the tree. The directory itself
-comes from `root_dirs`; `import_dir` does not create it. If the two settings
-drift apart, a path may be visible but use Monorepo rules, or use ImportRepo
-rules without a matching directory in the initial layout.
+The protocol classifies each path by whether it falls under the configured
+`import_dir` prefix, regardless of whether that directory already exists in
+the tree. The directory itself comes from `root_dirs`; `import_dir` does not
+create it. Validation requires its first component to appear in `root_dirs`,
+so an inconsistent layout fails before startup. Paths under `import_dir`
+always use ImportRepo semantics, even when `root_dirs` contains the same
+name. For branch and tag behavior, see the [User Guide](../user-guide.md).
 
 ## 5. Configure the layout safely
 
 Before the first service startup:
 
 1. Set `[monorepo].root_dirs` in `config/config.toml`.
-2. Keep `import_dir` aligned with the intended ImportRepo root.
+2. Ensure the first component of `import_dir` is listed in `root_dirs`; for the default `/third-party`, include `third-party`.
 3. Set `admin` to the system administrator accounts used by the deployment.
 4. Validate the config:
 
@@ -142,17 +146,23 @@ Before the first service startup:
 ### Directory depth: top-level entries only
 
 Each `root_dirs` string is written as one literal tree-entry name; mega2 does
-not split entries on `/` to create nested directories. For example,
-`root_dirs = ["a/b"]` does not create `a/` containing `b/`; it produces an
-invalid Git tree entry that clients cannot traverse. Use simple names such as
-`a`, then create `a/b` with a normal Git commit after cloning.
+not split entries on `/` to create nested directories. The validator rejects
+entries containing `/`, `\`, or NUL; empty entries, `.` and `..`; leading or
+trailing spaces; duplicates; and reserved root names (`.cedar`,
+`.mega_cedar.json`, `.buckroot`, `.buckconfig`, and `.git`, case-insensitive).
+It also requires `import_dir` to be a canonical absolute non-root path without
+a trailing slash, `//`, `.` or `..` segments, NUL, or `\`. Its first
+component must be in `root_dirs`; for example, `root_dirs = ["project"]` with
+`import_dir = "/vendor"` is rejected. The same checks run during config
+validation, service startup, and hot reload, and errors identify the invalid
+field. See the [Configuration Reference](../configuration.md).
 
-The current config validator checks that entries are non-empty but does not
-reject slashes. Until that validation is tightened, avoid `/` and `\\` in
-`root_dirs`. To change a layout after initialization, commit directory changes
-normally. Reinitializing requires resetting the data plane and is destructive;
-this manual does not provide reset steps.
-
+To create nested directories, initialize only the top-level layout, then
+clone and add deeper paths with a regular Git commit, such as
+`mkdir -p a/b && git add && git commit && git push`. After initialization,
+mega2 does not rebuild the root tree from config; change the layout through
+normal client commits, or reset the data plane and initialize again (a
+destructive operation whose steps are outside this manual).
 ## 6. Container configuration
 
 ### Config file lookup and overlays

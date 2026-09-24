@@ -61,6 +61,12 @@ sqlx_logging = false
 ## - Tags must not be created/updated/deleted via Git client; use Web UI /tags API.
 ## Only import_dir supports multi-branch and Git-client tags (ImportRepo).
 ## Mega treats files under this directory as import repo and other directories as monorepo
+## Shape: a canonical absolute non-root path (no trailing '/', no '//', '.' or '..' segments,
+## no '\' or NUL) whose first component is listed in root_dirs. Import first: a path under
+## import_dir is always an ImportRepo (created by Git push), even if root_dirs has the same name.
+## 形状:规范绝对非根路径(无尾 '/'、无 '//'、'.'、'..' 段,不含 '\' 或 NUL),首组件必须列在
+## root_dirs 中;import 优先:该目录下的路径一律按 ImportRepo 处理(由 Git 推送创建),即使
+## root_dirs 含同名项.
 import_dir = "/third-party"
 
 # Set System Admin(s) in directory init, these users will be added to the admin group
@@ -68,6 +74,16 @@ import_dir = "/third-party"
 admin = ["mega2"]
 
 # Set serveral root dirs in directory init
+# Shape: each entry is a unique single path component: no '/', '\' or NUL; not '.', '..'
+# or empty; no leading/trailing spaces; not a reserved root entry (.cedar, .mega_cedar.json,
+# .buckroot, .buckconfig, .git). `config validate` and startup reject anything else. Only the
+# first initialization (`service init`, or the first service start on an empty database)
+# creates these directories; changing the list later needs a restart and does not add or
+# remove top-level directories of an initialized repository.
+# 形状:每项为唯一的单组件目录名:不含 '/'、'\' 或 NUL,不能是 '.'、'..' 或空串,无首尾空格,
+# 且不能是根树保留项(.cedar、.mega_cedar.json、.buckroot、.buckconfig、.git),否则校验失败.
+# 只有首次初始化(`service init` 或空库上的首次服务启动)会创建这些目录;事后修改需重启,且不会
+# 增删已初始化库的顶层目录.
 root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
 
 # Object-ID format for the initial Monorepo graph and live Git service.

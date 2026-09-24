@@ -822,7 +822,7 @@ level = "debug"
 print_std = true
 
 [monorepo]
-import_dir = "/tmp/hot-reload-restart-required"
+import_dir = "/project/hot-reload-restart-required"
 "#,
     );
     let logs = wait_for_log_marker(
@@ -838,7 +838,7 @@ import_dir = "/tmp/hot-reload-restart-required"
     // 请求路径不在其下，因此应返回 true；若 restart-required 值被错误热应用则会返回 false。
     let clone_response = http_get(
         port,
-        "/api/v1/tree/path-can-clone?path=/tmp/hot-reload-restart-required/foo",
+        "/api/v1/tree/path-can-clone?path=/project/hot-reload-restart-required/foo",
     );
     assert!(
         clone_response.contains("\"data\":true"),
