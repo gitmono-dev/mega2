@@ -4,6 +4,7 @@ mod authz_audit_protect;
 mod authz_audit_run;
 pub mod config;
 pub mod debug;
+pub mod path;
 pub mod service;
 #[cfg(test)]
 mod un34_readonly_config;
@@ -95,6 +96,7 @@ pub fn builtin() -> Vec<Command> {
         config::cli(),
         debug::cli(),
         authz_audit::cli(),
+        path::cli(),
     ]
 }
 
@@ -104,6 +106,7 @@ pub(crate) fn builtin_exec(cmd: &str) -> Option<CommandExec> {
         "config" => config::exec,
         "debug" => debug::exec,
         "authz-audit" => authz_audit::exec,
+        "path" => path::exec,
         _ => return None,
     };
 
@@ -119,6 +122,8 @@ pub(crate) fn load_mode(cmd: &str, args: &ArgMatches) -> Option<LoadMode> {
         "debug" => Some(LoadMode::FullAppContext),
         "config" => Some(config::load_mode(args)),
         "authz-audit" => Some(authz_audit::load_mode(args)),
+        // A thin HTTP client of a running server: no config (ADR-FU-05).
+        "path" => Some(LoadMode::None),
         _ => None,
     }
 }
@@ -149,7 +154,22 @@ mod tests {
             .map(|cmd| cmd.get_name().to_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["service", "config", "debug", "authz-audit"]);
+        assert_eq!(
+            names,
+            vec!["service", "config", "debug", "authz-audit", "path"]
+        );
+    }
+
+    /// plan-20260923 FU-08: `path` is registered in all three tables and
+    /// reads no config.
+    #[test]
+    fn path_command_registered() {
+        assert!(builtin().iter().any(|cmd| cmd.get_name() == "path"));
+        assert!(builtin_exec("path").is_some());
+        let args = path::cli()
+            .try_get_matches_from(["path", "provision", "--server", "http://s", "/project/a"])
+            .expect("path provision arguments");
+        assert_eq!(load_mode("path", &args), Some(LoadMode::None));
     }
 
     #[test]

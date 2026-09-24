@@ -110,6 +110,8 @@ struct ApiWriteEnv {
     case_dir: PathBuf,
     /// `MEGA_MONOREPO__PUSH_POLICY` handed to the service.
     push_policy: &'static str,
+    /// Extra `MEGA_*` overrides for the service (e.g. custom `root_dirs`).
+    extra_env: Vec<(&'static str, String)>,
 }
 
 impl ApiWriteEnv {
@@ -190,7 +192,13 @@ ssh_receive_pack = false
             object_root,
             case_dir,
             push_policy,
+            extra_env: Vec::new(),
         }
+    }
+
+    fn with_env(mut self, key: &'static str, value: &str) -> Self {
+        self.extra_env.push((key, value.to_owned()));
+        self
     }
 
     fn full_config_command(&self) -> Command {
@@ -212,6 +220,9 @@ ssh_receive_pack = false
             .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root)
             .env("MEGA_MONOREPO__PUSH_POLICY", self.push_policy)
             .env("MEGA_GIT__SSH_RECEIVE_PACK", "false");
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
         command
     }
 }
@@ -1716,8 +1727,9 @@ fn move_entry_reject_root() {
         );
         assert_eq!(json["req_result"], Value::Bool(false), "{json}");
     }
-    // Cross-top-level move: the common parent is `/`, whose tip B0 refuses to
-    // advance through the write queue on trunk → 400 before any write.
+    // Cross-top-level move: the common parent is `/`, which trunk API writes
+    // never land on → 400 MONO_PATH_NOT_ALLOWED before any write
+    // (plan-20260923 ADR-FU-06; formerly the B0 "no non-root path tip" text).
     case.seed();
     case.create_dir_at(Some(&EntryCase::bearer()), "/project", "lb03-top");
     let tip_before = path_tip(case.db_url(), "/project");
@@ -1730,11 +1742,11 @@ fn move_entry_reject_root() {
     );
     assert_eq!(
         status, 400,
-        "cross-top-level move on trunk must 400 (B0): {json}"
+        "cross-top-level move on trunk must 400: {json}"
     );
     assert!(
-        err_message(&json).contains("no non-root path tip"),
-        "diagnosable B0 message expected: {json}"
+        err_message(&json).starts_with("MONO_PATH_NOT_ALLOWED: "),
+        "diagnosable path policy message expected: {json}"
     );
     assert_eq!(path_tip(case.db_url(), "/project"), tip_before);
     let names = case.tree_names("/project");
@@ -2763,5 +2775,651 @@ fn api_commit_subject_visible() {
         &["-C", "fu03-subject-clone", "log", "--format=%s", "-1"],
     );
     assert_eq!(subject, "create new directory fu03-subject");
+    case.finish();
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-06: product writes on a fresh stack (no non-root tip) land
+// on the lazily materialized first-level root; paths outside the roots and
+// the ImportRepo namespace return MONO_PATH_NOT_ALLOWED (ADR-FU-06).
+// ---------------------------------------------------------------------------
+
+/// Number of `main` rows at `prefix` or below it.
+fn fu06_main_rows_under(db_url: &str, prefix: &str) -> i64 {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect for main rows: {err}"));
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT COUNT(*)::bigint AS n FROM mega_refs \
+                     WHERE (path = '{prefix}' OR path LIKE '{prefix}/%') \
+                     AND ref_name = 'refs/heads/main' AND NOT is_cl"
+                ),
+            ))
+            .await
+            .expect("count main rows")
+            .expect("count row");
+        row.try_get::<i64>("", "n").expect("n")
+    })
+}
+
+/// Insert a `main@<path>` row by hand, as a pre-FU-06 or externally created
+/// state would have left it.
+fn fu06_insert_main_row(db_url: &str, path: &str, commit: &str, tree: &str) {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect for insert: {err}"));
+        db.execute_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO mega_refs (id, path, ref_name, ref_commit_hash, ref_tree_hash, \
+                 created_at, updated_at, is_cl) SELECT COALESCE(MAX(id), 0) + 1, '{path}', \
+                 'refs/heads/main', '{commit}', '{tree}', now(), now(), false FROM mega_refs"
+            ),
+        ))
+        .await
+        .expect("insert main row");
+    })
+}
+
+/// Remove the `git_repo` row of an ImportRepo (its tree leaf stays), as a
+/// cleanup would.
+fn fu06_drop_git_repo(db_url: &str, repo_path: &str) {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect for git_repo delete: {err}"));
+        db.execute_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("DELETE FROM git_repo WHERE repo_path = '{repo_path}'"),
+        ))
+        .await
+        .expect("delete git_repo row");
+    })
+}
+
+fn fu06_assert_not_allowed(status: u16, json: &Value, what: &str) {
+    assert_eq!(status, 400, "{what} must 400: {json}");
+    assert!(
+        err_message(json).starts_with("MONO_PATH_NOT_ALLOWED: "),
+        "{what} must return MONO_PATH_NOT_ALLOWED: {json}"
+    );
+}
+
+fn fu06_create(case: &EntryCase, path: &str, name: &str, is_directory: bool) -> (u16, Value) {
+    let mut body = serde_json::json!({
+        "is_directory": is_directory,
+        "name": name,
+        "path": path,
+        "author_username": LB02_AUTHOR,
+        "skip_build": true
+    });
+    if !is_directory {
+        body["content"] = Value::String("fu06\n".to_string());
+    }
+    case.post("create-entry", Some(&EntryCase::bearer()), body)
+}
+
+fn fu06_oid(case: &EntryCase, path: &str, name: &str) -> String {
+    case.tree_oids(path)
+        .into_iter()
+        .find(|(item, _)| item == name)
+        .unwrap_or_else(|| panic!("{name} under {path}"))
+        .1
+}
+
+#[test]
+fn create_entry_fresh_stack_without_clone() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    assert_eq!(fu06_main_rows_under(case.db_url(), "/project"), 0);
+    let project_tree = fu06_oid(&case, "/", "project");
+    let json = case.create_entry(Some(&EntryCase::bearer()), "fu06-fresh.txt", false);
+    let commit = json["data"]["commit_id"].as_str().expect("commit_id");
+    assert_eq!(path_tip(case.db_url(), "/project"), commit);
+
+    // The landed tip continues the materialized /project history.
+    let url = fu03_repo_url(case.port, "/project");
+    host_git_ok(
+        &case.env.case_dir,
+        PUSH_TOKEN,
+        &["clone", &url, "fu06-fresh"],
+    );
+    let git = |args: &[&str]| {
+        let mut all = vec!["-C", "fu06-fresh"];
+        all.extend_from_slice(args);
+        host_git_stdout(&case.env.case_dir, PUSH_TOKEN, &all)
+    };
+    assert_eq!(git(&["rev-parse", "HEAD"]), commit);
+    assert_eq!(git(&["rev-parse", "HEAD^^{tree}"]), project_tree);
+    assert_eq!(
+        git(&["rev-list", "--count", "HEAD"]),
+        "2",
+        "materialized commit is the only ancestor"
+    );
+    assert!(git(&["ls-tree", "--name-only", "HEAD"]).contains("fu06-fresh.txt"));
+    case.finish();
+}
+
+#[test]
+fn fresh_stack_concurrent_writes() {
+    // Two fresh-stack writes under different first-level roots race through
+    // the fallback (classify + materialize + queued landing on the shared
+    // root). Same-path concurrency is bounded by ADR-TP-10 (`DEFER-FU-12`).
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| fu06_create(&case, "/project", "fu06-a", true));
+        let b = scope.spawn(|| fu06_create(&case, "/doc", "fu06-b", true));
+        for handle in [a, b] {
+            let (status, json) = handle.join().expect("writer thread");
+            assert_eq!(
+                status, 200,
+                "concurrent fresh-stack write must land: {json}"
+            );
+        }
+    });
+    assert!(case.tree_names("/project").iter().any(|n| n == "fu06-a"));
+    assert!(case.tree_names("/doc").iter().any(|n| n == "fu06-b"));
+    for root in ["/project", "/doc"] {
+        assert_eq!(fu06_main_rows_under(case.db_url(), root), 1, "{root}");
+    }
+    case.finish();
+}
+
+#[test]
+fn api_write_outside_roots_path_policy() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    let root_before = path_tip(case.db_url(), "/");
+    for (path, name, what) in [
+        ("/", "fu06-top", "new top-level directory under /"),
+        ("/fu06-vendor", "lib", "path outside the roots"),
+        ("/", "fu06\\top", "top-level name with a backslash"),
+        (
+            "/.cedar",
+            "fu06.txt",
+            "existing top-level entry outside root_dirs",
+        ),
+    ] {
+        let (status, json) = fu06_create(&case, path, name, path == "/");
+        fu06_assert_not_allowed(status, &json, what);
+        // The error names the path the user wrote, not the landing directory.
+        let written = if path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{path}/{name}")
+        };
+        assert!(
+            err_message(&json).contains(&format!("{written:?}")),
+            "{what}: {json}"
+        );
+    }
+    assert_eq!(path_tip(case.db_url(), "/"), root_before);
+    // A move across two roots would land on `/`, where product writes never land.
+    case.seed();
+    case.create_dir_at(Some(&EntryCase::bearer()), "/project", "fu06-cross");
+    let (status, json) = case.move_entry(
+        Some(&EntryCase::bearer()),
+        "/project",
+        "fu06-cross",
+        "/doc",
+        "fu06-cross",
+    );
+    fu06_assert_not_allowed(status, &json, "move across two roots");
+    let root_before = path_tip(case.db_url(), "/");
+    let (status, json) = fu06_create(&case, "/", "fu06-top2", true);
+    fu06_assert_not_allowed(status, &json, "new top-level directory after seeding");
+    assert_eq!(path_tip(case.db_url(), "/"), root_before);
+    assert_eq!(fu06_main_rows_under(case.db_url(), "/fu06-vendor"), 0);
+    case.finish();
+}
+
+#[test]
+fn api_write_custom_root_dirs() {
+    let case = EntryCase::boot(
+        ApiWriteEnv::with_token_config_paths(None)
+            .with_env("MEGA_MONOREPO__ROOT_DIRS", "apps,third-party"),
+    );
+    let (status, json) = fu06_create(&case, "/apps", "fu06-web", true);
+    assert_eq!(status, 200, "custom root write must land: {json}");
+    assert!(case.tree_names("/apps").iter().any(|n| n == "fu06-web"));
+    // /project is not a root in this configuration (and was never created).
+    let (status, json) = fu06_create(&case, "/project", "fu06-x", true);
+    fu06_assert_not_allowed(status, &json, "/project outside custom roots");
+    case.finish();
+}
+
+#[test]
+fn api_write_nested_root_fresh_stack() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.create_dir_at(Some(&EntryCase::bearer()), "/project/fu06-a", "b");
+    assert!(case.tree_names("/project/fu06-a").iter().any(|n| n == "b"));
+    assert_eq!(fu06_main_rows_under(case.db_url(), "/project/fu06-a"), 0);
+    assert_eq!(fu06_main_rows_under(case.db_url(), "/project"), 1);
+    case.finish();
+
+    // Nested import_dir: the first-level root /third-party is a strict
+    // ancestor of the import directory and is never materialized (GC-FU-04);
+    // a write below it that has no tip yet needs provisioning first.
+    let nested = EntryCase::boot(
+        ApiWriteEnv::with_token_config_paths(None)
+            .with_env("MEGA_MONOREPO__IMPORT_DIR", "/third-party/vendor"),
+    );
+    let root_before = path_tip(nested.db_url(), "/");
+    let (status, json) = fu06_create(&nested, "/third-party/tools", "fu06", true);
+    assert_eq!(status, 409, "nested import_dir ancestor: {json}");
+    assert!(
+        err_message(&json).starts_with("MONO_PATH_UNINITIALIZED: \"/third-party/tools/fu06\""),
+        "a directory create names the directory: {json}"
+    );
+    let (status, json) = fu06_create(&nested, "/third-party/tools", "fu06.txt", false);
+    assert_eq!(status, 409, "nested import_dir ancestor (file): {json}");
+    assert!(
+        err_message(&json).starts_with("MONO_PATH_UNINITIALIZED: \"/third-party/tools\""),
+        "a file create names its parent directory: {json}"
+    );
+    let (status, json) = fu06_create(&nested, "/third-party/vendor", "fu06", true);
+    fu06_assert_not_allowed(status, &json, "create under nested import_dir");
+    assert_eq!(fu06_main_rows_under(nested.db_url(), "/third-party"), 0);
+    assert_eq!(path_tip(nested.db_url(), "/"), root_before);
+
+    // With a (legacy) main@/third-party tip, content next to the nested import
+    // dir is writable, but moving it into the import dir is refused by the
+    // destination guard (without it the move would fail later: /third-party/vendor
+    // does not exist in the tree yet).
+    let third_party_tree = fu06_oid(&nested, "/", "third-party");
+    fu06_insert_main_row(
+        nested.db_url(),
+        "/third-party",
+        &root_before,
+        &third_party_tree,
+    );
+    nested.create_dir_at(Some(&EntryCase::bearer()), "/third-party/tools", "a");
+    let tip = path_tip(nested.db_url(), "/third-party");
+    let (status, json) = nested.move_entry(
+        Some(&EntryCase::bearer()),
+        "/third-party/tools",
+        "a",
+        "/third-party/vendor",
+        "a",
+    );
+    fu06_assert_not_allowed(status, &json, "move into a nested import_dir");
+    assert_eq!(path_tip(nested.db_url(), "/third-party"), tip);
+    assert!(
+        nested
+            .tree_names("/third-party/tools")
+            .iter()
+            .any(|n| n == "a")
+    );
+    nested.finish();
+}
+
+#[test]
+fn api_write_import_namespace_guard() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    // (a) Fresh stack: nothing is materialized under the import directory.
+    let (status, json) = fu06_create(&case, "/third-party", "fu06-lib", true);
+    fu06_assert_not_allowed(status, &json, "create under import_dir");
+    assert_eq!(fu06_main_rows_under(case.db_url(), "/third-party"), 0);
+
+    // (b) An imported leaf whose git_repo row is gone (as after cleanup),
+    // under a hand-materialized main@/third-party: without the guard these
+    // writes would land on that tip; with it every one is refused.
+    let repo = format!("fu06-gone-{}", std::process::id());
+    seed_import_repo(&case.env.case_dir, case.port, PUSH_TOKEN, &repo);
+    let live = format!("fu06-live-{}", std::process::id());
+    seed_import_repo(&case.env.case_dir, case.port, PUSH_TOKEN, &live);
+    let leaf = format!("/third-party/{repo}");
+    fu06_drop_git_repo(case.db_url(), &leaf);
+    let root = path_tip(case.db_url(), "/");
+    let third_party_tree = fu06_oid(&case, "/", "third-party");
+    fu06_insert_main_row(case.db_url(), "/third-party", &root, &third_party_tree);
+    case.seed();
+    case.create_dir_at(Some(&EntryCase::bearer()), "/project", "fu06-dir");
+    case.create_entry(Some(&EntryCase::bearer()), "fu06-file.txt", false);
+    let root_before = path_tip(case.db_url(), "/");
+    let bearer = EntryCase::bearer();
+    let auth = Some(bearer.as_str());
+
+    let (status, json) = fu06_create(&case, &leaf, "fu06-new", true);
+    fu06_assert_not_allowed(status, &json, "create inside a detached import leaf");
+    let (status, json) = case.post(
+        "edit/save",
+        auth,
+        serde_json::json!({
+            "path": format!("{leaf}/src/lib.rs"),
+            "content": "// fu06\n",
+            "commit_message": "fu06 edit",
+            "skip_build": true
+        }),
+    );
+    fu06_assert_not_allowed(status, &json, "edit/save inside a detached import leaf");
+    let (status, json) = case.delete_entry(auth, "/third-party", &repo);
+    fu06_assert_not_allowed(status, &json, "delete a detached import leaf");
+    let (status, json) =
+        case.move_entry(auth, "/third-party", &repo, "/third-party", "fu06-renamed");
+    fu06_assert_not_allowed(status, &json, "rename inside import_dir");
+    // A live mounted leaf addressed from its parent is refused the same way
+    // (only paths inside a live ImportRepo are dispatched to ImportApiService).
+    let (status, json) = case.delete_entry(auth, "/third-party", &live);
+    fu06_assert_not_allowed(status, &json, "delete a live import leaf from its parent");
+    let (status, json) = case.move_entry(
+        auth,
+        "/third-party",
+        &live,
+        "/third-party",
+        "fu06-live-renamed",
+    );
+    fu06_assert_not_allowed(status, &json, "rename a live import leaf from its parent");
+
+    // (c) Moving monorepo content into the import namespace is refused too.
+    let (status, json) = case.move_entry(auth, "/project", "fu06-dir", "/third-party", "x");
+    fu06_assert_not_allowed(status, &json, "move directory into import_dir");
+    let (status, json) = case.move_entry_as(
+        auth,
+        "/project",
+        "fu06-file.txt",
+        "/third-party",
+        "x",
+        false,
+    );
+    fu06_assert_not_allowed(status, &json, "move file into import_dir");
+
+    assert_eq!(
+        path_tip(case.db_url(), "/"),
+        root_before,
+        "root must not move"
+    );
+    assert_eq!(path_tip(case.db_url(), "/third-party"), root);
+    assert_eq!(fu06_oid(&case, "/", "third-party"), third_party_tree);
+    let names = case.tree_names("/project");
+    for name in ["fu06-dir", "fu06-file.txt"] {
+        assert!(names.iter().any(|n| n == name), "{name} kept in {names:?}");
+    }
+    let imported = case.tree_names("/third-party");
+    assert!(
+        imported.contains(&repo) && imported.contains(&live),
+        "{imported:?}"
+    );
+    assert!(!imported.iter().any(|n| n == "x" || n == "fu06-renamed"));
+    case.finish();
+}
+
+#[test]
+fn import_attach_after_import_dir_api_write() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    let (status, json) = fu06_create(&case, "/third-party", "fu06-lib", true);
+    fu06_assert_not_allowed(status, &json, "create under import_dir");
+    let repo = format!("fu06-import-{}", std::process::id());
+    seed_import_repo(&case.env.case_dir, case.port, PUSH_TOKEN, &repo);
+    assert!(
+        case.tree_names("/third-party").contains(&repo),
+        "new ImportRepo must attach after the refused API write"
+    );
+    case.finish();
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-07: `POST /api/v1/path/provision` — idempotent `mkdir -p`
+// through MonoWriteQueue, authorized by the highest component it creates
+// (ADR-FU-05).
+// ---------------------------------------------------------------------------
+
+const FU07_NARROW_TOKEN: &str = "fu07-narrow-token";
+const FU07_WIDE_TOKEN: &str = "fu07-wide-token";
+
+fn fu07_provision(case: &EntryCase, auth: Option<&str>, path: &str) -> (u16, Value) {
+    case.post("path/provision", auth, serde_json::json!({ "path": path }))
+}
+
+fn fu07_expect(json: &Value, path: &str, created: bool) -> Option<String> {
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    let data = &json["data"];
+    assert_eq!(data["path"], Value::String(path.to_owned()), "{json}");
+    assert_eq!(data["created"], Value::Bool(created), "{json}");
+    let commit = data["commit_id"].as_str().map(str::to_owned);
+    assert_eq!(commit.is_some(), created, "{json}");
+    commit
+}
+
+#[test]
+fn path_provision_creates_missing_levels() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let (status, json) = fu07_provision(&case, Some(&EntryCase::bearer()), "/project/fu07/a/b");
+    assert_eq!(status, 200, "{json}");
+    let commit = fu07_expect(&json, "/project/fu07/a/b", true).expect("commit");
+    assert_eq!(path_tip(case.db_url(), "/project"), commit);
+    assert_eq!(case.tree_names("/project/fu07/a/b"), [".gitkeep"]);
+
+    let url = fu03_repo_url(case.port, "/project");
+    host_git_ok(
+        &case.env.case_dir,
+        PUSH_TOKEN,
+        &["clone", &url, "fu07-clone"],
+    );
+    let git = |args: &[&str]| {
+        let mut all = vec!["-C", "fu07-clone"];
+        all.extend_from_slice(args);
+        host_git_stdout(&case.env.case_dir, PUSH_TOKEN, &all)
+    };
+    assert_eq!(git(&["rev-list", "--count", "HEAD"]), "2", "one commit");
+    assert_eq!(
+        git(&["log", "--format=%s", "-1"]),
+        "provision /project/fu07/a/b"
+    );
+    assert_eq!(git(&["ls-files", "fu07"]), "fu07/a/b/.gitkeep");
+
+    // Component names that repeat or are substrings of their parents.
+    for path in [
+        "/project/pro/x",
+        "/project/fu07/fu07/x",
+        "/project/c/project/c",
+    ] {
+        let (status, json) = fu07_provision(&case, Some(&EntryCase::bearer()), path);
+        assert_eq!(status, 200, "{path}: {json}");
+        fu07_expect(&json, path, true);
+        assert_eq!(case.tree_names(path), [".gitkeep"], "{path}");
+    }
+    case.finish();
+}
+
+#[test]
+fn path_provision_is_idempotent() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let bearer = EntryCase::bearer();
+    let (status, json) = fu07_provision(&case, Some(&bearer), "/project/fu07-idem");
+    assert_eq!(status, 200, "{json}");
+    let commit = fu07_expect(&json, "/project/fu07-idem", true).expect("commit");
+    for path in ["/project/fu07-idem", "/project"] {
+        let (status, json) = fu07_provision(&case, Some(&bearer), path);
+        assert_eq!(status, 200, "{json}");
+        fu07_expect(&json, path, false);
+    }
+    assert_eq!(path_tip(case.db_url(), "/project"), commit, "no write");
+    case.finish();
+}
+
+#[test]
+fn path_provision_rejects_policy_violations() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    let bearer = EntryCase::bearer();
+    let root_before = path_tip(case.db_url(), "/");
+    for (path, code) in [
+        ("/fu07-vendor/x", "MONO_PATH_NOT_ALLOWED"),
+        ("/third-party", "MONO_PATH_NOT_ALLOWED"),
+        ("/third-party/x", "MONO_PATH_NOT_ALLOWED"),
+        ("/", "MONO_PATH_INVALID"),
+        ("project/x", "MONO_PATH_INVALID"),
+        ("/project//x", "MONO_PATH_INVALID"),
+        ("/project/x/", "MONO_PATH_INVALID"),
+        ("/project/./x", "MONO_PATH_INVALID"),
+        ("/project/../x", "MONO_PATH_INVALID"),
+        ("/project/x\\y", "MONO_PATH_INVALID"),
+        ("/project/a\nb", "MONO_PATH_INVALID"),
+        ("/project/a\tb", "MONO_PATH_INVALID"),
+    ] {
+        let (status, json) = fu07_provision(&case, Some(&bearer), path);
+        assert_eq!(status, 400, "{path}: {json}");
+        assert!(
+            err_message(&json).starts_with(&format!("{code}: ")),
+            "{path}: {json}"
+        );
+    }
+    assert_eq!(path_tip(case.db_url(), "/"), root_before);
+    assert_eq!(fu06_main_rows_under(case.db_url(), "/third-party"), 0);
+    assert_eq!(fu06_main_rows_under(case.db_url(), "/fu07-vendor"), 0);
+    case.finish();
+
+    let custom = EntryCase::boot(
+        ApiWriteEnv::with_token_config_paths(None)
+            .with_env("MEGA_MONOREPO__ROOT_DIRS", "apps,third-party"),
+    );
+    let (status, json) = fu07_provision(&custom, Some(&bearer), "/apps/fu07");
+    assert_eq!(status, 200, "{json}");
+    fu07_expect(&json, "/apps/fu07", true);
+    let (status, json) = fu07_provision(&custom, Some(&bearer), "/project/fu07");
+    assert_eq!(status, 400, "{json}");
+    assert!(
+        err_message(&json).starts_with("MONO_PATH_NOT_ALLOWED: "),
+        "{json}"
+    );
+    custom.finish();
+
+    // A coded 409 stays a 409 even when the path spells a retryable queue
+    // text (nested import_dir ancestors are never materialized).
+    let nested = EntryCase::boot(
+        ApiWriteEnv::with_token_config_paths(None)
+            .with_env("MEGA_MONOREPO__IMPORT_DIR", "/third-party/vendor"),
+    );
+    let (status, json) = fu07_provision(
+        &nested,
+        Some(&bearer),
+        "/third-party/non-fast-forward: new_id does not match current tip",
+    );
+    assert_eq!(status, 409, "{json}");
+    assert!(
+        err_message(&json).starts_with("MONO_PATH_UNINITIALIZED: "),
+        "{json}"
+    );
+    nested.finish();
+}
+
+#[test]
+fn path_provision_conflict_on_file_component() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.create_entry(Some(&EntryCase::bearer()), "fu07.txt", false);
+    let tip = path_tip(case.db_url(), "/project");
+    let (status, json) = fu07_provision(&case, Some(&EntryCase::bearer()), "/project/fu07.txt/sub");
+    assert_eq!(status, 409, "{json}");
+    assert!(
+        err_message(&json)
+            .starts_with("MONO_PATH_CONFLICT: \"/project/fu07.txt/sub\": \"/project/fu07.txt\""),
+        "{json}"
+    );
+    assert_eq!(path_tip(case.db_url(), "/project"), tip);
+    case.finish();
+}
+
+#[test]
+fn path_provision_token_scope() {
+    let env = ApiWriteEnv::with_git_append(
+        "trunk",
+        &format!(
+            r#"
+[git]
+anonymous_access = true
+push_auth = "token"
+ssh_receive_pack = false
+[[git.push_tokens]]
+name = "fu07-narrow"
+token = "{FU07_NARROW_TOKEN}"
+paths = ["/project/team/x"]
+[[git.push_tokens]]
+name = "fu07-wide"
+token = "{FU07_WIDE_TOKEN}"
+paths = ["/project/team"]
+"#
+        ),
+    );
+    let case = EntryCase::boot(env);
+    let narrow = format!("Bearer {FU07_NARROW_TOKEN}");
+    let wide = format!("Bearer {FU07_WIDE_TOKEN}");
+    let root_before = path_tip(case.db_url(), "/");
+
+    let (status, json) = fu07_provision(&case, None, "/project/team/x");
+    assert_eq!(status, 401, "{json}");
+    // The narrow token covers the target but not the container it would
+    // create (the highest new component, /project/team).
+    let (status, json) = fu07_provision(&case, Some(&narrow), "/project/team/x");
+    assert_eq!(status, 403, "{json}");
+    let (status, json) = fu07_provision(&case, Some(&narrow), "/project/other");
+    assert_eq!(status, 403, "{json}");
+    assert_eq!(path_tip(case.db_url(), "/"), root_before, "no write yet");
+
+    let (status, json) = fu07_provision(&case, Some(&wide), "/project/team");
+    assert_eq!(status, 200, "{json}");
+    fu07_expect(&json, "/project/team", true);
+    // Now the highest new component is the target itself.
+    let (status, json) = fu07_provision(&case, Some(&narrow), "/project/team/x");
+    assert_eq!(status, 200, "{json}");
+    fu07_expect(&json, "/project/team/x", true);
+    let (status, json) = fu07_provision(&case, Some(&narrow), "/project/team/x");
+    assert_eq!(status, 200, "{json}");
+    fu07_expect(&json, "/project/team/x", false);
+    case.finish();
+}
+
+#[test]
+fn path_provision_concurrent_same_path() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let bearer = EntryCase::bearer();
+    let start = std::sync::Barrier::new(2);
+    let results: Vec<(u16, Value)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    start.wait();
+                    fu07_provision(&case, Some(&bearer), "/project/fu07-race")
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("provision thread"))
+            .collect()
+    });
+    let mut created = 0;
+    for (status, json) in &results {
+        assert_eq!(*status, 200, "{json}");
+        if json["data"]["created"] == Value::Bool(true) {
+            created += 1;
+        }
+    }
+    assert_eq!(
+        created, 1,
+        "exactly one request creates the path: {results:?}"
+    );
+    assert_eq!(case.tree_names("/project/fu07-race"), [".gitkeep"]);
+    case.finish();
+}
+
+#[test]
+fn path_provision_openapi() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let (status, doc) = case.exchange(
+        case.client
+            .get(format!("http://127.0.0.1:{}/api/openapi.json", case.port)),
+        None,
+        "GET /api/openapi.json",
+    );
+    assert_eq!(status, 200, "GET /api/openapi.json");
+    let responses = doc["paths"]["/api/v1/path/provision"]["post"]["responses"]
+        .as_object()
+        .expect("path/provision POST responses");
+    for code in ["200", "400", "401", "403", "409"] {
+        assert!(responses.contains_key(code), "{code}: {responses:?}");
+    }
     case.finish();
 }

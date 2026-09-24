@@ -10,15 +10,19 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::CODE_PREVIEW, api_write_auth::authorize_trunk_api_write},
-    ceres::model::{
-        blame::{BlameQuery, BlameRequest, BlameResult},
-        change_list::DiffItemSchema,
-        git::{
-            BlobContentQuery, CodePreviewQuery, CreateEntryInfo, CreateEntryResult,
-            DeleteEntryInfo, DeleteEntryResult, DiffPreviewPayload, EditFilePayload,
-            EditFileResult, FileTreeItem, MoveEntryInfo, MoveEntryResult, TreeCommitItem,
-            TreeHashItem, TreeResponse,
+    ceres::{
+        api_service::mono_api_service::run_path_provision,
+        model::{
+            blame::{BlameQuery, BlameRequest, BlameResult},
+            change_list::DiffItemSchema,
+            git::{
+                BlobContentQuery, CodePreviewQuery, CreateEntryInfo, CreateEntryResult,
+                DeleteEntryInfo, DeleteEntryResult, DiffPreviewPayload, EditFilePayload,
+                EditFileResult, FileTreeItem, MoveEntryInfo, MoveEntryResult, PathProvisionRequest,
+                PathProvisionResult, TreeCommitItem, TreeHashItem, TreeResponse,
+            },
         },
+        pack::path_policy::strict_creation_path_input,
     },
     common::errors::ApiError,
     config::PushPolicy,
@@ -60,6 +64,12 @@ pub fn write_routers() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(delete_entry))
         .routes(routes!(move_entry))
         .routes(routes!(save_edit))
+}
+
+/// Storage-only write routes that the review morphology does not mount
+/// (plan-20260923 ADR-FU-05).
+pub fn storage_only_write_routers() -> OpenApiRouter<MonoApiServiceState> {
+    OpenApiRouter::new().routes(routes!(provision_path))
 }
 
 /// GET-only code preview used by the storage-only HTTP surface (TP-20).
@@ -121,6 +131,38 @@ async fn create_entry(
         .await?;
 
     upsert_commit_binding(&state, &result.commit_id, json.author_username.as_deref()).await?;
+    Ok(Json(CommonResult::success(Some(result))))
+}
+
+/// Provision a monorepo path: create it and any missing parent directories in
+/// one commit (`mkdir -p`), idempotently (plan-20260923 ADR-FU-05). The token
+/// must cover the highest component the request creates (the target itself
+/// when nothing is missing).
+#[utoipa::path(
+    post,
+    path = "/path/provision",
+    request_body = PathProvisionRequest,
+    responses(
+        (status = 200, body = CommonResult<PathProvisionResult>, content_type = "application/json"),
+        (status = 400, description = "MONO_PATH_NOT_ALLOWED or MONO_PATH_INVALID", body = CommonResult<String>, content_type = "application/json"),
+        (status = 401, description = "missing or invalid push token", body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "token does not cover the highest new component", body = CommonResult<String>, content_type = "application/json"),
+        (status = 409, description = "MONO_PATH_CONFLICT or MONO_PATH_UNINITIALIZED", body = CommonResult<String>, content_type = "application/json")
+    ),
+    tag = CODE_PREVIEW
+)]
+async fn provision_path(
+    state: State<MonoApiServiceState>,
+    headers: HeaderMap,
+    Json(request): Json<PathProvisionRequest>,
+) -> Result<Json<CommonResult<PathProvisionResult>>, ApiError> {
+    let path = strict_creation_path_input(&request.path)?;
+    let config = state.storage.config();
+    let service = state.monorepo();
+    let result = run_path_provision(&service, &path, |scope: &str| {
+        authorize_trunk_api_write(&config.git, &headers, scope).map(Some)
+    })
+    .await?;
     Ok(Json(CommonResult::success(Some(result))))
 }
 
@@ -535,6 +577,19 @@ mod tests {
             paths.iter().all(|p| !p.contains("preview")),
             "write_routers must omit preview_diff: {paths:?}"
         );
+    }
+
+    /// plan-20260923 ADR-FU-05: provisioning is mounted on the storage-only
+    /// surface only, never on the review morphology.
+    #[test]
+    fn path_provision_is_storage_only() {
+        let provision = |paths: &[String]| paths.iter().any(|p| p.ends_with("/path/provision"));
+        assert!(provision(&path_list(storage_only_write_routers())));
+        assert!(provision(&path_list(
+            crate::api::api_router::storage_only_routers()
+        )));
+        assert!(!provision(&path_list(routers())));
+        assert!(!provision(&path_list(crate::api::api_router::routers())));
     }
 
     #[test]

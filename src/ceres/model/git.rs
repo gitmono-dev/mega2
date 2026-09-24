@@ -246,6 +246,25 @@ pub struct CreateEntryResult {
     pub cl_link: Option<String>,
 }
 
+/// Request body for `POST /path/provision` (plan-20260923 ADR-FU-05):
+/// create `path` and any missing parent directories (`mkdir -p`).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct PathProvisionRequest {
+    /// Canonical absolute monorepo path, e.g. `/project/workbuddy/demo`.
+    pub path: String,
+}
+
+/// Response body of `POST /path/provision`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PathProvisionResult {
+    /// The provisioned path (canonical).
+    pub path: String,
+    /// `false` when the path already was a directory (nothing written).
+    pub created: bool,
+    /// Landed commit when `created`, otherwise `null`.
+    pub commit_id: Option<String>,
+}
+
 /// Request body for `POST /delete-entry` (plan-20260917 ADR-LB-03,
 /// plan-20260918 ADR-FT-01): parent `path` plus `name`; `is_directory`
 /// defaults to directory so existing directory clients omit the field.

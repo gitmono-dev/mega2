@@ -3,7 +3,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
-use super::{BuckError, MegaError};
+use super::{BuckError, MegaError, PathPolicyError};
 use crate::contract::api::common::CommonResult;
 
 /// Parse [code:xxx] format from error message.
@@ -41,6 +41,9 @@ fn parse_error_code(err_str: &str) -> Option<(&str, &str)> {
 pub struct ApiError {
     inner: anyhow::Error,
     status: StatusCode,
+    /// The message is a stable contract (e.g. `PathPolicyError`): send it as
+    /// is instead of stripping a `[code:…]` marker it may contain.
+    verbatim: bool,
 }
 
 impl ApiError {
@@ -49,6 +52,7 @@ impl ApiError {
         Self {
             inner: err.into(),
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            verbatim: false,
         }
     }
 
@@ -57,6 +61,7 @@ impl ApiError {
         Self {
             inner: err.into(),
             status,
+            verbatim: false,
         }
     }
 
@@ -82,7 +87,9 @@ impl IntoResponse for ApiError {
         let err_str = self.inner.to_string();
 
         // Remove [code:xxx] prefix from error message for cleaner display
-        let err_msg = if let Some((_, msg)) = parse_error_code(&err_str) {
+        let err_msg = if self.verbatim {
+            err_str
+        } else if let Some((_, msg)) = parse_error_code(&err_str) {
             msg.to_string()
         } else {
             err_str
@@ -117,6 +124,22 @@ where
 {
     fn from(err: E) -> Self {
         let anyhow_err = err.into();
+
+        // Path policy errors carry a stable `<CODE>: …` text, bare or wrapped.
+        let policy_status = anyhow_err
+            .downcast_ref::<PathPolicyError>()
+            .or_else(|| match anyhow_err.downcast_ref::<MegaError>() {
+                Some(MegaError::PathPolicy(policy)) => Some(policy),
+                _ => None,
+            })
+            .map(PathPolicyError::http_status);
+        if let Some(status) = policy_status {
+            return ApiError {
+                inner: anyhow_err,
+                status,
+                verbatim: true,
+            };
+        }
 
         // Try typed matching first: check if error is MegaError
         // Use downcast_ref (borrowing) instead of downcast (ownership) to preserve error context

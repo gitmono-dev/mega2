@@ -14,7 +14,7 @@
 
 ```text
 src/common/errors/
-├── mod.rs      # MegaError、MegaResult、BuckError、ProtocolError、GitLFSError、DiffParseError
+├── mod.rs      # MegaError、MegaResult、BuckError、PathPolicyError、ProtocolError、GitLFSError、DiffParseError
 ├── api.rs      # ApiError、map_ceres_error
 ├── policy.rs   # ContextError、SaturnContextError
 └── vault.rs    # VaultError、VaultResult（本仓定义）+ RvError（重导出 libvault::errors::RvError）
@@ -25,7 +25,7 @@ src/common/errors/
 ```rust
 use crate::common::errors::{
     ApiError, BuckError, ContextError, DiffParseError, GitLFSError, MegaError, MegaResult,
-    ProtocolError, RvError, SaturnContextError, VaultError, VaultResult,
+    PathPolicyError, ProtocolError, RvError, SaturnContextError, VaultError, VaultResult,
 };
 ```
 
@@ -42,6 +42,7 @@ use crate::common::errors::{
 | `ContextError` | Cedar policy context 构建、schema、policy、validation 和 JSON 错误。 | `src/contract/policy/context.rs` |
 | `SaturnContextError` | Cedar 授权请求构造和授权拒绝错误。 | `src/contract/policy/context.rs` |
 | `BuckError` | Buck session/upload 业务错误，作为 `MegaError::Buck` 被 `ApiError` 映射为精确 HTTP status。 | Buck service/router |
+| `PathPolicyError` | Monorepo 路径创建 / 写入策略错误（稳定码 `MONO_PATH_*`），裸用或经 `MegaError::PathPolicy` 包装，由 `ApiError` 映射为 400/409 并原样输出文本。 | `ceres::pack::path_policy`；产品写、路径开通、receive-pack（plan-20260923 FU-06 / FU-07 / FU-10） |
 | `GitLFSError` | Git LFS 处理错误。 | LFS router/handler |
 | `DiffParseError` | Code review re-anchor 统一 diff 解析错误。 | `src/jupiter/utils/code_review_reanchor.rs` |
 
@@ -106,6 +107,21 @@ use crate::common::errors::{ApiError, MegaError, RvError};
 - **404 = 未知 `link`**：`MegaError::NotFound` 经 `ApiError` 的 typed matching 映射（处理器先查 CL 行确立存在性，再读清单——裸透传 `get_cl_commits` 的空列表会把未知 link 与无数据 CL 混淆）。
 - **200 + 空列表 = CL 存在但无清单数据**（存量 CL 无回填，`mega_cl_commits` 无行）。
 - **403 = 授权拒绝**：OpenAPI 中声明；Cedar guard 映射（`guarded_endpoints.json` 登记 `GET /cl/{link}/commits`）随 MC-07 落地，经 REL-MC-01（MC-08）与该端点同时发布——在那之前该路径按 UN-23 口径处于「未登记即 unprotected」的中间态，这正是家族原子发布的原因。
+
+## PathPolicyError：Monorepo 路径策略（plan-20260923）
+
+`PathPolicyError`（`src/common/errors/mod.rs`）是路径「创建 / 写入」策略的领域错误，经 `MegaError::PathPolicy(#[from])` 包装；包装层用 `#[error("{0}")]`，文本原样透出，没有 `Other error:` 前缀。`NotAllowed` 与 `Invalid` 由 `ceres::pack::path_policy` 判定：创建分类走唯一的分类函数 `classify_creation_path`，产品写的 ImportRepo 命名空间守卫走 `check_write_operands`（ADR-FU-06）（规则见 [`plan/plan-20260923.md`](./plan/plan-20260923.md) ADR-FU-04；同模块的 `in_import_namespace`、`is_import_dir_ancestor`、`not_allowed` 供调用方复用，不得复制判断）；`Uninitialized` 与 `Conflict` 由调用方按树状态产生。客户端 JSON 路径入口先经 `strict_creation_path_input`（拒绝 NUL、`\`，要求原始输入已是规范路径）。
+
+| 变体 | 码 | HTTP（`ApiError`） | 含义 |
+|---|---|---|---|
+| `NotAllowed { path, allowed_roots, import_dir }` | `MONO_PATH_NOT_ALLOWED` | 400 | 目标路径不在任何 `root_dirs` 之下，或位于 `import_dir` 之下（import 优先：ImportRepo 由推送创建） |
+| `Uninitialized { path }` | `MONO_PATH_UNINITIALIZED` | 409 | 合法根下的路径尚未开通；消息点名 `mega2 path provision --server <url> <path>` 与 `POST /api/v1/path/provision` |
+| `Invalid { path, reason }` | `MONO_PATH_INVALID` | 400 | 路径非规范（相对、`.` / `..` 段、重复或尾斜杠）、含 NUL / `\` / 其它控制字符（JSON 严格入口），或为根 `/`（分类原语的判定；产品写落点为 `/` 时按 `NotAllowed` 返回，见 ADR-FU-06） |
+| `Conflict { path, component }` | `MONO_PATH_CONFLICT` | 409 | 路径上的某个组件已存在且不是目录 |
+
+文本格式（Git 面与 API 面同一文本）：`Display` = `"<CODE>: <人读消息>"`，恒为单行——路径以带引号的转义形式出现（`Uninitialized` 开通命令里的路径只转义、不加引号），根名、原因等其余片段中的控制字符（换行、NUL 等）按 `\n` / `\0` 形式转义，保证能放进 Git `ng` 行且无法伪造多行输出。产品写经 `GitError` 返回时，`MegaError::PathPolicy` 转为 `[code:400|409] <文本>`（`PathPolicyError::http_status`），`ApiError` 据此设置状态并剥去标记；裸 `PathPolicyError` 与 `MegaError::PathPolicy` 则按类型映射且原样输出（不再从文本中解析 `[code:…]`，路径里出现该字样也不会截断消息）。三条通道的 `err_message` 都是原文。Git report-status 的 `ng` 行与 API `err_message` 都携带这段原文，客户端可按冒号前的码分支；码是公开契约，改名需 minor 版本并更新本节。`NotAllowed` 只列出允许的根（`/<name>`，排序）与 ImportRepo 目录，任何变体都不包含配置文件路径、`base_dir`、数据库 / Redis / 对象存储地址或凭据。
+
+入口：产品写（create / edit-save / delete / move，FU-06）、路径开通 API 与 CLI（FU-07、FU-08）、trunk receive-pack 首推（FU-10）。
 
 ## 响应安全
 
