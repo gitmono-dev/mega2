@@ -123,6 +123,10 @@ use crate::common::errors::{ApiError, MegaError, RvError};
 
 入口：产品写（create / edit-save / delete / move，FU-06）、路径开通 API 与 CLI（FU-07、FU-08）、trunk receive-pack 首推（FU-10）。
 
+## MegaError::OrphanChain：孤儿链拒绝（plan-20260923）
+
+`MegaError::OrphanChain`（FU-09，ADR-FU-07）：新分支推送（`old_id` 为零）的第一父链沿 pack 走到无父根时的孤儿拒绝，首推与原样重试返回同一错误。显示文本保持历史措辞 `Other error: Can not init directory under monorepo directory!`，Git `ng` 行不变；类型化只为让调用方（FU-10 的 trunk 首推分类）经 `push_chain::is_orphan_chain_error` 精确识别，不再匹配文本。它不证明历史未被引用（已知 tip 的链走到根时同样返回，见 [`refactoring/trunk-push.md`](./refactoring/trunk-push.md)）。
+
 ## 响应安全
 
 - `ApiError` 只向客户端暴露 4xx 细节。

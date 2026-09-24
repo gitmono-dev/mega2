@@ -18,12 +18,26 @@ use git_internal::internal::object::commit::Commit;
 use crate::{
     callisto::{mega_cl, sea_orm_active_enums::RefTypeEnum},
     ceres::protocol::import_refs::{CommandType, RefCommand},
-    common::{
-        errors::MegaError,
-        utils::{ZERO_ID, is_protocol_zero_id},
-    },
+    common::{errors::MegaError, utils::is_protocol_zero_id},
     jupiter::{storage::mono_storage::MonoStorage, utils::converter::FromMegaModel},
 };
+
+/// The rejection for a new-branch push (`old_id` = zero) whose first-parent
+/// chain reaches a parentless root (plan-20260923 ADR-FU-07). For a new tip
+/// the new commits run down to the root with no known commit in the pack to
+/// fork from; for a known tip the pack's chain reaches a root, which includes
+/// history other refs already reference (such pushes always failed
+/// `validate`). So the error does not prove the history is unreferenced. The
+/// same error is returned on every verbatim retry of the same chain; its text
+/// is the historical first-push wording.
+pub fn orphan_chain_error() -> MegaError {
+    MegaError::OrphanChain
+}
+
+/// Whether `err` is the orphan-chain rejection.
+pub fn is_orphan_chain_error(err: &MegaError) -> bool {
+    matches!(err, MegaError::OrphanChain)
+}
 
 /// Push semantics state for one receive-pack.
 ///
@@ -279,14 +293,13 @@ impl PushChain {
                     // surface the validator must re-check, so rejections stay
                     // sticky (Codex R2 P1-1). It is deliberately *not*
                     // collapsed to `[tip]`: a collapsed increment would let a
-                    // retried chain with a mid-chain violation pass. When the
-                    // walk ends at the parentless root, the root itself is the
-                    // fork baseline.
-                    let fork = match walk_stop {
-                        Some(parent) => Some(parent),
-                        None => path.last().map(|c| c.id.to_string()),
-                    };
-                    (path.clone(), fork)
+                    // retried chain with a mid-chain violation pass. A walk
+                    // that ends at the parentless root has no fork point: for
+                    // a new-branch push that is the orphan rejection, exactly
+                    // as on the first attempt (ADR-FU-07) — using the root as
+                    // the baseline made retries drift to "push chain is
+                    // broken".
+                    (path.clone(), walk_stop)
                 };
                 let base = if !is_protocol_zero_id(&cmd.old_id) {
                     // The ref contract pins the base; the validator's
@@ -296,11 +309,7 @@ impl PushChain {
                     // New-branch push: `base` is the fork point. A missing stop
                     // means a brand-new parentless chain — the historical
                     // orphan rejection.
-                    let fork = fork.ok_or_else(|| {
-                        MegaError::Other(
-                            "Can not init directory under monorepo directory!".to_string(),
-                        )
-                    })?;
+                    let fork = fork.ok_or_else(orphan_chain_error)?;
                     // The fork point anchors the CL `from_hash` and its tree
                     // drives the aggregate diff — it must be server-known.
                     // (`old_id`-bearing updates get the same guarantee from
@@ -329,7 +338,9 @@ impl PushChain {
     /// Used when the pack is empty or carries only already-known objects so
     /// [`Self::resolve`] would return [`PushChainResolution::Noop`]. `n` is
     /// the resulting increment length (`ordered_commits.len()`), or `0` when
-    /// `old_id == new_id`. Server-knownness does not change `n`.
+    /// `old_id == new_id`. Server-knownness does not change `n`. A zero
+    /// `old_id` whose walk reaches a parentless root returns
+    /// [`MegaError::OrphanChain`].
     pub async fn from_known_tip(
         cmd: &RefCommand,
         tip: Commit,
@@ -361,7 +372,9 @@ impl PushChain {
             }
             let Some(parent_id) = current.parent_commit_ids.first().map(ToString::to_string) else {
                 if is_protocol_zero_id(&cmd.old_id) {
-                    break;
+                    // ADR-FU-07: a new-branch chain down to a parentless
+                    // root is an orphan, known tip or not.
+                    return Err(orphan_chain_error());
                 }
                 return Err(MegaError::Other(format!(
                     "push chain from {} never reached old_id {}; fetch and rebase onto the advertised tip",
@@ -384,15 +397,10 @@ impl PushChain {
             path.push(current.clone());
         }
 
-        let base = if !is_protocol_zero_id(&cmd.old_id) {
-            cmd.old_id.clone()
-        } else {
-            path.last()
-                .and_then(|c| c.parent_commit_ids.first().map(ToString::to_string))
-                .unwrap_or_else(|| ZERO_ID.to_string())
-        };
+        // A zero `old_id` never matches a parent, so the walk above only
+        // leaves the loop at `old_id`.
         Ok(PushChain {
-            base,
+            base: cmd.old_id.clone(),
             tip,
             ordered_commits: path,
         })
@@ -592,7 +600,10 @@ mod tests {
     use sea_orm::{EntityTrait, Set};
     use tempfile::TempDir;
 
-    use super::{PushChain, PushChainResolution, attribution_commit_id, primary_branch_command};
+    use super::{
+        PushChain, PushChainResolution, attribution_commit_id, is_orphan_chain_error,
+        primary_branch_command,
+    };
     use crate::{
         callisto::{mega_cl, mega_commit, sea_orm_active_enums::MergeStatusEnum},
         ceres::{merge_checker::MAX_CL_CHAIN_COMMITS, protocol::import_refs::RefCommand},
@@ -1133,6 +1144,88 @@ mod tests {
             err.to_string()
                 .contains("Can not init directory under monorepo directory")
         );
+    }
+
+    /// ADR-FU-07: a retried orphan push re-carries the same, now-known
+    /// commits; the rejection must not drift to "push chain is broken".
+    #[tokio::test]
+    async fn orphan_rejection_is_sticky_for_known_tip() {
+        let (_temp, storage) = setup_storage().await;
+        // Single parentless commit and a three-commit orphan chain.
+        insert_commits(&storage, vec![commit_row(300, &sha(300), &[])]).await;
+        let chain_tip = insert_linear_chain(&storage, 300, 2).await;
+        for (tip_row, pack) in [
+            (commit_row(300, &sha(300), &[]), id_set(&[&sha(300)])),
+            (chain_tip, id_set(&[&sha(300), &sha(301), &sha(302)])),
+        ] {
+            let tip = Commit::from_mega_model(tip_row.clone());
+            let cmd = branch_command(ZERO_ID.to_string(), tip_row.commit_id.clone());
+            let first = PushChain::resolve(
+                &cmd,
+                &pack,
+                &pack.clone(),
+                Some(tip.clone()),
+                &storage.mono_storage(),
+                MAX_CL_CHAIN_COMMITS,
+            )
+            .await
+            .unwrap_err();
+            let retry = PushChain::resolve(
+                &cmd,
+                &pack,
+                &HashSet::new(),
+                Some(tip),
+                &storage.mono_storage(),
+                MAX_CL_CHAIN_COMMITS,
+            )
+            .await
+            .unwrap_err();
+            assert!(is_orphan_chain_error(&first), "{first}");
+            assert!(is_orphan_chain_error(&retry), "{retry}");
+            assert_eq!(first.to_string(), retry.to_string());
+            assert!(
+                !retry.to_string().contains("push chain is broken"),
+                "{retry}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn from_known_tip_zero_old_id_orphan() {
+        let (_temp, storage) = setup_storage().await;
+        insert_commits(&storage, vec![commit_row(400, &sha(400), &[])]).await;
+        let tip_row = insert_linear_chain(&storage, 400, 2).await;
+        let tip = Commit::from_mega_model(tip_row.clone());
+
+        let orphan = PushChain::from_known_tip(
+            &branch_command(ZERO_ID.to_string(), tip_row.commit_id.clone()),
+            tip.clone(),
+            &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
+        )
+        .await
+        .unwrap_err();
+        assert!(is_orphan_chain_error(&orphan), "{orphan}");
+        assert!(
+            matches!(orphan, crate::common::errors::MegaError::OrphanChain),
+            "{orphan}"
+        );
+        assert_eq!(
+            orphan.to_string(),
+            "Other error: Can not init directory under monorepo directory!"
+        );
+
+        // A non-zero old_id on the chain still resolves (unchanged).
+        let chain = PushChain::from_known_tip(
+            &branch_command(sha(400), tip_row.commit_id.clone()),
+            tip,
+            &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(chain.base, sha(400));
+        assert_eq!(chain.ordered_commits.len(), 2);
     }
 
     #[tokio::test]

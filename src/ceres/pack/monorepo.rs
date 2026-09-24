@@ -2081,6 +2081,49 @@ mod tests {
         }
     }
 
+    /// ADR-FU-07 (review morphology): retrying an orphan push re-carries the
+    /// same, now-known commit and gets the first-push text again.
+    #[tokio::test]
+    async fn fu09_review_orphan_retry_text() {
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        let orphan = test_commit("fu09 orphan");
+        let orphan = Commit::new(
+            orphan.author,
+            orphan.committer,
+            orphan.tree_id,
+            vec![],
+            &orphan.message,
+        );
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![orphan.clone()], None)
+            .await
+            .expect("orphan commit");
+        let tip = orphan.id.to_string();
+        let cmd = RefCommand::new(
+            ZERO_ID.to_string(),
+            tip.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let mut texts = Vec::new();
+        for new_ids in [id_set(&[&tip]), HashSet::new()] {
+            let repo = test_monorepo(&storage, vec![cmd.clone()], id_set(&[&tip]), new_ids);
+            let err = repo
+                .validate_incoming_push()
+                .await
+                .expect_err("orphan push");
+            texts.push(err.to_string());
+        }
+        assert_eq!(
+            texts,
+            [
+                "Other error: Can not init directory under monorepo directory!",
+                "Other error: Can not init directory under monorepo directory!"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn tp09_materialize_skips_when_tombstone_path_missing_from_root() {
         let temp = TempDir::new().expect("temp");

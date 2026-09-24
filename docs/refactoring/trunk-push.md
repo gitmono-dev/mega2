@@ -158,6 +158,8 @@
 
 **墓碑优先于创建**：`P` 无行但存在墓碑时，创建语义**不得**生效——直接 INSERT 会让新 tip 与墓碑记录的历史断开（I1 破损）。B0 拒绝这类推送并提示：先经 advertise 从墓碑续接重新物化，`fetch && reset` 对齐后基于续接 tip 正常推送。
 
+**孤儿链拒绝具有黏性**（[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-07，issue #25 E3/E4）：`old_id = ZERO_ID` 的推送，若其第一父链沿 pack 内容走到无父根——新 tip 时途中没有可作 fork 基线的已知 commit；已知 tip 时只要 pack 链走到根即是，哪怕该历史已被其它 ref 引用（例如把另一路径的 clone 原样推到新路径，此前经 `validate` 以 `push chain is broken` 拒绝；因此孤儿拒绝不能证明历史未被引用）——`PushChain::resolve` 返回孤儿拒绝 `Can not init directory under monorepo directory!`；首推失败后对象已入库，原样重试时整条链变为「已知」——此前已知 tip 分支把根当作 fork 基线，重试漂移为 `push chain is broken: base X is not on the first-parent chain of tip X`。现在不论 tip 新旧都返回同一孤儿拒绝（类型化为 `MegaError::OrphanChain`，显示文本仍为 `Other error: Can not init directory under monorepo directory!`；`push_chain::orphan_chain_error` / `is_orphan_chain_error`）；trunk Noop 桥的 `PushChain::from_known_tip` 在 `old_id = ZERO_ID` 走到根时同样返回它。`old_id ≠ ZERO_ID` 的拒绝文案与对齐提示不变。trunk 形态下该拒绝将由 FU-10 映射为路径策略码。
+
 已有行的写入走同一条合成规则——`parent` 取该 ref 自身的旧 tip，`tree` 取该层的新子树——差别仅在新子树从哪里来。两个例外：N = 1 的被推路径（客户端 commit 的 tree 恰好就是该层所需的 tree，无需合成，直接 fast-forward）与被推路径无已物化行的创建语义（上表首行）。祖先方向的合成已经实现（事实校准 10），后代方向是阶段 2 的内容，被推路径的 N > 1 分支是阶段 4 的内容。
 
 **N 的定义**：N = 从 `cmd.new_id` 沿第一父链回溯到 `cmd.old_id`（**客户端声明的基线**）的步长——**只由客户端意图决定，服务端已知性完全不参与**（被拒重试的对象都已持久化，按已知性计数会把 N>1 重试错算成 N=0 而 fast-forward，违反 ADR-TP-12；`fork_base` 作为对象边界单独记录，不混入 N）。N 在 B0 一次算出、随描述符持久化（1.3），重试不重算。N 只决定写入模型的 squash 分流，**不携带落地与否的语义**。

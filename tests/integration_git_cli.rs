@@ -5293,3 +5293,82 @@ fn path_provision_cli_then_two_pushes() {
             .success()
     );
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-09: retrying an orphan push gets the first-push rejection
+// again (ADR-FU-07), instead of drifting to a chain-topology error.
+// ---------------------------------------------------------------------------
+
+/// The `(reason)` of the `! [remote rejected]` line of a failed push.
+fn fu09_rejection_reason(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .find(|line| line.contains("[remote rejected]"))
+        .and_then(|line| line.split_once('(').map(|(_, rest)| rest))
+        .map(|rest| rest.trim_end().trim_end_matches(')').to_owned())
+        .unwrap_or_else(|| panic!("no remote rejection in:\n{stderr}"))
+}
+
+#[test]
+fn orphan_retry_same_rejection() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (mut service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    git_ok_no_auth(case_dir, &["init", "-b", "main", "fu09-orphan"]);
+    configure_git_identity_no_auth(case_dir, "fu09-orphan");
+    fs::write(case_dir.join("fu09-orphan").join("orphan.txt"), "orphan\n").expect("write");
+    git_ok_no_auth(case_dir, &["-C", "fu09-orphan", "add", "orphan.txt"]);
+    git_ok_no_auth(
+        case_dir,
+        &["-C", "fu09-orphan", "commit", "-m", "fu09 orphan"],
+    );
+    let url = trunk_subpath_url(port, "/project/fu09");
+
+    let mut reasons = Vec::new();
+    for attempt in 0..2 {
+        let output = trunk_host_git(
+            case_dir,
+            &[
+                "-C",
+                "fu09-orphan",
+                "push",
+                "--no-thin",
+                &url,
+                "HEAD:refs/heads/main",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "attempt {attempt} must be rejected"
+        );
+        reasons.push(fu09_rejection_reason(&output));
+    }
+    assert_eq!(
+        reasons[0], reasons[1],
+        "retry must repeat the first rejection"
+    );
+    assert!(
+        reasons[0].contains("Can not init directory under monorepo directory!"),
+        "{reasons:?}"
+    );
+    for reason in &reasons {
+        assert!(
+            !reason.contains("is not on the first-parent chain"),
+            "{reason}"
+        );
+        assert!(!reason.contains("push chain is broken"), "{reason}");
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(60))
+            .success(),
+        "shutdown failed\n{}",
+        read_log(&stderr_path)
+    );
+}

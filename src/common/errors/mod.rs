@@ -61,6 +61,15 @@ pub enum MegaError {
     StaleMonorepoRootRef,
     #[error("lazy materialize aborted after concurrent root updates; retry the advertise")]
     MaterializeAborted,
+    /// New-branch push whose first-parent chain, walked through the pack,
+    /// reaches a parentless root (plan-20260923 ADR-FU-07): for a new tip no
+    /// known commit on the way to fork from; for a known tip any chain that
+    /// reaches a root, even history other refs already reference. The
+    /// display keeps the historical text, including the `Other error: `
+    /// prefix it always had, so push rejections read the same as before the
+    /// variant existed.
+    #[error("Other error: Can not init directory under monorepo directory!")]
+    OrphanChain,
     /// Monorepo path creation policy (plan-20260923 ADR-FU-03); the text is
     /// the stable `<CODE>: <message>` shared by Git `ng` lines and the API.
     #[error("{0}")]
