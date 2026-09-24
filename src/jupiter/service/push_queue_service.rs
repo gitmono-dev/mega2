@@ -18,11 +18,13 @@ use crate::{
     common::{
         errors::{ImportRepoError, MegaError},
         utils::{
-            MEGA_BRANCH_NAME, ZERO_ID, commit_body_subject, format_commit_msg, split_commit_message,
+            MEGA_BRANCH_NAME, ZERO_ID, commit_body_subject, format_commit_msg, is_protocol_zero_id,
+            split_commit_message,
         },
     },
     config::{DEFAULT_MAX_PUSH_COMMITS, PushPolicy},
     jupiter::storage::{
+        audit_storage::AuditStorage,
         base_storage::{BaseStorage, StorageConnector},
         blob_path_index::BlobPathIndexMode,
         git_db_storage::GitDbStorage,
@@ -186,6 +188,77 @@ pub(crate) async fn apply_import_branch_commands_in_txn(
         }
     }
     Ok(Ok(()))
+}
+
+/// Where an ImportRepo leaf path stands in a monorepo root tree
+/// (plan-20260923 ADR-FU-08 item 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportLeaf {
+    Absent,
+    GitkeepOnly,
+    Directory,
+    NotDirectory,
+}
+
+async fn import_leaf_in_txn(
+    mono: &MonoStorage,
+    root_tree: &str,
+    path: &str,
+    txn: &DatabaseTransaction,
+) -> Result<ImportLeaf, MegaError> {
+    use git_internal::internal::object::tree::{Tree, TreeItemMode};
+
+    use crate::jupiter::utils::converter::FromMegaModel;
+
+    let missing = |hash: &str| MegaError::Other(format!("tree {hash} not found"));
+    let model = mono
+        .get_tree_by_hash_in_txn(root_tree, txn)
+        .await?
+        .ok_or_else(|| missing(root_tree))?;
+    let mut tree = Tree::from_mega_model(model);
+    for component in path.split('/').filter(|c| !c.is_empty()) {
+        let Some(item) = tree.tree_items.iter().find(|x| x.name == component) else {
+            return Ok(ImportLeaf::Absent);
+        };
+        if item.mode != TreeItemMode::Tree {
+            return Ok(ImportLeaf::NotDirectory);
+        }
+        let hash = item.id.to_string();
+        let next = mono
+            .get_tree_by_hash_in_txn(&hash, txn)
+            .await?
+            .ok_or_else(|| missing(&hash))?;
+        tree = Tree::from_mega_model(next);
+    }
+    Ok(
+        if crate::ceres::api_service::tree_ops::is_gitkeep_only(&tree) {
+            ImportLeaf::GitkeepOnly
+        } else {
+            ImportLeaf::Directory
+        },
+    )
+}
+
+/// Keep exactly one default branch after a batch that deleted the old one
+/// (e.g. Delete of the old default + Create of a replacement without a
+/// precomputed flag).
+async fn ensure_default_branch_in_txn(
+    git_db: &GitDbStorage,
+    repo_id: i64,
+    txn: &DatabaseTransaction,
+) -> Result<(), MegaError> {
+    if !git_db.default_branch_exist_in_txn(repo_id, txn).await?
+        && let Some(first) = git_db
+            .list_branch_refs_in_txn(repo_id, txn)
+            .await?
+            .into_iter()
+            .next()
+    {
+        git_db
+            .set_default_branch_in_txn(repo_id, &first.ref_name, txn)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Context required to execute a claimed `kind=attach` round under B3.
@@ -1347,6 +1420,67 @@ impl PushQueueService {
         }
     }
 
+    /// Refuse an attach round inside its transaction: undo the round's writes
+    /// (SAVEPOINT `b3_kind`) and persist the row `Failed`.
+    async fn b3_attach_fail(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        id: i64,
+        message: String,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+        let updated =
+            PushQueueStorage::mark_failed_if_running_in_txn(&txn, id, "AttachFailure", &message)
+                .await?;
+        if !updated {
+            tracing::error!(id, "B3 attach refusal hit 0 rows");
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+        Ok(ExecuteOutcome::Failed {
+            id,
+            failure: "AttachFailure".into(),
+            message,
+        })
+    }
+
+    /// Update push to a mounted ImportRepo (ADR-FU-08 item 1): branch refs
+    /// only, with CAS; the monorepo root does not move, so the row lands on the
+    /// current root commit.
+    async fn b3_attach_update_refs(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        row: &push_queue::Model,
+        payload: &AttachPayload,
+        git_db: &GitDbStorage,
+        root_commit: &str,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        if let Err(stale) =
+            apply_import_branch_commands_in_txn(git_db, payload.repo_id, &payload.commands, &txn)
+                .await?
+        {
+            return self.b3_attach_fail(txn, row.id, stale.to_string()).await;
+        }
+        ensure_default_branch_in_txn(git_db, payload.repo_id, &txn).await?;
+        let updated =
+            PushQueueStorage::mark_done_if_running_in_txn(&txn, row.id, root_commit).await?;
+        if !updated {
+            txn.rollback().await?;
+            tracing::error!(
+                id = row.id,
+                "B3 attach update Done hit 0 rows after fencing"
+            );
+            return Ok(self.outcome_claim_lost(row.id));
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+        Ok(ExecuteOutcome::Done {
+            id: row.id,
+            landed_commit_id: root_commit.to_owned(),
+            root_cas_writes: 0,
+        })
+    }
+
     async fn terminalize_attach_failure(
         &self,
         id: i64,
@@ -1440,11 +1574,21 @@ impl PushQueueService {
             .ok_or_else(|| MegaError::Other("attach root tree missing".into()))?
             .to_owned();
 
+        // A delete-only batch never touches the mount, so neither the
+        // materialization precheck nor the ownership gate below protects
+        // anything for it (and both would refuse deletes that worked before):
+        // refs only, still inside B3 (GC-FU-03).
+        let delete_only = !payload
+            .commands
+            .iter()
+            .any(|c| c.ref_type == "branch" && !is_protocol_zero_id(&c.new_id));
+
         // Lock-held redo of materialization precheck (intervening writes).
-        if let Err(e) = self
-            .mono_storage
-            .attach_materialization_precheck_in_txn(&repo_path, &txn)
-            .await
+        if !delete_only
+            && let Err(e) = self
+                .mono_storage
+                .attach_materialization_precheck_in_txn(&repo_path, &txn)
+                .await
         {
             let msg = e.to_string();
             let updated = PushQueueStorage::mark_failed_if_running_in_txn(
@@ -1473,6 +1617,53 @@ impl PushQueueService {
         let path = PathBuf::from(&repo_path);
 
         PushQueueStorage::savepoint(&txn, "b3_kind").await?;
+
+        // plan-20260923 ADR-FU-08 item 1: a leaf that is already a directory is
+        // this ImportRepo's mount only with a provenance record, or in the
+        // legacy `.gitkeep`-only shape of a repository that already has
+        // branches (backfilled here); such a push writes refs only.
+        let git_db = ctx.storage.git_db_storage();
+        if delete_only {
+            return self
+                .b3_attach_update_refs(txn, row, &payload, &git_db, &expected_commit)
+                .await;
+        }
+        match import_leaf_in_txn(&self.mono_storage, &expected_tree, &repo_path, &txn).await? {
+            ImportLeaf::Absent => {}
+            leaf @ (ImportLeaf::GitkeepOnly | ImportLeaf::Directory) => {
+                let recorded =
+                    AuditStorage::has_import_repo_attach_in_txn(&txn, payload.repo_id, &repo_path)
+                        .await?;
+                let legacy = !recorded
+                    && leaf == ImportLeaf::GitkeepOnly
+                    && !git_db
+                        .list_branch_refs_in_txn(payload.repo_id, &txn)
+                        .await?
+                        .is_empty();
+                if !recorded && !legacy {
+                    let occupied = ImportRepoError::PathOccupied { path: repo_path };
+                    return self.b3_attach_fail(txn, row.id, occupied.to_string()).await;
+                }
+                if legacy {
+                    AuditStorage::log_import_repo_attach_in_txn(&txn, payload.repo_id, &repo_path)
+                        .await?;
+                }
+                return self
+                    .b3_attach_update_refs(txn, row, &payload, &git_db, &expected_commit)
+                    .await;
+            }
+            ImportLeaf::NotDirectory => {
+                let occupied = ImportRepoError::PathOccupied { path: repo_path };
+                return self.b3_attach_fail(txn, row.id, occupied.to_string()).await;
+            }
+        }
+        // First mount. The provenance record is inside the SAVEPOINT, so any
+        // later refusal (tree build, branch CAS, `.gitkeep`, root CAS) drops
+        // it together with the mount. A re-mount after the leaf went away
+        // keeps the record it already has.
+        if !AuditStorage::has_import_repo_attach_in_txn(&txn, payload.repo_id, &repo_path).await? {
+            AuditStorage::log_import_repo_attach_in_txn(&txn, payload.repo_id, &repo_path).await?;
+        }
 
         let (save_trees, gitkeep_blob) =
             match tree_ops::search_and_create_tree(&mono_api, &path).await {
@@ -1503,7 +1694,7 @@ impl PushQueueService {
         let tip_commit_id = payload
             .commands
             .iter()
-            .find(|c| c.ref_type == "branch" && c.new_id != ZERO_ID)
+            .find(|c| c.ref_type == "branch" && !is_protocol_zero_id(&c.new_id))
             .map(|c| c.new_id.clone())
             .ok_or_else(|| MegaError::Other("attach payload has no branch tip".into()))?;
 
@@ -1532,7 +1723,6 @@ impl PushQueueService {
 
         // Branch CAS first: a stale batch must not leave the `.gitkeep` blob
         // written below (object storage is outside the SAVEPOINT).
-        let git_db = ctx.storage.git_db_storage();
         if let Err(stale) =
             apply_import_branch_commands_in_txn(&git_db, payload.repo_id, &payload.commands, &txn)
                 .await?
@@ -1557,7 +1747,6 @@ impl PushQueueService {
                 message: msg,
             });
         }
-
         // Object-store write is outside the DB SAVEPOINT (same as pre-queue attach).
         if let Err(e) = ctx
             .storage
@@ -1586,21 +1775,7 @@ impl PushQueueService {
             });
         }
 
-        // Ensure a sole default survives the batch (e.g. Delete of the old
-        // default + Create of a replacement without a precomputed flag).
-        if !git_db
-            .default_branch_exist_in_txn(payload.repo_id, &txn)
-            .await?
-            && let Some(first) = git_db
-                .list_branch_refs_in_txn(payload.repo_id, &txn)
-                .await?
-                .into_iter()
-                .next()
-        {
-            git_db
-                .set_default_branch_in_txn(payload.repo_id, &first.ref_name, &txn)
-                .await?;
-        }
+        ensure_default_branch_in_txn(&git_db, payload.repo_id, &txn).await?;
 
         let trees: Vec<Tree> = save_trees.into_iter().collect();
         match self
@@ -5639,5 +5814,795 @@ mod tests {
             assert_eq!(root_after.ref_commit_hash, root.ref_commit_hash);
             assert_eq!(root_after.ref_tree_hash, root.ref_tree_hash);
         }
+    }
+
+    // plan-20260923 FU-13: a mounted ImportRepo takes further pushes (refs
+    // only, root untouched); the first mount records provenance in the same
+    // transaction; anything else at the leaf is IMPORT_REPO_PATH_OCCUPIED.
+
+    async fn fu13_storage(temp: &std::path::Path) -> crate::jupiter::storage::Storage {
+        let mut storage = crate::jupiter::tests::test_storage(temp).await;
+        let git_service = crate::jupiter::service::git_service::GitService {
+            obj_storage: crate::jupiter::storage::object_storage::mock_object_storage(),
+        };
+        storage.git_service = git_service.clone();
+        storage.mono_service = crate::jupiter::service::mono_service::MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service: git_service.clone(),
+        };
+        storage.import_service = crate::jupiter::service::import_service::ImportService {
+            git_db_storage: storage.git_db_storage(),
+            git_service,
+        };
+        storage
+            .mono_service
+            .init_monorepo(&storage.config().monorepo)
+            .await
+            .unwrap();
+        storage
+    }
+
+    async fn fu13_attach(
+        storage: &crate::jupiter::storage::Storage,
+        repo: &crate::ceres::protocol::repo::Repo,
+        commands: Vec<AttachCommand>,
+        tip: &str,
+    ) -> ExecuteOutcome {
+        let payload = AttachPayload {
+            repo_id: repo.repo_id,
+            repo_path: repo.repo_path.clone(),
+            commands,
+        };
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let EnqueueOutcome::Inserted { id } = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Attach,
+                operation_id: attach_operation_id(
+                    &repo.repo_id.to_string(),
+                    &payload.normalize_fingerprint_input(),
+                ),
+                path: repo.repo_path.clone(),
+                old_id: root.ref_commit_hash,
+                new_id: tip.to_owned(),
+                requester: None,
+                payload: serde_json::to_value(&payload).unwrap(),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("attach insert");
+        };
+        assert_eq!(
+            storage
+                .push_queue_service
+                .storage()
+                .claim_for_execution(id)
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed
+        );
+        let ctx = AttachExecContext {
+            storage: storage.clone(),
+            git_object_cache: std::sync::Arc::new(
+                crate::ceres::api_service::cache::GitObjectCache {
+                    connection: crate::jupiter::tests::test_redis_manager().await,
+                    prefix: String::new(),
+                },
+            ),
+        };
+        storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                Some(&ctx),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A child of `parent` (same tree) stored in the ImportRepo tables.
+    async fn fu13_next_commit(
+        storage: &crate::jupiter::storage::Storage,
+        repo_id: i64,
+        parent: &git_internal::internal::object::commit::Commit,
+        message: &str,
+    ) -> git_internal::internal::object::commit::Commit {
+        use git_internal::internal::{
+            metadata::{EntryMeta, MetaAttached},
+            object::commit::Commit,
+        };
+        let commit = Commit::from_tree_id(parent.tree_id, vec![parent.id], message);
+        storage
+            .import_service
+            .save_entry(
+                repo_id,
+                vec![MetaAttached {
+                    inner: commit.clone().into(),
+                    meta: EntryMeta::new(),
+                }],
+            )
+            .await
+            .unwrap();
+        commit
+    }
+
+    async fn fu13_has_provenance(
+        storage: &crate::jupiter::storage::Storage,
+        repo_id: i64,
+        path: &str,
+    ) -> bool {
+        AuditStorage::has_import_repo_attach_in_txn(
+            storage.mono_storage().get_connection(),
+            repo_id,
+            path,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn fu13_root(storage: &crate::jupiter::storage::Storage) -> (String, String) {
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        (root.ref_commit_hash, root.ref_tree_hash)
+    }
+
+    #[tokio::test]
+    async fn fu13_update_keeps_root_ref() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, c1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-update").await;
+        let c1_id = c1.id.to_string();
+        let first = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/main", "Create", ZERO_ID, &c1_id)],
+            &c1_id,
+        )
+        .await;
+        assert!(
+            matches!(
+                first,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 1,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        let root = fu13_root(&storage).await;
+
+        let c2 = fu13_next_commit(&storage, repo.repo_id, &c1, "fu13 second").await;
+        let c2_id = c2.id.to_string();
+        let second = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/main", "Update", &c1_id, &c2_id)],
+            &c2_id,
+        )
+        .await;
+        let ExecuteOutcome::Done {
+            landed_commit_id,
+            root_cas_writes,
+            ..
+        } = second
+        else {
+            panic!("update push must land, got {second:?}");
+        };
+        assert_eq!(root_cas_writes, 0, "an update does not rewrite the root");
+        assert_eq!(landed_commit_id, root.0);
+        assert_eq!(fu13_root(&storage).await, root);
+        assert_eq!(
+            fu12_ref_id(&storage.git_db_storage(), repo.repo_id, "refs/heads/main").await,
+            Some(c2_id.clone())
+        );
+
+        // A nested child mounted under the leaf turns it into a directory; the
+        // parent's record still claims it, so the parent keeps updating.
+        let (child, k1, _) =
+            wh03_seed_import_repo(&storage, "/third-party/fu13-update/child").await;
+        let k1_id = k1.id.to_string();
+        let nested = fu13_attach(
+            &storage,
+            &child,
+            vec![fu12_cmd("refs/heads/main", "Create", ZERO_ID, &k1_id)],
+            &k1_id,
+        )
+        .await;
+        assert!(matches!(nested, ExecuteOutcome::Done { .. }), "{nested:?}");
+        let root = fu13_root(&storage).await;
+        let c3 = fu13_next_commit(&storage, repo.repo_id, &c2, "fu13 third").await;
+        let c3_id = c3.id.to_string();
+        let third = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/main", "Update", &c2_id, &c3_id)],
+            &c3_id,
+        )
+        .await;
+        assert!(
+            matches!(
+                third,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{third:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, root);
+        assert_eq!(
+            fu12_ref_id(&storage.git_db_storage(), repo.repo_id, "refs/heads/main").await,
+            Some(c3_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn fu13_first_attach_records_provenance() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, c1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-prov").await;
+        let c1_id = c1.id.to_string();
+        assert!(!fu13_has_provenance(&storage, repo.repo_id, &repo.repo_path).await);
+        let first = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/main", "Create", ZERO_ID, &c1_id)],
+            &c1_id,
+        )
+        .await;
+        assert!(matches!(first, ExecuteOutcome::Done { .. }), "{first:?}");
+        assert!(fu13_has_provenance(&storage, repo.repo_id, &repo.repo_path).await);
+
+        // A first mount refused after the provenance write (here: a stale
+        // branch in the batch) rolls the record back with the mount.
+        let (other, c2, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-prov-stale").await;
+        let c2_id = c2.id.to_string();
+        let root = fu13_root(&storage).await;
+        let refused = fu13_attach(
+            &storage,
+            &other,
+            vec![
+                fu12_cmd("refs/heads/main", "Create", ZERO_ID, &c2_id),
+                fu12_cmd("refs/heads/dev", "Update", &"3".repeat(40), &c2_id),
+            ],
+            &c2_id,
+        )
+        .await;
+        assert!(
+            matches!(&refused, ExecuteOutcome::Failed { message, .. }
+                if message.starts_with("IMPORT_REPO_STALE_REF: ")),
+            "{refused:?}"
+        );
+        assert!(!fu13_has_provenance(&storage, other.repo_id, &other.repo_path).await);
+        assert_eq!(fu13_root(&storage).await, root, "no mount either");
+    }
+
+    /// Put a directory holding a README (not a mount placeholder), or a file
+    /// when `as_file`, at `/<parent>/<name>` in the monorepo root.
+    async fn fu13_plant(
+        storage: &crate::jupiter::storage::Storage,
+        parent: &str,
+        name: &str,
+        as_file: bool,
+    ) {
+        use std::str::FromStr;
+
+        use git_internal::{
+            hash::ObjectHash,
+            internal::object::{
+                commit::Commit,
+                tree::{Tree, TreeItem, TreeItemMode},
+            },
+        };
+
+        use crate::jupiter::utils::converter::FromMegaModel;
+
+        let mono = storage.mono_storage();
+        let root_ref = mono.get_main_ref("/").await.unwrap().unwrap();
+        let root = Tree::from_mega_model(
+            mono.get_tree_by_hash(&root_ref.ref_tree_hash)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let parent_item = root
+            .tree_items
+            .iter()
+            .find(|item| item.name == parent)
+            .unwrap()
+            .clone();
+        let parent_tree = Tree::from_mega_model(
+            mono.get_tree_by_hash(&parent_item.id.to_string())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let leaf = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            ObjectHash::from_str(&"a".repeat(40)).unwrap(),
+            "README.md".to_owned(),
+        )])
+        .unwrap();
+        let mut items = parent_tree.tree_items.clone();
+        if as_file {
+            items.push(TreeItem::new(
+                TreeItemMode::Blob,
+                ObjectHash::from_str(&"b".repeat(40)).unwrap(),
+                name.to_owned(),
+            ));
+        } else {
+            items.push(TreeItem::new(TreeItemMode::Tree, leaf.id, name.to_owned()));
+        }
+        let new_parent = Tree::from_tree_items(items).unwrap();
+        let mut root_items: Vec<TreeItem> = root
+            .tree_items
+            .iter()
+            .filter(|item| item.name != parent)
+            .cloned()
+            .collect();
+        root_items.push(TreeItem::new(
+            TreeItemMode::Tree,
+            new_parent.id,
+            parent.to_owned(),
+        ));
+        let new_root = Tree::from_tree_items(root_items).unwrap();
+        let commit = Commit::from_tree_id(
+            new_root.id,
+            vec![ObjectHash::from_str(&root_ref.ref_commit_hash).unwrap()],
+            "fu13 plant directory",
+        );
+        mono.save_mega_trees(vec![leaf, new_parent, new_root.clone()], commit.id, None)
+            .await
+            .unwrap();
+        mono.save_mega_commits(vec![commit.clone()], None)
+            .await
+            .unwrap();
+        let mut updated = root_ref;
+        updated.ref_commit_hash = commit.id.to_string();
+        updated.ref_tree_hash = new_root.id.to_string();
+        mono.update_ref(updated, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fu13_directory_collision_occupied() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        fu13_plant(&storage, "third-party", "fu13-occ", false).await;
+        let root = fu13_root(&storage).await;
+        let (repo, _c1, create) = wh03_seed_import_repo(&storage, "/third-party/fu13-occ").await;
+        let import_repo = crate::ceres::pack::import_repo::ImportRepo {
+            storage: storage.clone(),
+            repo: repo.clone(),
+            command_list: std::sync::Mutex::new(vec![create]),
+            git_object_cache: std::sync::Arc::new(
+                crate::ceres::api_service::cache::GitObjectCache {
+                    connection: crate::jupiter::tests::test_redis_manager().await,
+                    prefix: String::new(),
+                },
+            ),
+            receive_pack_extra_timings_ms: std::sync::Mutex::new(vec![]),
+        };
+        let err = import_repo
+            .attach_to_monorepo_parent()
+            .await
+            .expect_err("an ordinary directory is not this ImportRepo's mount");
+        let text = err.to_string();
+        assert!(
+            text.starts_with("IMPORT_REPO_PATH_OCCUPIED: \"/third-party/fu13-occ\""),
+            "{text}"
+        );
+        assert!(!text.contains("cannot attach leaf"), "{text}");
+        assert!(!text.contains("Failed { id"), "{text}");
+        assert_eq!(fu13_root(&storage).await, root, "root tree unchanged");
+        assert!(!fu13_has_provenance(&storage, repo.repo_id, &repo.repo_path).await);
+
+        // A file at the leaf is occupied too.
+        fu13_plant(&storage, "third-party", "fu13-file", true).await;
+        let root = fu13_root(&storage).await;
+        let (file_repo, f1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-file").await;
+        let f1_id = f1.id.to_string();
+        let refused = fu13_attach(
+            &storage,
+            &file_repo,
+            vec![fu12_cmd("refs/heads/main", "Create", ZERO_ID, &f1_id)],
+            &f1_id,
+        )
+        .await;
+        assert!(
+            matches!(&refused, ExecuteOutcome::Failed { message, .. }
+                if message.starts_with("IMPORT_REPO_PATH_OCCUPIED: \"/third-party/fu13-file\"")),
+            "{refused:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, root, "root tree unchanged");
+    }
+
+    #[tokio::test]
+    async fn fu13_legacy_mount_backfilled() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let conn = storage.mono_storage().get_connection().clone();
+        let forget = |repo_id: i64| {
+            crate::callisto::audit_logs::Entity::delete_many()
+                .filter(crate::callisto::audit_logs::Column::TargetId.eq(repo_id))
+                .exec(&conn)
+        };
+
+        // A mount made before FU-13: `.gitkeep`-only leaf, branches, no record.
+        let (repo, c1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-legacy").await;
+        let c1_id = c1.id.to_string();
+        let first = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/main", "Create", ZERO_ID, &c1_id)],
+            &c1_id,
+        )
+        .await;
+        assert!(matches!(first, ExecuteOutcome::Done { .. }), "{first:?}");
+        forget(repo.repo_id).await.unwrap();
+        assert!(!fu13_has_provenance(&storage, repo.repo_id, &repo.repo_path).await);
+        let root = fu13_root(&storage).await;
+        let c2 = fu13_next_commit(&storage, repo.repo_id, &c1, "fu13 legacy second").await;
+        let c2_id = c2.id.to_string();
+        let update = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/main", "Update", &c1_id, &c2_id)],
+            &c2_id,
+        )
+        .await;
+        assert!(
+            matches!(
+                update,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{update:?}"
+        );
+        assert!(fu13_has_provenance(&storage, repo.repo_id, &repo.repo_path).await);
+        assert_eq!(fu13_root(&storage).await, root);
+
+        // Without branches the `.gitkeep`-only leaf is not claimed.
+        let (bare, b1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-bare").await;
+        let b1_id = b1.id.to_string();
+        let mounted = fu13_attach(
+            &storage,
+            &bare,
+            vec![fu12_cmd("refs/heads/main", "Create", ZERO_ID, &b1_id)],
+            &b1_id,
+        )
+        .await;
+        assert!(
+            matches!(mounted, ExecuteOutcome::Done { .. }),
+            "{mounted:?}"
+        );
+        forget(bare.repo_id).await.unwrap();
+        crate::callisto::import_refs::Entity::delete_many()
+            .filter(crate::callisto::import_refs::Column::RepoId.eq(bare.repo_id))
+            .exec(&conn)
+            .await
+            .unwrap();
+        let root_before_bare = fu13_root(&storage).await;
+        let refused = fu13_attach(
+            &storage,
+            &bare,
+            vec![fu12_cmd("refs/heads/again", "Create", ZERO_ID, &b1_id)],
+            &b1_id,
+        )
+        .await;
+        assert!(
+            matches!(&refused, ExecuteOutcome::Failed { message, .. }
+                if message.starts_with("IMPORT_REPO_PATH_OCCUPIED: ")),
+            "{refused:?}"
+        );
+        let root_now = fu13_root(&storage).await;
+        assert_eq!(
+            root_now, root_before_bare,
+            "the refusal leaves the root alone"
+        );
+
+        // Only a `.gitkeep`-only leaf is claimed by the legacy rule: an
+        // ordinary directory stays occupied even for a repository with
+        // branches.
+        fu13_plant(&storage, "third-party", "fu13-legacy-dir", false).await;
+        let root_planted = fu13_root(&storage).await;
+        assert_ne!(root_planted, root_now);
+        let (dir_repo, d1, _) =
+            wh03_seed_import_repo(&storage, "/third-party/fu13-legacy-dir").await;
+        let d1_id = d1.id.to_string();
+        storage
+            .git_db_storage()
+            .save_ref(
+                dir_repo.repo_id,
+                fu12_ref(dir_repo.repo_id, "refs/heads/main", &d1_id),
+            )
+            .await
+            .unwrap();
+        let d2 = fu13_next_commit(&storage, dir_repo.repo_id, &d1, "fu13 dir second").await;
+        let d2_id = d2.id.to_string();
+        let occupied = fu13_attach(
+            &storage,
+            &dir_repo,
+            vec![fu12_cmd("refs/heads/main", "Update", &d1_id, &d2_id)],
+            &d2_id,
+        )
+        .await;
+        assert!(
+            matches!(&occupied, ExecuteOutcome::Failed { message, .. }
+                if message.starts_with("IMPORT_REPO_PATH_OCCUPIED: ")),
+            "{occupied:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, root_planted);
+        assert!(!fu13_has_provenance(&storage, dir_repo.repo_id, &dir_repo.repo_path).await);
+    }
+
+    #[tokio::test]
+    async fn fu13_delete_only_batch_refs_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, c1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-delete").await;
+        let c1_id = c1.id.to_string();
+        let mounted = fu13_attach(
+            &storage,
+            &repo,
+            vec![
+                fu12_cmd("refs/heads/main", "Create", ZERO_ID, &c1_id),
+                fu12_cmd("refs/heads/dev", "Create", ZERO_ID, &c1_id),
+            ],
+            &c1_id,
+        )
+        .await;
+        assert!(
+            matches!(mounted, ExecuteOutcome::Done { .. }),
+            "{mounted:?}"
+        );
+        let root = fu13_root(&storage).await;
+        // A delete-only batch on an owned mount: refs only, root untouched.
+        let deleted = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/dev", "Delete", &c1_id, ZERO_ID)],
+            ZERO_ID,
+        )
+        .await;
+        assert!(
+            matches!(
+                deleted,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{deleted:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, root);
+        let git_db = storage.git_db_storage();
+        assert_eq!(
+            fu12_ref_id(&git_db, repo.repo_id, "refs/heads/dev").await,
+            None
+        );
+        assert_eq!(
+            fu12_ref_id(&git_db, repo.repo_id, "refs/heads/main").await,
+            Some(c1_id)
+        );
+
+        // Deletes never touch the mount, so no ownership gate: a directory
+        // leaf without a record (e.g. a legacy parent with a nested child)
+        // still deletes, and the root stays put.
+        fu13_plant(&storage, "third-party", "fu13-delete-occ", false).await;
+        let root = fu13_root(&storage).await;
+        let (occ, d1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-delete-occ").await;
+        let d1_id = d1.id.to_string();
+        git_db
+            .save_ref(
+                occ.repo_id,
+                fu12_ref(occ.repo_id, "refs/heads/main", &d1_id),
+            )
+            .await
+            .unwrap();
+        let applied = fu13_attach(
+            &storage,
+            &occ,
+            vec![fu12_cmd("refs/heads/main", "Delete", &d1_id, ZERO_ID)],
+            ZERO_ID,
+        )
+        .await;
+        assert!(
+            matches!(
+                applied,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{applied:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, root);
+        assert_eq!(
+            fu12_ref_id(&git_db, occ.repo_id, "refs/heads/main").await,
+            None
+        );
+        assert!(!fu13_has_provenance(&storage, occ.repo_id, &occ.repo_path).await);
+    }
+
+    #[tokio::test]
+    async fn fu13_delete_only_sha256_zero_id() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        fu13_plant(&storage, "third-party", "fu13-delete-256", false).await;
+        let root = fu13_root(&storage).await;
+        let (occ, d1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-delete-256").await;
+        let d1_id = d1.id.to_string();
+        let git_db = storage.git_db_storage();
+        git_db
+            .save_ref(
+                occ.repo_id,
+                fu12_ref(occ.repo_id, "refs/heads/main", &d1_id),
+            )
+            .await
+            .unwrap();
+        // A SHA-256 delete carries 64 zeroes; it is still a delete-only batch,
+        // so the unrecorded directory leaf is not refused as occupied.
+        let applied = fu13_attach(
+            &storage,
+            &occ,
+            vec![fu12_cmd(
+                "refs/heads/main",
+                "Delete",
+                &d1_id,
+                &"0".repeat(64),
+            )],
+            ZERO_ID,
+        )
+        .await;
+        assert!(
+            matches!(
+                applied,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{applied:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, root);
+        assert_eq!(
+            fu12_ref_id(&git_db, occ.repo_id, "refs/heads/main").await,
+            None
+        );
+        assert!(!fu13_has_provenance(&storage, occ.repo_id, &occ.repo_path).await);
+    }
+
+    #[tokio::test]
+    async fn fu13_delete_only_skips_materialization_precheck() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, c1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-mat").await;
+        let c1_id = c1.id.to_string();
+        let git_db = storage.git_db_storage();
+        for name in ["refs/heads/main", "refs/heads/dev"] {
+            git_db
+                .save_ref(repo.repo_id, fu12_ref(repo.repo_id, name, &c1_id))
+                .await
+                .unwrap();
+        }
+        // An ancestor with a materialized main ref (DEFER-FU-13/20 shape).
+        storage
+            .mono_storage()
+            .save_refs(
+                crate::callisto::mega_refs::Model::new(
+                    "/third-party",
+                    MEGA_BRANCH_NAME.to_owned(),
+                    "a".repeat(40),
+                    "b".repeat(40),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let root = fu13_root(&storage).await;
+        let deleted = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/dev", "Delete", &c1_id, ZERO_ID)],
+            ZERO_ID,
+        )
+        .await;
+        assert!(
+            matches!(
+                deleted,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{deleted:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, root);
+        assert_eq!(
+            fu12_ref_id(&git_db, repo.repo_id, "refs/heads/dev").await,
+            None
+        );
+        // A batch that mounts is still refused by the precheck.
+        let updated = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/topic", "Create", ZERO_ID, &c1_id)],
+            &c1_id,
+        )
+        .await;
+        let ExecuteOutcome::Failed { message, .. } = updated else {
+            panic!("{updated:?}");
+        };
+        assert!(message.contains("(I3)"), "{message}");
+        assert_eq!(fu13_root(&storage).await, root);
+        assert_eq!(
+            fu12_ref_id(&git_db, repo.repo_id, "refs/heads/topic").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn fu13_first_mount_tip_skips_sha256_delete() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let (repo, c1, _) = wh03_seed_import_repo(&storage, "/third-party/fu13-tip-256").await;
+        let c1_id = c1.id.to_string();
+        let git_db = storage.git_db_storage();
+        git_db
+            .save_ref(
+                repo.repo_id,
+                fu12_ref(repo.repo_id, "refs/heads/old", &c1_id),
+            )
+            .await
+            .unwrap();
+        let root = fu13_root(&storage).await;
+        // The tip is the first branch command that is not a delete: a
+        // leading 64-zero delete is skipped, not looked up as a commit.
+        let mounted = fu13_attach(
+            &storage,
+            &repo,
+            vec![
+                fu12_cmd("refs/heads/old", "Delete", &c1_id, &"0".repeat(64)),
+                fu12_cmd("refs/heads/main", "Create", ZERO_ID, &c1_id),
+            ],
+            &c1_id,
+        )
+        .await;
+        assert!(
+            matches!(mounted, ExecuteOutcome::Done { .. }),
+            "{mounted:?}"
+        );
+        assert_ne!(fu13_root(&storage).await, root, "the mount lands");
+        assert!(fu13_has_provenance(&storage, repo.repo_id, &repo.repo_path).await);
+        assert_eq!(
+            fu12_ref_id(&git_db, repo.repo_id, "refs/heads/old").await,
+            None
+        );
+        assert_eq!(
+            fu12_ref_id(&git_db, repo.repo_id, "refs/heads/main").await,
+            Some(c1_id)
+        );
     }
 }

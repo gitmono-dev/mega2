@@ -102,6 +102,15 @@ pub async fn search_tree_by_path<T: ApiHandler + ?Sized>(
     Ok(Some(search_tree))
 }
 
+/// Whether `tree` holds exactly one `.gitkeep` blob: the placeholder an
+/// ImportRepo mount (and any freshly created leaf) consists of.
+pub fn is_gitkeep_only(tree: &Tree) -> bool {
+    matches!(
+        tree.tree_items.as_slice(),
+        [item] if item.name == ".gitkeep" && item.mode == TreeItemMode::Blob
+    )
+}
+
 /// Searches for a tree in the Git repository by its path, creating intermediate trees if necessary,
 /// and returns the trees involved in the update process.
 ///

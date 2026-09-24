@@ -1528,10 +1528,26 @@ fn post_packless_receive_pack_at(
     new_id: &str,
     ref_name: &str,
 ) -> String {
-    let mut line = format!("{old_id} {new_id} {ref_name}");
-    line.push('\0');
-    line.push_str("report-status\n");
-    let mut body = pkt_line(&line);
+    post_packless_receive_pack_commands(port, repo_path, token, &[(old_id, new_id, ref_name)])
+}
+
+/// A packless receive-pack with several `(old_id, new_id, ref)` commands.
+fn post_packless_receive_pack_commands(
+    port: u16,
+    repo_path: &str,
+    token: &str,
+    commands: &[(&str, &str, &str)],
+) -> String {
+    let mut body = Vec::new();
+    for (i, (old_id, new_id, ref_name)) in commands.iter().enumerate() {
+        let mut line = format!("{old_id} {new_id} {ref_name}");
+        if i == 0 {
+            line.push('\0');
+            line.push_str("report-status");
+        }
+        line.push('\n');
+        body.extend_from_slice(&pkt_line(&line));
+    }
     body.extend_from_slice(b"0000");
 
     let url = format!(
@@ -5391,6 +5407,254 @@ fn orphan_retry_same_rejection() {
         "shutdown failed\n{}",
         read_log(&stderr_path)
     );
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-13: a mounted ImportRepo takes further pushes (ordinary Git
+// semantics: fast-forward, --force, new branches); branch commands of one push
+// land or fail together, tags stand alone.
+// ---------------------------------------------------------------------------
+
+fn fu13_commit(case_dir: &Path, repo: &str, content: &str, message: &str) -> String {
+    fs::write(case_dir.join(repo).join("file.txt"), content).expect("write");
+    git_ok_no_auth(case_dir, &["-C", repo, "add", "file.txt"]);
+    git_ok_no_auth(case_dir, &["-C", repo, "commit", "-m", message]);
+    git_stdout_no_auth(case_dir, &["-C", repo, "rev-parse", "HEAD"])
+}
+
+fn fu13_push(case_dir: &Path, repo: &str, url: &str, refspecs: &[&str]) -> std::process::Output {
+    let mut args = vec!["-C", repo, "push", "--no-thin", url];
+    args.extend_from_slice(refspecs);
+    trunk_host_git(case_dir, &args)
+}
+
+fn fu13_ls_remote(case_dir: &Path, url: &str) -> Vec<(String, String)> {
+    let output = trunk_host_git(case_dir, &["ls-remote", url]);
+    git_cli::assert_git_success(&output, "ls-remote");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(id, name)| (name.to_owned(), id.to_owned()))
+        .collect()
+}
+
+fn fu13_remote_ref(case_dir: &Path, url: &str, name: &str) -> Option<String> {
+    fu13_ls_remote(case_dir, url)
+        .into_iter()
+        .find(|(ref_name, _)| ref_name == name)
+        .map(|(_, id)| id)
+}
+
+#[test]
+fn import_repo_incremental_updates() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    let url = trunk_subpath_url(port, "/third-party/fu13-inc");
+    git_ok_no_auth(case_dir, &["init", "-b", "main", "fu13-inc"]);
+    configure_git_identity_no_auth(case_dir, "fu13-inc");
+    fu13_commit(case_dir, "fu13-inc", "v1\n", "v1");
+    let first = fu13_push(case_dir, "fu13-inc", &url, &["HEAD:refs/heads/main"]);
+    git_cli::assert_git_success(&first, "first ImportRepo push");
+
+    // The second fast-forward push used to fail at the mount step (E7).
+    let v2 = fu13_commit(case_dir, "fu13-inc", "v2\n", "v2");
+    let second = fu13_push(case_dir, "fu13-inc", &url, &["HEAD:refs/heads/main"]);
+    git_cli::assert_git_success(&second, "second ImportRepo push");
+    assert_eq!(fu13_remote_ref(case_dir, &url, "refs/heads/main"), Some(v2));
+    git_ok_no_auth(case_dir, &["clone", &url, "fu13-inc-clone"]);
+    let content =
+        fs::read_to_string(case_dir.join("fu13-inc-clone").join("file.txt")).expect("read clone");
+    assert_eq!(content, "v2\n");
+
+    let feature = fu13_push(case_dir, "fu13-inc", &url, &["HEAD:refs/heads/feature"]);
+    git_cli::assert_git_success(&feature, "new branch push");
+    let heads: Vec<String> = fu13_ls_remote(case_dir, &url)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("refs/heads/"))
+        .collect();
+    assert!(heads.contains(&"refs/heads/main".to_owned()), "{heads:?}");
+    assert!(
+        heads.contains(&"refs/heads/feature".to_owned()),
+        "{heads:?}"
+    );
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn import_repo_ref_cas_force_non_ff() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    let url = trunk_subpath_url(port, "/third-party/fu13-force");
+    git_ok_no_auth(case_dir, &["init", "-b", "main", "fu13-force"]);
+    configure_git_identity_no_auth(case_dir, "fu13-force");
+    fu13_commit(case_dir, "fu13-force", "a\n", "a");
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu13-force", &url, &["HEAD:refs/heads/main"]),
+        "push a",
+    );
+    fu13_commit(case_dir, "fu13-force", "b\n", "b");
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu13-force", &url, &["HEAD:refs/heads/main"]),
+        "push b",
+    );
+    // Rewrite history: drop b, commit c on a. Plain Git accepts --force.
+    git_ok_no_auth(case_dir, &["-C", "fu13-force", "reset", "--hard", "HEAD~1"]);
+    let c = fu13_commit(case_dir, "fu13-force", "c\n", "c");
+    git_cli::assert_git_success(
+        &fu13_push(
+            case_dir,
+            "fu13-force",
+            &url,
+            &["--force", "HEAD:refs/heads/main"],
+        ),
+        "force push c",
+    );
+    assert_eq!(fu13_remote_ref(case_dir, &url, "refs/heads/main"), Some(c));
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn import_repo_repeated_transition_applies() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    let url = trunk_subpath_url(port, "/third-party/fu13-repeat");
+    git_ok_no_auth(case_dir, &["init", "-b", "main", "fu13-repeat"]);
+    configure_git_identity_no_auth(case_dir, "fu13-repeat");
+    let a = fu13_commit(case_dir, "fu13-repeat", "a\n", "a");
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu13-repeat", &url, &["HEAD:refs/heads/main"]),
+        "push a",
+    );
+    let b = fu13_commit(case_dir, "fu13-repeat", "b\n", "b");
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu13-repeat", &url, &["HEAD:refs/heads/main"]),
+        "push a→b",
+    );
+    git_cli::assert_git_success(
+        &fu13_push(
+            case_dir,
+            "fu13-repeat",
+            &url,
+            &["--force", &format!("{a}:refs/heads/main")],
+        ),
+        "force back to a",
+    );
+    // The same a→b transition again must move the ref, not replay the old row.
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu13-repeat", &url, &["HEAD:refs/heads/main"]),
+        "push a→b again",
+    );
+    assert_eq!(
+        fu13_remote_ref(case_dir, &url, "refs/heads/main"),
+        Some(b.clone())
+    );
+
+    // Create, delete and re-create a branch at the same commit.
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu13-repeat", &url, &["HEAD:refs/heads/feature"]),
+        "create feature",
+    );
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu13-repeat", &url, &[":refs/heads/feature"]),
+        "delete feature",
+    );
+    assert_eq!(fu13_remote_ref(case_dir, &url, "refs/heads/feature"), None);
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu13-repeat", &url, &["HEAD:refs/heads/feature"]),
+        "re-create feature",
+    );
+    assert_eq!(
+        fu13_remote_ref(case_dir, &url, "refs/heads/feature"),
+        Some(b)
+    );
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn import_repo_branch_batch_atomic_tag_independent() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    let path = "/third-party/fu13-batch";
+    let url = trunk_subpath_url(port, path);
+    git_ok_no_auth(case_dir, &["init", "-b", "main", "fu13-batch"]);
+    configure_git_identity_no_auth(case_dir, "fu13-batch");
+    let a = fu13_commit(case_dir, "fu13-batch", "a\n", "a");
+    git_cli::assert_git_success(
+        &fu13_push(
+            case_dir,
+            "fu13-batch",
+            &url,
+            &["HEAD:refs/heads/main", "HEAD:refs/heads/dev"],
+        ),
+        "push main and dev",
+    );
+    // Make commit b known to the server on a side branch.
+    let b = fu13_commit(case_dir, "fu13-batch", "b\n", "b");
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu13-batch", &url, &["HEAD:refs/heads/side"]),
+        "push side",
+    );
+
+    // One receive-pack: main a→b (fresh), dev <stale>→b, tag v1 created.
+    let stale = "3".repeat(40);
+    let report = post_packless_receive_pack_commands(
+        port,
+        path,
+        "unused",
+        &[
+            (a.as_str(), b.as_str(), "refs/heads/main"),
+            (stale.as_str(), b.as_str(), "refs/heads/dev"),
+            (
+                "0000000000000000000000000000000000000000",
+                a.as_str(),
+                "refs/tags/v1",
+            ),
+        ],
+    );
+    assert!(
+        report.contains("ng refs/heads/main IMPORT_REPO_STALE_REF: \"refs/heads/dev\""),
+        "{report}"
+    );
+    assert!(
+        report.contains("ng refs/heads/dev IMPORT_REPO_STALE_REF: \"refs/heads/dev\""),
+        "{report}"
+    );
+    assert!(report.contains("ok refs/tags/v1"), "{report}");
+    assert_eq!(
+        fu13_remote_ref(case_dir, &url, "refs/heads/main"),
+        Some(a.clone())
+    );
+    assert_eq!(
+        fu13_remote_ref(case_dir, &url, "refs/heads/dev"),
+        Some(a.clone())
+    );
+    assert_eq!(fu13_remote_ref(case_dir, &url, "refs/tags/v1"), Some(a));
+    fu10_shutdown(service, &stderr_path);
 }
 
 // ---------------------------------------------------------------------------

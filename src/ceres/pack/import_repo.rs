@@ -504,6 +504,31 @@ pub(crate) async fn collect_git_blob_filepaths(
 }
 
 impl ImportRepo {
+    /// Whether this push's branch commands are already in effect: every
+    /// Create / Update ref points at its `new_id` and every Delete ref is gone.
+    async fn attach_refs_applied(&self, payload: &AttachPayload) -> Result<bool, MegaError> {
+        let names: Vec<String> = payload
+            .commands
+            .iter()
+            .map(|cmd| cmd.ref_name.clone())
+            .collect();
+        let refs = self
+            .storage
+            .git_db_storage()
+            .get_refs_by_names(self.repo.repo_id, &names)
+            .await?;
+        Ok(payload.commands.iter().all(|cmd| {
+            let current = refs
+                .iter()
+                .find(|r| r.ref_name == cmd.ref_name)
+                .map(|r| r.ref_git_id.as_str());
+            match cmd.command_type.as_str() {
+                "Delete" => current.is_none(),
+                _ => current == Some(cmd.new_id.as_str()),
+            }
+        }))
+    }
+
     // attach import repo to monorepo parent tree via MonoWriteQueue (TP-08).
     pub(crate) async fn attach_to_monorepo_parent(&self) -> Result<(), MegaError> {
         // Snapshot commands without holding the mutex across await (Send + avoids deadlocks).
@@ -512,53 +537,6 @@ impl ImportRepo {
             .lock()
             .expect("command_list lock poisoned")
             .clone();
-        // Pure delete-only attach: no non-zero branch tip → do not enqueue.
-        if !commands_snapshot.iter().any(|c| {
-            c.status == "ok" && c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id)
-        }) {
-            let txn = self.storage.begin_db_transaction().await?;
-            let git_db = self.storage.git_db_storage();
-            for cmd in &commands_snapshot {
-                if cmd.status != "ok" || cmd.ref_type != RefTypeEnum::Branch {
-                    continue;
-                }
-                if let CommandType::Delete = cmd.command_type {
-                    let deleted = git_db
-                        .remove_ref_if_unchanged(
-                            self.repo.repo_id,
-                            &cmd.ref_name,
-                            &cmd.old_id,
-                            &txn,
-                        )
-                        .await?;
-                    if !deleted {
-                        return Err(ImportRepoError::StaleRef {
-                            ref_name: cmd.ref_name.clone(),
-                            expected: cmd.old_id.clone(),
-                        }
-                        .into());
-                    }
-                }
-            }
-            // Deleting the default must not leave the remaining branches
-            // without one (same fallback as the B3 batch).
-            if !git_db
-                .default_branch_exist_in_txn(self.repo.repo_id, &txn)
-                .await?
-                && let Some(first) = git_db
-                    .list_branch_refs_in_txn(self.repo.repo_id, &txn)
-                    .await?
-                    .into_iter()
-                    .next()
-            {
-                git_db
-                    .set_default_branch_in_txn(self.repo.repo_id, &first.ref_name, &txn)
-                    .await?;
-            }
-            txn.commit().await.map_err(MegaError::Db)?;
-            return Ok(());
-        }
-
         let commit_id = commands_snapshot
             .iter()
             .find(|c| {
@@ -567,7 +545,9 @@ impl ImportRepo {
                     && !is_protocol_zero_id(&c.new_id)
             })
             .map(|c| c.new_id.clone())
-            .ok_or_else(|| MegaError::Other("attach: no branch tip".into()))?;
+            // A delete-only batch has no tip; it still goes through B3 so the
+            // branch writes stay inside the attach transaction (GC-FU-03).
+            .unwrap_or_else(|| ZERO_ID.to_owned());
 
         let path = crate::common::utils::canonicalize_mono_ref_path(&self.repo.repo_path)?;
         // Materialization precheck permits P=/ (main@/ does not participate), but
@@ -615,41 +595,65 @@ impl ImportRepo {
                 )
             })
             .collect();
-        let operation_id = attach_operation_id(
-            &self.repo.repo_id.to_string(),
-            &normalize_attach_commands(&fingerprint_rows),
-        );
-        let old_id = mono
-            .get_main_ref("/")
-            .await?
-            .map(|r| r.ref_commit_hash)
-            .unwrap_or_else(|| ZERO_ID.to_owned());
+        let fingerprint = normalize_attach_commands(&fingerprint_rows);
+        let mut operation_id = attach_operation_id(&self.repo.repo_id.to_string(), &fingerprint);
+        let payload_json = serde_json::to_value(&payload)
+            .map_err(|e| MegaError::Other(format!("attach payload encode: {e}")))?;
 
-        let wait = self
-            .storage
-            .push_queue_service
-            .enqueue_and_wait(EnqueueRequest {
-                kind: crate::callisto::sea_orm_active_enums::PushQueueKindEnum::Attach,
-                operation_id,
-                path,
-                old_id,
-                new_id: commit_id,
-                requester: None,
-                payload: serde_json::to_value(&payload)
-                    .map_err(|e| MegaError::Other(format!("attach payload encode: {e}")))?,
-                ref_name: None,
-                is_delete: false,
-            })
-            .await?;
+        // A Done row is a permanent replay key for its operation id, and once
+        // pushes may update, force and delete, the same command set can come
+        // round again after the refs moved away. A replay therefore only
+        // counts when this push's refs are already in place; otherwise the
+        // push is enqueued once more under a fresh id and B3's CAS decides.
+        let mut replayed_stale = false;
+        let wait = loop {
+            let old_id = mono
+                .get_main_ref("/")
+                .await?
+                .map(|r| r.ref_commit_hash)
+                .unwrap_or_else(|| ZERO_ID.to_owned());
+            let wait = self
+                .storage
+                .push_queue_service
+                .enqueue_and_wait(EnqueueRequest {
+                    kind: crate::callisto::sea_orm_active_enums::PushQueueKindEnum::Attach,
+                    operation_id: operation_id.clone(),
+                    path: path.clone(),
+                    old_id,
+                    new_id: commit_id.clone(),
+                    requester: None,
+                    payload: payload_json.clone(),
+                    ref_name: None,
+                    is_delete: false,
+                })
+                .await?;
+            match wait {
+                QueueWaitResult::Replayed { id, .. }
+                    if !self.attach_refs_applied(&payload).await? =>
+                {
+                    if replayed_stale {
+                        return Err(MegaError::Other(format!(
+                            "ImportRepo attach replayed push_queue id {id} but the refs did not move; retry the push"
+                        )));
+                    }
+                    replayed_stale = true;
+                    operation_id = attach_operation_id(
+                        &format!("{}#{}", self.repo.repo_id, uuid::Uuid::new_v4()),
+                        &fingerprint,
+                    );
+                }
+                wait => break wait,
+            }
+        };
 
         match wait {
             QueueWaitResult::Replayed { .. } => Ok(()),
             QueueWaitResult::Abandoned { id } => Err(MegaError::Other(format!(
                 "attach wait abandoned for push_queue id {id}"
             ))),
-            QueueWaitResult::Rejected { id, message } => Err(MegaError::Other(format!(
-                "attach rejected for push_queue id {id}: {message}"
-            ))),
+            QueueWaitResult::Rejected { id, message } => {
+                Err(attach_refusal(&payload, id, &message))
+            }
             QueueWaitResult::Ready { id } => {
                 let ctx = AttachExecContext {
                     storage: self.storage.clone(),
@@ -670,13 +674,52 @@ impl ImportRepo {
                     .await?
                 {
                     ExecuteOutcome::Done { .. } => Ok(()),
-                    other => Err(MegaError::Other(format!(
-                        "attach B3 did not complete successfully: {other:?}"
+                    ExecuteOutcome::Failed { id, message, .. } => {
+                        Err(attach_refusal(&payload, id, &message))
+                    }
+                    _ => Err(MegaError::Other(format!(
+                        "ImportRepo attach for push_queue id {id} did not complete; retry the push"
                     ))),
                 }
             }
         }
     }
+}
+
+/// Client text for a refused attach round (plan-20260923 ADR-FU-08 item 5).
+/// The queue carries the refusal as text, so return the typed
+/// `ImportRepoError` whose text it is (the leaf path or one of this push's
+/// branch commands). The materialization precheck keeps its I3 detail (it
+/// names monorepo paths only). Anything else can carry storage internals, so
+/// the client gets a fixed sentence; the reason stays in the queue row.
+fn attach_refusal(payload: &AttachPayload, id: i64, message: &str) -> MegaError {
+    let occupied = ImportRepoError::PathOccupied {
+        path: payload.repo_path.clone(),
+    };
+    let stale = payload.commands.iter().map(|c| ImportRepoError::StaleRef {
+        ref_name: c.ref_name.clone(),
+        expected: c.old_id.clone(),
+    });
+    if let Some(typed) = std::iter::once(occupied)
+        .chain(stale)
+        .find(|candidate| candidate.to_string() == message)
+    {
+        return typed.into();
+    }
+    if let Some(detail) = message
+        .strip_prefix("Other error: ")
+        .filter(|detail| detail.starts_with("attach refused: ") && detail.ends_with(" (I3)"))
+    {
+        return MegaError::Other(format!("ImportRepo attach failed: {detail}"));
+    }
+    // The reason stays in `push_queue.error_message`; not logged here.
+    tracing::warn!(
+        id,
+        "ImportRepo attach refused without a client-facing reason"
+    );
+    MegaError::Other(format!(
+        "ImportRepo attach failed (push_queue id {id}); retry the push"
+    ))
 }
 
 async fn process_objects(
@@ -1087,9 +1130,10 @@ mod tests {
         assert!(git_db.get_ref(repo_id).await.unwrap().is_empty());
     }
 
-    /// Pure delete-only attach must not enqueue into MonoWriteQueue.
+    /// A delete-only batch goes through MonoWriteQueue like any other branch
+    /// batch (GC-FU-03) and never moves the monorepo root.
     #[tokio::test]
-    async fn attach_delete_only_does_not_enqueue() {
+    async fn fu13_delete_only_applies_through_queue() {
         let temp = tempfile::tempdir().unwrap();
         let storage = wired_storage_with_monorepo(&temp).await;
         let (repo, _commit, create_cmd) =
@@ -1106,6 +1150,12 @@ mod tests {
         delete_cmd.old_id = create_cmd.new_id.clone();
         delete_cmd.new_id = ZERO_ID.to_string();
 
+        let root_before = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
         let import_repo = ImportRepo {
             storage: storage.clone(),
             repo,
@@ -1124,11 +1174,23 @@ mod tests {
                 .is_empty(),
             "delete-only attach must remove the import ref"
         );
-        let queued = push_queue::Entity::find()
-            .count(storage.git_db_storage().get_connection())
+        let rows = push_queue::Entity::find()
+            .all(storage.git_db_storage().get_connection())
             .await
             .unwrap();
-        assert_eq!(queued, 0, "delete-only attach must not enqueue");
+        assert_eq!(rows.len(), 1, "delete-only attach is one queue round");
+        assert_eq!(
+            rows[0].status,
+            crate::callisto::sea_orm_active_enums::PushQueueStatusEnum::Done
+        );
+        let root_after = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_after.ref_commit_hash, root_before.ref_commit_hash);
+        assert_eq!(root_after.ref_tree_hash, root_before.ref_tree_hash);
     }
 
     /// FU-12: an ImportRepo whose tag `refs/tags/v1` points at `"1" * 40`.
@@ -1320,6 +1382,138 @@ mod tests {
         assert!(
             refs[0].default_branch,
             "the remaining branch becomes the default"
+        );
+    }
+
+    /// FU-13: push `commands` to `repo` through the real attach path.
+    async fn fu13_push(
+        storage: &Storage,
+        repo: &Repo,
+        commands: Vec<RefCommand>,
+    ) -> Result<(), String> {
+        let import_repo = ImportRepo {
+            storage: storage.clone(),
+            repo: repo.clone(),
+            command_list: Mutex::new(commands),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        };
+        import_repo
+            .attach_to_monorepo_parent()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn fu13_replayed_attach_rechecks_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, c1, create) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/fu13-replay").await;
+        let c2 = Commit::from_tree_id(c1.tree_id, vec![c1.id], "fu13 replay second");
+        storage
+            .import_service
+            .save_entry(
+                repo.repo_id,
+                vec![MetaAttached {
+                    inner: c2.clone().into(),
+                    meta: EntryMeta::new(),
+                }],
+            )
+            .await
+            .unwrap();
+        let (c1_id, c2_id) = (c1.id.to_string(), c2.id.to_string());
+        let main = |old: &str, new: &str| {
+            let mut cmd = RefCommand::new(old.to_owned(), new.to_owned(), "refs/heads/main".into());
+            cmd.command_type = CommandType::Update;
+            cmd
+        };
+        fu13_push(&storage, &repo, vec![create])
+            .await
+            .expect("first push");
+        fu13_push(&storage, &repo, vec![main(&c1_id, &c2_id)])
+            .await
+            .expect("c1 → c2");
+        fu13_push(&storage, &repo, vec![main(&c2_id, &c1_id)])
+            .await
+            .expect("force back to c1");
+        // Same commands as the second push: its Done row is replayed, but the
+        // ref is not at c2 any more, so the push must be applied again.
+        fu13_push(&storage, &repo, vec![main(&c1_id, &c2_id)])
+            .await
+            .expect("c1 → c2 again");
+        let refs = storage
+            .git_db_storage()
+            .get_ref(repo.repo_id)
+            .await
+            .unwrap();
+        let tip = refs
+            .iter()
+            .find(|r| r.ref_name == "refs/heads/main")
+            .map(|r| r.ref_git_id.clone());
+        assert_eq!(tip, Some(c2_id.clone()));
+        // A genuine retry (refs already in place) is still an idempotent replay.
+        fu13_push(&storage, &repo, vec![main(&c1_id, &c2_id)])
+            .await
+            .expect("idempotent retry");
+        let queued = push_queue::Entity::find()
+            .filter(push_queue::Column::Path.eq(repo.repo_path.clone()))
+            .count(storage.git_db_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(queued, 4, "the idempotent retry adds no row");
+    }
+
+    #[test]
+    fn fu13_attach_refusal_rebuilds_typed_errors() {
+        use crate::common::errors::{ImportRepoError, MegaError};
+        let payload = AttachPayload {
+            repo_id: 1,
+            repo_path: "/third-party/x".to_owned(),
+            commands: vec![AttachCommand {
+                ref_name: "refs/heads/dev".to_owned(),
+                old_id: "3".repeat(40),
+                new_id: "4".repeat(40),
+                command_type: "Update".to_owned(),
+                ref_type: "branch".to_owned(),
+                default_branch: false,
+            }],
+        };
+        let occupied = ImportRepoError::PathOccupied {
+            path: "/third-party/x".to_owned(),
+        };
+        let err = super::attach_refusal(&payload, 9, &occupied.to_string());
+        assert!(
+            matches!(
+                err,
+                MegaError::ImportRepo(ImportRepoError::PathOccupied { .. })
+            ),
+            "{err}"
+        );
+        let stale = ImportRepoError::StaleRef {
+            ref_name: "refs/heads/dev".to_owned(),
+            expected: "3".repeat(40),
+        };
+        let err = super::attach_refusal(&payload, 9, &stale.to_string());
+        assert_eq!(err.to_string(), stale.to_string());
+        // The materialization precheck keeps its I3 detail.
+        let precheck = "Other error: attach refused: ancestor '/third-party' already has a materialized main ref (I3)";
+        let err = super::attach_refusal(&payload, 9, precheck);
+        assert_eq!(
+            err.to_string(),
+            "Other error: ImportRepo attach failed: attach refused: ancestor '/third-party' already has a materialized main ref (I3)"
+        );
+        // Anything else never reaches the client verbatim.
+        let internal =
+            "Database error: connection to postgres://mega2:s3cret@10.0.0.5/mega2 failed";
+        let err = super::attach_refusal(&payload, 9, internal).to_string();
+        assert_eq!(
+            err,
+            "Other error: ImportRepo attach failed (push_queue id 9); retry the push"
+        );
+        assert!(
+            !err.contains("s3cret") && !err.contains("postgres://"),
+            "{err}"
         );
     }
 

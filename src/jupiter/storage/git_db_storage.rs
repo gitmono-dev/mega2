@@ -112,6 +112,20 @@ impl GitDbStorage {
         Ok(result)
     }
 
+    /// The refs of `repo_id` named in `names` (at most one row per name, by
+    /// the unique index); bounded by the caller's command count.
+    pub async fn get_refs_by_names(
+        &self,
+        repo_id: i64,
+        names: &[String],
+    ) -> Result<Vec<import_refs::Model>, MegaError> {
+        Ok(import_refs::Entity::find()
+            .filter(import_refs::Column::RepoId.eq(repo_id))
+            .filter(import_refs::Column::RefName.is_in(names.iter().cloned()))
+            .all(self.get_connection())
+            .await?)
+    }
+
     pub async fn update_ref(
         &self,
         repo_id: i64,
