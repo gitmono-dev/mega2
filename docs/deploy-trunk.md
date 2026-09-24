@@ -275,6 +275,52 @@ git -c transfer.fsckObjects=true -c fetch.fsck.skipList="$PWD/mega2-fsck-skiplis
 
 本地 `git fsck` 同样可加 `-c fsck.skipList=<同一文件>`。skip list 只豁免列出的对象，其余对象仍按严格规则校验。
 
+### 9.2 升级时的 ImportRepo 别名路径规范化
+
+升级到 `0.40.4` 后的首次启动执行一次迁移 `m20260923_000200_canonicalize_import_repo_paths`：`git_repo` 中 `repo_path` 不是规范形式的行，即 TP-08 之前写入的旧别名（重复斜杠、尾斜杠、`.` 段，例如 `/third-party//foo/`），改写为规范路径（`/third-party/foo`），`repo_id` 及其 ref 与对象行不变。迁移按行本身判定，与 `monorepo.import_dir` 无关，非默认的 import 根同样覆盖；整个改写在一个事务内完成，重复执行无变化，无需配置。协议层的 TP-08 规范化保持不变，旧别名 URL 仍命中同一仓库（回归用例 `import_repo_alias_*`，[`plan-20260923.md`](plan/plan-20260923.md) FU-15）。
+
+启动日志输出一行汇总：
+
+```text
+canonicalized ImportRepo alias paths rewritten=<N> collisions=<M> invalid=<K>
+```
+
+| 计数 | 含义 |
+|---|---|
+| `rewritten` | 已改写为规范路径的别名行数。 |
+| `collisions` | 规范路径已被另一行占用而保留原样的别名行数：同一仓库已分裂为两个 `repo_id`。每行另有一条 WARN，只含 `repo_id` 与规范路径。 |
+| `invalid` | 路径无法规范化（例如含 `..` 段或 `\`）而保留原样的行数，每行另有一条 WARN，只含 `repo_id`。 |
+
+两个计数都为 0 时无需任何操作。
+
+`collisions` 不为 0 时，同一仓库已分裂为两个 `repo_id`（升级前即已如此，迁移不改变它）：
+
+- Git 请求（clone / fetch / push）一律按规范路径解析，命中占用规范路径的那一行；
+- Web / API 按路径前缀查找仓库时取最长的已存路径：别名以 `/` 或 `/.` 结尾时，规范路径之下的文件、tag、commit 的查询与写入仍落到别名那一行；
+- 后续版本的 ImportRepo 清理按规范路径精确查找仓库：不删除这类别名行，也不把它们算作子仓（计划 ADR-FU-10 第 3 条、`DEFER-FU-10`）。
+
+处理步骤：
+
+1. 用 WARN 中的 `repo_id` 与规范路径对照两行及其 ref：
+
+   ```sql
+   SELECT id, repo_path, created_at, updated_at FROM git_repo
+    WHERE id = <WARN 中的 repo_id> OR repo_path = '<WARN 中的规范路径>';
+   SELECT repo_id, ref_name, ref_git_id FROM import_refs
+    WHERE repo_id IN (<两个 id>) ORDER BY ref_name, repo_id;
+   ```
+
+2. 不要手工改写或删除两行中的任何一行：自动合并尚未提供（计划 `DEFER-FU-10`），请附上述查询结果提交 issue。别名行的数据不会被迁移删除。
+
+`invalid` 不为 0 时，计入的行没有规范形式，因此也没有对应的规范行：协议层对这类路径的请求一律拒绝（TP-08 规范化失败），升级前后都不被服务，迁移不改动它们。按 WARN 中的 `repo_id` 查看：
+
+```sql
+SELECT id, repo_path, created_at, updated_at FROM git_repo WHERE id = <WARN 中的 repo_id>;
+SELECT ref_name, ref_git_id FROM import_refs WHERE repo_id = <同一 id> ORDER BY ref_name;
+```
+
+需要其中的内容时同样不要手工改写该行，请附查询结果提交 issue。
+
 ## 10. storage-only OCI Distribution（`/v2`）
 
 架构与端点事实源：[`refactoring/oci.md`](./refactoring/oci.md)（plan-20260902）。本节只覆盖运维启用与 `docker login` 认证语义。

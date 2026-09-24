@@ -5908,3 +5908,172 @@ fn path_policy_raw_nonzero_old_id_unresolved_root_rejected() {
     );
     fu10_shutdown(service, &stderr_path);
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-15: a legacy alias `git_repo.repo_path` is rewritten to its
+// canonical form at startup, so the canonical URL keeps serving the same
+// repo_id instead of splitting the identity.
+// ---------------------------------------------------------------------------
+
+fn fu15_exec(db_url: &str, sql: &str) -> u64 {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB: {err}"));
+        db.execute_unprepared(sql)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}: {err}"))
+            .rows_affected()
+    })
+}
+
+fn fu15_repo_rows(db_url: &str) -> Vec<(i64, String)> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB: {err}"));
+        db.query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT id, repo_path FROM git_repo ORDER BY id".to_owned(),
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("query git_repo: {err}"))
+        .iter()
+        .map(|row| {
+            (
+                row.try_get("", "id").unwrap(),
+                row.try_get("", "repo_path").unwrap(),
+            )
+        })
+        .collect()
+    })
+}
+
+#[test]
+fn import_repo_alias_row_served_after_migration() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let db_url = env.database.db_url.clone();
+    let path = "/third-party/fu15-alias";
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    git_ok_no_auth(case_dir, &["init", "-b", "main", "fu15-alias"]);
+    configure_git_identity_no_auth(case_dir, "fu15-alias");
+    fu13_commit(case_dir, "fu15-alias", "v1\n", "v1");
+    git_cli::assert_git_success(
+        &fu13_push(
+            case_dir,
+            "fu15-alias",
+            &trunk_subpath_url(port, path),
+            &["HEAD:refs/heads/main"],
+        ),
+        "first push",
+    );
+    let rows = fu15_repo_rows(&db_url);
+    let [(repo_id, stored)] = rows.as_slice() else {
+        panic!("one git_repo row expected: {rows:?}");
+    };
+    let repo_id = *repo_id;
+    assert_eq!(stored, path);
+    fu10_shutdown(service, &stderr_path);
+
+    // A database from before TP-08: the row carries an alias spelling that no
+    // request resolves to, and the FU-15 migration has not run yet.
+    assert_eq!(
+        fu15_exec(
+            &db_url,
+            &format!(
+                "UPDATE git_repo SET repo_path = '/third-party//fu15-alias/' WHERE id = {repo_id}"
+            ),
+        ),
+        1
+    );
+    assert_eq!(
+        fu15_exec(
+            &db_url,
+            "DELETE FROM seaql_migrations \
+             WHERE version = 'm20260923_000200_canonicalize_import_repo_paths'",
+        ),
+        1
+    );
+    // Such a row predates the FU-13 mount record as well.
+    assert_eq!(
+        fu15_exec(
+            &db_url,
+            &format!(
+                "DELETE FROM audit_logs WHERE target_id = {repo_id} \
+                 AND metadata->>'kind' = 'import_repo.attach'"
+            ),
+        ),
+        1
+    );
+
+    let mut boot_env = trunk_boot_env().to_vec();
+    boot_env.push(("MEGA_LOG__WITH_ANSI", "false"));
+    let (service, port, stdout_path, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &boot_env);
+    let log = read_log(&stdout_path);
+    assert!(
+        log.lines()
+            .any(|line| line.contains("canonicalized ImportRepo alias paths")
+                && line.contains("rewritten=1")
+                && line.contains("collisions=0")),
+        "the startup migration reports its rewrite:\n{log}"
+    );
+    assert_eq!(fu15_repo_rows(&db_url), vec![(repo_id, path.to_owned())]);
+
+    let url = trunk_subpath_url(port, path);
+    git_ok_no_auth(case_dir, &["clone", &url, "fu15-clone"]);
+    assert_eq!(
+        fs::read_to_string(case_dir.join("fu15-clone").join("file.txt")).expect("read clone"),
+        "v1\n"
+    );
+    let v2 = fu13_commit(case_dir, "fu15-alias", "v2\n", "v2");
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu15-alias", &url, &["HEAD:refs/heads/main"]),
+        "push after migration",
+    );
+    git_ok_no_auth(case_dir, &["-C", "fu15-clone", "fetch", "origin"]);
+    assert_eq!(
+        git_stdout_no_auth(case_dir, &["-C", "fu15-clone", "rev-parse", "origin/main"]),
+        v2
+    );
+    // An alias spelling of the URL reaches the same repository through the
+    // protocol's TP-08 canonicalization.
+    assert_eq!(
+        fu13_remote_ref(
+            case_dir,
+            &trunk_subpath_url(port, "/third-party//fu15-alias"),
+            "refs/heads/main"
+        ),
+        Some(v2)
+    );
+    assert_eq!(
+        fu15_repo_rows(&db_url),
+        vec![(repo_id, path.to_owned())],
+        "clone, push, fetch and ls-remote used the same repo_id; no second row"
+    );
+    // The push after the migration recorded the mount at the canonical path
+    // (legacy backfill), which later cleanup relies on.
+    with_runtime(async {
+        let db = Database::connect(db_url.as_str()).await.unwrap();
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT count(*) AS n FROM audit_logs WHERE target_id = {repo_id} \
+                     AND metadata->>'kind' = 'import_repo.attach' \
+                     AND metadata->>'path' = '{path}'"
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
+    });
+    fu10_shutdown(service, &stderr_path);
+}
