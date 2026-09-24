@@ -4,6 +4,8 @@
 
 > **范围**：不接入 mega2 用户系统、不使用 Issue / Change List、不走评审门控的存储与分发部署。默认形态仍是 `push_policy=review`；未改配置的既有部署行为不变。
 
+该部署形态提供 Monorepo Git 服务；Agent Session Capture 是独立的可选 HTTP 接口，需单独启用和配置 ingest token，不会由 Git push 自动产生会话记录。配置条件与数据接口见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
+
 ## 1. `push_policy=trunk`
 
 ```toml

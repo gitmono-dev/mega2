@@ -2,7 +2,7 @@
 
 [English](user-guide.md) · 中文
 
-本指南介绍 mega2 的日常使用方式，包括 Git 客户端、HTTP API、大文件、可选服务和 CLI。部署步骤见[部署指南](./deployment.zh.md)；配置键以带注释的 [`config.toml`](../config/config.toml) 为准；错误类型与状态码见[错误模型](./errors.md)。
+mega2 是面向 Agent 的第二代 Mega 引擎，主要提供 Monorepo 引擎与可选的 Agent Session Capture。推荐的 Agent 工作流会将 mega2 与 ScorpioFS（本地文件系统挂载）和 Libra（版本控制工作流）配合使用。本指南介绍日常 Git、HTTP API、大文件、可选服务和 CLI 操作；部署步骤见[部署指南](./deployment.zh.md)，配置键以带注释的 [`config.toml`](../config/config.toml) 为准，错误类型与状态码见[错误模型](./errors.md)。
 
 > **范围：**mega2 开源版只支持 **trunk / storage-only** 部署模式，不提供 Web UI 或 Change List（CL）。交互式浏览和目录、Tag 操作请使用 Libra 的 `libra mega2 browser`（见第 6 节）。
 
@@ -124,17 +124,17 @@ Git 客户端 tag 被禁后的唯一入口:
 两个面均为**双重门控**(storage-only 形态 + 各自开关),缺一则整面不存在(裸 404);在非 storage-only 形态下打开开关会拒绝启动。
 
 - **OCI Distribution `/v2`**:storage-only 且 `[oci].enabled=true` 时挂载,可作容器镜像仓库(`docker login` 复用 push token,无独立 token 服务)。架构与端点事实源见 [`refactoring/oci.md`](./refactoring/oci.md),启用步骤见 [`deploy-trunk.md`](./deploy-trunk.md) 第 10 节。
-- **Agent Capture `/api/v1/agent-capture`**:storage-only 且 `[agent_capture].enabled=true` 时挂载,捕获 agent 会话 / 事件 / checkpoint / 文件操作;另有独立的 `[[agent_capture.ingest_tokens]]` 认证面。配置与配额事实源见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
+- **Agent Session Capture `/api/v1/agent-capture`**：可选能力，接收并查询 Agent 会话、事件、checkpoint、transcript 与文件操作记录。仅在 storage-only 且 `[agent_capture].enabled=true`、配置至少一个 `[[agent_capture.ingest_tokens]]` 时挂载；使用独立 ingest token，不复用 Git push token，也不会由 Git push 自动产生会话记录。配置与配额事实源见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
 
 ## 6. 配合 Libra 使用
 
-mega2 自身不提供交互界面。日常浏览与目录 / Tag 操作在 Libra 工作副本中执行:
+mega2 开源版不提供 Web UI。Libra 的 `libra mega2 browser` 在终端提供基础远程目录浏览，以及受支持的目录和 Tag 列出、创建、删除等操作；这些操作不替代 Git 客户端的 clone、fetch、push:
 
 ```bash
 libra mega2 browser
 ```
 
-该 TUI 消费第 4 节的 HTTP 面(tree 读、create / delete / move-entry、tags)。sha256 / blake3 对象格式同样只在 Libra 客户端下可用(见 2.4)。
+该 TUI 逐层浏览远程目录，支持创建、删除、移动、重命名目录；Tag 面板可列出、创建和删除根 Tag，创建和删除需要写入凭据。它读取 Mega2 的远程目录与 Tag 数据，不执行 Git clone、fetch、push。sha256 / blake3 对象格式同样只在 Libra 客户端下可用(见 2.4)。
 
 ## 7. CLI 速查
 

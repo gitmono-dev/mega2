@@ -2,7 +2,7 @@
 
 [English](recipes.md) · 中文
 
-本篇收集快速开始之后常用的操作示例：推送目录、迁移或镜像仓库、使用 LFS 和 OCI、上传构建产物，以及保存本地数据。首次启动与第一次推送见[快速开始](./quick-start.zh.md)。
+mega2 的核心能力是 Monorepo 与可选的 Agent Session Capture。本篇补充 LFS、OCI、构建产物和数据持久化等其他功能的操作示例；首次启动与 Monorepo 推送见[快速开始](./quick-start.zh.md)，Agent 会话捕获见[使用指南](./user-guide.zh.md)和[接口配置说明](./refactoring/agent-capture.md)。
 
 ## 推送嵌套目录
 

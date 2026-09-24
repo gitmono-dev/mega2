@@ -2,13 +2,13 @@ English · [中文](architecture.zh.md)
 
 # Architecture
 
-This document maps mega2's modules, storage layers, write path, protocol surfaces, and configuration reload flow. It reflects the source in this checkout; inline `src/...` paths point to the relevant implementation.
+The original Mega was the first-generation monorepo platform; Mega2 is the second-generation engine built for Agents. Its core capabilities are the Monorepo engine and optional Agent Session Capture. The recommended Agent setup combines Mega2 with [ScorpioFS](https://github.com/gitmono-dev/scorpiofs), which mounts Monorepo paths as a local filesystem, and [Libra](https://libra.tools), which provides Agent version-control workflows and terminal browsing. This document maps Mega2's modules, storage layers, write path, protocol surfaces, and configuration reload flow. It reflects the source in this checkout; inline `src/...` paths point to the relevant implementation.
 
 > **Scope:** the open-source service is deployed in trunk / storage-only mode. It has no Web UI; use Libra's `libra mega2 browser` for interactive browsing. The [User Guide](./user-guide.md) covers repository paths, branches, tags, and push behavior; the [Deployment Guide](./deployment.md) covers installation and operations. This page provides an architecture overview and links to implementation references.
 
 ## 1. Overview and dependency flow
 
-mega2 is a single Cargo package (lib `mega2_core` + binaries; see [`../Cargo.toml`](../Cargo.toml)). It ports and refactors selected parts of the upstream Mega project; it is not a mirror, and the two repositories do not share identical module boundaries. Evaluate upstream changes against this checkout's code and dependency lockfile before adopting them. Entry point: `src/main.rs` → `cli::parse` → the subcommand registry in `src/commands/mod.rs`. Runtime dependency flow is one-directional: upper layers compose lower layers; lower layers never reference back up.
+Mega2 is a second-generation engine for Agent workflows; the first-generation Mega project and this repository are separate codebases. The Monorepo service manages the code tree and Git protocols, while Agent Session Capture stores and queries Agent session records through a separate, optional API. Mega2 is a single Cargo package (lib `mega2_core` + binaries; see [`../Cargo.toml`](../Cargo.toml)) and ports and refactors selected parts of the first-generation Mega project; it is not a mirror, and the two repositories do not share identical module boundaries. Evaluate upstream changes against this checkout's code and dependency lockfile before adopting them. Entry point: `src/main.rs` → `cli::parse` → the subcommand registry in `src/commands/mod.rs`. Runtime dependency flow is one-directional: upper layers compose lower layers; lower layers never reference back up.
 
 ```
 ┌────────────────────────────────────────────────────────────┐

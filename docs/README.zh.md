@@ -2,7 +2,20 @@
 
 [English](README.md) · 中文
 
-按你的任务从这里开始。快速开始和使用指南面向使用者；配置、部署和开发文档面向运维人员与贡献者。mega2 不提供 Web UI；需要互动式浏览仓库或执行受支持的目录、Tag 操作时，请在 Libra 工作副本中运行 `libra mega2 browser`。子系统契约和计划记录保留在各自目录中。
+Mega 是第一代 Monorepo 平台；Mega2 是面向 Agent 的第二代引擎，重点提供 Monorepo 引擎与可选的 Agent Session Capture。Agent 场景推荐组合使用 Mega2、[ScorpioFS](https://github.com/gitmono-dev/scorpiofs) 和 [Libra](https://libra.tools)：Mega2 托管 Monorepo 并提供会话捕获接口，ScorpioFS 将仓库挂载为本地文件系统，Libra 为 Agent 提供版本控制工作流和终端浏览入口。
+
+Mega2 开源版不提供 Web UI。运行 `libra mega2 browser --server <URL>` 可打开 Libra 终端浏览器：它逐层浏览远程目录，支持创建、删除、移动、重命名目录，并可列出、创建和删除根 Tag；创建或删除需要写入凭据。该命令不替代 Git 客户端的 clone、fetch、push。
+
+按你的任务从这里开始。快速开始和使用指南面向使用者；配置、部署和开发文档面向运维人员与贡献者。子系统契约和计划记录保留在各自目录中。
+
+## Mega2 核心能力
+
+| 能力 | 说明 | 深入阅读 |
+|---|---|---|
+| Monorepo 引擎 | 托管代码目录与 Git 仓库；Git 客户端负责 clone、fetch、push，Libra browser 提供基础远程目录浏览和 Tag 操作。 | [使用指南](user-guide.zh.md) |
+| Agent Session Capture | 可选 HTTP 能力，接收并查询 Agent 会话、事件、checkpoint、transcript 和文件操作记录；它与 Git push 是独立接口。需在 storage-only 部署中显式启用并配置 ingest token。 | [Agent Capture 配置与接口](refactoring/agent-capture.md) · [部署指南](deployment.zh.md) |
+
+LFS、OCI、构建产物、Vault、通知和配置等其他能力见[进阶使用场景](recipes.zh.md)、[使用指南](user-guide.zh.md)及[配置参考](configuration.zh.md)。
 
 ## 开始使用
 

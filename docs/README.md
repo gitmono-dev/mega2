@@ -2,7 +2,20 @@
 
 English · [中文](README.zh.md)
 
-Choose a guide by task. The quick start and user guide cover day-to-day use; configuration, deployment, and development guides are for operators and contributors. mega2 does not provide a Web UI; use `libra mega2 browser` from a Libra working copy for interactive repository browsing and supported directory or tag operations. Subsystem contracts and planning records remain in their own directories.
+The original Mega was the first-generation monorepo platform. Mega2 is the second-generation engine built for Agents, with two core capabilities: the Monorepo engine and optional Agent Session Capture. The recommended Agent setup combines Mega2, [ScorpioFS](https://github.com/gitmono-dev/scorpiofs), and [Libra](https://libra.tools): Mega2 hosts the Monorepo and exposes the capture API, ScorpioFS mounts repository paths as a local filesystem, and Libra provides Agent version-control workflows and terminal browsing.
+
+The open-source edition of Mega2 has no Web UI. Run `libra mega2 browser --server <URL>` to open Libra's terminal browser: it browses remote directories one level at a time, supports creating, deleting, moving, and renaming directories, and can list, create, and delete root tags. Write credentials are required to create or delete tags. The command does not replace Git clone, fetch, or push.
+
+Choose a guide by task. The quick start and user guide cover day-to-day use; configuration, deployment, and development guides are for operators and contributors. Subsystem contracts and planning records remain in their own directories.
+
+## Mega2 core capabilities
+
+| Capability | Description | Further reading |
+|---|---|---|
+| Monorepo engine | Hosts code trees and Git repositories. Use Git clients for clone, fetch, and push; use Libra browser for basic remote directory browsing and tag operations. | [User Guide](user-guide.md) |
+| Agent Session Capture | Optional HTTP capability for ingesting and querying Agent sessions, events, checkpoints, transcripts, and file operations. It is separate from Git push and requires explicit enablement plus an ingest token in storage-only mode. | [Agent Capture configuration and API](refactoring/agent-capture.md) · [Deployment Guide](deployment.md) |
+
+Other capabilities—including LFS, OCI, build artifacts, Vault, notifications, and configuration—are covered in [Usage Recipes](recipes.md), the [User Guide](user-guide.md), and the [Configuration Reference](configuration.md).
 
 ## Get started
 

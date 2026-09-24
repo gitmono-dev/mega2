@@ -5,6 +5,8 @@
 [`refactoring/test-infra.md`](./refactoring/test-infra.md)；提交前三门禁见
 [`AGENTS.md`](../AGENTS.md)。
 
+mega2 是面向 Agent 的第二代 Mega 引擎，核心能力为 Monorepo 与可选的 Agent Session Capture。本文聚焦源码构建和测试环境；产品组件关系见[架构设计](./architecture.zh.md)，会话捕获配置见[接口参考](./refactoring/agent-capture.md)。
+
 **Monorepo 产品规则**（公开分支仅 `main`、禁止 Git 客户端操作 tag、初始化与目录结构、trunk 不变式）见集中文档
 [使用指南](./user-guide.zh.md)。Trunk / storage-only 部署见 [`deployment.zh.md`](./deployment.zh.md) 与 [`deploy-trunk.md`](./deploy-trunk.md)。
 

@@ -2,7 +2,7 @@
 
 English · [中文](recipes.zh.md)
 
-Use these recipes after completing the [Quick Start](./quick-start.md). They cover nested directories, repository migration and mirroring, Git LFS, OCI images, build artifacts, and persistent local data.
+Mega2's core capabilities are the Monorepo engine and optional Agent Session Capture. These recipes cover additional workflows such as LFS, OCI, build artifacts, and persistent data. Start with the [Quick Start](./quick-start.md) for Monorepo Git operations; see the [User Guide](./user-guide.md) and [Agent Capture API reference](./refactoring/agent-capture.md) for session capture.
 
 ## Push nested directories
 

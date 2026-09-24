@@ -2,6 +2,8 @@
 
 English · [中文](quick-start.zh.md)
 
+The original Mega was the first-generation monorepo platform; Mega2 is the second-generation engine built for Agents. Its core capabilities are Monorepo hosting and optional Agent Session Capture. The recommended Agent setup combines Mega2 with ScorpioFS, which mounts repository paths as a local filesystem, and Libra, which provides Agent version-control workflows. This quick start focuses on Git operations against the Monorepo; Agent Session Capture must be enabled separately (see the [Deployment Guide](./deployment.md) and [Configuration Reference](./configuration.md)).
+
 Start the local mega2 evaluation stack with the Compose file for your platform: [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml) on macOS with OrbStack, or [`linux-mega2-compose.yml`](../linux-mega2-compose.yml) on Linux. You will clone a repository over HTTP, push to `main`, and read the result back through the API. The remaining examples cover repository migration, Git LFS, OCI images, build artifacts, and data persistence. The stack pulls the **official release image from Docker Hub** (`genedna/mega2:latest`); it does not build from source and needs no bootstrap command or token. For branch and tag behavior, see the [User Guide](./user-guide.md).
 
 ## Prerequisites
@@ -55,7 +57,7 @@ Pushes to branches other than `main` and tag pushes from Git clients are rejecte
 curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 ```
 
-Explore the HTTP API—including Git Smart HTTP, LFS, product writes, tags, and optional OCI `/v2`—in Swagger UI at `http://127.0.0.1:9000/swagger-ui`. The OpenAPI document is at `/api/openapi.json`. mega2 has no Web UI; use `libra mega2 browser` for interactive terminal browsing.
+Explore the HTTP API—including Git Smart HTTP, LFS, product writes, tags, and optional OCI `/v2`—in Swagger UI at `http://127.0.0.1:9000/swagger-ui`. The OpenAPI document is at `/api/openapi.json`. Mega2 has no Web UI; use `libra mega2 browser` for basic terminal directory browsing and tag operations. Git clone, fetch, and push still use a Git client.
 
 ## Example: create a repository at a new path
 

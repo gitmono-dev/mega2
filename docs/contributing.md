@@ -133,9 +133,12 @@ listed here:
 
 ## 7. Adapting upstream changes
 
-mega2 ports and refactors selected parts of the upstream Mega project; it is
-not a mirror. Before adopting an upstream change, check that it applies to a
-module and behavior present in this checkout. Compare the actual source and
+Mega was the first-generation monorepo platform; Mega2 is the second-generation
+engine built for Agent workflows, with Monorepo hosting and Agent Session
+Capture as its core capabilities. Mega2 ports and refactors selected parts of
+the first-generation Mega project; it is not a mirror. Before adopting an
+upstream change, check that it applies to a module and behavior present in this
+checkout. Compare the actual source and
 tests rather than copying a list of changed files, and classify changes that
 depend on upstream-only services or repository structure as out of scope.
 

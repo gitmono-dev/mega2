@@ -2,13 +2,13 @@
 
 # 架构设计
 
-本文描述 mega2 的整体架构：模块划分、存储分层、写入路径、认证授权与机密管理、协议面挂载、配置与热加载。事实基线是当前 checkout 的源码；代码引用以 `src/...` 内联路径标注。
+Mega 是第一代 Monorepo 平台；mega2 是面向 Agent 的第二代引擎，核心能力是 Monorepo 引擎和可选的 Agent Session Capture。面向 Agent 的推荐实践是配合 [ScorpioFS](https://github.com/gitmono-dev/scorpiofs)（将 Monorepo 挂载为本地文件系统）与 [Libra](https://libra.tools)（Agent 版本控制工作流及终端浏览）。本文描述 mega2 的模块划分、存储分层、写入路径、认证授权与机密管理、协议面挂载、配置与热加载。事实基线是当前 checkout 的源码；代码引用以 `src/...` 内联路径标注。
 
 > **范围：**开源版 mega2 以 trunk / storage-only 模式部署，不提供 Web UI；交互式浏览请使用 Libra 命令 `libra mega2 browser`。[使用指南](./user-guide.zh.md)介绍仓库路径、分支、Tag 和推送行为；[部署指南](./deployment.zh.md)介绍安装与运维。本文概述架构并链接到实现参考。
 
 ## 1. 总览与依赖流向
 
-mega2 是单 Cargo package（lib `mega2_core` + 二进制；见 [`../Cargo.toml`](../Cargo.toml)）。它移植并重构了上游 Mega 项目的部分功能，不是上游仓库的镜像；两边的模块边界也不完全相同。评估上游改动时，应以本仓库源码和依赖锁文件为依据，再判断是否适用。入口 `src/main.rs` → `cli::parse` → `src/commands/mod.rs` 的子命令注册表。运行期依赖流向是单向的：上层组装下层，下层不反向引用上层。
+mega2 是服务 Agent 工作流的第二代 Mega 引擎；第一代 Mega 项目与本仓库并非同一代码库。mega2 的 Monorepo 服务管理代码树和 Git 协议，Agent Session Capture 则通过独立的可选 API 保存和查询 Agent 会话记录，二者职责不同。mega2 是单 Cargo package（lib `mega2_core` + 二进制；见 [`../Cargo.toml`](../Cargo.toml)），移植并重构了第一代 Mega 的部分功能，不是上游仓库的镜像；两边的模块边界也不完全相同。评估上游改动时，应以本仓库源码和依赖锁文件为依据，再判断是否适用。入口 `src/main.rs` → `cli::parse` → `src/commands/mod.rs` 的子命令注册表。运行期依赖流向是单向的：上层组装下层，下层不反向引用上层。
 
 ```
 ┌────────────────────────────────────────────────────────────┐

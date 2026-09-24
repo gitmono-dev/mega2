@@ -2,14 +2,14 @@ English · [中文](deployment.zh.md)
 
 # Deployment Guide
 
-The open-source edition of mega2 is deployed in **trunk / storage-only** mode. It has no Web UI; use Libra's `libra mega2 browser` for interactive browsing. This guide covers installation, runtime behavior, authentication, and mode changes. Repository and push behavior is summarized in the [User Guide](./user-guide.md). The commented [`config.toml`](../config/config.toml) lists the configuration keys.
+Mega2 is the second-generation Mega engine built for Agents. Its Monorepo service is a core capability; Agent Session Capture is an optional API. The open-source edition is deployed in **trunk / storage-only** mode and has no Web UI; Libra's `libra mega2 browser` provides basic terminal directory browsing and supported tag operations. This guide covers installation, runtime behavior, authentication, and mode changes. Repository and push behavior is summarized in the [User Guide](./user-guide.md). The commented [`config.toml`](../config/config.toml) lists the configuration keys.
 
 ## 1. Deployment shape
 
 The only supported deployment shape is trunk / storage-only:
 
 - Single public branch `main`; all writes (git push and product API writes) are globally serialized through the MonoWriteQueue and share tip authority; no CL / issue / reviewer / OAuth user routes are registered.
-- HTTP surface: Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`), LFS (`/info/lfs`, `/api/v1/lfs`), storage-only `/api/v1/*` (status, file/blob, file/tree, preview reads; create-entry / delete-entry / move-entry / edit/save, tags writes), optional OCI `/v2` (`[oci].enabled`), optional Agent Capture `/api/v1/agent-capture` (`[agent_capture].enabled`), Swagger UI `/swagger-ui`, OpenAPI `/api/openapi.json`.
+- HTTP surface: Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`), LFS (`/info/lfs`, `/api/v1/lfs`), storage-only `/api/v1/*` (status, file/blob, file/tree, preview reads; create-entry / delete-entry / move-entry / edit/save, tags writes), optional OCI `/v2` (`[oci].enabled`), optional Agent Session Capture `/api/v1/agent-capture` (`[agent_capture].enabled`, separate ingestion of session, event, checkpoint, transcript, and file-operation records; not triggered by Git push), Swagger UI `/swagger-ui`, OpenAPI `/api/openapi.json`.
 - SSH is upload-pack only (clone / fetch / pull); `ssh_receive_pack` must be explicitly `false` — omitting it refuses startup.
 - Write auth: `git.push_auth = "token"` (recommended) or `"none"` (controlled networks only). Configure authentication and SSH as described in sections 3–5 of this guide.
 

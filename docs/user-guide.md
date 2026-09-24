@@ -2,7 +2,7 @@
 
 English · [中文](user-guide.zh.md)
 
-Use this guide for everyday Git, HTTP API, large-file, optional-service, and CLI workflows. For deployment instructions, see the [Deployment Guide](./deployment.md); the commented [`config.toml`](../config/config.toml) is the authoritative list of configuration keys.
+Mega2 is the second-generation Mega engine built for Agents. Its core capabilities are the Monorepo engine and optional Agent Session Capture. The recommended Agent workflow combines Mega2 with ScorpioFS for local filesystem mounts and Libra for version-control workflows. This guide covers everyday Git, HTTP API, large-file, optional-service, and CLI operations. For deployment instructions, see the [Deployment Guide](./deployment.md); the commented [`config.toml`](../config/config.toml) is the authoritative list of configuration keys.
 
 > **Scope:** the open-source edition supports only **trunk / storage-only** mode. It has no Web UI or Change List (CL). Use Libra's `libra mega2 browser` for interactive browsing and directory or tag operations (see §6).
 
@@ -124,17 +124,17 @@ Error types and HTTP status mapping are centralized in `crate::common::errors`.
 Both surfaces require storage-only mode and their own config switch. If either condition is missing, the route is not mounted and returns 404; enabling either switch outside storage-only mode prevents startup.
 
 - **OCI Distribution `/v2`**: mounted when storage-only and `[oci].enabled=true`; serves as a container registry (`docker login` reuses push tokens — there is no separate token service). See the [Deployment Guide](./deployment.md) for enablement and usage.
-- **Agent Capture `/api/v1/agent-capture`**: mounted when storage-only and `[agent_capture].enabled=true`; captures agent sessions, events, checkpoints, and file operations, with its own `[[agent_capture.ingest_tokens]]` authentication surface. The [Architecture Guide](./architecture.md) lists the route and its configuration gate.
+- **Agent Session Capture `/api/v1/agent-capture`**: an optional API for ingesting and querying Agent sessions, events, checkpoints, transcripts, and file operations. It is mounted only in storage-only mode when `[agent_capture].enabled=true` and at least one `[[agent_capture.ingest_tokens]]` is configured. It uses separate ingest tokens and is independent of Git push; a Git push does not create a session capture record. See the [configuration and API reference](./refactoring/agent-capture.md).
 
 ## 6. Using mega2 with Libra
 
-mega2 itself serves no interactive interface. Day-to-day browsing and directory / tag operations run inside a Libra working copy:
+The open-source edition has no Web UI. Libra's `libra mega2 browser` command provides basic remote directory browsing and supported directory and tag operations. These operations do not replace Git client clone, fetch, or push:
 
 ```bash
 libra mega2 browser
 ```
 
-That TUI consumes the HTTP surface of §4 (tree reads, create / delete / move-entry, tags). The sha256 / blake3 object formats are likewise only available with the Libra client (see §2.4).
+The TUI browses remote directories one level at a time and supports creating, deleting, moving, and renaming directories. Its Tag panel lists, creates, and deletes root tags; creating or deleting requires write credentials. It reads remote directory and tag data from Mega2 and does not replace a Git client's clone, fetch, or push. The sha256 / blake3 object formats are likewise only available with the Libra client (see §2.4).
 
 ## 7. CLI quick reference
 

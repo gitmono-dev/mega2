@@ -105,7 +105,7 @@ New DB Entity / Migration」）：
 
 ## 7. 评估并移植上游改动
 
-mega2 只移植并重构上游 Mega 项目的部分功能，并非上游仓库的镜像。移植前先确认
+Mega 是第一代 Monorepo 平台，mega2 是面向 Agent 的第二代引擎，核心方向是 Monorepo 与 Agent Session Capture。mega2 会移植并重构第一代 Mega 的部分功能，但并非上游仓库的镜像。移植前先确认
 相关模块和行为在当前 checkout 中确实存在。应对照当前源码和测试评估具体改动，
 不要只按上游的文件变更清单机械复制；依赖上游专有服务或仓库结构的改动应标记为
 不适用。
