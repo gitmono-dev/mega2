@@ -16,7 +16,7 @@ use crate::{
         sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
     },
     common::{
-        errors::MegaError,
+        errors::{ImportRepoError, MegaError},
         utils::{
             MEGA_BRANCH_NAME, ZERO_ID, commit_body_subject, format_commit_msg, split_commit_message,
         },
@@ -25,6 +25,7 @@ use crate::{
     jupiter::storage::{
         base_storage::{BaseStorage, StorageConnector},
         blob_path_index::BlobPathIndexMode,
+        git_db_storage::GitDbStorage,
         mono_storage::MonoStorage,
         push_queue_storage::{
             ClaimOutcome, EnqueueOutcome, EnqueueParams, EnqueueRejectReason, PushQueueStorage,
@@ -115,6 +116,76 @@ impl AttachPayload {
             .collect();
         normalize_attach_commands(&rows)
     }
+}
+
+/// Apply one push's ImportRepo branch commands inside the B3 transaction with
+/// receive-pack CAS (plan-20260923 ADR-FU-08 items 2 and 4): `Create` needs
+/// the ref to be absent, `Update` needs it to still point at `old_id`, and
+/// `Delete` keeps its lease. The first command that fails its CAS comes back
+/// as `IMPORT_REPO_STALE_REF`; the caller rolls the whole batch back, so no
+/// branch moves.
+pub(crate) async fn apply_import_branch_commands_in_txn(
+    git_db: &GitDbStorage,
+    repo_id: i64,
+    commands: &[AttachCommand],
+    txn: &DatabaseTransaction,
+) -> Result<Result<(), ImportRepoError>, MegaError> {
+    use crate::{
+        callisto::sea_orm_active_enums::RefTypeEnum,
+        ceres::protocol::import_refs::{CommandType, RefCommand},
+    };
+
+    for cmd in commands.iter().filter(|cmd| cmd.ref_type == "branch") {
+        let command_type = match cmd.command_type.as_str() {
+            "Create" => CommandType::Create,
+            "Delete" => CommandType::Delete,
+            "Update" => CommandType::Update,
+            other => {
+                return Err(MegaError::Other(format!(
+                    "unknown attach command_type '{other}'"
+                )));
+            }
+        };
+        let applied = match command_type {
+            CommandType::Create => {
+                let ref_cmd = RefCommand {
+                    ref_name: cmd.ref_name.clone(),
+                    old_id: cmd.old_id.clone(),
+                    new_id: cmd.new_id.clone(),
+                    status: "ok".into(),
+                    error_msg: String::new(),
+                    command_type: CommandType::Create,
+                    ref_type: RefTypeEnum::Branch,
+                    default_branch: cmd.default_branch,
+                };
+                git_db
+                    .create_ref_if_absent(repo_id, ref_cmd.into(), txn)
+                    .await?
+            }
+            CommandType::Update => {
+                git_db
+                    .update_ref_if_unchanged(repo_id, &cmd.ref_name, &cmd.old_id, &cmd.new_id, txn)
+                    .await?
+            }
+            CommandType::Delete => {
+                git_db
+                    .remove_ref_if_unchanged(repo_id, &cmd.ref_name, &cmd.old_id, txn)
+                    .await?
+            }
+        };
+        if !applied {
+            return Ok(Err(ImportRepoError::StaleRef {
+                ref_name: cmd.ref_name.clone(),
+                expected: cmd.old_id.clone(),
+            }));
+        }
+        if cmd.default_branch && command_type != CommandType::Delete {
+            git_db
+                .set_default_branch_in_txn(repo_id, &cmd.ref_name, txn)
+                .await?;
+        }
+    }
+    Ok(Ok(()))
 }
 
 /// Context required to execute a claimed `kind=attach` round under B3.
@@ -1322,11 +1393,7 @@ impl PushQueueService {
         };
 
         use crate::{
-            callisto::sea_orm_active_enums::RefTypeEnum,
-            ceres::{
-                api_service::{mono_api_service::MonoApiService, tree_ops},
-                protocol::import_refs::{CommandType, RefCommand},
-            },
+            ceres::api_service::{mono_api_service::MonoApiService, tree_ops},
             common::utils::canonicalize_mono_ref_path,
             contract::policy::notify::{
                 after_b3_commit_authz, authz_blob_id, insert_b3_authz_outbox_if_builds,
@@ -1463,6 +1530,34 @@ impl PushQueueService {
         let new_root_tree_hash = new_commit.tree_id.to_string();
         let landed_commit_id = new_commit.id.to_string();
 
+        // Branch CAS first: a stale batch must not leave the `.gitkeep` blob
+        // written below (object storage is outside the SAVEPOINT).
+        let git_db = ctx.storage.git_db_storage();
+        if let Err(stale) =
+            apply_import_branch_commands_in_txn(&git_db, payload.repo_id, &payload.commands, &txn)
+                .await?
+        {
+            PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+            let msg = stale.to_string();
+            let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                &txn,
+                row.id,
+                "AttachFailure",
+                &msg,
+            )
+            .await?;
+            if !updated {
+                tracing::error!(id = row.id, "B3 attach stale ref hit 0 rows");
+            }
+            PushQueueStorage::notify_mono_write_queue(&txn).await?;
+            txn.commit().await?;
+            return Ok(ExecuteOutcome::Failed {
+                id: row.id,
+                failure: "AttachFailure".into(),
+                message: msg,
+            });
+        }
+
         // Object-store write is outside the DB SAVEPOINT (same as pre-queue attach).
         if let Err(e) = ctx
             .storage
@@ -1489,66 +1584,6 @@ impl PushQueueService {
                 failure: "AttachFailure".into(),
                 message: msg,
             });
-        }
-
-        let git_db = ctx.storage.git_db_storage();
-        for cmd in &payload.commands {
-            if cmd.ref_type != "branch" {
-                continue;
-            }
-            let command_type = match cmd.command_type.as_str() {
-                "Create" => CommandType::Create,
-                "Delete" => CommandType::Delete,
-                "Update" => CommandType::Update,
-                other => {
-                    return Err(MegaError::Other(format!(
-                        "unknown attach command_type '{other}'"
-                    )));
-                }
-            };
-            let ref_cmd = RefCommand {
-                ref_name: cmd.ref_name.clone(),
-                old_id: cmd.old_id.clone(),
-                new_id: cmd.new_id.clone(),
-                status: "ok".into(),
-                error_msg: String::new(),
-                command_type: command_type.clone(),
-                ref_type: RefTypeEnum::Branch,
-                default_branch: cmd.default_branch,
-            };
-            match command_type {
-                CommandType::Create => {
-                    git_db
-                        .save_ref_in_txn(payload.repo_id, ref_cmd.into(), &txn)
-                        .await?;
-                    if cmd.default_branch {
-                        git_db
-                            .set_default_branch_in_txn(payload.repo_id, &cmd.ref_name, &txn)
-                            .await?;
-                    }
-                }
-                CommandType::Delete => {
-                    let deleted = git_db
-                        .remove_ref_if_unchanged(payload.repo_id, &cmd.ref_name, &cmd.old_id, &txn)
-                        .await?;
-                    if !deleted {
-                        return Err(MegaError::Other(format!(
-                            "ref {} moved since advertisement (expected {})",
-                            cmd.ref_name, cmd.old_id
-                        )));
-                    }
-                }
-                CommandType::Update => {
-                    git_db
-                        .update_ref_in_txn(payload.repo_id, &cmd.ref_name, &cmd.new_id, &txn)
-                        .await?;
-                    if cmd.default_branch {
-                        git_db
-                            .set_default_branch_in_txn(payload.repo_id, &cmd.ref_name, &txn)
-                            .await?;
-                    }
-                }
-            }
         }
 
         // Ensure a sole default survives the batch (e.g. Delete of the old
@@ -5331,6 +5366,278 @@ mod tests {
                 },
             )
             })
+        }
+    }
+
+    // plan-20260923 FU-12: ImportRepo branch commands apply with receive-pack
+    // CAS inside the B3 transaction; one stale command refuses the batch.
+
+    fn fu12_ref(repo_id: i64, name: &str, git_id: &str) -> crate::callisto::import_refs::Model {
+        crate::callisto::import_refs::Model {
+            id: crate::common::utils::generate_id(),
+            repo_id,
+            ref_name: name.to_owned(),
+            ref_git_id: git_id.to_owned(),
+            ref_type: crate::callisto::sea_orm_active_enums::RefTypeEnum::Branch,
+            default_branch: name == "refs/heads/main",
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+        }
+    }
+
+    fn fu12_cmd(name: &str, command_type: &str, old_id: &str, new_id: &str) -> AttachCommand {
+        AttachCommand {
+            ref_name: name.to_owned(),
+            old_id: old_id.to_owned(),
+            new_id: new_id.to_owned(),
+            command_type: command_type.to_owned(),
+            ref_type: "branch".to_owned(),
+            default_branch: false,
+        }
+    }
+
+    async fn fu12_ref_id(git_db: &GitDbStorage, repo_id: i64, name: &str) -> Option<String> {
+        git_db
+            .get_ref(repo_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.ref_name == name)
+            .map(|r| r.ref_git_id)
+    }
+
+    #[tokio::test]
+    async fn fu12_branch_update_stale() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let git_db = storage.git_db_storage();
+        let repo_id = crate::common::utils::generate_id();
+        let (current, stale) = ("1".repeat(40), "2".repeat(40));
+        git_db
+            .save_ref(repo_id, fu12_ref(repo_id, "refs/heads/main", &current))
+            .await
+            .unwrap();
+        let txn = git_db.get_connection().begin().await.unwrap();
+        let cmds = [fu12_cmd(
+            "refs/heads/main",
+            "Update",
+            &stale,
+            &"3".repeat(40),
+        )];
+        let result = apply_import_branch_commands_in_txn(&git_db, repo_id, &cmds, &txn)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            Err(ImportRepoError::StaleRef {
+                ref_name: "refs/heads/main".to_owned(),
+                expected: stale,
+            })
+        );
+        txn.commit().await.unwrap();
+        assert_eq!(
+            fu12_ref_id(&git_db, repo_id, "refs/heads/main").await,
+            Some(current)
+        );
+    }
+
+    #[tokio::test]
+    async fn fu12_branch_create_existing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let git_db = storage.git_db_storage();
+        let repo_id = crate::common::utils::generate_id();
+        let current = "1".repeat(40);
+        git_db
+            .save_ref(repo_id, fu12_ref(repo_id, "refs/heads/main", &current))
+            .await
+            .unwrap();
+        let txn = git_db.get_connection().begin().await.unwrap();
+        let cmds = [fu12_cmd(
+            "refs/heads/main",
+            "Create",
+            ZERO_ID,
+            &"3".repeat(40),
+        )];
+        let result = apply_import_branch_commands_in_txn(&git_db, repo_id, &cmds, &txn)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Err(ImportRepoError::StaleRef { .. })),
+            "{result:?}"
+        );
+        // ON CONFLICT DO NOTHING leaves the transaction usable.
+        let refs = git_db.list_branch_refs_in_txn(repo_id, &txn).await.unwrap();
+        assert_eq!(refs.len(), 1);
+        txn.commit().await.unwrap();
+        assert_eq!(
+            fu12_ref_id(&git_db, repo_id, "refs/heads/main").await,
+            Some(current)
+        );
+    }
+
+    #[tokio::test]
+    async fn fu12_branch_batch_atomic() {
+        use sea_orm::{EntityTrait, PaginatorTrait};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        // Same wiring as import_repo's `wired_storage_with_monorepo`.
+        let git_service = crate::jupiter::service::git_service::GitService {
+            obj_storage: crate::jupiter::storage::object_storage::mock_object_storage(),
+        };
+        storage.git_service = git_service.clone();
+        storage.mono_service = crate::jupiter::service::mono_service::MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service: git_service.clone(),
+        };
+        storage.import_service = crate::jupiter::service::import_service::ImportService {
+            git_db_storage: storage.git_db_storage(),
+            git_service,
+        };
+        storage
+            .mono_service
+            .init_monorepo(&storage.config().monorepo)
+            .await
+            .unwrap();
+        let (repo, commit, _create) =
+            wh03_seed_import_repo(&storage, "/third-party/fu12-batch").await;
+        let git_db = storage.git_db_storage();
+        let (main_old, dev_old, stale) = ("1".repeat(40), "2".repeat(40), "3".repeat(40));
+        git_db
+            .save_ref(
+                repo.repo_id,
+                fu12_ref(repo.repo_id, "refs/heads/main", &main_old),
+            )
+            .await
+            .unwrap();
+        git_db
+            .save_ref(
+                repo.repo_id,
+                fu12_ref(repo.repo_id, "refs/heads/dev", &dev_old),
+            )
+            .await
+            .unwrap();
+        let tip = commit.id.to_string();
+        let ctx = AttachExecContext {
+            storage: storage.clone(),
+            git_object_cache: std::sync::Arc::new(
+                crate::ceres::api_service::cache::GitObjectCache {
+                    connection: crate::jupiter::tests::test_redis_manager().await,
+                    prefix: String::new(),
+                },
+            ),
+        };
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        // main's CAS holds, dev's does not (stale Update, then stale Delete):
+        // neither branch may move, and no `.gitkeep` blob is written.
+        let batches = [
+            vec![
+                fu12_cmd("refs/heads/main", "Update", &main_old, &tip),
+                fu12_cmd("refs/heads/dev", "Update", &stale, &tip),
+            ],
+            vec![
+                fu12_cmd("refs/heads/main", "Update", &main_old, &tip),
+                fu12_cmd("refs/heads/dev", "Delete", &stale, ZERO_ID),
+            ],
+        ];
+        for commands in batches {
+            let payload = AttachPayload {
+                repo_id: repo.repo_id,
+                repo_path: repo.repo_path.clone(),
+                commands,
+            };
+            let blobs_before = crate::callisto::mega_blob::Entity::find()
+                .count(storage.mono_storage().get_connection())
+                .await
+                .unwrap();
+            let EnqueueOutcome::Inserted { id } = storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Attach,
+                    operation_id: attach_operation_id(
+                        &repo.repo_id.to_string(),
+                        &payload.normalize_fingerprint_input(),
+                    ),
+                    path: repo.repo_path.clone(),
+                    old_id: root.ref_commit_hash.clone(),
+                    new_id: tip.clone(),
+                    requester: None,
+                    payload: serde_json::to_value(&payload).unwrap(),
+                    ref_name: None,
+                    is_delete: false,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("attach insert");
+            };
+            assert_eq!(
+                storage
+                    .push_queue_service
+                    .storage()
+                    .claim_for_execution(id)
+                    .await
+                    .unwrap(),
+                ClaimOutcome::Claimed
+            );
+            let outcome = storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id,
+                        ..Default::default()
+                    },
+                    Some(&ctx),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let ExecuteOutcome::Failed {
+                failure, message, ..
+            } = outcome
+            else {
+                panic!("stale batch must fail, got {outcome:?}");
+            };
+            assert_eq!(failure, "AttachFailure");
+            assert!(
+                message.starts_with("IMPORT_REPO_STALE_REF: \"refs/heads/dev\""),
+                "{message}"
+            );
+            assert_eq!(
+                wh03_row_status(&storage, id).await,
+                PushQueueStatusEnum::Failed
+            );
+            assert_eq!(
+                fu12_ref_id(&git_db, repo.repo_id, "refs/heads/main").await,
+                Some(main_old.clone())
+            );
+            assert_eq!(
+                fu12_ref_id(&git_db, repo.repo_id, "refs/heads/dev").await,
+                Some(dev_old.clone())
+            );
+            let blobs_after = crate::callisto::mega_blob::Entity::find()
+                .count(storage.mono_storage().get_connection())
+                .await
+                .unwrap();
+            assert_eq!(
+                blobs_after, blobs_before,
+                "no .gitkeep blob on a stale batch"
+            );
+            let root_after = storage
+                .mono_storage()
+                .get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(root_after.ref_commit_hash, root.ref_commit_hash);
+            assert_eq!(root_after.ref_tree_hash, root.ref_tree_hash);
         }
     }
 }

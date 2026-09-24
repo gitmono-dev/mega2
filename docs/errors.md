@@ -136,6 +136,16 @@ report-status 行为 `ng refs/heads/main <文本>`；`git push` 显示为 `! [re
 
 `MegaError::OrphanChain`（FU-09，ADR-FU-07）：新分支推送（`old_id` 为零）的第一父链沿 pack 走到无父根时的孤儿拒绝，首推与原样重试返回同一错误。显示文本保持历史措辞 `Other error: Can not init directory under monorepo directory!`，Git `ng` 行不变；类型化只为让调用方（FU-10 的 trunk 首推分类）经 `push_chain::is_orphan_chain_error` 精确识别，不再匹配文本。它不证明历史未被引用（已知 tip 的链走到根时同样返回，见 [`refactoring/trunk-push.md`](./refactoring/trunk-push.md)）。trunk 形态下，推送到待创建路径（无 `main` 行、无墓碑、根树中不可解析）时它被映射为 `MONO_PATH_UNINITIALIZED`（FU-10），客户端看到的是路径策略码。
 
+## ImportRepoError：ImportRepo ref 与生命周期（plan-20260923）
+
+`ImportRepoError`（`src/common/errors/mod.rs`）是 ImportRepo 的领域错误，经 `MegaError::ImportRepo(#[from])` 包装；包装层用 `#[error("{0}")]`，文本原样透出。`Display` = `"<CODE>: <人读消息>"`，恒为单行（路径、ref 名与 id 中的控制字符按转义形式出现），同一文本进 Git `ng` 行与 API `err_message`；`ApiError` 按类型映射状态并原样输出，`GitError` 通道带 `[code:…]` 标记。完整错误域在 FU-12 一次定义，**各码在首次对用户暴露它的卡中登记于此**（[`plan/plan-20260923.md`](./plan/plan-20260923.md) ADR-FU-03 第 2 条）：
+
+| 变体 | 码 | HTTP（`ApiError`） | 含义 |
+|---|---|---|---|
+| `StaleRef { ref_name, expected }` | `IMPORT_REPO_STALE_REF` | 409 | ImportRepo 推送的 ref 更新未通过服务端 CAS（ADR-FU-08 第 2 条）：`Create` 时该 ref 已存在，`Update` / `Delete` 时它已不再指向客户端声称的 `old_id`（广告之后有别的推送或 API 写入）。`fetch` 后重推即可 |
+
+出现场景（ImportRepo 推送，`import_dir` 之下；ADR-FU-08 第 4 条）：tag 命令逐 ref 独立，失败的 tag 得到以本码开头的 `ng` 行；同一推送内的分支命令作为一批在同一 B3 事务内应用，任一分支 CAS 失败则整批回滚、所有分支 `ng`、无一分支前进。只含删除的分支批不经写入队列，失败文本同样以本码开头；经写入队列的分支批在 FU-13 之前被包在 `attach B3 did not complete successfully: Failed { … message: "IMPORT_REPO_STALE_REF: …" }` 中（本码文本以 Debug 转义形式出现；被回放的队列行包为 `attach rejected for push_queue id N: …`），FU-13 起改为本码原文。`Create` 遇到已存在的 ref 时文本为 `IMPORT_REPO_STALE_REF: "<ref>" already exists; fetch and push again`。
+
 ## 响应安全
 
 - `ApiError` 只向客户端暴露 4xx 细节。

@@ -34,7 +34,7 @@ use crate::{
         },
     },
     common::{
-        errors::MegaError,
+        errors::{ImportRepoError, MegaError},
         utils::{ZERO_ID, is_protocol_zero_id},
     },
     jupiter::{
@@ -358,37 +358,42 @@ impl RepoHandler for ImportRepo {
             // Branch `import_refs` rows are written in the same DB transaction as monorepo attach.
             return Ok(());
         }
+        // Tags are written right after unpack, one ref at a time, with the
+        // receive-pack CAS (plan-20260923 ADR-FU-08 items 2 and 4).
         let storage = self.storage.git_db_storage();
-        match refs.command_type {
+        let conn = storage.get_connection();
+        let applied = match refs.command_type {
             CommandType::Create => {
                 storage
-                    .save_ref(self.repo.repo_id, refs.clone().into())
+                    .create_ref_if_absent(self.repo.repo_id, refs.clone().into(), conn)
                     .await
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
             }
             CommandType::Delete => {
-                let deleted = storage
-                    .remove_ref_if_unchanged(
-                        self.repo.repo_id,
-                        &refs.ref_name,
-                        &refs.old_id,
-                        storage.get_connection(),
-                    )
+                storage
+                    .remove_ref_if_unchanged(self.repo.repo_id, &refs.ref_name, &refs.old_id, conn)
                     .await
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
-                if !deleted {
-                    return Err(GitError::CustomError(format!(
-                        "tag {} moved since advertisement (expected {})",
-                        refs.ref_name, refs.old_id
-                    )));
-                }
             }
             CommandType::Update => {
                 storage
-                    .update_ref(self.repo.repo_id, &refs.ref_name, &refs.new_id)
+                    .update_ref_if_unchanged(
+                        self.repo.repo_id,
+                        &refs.ref_name,
+                        &refs.old_id,
+                        &refs.new_id,
+                        conn,
+                    )
                     .await
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
             }
+        }
+        .map_err(|e| GitError::CustomError(e.to_string()))?;
+        if !applied {
+            return Err(GitError::CustomError(
+                ImportRepoError::StaleRef {
+                    ref_name: refs.ref_name.clone(),
+                    expected: refs.old_id.clone(),
+                }
+                .to_string(),
+            ));
         }
         Ok(())
     }
@@ -527,12 +532,28 @@ impl ImportRepo {
                         )
                         .await?;
                     if !deleted {
-                        return Err(MegaError::Other(format!(
-                            "ref {} moved since advertisement (expected {})",
-                            cmd.ref_name, cmd.old_id
-                        )));
+                        return Err(ImportRepoError::StaleRef {
+                            ref_name: cmd.ref_name.clone(),
+                            expected: cmd.old_id.clone(),
+                        }
+                        .into());
                     }
                 }
+            }
+            // Deleting the default must not leave the remaining branches
+            // without one (same fallback as the B3 batch).
+            if !git_db
+                .default_branch_exist_in_txn(self.repo.repo_id, &txn)
+                .await?
+                && let Some(first) = git_db
+                    .list_branch_refs_in_txn(self.repo.repo_id, &txn)
+                    .await?
+                    .into_iter()
+                    .next()
+            {
+                git_db
+                    .set_default_branch_in_txn(self.repo.repo_id, &first.ref_name, &txn)
+                    .await?;
             }
             txn.commit().await.map_err(MegaError::Db)?;
             return Ok(());
@@ -775,6 +796,7 @@ mod tests {
         },
         ceres::{
             api_service::cache::GitObjectCache,
+            pack::RepoHandler,
             protocol::{
                 import_refs::{CommandType, RefCommand},
                 repo::Repo,
@@ -1109,6 +1131,198 @@ mod tests {
         assert_eq!(queued, 0, "delete-only attach must not enqueue");
     }
 
+    /// FU-12: an ImportRepo whose tag `refs/tags/v1` points at `"1" * 40`.
+    async fn fu12_tag_repo(path: &str) -> (tempfile::TempDir, Storage, ImportRepo) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, _commit, _create) = seed_import_repo_with_main_tip(&storage, path).await;
+        let mut tag = RefCommand::new(ZERO_ID.to_string(), "1".repeat(40), "refs/tags/v1".into());
+        tag.ref_type = RefTypeEnum::Tag;
+        storage
+            .git_db_storage()
+            .save_ref(repo.repo_id, tag.into())
+            .await
+            .unwrap();
+        let import_repo = ImportRepo {
+            storage: storage.clone(),
+            repo,
+            command_list: Mutex::new(vec![]),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        };
+        (temp, storage, import_repo)
+    }
+
+    fn fu12_tag_cmd(
+        name: &str,
+        command_type: CommandType,
+        old_id: &str,
+        new_id: &str,
+    ) -> RefCommand {
+        let mut cmd = RefCommand::new(old_id.to_owned(), new_id.to_owned(), name.to_owned());
+        cmd.ref_type = RefTypeEnum::Tag;
+        cmd.command_type = command_type;
+        cmd
+    }
+
+    async fn fu12_tag_id(storage: &Storage, repo_id: i64, name: &str) -> Option<String> {
+        storage
+            .git_db_storage()
+            .get_ref(repo_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.ref_name == name)
+            .map(|r| r.ref_git_id)
+    }
+
+    #[tokio::test]
+    async fn fu12_tag_update_stale() {
+        let (_temp, storage, repo) = fu12_tag_repo("/third-party/fu12-tag-update").await;
+        let stale = fu12_tag_cmd(
+            "refs/tags/v1",
+            CommandType::Update,
+            &"2".repeat(40),
+            &"3".repeat(40),
+        );
+        let err = repo
+            .update_refs(&stale)
+            .await
+            .expect_err("stale tag update");
+        assert!(
+            err.to_string().starts_with(
+                "IMPORT_REPO_STALE_REF: \"refs/tags/v1\" changed since it was advertised"
+            ),
+            "{err}"
+        );
+        let id = repo.repo.repo_id;
+        assert_eq!(
+            fu12_tag_id(&storage, id, "refs/tags/v1").await,
+            Some("1".repeat(40))
+        );
+        // The matching update applies.
+        let ok = fu12_tag_cmd(
+            "refs/tags/v1",
+            CommandType::Update,
+            &"1".repeat(40),
+            &"3".repeat(40),
+        );
+        repo.update_refs(&ok).await.expect("matching tag update");
+        assert_eq!(
+            fu12_tag_id(&storage, id, "refs/tags/v1").await,
+            Some("3".repeat(40))
+        );
+    }
+
+    #[tokio::test]
+    async fn fu12_tag_create_existing() {
+        let (_temp, storage, repo) = fu12_tag_repo("/third-party/fu12-tag-create").await;
+        let existing = fu12_tag_cmd(
+            "refs/tags/v1",
+            CommandType::Create,
+            ZERO_ID,
+            &"3".repeat(40),
+        );
+        let err = repo
+            .update_refs(&existing)
+            .await
+            .expect_err("tag already exists");
+        assert!(
+            err.to_string()
+                .starts_with("IMPORT_REPO_STALE_REF: \"refs/tags/v1\" already exists"),
+            "{err}"
+        );
+        let id = repo.repo.repo_id;
+        assert_eq!(
+            fu12_tag_id(&storage, id, "refs/tags/v1").await,
+            Some("1".repeat(40))
+        );
+        // A new tag name is created.
+        let fresh = fu12_tag_cmd(
+            "refs/tags/v2",
+            CommandType::Create,
+            ZERO_ID,
+            &"3".repeat(40),
+        );
+        repo.update_refs(&fresh).await.expect("new tag");
+        assert_eq!(
+            fu12_tag_id(&storage, id, "refs/tags/v2").await,
+            Some("3".repeat(40))
+        );
+    }
+
+    #[tokio::test]
+    async fn fu12_tag_delete_stale() {
+        let (_temp, storage, repo) = fu12_tag_repo("/third-party/fu12-tag-delete").await;
+        let stale = fu12_tag_cmd(
+            "refs/tags/v1",
+            CommandType::Delete,
+            &"2".repeat(40),
+            ZERO_ID,
+        );
+        let err = repo
+            .update_refs(&stale)
+            .await
+            .expect_err("stale tag delete");
+        assert!(
+            err.to_string().starts_with("IMPORT_REPO_STALE_REF: "),
+            "{err}"
+        );
+        let id = repo.repo.repo_id;
+        assert_eq!(
+            fu12_tag_id(&storage, id, "refs/tags/v1").await,
+            Some("1".repeat(40))
+        );
+        // The matching delete applies.
+        let ok = fu12_tag_cmd(
+            "refs/tags/v1",
+            CommandType::Delete,
+            &"1".repeat(40),
+            ZERO_ID,
+        );
+        repo.update_refs(&ok).await.expect("matching tag delete");
+        assert_eq!(fu12_tag_id(&storage, id, "refs/tags/v1").await, None);
+    }
+
+    #[tokio::test]
+    async fn fu12_delete_only_keeps_a_default_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, commit, main) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/fu12-del-default").await;
+        let repo_id = repo.repo_id;
+        let git_db = storage.git_db_storage();
+        git_db.save_ref(repo_id, main.clone().into()).await.unwrap();
+        let mut dev = RefCommand::new(
+            ZERO_ID.to_string(),
+            commit.id.to_string(),
+            "refs/heads/dev".into(),
+        );
+        dev.default_branch = false;
+        git_db.save_ref(repo_id, dev.into()).await.unwrap();
+
+        let mut delete_main = main.clone();
+        delete_main.command_type = CommandType::Delete;
+        delete_main.old_id = main.new_id.clone();
+        delete_main.new_id = ZERO_ID.to_string();
+        let import_repo = ImportRepo {
+            storage: storage.clone(),
+            repo,
+            command_list: Mutex::new(vec![delete_main]),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        };
+        import_repo.attach_to_monorepo_parent().await.unwrap();
+
+        let refs = git_db.get_ref(repo_id).await.unwrap();
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(refs[0].ref_name, "refs/heads/dev");
+        assert!(
+            refs[0].default_branch,
+            "the remaining branch becomes the default"
+        );
+    }
+
     #[tokio::test]
     async fn attach_delete_stale_old_id_does_not_remove_moved_ref() {
         let temp = tempfile::tempdir().unwrap();
@@ -1144,7 +1358,16 @@ mod tests {
             .await
             .expect_err("stale advertised old id must conflict");
         assert!(
-            err.to_string().contains("moved since advertisement"),
+            matches!(
+                &err,
+                crate::common::errors::MegaError::ImportRepo(
+                    crate::common::errors::ImportRepoError::StaleRef { .. }
+                )
+            ),
+            "got {err}"
+        );
+        assert!(
+            err.to_string().starts_with("IMPORT_REPO_STALE_REF: "),
             "got {err}"
         );
         let refs = git_db.get_ref(repo_id).await.unwrap();

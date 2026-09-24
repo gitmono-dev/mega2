@@ -5,7 +5,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr,
     EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait, Set,
     Statement, TransactionTrait,
-    sea_query::{CaseStatement, Expr, ExprTrait},
+    sea_query::{CaseStatement, Expr, ExprTrait, OnConflict},
 };
 
 use crate::{
@@ -172,6 +172,52 @@ impl GitDbStorage {
         conn: &C,
     ) -> Result<bool, MegaError> {
         let result = import_refs::Entity::delete_many()
+            .filter(import_refs::Column::RepoId.eq(repo_id))
+            .filter(import_refs::Column::RefName.eq(ref_name))
+            .filter(import_refs::Column::RefGitId.eq(expected_git_id))
+            .exec(conn)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
+    /// Inserts the ref only if `(repo_id, ref_name)` does not exist yet
+    /// (receive-pack `Create`, plan-20260923 ADR-FU-08 item 2). Returns
+    /// whether a row was inserted; a conflict leaves the transaction usable.
+    pub async fn create_ref_if_absent<C: ConnectionTrait>(
+        &self,
+        repo_id: i64,
+        mut refs: import_refs::Model,
+        conn: &C,
+    ) -> Result<bool, MegaError> {
+        refs.repo_id = repo_id;
+        let inserted = import_refs::Entity::insert(refs.into_active_model())
+            .on_conflict(
+                OnConflict::columns([import_refs::Column::RepoId, import_refs::Column::RefName])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(conn)
+            .await?;
+        Ok(inserted > 0)
+    }
+
+    /// Moves the ref to `new_id` only if it still points at
+    /// `expected_git_id` (receive-pack `Update`). Returns whether a row was
+    /// updated.
+    pub async fn update_ref_if_unchanged<C: ConnectionTrait>(
+        &self,
+        repo_id: i64,
+        ref_name: &str,
+        expected_git_id: &str,
+        new_id: &str,
+        conn: &C,
+    ) -> Result<bool, MegaError> {
+        let result = import_refs::Entity::update_many()
+            .col_expr(import_refs::Column::RefGitId, Expr::value(new_id))
+            .col_expr(
+                import_refs::Column::UpdatedAt,
+                Expr::value(chrono::Utc::now().naive_utc()),
+            )
             .filter(import_refs::Column::RepoId.eq(repo_id))
             .filter(import_refs::Column::RefName.eq(ref_name))
             .filter(import_refs::Column::RefGitId.eq(expected_git_id))

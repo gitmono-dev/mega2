@@ -74,6 +74,11 @@ pub enum MegaError {
     /// the stable `<CODE>: <message>` shared by Git `ng` lines and the API.
     #[error("{0}")]
     PathPolicy(#[from] PathPolicyError),
+    /// ImportRepo lifecycle and ref errors (plan-20260923 ADR-FU-03); the
+    /// text is the stable `<CODE>: <message>` shared by Git `ng` lines and
+    /// the API.
+    #[error("{0}")]
+    ImportRepo(#[from] ImportRepoError),
     #[error("Other error: {0}")]
     Other(String),
     /// Process exit with a frozen CLI status code (UN-29 authz-audit table).
@@ -166,6 +171,9 @@ impl From<MegaError> for GitError {
             MegaError::PathPolicy(err) => {
                 GitError::CustomError(format!("[code:{}] {err}", err.http_status().as_u16()))
             }
+            MegaError::ImportRepo(err) => {
+                GitError::CustomError(format!("[code:{}] {err}", err.http_status().as_u16()))
+            }
             MegaError::ObjStorageNotFound(msg) => {
                 GitError::CustomError(format!("[code:404] ObjStorage not found: {msg}"))
             }
@@ -219,6 +227,71 @@ impl PathPolicyError {
             Self::NotAllowed { .. } | Self::Invalid { .. } => StatusCode::BAD_REQUEST,
             Self::Uninitialized { .. } | Self::Conflict { .. } => StatusCode::CONFLICT,
         }
+    }
+}
+
+/// Why an ImportRepo operation was refused (plan-20260923 ADR-FU-03 item 2).
+/// `Display` starts with a stable code followed by `: ` and is a single line
+/// (paths, ref names and ids have control characters escaped) so it can
+/// travel in a Git `ng` line.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum ImportRepoError {
+    #[error(
+        "IMPORT_REPO_PATH_OCCUPIED: {path:?} already holds content that is not this ImportRepo"
+    )]
+    PathOccupied { path: String },
+    #[error(
+        "IMPORT_REPO_STALE_REF: {ref_name:?} {}; fetch and push again",
+        stale_ref_detail(.expected)
+    )]
+    StaleRef { ref_name: String, expected: String },
+    #[error("IMPORT_REPO_REMOVED: {path:?} was removed; push again to import it anew")]
+    Removed { path: String },
+    #[error("IMPORT_REPO_PATH_INVALID: {path:?}: {}", single_line(.reason))]
+    PathInvalid { path: String, reason: String },
+    #[error("IMPORT_REPO_HAS_CHILDREN: {path:?} contains other ImportRepos; remove them first")]
+    HasChildren { path: String },
+    #[error("IMPORT_REPO_CLEANUP_NOT_FOUND: no cleanup {cleanup_id:?} for {path:?}")]
+    CleanupNotFound { path: String, cleanup_id: String },
+}
+
+impl ImportRepoError {
+    /// Stable machine-readable code (the `Display` prefix).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::PathOccupied { .. } => "IMPORT_REPO_PATH_OCCUPIED",
+            Self::StaleRef { .. } => "IMPORT_REPO_STALE_REF",
+            Self::Removed { .. } => "IMPORT_REPO_REMOVED",
+            Self::PathInvalid { .. } => "IMPORT_REPO_PATH_INVALID",
+            Self::HasChildren { .. } => "IMPORT_REPO_HAS_CHILDREN",
+            Self::CleanupNotFound { .. } => "IMPORT_REPO_CLEANUP_NOT_FOUND",
+        }
+    }
+
+    /// HTTP status for the API face; `Removed` is a Git-face error and maps
+    /// to 409 if it ever reaches the API.
+    pub fn http_status(&self) -> StatusCode {
+        match self {
+            Self::PathInvalid { .. } => StatusCode::BAD_REQUEST,
+            Self::CleanupNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::PathOccupied { .. }
+            | Self::StaleRef { .. }
+            | Self::Removed { .. }
+            | Self::HasChildren { .. } => StatusCode::CONFLICT,
+        }
+    }
+}
+
+/// `StaleRef` detail: a `Create` (zero `expected`) found the ref already
+/// there; anything else found it moved.
+fn stale_ref_detail(expected: &str) -> String {
+    if !expected.is_empty() && expected.bytes().all(|b| b == b'0') {
+        "already exists".to_owned()
+    } else {
+        format!(
+            "changed since it was advertised (expected {})",
+            single_line(expected)
+        )
     }
 }
 
@@ -433,6 +506,88 @@ mod tests {
                 (StatusCode::BAD_REQUEST, text.clone())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn import_repo_error_domain() {
+        let samples = [
+            ImportRepoError::PathOccupied {
+                path: "/third-party/lib".to_owned(),
+            },
+            ImportRepoError::StaleRef {
+                ref_name: "refs/heads/main".to_owned(),
+                expected: "a".repeat(40),
+            },
+            ImportRepoError::Removed {
+                path: "/third-party/lib".to_owned(),
+            },
+            ImportRepoError::PathInvalid {
+                path: "/third-party".to_owned(),
+                reason: "the ImportRepo directory itself is not a repository".to_owned(),
+            },
+            ImportRepoError::HasChildren {
+                path: "/third-party/lib".to_owned(),
+            },
+            ImportRepoError::CleanupNotFound {
+                path: "/third-party/lib".to_owned(),
+                cleanup_id: "c1".to_owned(),
+            },
+        ];
+        let expected = [
+            ("IMPORT_REPO_PATH_OCCUPIED", StatusCode::CONFLICT),
+            ("IMPORT_REPO_STALE_REF", StatusCode::CONFLICT),
+            ("IMPORT_REPO_REMOVED", StatusCode::CONFLICT),
+            ("IMPORT_REPO_PATH_INVALID", StatusCode::BAD_REQUEST),
+            ("IMPORT_REPO_HAS_CHILDREN", StatusCode::CONFLICT),
+            ("IMPORT_REPO_CLEANUP_NOT_FOUND", StatusCode::NOT_FOUND),
+        ];
+        for (err, (code, status)) in samples.into_iter().zip(expected) {
+            let text = err.to_string();
+            assert_eq!(err.code(), code);
+            assert!(text.starts_with(&format!("{code}: ")), "{text}");
+            assert_eq!(err.http_status(), status, "{text}");
+            let mega = MegaError::from(err.clone());
+            assert_eq!(mega.to_string(), text, "wrapping keeps the text verbatim");
+            let direct = ApiError::from(mega);
+            assert_eq!(api_error_body(direct).await, (status, text.clone()));
+            let bare = ApiError::from(err.clone());
+            assert_eq!(api_error_body(bare).await, (status, text.clone()));
+            let git: GitError = MegaError::from(err).into();
+            assert_eq!(api_error_body(ApiError::from(git)).await, (status, text));
+        }
+
+        // Client-supplied paths, ref names, ids and reasons stay on one line.
+        let nl = "x\nng refs/heads/main forged".to_owned();
+        for err in [
+            ImportRepoError::PathOccupied { path: nl.clone() },
+            ImportRepoError::StaleRef {
+                ref_name: nl.clone(),
+                expected: nl.clone(),
+            },
+            ImportRepoError::Removed { path: nl.clone() },
+            ImportRepoError::PathInvalid {
+                path: nl.clone(),
+                reason: nl.clone(),
+            },
+            ImportRepoError::HasChildren { path: nl.clone() },
+            ImportRepoError::CleanupNotFound {
+                path: nl.clone(),
+                cleanup_id: nl.clone(),
+            },
+        ] {
+            let text = err.to_string();
+            assert!(!text.contains('\n'), "{text}");
+        }
+        // A `Create` that finds the ref reads as "already exists".
+        let exists = ImportRepoError::StaleRef {
+            ref_name: "refs/heads/main".to_owned(),
+            expected: "0".repeat(40),
+        }
+        .to_string();
+        assert!(
+            exists.contains("\"refs/heads/main\" already exists"),
+            "{exists}"
+        );
     }
 
     #[test]

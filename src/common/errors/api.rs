@@ -3,7 +3,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
-use super::{BuckError, MegaError, PathPolicyError};
+use super::{BuckError, ImportRepoError, MegaError, PathPolicyError};
 use crate::contract::api::common::CommonResult;
 
 /// Parse [code:xxx] format from error message.
@@ -125,15 +125,25 @@ where
     fn from(err: E) -> Self {
         let anyhow_err = err.into();
 
-        // Path policy errors carry a stable `<CODE>: …` text, bare or wrapped.
-        let policy_status = anyhow_err
+        // Path policy and ImportRepo errors carry a stable `<CODE>: …` text,
+        // bare or wrapped.
+        let contract_status = anyhow_err
             .downcast_ref::<PathPolicyError>()
             .or_else(|| match anyhow_err.downcast_ref::<MegaError>() {
                 Some(MegaError::PathPolicy(policy)) => Some(policy),
                 _ => None,
             })
-            .map(PathPolicyError::http_status);
-        if let Some(status) = policy_status {
+            .map(PathPolicyError::http_status)
+            .or_else(|| {
+                anyhow_err
+                    .downcast_ref::<ImportRepoError>()
+                    .or_else(|| match anyhow_err.downcast_ref::<MegaError>() {
+                        Some(MegaError::ImportRepo(err)) => Some(err),
+                        _ => None,
+                    })
+                    .map(ImportRepoError::http_status)
+            });
+        if let Some(status) = contract_status {
             return ApiError {
                 inner: anyhow_err,
                 status,
