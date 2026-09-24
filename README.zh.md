@@ -17,6 +17,7 @@ mega2 只支持 **trunk / storage-only** 部署模式，不提供 Web UI。需�
 - **开源版不包含 Change List**：开源版提供 monorepo 的核心存储能力，不包含依赖多分支的 Change List，因此不支持多分支。
 - **ImportRepo**：`[monorepo].import_dir`（默认 `/third-party`）下的仓库遵循普通 Git 语义，可以使用多个分支和客户端 tag。这里适合存放需要在本地修改、并定期与上游同步的第三方依赖源码。
 - **Tag**：Monorepo 拒绝 `git push --tags`；创建、查询和删除 Tag 都走 HTTP API。Libra 提供交互式终端界面，以及受支持的目录和 Tag 操作。
+- **新路径**：新路径只能建在 `[monorepo].root_dirs` 列出的根之下；推送到根外的路径，或把从零开始的历史（例如 `git init` 新建的仓库）推送到尚不存在的路径，Git 客户端会收到以 `MONO_PATH_*` 码开头的拒绝。先用 `mega2 path provision` 开通，再 clone 和推送，详见[路径策略与首次使用](docs/user-guide.zh.md#25-monorepo-路径策略与首次使用)。
 - **对象存储**：元数据保存在 Postgres，Git 对象保存在对象存储服务（本地磁盘或 S3-compatible 服务）。`object_format` 默认为 `sha1`；可选的 `sha256` 和 `blake3` 格式需要配合 [Libra](https://libra.tools) 使用。
 
 ### 协议与大文件

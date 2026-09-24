@@ -57,6 +57,25 @@ curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 
 Explore the HTTP API—including Git Smart HTTP, LFS, product writes, tags, and optional OCI `/v2`—in Swagger UI at `http://127.0.0.1:9000/swagger-ui`. The OpenAPI document is at `/api/openapi.json`. mega2 has no Web UI; use `libra mega2 browser` for interactive terminal browsing.
 
+## Example: create a repository at a new path
+
+A repository created with `git init` cannot be pushed straight to a Monorepo path (outside `/third-party`) that does not exist yet: the server rejects it with `MONO_PATH_UNINITIALIZED` and asks you to provision the path first. Provisioning only creates the directory and is safe to repeat; after it, clone the path, commit on top and push. Allowed roots, the three first-push cases and the error codes are in the User Guide's ["Monorepo path policy and first use"](./user-guide.md#25-monorepo-path-policy-and-first-use).
+
+```bash
+# Provision /project/demo inside the mega2 container (this evaluation stack needs no token); the in-container port depends on the compose file
+case "$COMPOSE" in macos-*) PORT=8000 ;; *) PORT=9000 ;; esac
+docker compose -f $COMPOSE exec mega2 mega2 path provision --server http://127.0.0.1:$PORT /project/demo
+
+# Clone the provisioned path, commit and push
+git clone http://127.0.0.1:9000/project/demo
+cd demo
+echo "# demo" > README.md
+git add README.md && git commit -m "add README.md"
+git push origin main
+```
+
+`mega2 path provision` needs an image of 0.39.4 or later; for a stack pulled earlier, re-run `docker compose -f $COMPOSE up -d --wait` first to pull the current image. A successful run prints `created /project/demo (<commit>)`; running it again prints `already exists /project/demo`. With the mega2 CLI installed locally you can also run `mega2 path provision --server http://127.0.0.1:9000 /project/demo` directly; deployments that require a token take it from the environment variable `MEGA2_TOKEN`.
+
 ## Example: push nested directories
 
 You **don't need to create directories in advance**. Create a nested directory in your `/project` clone and push; mega2 creates both `rust-lang/` and `rust-lang/crate/` as part of that push:

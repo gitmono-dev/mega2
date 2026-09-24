@@ -113,6 +113,8 @@ With the sample configuration, the logical root looks like this:
     └── BUCK
 ```
 
+The directories listed in `root_dirs` (`third-party/` through `toolchains/` above; not `.cedar/` or the Buck files) are also the runtime allow-list for creating paths: a new path (a first Git push, provisioning, a product write) can only be created under one of them, and a path outside them gets `MONO_PATH_NOT_ALLOWED`; paths under `import_dir` are ImportRepos and follow their own rules. The steps and error codes for creating a new path under an existing root, and how to add a root after initialization, are in the User Guide's ["Monorepo path policy and first use"](../user-guide.md#25-monorepo-path-policy-and-first-use).
+
 ### How `import_dir` classifies paths
 
 The actual tree always follows the running config's `root_dirs`. The sample

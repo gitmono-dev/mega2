@@ -57,6 +57,25 @@ curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 
 在 Swagger UI 中查看完整 HTTP API，包括 Git Smart HTTP、LFS、产品写入、Tag 和可选 OCI `/v2`：`http://127.0.0.1:9000/swagger-ui`。OpenAPI 文档位于 `/api/openapi.json`。mega2 不提供 Web UI；如需交互式浏览，请在 Libra 工作副本中运行 `libra mega2 browser`。
 
+## 示例：在新路径建仓库
+
+用 `git init` 新建的仓库不能直接推送到尚不存在的 Monorepo 路径（`/third-party` 之外）：服务端会以 `MONO_PATH_UNINITIALIZED` 拒绝并提示先开通。开通只创建目录，可重复执行；开通后 clone 该路径，在其上提交并推送。允许的根、三类首推情形与错误码见使用指南的[「Monorepo 路径策略与首次使用」](./user-guide.zh.md#25-monorepo-路径策略与首次使用)。
+
+```bash
+# 在 mega2 容器内开通 /project/demo（本评估栈无需 token）；容器内端口随 compose 文件而定
+case "$COMPOSE" in macos-*) PORT=8000 ;; *) PORT=9000 ;; esac
+docker compose -f $COMPOSE exec mega2 mega2 path provision --server http://127.0.0.1:$PORT /project/demo
+
+# clone 开通好的路径，提交并推送
+git clone http://127.0.0.1:9000/project/demo
+cd demo
+echo "# demo" > README.md
+git add README.md && git commit -m "add README.md"
+git push origin main
+```
+
+`mega2 path provision` 需要 0.39.4 及以上的镜像；更早拉取的栈请先重新运行 `docker compose -f $COMPOSE up -d --wait` 拉取当前镜像。开通成功时输出 `created /project/demo (<commit>)`，重复执行输出 `already exists /project/demo`。本机装有 mega2 CLI 时，也可以直接运行 `mega2 path provision --server http://127.0.0.1:9000 /project/demo`；需要 token 的部署通过环境变量 `MEGA2_TOKEN` 传入 token。
+
 ## 示例：推送嵌套目录
 
 **无需预先创建目录。**在 `/project` 的克隆中直接建立多级目录并推送，`rust-lang/` 和 `rust-lang/crate/` 会随本次 push 一并写入：

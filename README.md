@@ -17,6 +17,7 @@ Start with the [Quick Start](docs/quick-start.md), then see the [documentation i
 - **No Change List in the open-source edition**: the open-source edition provides the core monorepo storage layer, without Change List. Change Lists depend on multiple branches, which this edition does not support.
 - **ImportRepo**: repositories under `[monorepo].import_dir` (default `/third-party`) use ordinary Git semantics, including multiple branches and client-managed tags. This is a good place to keep third-party dependency sources that you need to modify locally and periodically sync with upstream.
 - **Tags**: the Monorepo rejects `git push --tags`; create, list, and delete tags through the HTTP API. Libra provides an interactive terminal browser and the supported directory and tag operations.
+- **New paths**: new paths can only be created under the roots listed in `[monorepo].root_dirs`; a Git push to a path outside them, or of history that starts from nothing (e.g. a `git init` repository) to a path that does not exist yet, is rejected with a message that starts with a `MONO_PATH_*` code. Provision the path with `mega2 path provision`, then clone and push; see [Monorepo path policy and first use](docs/user-guide.md#25-monorepo-path-policy-and-first-use).
 - **Object storage**: metadata lives in Postgres, while Git objects live in object storage (local disk or an S3-compatible service). The default `object_format` is `sha1`; the optional `sha256` and `blake3` formats require [Libra](https://libra.tools).
 
 ### Protocols and large files

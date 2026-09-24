@@ -97,6 +97,8 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
     └── BUCK                 # system_demo_toolchains()
 ```
 
+`root_dirs` 列出的目录（上图中 `third-party/` 至 `toolchains/`，不含 `.cedar/` 与 Buck 文件）同时是运行期的「创建」白名单：新路径（Git 首推、路径开通、产品写）只能建在其中某一项之下，根外路径得到 `MONO_PATH_NOT_ALLOWED`；`import_dir` 之下的路径是 ImportRepo，另按其规则处理。在已有根下建新路径的步骤、错误码与初始化后新增根的做法见使用指南的[「Monorepo 路径策略与首次使用」](../user-guide.zh.md#25-monorepo-路径策略与首次使用)。
+
 ### `import_dir` 的作用
 
 `import_dir`（默认 `/third-party`）不是普通的一级目录声明，而是 **ImportRepo 与 Monorepo 的路径边界**：

@@ -123,6 +123,15 @@ use crate::common::errors::{ApiError, MegaError, RvError};
 
 入口：产品写（create / edit-save / delete / move，FU-06）、路径开通 API 与 CLI（FU-07、FU-08）、trunk receive-pack 首推（FU-10）。
 
+Git 面出现场景（trunk receive-pack，FU-10；判定见 [`refactoring/trunk-push.md`](./refactoring/trunk-push.md)「创建的路径策略」）：只在推送**创建**路径时出现，即 `old_id` 为零、目标路径无 `main` 行、无墓碑且在根树中不可解析为目录。首推与原样重试得到同一文本。
+
+- 根外路径 → `MONO_PATH_NOT_ALLOWED`，不论推送的历史。
+- 允许的根下、推送的链为孤儿（历史从零开始，或原样推送另一路径的已知历史）→ `MONO_PATH_UNINITIALIZED`。
+- 非规范的原始 URL 路径（如 `/project//x`）→ `MONO_PATH_INVALID`：协议层只去掉末尾的 `.git`（`contract/git_protocol/path.rs` 的 `normalize_repo_path`），规范化只发生在 ImportRepo 分派，Monorepo 分派使用原始路径（`DEFER-FU-18`）。常见客户端自己会去掉尾斜杠，不受影响。
+- `MONO_PATH_CONFLICT` 不在 Git 面出现（文件路径上的创建见 `DEFER-FU-19`）。
+
+report-status 行为 `ng refs/heads/main <文本>`；`git push` 显示为 `! [remote rejected] <src> -> main (<文本>)`，Libra 显示为 `remote rejected ref update for 'refs/heads/main': <文本>`（Libra 会截断过长的文本）。用户侧的处理步骤见[使用指南 2.5 节](./user-guide.zh.md#25-monorepo-路径策略与首次使用)。
+
 ## MegaError::OrphanChain：孤儿链拒绝（plan-20260923）
 
 `MegaError::OrphanChain`（FU-09，ADR-FU-07）：新分支推送（`old_id` 为零）的第一父链沿 pack 走到无父根时的孤儿拒绝，首推与原样重试返回同一错误。显示文本保持历史措辞 `Other error: Can not init directory under monorepo directory!`，Git `ng` 行不变；类型化只为让调用方（FU-10 的 trunk 首推分类）经 `push_chain::is_orphan_chain_error` 精确识别，不再匹配文本。它不证明历史未被引用（已知 tip 的链走到根时同样返回，见 [`refactoring/trunk-push.md`](./refactoring/trunk-push.md)）。trunk 形态下，推送到待创建路径（无 `main` 行、无墓碑、根树中不可解析）时它被映射为 `MONO_PATH_UNINITIALIZED`（FU-10），客户端看到的是路径策略码。

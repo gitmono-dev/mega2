@@ -51,6 +51,36 @@ See the [Deployment Guide](./deployment.md) for token setup, credential injectio
 
 `[monorepo].object_format` defaults to `sha1`, which works with standard Git clients. The `sha256` and `blake3` formats are Libra extensions and require the Libra client; standard Git interoperability is not supported for those formats. Configuration options are listed in [`config.toml`](../config/config.toml).
 
+### 2.5 Monorepo path policy and first use
+
+This section is the single authoritative description of creating a new path in the monorepo; the Quick Start, the README and the initialization manual link here.
+
+**Allowed roots.** The first-level directories listed in `[monorepo].root_dirs` (values in [`config/config.toml`](../config/config.toml), shape rules in the [Configuration Guide](./configuration.md)) are the allow-list for creating paths: a new path can only be created under one of them. Paths under `import_dir` (default `/third-party`) are ImportRepos (see §1); a Git push creates them directly and this section does not apply. Adding a first-level root requires a config change and a restart; the new root is then still missing from the root tree, and only a push that adds commits on top of existing history can create it, because provisioning and product writes never land at `/`.
+
+**First push to a new path.** If the path already exists (it was pushed, provisioned or written through the API), push as described in §2.1. If it does not exist yet, trunk mode handles the push as follows; both path-policy rejections in the table stay the same on a verbatim retry:
+
+| Case | Result | Next step |
+|---|---|---|
+| The path is not under any allowed root | Rejected with `MONO_PATH_NOT_ALLOWED`, listing the allowed roots | Use a path under one of the roots; for a new root see "Allowed roots" above |
+| The path is under an allowed root and the pushed history starts from nothing (e.g. the first commit after `git init`), or is another path's history pushed unchanged | Rejected with `MONO_PATH_UNINITIALIZED`, naming the provisioning command | Provision the path as below, clone it, commit on top and push; for a new root that is not in the root tree yet see "Allowed roots" above |
+| The path is under an allowed root and the push adds at least one commit on top of a commit the server already has (e.g. committing in a clone of another path) | Accepted and created | After the push, run `git fetch && git reset --hard origin/main` to align |
+
+In the second and third cases the new path advertises no refs, so Git sends the whole source history: if it carries more than `[monorepo].max_push_commits` (default 250) commits, the push is rejected with that limit (no path-policy code; a verbatim retry may show a different text). Provision the path instead under an existing root; a root added after initialization cannot be provisioned, so clone a path with a short history, commit on top and push that to the new root.
+
+**Provisioning a path.** Provisioning only creates the directory (one `.gitkeep` commit) and is safe to repeat:
+
+- CLI: `mega2 path provision --server <URL> <PATH>`. It reads the push token only from the environment variable `MEGA2_TOKEN` (omit it under `push_auth=none`) and reads no config file. On success it prints `created <path> (<commit>)` or `already exists <path>` and exits 0; when the server refuses, it writes the error text to stderr and exits 1.
+- HTTP: `POST /api/v1/path/provision` with body `{"path": "<PATH>"}`; authentication, status codes and the response shape are in the runtime OpenAPI (§4.4) and in the contract page [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md) (Chinese).
+
+After provisioning, `git clone <URL><PATH>`, commit on top and push. Product writes (§4.1) under an allowed root that is already in the root tree create the path themselves and need no provisioning.
+
+**Error codes.** Path-policy error texts start with a stable code, so clients can branch on the code before the colon; the exact text format, HTTP status and where each code occurs are in the [error model](./errors.md) (Chinese). The four codes and what to do:
+
+- `MONO_PATH_NOT_ALLOWED`: use a path under an allowed root (provisioning and product writes also return it for paths under `import_dir`).
+- `MONO_PATH_UNINITIALIZED`: provision the path first.
+- `MONO_PATH_INVALID`: use a canonical path (absolute, no `.` / `..`, repeated or trailing `/`).
+- `MONO_PATH_CONFLICT`: a component of the path is a file; choose another path (returned only by provisioning, through the API or the CLI).
+
 ## 3. Large files: LFS
 
 - **Git LFS (standard)**: endpoints `/info/lfs` and `/api/v1/lfs` work with standard `git-lfs` clients. LFS writes use the same `git.push_auth` setting as Git receive-pack; see the [Deployment Guide](./deployment.md) for authentication modes.
@@ -116,6 +146,7 @@ Global flags: `--config <PATH>` (env `MEGA_CONFIG`) and `--profile <NAME>` (env 
 | `mega2 service http --host 0.0.0.0 -p 8000` | Start the HTTP surface (Git smart HTTP + LFS + `/api/v1` + optional OCI / Agent Capture); matches the Dockerfile default CMD |
 | `mega2 service ssh [--ssh-port 2222]` | Start the SSH surface (upload-pack only under storage-only); standalone requires `cedar.enforcement=off`, otherwise use `multi` |
 | `mega2 service multi http ssh` | Start HTTP + SSH in one process (shared authorization snapshot) |
+| `mega2 path provision --server <URL> <PATH>` | Provision a monorepo path (before its first push, see §2.5); the token comes only from the environment variable `MEGA2_TOKEN`, no config file is read |
 | `mega2 config validate [--resolve-secrets] [--show-sources]` | Validate configuration before startup; add `--deny-warnings` in automation |
 | `mega2 config init [-o PATH] [--force]` | Generate a safe starter configuration file |
 | `mega2 config secret ref/set/check/rotate` | Manage vault-backed config secrets (SecretRef) |

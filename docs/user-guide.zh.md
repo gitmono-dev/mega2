@@ -51,6 +51,36 @@ storage-only **不暴露 SSH receive-pack**(`git.ssh_receive_pack=false` 是强�
 
 `[monorepo].object_format` 默认 `sha1`(标准 Git)。`sha256` 与 `blake3` 是 **git-internal / Libra 扩展**,不宣称与标准 Git 客户端互通,需配合 Libra 使用;口径见 [`refactoring/protocol.md`](./refactoring/protocol.md) 与 [`refactoring/config.md`](./refactoring/config.md)。
 
+### 2.5 Monorepo 路径策略与首次使用
+
+本节是「在 Monorepo 中建一个新路径」的唯一权威说明；快速开始、README 与初始化手册都链接到这里。
+
+**允许的根。**`[monorepo].root_dirs` 列出的一级目录（取值见 [`config/config.toml`](../config/config.toml)，形状规则见[配置指南](./configuration.zh.md)）是「创建」白名单：新路径只能建在某个根之下。`import_dir`（默认 `/third-party`）之下的路径是 ImportRepo（见第 1 节），由 Git 推送直接创建，不适用本节。新增一级根要改配置并重启服务；此后该根还不在根树中，只有在已有历史之上新增 commit 的推送能创建它——开通与产品写都不在 `/` 落地。
+
+**第一次推送到新路径。**目标路径已经存在时（已被推送、开通或 API 写入过），按第 2.1 节的规则推送即可。目标路径尚不存在时，trunk 模式按下表处理；表中两种路径策略拒绝在原样重试时保持不变：
+
+| 情形 | 结果 | 下一步 |
+|---|---|---|
+| 路径不在任何允许的根之下 | 拒绝，`MONO_PATH_NOT_ALLOWED`，列出允许的根 | 改用某个根之下的路径；需要新根时见上文「允许的根」 |
+| 路径在允许的根之下，推送的历史从零开始（例如 `git init` 后的第一个 commit），或把另一路径的历史原样推过来 | 拒绝，`MONO_PATH_UNINITIALIZED`，点名开通命令 | 按下文开通路径，clone 后在其上提交，再推送；尚不在根树中的新根见上文「允许的根」 |
+| 路径在允许的根之下，推送在服务端已有的 commit 之上至少新增一个 commit（例如 clone 另一个路径后提交） | 接受，按创建语义落地 | 推送后运行 `git fetch && git reset --hard origin/main` 对齐 |
+
+第二、三种情形下新路径不广告任何 ref，Git 会把整段源历史一起发送：其中的 commit 超过 `[monorepo].max_push_commits`（默认 250）时推送以该上限被拒（不带路径策略码，原样重试时文本可能不同）。此时对已有的根改用开通；初始化后新增的根无法开通，可 clone 一个历史较短的路径，在其上提交后推送到新根。
+
+**开通路径。**开通只创建目录（写入一个 `.gitkeep` commit），可重复执行：
+
+- CLI：`mega2 path provision --server <URL> <PATH>`。只读取环境变量 `MEGA2_TOKEN` 作为 push token（`push_auth=none` 时可省略），不读配置文件；成功输出 `created <path> (<commit>)` 或 `already exists <path>` 并以 0 退出，服务端拒绝时把错误文本写到 stderr 并以 1 退出。
+- HTTP：`POST /api/v1/path/provision`，请求体 `{"path": "<PATH>"}`；鉴权、状态码与响应形态见运行时 OpenAPI（第 4.4 节）与契约页 [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md)。
+
+开通之后 `git clone <URL><PATH>`，在其上提交并推送。第 4.1 节的产品写在已位于根树中的允许根之下本身就会创建路径，不需要先开通。
+
+**错误码。**路径策略错误的文本以稳定的码开头，客户端可按冒号前的码分支；完整文本格式、HTTP 状态与各码的出现场景见[错误模型](./errors.md)。四个码与对应动作：
+
+- `MONO_PATH_NOT_ALLOWED`：改用允许的根之下的路径（开通与产品写对 `import_dir` 之下的路径也返回此码）。
+- `MONO_PATH_UNINITIALIZED`：先开通该路径。
+- `MONO_PATH_INVALID`：改用规范路径（绝对路径，不含 `.` / `..`、重复或末尾的 `/`）。
+- `MONO_PATH_CONFLICT`：路径上的某一级已是文件，换一个路径（只由开通返回，API 与 CLI 均然）。
+
 ## 3. 大文件:LFS
 
 - **Git LFS(标准)**:端点 `/info/lfs` 与 `/api/v1/lfs`,stock `git-lfs` 客户端直接可用;LFS 写授权与 Git receive-pack 共用 `git.push_auth`(矩阵见 [`deploy-trunk.md`](./deploy-trunk.md) 第 6 节)。
@@ -116,6 +146,7 @@ libra mega2 browser
 | `mega2 service http --host 0.0.0.0 -p 8000` | 启动 HTTP 面(Git smart HTTP + LFS + `/api/v1` + 可选 OCI / Agent Capture);与 Dockerfile 默认 CMD 一致 |
 | `mega2 service ssh [--ssh-port 2222]` | 启动 SSH 面(storage-only 下仅 upload-pack);standalone 形态要求 `cedar.enforcement=off`,否则改用 `multi` |
 | `mega2 service multi http ssh` | 单进程同时启动 HTTP + SSH(共享授权快照) |
+| `mega2 path provision --server <URL> <PATH>` | 开通 Monorepo 路径(首次推送前,见 2.5);token 只从环境变量 `MEGA2_TOKEN` 读取,不读配置文件 |
 | `mega2 config validate [--resolve-secrets] [--show-sources]` | 启动前校验配置;自动化加 `--deny-warnings` |
 | `mega2 config init [-o PATH] [--force]` | 生成安全的起始配置文件 |
 | `mega2 config secret ref/set/check/rotate` | 管理 vault 承载的配置密文(SecretRef) |
