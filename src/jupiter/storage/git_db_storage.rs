@@ -454,11 +454,15 @@ impl GitDbStorage {
         Ok(result)
     }
 
-    /// Finds a Git repository with a path that matches the beginning of the provided repository path using a LIKE query.
+    /// Finds the Git repository whose stored `repo_path` is the longest path prefix of the provided path.
+    ///
+    /// Matching is by whole path components: `/a/b` matches `/a/b` and `/a/b/c`, but not `/a/bc`.
+    /// The stored path is compared literally (no `LIKE` wildcards), and a trailing `/` on either
+    /// side is ignored.
     ///
     /// # Arguments
     ///
-    /// * `repo_path` - A string slice that holds the beginning of the path of the repository to search for.
+    /// * `repo_path` - The path to resolve; it may point at the repository root or anywhere below it.
     ///
     /// # Returns
     ///
@@ -469,7 +473,10 @@ impl GitDbStorage {
         repo_path: &str,
     ) -> Result<Option<git_repo::Model>, MegaError> {
         let query = git_repo::Entity::find()
-            .filter(Expr::cust(format!("'{repo_path}' LIKE repo_path || '%'")))
+            .filter(Expr::cust_with_values(
+                "starts_with($1 || '/', RTRIM(repo_path, '/') || '/')",
+                [repo_path],
+            ))
             .order_by_desc(Expr::cust("LENGTH(repo_path)"));
         tracing::debug!("{}", query.build(DbBackend::Postgres).to_string());
         let result = query.one(self.get_connection()).await?;
@@ -1400,5 +1407,69 @@ mod tests {
             .map(|row| row.try_get::<String>("", "name").unwrap())
             .collect();
         assert_eq!(key, vec!["id".to_owned()]);
+    }
+
+    async fn save_repo(git_db: &GitDbStorage, repo_path: &str) {
+        git_db
+            .save_git_repo(git_repo::Model {
+                id: generate_id(),
+                repo_path: repo_path.to_owned(),
+                repo_name: repo_path.rsplit('/').next().unwrap().to_owned(),
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn like_path(git_db: &GitDbStorage, path: &str) -> Option<String> {
+        git_db
+            .find_git_repo_like_path(path)
+            .await
+            .unwrap()
+            .map(|m| m.repo_path)
+    }
+
+    #[tokio::test]
+    async fn find_git_repo_like_path_binds_quoted_path() {
+        let git_db = storage().await;
+        save_repo(&git_db, "/third-party/x").await;
+
+        let found = git_db
+            .find_git_repo_like_path("/third-party/x'; DROP TABLE git_repo; --")
+            .await
+            .expect("quoted path must not break the query");
+        assert!(found.is_none());
+        assert_eq!(
+            like_path(&git_db, "/third-party/x").await.as_deref(),
+            Some("/third-party/x")
+        );
+    }
+
+    #[tokio::test]
+    async fn find_git_repo_like_path_matches_longest_component_prefix() {
+        let git_db = storage().await;
+        for path in ["/third-party/x", "/third-party/x/sub", "/third-party/a_b"] {
+            save_repo(&git_db, path).await;
+        }
+
+        let cases = [
+            ("/third-party/x", Some("/third-party/x")),
+            ("/third-party/x/", Some("/third-party/x")),
+            ("/third-party/x/src/lib.rs", Some("/third-party/x")),
+            ("/third-party/x/sub", Some("/third-party/x/sub")),
+            ("/third-party/x/sub/a.rs", Some("/third-party/x/sub")),
+            ("/third-party/xyz/a.rs", None),
+            ("/third-party/a_b/c", Some("/third-party/a_b")),
+            ("/third-party/aXb/c", None),
+            ("/third-party", None),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                like_path(&git_db, path).await.as_deref(),
+                expected,
+                "{path}"
+            );
+        }
     }
 }
