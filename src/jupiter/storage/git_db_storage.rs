@@ -788,6 +788,35 @@ impl GitDbStorage {
         Ok(())
     }
 
+    /// `insert_tag` inside the caller's transaction (plan-20260923 ADR-FU-09
+    /// item 5): the stored row comes back through `RETURNING` on `txn`, never
+    /// through a pool read. Callers take `lock_live_import_repo` first.
+    pub async fn insert_tag_in_txn(
+        &self,
+        tag: git_tag::Model,
+        txn: &DatabaseTransaction,
+    ) -> Result<git_tag::Model, MegaError> {
+        Ok(git_tag::Entity::insert(tag.into_active_model())
+            .exec_with_returning(txn)
+            .await?)
+    }
+
+    /// `delete_tag` inside the caller's transaction: every `git_tag` row of
+    /// `name` in `repo_id` (none for a lightweight tag).
+    pub async fn delete_tag_in_txn(
+        &self,
+        repo_id: i64,
+        name: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), MegaError> {
+        git_tag::Entity::delete_many()
+            .filter(git_tag::Column::RepoId.eq(repo_id))
+            .filter(git_tag::Column::TagName.eq(name))
+            .exec(txn)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_obj_count_by_repo_id(&self, repo_id: i64) -> usize {
         let c_count = git_commit::Entity::find()
             .filter(git_commit::Column::RepoId.eq(repo_id))
@@ -1066,12 +1095,14 @@ impl GitDbStorage {
     }
 
     /// Share-lock the live ImportRepo row `(repo_id, repo_path)` until `txn`
-    /// ends (plan-20260923 ADR-FU-09 item 5). Every receive-pack write of the
-    /// repository takes it first in its own transaction: a detach (`FOR
-    /// UPDATE`, then `DELETE`) waits for the write to commit, or has committed
-    /// and the write lands no row. `repo_path` is the path the caller resolved
-    /// the row by (canonical on the Git face); no such row is
-    /// `IMPORT_REPO_REMOVED`.
+    /// ends (plan-20260923 ADR-FU-09 item 5). Every write of the repository
+    /// (receive-pack since FU-18; the `ImportApiService` default-ref, tag
+    /// create and tag delete transactions since FU-19) takes it first in its
+    /// own transaction: a detach (`FOR UPDATE`, then `DELETE`) waits for the
+    /// write to commit, or has committed and the write lands no row.
+    /// `repo_path` is the path the caller resolved the row by (canonical on
+    /// the Git face, the dispatched row's stored path on the API face); no
+    /// such row is `IMPORT_REPO_REMOVED`.
     pub async fn lock_live_import_repo(
         &self,
         txn: &DatabaseTransaction,

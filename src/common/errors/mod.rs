@@ -268,8 +268,9 @@ impl ImportRepoError {
         }
     }
 
-    /// HTTP status for the API face; `Removed` is a Git-face error and maps
-    /// to 409 if it ever reaches the API.
+    /// HTTP status for the API face; `Removed` reaches the API as 409 from
+    /// the edit/save object batch (plan-20260923 FU-18) and from the
+    /// edit/save pre-reads, default-ref write and tag writes (FU-19).
     pub fn http_status(&self) -> StatusCode {
         match self {
             Self::PathInvalid { .. } => StatusCode::BAD_REQUEST,

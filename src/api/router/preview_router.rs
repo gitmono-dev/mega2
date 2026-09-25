@@ -185,7 +185,7 @@ async fn delete_entry(
     let requester = trunk_write_requester(&state, &headers, &json.path)?;
     let handler = state.api_handler(json.path.as_ref()).await?;
     // Bare `?`: the service's `[code:4xx]` prefixes map through
-    // `From<E> for ApiError` (`map_ceres_error` would turn 409 into 500).
+    // `From<E> for ApiError`.
     let result = handler
         .delete_monorepo_entry(json.clone(), requester)
         .await?;

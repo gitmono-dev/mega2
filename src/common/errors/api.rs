@@ -223,7 +223,8 @@ where
     }
 }
 
-// Map ceres-style coded errors like "[code:404] message" into ApiError with proper status.
+// Map ceres-style coded errors ("[code:400|404|409] message"; 409 since
+// plan-20260923 FU-19 for IMPORT_REPO_REMOVED) into ApiError with proper status.
 pub(crate) fn map_ceres_error<D: std::fmt::Display>(err: D, ctx: &str) -> ApiError {
     let s = err.to_string();
 
@@ -233,6 +234,7 @@ pub(crate) fn map_ceres_error<D: std::fmt::Display>(err: D, ctx: &str) -> ApiErr
         return match code {
             "400" => ApiError::bad_request(error_msg),
             "404" => ApiError::not_found(error_msg),
+            "409" => ApiError::with_status(StatusCode::CONFLICT, error_msg),
             _ => ApiError::internal(error_msg),
         };
     }
