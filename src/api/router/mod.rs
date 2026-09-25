@@ -7,6 +7,7 @@ pub mod cl_router;
 pub mod commit_router;
 pub mod gpg_router;
 pub mod group_router;
+pub mod import_repo_router;
 #[cfg(feature = "fastcdc")]
 pub mod lfs_media;
 pub mod lfs_router;
@@ -98,6 +99,39 @@ mod tests {
             paths.iter().any(|p| p.contains("/edit/save")),
             "review OpenAPI must include /edit/save: {paths:?}"
         );
+    }
+
+    /// plan-20260923 FU-20: the ImportRepo cleanup route exists on the
+    /// storage-only surface only (DEFER-FU-02).
+    #[test]
+    fn import_repo_remove_is_storage_only() {
+        const ROUTE: &str = "/api/v1/import-repo/remove";
+        let with_capture: Vec<String> = OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .nest("/api/v1", api_router::storage_only_routers_with(true))
+            .split_for_parts()
+            .1
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect();
+        for paths in [api_v1_paths(PushPolicy::Trunk), with_capture] {
+            assert!(paths.iter().any(|p| p == ROUTE), "{paths:?}");
+        }
+        let write_paths: Vec<String> = crate::api::router::preview_router::write_routers()
+            .split_for_parts()
+            .1
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect();
+        for paths in [api_v1_paths(PushPolicy::Review), write_paths] {
+            assert!(
+                paths.iter().all(|p| !p.ends_with("/import-repo/remove")),
+                "{paths:?}"
+            );
+        }
     }
 
     #[test]

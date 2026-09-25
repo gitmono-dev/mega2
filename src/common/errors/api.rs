@@ -80,6 +80,11 @@ impl ApiError {
     pub fn internal(err: impl Into<anyhow::Error>) -> Self {
         Self::with_status(StatusCode::INTERNAL_SERVER_ERROR, err)
     }
+
+    /// HTTP status this error answers with (plan-20260923 ADR-FU-10 item 4).
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -240,4 +245,69 @@ pub(crate) fn map_ceres_error<D: std::fmt::Display>(err: D, ctx: &str) -> ApiErr
     }
 
     ApiError::internal(anyhow::anyhow!(format!("{}: {}", ctx, s)))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{http::StatusCode, response::IntoResponse};
+    use sea_orm::DbErr;
+
+    use super::ApiError;
+    use crate::common::errors::{ImportRepoError, MegaError};
+
+    #[test]
+    fn api_error_status_matches_response() {
+        let cases = [
+            (
+                ApiError::with_status(StatusCode::UNAUTHORIZED, anyhow::anyhow!("x")),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                ApiError::forbidden(anyhow::anyhow!("x")),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                ApiError::bad_request(anyhow::anyhow!("x")),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ApiError::not_found(anyhow::anyhow!("x")),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ApiError::internal(anyhow::anyhow!("x")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ApiError::new(anyhow::anyhow!("x")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ApiError::from(ImportRepoError::HasChildren {
+                    path: "/third-party/a".to_owned(),
+                }),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ApiError::from(ImportRepoError::CleanupNotFound {
+                    path: "/third-party/a".to_owned(),
+                    cleanup_id: "12".to_owned(),
+                }),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ApiError::from(MegaError::Db(DbErr::Custom("x".to_owned()))),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ApiError::from(anyhow::anyhow!("[code:409] x")),
+                StatusCode::CONFLICT,
+            ),
+        ];
+        for (error, expected) in cases {
+            let status = error.status();
+            assert_eq!(status, expected, "{error:?}");
+            assert_eq!(error.into_response().status(), status);
+        }
+    }
 }

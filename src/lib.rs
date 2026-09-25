@@ -36,8 +36,9 @@ pub mod readonly_ops {
     };
 }
 
-/// Internal seam for the ImportRepo detach IT (plan-20260923 FU-16) until the
-/// cleanup entry lands (FU-17 / FU-20). Not a supported API.
+/// Internal seam for the ImportRepo detach IT (plan-20260923 FU-16): detach
+/// without the sweep, which the product entry (POST /api/v1/import-repo/remove,
+/// FU-20) cannot do. Not a supported API.
 #[doc(hidden)]
 pub mod import_repo_ops {
     pub use crate::ceres::pack::import_repo::detach_for_integration_test;

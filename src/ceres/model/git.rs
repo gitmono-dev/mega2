@@ -265,6 +265,50 @@ pub struct PathProvisionResult {
     pub commit_id: Option<String>,
 }
 
+/// Request body of `POST /import-repo/remove` (plan-20260923 ADR-FU-10 item 5).
+/// `path` alone is a new cleanup; with `cleanup_id` only that cleanup
+/// continues and no live repository is removed. Unknown fields are refused so
+/// a misspelled `cleanup_id` cannot turn into a new cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImportRepoRemoveRequest {
+    /// Registered ImportRepo path: canonical and strictly below the import
+    /// directory (the clone URL path without one trailing `.git`).
+    pub path: String,
+    /// `cleanup_id` of an earlier answer for the same `path`; omitted or
+    /// `null` is a new operation.
+    #[serde(default)]
+    pub cleanup_id: Option<i64>,
+}
+
+/// `outcome` of `POST /import-repo/remove`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportRepoRemoveOutcome {
+    /// The cleanup's ledger row is swept.
+    Removed,
+    /// Detached, sweep not finished: resend with `cleanup_id`.
+    Pending,
+    /// No live repository at `path` and nothing pending.
+    Absent,
+}
+
+/// Response data of `POST /import-repo/remove`; all four keys are always
+/// present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ImportRepoRemoveResult {
+    /// The requested path (canonical).
+    pub path: String,
+    pub outcome: ImportRepoRemoveOutcome,
+    /// Repository of the cleanup (64-bit, may exceed 2^53); `null` for
+    /// `absent`.
+    #[schema(required = true)]
+    pub repo_id: Option<i64>,
+    /// Cleanup to continue with; `null` for `absent`.
+    #[schema(required = true)]
+    pub cleanup_id: Option<i64>,
+}
+
 /// Request body for `POST /delete-entry` (plan-20260917 ADR-LB-03,
 /// plan-20260918 ADR-FT-01): parent `path` plus `name`; `is_directory`
 /// defaults to directory so existing directory clients omit the field.

@@ -19,12 +19,13 @@
 | `POST /api/v1/create-entry` | `implemented` | — | 可用 |
 | `POST /api/v1/delete-entry` | `implemented` | LB-02 / FT-02 | 可用：省略 `is_directory` 删目录；`false` 删文件 |
 | `POST /api/v1/move-entry` | `implemented` | LB-03 / FT-03 | 可用：省略 `is_directory` 移目录；`false` 移文件（同一 blob oid） |
-| `POST /api/v1/tags` | `implemented` | LB-04 | 可用：`storage_only_routers_with` 已 merge `tag_router::routers()`（`api_router.rs:83`）；trunk 写经 `push_auth`，见「鉴权」 |
+| `POST /api/v1/tags` | `implemented` | LB-04 | 可用：`storage_only_routers_with` 已 merge `tag_router::routers()`；trunk 写经 `push_auth`，见「鉴权」 |
 | `POST /api/v1/tags/list` | `implemented` | FT-04 | **405**（不再登记 POST） |
 | `GET /api/v1/tags/list` | `implemented` | FT-04 | 唯一 list：必填 query `page`、`per_page`、`path` |
 | `GET /api/v1/tags/{name}` | `implemented` | LB-04 / FT-06 | 可用（读，不要求 Authorization）。可选 `?path=`（省略或空 = `/`） |
 | `DELETE /api/v1/tags/{name}` | `implemented` | LB-04 / FT-06 | 可用：鉴权 path = 选择器 `path`（省略或空 = `/`） |
 | `POST /api/v1/path/provision` | `implemented` | plan-20260923 FU-07 | 可用：**只挂 storage-only**（`storage_only_write_routers`）；Review 形态 404 |
+| `POST /api/v1/import-repo/remove` | `implemented` | plan-20260923 FU-20 | 可用：**只挂 storage-only**（`storage_only_routers_with` 合并 `import_repo_router::routers()`）；token 须覆盖 `path`，`push_auth=none` 一律 403；Review 形态 404 |
 
 公共前缀 `/api/v1` 由外层 nest 施加。
 
@@ -43,6 +44,7 @@
 - **只 pin 不改语义：** `GET /tree`、`POST /create-entry`。
 - **新增产品写：** `POST /delete-entry`、`POST /move-entry`（改名 = 同 parent 的 move）。plan-20260918 用同一路径扩文件（`is_directory=false`）。
 - **挂载 + 鉴权 + 文档对齐：** 四条 `/tags*`。plan-20260918 把 list 改 GET，并为 get/delete 加 `?path=`。
+- **ImportRepo 叶子清理（plan-20260923 FU-20）：** `POST /import-repo/remove`，见「ImportRepo 叶子清理」。
 - 目录/文件变更是**父目录 tree 改写**后写新 commit，经 `land_api_tip_push`（trunk）或既有 CL 分支（Review）前进 tip；**不是** Git delete command，也不走 CL `apply_changes`（ADR-LB-02 / ADR-FT-01）。
 
 ## 已有 API（本计划不改语义）
@@ -223,7 +225,7 @@
 
 ## 标签（monorepo tags）
 
-服务层 `MonoApiService` 的 `create_tag` / `list_tags` / `get_tag` / `delete_tag` 已实现；LB-04 起 `storage_only_routers_with`（`src/api/api_router.rs:83`）merge 了 `tag_router::routers()`（`tag_router.rs:20`），四条路由在 storage-only / trunk 与 Review 上都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 与 `tag_router::tag_routes_registered_on_storage_only_routers` 锁定）。trunk 写鉴权见「鉴权」。
+服务层 `MonoApiService` 的 `create_tag` / `list_tags` / `get_tag` / `delete_tag` 已实现；LB-04 起 `storage_only_routers_with`（`src/api/api_router.rs`）merge 了 `tag_router::routers()`（`tag_router.rs` 的 `routers`），四条路由在 storage-only / trunk 与 Review 上都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 与 `tag_router::tag_routes_registered_on_storage_only_routers` 锁定）。trunk 写鉴权见「鉴权」。
 
 Git 客户端 push Tag 仍然**禁止**（见[使用指南](../user-guide.zh.md)）；Tag 只能通过本节 HTTP API 管理。
 
@@ -273,9 +275,94 @@ Git 客户端 push Tag 仍然**禁止**（见[使用指南](../user-guide.zh.md)
 
 `TagResponse` 字段：`name`、`tag_id`、`object_id`、`object_type`、`tagger`、`message`、`created_at`。七个字段**全部是非 `Option` 的 `String`**（`ceres/model/tag.rs:37-52`），键始终存在；`created_at` 是**字符串**不是数值时间戳；list / get 回传的 lightweight tag `tagger` 与 `message` 为**空串**（`mono_api_service.rs:1755-1756`、`:1803-1804`）；**create 的回应**里 lightweight tag 的 `tagger` 是 `tagger_name` / `tagger_email` 的组合、两者都缺省时为 `unknown`（`:1661-1666`、`:2668`），`message` 为空串。
 
+## ImportRepo 叶子清理（plan-20260923 FU-20）
+
+### `POST /api/v1/import-repo/remove` — `implemented`（plan-20260923 FU-20）
+
+**用途。** 清理 `import_dir` 之下的一个 ImportRepo 叶子：经写入队列 detach（B3 `op = detach`：删除 `git_repo` 与 `import_refs` 行、从根树移除挂载叶子），再在本请求的预算内清扫对象行。机制见 [trunk-push.md](trunk-push.md) 与 [`../plan/plan-20260923.md`](../plan/plan-20260923.md) 的 ADR-FU-09 / ADR-FU-10，本节只写 HTTP 契约。只挂 storage-only（`storage_only_routers_with` 合并 `import_repo_router::routers()`；单测 `api::router::tests::import_repo_remove_is_storage_only` 锁定 Review 不挂）。
+
+**请求。** 新操作只给 `path`；续做再给上一次答复中的 `cleanup_id`：
+
+```json
+{ "path": "/third-party/acme/lib" }
+```
+
+```json
+{ "path": "/third-party/acme/lib", "cleanup_id": 7340032 }
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `path` | string，必填 | 已注册 ImportRepo 的存储路径：规范形式、组件级严格位于 `import_dir` 之下。拒绝 NUL、`\`、相对路径、`.` 与 `..` 段、重复或结尾斜杠、首尾空白、`import_dir` 本身与其外的路径；NUL 以外的控制字符不拒绝（计划 `DEFER-FU-44`）。`.git` 是普通字符：Git URL `…/lib.git` 对应的 `path` 是 `/third-party/acme/lib` |
+| `cleanup_id` | i64，可选 | 上一次答复中的 `cleanup_id`（同一 `path`）；省略或 `null` 为新操作 |
+
+未知字段（例如拼错的 `cleanupId`）→ axum 纯文本 **422**，以免续做被当成新操作。
+
+**判定顺序。**
+
+1. axum `Json` 提取器：Content-Type、JSON 语法与字段类型（纯文本 400 / 413 / 415 / 422，不是 `CommonResult`）。
+2. 严格路径校验 → 400 `IMPORT_REPO_PATH_INVALID`：先于鉴权，只回显调用方输入与公开的 `import_dir`（Git 面相反，先 401 / 403）。
+3. 鉴权（`authorize_import_repo_removal`，见「鉴权」）→ 固定体 401 / 403。
+4. 清理入口（FU-17）：所有查询都在此之后，全部为绑定参数——仓库按精确路径查找，子仓检查为转义的前缀扫描，台账按 id 或 `(path, state)` 读取。
+
+**成功体。** `data` 四键恒在：
+
+```json
+{ "req_result": true, "data": { "path": "/third-party/acme/lib", "outcome": "removed", "repo_id": 7340037, "cleanup_id": 7340032 }, "err_message": "" }
+```
+
+`repo_id` 与 `cleanup_id` 为 64 位整数，可能超过 2^53（JavaScript 客户端须用 BigInt）；`outcome = "absent"` 时两者为 `null`。
+
+**结局（在请求结束时判定）。**
+
+| 请求 | 结局 |
+|---|---|
+| 新操作，`path` 有存活仓库 | 先做无写子仓预检（有子仓 → 409，不入队）；detach 得到新 `cleanup_id`，先清扫本请求自己的台账行：完成 → `removed`（本行 id；剩余预算续做同路径更早的待续行，但不改变答复）；超出预算 → `pending`（本行 id） |
+| 新操作，`path` 无存活仓库 | 按 id 续做至多 16 行待续台账（至多 100 条清扫语句）：已无剩余 → `absent`（两 id 为 `null`，即使本请求做了清扫）；否则 `pending`，指名最小的剩余行（超过 16 行时可能是本请求未触及的行） |
+| 续做（带 `cleanup_id`） | 只处理该台账行，**永不 detach**：不存在或属于另一路径 → 404（同一文本）；已清扫或本次完成 → `removed`（幂等）；否则 `pending`（同 id） |
+
+`repo_id` 恒为该台账行的仓库。`removed` 不等于该路径已排空：更早的待续行由之后只带 `path` 的请求续做（计划 `DEFER-FU-06`）。
+
+**客户端协议。**
+
+- 遇 `pending`：带返回的 `cleanup_id` 续做，直到 `removed`。续做对同路径的重新导入安全。
+- 要排空路径：重复只带 `path` 的请求，直到 `absent`。**只带 `path` 的请求会 detach 当时存活的仓库，包括期间重新导入的仓库。**
+- 丢失 `cleanup_id` 且没有重新导入时，只带 `path` 的请求会续做待续行：在本次预算内清扫完则答 `absent`（两 id 为 `null`），否则以 `pending` 返回最小的待续 `cleanup_id`。
+- 500 可重试（见下表）；续做重试总是安全的，只带 `path` 的重试会 detach 期间重新导入的仓库。
+
+**错误。**
+
+| 情况 | 状态 | `err_message` / 体 |
+|---|---|---|
+| Review 形态 | 404 | 路由未挂载 |
+| 非 POST | 405 | 空体，`allow: POST` |
+| 缺 `Content-Type: application/json` / JSON 语法错 / 缺 `path`、字段类型错、未知字段 / 超过默认 2 MiB | 415 / 400 / 422 / 413 | axum 纯文本（不是 `CommonResult`） |
+| 严格路径校验失败 | 400 | `IMPORT_REPO_PATH_INVALID: "<输入>": <原因>`（`import_dir` 本身、在其之外、非规范形式时 `did you mean "<规范形式>"?`、NUL、`\`） |
+| `push_auth=token`，无凭据或 token 未知 | 401 | 固定体 `authentication required` |
+| token 未覆盖 `path`；或 `push_auth=none` / 未配置 | 403 | 固定体 `forbidden` |
+| 续做的 `cleanup_id` 不存在或属于另一路径 | 404 | `IMPORT_REPO_CLEANUP_NOT_FOUND: no cleanup "<id>" for "<path>"` |
+| 目标之下仍有已注册 ImportRepo | 409 | `IMPORT_REPO_HAS_CHILDREN: "<path>" contains other ImportRepos; remove them first` |
+| 写入队列暂停 / 硬停 / 满、detach 轮次未完成、存储错误 | 500 | `Internal server error`，可重试（计划 `DEFER-FU-42`） |
+
+400 / 401 / 403 / 404 不写任何行；409 不写台账、审计、ref、对象与根树（入口的无写预检不入队；由写入队列锁内再检拒绝时留下一行 `Failed` 队列行）。未授权调用方对「不存在 / 叶子 / 有子仓的父」三类路径得到逐字节相同的体（响应头除 `Date` 与按请求的 `x-request-id` 外一致，无 `WWW-Authenticate`），error 日志只含固定文本。码的含义见 [错误码](../errors.md) 的 ImportRepoError 小节；运行时 OpenAPI 声明 200 / 400 / 401 / 403 / 404 / 409 / 500（IT `import_repo_remove_openapi`）。
+
+**保留策略。**
+
+- 对象存储中的 blob 字节保留（计划 `DEFER-FU-01`）；清扫删除 `git_commit`、`git_tree`、`git_blob`、`git_tag` 行。
+- detach 删除 `git_repo` 与 `import_refs` 行，从根树移除挂载叶子，并修剪 `import_dir` 之下因此变空的、由挂载创建的目录（ADR-FU-09 第 2 条）。
+- 台账 `import_repo_cleanups` 与 `audit_logs`（`kind = import_repo.remove`，`phase` 为 `detached` / `swept`，`requester` 为 token 名）永久保留。
+- 清理不可逆；再次推送即以新的 `repo_id` 重新导入。
+
+**已知限制。**
+
+- `absent` 不等于该路径无人服务：存活 ImportRepo 的子路径由父仓库服务；子仓被清理后，该路径的 tag 与编辑路由作用于存活的父仓库，而 Git clone 该路径为 404（计划 `DEFER-FU-39`）。
+- 被清理路径上的 `POST /api/v1/tags` 按 Monorepo 语义处理，可在 `import_dir` 之下写出 Monorepo tag（计划 `DEFER-FU-38`）。
+- 清理只删除规范行：FU-15 保留的别名行（如 `P/`）不删、不算子仓、严格入口无法点名，之后以别名拼写的 Git 请求会使 `P` 重新存活（计划 `DEFER-FU-10`）。
+- 子仓检查为顺序扫描（`DEFER-FU-27`）；请求可能较长、无服务端超时，断连按崩溃点语义恢复（`DEFER-FU-32`）；`import_dir` 本身的存量行无法点名（`DEFER-FU-09`）；400 回显输入的长度与控制字符见 `DEFER-FU-43` / `DEFER-FU-44`。
+
 ## 鉴权
 
-目录变更写复用既有 `authorize_trunk_api_write`（`src/api/api_write_auth.rs`），与 LFS / create-entry 同一威胁模型。
+目录变更写复用既有 `authorize_trunk_api_write`（`src/api/api_write_auth.rs`），与 LFS / create-entry 同一威胁模型；ImportRepo 清理端点例外，用更严格的 `authorize_import_repo_removal`（见「ImportRepo 叶子清理」）。
 
 > **整节的形态前提：** 这道闸**仅**在 `push_policy=trunk`（含 storage-only）时生效。Review 形态下 `trunk_write_requester` 返回 `Ok(None)` 并**跳过**鉴权（`preview_router.rs:475-485`；LB-04 起为 `pub(crate)`，`tag_router` 复用同一实现），目录变更走既有 CL 分支，tag 写沿用 Review 既有面。
 
@@ -291,6 +378,7 @@ Git 客户端 push Tag 仍然**禁止**（见[使用指南](../user-guide.zh.md)
 | `POST /delete-entry` | `implemented`（LB-02）——`delete_entry`（`preview_router.rs:138`）取 `HeaderMap` 并调 `trunk_write_requester(path = 父目录)`，鉴权先于任何存储访问 |
 | `POST /move-entry` | `implemented`（LB-03）——`move_entry`（`preview_router.rs:166`）对 `from_path` 与 `to_path` 各调一次 `trunk_write_requester`，任一失败即拒绝，先于任何存储访问 |
 | `POST /path/provision` | `implemented`（plan-20260923 FU-07）——先以目标路径调用 `authorize_trunk_api_write`（先于任何树读取），再每轮以**最高新建组件**重新鉴权，见该小节 |
+| `POST /import-repo/remove` | `implemented`（plan-20260923 FU-20）——严格路径校验之后、任何查询之前以 `authorize_import_repo_removal` 鉴权；只接受覆盖目标路径的 token；`push_auth=none` 或未配置一律 403；401 / 403 为固定体 |
 | `POST /tags` / `DELETE /tags/{name}` | `implemented`（LB-04 / FT-06）——`create_tag` 以 `path_context.unwrap_or("/")`、`delete_tag` 以选择器 `path`（省略或空 = `/`）各调一次 `trunk_write_requester`，先于任何存储访问 |
 
 > **落地状态（LB-04，安全相关）：** `create_tag`（`tag_router.rs:162`）与 `delete_tag`（`:321`）都接收 `HeaderMap`，并在任何存储访问之前调用 `trunk_write_requester`；这关闭了计划里的 `GAP-LB-04`（裸挂会让 `token` 部署匿名写 `refs/tags`）。Review 形态该函数返回 `Ok(None)`，tag 写沿用 Review 既有面（cedar_guard 只覆盖 `/cl`，不覆盖 `/tags`）——本卡不为 Review 新增 401（IT `tag_review_form_no_trunk_gate`）。
@@ -300,13 +388,14 @@ trunk / storage-only 上的 `push_auth` 行为（IT `tag_create_unauth_401` / `t
 | `push_auth` | 行为 |
 |---|---|
 | `token` | Bearer，或 Basic 的密码栏 |
-| `none` | 无 header 即可写（目录写把 requester 记为 `anonymous` 进 push_queue；tag 写不记录 requester，两个 handler 丢弃返回值） |
+| `none` | 无 header 即可写（目录写把 requester 记为 `anonymous` 进 push_queue；tag 写不记录 requester，两个 handler 丢弃返回值）（`POST /import-repo/remove` 除外：一律 403） |
 
-状态码分类（`api_write_auth.rs:33-48`）：
+状态码分类（`api_write_auth.rs` 的 `authorize_trunk_api_write`）：
 
 - 凭据**缺失**，**或**提供了但查不到对应 push token → **401**（两者都走 `api_write_auth_challenge`）
 - 凭据识别成功、但 `paths` 未覆盖目标 path → **403**
 - `push_auth` **未配置**（`None`）→ **401**，fail-closed
+- 例外：`POST /import-repo/remove` 在 `push_auth` 不为 `token`（含未配置）时一律 **403**；两种拒绝都只用固定体（401 `authentication required`、403 `forbidden`），不回显路径
 
 错误响应、JSON 与 trace **不得**回显 token。
 
@@ -335,7 +424,7 @@ tag 写的鉴权 path 不是你操作的业务路径：
 | trunk / storage-only | `land_api_tip_push` | 必为 `null` |
 | Review | 既有 `find_or_create_cl_for_edit` CL 分支 | 可为非 null |
 
-`POST /path/provision` 只挂 storage-only（`preview_router::storage_only_write_routers`，由 `storage_only_routers_with` 合并；单测 `path_provision_is_storage_only` 锁定 Review 的 `routers()` 不含它）。`write_routers`（`preview_router.rs:57-63`）同时挂在 Review 与 trunk；LB-02 / LB-03 已把 `delete-entry` 与 `move-entry` 登记进同一函数，因此两者在两种形态下都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 锁定）。`tag_router::routers()` 同样两边都挂：Review 的 `routers()` 原本就有，LB-04 把它 merge 进 `storage_only_routers_with`（`api_router.rs:83`）；三份 OpenAPI 锁（storage-only / trunk / OAuth）都断言 `/tags`、`/tags/list`、`/tags/{name}`。
+`POST /path/provision` 只挂 storage-only（`preview_router::storage_only_write_routers`，由 `storage_only_routers_with` 合并；单测 `path_provision_is_storage_only` 锁定 Review 的 `routers()` 不含它）。`POST /import-repo/remove` 同样只挂 storage-only（`import_repo_router::routers()`，单测 `import_repo_remove_is_storage_only`）。`write_routers`（`preview_router.rs`）同时挂在 Review 与 trunk；LB-02 / LB-03 已把 `delete-entry` 与 `move-entry` 登记进同一函数，因此两者在两种形态下都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 锁定）。`tag_router::routers()` 同样两边都挂：Review 的 `routers()` 原本就有，LB-04 把它 merge 进 `storage_only_routers_with`（`api_router.rs:83`）；三份 OpenAPI 锁（storage-only / trunk / OAuth）都断言 `/tags`、`/tags/list`、`/tags/{name}`。
 
 `ImportRepo`（`import_dir` 下）对 delete/move 必须返回 **409**（计划门 `delete_entry_reject_import_repo_409`，见 plan-20260917 LB-02 卡「判据规范 — EX-LB-01」门 11；该门只规定状态码）。LB-02 的 `delete_monorepo_entry`（`import_api_service.rs`）返回 `[code:409] import dir does not support delete entry`，wire 上 `err_message` = `import dir does not support delete entry`；LB-03 的 move 同样：源在 ImportRepo 下由 `ImportApiService` 返回 `[code:409] import dir does not support move entry`，目标在 ImportRepo 下由 monorepo handler 自查 `git_repo` 后返回同一文本。实现上**必须**带 `[code:409]` 前缀——这是推导出来的必要条件，不是计划原文：`GitError::CustomError` 只有带该前缀才会被 `common/errors/api.rs` 中 `From<E> for ApiError` 的 `409` 分支映射成 `StatusCode::CONFLICT`。**另有一个陷阱：** `map_ceres_error`（`common/errors/api.rs`）FU-19 之前只识别 `400` 与 `404`，FU-19 起增加 `409`（ImportRepo tag 写的 `IMPORT_REPO_REMOVED`），其余一律 500，而它正是 `tag_router.rs` 的惯用写法。因此 delete/move 走裸 `?`（`From<E> for ApiError`，如 `preview_router` 的 `delete_entry`）那条路径；FU-19 之前若用 `map_ceres_error` 包装，带 `[code:409]` 也会落成 500；delete/move 仍走裸 `?`。今日 create-entry 的同类拒绝（`ImportApiService::create_monorepo_entry` 的 `CustomError("import dir does not support create entry")`）**没有**前缀，因而落成 500 + `"Internal server error"`——见「错误映射」，delete/move 不得复制该缺陷。其 Git 多分支与客户端 tag 语义不受本计划影响。
 
@@ -391,3 +480,5 @@ Libra 必须按以下事实实现，不得反向假设：
 - [`../deploy-trunk.md`](../deploy-trunk.md) —— storage-only 运维手册与产品 API 写契约
 - [`../plan/plan-20260904.md`](../plan/plan-20260904.md) —— create-entry / edit/save + `push_auth` + `land_api_tip_push` 的来源计划
 - [`integration.md`](integration.md) —— 集成测试与黑盒矩阵
+- [`../errors.md`](../errors.md) —— 错误码（ImportRepoError：`IMPORT_REPO_PATH_INVALID`、`IMPORT_REPO_HAS_CHILDREN`、`IMPORT_REPO_CLEANUP_NOT_FOUND`）
+- [`trunk-push.md`](trunk-push.md) —— ImportRepo 的 detach、清扫与存活栅栏

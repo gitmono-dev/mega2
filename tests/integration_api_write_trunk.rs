@@ -3444,3 +3444,987 @@ fn path_provision_openapi() {
     }
     case.finish();
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-20: `POST /api/v1/import-repo/remove` (ADR-FU-10). Every
+// query below uses bound parameters; paths deliberately contain `%` and `_`.
+// ---------------------------------------------------------------------------
+
+const FU20_ROUTE: &str = "import-repo/remove";
+const FU20_REQUEST_ID: &str = "fu20-probe";
+const FU20_WIDE_TOKEN: &str = "fu20-wide-token";
+const FU20_NARROW_TOKEN: &str = "fu20-narrow-token";
+const FU20_UNAUTHORIZED: &[u8] =
+    br#"{"req_result":false,"data":null,"err_message":"authentication required"}"#;
+const FU20_FORBIDDEN: &[u8] = br#"{"req_result":false,"data":null,"err_message":"forbidden"}"#;
+
+/// Trunk + `push_auth=token` with a wide (`/project`, `/third-party`) and a
+/// narrow (`/project`) token.
+fn fu20_env() -> ApiWriteEnv {
+    ApiWriteEnv::with_git_append(
+        "trunk",
+        &format!(
+            r#"
+[git]
+anonymous_access = true
+push_auth = "token"
+ssh_receive_pack = false
+[[git.push_tokens]]
+name = "fu20-wide"
+token = "{FU20_WIDE_TOKEN}"
+paths = ["/project", "/third-party"]
+[[git.push_tokens]]
+name = "fu20-narrow"
+token = "{FU20_NARROW_TOKEN}"
+paths = ["/project"]
+"#
+        ),
+    )
+}
+
+fn fu20_wide() -> String {
+    format!("Bearer {FU20_WIDE_TOKEN}")
+}
+
+fn fu20_body(path: &str, cleanup_id: Option<i64>) -> Value {
+    match cleanup_id {
+        Some(id) => serde_json::json!({ "path": path, "cleanup_id": id }),
+        None => serde_json::json!({ "path": path }),
+    }
+}
+
+fn fu20_remove(case: &EntryCase, path: &str, cleanup_id: Option<i64>) -> (u16, Value) {
+    case.post(FU20_ROUTE, Some(&fu20_wide()), fu20_body(path, cleanup_id))
+}
+
+/// The same call through a 180 s client, for the volume-driven requests.
+fn fu20_remove_slow(case: &EntryCase, path: &str, cleanup_id: Option<i64>) -> (u16, Value) {
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(180))
+        .build()
+        .expect("slow http client");
+    case.exchange(
+        client
+            .post(format!("{}/{FU20_ROUTE}", case.api))
+            .json(&fu20_body(path, cleanup_id)),
+        Some(&fu20_wide()),
+        "POST import-repo/remove (slow)",
+    )
+}
+
+/// Assert a success envelope with exactly the four data keys; return the ids.
+fn fu20_expect(json: &Value, path: &str, outcome: &str) -> (Option<i64>, Option<i64>) {
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    assert_eq!(json["err_message"].as_str(), Some(""), "{json}");
+    let data = json["data"]
+        .as_object()
+        .unwrap_or_else(|| panic!("data: {json}"));
+    let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["cleanup_id", "outcome", "path", "repo_id"], "{json}");
+    assert_eq!(data["path"].as_str(), Some(path), "{json}");
+    assert_eq!(data["outcome"].as_str(), Some(outcome), "{json}");
+    if outcome == "absent" {
+        assert!(
+            data["repo_id"].is_null() && data["cleanup_id"].is_null(),
+            "{json}"
+        );
+    } else {
+        assert!(
+            data["repo_id"].is_i64() && data["cleanup_id"].is_i64(),
+            "{json}"
+        );
+    }
+    (data["repo_id"].as_i64(), data["cleanup_id"].as_i64())
+}
+
+/// A response as bytes: status, headers (sorted, `date` dropped) and body.
+#[derive(Debug, PartialEq, Eq)]
+struct Fu20Raw {
+    status: u16,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
+}
+
+fn fu20_send_raw(request: reqwest::blocking::RequestBuilder, auth: Option<&str>) -> Fu20Raw {
+    let mut request = request.header("X-Request-Id", FU20_REQUEST_ID);
+    if let Some(auth) = auth {
+        request = request.header("Authorization", auth);
+    }
+    let response = request.send().expect("POST import-repo/remove");
+    let status = response.status().as_u16();
+    let mut headers: Vec<(String, Vec<u8>)> = response
+        .headers()
+        .iter()
+        .filter(|(name, _)| name.as_str() != "date")
+        .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+        .collect();
+    headers.sort();
+    let body = response.bytes().expect("response body").to_vec();
+    Fu20Raw {
+        status,
+        headers,
+        body,
+    }
+}
+
+fn fu20_raw(case: &EntryCase, auth: Option<&str>, body: &Value) -> Fu20Raw {
+    fu20_send_raw(
+        case.client
+            .post(format!("{}/{FU20_ROUTE}", case.api))
+            .json(body),
+        auth,
+    )
+}
+
+fn fu20_raw_text(case: &EntryCase, content_type: Option<&str>, body: &str) -> Fu20Raw {
+    let mut request = case
+        .client
+        .post(format!("{}/{FU20_ROUTE}", case.api))
+        .body(body.to_owned());
+    if let Some(content_type) = content_type {
+        request = request.header("Content-Type", content_type);
+    }
+    fu20_send_raw(request, Some(&fu20_wide()))
+}
+
+fn fu20_raw_message(raw: &Fu20Raw) -> String {
+    let json: Value = serde_json::from_slice(&raw.body)
+        .unwrap_or_else(|_| panic!("json body: {}", String::from_utf8_lossy(&raw.body)));
+    err_message(&json)
+}
+
+fn fu20_scalar(db_url: &str, sql: &str, values: Vec<sea_orm::Value>) -> Option<i64> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect: {err}"));
+        db.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: {err}"))
+        .and_then(|row| row.try_get::<Option<i64>>("", "n").expect("column n"))
+    })
+}
+
+fn fu20_count(db_url: &str, sql: &str, values: Vec<sea_orm::Value>) -> i64 {
+    fu20_scalar(db_url, sql, values).unwrap_or(0)
+}
+
+fn fu20_exec(db_url: &str, sql: &str, values: Vec<sea_orm::Value>) {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect: {err}"));
+        db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: {err}"));
+    })
+}
+
+fn fu20_repo_id(db_url: &str, path: &str) -> Option<i64> {
+    fu20_scalar(
+        db_url,
+        "SELECT id AS n FROM git_repo WHERE repo_path = $1",
+        vec![path.into()],
+    )
+}
+
+/// A `git_repo` row with no refs, objects or mount (B3's row-only detach).
+fn fu20_insert_repo_row(db_url: &str, path: &str) -> i64 {
+    let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+    fu20_scalar(
+        db_url,
+        "INSERT INTO git_repo (id, repo_path, repo_name, created_at, updated_at) \
+         SELECT COALESCE(MAX(id), 0) + 1, $1, $2, now(), now() FROM git_repo RETURNING id AS n",
+        vec![path.into(), name.into()],
+    )
+    .expect("inserted git_repo id")
+}
+
+fn fu20_detach_rows(db_url: &str) -> i64 {
+    fu20_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM push_queue WHERE payload->>'op' = $1",
+        vec!["detach".into()],
+    )
+}
+
+fn fu20_queue_rows(db_url: &str) -> i64 {
+    fu20_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM push_queue",
+        vec![],
+    )
+}
+
+fn fu20_ledger_rows(db_url: &str) -> i64 {
+    fu20_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM import_repo_cleanups",
+        vec![],
+    )
+}
+
+/// `(path, repo_id, state, requester, rows_deleted.git_blob)` of a ledger row.
+fn fu20_ledger(db_url: &str, id: i64) -> Option<(String, i64, String, String, i64)> {
+    with_runtime(async {
+        let db = Database::connect(db_url).await.expect("connect");
+        db.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT path, repo_id, state, requester, \
+             COALESCE((rows_deleted->>'git_blob')::bigint, 0) AS blobs \
+             FROM import_repo_cleanups WHERE id = $1",
+            vec![id.into()],
+        ))
+        .await
+        .expect("ledger query")
+        .map(|row| {
+            (
+                row.try_get("", "path").expect("path"),
+                row.try_get("", "repo_id").expect("repo_id"),
+                row.try_get("", "state").expect("state"),
+                row.try_get("", "requester").expect("requester"),
+                row.try_get("", "blobs").expect("blobs"),
+            )
+        })
+    })
+}
+
+fn fu20_audit_rows(db_url: &str, cleanup_id: i64, phase: &str, requester: &str) -> i64 {
+    fu20_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM audit_logs \
+         WHERE metadata->>'kind' = 'import_repo.remove' AND metadata->>'cleanup_id' = $1 \
+         AND metadata->>'phase' = $2 AND metadata->>'requester' = $3",
+        vec![
+            cleanup_id.to_string().into(),
+            phase.into(),
+            requester.into(),
+        ],
+    )
+}
+
+fn fu20_all_audit_rows(db_url: &str) -> i64 {
+    fu20_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM audit_logs WHERE metadata->>'kind' = 'import_repo.remove'",
+        vec![],
+    )
+}
+
+fn fu20_audit_text(db_url: &str, repo_id: i64) -> String {
+    with_runtime(async {
+        let db = Database::connect(db_url).await.expect("connect");
+        db.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COALESCE(string_agg(metadata::text, ' '), '') AS t FROM audit_logs \
+             WHERE target_id = $1 AND metadata->>'kind' = 'import_repo.remove'",
+            vec![repo_id.into()],
+        ))
+        .await
+        .expect("audit query")
+        .map(|row| row.try_get::<String>("", "t").expect("t"))
+        .unwrap_or_default()
+    })
+}
+
+fn fu20_object_rows(db_url: &str, repo_id: i64) -> i64 {
+    fu20_count(
+        db_url,
+        "SELECT ((SELECT COUNT(*) FROM git_commit WHERE repo_id = $1) \
+         + (SELECT COUNT(*) FROM git_tree WHERE repo_id = $1) \
+         + (SELECT COUNT(*) FROM git_blob WHERE repo_id = $1) \
+         + (SELECT COUNT(*) FROM git_tag WHERE repo_id = $1))::bigint AS n",
+        vec![repo_id.into()],
+    )
+}
+
+fn fu20_blob_rows(db_url: &str, repo_id: i64) -> i64 {
+    fu20_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM git_blob WHERE repo_id = $1",
+        vec![repo_id.into()],
+    )
+}
+
+fn fu20_import_refs(db_url: &str, repo_id: i64) -> i64 {
+    fu20_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM import_refs WHERE repo_id = $1",
+        vec![repo_id.into()],
+    )
+}
+
+/// `count` more `git_blob` rows for `repo_id`, then fresh planner statistics.
+fn fu20_seed_blobs(db_url: &str, repo_id: i64, count: i64) {
+    fu20_exec(
+        db_url,
+        "INSERT INTO git_blob (id, repo_id, blob_id, name, size, created_at, pack_id, file_path, pack_offset, is_delta_in_pack) \
+         SELECT m.base + g, $1, 'f' || lpad(g::text, 39, '0'), NULL, 0, now(), '', '', 0, false \
+         FROM generate_series(1, $2::bigint) AS g, (SELECT COALESCE(MAX(id), 0) AS base FROM git_blob) AS m",
+        vec![repo_id.into(), count.into()],
+    );
+    fu20_exec(db_url, "ANALYZE git_blob", vec![]);
+}
+
+/// Counts of `git_repo`, ledger, detach queue and cleanup audit rows, plus
+/// the root tip.
+fn fu20_snapshot(case: &EntryCase) -> (i64, i64, i64, i64, String) {
+    let db = case.db_url();
+    (
+        fu20_count(db, "SELECT COUNT(*)::bigint AS n FROM git_repo", vec![]),
+        fu20_ledger_rows(db),
+        fu20_detach_rows(db),
+        fu20_all_audit_rows(db),
+        path_tip(db, "/"),
+    )
+}
+
+fn fu20_upload_pack(case: &EntryCase, path: &str) -> (u16, String) {
+    let response = case
+        .client
+        .get(format!(
+            "http://127.0.0.1:{}{path}/info/refs?service=git-upload-pack",
+            case.port
+        ))
+        .send()
+        .expect("GET info/refs");
+    let status = response.status().as_u16();
+    (status, response.text().unwrap_or_default())
+}
+
+fn fu20_clone_ok(case: &EntryCase, path: &str, dir: &str) -> bool {
+    let url = git_cli::mega2_host_http_url(case.port, path);
+    host_git_command(
+        &case.env.case_dir,
+        FU20_WIDE_TOKEN,
+        &["clone", "--quiet", &url, dir],
+    )
+    .output()
+    .expect("git clone")
+    .status
+    .success()
+}
+
+fn fu20_has_leaf(case: &EntryCase, parent: &str, name: &str) -> bool {
+    let response = case
+        .client
+        .get(format!("{}/tree?path={parent}", case.api))
+        .send()
+        .expect("GET /tree");
+    if response.status().as_u16() != 200 {
+        return false;
+    }
+    let json: Value = response.json().expect("tree json");
+    json["data"]["tree_items"]
+        .as_array()
+        .map(|items| items.iter().any(|item| item["name"] == name))
+        .unwrap_or(false)
+}
+
+fn fu20_assert_gone(case: &EntryCase, path: &str, dir: &str) {
+    let (status, text) = fu20_upload_pack(case, path);
+    assert_eq!(status, 404, "{path}: {text}");
+    assert!(!fu20_clone_ok(case, path, dir), "{path} must not clone");
+    assert_eq!(fu20_repo_id(case.db_url(), path), None, "{path}");
+}
+
+/// Push the seeded repository of `repo` again (after its removal).
+fn fu20_repush(case: &EntryCase, repo: &str) {
+    let dir = format!("import-seed-{repo}");
+    let url = format!(
+        "{}/",
+        git_cli::mega2_host_http_url(case.port, &format!("/third-party/{repo}"))
+            .trim_end_matches('/')
+    );
+    host_git_ok(
+        &case.env.case_dir,
+        FU20_WIDE_TOKEN,
+        &[
+            "-C",
+            &dir,
+            "push",
+            "--no-thin",
+            &url,
+            "HEAD:refs/heads/main",
+        ],
+    );
+}
+
+fn fu20_log_paths(case: &EntryCase) -> [PathBuf; 2] {
+    let dir = case.env.temp_dir.path();
+    [
+        dir.join(format!("service-{}.out", case.port)),
+        dir.join(format!("service-{}.err", case.port)),
+    ]
+}
+
+fn fu20_log_offset(case: &EntryCase) -> [usize; 2] {
+    fu20_log_paths(case).map(|path| read_log(&path).len())
+}
+
+/// Service log text written after `offset`.
+fn fu20_log_since(case: &EntryCase, offset: [usize; 2]) -> String {
+    sleep(Duration::from_millis(500));
+    fu20_log_paths(case)
+        .iter()
+        .zip(offset)
+        .map(|(path, from)| read_log(path).get(from..).unwrap_or_default().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn import_repo_remove_populated_then_absent() {
+    let case = EntryCase::boot(fu20_env());
+    let db = case.db_url().to_owned();
+    let repo = "fu20-pop";
+    let path = "/third-party/fu20-pop";
+    seed_import_repo(&case.env.case_dir, case.port, FU20_WIDE_TOKEN, repo);
+    let r1 = fu20_repo_id(&db, path).expect("seeded repository");
+    assert_eq!(fu20_upload_pack(&case, path).0, 200);
+    assert!(fu20_has_leaf(&case, "/third-party", repo));
+    assert!(fu20_object_rows(&db, r1) > 0);
+    assert!(fu20_import_refs(&db, r1) > 0);
+    let root_before = path_tip(&db, "/");
+
+    let (status, json) = fu20_remove(&case, path, None);
+    assert_eq!(status, 200, "{json}");
+    let (repo_id, cleanup_id) = fu20_expect(&json, path, "removed");
+    assert_eq!(repo_id, Some(r1));
+    let c1 = cleanup_id.expect("cleanup id");
+    assert!(c1 > 0);
+    fu20_assert_gone(&case, path, "clone-pop-1");
+    assert!(
+        !case
+            .tree_names("/third-party")
+            .iter()
+            .any(|name| name == repo)
+    );
+    assert_ne!(path_tip(&db, "/"), root_before);
+    assert_eq!(fu20_object_rows(&db, r1), 0);
+    assert_eq!(fu20_import_refs(&db, r1), 0);
+    let (ledger_path, ledger_repo, state, requester, _) = fu20_ledger(&db, c1).expect("ledger row");
+    assert_eq!(
+        (
+            ledger_path.as_str(),
+            ledger_repo,
+            state.as_str(),
+            requester.as_str()
+        ),
+        (path, r1, "swept", "fu20-wide")
+    );
+    assert_eq!(fu20_audit_rows(&db, c1, "detached", "fu20-wide"), 1);
+    assert_eq!(fu20_audit_rows(&db, c1, "swept", "fu20-wide"), 1);
+    assert!(!fu20_audit_text(&db, r1).contains(FU20_WIDE_TOKEN));
+    assert_eq!(fu20_detach_rows(&db), 1);
+
+    // Repeat: nothing live, nothing pending.
+    let before = fu20_snapshot(&case);
+    let (status, json) = fu20_remove(&case, path, None);
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(fu20_expect(&json, path, "absent"), (None, None));
+    assert_eq!(fu20_snapshot(&case), before);
+
+    // A continuation of the finished cleanup is idempotent.
+    let (status, json) = fu20_remove(&case, path, Some(c1));
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(fu20_expect(&json, path, "removed"), (Some(r1), Some(c1)));
+    assert_eq!(fu20_snapshot(&case), before);
+
+    // Re-import at the same path: a new repository, removable again.
+    fu20_repush(&case, repo);
+    let r2 = fu20_repo_id(&db, path).expect("re-imported repository");
+    assert_ne!(r2, r1);
+    assert!(fu20_clone_ok(&case, path, "clone-pop-2"));
+    let (status, json) = fu20_remove(&case, path, None);
+    assert_eq!(status, 200, "{json}");
+    let (repo_id, cleanup_id) = fu20_expect(&json, path, "removed");
+    assert_eq!(repo_id, Some(r2));
+    assert!(cleanup_id.expect("cleanup id") > c1);
+    fu20_assert_gone(&case, path, "clone-pop-3");
+    case.finish();
+}
+
+#[test]
+fn import_repo_remove_pending_continuation() {
+    let case = EntryCase::boot(fu20_env());
+    let db = case.db_url().to_owned();
+    let repo = "fu20-pend";
+    let path = "/third-party/fu20-pend";
+    seed_import_repo(&case.env.case_dir, case.port, FU20_WIDE_TOKEN, repo);
+    let r1 = fu20_repo_id(&db, path).expect("seeded repository");
+    // 100 500 more blobs: more than the 100 sweep statements of one request.
+    fu20_seed_blobs(&db, r1, 100_500);
+    let b0 = fu20_blob_rows(&db, r1);
+
+    let (status, json) = fu20_remove_slow(&case, path, None);
+    assert_eq!(status, 200, "{json}");
+    let (repo_id, cleanup_id) = fu20_expect(&json, path, "pending");
+    assert_eq!(repo_id, Some(r1));
+    let c1 = cleanup_id.expect("cleanup id");
+    assert_eq!(fu20_repo_id(&db, path), None);
+    assert_eq!(fu20_upload_pack(&case, path).0, 404);
+    // 1 (commit) + 1 (tree) + 98 (blob batches of 1 000) statements.
+    assert_eq!(fu20_blob_rows(&db, r1), b0 - 98_000);
+    assert_eq!(fu20_object_rows(&db, r1), 2_501);
+    assert_eq!(
+        fu20_ledger(&db, c1),
+        Some((
+            path.to_owned(),
+            r1,
+            "detached".to_owned(),
+            "fu20-wide".to_owned(),
+            98_000
+        ))
+    );
+    assert_eq!(fu20_detach_rows(&db), 1);
+
+    // While the cleanup still has work: unknown ids and ids of another path
+    // are 404 with one text and touch nothing.
+    let pending = fu20_ledger(&db, c1);
+    let unknown = fu20_count(
+        &db,
+        "SELECT (COALESCE(MAX(id), 0) + 1000000)::bigint AS n FROM push_queue",
+        vec![],
+    );
+    let (status, json) = fu20_remove(&case, path, Some(unknown));
+    assert_eq!(status, 404, "{json}");
+    assert_eq!(
+        err_message(&json),
+        format!("IMPORT_REPO_CLEANUP_NOT_FOUND: no cleanup \"{unknown}\" for \"{path}\"")
+    );
+    let other = "/third-party/fu20-other";
+    let (status, json) = fu20_remove(&case, other, Some(c1));
+    assert_eq!(status, 404, "{json}");
+    assert_eq!(
+        err_message(&json),
+        format!("IMPORT_REPO_CLEANUP_NOT_FOUND: no cleanup \"{c1}\" for \"{other}\"")
+    );
+    assert_eq!(fu20_ledger(&db, c1), pending);
+    assert_eq!(fu20_blob_rows(&db, r1), b0 - 98_000);
+
+    // Re-import while the cleanup is pending; the continuation leaves it.
+    fu20_repush(&case, repo);
+    let r2 = fu20_repo_id(&db, path).expect("re-imported repository");
+    assert_ne!(r2, r1);
+    let n2 = fu20_object_rows(&db, r2);
+    let queue = fu20_queue_rows(&db);
+    let (status, json) = fu20_remove_slow(&case, path, Some(c1));
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(fu20_expect(&json, path, "removed"), (Some(r1), Some(c1)));
+    assert_eq!(fu20_object_rows(&db, r1), 0);
+    assert_eq!(
+        fu20_ledger(&db, c1).map(|row| (row.2, row.4)),
+        Some(("swept".to_owned(), 100_501))
+    );
+    assert_eq!(fu20_queue_rows(&db), queue);
+    assert_eq!(fu20_repo_id(&db, path), Some(r2));
+    assert_eq!(fu20_object_rows(&db, r2), n2);
+    assert!(fu20_clone_ok(&case, path, "clone-pend-1"));
+
+    // Repeating the continuation writes nothing new.
+    let audit = fu20_all_audit_rows(&db);
+    let (status, json) = fu20_remove(&case, path, Some(c1));
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(fu20_expect(&json, path, "removed"), (Some(r1), Some(c1)));
+    assert_eq!(fu20_all_audit_rows(&db), audit);
+
+    // A path-only request removes whatever is live now, then nothing is left.
+    let (status, json) = fu20_remove(&case, path, None);
+    assert_eq!(status, 200, "{json}");
+    let (repo_id, cleanup_id) = fu20_expect(&json, path, "removed");
+    assert_eq!(repo_id, Some(r2));
+    assert_ne!(cleanup_id, Some(c1));
+    assert_eq!(fu20_detach_rows(&db), 2);
+    let (status, json) = fu20_remove(&case, path, None);
+    assert_eq!(status, 200, "{json}");
+    fu20_expect(&json, path, "absent");
+    case.finish();
+}
+
+#[test]
+fn import_repo_remove_invalid_paths() {
+    let case = EntryCase::boot(fu20_env());
+    let db = case.db_url().to_owned();
+    let repo = "fu20-inv";
+    let leaf = "/third-party/fu20-inv";
+    seed_import_repo(&case.env.case_dir, case.port, FU20_WIDE_TOKEN, repo);
+    let before = fu20_snapshot(&case);
+    let narrow = format!("Bearer {FU20_NARROW_TOKEN}");
+    let wide = fu20_wide();
+    let unrelated = [
+        "/third-party",
+        "/third-party/",
+        "/",
+        "",
+        " /third-party/x",
+        "third-party/x",
+        "/project/x",
+        "/third-partyx/a",
+        "/third-party/../project",
+        "/third-party/x/..",
+        "/third-party/a\\b",
+        "/third-party/a\0b",
+    ];
+    let spellings = [
+        format!("{leaf}/"),
+        "/third-party//fu20-inv".to_owned(),
+        "/third-party/./fu20-inv".to_owned(),
+        format!(" {leaf}"),
+        format!("{leaf} "),
+        format!("{leaf}/."),
+        "third-party/fu20-inv".to_owned(),
+    ];
+    let paths: Vec<String> = unrelated
+        .iter()
+        .map(|path| (*path).to_owned())
+        .chain(spellings)
+        .collect();
+    for path in &paths {
+        let body = serde_json::json!({ "path": path });
+        let raws: Vec<Fu20Raw> = [None, Some(narrow.as_str()), Some(wide.as_str())]
+            .into_iter()
+            .map(|auth| fu20_raw(&case, auth, &body))
+            .collect();
+        for raw in &raws {
+            assert_eq!(raw.status, 400, "{path:?}");
+            assert!(
+                fu20_raw_message(raw).starts_with("IMPORT_REPO_PATH_INVALID: "),
+                "{path:?}: {}",
+                fu20_raw_message(raw)
+            );
+        }
+        assert!(
+            raws.windows(2).all(|pair| pair[0].body == pair[1].body),
+            "{path:?}"
+        );
+        let message = fu20_raw_message(&raws[0]);
+        match path.as_str() {
+            "/third-party" => assert_eq!(
+                message,
+                "IMPORT_REPO_PATH_INVALID: \"/third-party\": the ImportRepo directory itself is not an ImportRepo; push to a path below it"
+            ),
+            "/project/x" => assert_eq!(
+                message,
+                "IMPORT_REPO_PATH_INVALID: \"/project/x\": an ImportRepo path must lie strictly below \"/third-party\""
+            ),
+            "/third-party/fu20-inv/" => assert_eq!(
+                message,
+                "IMPORT_REPO_PATH_INVALID: \"/third-party/fu20-inv/\": path must be canonical (did you mean \"/third-party/fu20-inv\"?)"
+            ),
+            "/third-party/a\0b" => assert_eq!(
+                message,
+                "IMPORT_REPO_PATH_INVALID: \"/third-party/a\\0b\": path must not contain NUL"
+            ),
+            _ => {}
+        }
+    }
+
+    // Malformed requests never reach validation or authorization.
+    let malformed = [
+        (fu20_raw_text(&case, Some("application/json"), "{"), 400),
+        (
+            fu20_raw_text(
+                &case,
+                None,
+                &serde_json::json!({ "path": leaf }).to_string(),
+            ),
+            415,
+        ),
+        (fu20_raw(&case, Some(&wide), &serde_json::json!({})), 422),
+        (
+            fu20_raw(
+                &case,
+                Some(&wide),
+                &serde_json::json!({ "path": leaf, "cleanupId": 1 }),
+            ),
+            422,
+        ),
+        (
+            fu20_raw(
+                &case,
+                Some(&wide),
+                &serde_json::json!({ "path": leaf, "cleanup_id": "1" }),
+            ),
+            422,
+        ),
+    ];
+    for (raw, status) in malformed {
+        assert_eq!(raw.status, status, "{}", String::from_utf8_lossy(&raw.body));
+        assert!(!raw.body.starts_with(br#"{"req_result""#));
+    }
+
+    assert_eq!(fu20_snapshot(&case), before);
+    assert!(fu20_repo_id(&db, leaf).is_some());
+    assert_eq!(fu20_upload_pack(&case, leaf).0, 200);
+    case.finish();
+}
+
+#[test]
+fn import_repo_remove_exact_match_only() {
+    let case = EntryCase::boot(fu20_env());
+    let db = case.db_url().to_owned();
+
+    // Phase A: `_` is a literal; sub-paths, suffixes and case variants miss.
+    let target = "/third-party/fu20_a";
+    seed_import_repo(&case.env.case_dir, case.port, FU20_WIDE_TOKEN, "fu20_a");
+    let target_id = fu20_repo_id(&db, target).expect("pushed target");
+    let decoys: Vec<(&str, i64)> = [
+        "/third-party/fu20xa/c",
+        "/third-party/fu20_ab",
+        "/third-party/fu20xa",
+    ]
+    .into_iter()
+    .map(|path| (path, fu20_insert_repo_row(&db, path)))
+    .collect();
+    for probe in [
+        "/third-party/fu20_a.git",
+        "/third-party/fu20_a/src",
+        "/third-party/fu20_ab/x",
+        "/third-party/FU20_A",
+    ] {
+        let (status, json) = fu20_remove(&case, probe, None);
+        assert_eq!(status, 200, "{probe}: {json}");
+        fu20_expect(&json, probe, "absent");
+    }
+    assert_eq!(fu20_repo_id(&db, target), Some(target_id));
+    assert_eq!(fu20_detach_rows(&db), 0);
+    let (status, json) = fu20_remove(&case, target, None);
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(fu20_expect(&json, target, "removed").0, Some(target_id));
+    for (path, id) in &decoys {
+        assert_eq!(fu20_repo_id(&db, path), Some(*id), "{path}");
+    }
+    fu20_assert_gone(&case, target, "clone-exact-a");
+
+    // Phase B: `%` is a literal and an alias row of the target is no child.
+    let target2 = "/third-party/fu20%b";
+    let target2_id = fu20_insert_repo_row(&db, target2);
+    let decoys2: Vec<(&str, i64)> = ["/third-party/fu20zzb/c", "/third-party/fu20%bc"]
+        .into_iter()
+        .map(|path| (path, fu20_insert_repo_row(&db, path)))
+        .collect();
+    let alias = "/third-party/fu20%b/";
+    let alias_id = fu20_insert_repo_row(&db, alias);
+    let (status, json) = fu20_remove(&case, target2, None);
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(fu20_expect(&json, target2, "removed").0, Some(target2_id));
+    for (path, id) in &decoys2 {
+        assert_eq!(fu20_repo_id(&db, path), Some(*id), "{path}");
+    }
+    assert_eq!(fu20_repo_id(&db, alias), Some(alias_id), "alias row stays");
+
+    // Phase C: a parent with a registered child is refused until the child
+    // is removed.
+    let parent = "/third-party/fu20p";
+    let child = "/third-party/fu20p/c";
+    fu20_insert_repo_row(&db, parent);
+    fu20_insert_repo_row(&db, child);
+    let (detached, ledger) = (fu20_detach_rows(&db), fu20_ledger_rows(&db));
+    let (status, json) = fu20_remove(&case, parent, None);
+    assert_eq!(status, 409, "{json}");
+    assert_eq!(
+        err_message(&json),
+        "IMPORT_REPO_HAS_CHILDREN: \"/third-party/fu20p\" contains other ImportRepos; remove them first"
+    );
+    assert_eq!(
+        (fu20_detach_rows(&db), fu20_ledger_rows(&db)),
+        (detached, ledger)
+    );
+    let (status, json) = fu20_remove(&case, child, None);
+    assert_eq!(status, 200, "{json}");
+    fu20_expect(&json, child, "removed");
+    assert!(fu20_repo_id(&db, parent).is_some());
+    let (status, json) = fu20_remove(&case, parent, None);
+    assert_eq!(status, 200, "{json}");
+    fu20_expect(&json, parent, "removed");
+    assert_eq!(fu20_detach_rows(&db), 4);
+    case.finish();
+}
+
+#[test]
+fn import_repo_remove_requires_token() {
+    let case = EntryCase::boot(fu20_env());
+    let db = case.db_url().to_owned();
+    let leaf = "/third-party/fu20-rt-leaf";
+    let parent = "/third-party/fu20-rt-par";
+    let absent = "/third-party/fu20-rt-none";
+    seed_import_repo(
+        &case.env.case_dir,
+        case.port,
+        FU20_WIDE_TOKEN,
+        "fu20-rt-leaf",
+    );
+    fu20_insert_repo_row(&db, parent);
+    fu20_insert_repo_row(&db, &format!("{parent}/c"));
+    let before = fu20_snapshot(&case);
+    let offset = fu20_log_offset(&case);
+    let bodies = |path: &str| [fu20_body(path, None), fu20_body(path, Some(1))];
+
+    let mut unauthorized = Vec::new();
+    for auth in [
+        None,
+        Some("Bearer fu20-bogus".to_owned()),
+        Some("Basic dTpmdTIwLWJvZ3Vz".to_owned()),
+    ] {
+        for path in [absent, leaf, parent] {
+            for body in bodies(path) {
+                unauthorized.push(fu20_raw(&case, auth.as_deref(), &body));
+            }
+        }
+    }
+    assert_eq!(unauthorized.len(), 18);
+    let mut forbidden = Vec::new();
+    for auth in [
+        format!("Bearer {FU20_NARROW_TOKEN}"),
+        format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("u:{FU20_NARROW_TOKEN}")
+            )
+        ),
+    ] {
+        for path in [absent, leaf, parent] {
+            for body in bodies(path) {
+                forbidden.push(fu20_raw(&case, Some(&auth), &body));
+            }
+        }
+    }
+    assert_eq!(forbidden.len(), 12);
+    for (raws, status, body) in [
+        (&unauthorized, 401, FU20_UNAUTHORIZED),
+        (&forbidden, 403, FU20_FORBIDDEN),
+    ] {
+        for raw in raws.iter() {
+            assert_eq!(raw.status, status);
+            assert_eq!(raw.body, body, "{}", String::from_utf8_lossy(&raw.body));
+            assert!(
+                raw.headers
+                    .iter()
+                    .all(|(name, _)| name != "www-authenticate")
+            );
+            assert!(
+                raw.headers
+                    .iter()
+                    .any(|(name, value)| name == "x-request-id"
+                        && value == FU20_REQUEST_ID.as_bytes()),
+                "{:?}",
+                raw.headers
+            );
+        }
+        assert!(raws.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+    let logs = fu20_log_since(&case, offset);
+    for secret in [
+        absent,
+        leaf,
+        parent,
+        "fu20-rt",
+        FU20_WIDE_TOKEN,
+        FU20_NARROW_TOKEN,
+        "fu20-bogus",
+    ] {
+        assert!(!logs.contains(secret), "log names {secret}:\n{logs}");
+    }
+    assert!(
+        logs.matches("Application error: authentication required")
+            .count()
+            >= 18
+    );
+    assert!(logs.matches("Application error: forbidden").count() >= 12);
+    assert_eq!(fu20_snapshot(&case), before);
+    assert_eq!(fu20_upload_pack(&case, leaf).0, 200);
+
+    // A covering token gets the real answers.
+    let (status, json) = fu20_remove(&case, absent, None);
+    assert_eq!(status, 200, "{json}");
+    fu20_expect(&json, absent, "absent");
+    let (status, json) = fu20_remove(&case, parent, None);
+    assert_eq!(status, 409, "{json}");
+    assert_eq!(
+        err_message(&json),
+        "IMPORT_REPO_HAS_CHILDREN: \"/third-party/fu20-rt-par\" contains other ImportRepos; remove them first"
+    );
+    assert_eq!(fu20_snapshot(&case), before);
+    let (status, json) = fu20_remove(&case, leaf, None);
+    assert_eq!(status, 200, "{json}");
+    let (_, cleanup_id) = fu20_expect(&json, leaf, "removed");
+    let requester = fu20_ledger(&db, cleanup_id.expect("cleanup id")).map(|row| row.3);
+    assert_eq!(requester.as_deref(), Some("fu20-wide"));
+    case.finish();
+
+    // push_auth=none: always 403 once the path is valid; nothing is written.
+    let case = EntryCase::boot(ApiWriteEnv::with_auth_none_config());
+    let db = case.db_url().to_owned();
+    let anon = "/third-party/fu20-anon";
+    seed_import_repo(&case.env.case_dir, case.port, "unused", "fu20-anon");
+    let reference = unauthorized_forbidden_reference(&forbidden[0]);
+    for auth in [None, Some(fu20_wide())] {
+        for path in [anon, "/third-party/fu20-none2"] {
+            for body in bodies(path) {
+                let raw = fu20_raw(&case, auth.as_deref(), &body);
+                assert_eq!((raw.status, raw.body.clone()), reference, "{body}");
+            }
+        }
+    }
+    assert!(fu20_repo_id(&db, anon).is_some());
+    assert!(fu20_clone_ok(&case, anon, "clone-anon"));
+    assert_eq!((fu20_detach_rows(&db), fu20_ledger_rows(&db)), (0, 0));
+    let raw = fu20_raw(&case, None, &serde_json::json!({ "path": "/third-party" }));
+    assert_eq!(raw.status, 400);
+    assert!(fu20_raw_message(&raw).starts_with("IMPORT_REPO_PATH_INVALID: "));
+    case.finish();
+}
+
+fn unauthorized_forbidden_reference(raw: &Fu20Raw) -> (u16, Vec<u8>) {
+    (raw.status, raw.body.clone())
+}
+
+#[test]
+fn import_repo_remove_openapi() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let (status, doc) = case.exchange(
+        case.client
+            .get(format!("http://127.0.0.1:{}/api/openapi.json", case.port)),
+        None,
+        "GET /api/openapi.json",
+    );
+    assert_eq!(status, 200, "GET /api/openapi.json");
+    let item = doc["paths"]["/api/v1/import-repo/remove"]
+        .as_object()
+        .expect("import-repo/remove path item");
+    assert_eq!(item.keys().collect::<Vec<_>>(), ["post"]);
+    let mut statuses: Vec<&String> = item["post"]["responses"]
+        .as_object()
+        .expect("responses")
+        .keys()
+        .collect();
+    statuses.sort();
+    assert_eq!(statuses, ["200", "400", "401", "403", "404", "409", "500"]);
+    assert_eq!(
+        item["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ImportRepoRemoveRequest"
+    );
+    let schemas = &doc["components"]["schemas"];
+    assert_eq!(
+        schemas["ImportRepoRemoveRequest"]["additionalProperties"],
+        Value::Bool(false)
+    );
+    assert_eq!(
+        schemas["ImportRepoRemoveOutcome"]["enum"],
+        serde_json::json!(["removed", "pending", "absent"])
+    );
+    assert!(!doc.to_string().contains(PUSH_TOKEN));
+    case.finish();
+}

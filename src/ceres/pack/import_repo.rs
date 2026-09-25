@@ -765,8 +765,8 @@ impl ImportRepo {
 /// (plan-20260923 ADR-FU-09 items 1 and 2) and return its cleanup id: the id
 /// of the ledger row the detach wrote, or of the one an earlier detach of the
 /// same repository wrote. `None` means there was nothing to detach and no
-/// cleanup is pending. A repeat of a finished detach replays its row. There
-/// is no product entry yet; FU-17's cleanup entry builds on this.
+/// cleanup is pending. A repeat of a finished detach replays its row. Product
+/// entries reach it only through `remove_import_repo`.
 pub(crate) async fn detach_import_repo(
     storage: &Storage,
     git_object_cache: Arc<GitObjectCache>,
@@ -883,7 +883,10 @@ pub enum RemoveOutcome {
 /// items 3, 5). One request handles at most `CLEANUP_RESUME_BATCH` ledger
 /// rows and runs at most `SWEEP_STATEMENT_BUDGET` delete statements. A
 /// `continuation` names one ledger row to finish and never detaches a live
-/// repository. No product entry calls this yet (FU-20 / FU-21).
+/// repository. Callers validate the path with `strict_import_repo_leaf_input`
+/// and authorize the request before calling: this entry runs no leaf check and
+/// performs every lookup itself (POST /api/v1/import-repo/remove, FU-20; the
+/// operator CLI, FU-21).
 pub(crate) async fn remove_import_repo(
     storage: &Storage,
     git_object_cache: Arc<GitObjectCache>,

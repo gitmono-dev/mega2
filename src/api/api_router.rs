@@ -14,8 +14,9 @@ use crate::{
         api_doc::SYSTEM_COMMON,
         router::{
             admin_router, agent_capture_router, artifacts_router, bot_router, buck_router,
-            cl_router, commit_router, gpg_router, group_router, merge_queue_router, preview_router,
-            push_queue_router, repo_router, tag_router, user_router, webhook_router,
+            cl_router, commit_router, gpg_router, group_router, import_repo_router,
+            merge_queue_router, preview_router, push_queue_router, repo_router, tag_router,
+            user_router, webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
@@ -59,9 +60,9 @@ pub fn routers_for(policy: PushPolicy) -> OpenApiRouter<MonoApiServiceState> {
 }
 
 /// Git-adjacent surface for storage-only / trunk HTTP (no OAuth/CL/user
-/// routers): read-only preview, the product writes, the tag routes and
+/// routers): read-only preview, the product writes, the tag routes,
 /// (plan-20260921 AR-01) the artifacts protocol routes (writes gated by
-/// `git.push_auth`).
+/// `git.push_auth`), and (plan-20260923 FU-20) the ImportRepo cleanup route.
 pub fn storage_only_routers() -> OpenApiRouter<MonoApiServiceState> {
     storage_only_routers_with(false)
 }
@@ -78,6 +79,7 @@ pub fn storage_only_routers_with(
         .merge(preview_router::readonly_routers())
         .merge(preview_router::write_routers())
         .merge(preview_router::storage_only_write_routers())
+        .merge(import_repo_router::routers())
         .merge(tag_router::routers())
         .merge(artifacts_router::routers());
     if include_agent_capture {
