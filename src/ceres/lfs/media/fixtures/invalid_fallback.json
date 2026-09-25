@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "algorithm": "fastcdc-v1",
+  "algorithm": "fastcdc-v2020-32k",
   "hash_algorithm": "sha256",
   "media_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "media_size": 0,
@@ -10,7 +10,7 @@
     "client": "libra",
     "version": "0",
     "capabilities": [
-      "fastcdc-v1",
+      "fastcdc-v2020-32k",
       "sha256"
     ]
   }

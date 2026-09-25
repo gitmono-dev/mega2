@@ -26,7 +26,10 @@ impl LfsService {
     }
 
     #[cfg(feature = "fastcdc")]
-    pub fn media(&self) -> crate::ceres::lfs::media::service::MediaService {
-        crate::ceres::lfs::media::service::MediaService::new(self.obj_storage.clone())
+    pub fn media(
+        &self,
+        paging: crate::jupiter::storage::media_paging_storage::MediaPagingStorage,
+    ) -> crate::ceres::lfs::media::service::MediaService {
+        crate::ceres::lfs::media::service::MediaService::new(self.obj_storage.clone(), paging)
     }
 }

@@ -34,31 +34,37 @@ mod tests {
 
     struct Fixture {
         _dir: tempfile::TempDir,
+        _db_dir: tempfile::TempDir,
         service: MediaService,
         scope: MediaScope,
     }
 
     async fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
+        let obj_dir = tempfile::tempdir().unwrap();
         let cfg = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::Local,
             local: LocalConfig {
-                root_dir: dir.path().to_string_lossy().into_owned(),
+                root_dir: obj_dir.path().to_string_lossy().into_owned(),
             },
             ..Default::default()
         };
         let store = build_object_storage(&cfg).await.unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = test_db_connection(db_dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        let base = BaseStorage::new(std::sync::Arc::new(db));
+        let paging =
+            crate::jupiter::storage::media_paging_storage::MediaPagingStorage::new(base.clone());
         let service = LfsService {
-            lfs_storage: LfsDbStorage {
-                base: BaseStorage::mock(),
-            },
+            lfs_storage: LfsDbStorage { base: base.clone() },
             obj_storage: store,
             storage_event_emitter:
                 crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         }
-        .media();
+        .media(paging);
         Fixture {
-            _dir: dir,
+            _dir: obj_dir,
+            _db_dir: db_dir,
             service,
             scope: MediaScope::from_server("user-1", "/acme/app").unwrap(),
         }
@@ -69,24 +75,37 @@ mod tests {
         let mut chunks = Vec::new();
         let mut bodies = Vec::new();
         let mut all = BytesMut::new();
-        for part in parts {
-            all.extend_from_slice(part);
-            let hash = LfsDigest::sha256_of(part).hex().to_owned();
+        let n = parts.len();
+        for (i, part) in parts.iter().enumerate() {
+            // Non-tail chunks must meet MIN_SIZE; pad with zeros after the
+            // logical payload so hash covers the full declared length.
+            let is_tail = i + 1 == n;
+            let declared = if is_tail {
+                part.len()
+            } else {
+                part.len().max(chunker::MIN_SIZE)
+            };
+            let mut body = BytesMut::from(*part);
+            if body.len() < declared {
+                body.resize(declared, 0);
+            }
+            all.extend_from_slice(&body);
+            let hash = LfsDigest::sha256_of(&body).hex().to_owned();
             chunks.push(ChunkEntry {
                 offset,
-                length: part.len() as u64,
+                length: declared as u64,
                 chunk_hash: hash.clone(),
-                encoded_length: part.len() as u64,
+                encoded_length: declared as u64,
                 compression: "none".to_string(),
                 checksum: None,
             });
-            bodies.push((hash, Bytes::copy_from_slice(part)));
-            offset += part.len() as u64;
+            bodies.push((hash, body.freeze()));
+            offset += declared as u64;
         }
         let media_oid = LfsDigest::sha256_of(&all).hex().to_owned();
         let manifest = MediaManifest {
             version: 1,
-            algorithm: "fastcdc-v1".to_string(),
+            algorithm: chunker::ALGORITHM.to_string(),
             hash_algorithm: "sha256".to_string(),
             media_oid,
             media_size: offset,
@@ -94,7 +113,7 @@ mod tests {
             created_by: CreatedBy {
                 client: "test".to_string(),
                 version: "0".to_string(),
-                capabilities: vec!["fastcdc-v1".to_string()],
+                capabilities: vec![chunker::ALGORITHM.to_string()],
             },
             fallback_oid: None,
         };
@@ -220,8 +239,10 @@ mod tests {
     #[tokio::test]
     async fn resume_and_deduplicate() {
         let fx = fixture().await;
-        let repeated = b"same-bytes";
-        let (mut manifest, bodies) = manifest_for(&[repeated, b"other-bytes", repeated]);
+        // Non-tail and tail copies of the same MIN_SIZE payload share a hash.
+        let repeated = vec![0xab_u8; chunker::MIN_SIZE];
+        let other = vec![0xcd_u8; chunker::MIN_SIZE];
+        let (mut manifest, bodies) = manifest_for(&[&repeated, &other, &repeated]);
         assert_eq!(bodies[0].0, bodies[2].0);
         manifest.fallback_oid = Some("b".repeat(64));
         assert!(manifest.validate().is_err());
@@ -308,7 +329,11 @@ mod tests {
             storage_event_emitter:
                 crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         }
-        .media();
+        .media(
+            crate::jupiter::storage::media_paging_storage::MediaPagingStorage::new(
+                lfs_db.base.clone(),
+            ),
+        );
         DbFixture {
             _obj_dir: obj_dir,
             _db_dir: db_dir,
@@ -343,7 +368,7 @@ mod tests {
             .collect();
         let manifest = MediaManifest {
             version: 1,
-            algorithm: "fastcdc-v1".to_string(),
+            algorithm: chunker::ALGORITHM.to_string(),
             hash_algorithm: "sha256".to_string(),
             media_oid: LfsDigest::sha256_of(data).hex().to_owned(),
             media_size: data.len() as u64,
@@ -351,7 +376,7 @@ mod tests {
             created_by: CreatedBy {
                 client: "test".to_string(),
                 version: "0".to_string(),
-                capabilities: vec!["fastcdc-v1".to_string()],
+                capabilities: vec![chunker::ALGORITHM.to_string()],
             },
             fallback_oid: None,
         };

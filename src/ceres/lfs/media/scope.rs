@@ -7,7 +7,9 @@ use crate::{
     orbit_api::object_storage::{ObjectKey, ObjectNamespace},
 };
 
-const MEDIA_KEY_PREFIX: &str = "v1";
+/// Algorithm-scoped Media object namespace (C-08 / MF-02).
+/// Old `v1/` objects are retained unread and undeleted.
+const MEDIA_KEY_PREFIX: &str = "fastcdc-v2020-32k";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScopeError {
@@ -25,6 +27,8 @@ pub enum MediaObjectKind {
     Chunk,
     Manifest,
     Finalized,
+    /// Immutable page blob under `(manifest_id, page_no)`.
+    Page,
 }
 
 impl MediaObjectKind {
@@ -34,6 +38,7 @@ impl MediaObjectKind {
             Self::Chunk => "chunk",
             Self::Manifest => "manifest",
             Self::Finalized => "finalized",
+            Self::Page => "page",
         }
     }
 }
@@ -165,9 +170,14 @@ mod tests {
         let kb = b.object_key(MediaObjectKind::Chunk, &chunk).unwrap();
         assert_ne!(ka.key, kb.key);
         assert_eq!(ka.namespace, ObjectNamespace::Media);
-        assert!(ka.key.starts_with("v1/"));
-        assert!(ka.default_sharding().starts_with("media/v1/"));
+        assert!(ka.key.starts_with("fastcdc-v2020-32k/"));
+        assert!(
+            ka.default_sharding()
+                .starts_with("media/fastcdc-v2020-32k/")
+        );
         assert!(!ka.default_sharding().contains("alice"));
+        // Legacy v1 keys must not be produced by the new prefix.
+        assert!(!ka.key.starts_with("v1/"));
     }
 
     #[test]

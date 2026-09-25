@@ -14,7 +14,7 @@ use crate::{
         digest::LfsDigest,
         media::{
             chunker,
-            protocol::{MAX_MANIFEST_SIZE, ManifestError, ManifestResponse, MediaManifest},
+            protocol::{MAX_ENVELOPE_SIZE, ManifestError, ManifestResponse, MediaManifest},
             scope::{MediaObjectKind, MediaScope, redact_storage_error},
             service::{MediaError, MediaService, map_store, scope_key, unix_now},
         },
@@ -127,7 +127,7 @@ async fn rebuild_and_verify(
         chunker::chunk_reader(File::open(path).map_err(MediaError::Io)?).map_err(MediaError::Io)?;
     if recomputed.len() != manifest.chunks.len() {
         return Err(MediaError::Invalid(
-            "fastcdc-v1 boundaries do not match the pending manifest".to_string(),
+            "chunk layout boundaries do not match the pending manifest".to_string(),
         ));
     }
     for (got, want) in recomputed.iter().zip(manifest.chunks.iter()) {
@@ -136,7 +136,7 @@ async fn rebuild_and_verify(
             || got.chunk_hash != want.chunk_hash
         {
             return Err(MediaError::Invalid(
-                "fastcdc-v1 offset/length/hash do not match the pending manifest".to_string(),
+                "chunk offset/length/hash do not match the pending manifest".to_string(),
             ));
         }
     }
@@ -208,7 +208,7 @@ async fn publish_finalized(
     };
     let key = scope_key(scope, MediaObjectKind::Finalized, &manifest.media_oid)?;
     if media.exists(&key).await? {
-        let existing = media.read_bytes(&key, MAX_MANIFEST_SIZE).await?;
+        let existing = media.read_bytes(&key, MAX_ENVELOPE_SIZE).await?;
         let parsed: ManifestResponse =
             serde_json::from_slice(&existing).map_err(|e| MediaError::Json(e.to_string()))?;
         if parsed.manifest_id != manifest_id || parsed.manifest.media_oid != manifest.media_oid {
@@ -220,7 +220,7 @@ async fn publish_finalized(
     }
     let payload =
         Bytes::from(serde_json::to_vec(&response).map_err(|e| MediaError::Json(e.to_string()))?);
-    if payload.len() > MAX_MANIFEST_SIZE {
+    if payload.len() > MAX_ENVELOPE_SIZE {
         return Err(MediaError::Invalid(
             "finalized manifest exceeds size limit".to_string(),
         ));
@@ -408,10 +408,13 @@ mod tests {
         let lfs_db = LfsDbStorage {
             base: BaseStorage::new(std::sync::Arc::new(db)),
         };
+        let paging = crate::jupiter::storage::media_paging_storage::MediaPagingStorage::new(
+            lfs_db.base.clone(),
+        );
         Wh06Fixture {
             _obj_dir: obj_dir,
             _db_dir: db_dir,
-            service: MediaService::new(store),
+            service: MediaService::new(store, paging),
             lfs_db,
             scope: MediaScope::from_server("user-1", repo).unwrap(),
         }
@@ -442,7 +445,7 @@ mod tests {
             .collect();
         let manifest = MediaManifest {
             version: 1,
-            algorithm: "fastcdc-v1".to_string(),
+            algorithm: chunker::ALGORITHM.to_string(),
             hash_algorithm: "sha256".to_string(),
             media_oid: LfsDigest::sha256_of(data).hex().to_owned(),
             media_size: data.len() as u64,
@@ -450,7 +453,7 @@ mod tests {
             created_by: CreatedBy {
                 client: "test".to_string(),
                 version: "0".to_string(),
-                capabilities: vec!["fastcdc-v1".to_string()],
+                capabilities: vec![chunker::ALGORITHM.to_string()],
             },
             fallback_oid: None,
         };

@@ -6,12 +6,15 @@
 
 - 算法：`fastcdc-v2020-32k`（`fastcdc = "=3.2.1"`，v2020，Normalization::Level1，seed=0，min/avg/max = 32/64/256 KiB）。旧 `fastcdc-v1`（512 KiB / 2 MiB / 8 MiB）命名空间保留不读写。
 - Manifest：`version=1`，`hash_algorithm=sha256`，chunk `compression` 固定 `none` 且 `encoded_length == length`。
-- Canonical ID：SHA-256（小写 hex）over JSON of `(version, algorithm, hash_algorithm, media_oid, media_size, chunks)`。`created_by` 与 `fallback_oid` 不进入 identity。
-- 上限：最多 8192 chunks；manifest JSON ≤ 10 MiB；单 chunk ≤ 8 MiB。
+- Canonical ID：SHA-256（小写 hex）over JSON of `(version, algorithm, hash_algorithm, media_oid, media_size, chunks)`。`created_by` 与 `fallback_oid` 不进入 identity；分页边界不参与身份。
+- 容量：不设文件字节数/总 chunk 数/总 manifest 大小产品上限。单页 ≤4096 条且紧凑 entries ≤960 KiB；Media metadata 包装（摘要/页/状态）≤ **1 MiB**（`MAX_ENVELOPE_SIZE`）；单 chunk ≤ 256 KiB；完整 LFS 流不受页限额。
 - `fallback_oid` 若存在必须等于 `media_oid`。
 - HTTP 形状（路由由 FC-07 注册，路径以 Libra client 为准）：
   - capabilities：`GET <repo>.git/info/lfs/libra/media/v1/capabilities`
-  - prepare：`POST …/manifests` → `{manifest_id, missing_chunks}`
+  - prepare：`POST …/manifests` → `{manifest_id, missing_chunks}`（唯一 hash 差集；exists 并发 ≤16）
+  - page：`PUT …/manifests/{id}/pages/{page_no}`
+  - seal：`POST …/manifests/{id}/seal`
+  - missing：`GET …/manifests/{id}/missing?cursor=…`
   - upload：`PUT …/manifests/{id}/chunks/{hash}`（`application/octet-stream`）
   - finalize：`POST …/manifests/{id}/finalize`
   - get：`GET …/manifests/by-media/{oid}` → `{manifest_id, manifest}`
@@ -22,7 +25,7 @@
 - Namespace 字符串 `media` 只追加，不改 git/lfs/log/artifact/attachment/oci。
 - Scope = 服务端 actor + canonical 绝对仓库路径；digest = SHA-256(`actor || 0x00 || repo`)。
   Actor 取 `AccessTokenUser` 的 `website_user_id`（非空）否则 `username`。请求体 actor/repository/`created_by` 不得覆盖。
-- Object key：`v1/{scope_digest}/{pending|chunk|manifest|finalized}/{id}`，存储路径 `media/` + key（Media 不走 3-level sharding）。
+- Object key：`fastcdc-v2020-32k/{scope_digest}/{pending|chunk|manifest|finalized}/{id}`，存储路径 `media/` + key（Media 不走 3-level sharding）。旧前缀 `v1/` 保留不读写、不自动删除。
 - 对外错误不泄漏 digest、object key 或认证信息。
 
 ## 持久分页状态（FC-16 / MF-08）
@@ -35,20 +38,21 @@
 
 对象存储中的 sealed 页仍是权威页内容；索引可从页重建。`down` 不删除任务数据（compensating：停写后切回旧命名空间）。
 
+## 生命周期（FC-05 prepare / upload / resume）
 
-- `prepare` 只接受已 `validate` 的 manifest，并**强制** `fallback_oid = media_oid`。
-- pending 对象：`media/v1/{scope}/pending/{manifest_id}`，逻辑 TTL **24 小时**，JSON ≤ **10 MiB**。过期 session 不能继续 upload/get。
-- `missing_chunks` 按 scoped chunk key 检查存在性；重复 `chunk_hash` 在响应中去重（保序）。
-- chunk 上传必须命中 pending 声明的 hash/length，并校验实际 SHA-256（≤ 8 MiB）。同 scope 同 hash 的正确对象可幂等复用；已存错误内容返回 Conflict。
-- finalize 前只能通过 pending manifest 声明的 hash 读取 chunk，不能按任意 hash 取对象。
+- `prepare` 只接受已 `validate` 的 manifest，并**强制** `fallback_oid = media_oid`；写入 `MediaPagingStorage` pending 会话。
+- pending 对象：`media/fastcdc-v2020-32k/{scope}/pending/{manifest_id}`，逻辑 TTL **24 小时**，JSON ≤ **1 MiB**。过期 session 不能继续 upload/get。
+- `missing_chunks` / missing cursor 按 scoped chunk key 检查存在性；重复 `chunk_hash` 在响应中去重（保序）；exists 并发 ≤16。
+- chunk 上传必须命中 pending 声明的 hash/length，并校验实际 SHA-256（≤ 256 KiB）。同 scope 同 hash 的正确对象可幂等复用；已存错误内容返回 Conflict。
+- finalize 前只能通过 pending/sealed 声明的 hash 读取 chunk，不能按任意 hash 取对象。
 - 领域错误：`Invalid` / `NotFound` / `Conflict` / `Storage` / `Io` / `Json`。存储错误对外固定为 `media object store error`。
 
 ## Finalize / fallback（FC-06）
 
-- 同时最多 **2** 个 finalize（semaphore）。按 pending 声明的顺序逐块读取（≤8 MiB），写入临时文件并增量 SHA-256。
-- 校验整对象 `media_oid`/`media_size` 后，再跑一遍 `fastcdc-v1`：offset/length/hash 必须与 manifest 完全一致。
+- 同时最多 **2** 个 finalize（semaphore）。按 pending 声明的顺序逐块读取（≤256 KiB），写入临时文件并增量 SHA-256。
+- 校验整对象 `media_oid`/`media_size` 后，再跑一遍 `fastcdc-v2020-32k`：offset/length/hash 必须与 manifest 完全一致（MF-03 将改为覆盖验证、不再要求新鲜 CDC 边界）。
 - 缺失或损坏 chunk：**不**写 LFS namespace、**不**写 `lfs_objects`、**不**发布 finalized manifest；临时文件在成功和失败路径都删除。
-- 通过后：`put_stream_bounded` 发布到 `lfs/{oid}`，`lfs_objects` 以 `ON CONFLICT (oid) DO NOTHING` 幂等插入，重新读取 metadata 并确认对象存在，然后才写 `media/v1/{scope}/finalized/{media_oid}`。
+- 通过后：`put_stream_bounded` 发布到 `lfs/{oid}`，`lfs_objects` 以 `ON CONFLICT (oid) DO NOTHING` 幂等插入，重新读取 metadata 并确认对象存在，然后才写 `media/fastcdc-v2020-32k/{scope}/finalized/{media_oid}`。
 - 已存在的 finalized 若 `manifest_id`/`media_oid` 不一致则 Conflict；重复 finalize 在内容一致时成功。
 
 ## 出站事件（plan-20260912 / WH-06，已交付）
@@ -63,9 +67,9 @@
 - Feature-on 时挂在当前 LFS mount 下：逻辑前缀 `libra/media/v1`。仓库 URL `<repo>.git` 的外部路径是 `<repo>.git/info/lfs/libra/media/v1/...`；OpenAPI 登记为 `/api/v1/lfs/libra/media/v1/...`。Feature-off 不注册这些路由（运行时 404，schema 中也不出现）。
 - **每一条** Media 路由（含 capabilities）都要求 `AccessTokenUser`（Bearer）。不复用标准 LFS objects 的「batch 后裸 URL 可不再认证」例外。
 - 仓库路径取 URI 改写前保存在 `LfsRepoContext` 的原始前缀（例如 `/acme/app.git`）。缺少合法前缀 → 400。
-- Body 上限在 handler 前拒绝：JSON/manifest 路由 `DefaultBodyLimit` 10 MiB；chunk PUT 路由 8 MiB。另有 `Content-Length` 中间件在读 body 前返回 413。
+- Body 上限在 handler 前拒绝：JSON/摘要/页路由 `DefaultBodyLimit` **1 MiB**；chunk PUT 路由 **256 KiB**。另有 `Content-Length` 中间件在读 body 前返回 413。
 - 错误：Invalid/Json → 400，NotFound → 404，Conflict → 409，Storage/Io → 500 且 body 固定 `media object store error`。
-- Capabilities JSON 来自 `Capabilities::v1()`：`fastcdc-v1`、sha256、上限、`supports_batch_exists`、`supports_standard_lfs_fallback`。
+- Capabilities JSON 来自 `Capabilities::v1()`：`fastcdc-v2020-32k`、sha256、1 MiB envelope、`batch_exists`/`supports_batch_exists`、`range_read=false`、`standard_lfs_fallback`、`supports_manifest_id_read=true`、`manifest_paging="v1"`、`max_page_entries=4096`、`max_page_bytes=1048576`。
 - 普通 LFS `/objects`、`/locks`、`/objects/batch` 行为不变。
 
 固定 fixture：`src/ceres/lfs/media/fixtures/`（合法 `valid_v1.json` / 空文件 `empty.json` / 非法 version 与 fallback）。`valid_v1.json` 字节 SHA-256：`20226243095e92274b3683f4c09bcd12ae35d245b073b38296a2a895c13b8c9d`。

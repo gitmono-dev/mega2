@@ -490,6 +490,35 @@ impl MediaPagingStorage {
         txn.commit().await?;
         Ok(updated)
     }
+
+    /// Fetch a session by natural key.
+    pub async fn get_session(
+        &self,
+        scope_digest: &str,
+        manifest_id: &str,
+    ) -> Result<media_session::Model, MediaPagingError> {
+        media_session::Entity::find()
+            .filter(media_session::Column::ScopeDigest.eq(scope_digest))
+            .filter(media_session::Column::ManifestId.eq(manifest_id))
+            .one(self.get_connection())
+            .await?
+            .ok_or(MediaPagingError::NotFound)
+    }
+
+    /// Ordered page entries for a session (page_no, ordinal ascending).
+    pub async fn list_entries(
+        &self,
+        scope_digest: &str,
+        manifest_id: &str,
+    ) -> Result<Vec<media_entry::Model>, MediaPagingError> {
+        Ok(media_entry::Entity::find()
+            .filter(media_entry::Column::ScopeDigest.eq(scope_digest))
+            .filter(media_entry::Column::ManifestId.eq(manifest_id))
+            .order_by_asc(media_entry::Column::PageNo)
+            .order_by_asc(media_entry::Column::Ordinal)
+            .all(self.get_connection())
+            .await?)
+    }
 }
 
 #[cfg(test)]

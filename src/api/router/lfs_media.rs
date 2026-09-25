@@ -23,7 +23,10 @@ use crate::{
     },
     ceres::lfs::media::{
         chunker, finalize,
-        protocol::{Capabilities, MAX_MANIFEST_SIZE, MediaManifest},
+        protocol::{
+            Capabilities, MAX_ENVELOPE_SIZE, ManifestPage, MediaManifest, MissingChunksResponse,
+            SealResponse,
+        },
         scope::{MediaObjectKind, MediaScope},
         service::{MediaError, MediaService},
     },
@@ -36,10 +39,13 @@ pub fn media_routes() -> OpenApiRouter<MonoApiServiceState> {
     let json = OpenApiRouter::new()
         .routes(routes!(media_capabilities))
         .routes(routes!(media_prepare))
+        .routes(routes!(media_put_page))
+        .routes(routes!(media_seal))
+        .routes(routes!(media_missing))
         .routes(routes!(media_finalize))
         .routes(routes!(media_get_manifest))
         .routes(routes!(media_get_chunk))
-        .layer(DefaultBodyLimit::max(MAX_MANIFEST_SIZE))
+        .layer(DefaultBodyLimit::max(MAX_ENVELOPE_SIZE))
         .layer(middleware::from_fn(reject_oversize_media_body));
     let chunks = OpenApiRouter::new()
         .routes(routes!(media_upload_chunk))
@@ -90,7 +96,10 @@ fn media_scope(
 }
 
 fn media_service(state: &MonoApiServiceState) -> MediaService {
-    state.storage.lfs_service.media()
+    state
+        .storage
+        .lfs_service
+        .media(state.storage.media_paging_storage())
 }
 
 fn content_length(headers: &HeaderMap) -> Option<usize> {
@@ -104,7 +113,7 @@ fn body_limit_for(method: &Method, path: &str) -> usize {
     if *method == Method::PUT && path.contains("/chunks/") {
         chunker::MAX_SIZE
     } else {
-        MAX_MANIFEST_SIZE
+        MAX_ENVELOPE_SIZE
     }
 }
 
@@ -144,7 +153,7 @@ pub async fn media_capabilities(
         (status = 200, description = "Prepare response", content_type = "application/json"),
         (status = 400, description = "Invalid manifest"),
         (status = 401, description = "Missing or invalid access token"),
-        (status = 413, description = "Body exceeds 10 MiB")
+        (status = 413, description = "Body exceeds 1 MiB envelope")
     ),
     tag = MEDIA_TAG
 )]
@@ -154,7 +163,7 @@ pub async fn media_prepare(
     repo: Option<Extension<LfsRepoContext>>,
     body: Bytes,
 ) -> Response {
-    if body.len() > MAX_MANIFEST_SIZE {
+    if body.len() > MAX_ENVELOPE_SIZE {
         return media_json(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds limit");
     }
     let scope = match media_scope(&user, repo) {
@@ -177,6 +186,126 @@ pub async fn media_prepare(
 
 #[utoipa::path(
     put,
+    path = "/libra/media/v1/manifests/{manifest_id}/pages/{page_no}",
+    params(
+        ("manifest_id" = String, Path),
+        ("page_no" = u32, Path),
+    ),
+    request_body(content = String, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Page stored"),
+        (status = 400, description = "Invalid page"),
+        (status = 401, description = "Missing or invalid access token"),
+        (status = 409, description = "Page conflict"),
+        (status = 413, description = "Body exceeds 1 MiB envelope")
+    ),
+    tag = MEDIA_TAG
+)]
+pub async fn media_put_page(
+    State(state): State<MonoApiServiceState>,
+    AccessTokenUser(user): AccessTokenUser,
+    repo: Option<Extension<LfsRepoContext>>,
+    Path((manifest_id, page_no)): Path<(String, u32)>,
+    body: Bytes,
+) -> Response {
+    if body.len() > MAX_ENVELOPE_SIZE {
+        return media_json(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds limit");
+    }
+    let scope = match media_scope(&user, repo) {
+        Ok(scope) => scope,
+        Err(err) => return map_media_error(err),
+    };
+    let text = match std::str::from_utf8(&body) {
+        Ok(text) => text,
+        Err(_) => return map_media_error(MediaError::Invalid("page is not UTF-8".into())),
+    };
+    let page = match ManifestPage::from_json(text) {
+        Ok(page) => page,
+        Err(err) => return map_media_error(MediaError::Invalid(err.to_string())),
+    };
+    if page.page_no != page_no {
+        return map_media_error(MediaError::Invalid(
+            "page_no in body does not match path".into(),
+        ));
+    }
+    match media_service(&state)
+        .put_page(&scope, &manifest_id, page)
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(err) => map_media_error(err),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/libra/media/v1/manifests/{manifest_id}/seal",
+    params(("manifest_id" = String, Path)),
+    responses(
+        (status = 200, description = "Sealed layout", content_type = "application/json"),
+        (status = 400, description = "Invalid seal"),
+        (status = 401, description = "Missing or invalid access token"),
+        (status = 409, description = "Non-canonical pages")
+    ),
+    tag = MEDIA_TAG
+)]
+pub async fn media_seal(
+    State(state): State<MonoApiServiceState>,
+    AccessTokenUser(user): AccessTokenUser,
+    repo: Option<Extension<LfsRepoContext>>,
+    Path(manifest_id): Path<String>,
+) -> Response {
+    let scope = match media_scope(&user, repo) {
+        Ok(scope) => scope,
+        Err(err) => return map_media_error(err),
+    };
+    match media_service(&state).seal(&scope, &manifest_id).await {
+        Ok(sealed) => Json::<SealResponse>(sealed).into_response(),
+        Err(err) => map_media_error(err),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/libra/media/v1/manifests/{manifest_id}/missing",
+    params(
+        ("manifest_id" = String, Path),
+        ("cursor" = Option<String>, Query, description = "Opaque missing cursor"),
+    ),
+    responses(
+        (status = 200, description = "Missing chunk hashes", content_type = "application/json"),
+        (status = 400, description = "Invalid cursor"),
+        (status = 401, description = "Missing or invalid access token")
+    ),
+    tag = MEDIA_TAG
+)]
+pub async fn media_missing(
+    State(state): State<MonoApiServiceState>,
+    AccessTokenUser(user): AccessTokenUser,
+    repo: Option<Extension<LfsRepoContext>>,
+    Path(manifest_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MissingQuery>,
+) -> Response {
+    let scope = match media_scope(&user, repo) {
+        Ok(scope) => scope,
+        Err(err) => return map_media_error(err),
+    };
+    match media_service(&state)
+        .missing_chunks_page(&scope, &manifest_id, query.cursor.as_deref())
+        .await
+    {
+        Ok(page) => Json::<MissingChunksResponse>(page).into_response(),
+        Err(err) => map_media_error(err),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MissingQuery {
+    cursor: Option<String>,
+}
+
+#[utoipa::path(
+    put,
     path = "/libra/media/v1/manifests/{manifest_id}/chunks/{chunk_hash}",
     params(
         ("manifest_id" = String, Path),
@@ -188,7 +317,7 @@ pub async fn media_prepare(
         (status = 400, description = "Invalid chunk"),
         (status = 401, description = "Missing or invalid access token"),
         (status = 409, description = "Corrupt existing chunk"),
-        (status = 413, description = "Body exceeds 8 MiB")
+        (status = 413, description = "Body exceeds max chunk size")
     ),
     tag = MEDIA_TAG
 )]
@@ -345,7 +474,7 @@ async fn load_published(
         Ok(key) => key,
         Err(_) => return Err(MediaError::NotFound),
     };
-    let bytes = media.read_bytes(&key, MAX_MANIFEST_SIZE).await?;
+    let bytes = media.read_bytes(&key, MAX_ENVELOPE_SIZE).await?;
     serde_json::from_slice(&bytes).map_err(|e| MediaError::Json(e.to_string()))
 }
 
@@ -384,6 +513,9 @@ mod tests {
     const MEDIA_PATHS: &[&str] = &[
         "/libra/media/v1/capabilities",
         "/libra/media/v1/manifests",
+        "/libra/media/v1/manifests/{manifest_id}/pages/{page_no}",
+        "/libra/media/v1/manifests/{manifest_id}/seal",
+        "/libra/media/v1/manifests/{manifest_id}/missing",
         "/libra/media/v1/manifests/{manifest_id}/chunks/{chunk_hash}",
         "/libra/media/v1/manifests/{manifest_id}/finalize",
         "/libra/media/v1/manifests/by-media/{oid}",
@@ -504,7 +636,7 @@ mod tests {
         let chunks = chunker::chunk_bytes(data);
         MediaManifest {
             version: 1,
-            algorithm: "fastcdc-v1".to_string(),
+            algorithm: chunker::ALGORITHM.to_string(),
             hash_algorithm: "sha256".to_string(),
             media_oid: LfsDigest::sha256_of(data).hex().to_owned(),
             media_size: data.len() as u64,
@@ -522,7 +654,7 @@ mod tests {
             created_by: CreatedBy {
                 client: "test".to_string(),
                 version: "0".to_string(),
-                capabilities: vec!["fastcdc-v1".to_string()],
+                capabilities: vec![chunker::ALGORITHM.to_string()],
             },
             fallback_oid: None,
         }
@@ -594,12 +726,18 @@ mod tests {
             .unwrap();
         let caps: Capabilities = serde_json::from_slice(&bytes).unwrap();
         assert!(caps.chunked_lfs);
-        assert_eq!(caps.chunk_algorithms, vec!["fastcdc-v1".to_string()]);
+        assert_eq!(caps.chunk_algorithms, vec![chunker::ALGORITHM.to_string()]);
         assert_eq!(caps.hash_algorithms, vec!["sha256".to_string()]);
         assert_eq!(caps.max_chunk_size, chunker::MAX_SIZE as u64);
-        assert_eq!(caps.max_manifest_size, MAX_MANIFEST_SIZE as u64);
+        assert_eq!(caps.max_manifest_size, MAX_ENVELOPE_SIZE as u64);
         assert!(caps.supports_batch_exists);
+        assert!(caps.batch_exists);
         assert!(caps.supports_standard_lfs_fallback);
+        assert!(caps.standard_lfs_fallback);
+        assert!(caps.supports_manifest_id_read);
+        assert_eq!(caps.manifest_paging, "v1");
+        assert_eq!(caps.max_page_entries, 4096);
+        assert_eq!(caps.max_page_bytes, MAX_ENVELOPE_SIZE as u64);
 
         let bad = media_app(h.state)
             .oneshot(with_repo(
@@ -654,7 +792,7 @@ mod tests {
             .oneshot(with_repo(
                 Request::post("/libra/media/v1/manifests")
                     .header(AUTHORIZATION, format!("Bearer {token}"))
-                    .header("content-length", (MAX_MANIFEST_SIZE + 1).to_string())
+                    .header("content-length", (MAX_ENVELOPE_SIZE + 1).to_string())
                     .body(Body::empty())
                     .unwrap(),
             ))
@@ -773,7 +911,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(caps.chunk_algorithms, vec!["fastcdc-v1".to_string()]);
+        assert_eq!(caps.chunk_algorithms, vec![chunker::ALGORITHM.to_string()]);
         assert_eq!(caps.hash_algorithms, vec!["sha256".to_string()]);
     }
 
@@ -786,7 +924,7 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert_eq!(text, r#"{"message":"media object store error"}"#);
-        assert!(!text.contains("v1/"));
+        assert!(!text.contains("fastcdc-v2020-32k/"));
         assert_eq!(
             map_media_error(MediaError::Invalid("bad".into())).status(),
             StatusCode::BAD_REQUEST

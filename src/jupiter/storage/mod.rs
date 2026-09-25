@@ -543,6 +543,10 @@ impl Storage {
         self.app_service.oci_db_storage.clone()
     }
 
+    pub fn media_paging_storage(&self) -> MediaPagingStorage {
+        self.app_service.media_paging_storage.clone()
+    }
+
     #[cfg(test)]
     pub fn mock() -> Self {
         let mut config = crate::config::testing::isolated_config(
