@@ -4,7 +4,7 @@
 
 ## 协议（FC-02）
 
-- 算法：`fastcdc-v1`（min 512 KiB / avg 2 MiB / max 8 MiB）。
+- 算法：`fastcdc-v2020-32k`（`fastcdc = "=3.2.1"`，v2020，Normalization::Level1，seed=0，min/avg/max = 32/64/256 KiB）。旧 `fastcdc-v1`（512 KiB / 2 MiB / 8 MiB）命名空间保留不读写。
 - Manifest：`version=1`，`hash_algorithm=sha256`，chunk `compression` 固定 `none` 且 `encoded_length == length`。
 - Canonical ID：SHA-256（小写 hex）over JSON of `(version, algorithm, hash_algorithm, media_oid, media_size, chunks)`。`created_by` 与 `fallback_oid` 不进入 identity。
 - 上限：最多 8192 chunks；manifest JSON ≤ 10 MiB；单 chunk ≤ 8 MiB。

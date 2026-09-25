@@ -1,0 +1,282 @@
+{
+  "algorithm": "fastcdc-v2020-32k",
+  "recipe": {
+    "api": "v2020",
+    "avg": 65536,
+    "crate": "fastcdc",
+    "max": 262144,
+    "min": 32768,
+    "normalization": "Level1",
+    "seed": 0,
+    "version": "3.2.1"
+  },
+  "vectors": {
+    "avg": {
+      "chunks": [
+        {
+          "chunk_hash": "82f41f9b7b8aa784780aa79c3f743a1fdc1838d53f8536d06010db939cecea67",
+          "length": 65536,
+          "offset": 0
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 65536,
+      "input_sha256": "82f41f9b7b8aa784780aa79c3f743a1fdc1838d53f8536d06010db939cecea67"
+    },
+    "avg_minus_1": {
+      "chunks": [
+        {
+          "chunk_hash": "b30fd1296282a4b8d652f467b0b735196a2110f1c9b633de3dd41adc6ee74bb7",
+          "length": 65535,
+          "offset": 0
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 65535,
+      "input_sha256": "b30fd1296282a4b8d652f467b0b735196a2110f1c9b633de3dd41adc6ee74bb7"
+    },
+    "avg_plus_1": {
+      "chunks": [
+        {
+          "chunk_hash": "3c78490e0dd41a0272c666c8581b2b2638f69816028d8617998f06e2d44bae27",
+          "length": 65537,
+          "offset": 0
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 65537,
+      "input_sha256": "3c78490e0dd41a0272c666c8581b2b2638f69816028d8617998f06e2d44bae27"
+    },
+    "empty": {
+      "chunks": [],
+      "input_kind": "empty",
+      "input_len": 0,
+      "input_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixed_seq_1m": {
+      "chunks": [
+        {
+          "chunk_hash": "3b446c0d45482c970e99f42d33f3bceef7bef788c0c9ff95b165110f08c49027",
+          "length": 88070,
+          "offset": 0
+        },
+        {
+          "chunk_hash": "1c68fc47299e5d660ef0f136a5d8e1b82db134fc259d7234f57569558e4e2fa2",
+          "length": 108745,
+          "offset": 88070
+        },
+        {
+          "chunk_hash": "c320b540ee5dc12d2d72c21fef69e3ab943fed284fea25f801112b0e74af5c40",
+          "length": 177223,
+          "offset": 196815
+        },
+        {
+          "chunk_hash": "58a2b885dc4fb798f148e141b0c7d201b1471bfc28812b261dd6733277ae94c7",
+          "length": 84918,
+          "offset": 374038
+        },
+        {
+          "chunk_hash": "5b9e7ec7d00c19261e092e7a8c712a6fb727c5315b927810efa6b75139458862",
+          "length": 87719,
+          "offset": 458956
+        },
+        {
+          "chunk_hash": "32005d2e1605dac529a33f022cebc0fce6103175bc3ef54114b7e600f0e6feb6",
+          "length": 111174,
+          "offset": 546675
+        },
+        {
+          "chunk_hash": "d853505dfead0b1e241a986b9cec72904a589031a57ae4f294bb6dc20cc081b1",
+          "length": 82497,
+          "offset": 657849
+        },
+        {
+          "chunk_hash": "373e75741613b40d79b26714dcfd8268ae425e6117e23ca34904f2d0b88a5f8e",
+          "length": 105784,
+          "offset": 740346
+        },
+        {
+          "chunk_hash": "78fd86cb8c1e55fdfc6ac7591b663b2189e4e59fb28031eddf2930f46cd3127f",
+          "length": 94499,
+          "offset": 846130
+        },
+        {
+          "chunk_hash": "011c65597fe08c8316fb226850c1faba9be8049250fd6b11d6c06ca222c3cac9",
+          "length": 98027,
+          "offset": 940629
+        },
+        {
+          "chunk_hash": "2a39d4818f3ff8011b9abb91498280be54d33c8246b42f3fad32af5990d32d9d",
+          "length": 9920,
+          "offset": 1038656
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 1048576,
+      "input_sha256": "0d85a5950dcba802719a4d1240c3573d4abbfc9f6fa13a6f86d780cee4ed64c5"
+    },
+    "fixed_seq_max_plus": {
+      "chunks": [
+        {
+          "chunk_hash": "3b446c0d45482c970e99f42d33f3bceef7bef788c0c9ff95b165110f08c49027",
+          "length": 88070,
+          "offset": 0
+        },
+        {
+          "chunk_hash": "1c68fc47299e5d660ef0f136a5d8e1b82db134fc259d7234f57569558e4e2fa2",
+          "length": 108745,
+          "offset": 88070
+        },
+        {
+          "chunk_hash": "2d28b1959aed938c1f5f7a1221536e9f590b4117538f3acd90b05f37ae496f1a",
+          "length": 77674,
+          "offset": 196815
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 274489,
+      "input_sha256": "5ecd73f7e14c846c772de26ef21b6fe8684f3f047c6c207f9487f7915ef7023f"
+    },
+    "max": {
+      "chunks": [
+        {
+          "chunk_hash": "3b446c0d45482c970e99f42d33f3bceef7bef788c0c9ff95b165110f08c49027",
+          "length": 88070,
+          "offset": 0
+        },
+        {
+          "chunk_hash": "1c68fc47299e5d660ef0f136a5d8e1b82db134fc259d7234f57569558e4e2fa2",
+          "length": 108745,
+          "offset": 88070
+        },
+        {
+          "chunk_hash": "21468c2f0a054825c6a0d77806c921247a3103a264cd4a7b30f74842b4b13abf",
+          "length": 65329,
+          "offset": 196815
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 262144,
+      "input_sha256": "522c5e3cedba92249c3bca0a1193ed0b32c16b6f7c763e7d917adc11454cb6c8"
+    },
+    "max_minus_1": {
+      "chunks": [
+        {
+          "chunk_hash": "3b446c0d45482c970e99f42d33f3bceef7bef788c0c9ff95b165110f08c49027",
+          "length": 88070,
+          "offset": 0
+        },
+        {
+          "chunk_hash": "1c68fc47299e5d660ef0f136a5d8e1b82db134fc259d7234f57569558e4e2fa2",
+          "length": 108745,
+          "offset": 88070
+        },
+        {
+          "chunk_hash": "9f391ea183715d77f2318b793bfe8092c7107af8bab15ed2231b39127d97d218",
+          "length": 65328,
+          "offset": 196815
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 262143,
+      "input_sha256": "1b30e6060a4a01c9b341ee1063e95f070ea4bd65825bce69c62b0e5e39b4c7b3"
+    },
+    "max_plus_1": {
+      "chunks": [
+        {
+          "chunk_hash": "3b446c0d45482c970e99f42d33f3bceef7bef788c0c9ff95b165110f08c49027",
+          "length": 88070,
+          "offset": 0
+        },
+        {
+          "chunk_hash": "1c68fc47299e5d660ef0f136a5d8e1b82db134fc259d7234f57569558e4e2fa2",
+          "length": 108745,
+          "offset": 88070
+        },
+        {
+          "chunk_hash": "049e9cdb7b17f977f2c15c9c683d11bd4e491bbdcf2f5d9655bc3d74f933ff84",
+          "length": 65330,
+          "offset": 196815
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 262145,
+      "input_sha256": "43a2663cf4d04f914d0d6ee390a3c1aac62642738acb9d8cf44f496eac1370a5"
+    },
+    "min": {
+      "chunks": [
+        {
+          "chunk_hash": "e5b6ad006540263bfcd25628c17a553329c62efd4381115e7a13aefdc015b05a",
+          "length": 32768,
+          "offset": 0
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 32768,
+      "input_sha256": "e5b6ad006540263bfcd25628c17a553329c62efd4381115e7a13aefdc015b05a"
+    },
+    "min_minus_1": {
+      "chunks": [
+        {
+          "chunk_hash": "280e2c9d1d13b8238bd5057b609725c76a1bf55d4e90c3f39fd233932af50db6",
+          "length": 32767,
+          "offset": 0
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 32767,
+      "input_sha256": "280e2c9d1d13b8238bd5057b609725c76a1bf55d4e90c3f39fd233932af50db6"
+    },
+    "min_plus_1": {
+      "chunks": [
+        {
+          "chunk_hash": "36685a9e53aeb985d661a4b25a07ad4fc66d91d2a19bf000f96b8c4ae37f5fd5",
+          "length": 32769,
+          "offset": 0
+        }
+      ],
+      "input_kind": "fixed_seq",
+      "input_len": 32769,
+      "input_sha256": "36685a9e53aeb985d661a4b25a07ad4fc66d91d2a19bf000f96b8c4ae37f5fd5"
+    },
+    "repeat_a_1m": {
+      "chunks": [
+        {
+          "chunk_hash": "97a2fc5541dcc9c06b99b2a84c34961fa0c3af20dba3968df2f96a56c6bc00c9",
+          "length": 262144,
+          "offset": 0
+        },
+        {
+          "chunk_hash": "97a2fc5541dcc9c06b99b2a84c34961fa0c3af20dba3968df2f96a56c6bc00c9",
+          "length": 262144,
+          "offset": 262144
+        },
+        {
+          "chunk_hash": "97a2fc5541dcc9c06b99b2a84c34961fa0c3af20dba3968df2f96a56c6bc00c9",
+          "length": 262144,
+          "offset": 524288
+        },
+        {
+          "chunk_hash": "97a2fc5541dcc9c06b99b2a84c34961fa0c3af20dba3968df2f96a56c6bc00c9",
+          "length": 262144,
+          "offset": 786432
+        }
+      ],
+      "input_kind": "repeat_a",
+      "input_len": 1048576,
+      "input_sha256": "4e29ad18ab9f42d7c233500771a39d7c852b200baf328fd00fbbe3fecea1eb56"
+    },
+    "zeros_256k": {
+      "chunks": [
+        {
+          "chunk_hash": "8a39d2abd3999ab73c34db2476849cddf303ce389b35826850f9a700589b4a90",
+          "length": 262144,
+          "offset": 0
+        }
+      ],
+      "input_kind": "zeros",
+      "input_len": 262144,
+      "input_sha256": "8a39d2abd3999ab73c34db2476849cddf303ce389b35826850f9a700589b4a90"
+    }
+  }
+}

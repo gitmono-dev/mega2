@@ -1,42 +1,29 @@
-//! Frozen `fastcdc-v1` chunker (Mega `bb3ef17` / Libra wire contract).
+//! Frozen `fastcdc-v2020-32k` chunker (shared mega2 ↔ Libra Media contract).
 //!
-//! Gear table, masks, and min/avg/max are protocol constants. Changing them
-//! requires a new algorithm name; v1 must stay byte-identical.
+//! Recipe: `fastcdc = "=3.2.1"`, `v2020`, `Normalization::Level1`, seed=`0`,
+//! min/avg/max = 32768/65536/262144 bytes. Changing any of these requires a
+//! new algorithm name and synchronized dual-repo revision.
 
 use std::io::{self, Read};
 
+use fastcdc::v2020::{ChunkData, FastCDC, Normalization, StreamCDC};
+
 use crate::ceres::lfs::digest::LfsDigest;
 
-/// Algorithm name recorded by later Media manifests (FC-02).
-pub const ALGORITHM: &str = "fastcdc-v1";
+/// Algorithm name recorded by Media manifests (FC-02 / C-01).
+pub const ALGORITHM: &str = "fastcdc-v2020-32k";
 
-/// Minimum chunk size: no content boundary may fire before this many bytes.
-pub const MIN_SIZE: usize = 512 * 1024;
-/// Target average chunk size (`log2(AVG_SIZE) == 21` sets mask width).
-pub const AVG_SIZE: usize = 2 * 1024 * 1024;
-/// Maximum chunk size: a boundary is forced here (8 MiB).
-pub const MAX_SIZE: usize = 8 * 1024 * 1024;
+/// Minimum chunk size (non-tail chunks must be ≥ this).
+pub const MIN_SIZE: usize = 32 * 1024;
+/// Target average chunk size.
+pub const AVG_SIZE: usize = 64 * 1024;
+/// Maximum chunk size (non-tail and tail upper bound).
+pub const MAX_SIZE: usize = 256 * 1024;
 
-const MASK_STRICT: u64 = ((1u64 << 23) - 1) << 41;
-const MASK_LOOSE: u64 = ((1u64 << 19) - 1) << 45;
-
-const GEAR: [u64; 256] = build_gear();
-
-const fn build_gear() -> [u64; 256] {
-    let mut table = [0u64; 256];
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut i = 0;
-    while i < 256 {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        table[i] = z;
-        i += 1;
-    }
-    table
-}
+const MIN_U32: u32 = MIN_SIZE as u32;
+const AVG_U32: u32 = AVG_SIZE as u32;
+const MAX_U32: u32 = MAX_SIZE as u32;
+const SEED: u64 = 0;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     LfsDigest::sha256_of(bytes).hex().to_owned()
@@ -51,140 +38,190 @@ pub struct Chunk {
     pub chunk_hash: String,
 }
 
-/// Chunk a byte stream. Empty input yields no chunks; input shorter than
-/// [`MIN_SIZE`] yields exactly one chunk covering the whole input.
-pub fn chunk_reader<R: Read>(mut reader: R) -> io::Result<Vec<Chunk>> {
+/// Chunk a byte stream. Empty input yields no chunks; EOF always emits a
+/// trailing chunk covering remaining bytes (may be shorter than [`MIN_SIZE`]).
+pub fn chunk_reader<R: Read>(reader: R) -> io::Result<Vec<Chunk>> {
+    let chunker = StreamCDC::with_level_and_seed(
+        reader,
+        MIN_U32,
+        AVG_U32,
+        MAX_U32,
+        Normalization::Level1,
+        SEED,
+    );
     let mut out = Vec::new();
-    let mut buf = [0u8; 65536];
-    let mut cur: Vec<u8> = Vec::with_capacity(MAX_SIZE.min(1 << 20));
     let mut offset: u64 = 0;
-    let mut fingerprint: u64 = 0;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        for &byte in &buf[..n] {
-            cur.push(byte);
-            fingerprint = (fingerprint << 1).wrapping_add(GEAR[byte as usize]);
-            let len = cur.len();
-            let cut = if len < MIN_SIZE {
-                false
-            } else if len < AVG_SIZE {
-                (fingerprint & MASK_STRICT) == 0
-            } else if len < MAX_SIZE {
-                (fingerprint & MASK_LOOSE) == 0
-            } else {
-                true
-            };
-            if cut {
-                out.push(Chunk {
-                    offset,
-                    length: len as u64,
-                    chunk_hash: sha256_hex(&cur),
-                });
-                offset += len as u64;
-                cur.clear();
-                fingerprint = 0;
-            }
-        }
-    }
-    if !cur.is_empty() {
+    for item in chunker {
+        let ChunkData { length, data, .. } = item.map_err(io::Error::other)?;
         out.push(Chunk {
             offset,
-            length: cur.len() as u64,
-            chunk_hash: sha256_hex(&cur),
+            length: length as u64,
+            chunk_hash: sha256_hex(&data),
         });
+        offset = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| io::Error::other("chunk offset overflow"))?;
     }
     Ok(out)
 }
 
-/// In-memory convenience over [`chunk_reader`].
+/// In-memory convenience over [`chunk_reader`]; must agree with the streaming path.
 pub fn chunk_bytes(data: &[u8]) -> Vec<Chunk> {
-    // INVARIANT: `io::Cursor<&[u8]>` never returns an I/O error.
-    chunk_reader(io::Cursor::new(data)).expect("in-memory chunking cannot fail")
+    let chunker =
+        FastCDC::with_level_and_seed(data, MIN_U32, AVG_U32, MAX_U32, Normalization::Level1, SEED);
+    chunker
+        .map(|c| {
+            let slice = &data[c.offset..c.offset + c.length];
+            Chunk {
+                offset: c.offset as u64,
+                length: c.length as u64,
+                chunk_hash: sha256_hex(slice),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use serde::Deserialize;
+
     use super::*;
 
-    fn lcg_bytes(len: usize) -> Vec<u8> {
-        let mut data = Vec::with_capacity(len);
-        let mut x: u64 = 0x1234_5678_9ABC_DEF0;
-        while data.len() < len {
-            x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            data.push((x >> 33) as u8);
-        }
-        data
+    #[derive(Debug, Deserialize)]
+    struct GoldenFile {
+        algorithm: String,
+        vectors: std::collections::BTreeMap<String, GoldenVector>,
     }
 
-    fn assert_contiguous_cover(data: &[u8], chunks: &[Chunk]) {
-        let mut expected_offset = 0u64;
-        for c in chunks {
-            assert_eq!(c.offset, expected_offset);
-            assert!(c.length >= 1 && c.length <= MAX_SIZE as u64);
-            let start = c.offset as usize;
-            let end = start + c.length as usize;
-            assert_eq!(c.chunk_hash, sha256_hex(&data[start..end]));
-            expected_offset += c.length;
+    #[derive(Debug, Deserialize)]
+    struct GoldenVector {
+        input_kind: String,
+        input_len: usize,
+        input_sha256: String,
+        chunks: Vec<GoldenChunk>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct GoldenChunk {
+        offset: u64,
+        length: u64,
+        chunk_hash: String,
+    }
+
+    /// Short-read reader: at most `n` bytes per `read` (C-01 short-read equivalence).
+    struct ShortRead<'a> {
+        inner: io::Cursor<&'a [u8]>,
+        n: usize,
+    }
+
+    impl Read for ShortRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let cap = self.n.min(buf.len());
+            self.inner.read(&mut buf[..cap])
         }
-        assert_eq!(expected_offset as usize, data.len());
+    }
+
+    fn fixture_bytes(kind: &str, len: usize) -> Vec<u8> {
+        match kind {
+            "empty" => Vec::new(),
+            "zeros" => vec![0u8; len],
+            "repeat_a" => vec![b'A'; len],
+            "fixed_seq" => {
+                let mut out = Vec::with_capacity(len);
+                let mut counter: u64 = 0;
+                while out.len() < len {
+                    let mut h = ring::digest::Context::new(&ring::digest::SHA256);
+                    h.update(b"libra-fastcdc-fixture");
+                    h.update(&counter.to_le_bytes());
+                    let raw = h.finish();
+                    let take = (len - out.len()).min(raw.as_ref().len());
+                    out.extend_from_slice(&raw.as_ref()[..take]);
+                    counter += 1;
+                }
+                out
+            }
+            other => panic!("unknown golden input_kind: {other}"),
+        }
+    }
+
+    fn load_golden() -> GoldenFile {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fastcdc/golden.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&text).expect("parse shared golden.json")
+    }
+
+    #[test]
+    fn algorithm_constants_match_shared_recipe() {
+        assert_eq!(ALGORITHM, "fastcdc-v2020-32k");
+        assert_eq!(MIN_SIZE, 32 * 1024);
+        assert_eq!(AVG_SIZE, 64 * 1024);
+        assert_eq!(MAX_SIZE, 256 * 1024);
     }
 
     #[test]
     fn empty_input_yields_zero_chunks() {
         assert!(chunk_bytes(&[]).is_empty());
+        assert!(chunk_reader(io::Cursor::new(&[][..])).unwrap().is_empty());
     }
 
     #[test]
-    fn short_input_is_a_single_chunk() {
-        let data = vec![7u8; MIN_SIZE - 1];
-        let chunks = chunk_bytes(&data);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].offset, 0);
-        assert_eq!(chunks[0].length, (MIN_SIZE - 1) as u64);
-        assert_eq!(chunks[0].chunk_hash, sha256_hex(&data));
-    }
+    fn shared_golden_slice_stream_and_short_read_agree() {
+        let golden = load_golden();
+        assert_eq!(golden.algorithm, ALGORITHM);
+        assert!(!golden.vectors.is_empty());
+        for (name, vec) in &golden.vectors {
+            let data = fixture_bytes(&vec.input_kind, vec.input_len);
+            assert_eq!(data.len(), vec.input_len, "{name} length");
+            assert_eq!(sha256_hex(&data), vec.input_sha256, "{name} input hash");
 
-    #[test]
-    fn min_size_is_the_first_possible_boundary() {
-        let data = vec![0x11u8; MIN_SIZE];
-        let chunks = chunk_bytes(&data);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].length, MIN_SIZE as u64);
-    }
+            let sliced = chunk_bytes(&data);
+            let expected: Vec<Chunk> = vec
+                .chunks
+                .iter()
+                .map(|c| Chunk {
+                    offset: c.offset,
+                    length: c.length,
+                    chunk_hash: c.chunk_hash.clone(),
+                })
+                .collect();
+            assert_eq!(sliced, expected, "{name} slice vs golden");
 
-    #[test]
-    fn repeated_identical_inputs_match() {
-        let data = vec![0x5Au8; MIN_SIZE + 4096];
-        assert_eq!(chunk_bytes(&data), chunk_bytes(&data));
-    }
+            let streamed = chunk_reader(io::Cursor::new(&data[..])).unwrap();
+            assert_eq!(streamed, expected, "{name} stream vs golden");
 
-    #[test]
-    fn greater_than_max_splits_and_never_exceeds_max() {
-        let data = lcg_bytes(MAX_SIZE * 3);
-        let chunks = chunk_bytes(&data);
-        assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|c| c.length <= MAX_SIZE as u64));
-        assert_contiguous_cover(&data, &chunks);
-    }
+            if !data.is_empty() {
+                let short = chunk_reader(ShortRead {
+                    inner: io::Cursor::new(&data[..]),
+                    n: 7,
+                })
+                .unwrap();
+                assert_eq!(short, expected, "{name} short-read vs golden");
+            }
 
-    #[test]
-    fn streaming_and_memory_agree() {
-        let data = vec![0xABu8; MAX_SIZE + 123];
-        let streamed = chunk_reader(io::Cursor::new(&data[..])).unwrap();
-        assert_eq!(streamed, chunk_bytes(&data));
-        assert_contiguous_cover(&data, &streamed);
-    }
-
-    #[test]
-    fn algorithm_constants_match_fastcdc_v1() {
-        assert_eq!(ALGORITHM, "fastcdc-v1");
-        assert_eq!(MIN_SIZE, 512 * 1024);
-        assert_eq!(AVG_SIZE, 2 * 1024 * 1024);
-        assert_eq!(MAX_SIZE, 8 * 1024 * 1024);
+            // Contiguity + bounds (C-01 / block limits).
+            let mut off = 0u64;
+            for (i, c) in sliced.iter().enumerate() {
+                assert_eq!(c.offset, off, "{name}[{i}] offset");
+                assert!(
+                    c.length >= 1 && c.length <= MAX_SIZE as u64,
+                    "{name}[{i}] len"
+                );
+                if i + 1 < sliced.len() {
+                    assert!(
+                        c.length >= MIN_SIZE as u64,
+                        "{name}[{i}] non-tail below MIN"
+                    );
+                }
+                let start = c.offset as usize;
+                let end = start + c.length as usize;
+                assert_eq!(c.chunk_hash, sha256_hex(&data[start..end]));
+                off += c.length;
+            }
+            assert_eq!(off as usize, data.len(), "{name} coverage");
+        }
     }
 }
