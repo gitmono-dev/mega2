@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod finalize;
+pub mod membership_cache;
 pub mod protocol;
 pub mod publication;
 pub mod scope;
@@ -516,5 +517,143 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn pending_ttl_enforced_on_membership_cache_hit() {
+        use super::membership_cache::MembershipCache;
+
+        let obj_dir = tempfile::tempdir().unwrap();
+        let cfg = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::Local,
+            local: LocalConfig {
+                root_dir: obj_dir.path().to_string_lossy().into_owned(),
+            },
+            ..Default::default()
+        };
+        let store = build_object_storage(&cfg).await.unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = test_db_connection(db_dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        let base = BaseStorage::new(std::sync::Arc::new(db));
+        let paging =
+            crate::jupiter::storage::media_paging_storage::MediaPagingStorage::new(base.clone());
+        let cache = MembershipCache::with_capacity(1024 * 1024);
+        let service = MediaService::new_with_cache(store, paging, cache.clone());
+        let scope = MediaScope::from_server("user-1", "/acme/app").unwrap();
+
+        let (manifest, bodies) = manifest_for(&[b"ttl-cache-chunk"]);
+        let prepared = service.prepare_at(&scope, manifest, 100).await.unwrap();
+        service
+            .upload_chunk_at(
+                &scope,
+                &prepared.manifest_id,
+                &bodies[0].0,
+                bodies[0].1.clone(),
+                100,
+            )
+            .await
+            .unwrap();
+        // Prime cache.
+        service
+            .get_chunk_at(&scope, &prepared.manifest_id, &bodies[0].0, 101)
+            .await
+            .unwrap();
+        assert!(cache.len() >= 1);
+
+        // TTL must still fail on cache hit.
+        assert!(matches!(
+            service
+                .get_chunk_at(
+                    &scope,
+                    &prepared.manifest_id,
+                    &bodies[0].0,
+                    100 + PENDING_TTL_SECS,
+                )
+                .await,
+            Err(MediaError::Invalid(msg)) if msg.contains("expired")
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalized_reads_use_immutable_id() {
+        let fx = db_fixture().await;
+        let data = b"mf04-service-fixed-id";
+        let (manifest, bodies) = manifest_from_bytes(data);
+        let prepared = fx
+            .service
+            .prepare_at(&fx.scope, manifest.clone(), 10)
+            .await
+            .unwrap();
+        for (hash, body) in &bodies {
+            fx.service
+                .upload_chunk_at(&fx.scope, &prepared.manifest_id, hash, body.clone(), 10)
+                .await
+                .unwrap();
+        }
+        finalize::put_pages_and_seal(&fx.service, &fx.scope, &manifest, &prepared.manifest_id, 10)
+            .await
+            .unwrap();
+        finalize::finalize_at(
+            &fx.service,
+            &fx.lfs_db,
+            &fx.scope,
+            &prepared.manifest_id,
+            11,
+            &crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
+        )
+        .await
+        .unwrap();
+
+        let summary = fx
+            .service
+            .finalized_summary(&fx.scope, &prepared.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(summary.manifest_id, prepared.manifest_id);
+        assert_eq!(summary.oid, manifest.media_oid);
+
+        let pages = fx
+            .service
+            .finalized_pages(&fx.scope, &prepared.manifest_id, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(pages.manifest_id, prepared.manifest_id);
+        assert!(!pages.pages.is_empty() || manifest.chunks.is_empty());
+
+        // Covering query.
+        if let Some(first) = manifest.chunks.first() {
+            let covering = fx
+                .service
+                .finalized_pages(
+                    &fx.scope,
+                    &prepared.manifest_id,
+                    None,
+                    Some(first.offset),
+                    Some(first.length),
+                )
+                .await
+                .unwrap();
+            assert_eq!(covering.pages.len(), 1);
+            assert_eq!(covering.pages[0].page_no, 0);
+        }
+
+        let got = fx
+            .service
+            .finalized_chunk(&fx.scope, &prepared.manifest_id, &bodies[0].0)
+            .await
+            .unwrap();
+        assert_eq!(got, bodies[0].1);
+
+        fx.service
+            .overwrite_chunk_for_test(&fx.scope, &bodies[0].0, Bytes::from_static(b"bad"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fx.service
+                .finalized_chunk(&fx.scope, &prepared.manifest_id, &bodies[0].0)
+                .await,
+            Err(MediaError::Conflict(_))
+        ));
     }
 }

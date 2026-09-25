@@ -24,10 +24,11 @@ use crate::{
     ceres::lfs::media::{
         chunker, finalize,
         protocol::{
-            Capabilities, FinalizeAcceptedResponse, FinalizeTaskResponse, MAX_ENVELOPE_SIZE,
-            ManifestPage, MediaManifest, MissingChunksResponse, SealResponse,
+            Capabilities, FinalizeAcceptedResponse, FinalizeTaskResponse, FinalizedPagesResponse,
+            MAX_ENVELOPE_SIZE, ManifestPage, ManifestSummary, MediaManifest, MissingChunksResponse,
+            SealResponse,
         },
-        scope::{MediaObjectKind, MediaScope},
+        scope::MediaScope,
         service::{MediaError, MediaService},
     },
 };
@@ -46,6 +47,9 @@ pub fn media_routes() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(media_get_task))
         .routes(routes!(media_get_manifest))
         .routes(routes!(media_get_chunk))
+        .routes(routes!(media_get_finalized))
+        .routes(routes!(media_get_finalized_pages))
+        .routes(routes!(media_get_finalized_chunk))
         .layer(DefaultBodyLimit::max(MAX_ENVELOPE_SIZE))
         .layer(middleware::from_fn(reject_oversize_media_body));
     let chunks = OpenApiRouter::new()
@@ -488,22 +492,137 @@ pub async fn media_get_chunk(
     {
         return map_media_error(MediaError::NotFound);
     }
-    let key = match scope.object_key(MediaObjectKind::Chunk, &chunk_hash) {
-        Ok(key) => key,
-        Err(_) => return map_media_error(MediaError::NotFound),
-    };
-    match media.read_bytes(&key, chunker::MAX_SIZE).await {
-        Ok(bytes) => {
-            let mut response = Response::new(Body::from(bytes));
-            *response.status_mut() = StatusCode::OK;
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("application/octet-stream"),
-            );
-            response
-        }
+    match media
+        .finalized_chunk(&scope, &published.manifest_id, &chunk_hash)
+        .await
+    {
+        Ok(bytes) => octet_stream(bytes),
         Err(err) => map_media_error(err),
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/libra/media/v1/finalized/{manifest_id}",
+    params(("manifest_id" = String, Path)),
+    responses(
+        (status = 200, description = "Finalized layout summary", content_type = "application/json"),
+        (status = 401, description = "Missing or invalid access token"),
+        (status = 404, description = "Not found")
+    ),
+    tag = MEDIA_TAG
+)]
+pub async fn media_get_finalized(
+    State(state): State<MonoApiServiceState>,
+    AccessTokenUser(user): AccessTokenUser,
+    repo: Option<Extension<LfsRepoContext>>,
+    Path(manifest_id): Path<String>,
+) -> Response {
+    let scope = match media_scope(&user, repo) {
+        Ok(scope) => scope,
+        Err(err) => return map_media_error(err),
+    };
+    match media_service(&state)
+        .finalized_summary(&scope, &manifest_id)
+        .await
+    {
+        Ok(summary) => Json::<ManifestSummary>(summary).into_response(),
+        Err(err) => map_media_error(err),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/libra/media/v1/finalized/{manifest_id}/pages",
+    params(
+        ("manifest_id" = String, Path),
+        ("cursor" = Option<String>, Query, description = "Opaque pages cursor"),
+        ("offset" = Option<u64>, Query, description = "Covering range start"),
+        ("length" = Option<u64>, Query, description = "Covering range length"),
+    ),
+    responses(
+        (status = 200, description = "Finalized pages", content_type = "application/json"),
+        (status = 400, description = "Invalid cursor or range"),
+        (status = 401, description = "Missing or invalid access token"),
+        (status = 404, description = "Not found")
+    ),
+    tag = MEDIA_TAG
+)]
+pub async fn media_get_finalized_pages(
+    State(state): State<MonoApiServiceState>,
+    AccessTokenUser(user): AccessTokenUser,
+    repo: Option<Extension<LfsRepoContext>>,
+    Path(manifest_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<FinalizedPagesQuery>,
+) -> Response {
+    let scope = match media_scope(&user, repo) {
+        Ok(scope) => scope,
+        Err(err) => return map_media_error(err),
+    };
+    match media_service(&state)
+        .finalized_pages(
+            &scope,
+            &manifest_id,
+            query.cursor.as_deref(),
+            query.offset,
+            query.length,
+        )
+        .await
+    {
+        Ok(pages) => Json::<FinalizedPagesResponse>(pages).into_response(),
+        Err(err) => map_media_error(err),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FinalizedPagesQuery {
+    cursor: Option<String>,
+    offset: Option<u64>,
+    length: Option<u64>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/libra/media/v1/finalized/{manifest_id}/chunks/{chunk_hash}",
+    params(
+        ("manifest_id" = String, Path),
+        ("chunk_hash" = String, Path),
+    ),
+    responses(
+        (status = 200, description = "Chunk bytes", content_type = "application/octet-stream"),
+        (status = 401, description = "Missing or invalid access token"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Corrupt stored chunk")
+    ),
+    tag = MEDIA_TAG
+)]
+pub async fn media_get_finalized_chunk(
+    State(state): State<MonoApiServiceState>,
+    AccessTokenUser(user): AccessTokenUser,
+    repo: Option<Extension<LfsRepoContext>>,
+    Path((manifest_id, chunk_hash)): Path<(String, String)>,
+) -> Response {
+    let scope = match media_scope(&user, repo) {
+        Ok(scope) => scope,
+        Err(err) => return map_media_error(err),
+    };
+    match media_service(&state)
+        .finalized_chunk(&scope, &manifest_id, &chunk_hash)
+        .await
+    {
+        Ok(bytes) => octet_stream(bytes),
+        Err(err) => map_media_error(err),
+    }
+}
+
+fn octet_stream(bytes: Bytes) -> Response {
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response
 }
 
 async fn load_published(
@@ -560,6 +679,9 @@ mod tests {
         "/libra/media/v1/tasks/{task_id}",
         "/libra/media/v1/manifests/by-media/{oid}",
         "/libra/media/v1/manifests/by-media/{oid}/chunks/{chunk_hash}",
+        "/libra/media/v1/finalized/{manifest_id}",
+        "/libra/media/v1/finalized/{manifest_id}/pages",
+        "/libra/media/v1/finalized/{manifest_id}/chunks/{chunk_hash}",
     ];
 
     fn openapi_paths() -> Vec<String> {
@@ -645,6 +767,8 @@ mod tests {
             ..Default::default()
         };
         storage.lfs_service.obj_storage = build_object_storage(&cfg).await.unwrap();
+        // test_storage mocks LfsService; finalize fallback writes lfs_objects.
+        storage.lfs_service.lfs_storage = storage.lfs_db_storage();
         let state = state_from(storage);
         Harness {
             _db_dir: db_dir,
@@ -735,6 +859,15 @@ mod tests {
             ))
             .body(Body::empty())
             .unwrap(),
+            Request::get(format!("/libra/media/v1/finalized/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+            Request::get(format!("/libra/media/v1/finalized/{id}/pages"))
+                .body(Body::empty())
+                .unwrap(),
+            Request::get(format!("/libra/media/v1/finalized/{id}/chunks/{id}"))
+                .body(Body::empty())
+                .unwrap(),
         ];
         for req in routes {
             let response = app.clone().oneshot(with_repo(req)).await.unwrap();
@@ -1169,6 +1302,283 @@ mod tests {
         .await
         .expect("emitter shutdown within 3s");
         assert_eq!(transport.calls(), 1, "no late delivery after drain");
+    }
+
+    /// MF-04: fixed-id summary/pages/chunks; cross-scope rejection; corrupt payload.
+    #[tokio::test]
+    async fn fixed_id_reads_independent_of_by_media() {
+        let h = harness().await;
+        let alice = token_for(&h.state, "alice").await;
+        let bob = token_for(&h.state, "bob").await;
+        let app = media_app(h.state.clone());
+
+        let data_a = b"mf04-layout-a-fixed-id";
+        let data_b = b"mf04-layout-b-same-bytes!!";
+        let m1 = sample_manifest(data_a);
+        let mid1 = publish_via_http(&app, &alice, data_a, &m1).await;
+
+        // Fixed-id summary matches layout 1.
+        let summary = get_json(&app, &alice, &format!("/libra/media/v1/finalized/{mid1}")).await;
+        assert_eq!(summary["manifest_id"], mid1);
+        assert_eq!(summary["oid"], m1.media_oid);
+        assert_eq!(summary["size"], m1.media_size);
+
+        let pages = get_json(
+            &app,
+            &alice,
+            &format!("/libra/media/v1/finalized/{mid1}/pages"),
+        )
+        .await;
+        assert_eq!(pages["manifest_id"], mid1);
+        assert!(!pages["pages"].as_array().unwrap().is_empty() || m1.chunks.is_empty());
+
+        let hash = &m1.chunks[0].chunk_hash;
+        let chunk = app
+            .clone()
+            .oneshot(with_repo(
+                Request::get(format!("/libra/media/v1/finalized/{mid1}/chunks/{hash}"))
+                    .header(AUTHORIZATION, format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(chunk.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(chunk.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            LfsDigest::sha256_of(&got).hex(),
+            hash.as_str(),
+            "payload must verify"
+        );
+
+        // Publish a second layout; by-media moves, fixed id mid1 does not.
+        let m2 = sample_manifest(data_b);
+        let mid2 = publish_via_http(&app, &alice, data_b, &m2).await;
+        assert_ne!(mid1, mid2);
+
+        let by = get_json(
+            &app,
+            &alice,
+            &format!("/libra/media/v1/manifests/by-media/{}", m2.media_oid),
+        )
+        .await;
+        assert_eq!(by["manifest_id"], mid2);
+
+        let still = get_json(&app, &alice, &format!("/libra/media/v1/finalized/{mid1}")).await;
+        assert_eq!(still["manifest_id"], mid1);
+        assert_eq!(still["oid"], m1.media_oid);
+
+        // Cross-actor / cross-repo / non-member hash → 404.
+        let other_actor = app
+            .clone()
+            .oneshot(with_repo(
+                Request::get(format!("/libra/media/v1/finalized/{mid1}"))
+                    .header(AUTHORIZATION, format!("Bearer {bob}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(other_actor.status(), StatusCode::NOT_FOUND);
+
+        let other_repo = app
+            .clone()
+            .oneshot(with_repo_path(
+                Request::get(format!("/libra/media/v1/finalized/{mid1}"))
+                    .header(AUTHORIZATION, format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+                "/other/repo.git",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(other_repo.status(), StatusCode::NOT_FOUND);
+
+        let foreign_hash = "f".repeat(64);
+        let non_member = app
+            .clone()
+            .oneshot(with_repo(
+                Request::get(format!(
+                    "/libra/media/v1/finalized/{mid1}/chunks/{foreign_hash}"
+                ))
+                .header(AUTHORIZATION, format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(non_member.status(), StatusCode::NOT_FOUND);
+
+        // Corrupt stored chunk → conflict, never unchecked payload.
+        let media = media_service(&h.state);
+        let scope = MediaScope::from_server("alice", "/acme/app.git").unwrap();
+        media
+            .overwrite_chunk_for_test(&scope, hash, Bytes::from_static(b"corrupt-bytes"))
+            .await
+            .unwrap();
+        let corrupt = app
+            .oneshot(with_repo(
+                Request::get(format!("/libra/media/v1/finalized/{mid1}/chunks/{hash}"))
+                    .header(AUTHORIZATION, format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(corrupt.status(), StatusCode::CONFLICT);
+    }
+
+    async fn publish_via_http(
+        app: &Router,
+        token: &str,
+        data: &[u8],
+        manifest: &MediaManifest,
+    ) -> String {
+        let body = serde_json::to_vec(manifest).unwrap();
+        let prepared = app
+            .clone()
+            .oneshot(with_repo(
+                Request::post("/libra/media/v1/manifests")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_TYPE, MEDIA_JSON)
+                    .body(Body::from(body))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(prepared.status(), StatusCode::OK);
+        let prepared: PrepareResponse = serde_json::from_slice(
+            &axum::body::to_bytes(prepared.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for chunk in &manifest.chunks {
+            let start = chunk.offset as usize;
+            let end = start + chunk.length as usize;
+            let put = app
+                .clone()
+                .oneshot(with_repo(
+                    Request::put(format!(
+                        "/libra/media/v1/manifests/{}/chunks/{}",
+                        prepared.manifest_id, chunk.chunk_hash
+                    ))
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(data[start..end].to_vec()))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(put.status(), StatusCode::OK);
+        }
+        let pages = crate::ceres::lfs::media::protocol::split_pages(&manifest.chunks).unwrap();
+        for (page_no, entries) in pages.into_iter().enumerate() {
+            let page = ManifestPage {
+                page_no: page_no as u32,
+                entries,
+            };
+            let put_page = app
+                .clone()
+                .oneshot(with_repo(
+                    Request::put(format!(
+                        "/libra/media/v1/manifests/{}/pages/{}",
+                        prepared.manifest_id, page_no
+                    ))
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_TYPE, MEDIA_JSON)
+                    .body(Body::from(serde_json::to_vec(&page).unwrap()))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(put_page.status(), StatusCode::OK);
+        }
+        let sealed = app
+            .clone()
+            .oneshot(with_repo(
+                Request::post(format!(
+                    "/libra/media/v1/manifests/{}/seal",
+                    prepared.manifest_id
+                ))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(sealed.status(), StatusCode::OK);
+        let accepted = app
+            .clone()
+            .oneshot(with_repo(
+                Request::post(format!(
+                    "/libra/media/v1/manifests/{}/finalize",
+                    prepared.manifest_id
+                ))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let accepted: FinalizeAcceptedResponse = serde_json::from_slice(
+            &axum::body::to_bytes(accepted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let resp = app
+                    .clone()
+                    .oneshot(with_repo(
+                        Request::get(format!("/libra/media/v1/tasks/{}", accepted.task_id))
+                            .header(AUTHORIZATION, format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let st: FinalizeTaskResponse = serde_json::from_slice(
+                    &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                if st.state == "complete" || st.state == "failed" {
+                    return st;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("task finish");
+        assert_eq!(status.state, "complete");
+        prepared.manifest_id
+    }
+
+    async fn get_json(app: &Router, token: &str, path: &str) -> serde_json::Value {
+        let resp = app
+            .clone()
+            .oneshot(with_repo(
+                Request::get(path)
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET {path}");
+        serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     // --- WH-06 helpers ---

@@ -143,6 +143,26 @@ pub struct ManifestResponse {
     pub manifest: MediaManifest,
 }
 
+/// One page in a `GET …/finalized/{id}/pages` response (P-03 / MF-04).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizedPageItem {
+    pub page_no: u32,
+    /// Inclusive absolute byte offset of the first entry.
+    pub offset_start: u64,
+    /// Exclusive absolute end (`offset_start` + covered length).
+    pub offset_end: u64,
+    pub entries: Vec<ChunkEntry>,
+}
+
+/// `GET …/finalized/{manifest_id}/pages` body (P-03).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizedPagesResponse {
+    pub manifest_id: String,
+    pub pages: Vec<FinalizedPageItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// Capability document at `libra/media/v1/capabilities`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {

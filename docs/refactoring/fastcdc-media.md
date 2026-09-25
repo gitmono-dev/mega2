@@ -20,6 +20,9 @@
   - finalize：`POST …/manifests/{id}/finalize` → 202 任务（MF-03）；`GET …/tasks/{task_id}` 轮询
   - get：`GET …/manifests/by-media/{oid}` → `{manifest_id, manifest}`
   - chunk download：`GET …/manifests/by-media/{oid}/chunks/{hash}`
+  - fixed-id summary：`GET …/finalized/{manifest_id}` → `ManifestSummary`
+  - fixed-id pages：`GET …/finalized/{manifest_id}/pages`
+  - fixed-id chunk：`GET …/finalized/{manifest_id}/chunks/{hash}`
 
 ## Capabilities（共享表）
 
@@ -59,6 +62,13 @@
 
 `prepare` 在对象存储写入 pending 的同时 `upsert_pending_session`；`put_page` / `seal` / `missing` 走 `MediaPagingStorage` + page blob。
 
+## 固定 id 读取与成员缓存（FC-04 / MF-04）
+
+- `GET …/finalized/{manifest_id}` → `ManifestSummary`（不可变布局；与 by-media 当前发现无关）。
+- `GET …/finalized/{manifest_id}/pages`：顺序分页（`cursor`）或覆盖查询（`offset`+`length` 启动，后续 cursor 绑定该范围）。响应含 `page_no`、绝对 `offset_start`/`offset_end`、entries 与 `next_cursor`；单页包装 ≤1 MiB。
+- `GET …/finalized/{manifest_id}/chunks/{hash}`：仅当 hash 属于该 id 的 finalized 布局；跨 actor/repo/非成员统一 404；存储块必须重新校验 SHA-256，损坏返回 409，不得返回未校验 payload。
+- 成员/页索引缓存（`membership_cache`）按 `(scope_digest, manifest_id)` 计费，总计 ≤**128 MiB**（含索引开销）；满后 LRU 驱逐，不拒绝大文件。缓存不跨 scope；pending TTL 在缓存命中时仍逐请求检查（R-MF-04）。
+
 ## Prepare / chunk（FC-05）
 
 - `prepare` 只接受已 `validate` 的 manifest（≤1 MiB 包装），并**强制** `fallback_oid = media_oid`；按 P-01a 计算 `page_count`。
@@ -82,7 +92,7 @@
   4. 可替换发现 `media/…/manifest/{media_oid}`（by-media；任一完整已发布布局可成为当前值，无需胜者 CAS）；
   5. 仅在本调用**新写入**不可变记录且已可读后发 `lfs.media.finalized`。
 - 同 oid、不同合法布局（不同 `manifest_id`）可并发成功；同 id 重试返回等价 canonical 身份（`created_by` 不参与比较）。不得暴露半 JSON / 错 id。
-- `GET …/manifests/by-media/{oid}` 只返回会话已 `finalized` 的完整 `ManifestResponse`。固定 id HTTP 路由见 MF-04；此前可通过存储直读 `finalized/{manifest_id}`。
+- `GET …/manifests/by-media/{oid}` 只返回会话已 `finalized` 的完整 `ManifestResponse`。固定 id HTTP 路由见上文「固定 id 读取」；immutable 记录仍可通过存储直读 `finalized/{manifest_id}`。
 - 不支持原子完整对象 PUT 的后端必须对 `put_metadata_atomic` 返回明确错误，禁止退化为边写边可见。
 
 ## 出站事件（plan-20260912 / WH-06，已交付）

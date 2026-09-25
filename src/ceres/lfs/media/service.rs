@@ -16,10 +16,13 @@ use crate::{
         digest::LfsDigest,
         media::{
             chunker,
+            membership_cache::{CacheKey, MembershipCache, MembershipRecord},
             protocol::{
-                ChunkEntry, MAX_ENVELOPE_SIZE, MAX_PAGE_ENTRIES, ManifestError, ManifestPage,
-                MediaManifest, MissingChunksResponse, PrepareResponse, SealResponse, split_pages,
+                ChunkEntry, FinalizedPageItem, FinalizedPagesResponse, MAX_ENVELOPE_SIZE,
+                MAX_PAGE_ENTRIES, ManifestError, ManifestPage, ManifestSummary, MediaManifest,
+                MissingChunksResponse, PrepareResponse, SealResponse, split_pages,
             },
+            publication,
             scope::{MediaObjectKind, MediaScope, ScopeError, redact_storage_error},
         },
     },
@@ -66,6 +69,7 @@ pub enum MediaError {
 pub struct MediaService {
     store: MegaObjectStorageWrapper,
     paging: MediaPagingStorage,
+    membership: MembershipCache,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,13 +87,47 @@ struct MissingCursorV1 {
     index: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PagesCursorV1 {
+    v: u8,
+    scope: String,
+    manifest_id: String,
+    page_no: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cover_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cover_end: Option<u64>,
+}
+
 impl MediaService {
     pub fn new(store: MegaObjectStorageWrapper, paging: MediaPagingStorage) -> Self {
-        Self { store, paging }
+        Self {
+            store,
+            paging,
+            membership: MembershipCache::shared(),
+        }
+    }
+
+    /// Test helper: isolated cache capacity (does not touch the process shared cache).
+    #[cfg(test)]
+    pub fn new_with_cache(
+        store: MegaObjectStorageWrapper,
+        paging: MediaPagingStorage,
+        membership: MembershipCache,
+    ) -> Self {
+        Self {
+            store,
+            paging,
+            membership,
+        }
     }
 
     pub fn paging(&self) -> &MediaPagingStorage {
         &self.paging
+    }
+
+    pub fn membership_cache(&self) -> &MembershipCache {
+        &self.membership
     }
 
     pub async fn prepare(
@@ -119,6 +157,189 @@ impl MediaService {
     ) -> Result<Bytes, MediaError> {
         self.get_chunk_at(scope, manifest_id, chunk_hash, unix_now())
             .await
+    }
+
+    /// `GET …/finalized/{manifest_id}` → summary (immutable layout).
+    pub async fn finalized_summary(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+    ) -> Result<ManifestSummary, MediaError> {
+        let identity = publication::load_immutable_by_id(self, scope, manifest_id).await?;
+        identity.manifest.summary().map_err(map_manifest)
+    }
+
+    /// `GET …/finalized/{manifest_id}/pages` — sequential or covering (P-03).
+    pub async fn finalized_pages(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+        cursor: Option<&str>,
+        offset: Option<u64>,
+        length: Option<u64>,
+    ) -> Result<FinalizedPagesResponse, MediaError> {
+        self.require_finalized_session(scope, manifest_id).await?;
+        let digest = scope.digest();
+
+        let (mut page_no, cover) = match (cursor, offset, length) {
+            (Some(raw), _, _) => {
+                let cur = decode_pages_cursor(raw)?;
+                if cur.scope != digest || cur.manifest_id != manifest_id {
+                    return Err(MediaError::Invalid(
+                        "pages cursor is expired or unauthorized".into(),
+                    ));
+                }
+                (
+                    cur.page_no,
+                    cur.cover_start
+                        .zip(cur.cover_end)
+                        .map(|(s, e)| (s, e.saturating_sub(s))),
+                )
+            }
+            (None, Some(off), Some(len)) => {
+                let end = off
+                    .checked_add(len)
+                    .ok_or_else(|| MediaError::Invalid("range overflow".into()))?;
+                let entries = self
+                    .paging
+                    .entries_covering_range(&digest, manifest_id, off, len, MAX_PAGE_ENTRIES as u64)
+                    .await
+                    .map_err(map_paging)?;
+                let first = entries
+                    .first()
+                    .map(|e| e.page_no as u32)
+                    .unwrap_or(u32::MAX);
+                (first, Some((off, end.saturating_sub(off))))
+            }
+            (None, None, None) => (0u32, None),
+            _ => {
+                return Err(MediaError::Invalid(
+                    "pages query requires cursor, or both offset and length, or neither".into(),
+                ));
+            }
+        };
+
+        if page_no == u32::MAX {
+            return Ok(FinalizedPagesResponse {
+                manifest_id: manifest_id.to_owned(),
+                pages: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        let session = self
+            .paging
+            .get_session(&digest, manifest_id)
+            .await
+            .map_err(map_paging)?;
+        if page_no as i32 >= session.page_count {
+            return Ok(FinalizedPagesResponse {
+                manifest_id: manifest_id.to_owned(),
+                pages: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        // Covering mode: advance page_no until the page intersects [start, end).
+        if let Some((start, len)) = cover {
+            let end = start.saturating_add(len);
+            while (page_no as i32) < session.page_count {
+                let item = self
+                    .load_finalized_page_item(scope, manifest_id, page_no)
+                    .await?;
+                if item.offset_end > start && item.offset_start < end {
+                    let next = page_no.saturating_add(1);
+                    let next_cursor = if (next as i32) < session.page_count {
+                        // Peek whether more covering pages remain.
+                        let more = self
+                            .page_intersects_range(scope, manifest_id, next, start, end)
+                            .await?;
+                        if more {
+                            Some(encode_pages_cursor(&PagesCursorV1 {
+                                v: 1,
+                                scope: digest.clone(),
+                                manifest_id: manifest_id.to_owned(),
+                                page_no: next,
+                                cover_start: Some(start),
+                                cover_end: Some(end),
+                            })?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let resp = FinalizedPagesResponse {
+                        manifest_id: manifest_id.to_owned(),
+                        pages: vec![item],
+                        next_cursor,
+                    };
+                    ensure_envelope(&resp)?;
+                    return Ok(resp);
+                }
+                page_no = page_no.saturating_add(1);
+            }
+            return Ok(FinalizedPagesResponse {
+                manifest_id: manifest_id.to_owned(),
+                pages: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        // Sequential: one page per response.
+        let item = self
+            .load_finalized_page_item(scope, manifest_id, page_no)
+            .await?;
+        let next = page_no.saturating_add(1);
+        let next_cursor = if (next as i32) < session.page_count {
+            Some(encode_pages_cursor(&PagesCursorV1 {
+                v: 1,
+                scope: digest,
+                manifest_id: manifest_id.to_owned(),
+                page_no: next,
+                cover_start: None,
+                cover_end: None,
+            })?)
+        } else {
+            None
+        };
+        let resp = FinalizedPagesResponse {
+            manifest_id: manifest_id.to_owned(),
+            pages: vec![item],
+            next_cursor,
+        };
+        ensure_envelope(&resp)?;
+        Ok(resp)
+    }
+
+    /// `GET …/finalized/{manifest_id}/chunks/{hash}` — fixed-layout membership.
+    pub async fn finalized_chunk(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+        chunk_hash: &str,
+    ) -> Result<Bytes, MediaError> {
+        self.require_finalized_session(scope, manifest_id).await?;
+        let members = self.membership_for_finalized(scope, manifest_id).await?;
+        if !members.contains(chunk_hash) {
+            return Err(MediaError::NotFound);
+        }
+        let expected_len = members.length_of(chunk_hash);
+        let key = scope_key(scope, MediaObjectKind::Chunk, chunk_hash)?;
+        let bytes = self.read_existing_chunk(&key).await?;
+        if let Some(len) = expected_len
+            && bytes.len() as u64 != len
+        {
+            return Err(MediaError::Conflict(
+                "stored chunk length does not match the finalized layout".to_string(),
+            ));
+        }
+        if LfsDigest::sha256_of(&bytes).hex() != chunk_hash {
+            return Err(MediaError::Conflict(
+                "stored chunk content does not match the declared hash".to_string(),
+            ));
+        }
+        Ok(bytes)
     }
 
     pub async fn put_page(
@@ -400,16 +621,11 @@ impl MediaService {
         body: Bytes,
         now: u64,
     ) -> Result<(), MediaError> {
-        let session = self.require_active_pending(scope, manifest_id, now).await?;
-        let declared = session
-            .manifest
-            .chunks
-            .iter()
-            .find(|chunk| chunk.chunk_hash == chunk_hash)
-            .ok_or_else(|| {
-                MediaError::Invalid("chunk is not declared by the pending manifest".to_string())
-            })?;
-        if body.len() as u64 != declared.length {
+        let members = self.membership_for_pending(scope, manifest_id, now).await?;
+        let declared_len = members.length_of(chunk_hash).ok_or_else(|| {
+            MediaError::Invalid("chunk is not declared by the pending manifest".to_string())
+        })?;
+        if body.len() as u64 != declared_len {
             return Err(MediaError::Invalid(
                 "chunk length does not match the pending manifest".to_string(),
             ));
@@ -446,13 +662,8 @@ impl MediaService {
         chunk_hash: &str,
         now: u64,
     ) -> Result<Bytes, MediaError> {
-        let session = self.require_active_pending(scope, manifest_id, now).await?;
-        if !session
-            .manifest
-            .chunks
-            .iter()
-            .any(|chunk| chunk.chunk_hash == chunk_hash)
-        {
+        let members = self.membership_for_pending(scope, manifest_id, now).await?;
+        if !members.contains(chunk_hash) {
             return Err(MediaError::NotFound);
         }
         let key = scope_key(scope, MediaObjectKind::Chunk, chunk_hash)?;
@@ -519,6 +730,131 @@ impl MediaService {
             ));
         }
         Ok(session)
+    }
+
+    async fn require_finalized_session(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+    ) -> Result<crate::callisto::media_session::Model, MediaError> {
+        let session = self
+            .paging
+            .get_session(&scope.digest(), manifest_id)
+            .await
+            .map_err(map_paging)?;
+        if session.state != STATE_FINALIZED {
+            return Err(MediaError::NotFound);
+        }
+        Ok(session)
+    }
+
+    /// Pending membership with TTL enforced on every hit (AC / R-MF-04).
+    async fn membership_for_pending(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+        now: u64,
+    ) -> Result<MembershipRecord, MediaError> {
+        let key = CacheKey {
+            scope_digest: scope.digest(),
+            manifest_id: manifest_id.to_owned(),
+        };
+        if let Some(cached) = self.membership.get(&key)
+            && let Some(created) = cached.pending_created_at
+        {
+            if is_expired(created, now) {
+                return Err(MediaError::Invalid("media session expired".to_string()));
+            }
+            return Ok(cached);
+        }
+        let session = self.require_active_pending(scope, manifest_id, now).await?;
+        let record = MembershipRecord::from_chunks(
+            session
+                .manifest
+                .chunks
+                .iter()
+                .map(|c| (c.chunk_hash.as_str(), c.length)),
+            Some(session.created_at_unix),
+        );
+        self.membership.insert(key, record.clone());
+        Ok(record)
+    }
+
+    async fn membership_for_finalized(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+    ) -> Result<MembershipRecord, MediaError> {
+        let key = CacheKey {
+            scope_digest: scope.digest(),
+            manifest_id: manifest_id.to_owned(),
+        };
+        if let Some(cached) = self.membership.get(&key)
+            && cached.pending_created_at.is_none()
+        {
+            return Ok(cached);
+        }
+        let entries = self
+            .paging
+            .list_entries(&scope.digest(), manifest_id)
+            .await
+            .map_err(map_paging)?;
+        let record = MembershipRecord::from_chunks(
+            entries
+                .iter()
+                .map(|e| (e.chunk_hash.as_str(), e.length as u64)),
+            None,
+        );
+        self.membership.insert(key, record.clone());
+        Ok(record)
+    }
+
+    async fn load_finalized_page_item(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+        page_no: u32,
+    ) -> Result<FinalizedPageItem, MediaError> {
+        let page_id = page_object_id(manifest_id, page_no);
+        let key = scope_key(scope, MediaObjectKind::Page, &page_id)?;
+        let bytes = self.read_bytes(&key, MAX_ENVELOPE_SIZE).await?;
+        let page: ManifestPage =
+            serde_json::from_slice(&bytes).map_err(|e| MediaError::Json(e.to_string()))?;
+        if page.page_no != page_no {
+            return Err(MediaError::Conflict(
+                "stored page_no does not match requested page".into(),
+            ));
+        }
+        page.validate().map_err(map_manifest)?;
+        let (offset_start, offset_end) = page_byte_range(&page.entries)?;
+        Ok(FinalizedPageItem {
+            page_no,
+            offset_start,
+            offset_end,
+            entries: page.entries,
+        })
+    }
+
+    async fn page_intersects_range(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+        page_no: u32,
+        start: u64,
+        end: u64,
+    ) -> Result<bool, MediaError> {
+        let session = self
+            .paging
+            .get_session(&scope.digest(), manifest_id)
+            .await
+            .map_err(map_paging)?;
+        if page_no as i32 >= session.page_count {
+            return Ok(false);
+        }
+        let item = self
+            .load_finalized_page_item(scope, manifest_id, page_no)
+            .await?;
+        Ok(item.offset_end > start && item.offset_start < end)
     }
 
     /// Ordered unique missing hashes (C-03 / batch_exists). Exists probes run
@@ -689,6 +1025,40 @@ fn decode_missing_cursor(raw: &str) -> Result<MissingCursorV1, MediaError> {
         .decode(raw.as_bytes())
         .map_err(|_| MediaError::Invalid("invalid missing cursor".into()))?;
     serde_json::from_slice(&bytes).map_err(|_| MediaError::Invalid("invalid missing cursor".into()))
+}
+
+fn encode_pages_cursor(cur: &PagesCursorV1) -> Result<String, MediaError> {
+    let bytes = serde_json::to_vec(cur).map_err(|e| MediaError::Json(e.to_string()))?;
+    Ok(URL_SAFE_NO_PAD.encode(&bytes))
+}
+
+fn decode_pages_cursor(raw: &str) -> Result<PagesCursorV1, MediaError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw.as_bytes())
+        .map_err(|_| MediaError::Invalid("invalid pages cursor".into()))?;
+    serde_json::from_slice(&bytes).map_err(|_| MediaError::Invalid("invalid pages cursor".into()))
+}
+
+fn page_byte_range(entries: &[ChunkEntry]) -> Result<(u64, u64), MediaError> {
+    let Some(first) = entries.first() else {
+        return Ok((0, 0));
+    };
+    let last = entries.last().expect("non-empty");
+    let end = last
+        .offset
+        .checked_add(last.length)
+        .ok_or_else(|| MediaError::Invalid("page offset overflow".into()))?;
+    Ok((first.offset, end))
+}
+
+fn ensure_envelope<T: Serialize>(value: &T) -> Result<(), MediaError> {
+    let encoded = serde_json::to_vec(value).map_err(|e| MediaError::Json(e.to_string()))?;
+    if encoded.len() > MAX_ENVELOPE_SIZE {
+        return Err(MediaError::Invalid(
+            "pages response exceeds envelope".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn scope_key(

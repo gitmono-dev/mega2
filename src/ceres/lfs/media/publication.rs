@@ -98,7 +98,7 @@ pub async fn publish_finalized_records(
     Ok(identity)
 }
 
-/// Load immutable identity by `manifest_id` (MF-07 until MF-04 HTTP routes).
+/// Load immutable identity by `manifest_id` (HTTP routes in MF-04).
 pub async fn load_immutable_by_id(
     media: &MediaService,
     scope: &MediaScope,
