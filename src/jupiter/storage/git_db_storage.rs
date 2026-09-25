@@ -1197,10 +1197,11 @@ impl GitDbStorage {
     /// the `(path, state, id)` index when the planner takes it, or scans the
     /// ledger when that segment is a sizeable share of it (from about 30 %):
     /// at worst two scans of the ledger, which holds one row per detach ever
-    /// made. Only `resolve_cleanup_id` reaches it, for a round that detached
+    /// made. Two callers: `resolve_cleanup_id`, for a round that detached
     /// nothing, fresh or replayed (B3 found the repository already gone, or
-    /// the row predates FU-16): a round that detached answers with its own
-    /// ledger row.
+    /// the row predates FU-16), since a round that detached answers with its
+    /// own ledger row; and `mega2 import-repo remove` after a round that
+    /// stopped without an answer, to learn whether its detach committed.
     pub async fn latest_cleanup_for<C: ConnectionTrait>(
         &self,
         repo_id: i64,

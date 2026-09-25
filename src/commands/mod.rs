@@ -4,6 +4,7 @@ mod authz_audit_protect;
 mod authz_audit_run;
 pub mod config;
 pub mod debug;
+pub mod import_repo;
 pub mod path;
 pub mod service;
 #[cfg(test)]
@@ -97,6 +98,7 @@ pub fn builtin() -> Vec<Command> {
         debug::cli(),
         authz_audit::cli(),
         path::cli(),
+        import_repo::cli(),
     ]
 }
 
@@ -107,6 +109,7 @@ pub(crate) fn builtin_exec(cmd: &str) -> Option<CommandExec> {
         "debug" => debug::exec,
         "authz-audit" => authz_audit::exec,
         "path" => path::exec,
+        "import-repo" => import_repo::exec,
         _ => return None,
     };
 
@@ -124,6 +127,9 @@ pub(crate) fn load_mode(cmd: &str, args: &ArgMatches) -> Option<LoadMode> {
         "authz-audit" => Some(authz_audit::load_mode(args)),
         // A thin HTTP client of a running server: no config (ADR-FU-05).
         "path" => Some(LoadMode::None),
+        // Destructive operator command: an existing config only, never a
+        // generated default (plan-20260923 FU-21).
+        "import-repo" => Some(LoadMode::ParsedExistingConfig),
         _ => None,
     }
 }
@@ -156,7 +162,14 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["service", "config", "debug", "authz-audit", "path"]
+            vec![
+                "service",
+                "config",
+                "debug",
+                "authz-audit",
+                "path",
+                "import-repo"
+            ]
         );
     }
 
@@ -170,6 +183,21 @@ mod tests {
             .try_get_matches_from(["path", "provision", "--server", "http://s", "/project/a"])
             .expect("path provision arguments");
         assert_eq!(load_mode("path", &args), Some(LoadMode::None));
+    }
+
+    /// plan-20260923 FU-21: `import-repo` is registered in all three tables
+    /// and never generates a default config.
+    #[test]
+    fn import_repo_command_registered() {
+        assert!(builtin().iter().any(|cmd| cmd.get_name() == "import-repo"));
+        assert!(builtin_exec("import-repo").is_some());
+        let args = import_repo::cli()
+            .try_get_matches_from(["import-repo", "remove", "--path", "/third-party/a", "--yes"])
+            .expect("import-repo remove arguments");
+        assert_eq!(
+            load_mode("import-repo", &args),
+            Some(LoadMode::ParsedExistingConfig)
+        );
     }
 
     #[test]

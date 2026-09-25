@@ -99,7 +99,12 @@ pub fn read_only_db_url(db_url: &str) -> Result<String, MegaError> {
     Ok(url.to_string())
 }
 
-async fn postgres_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
+/// Connect for writing without migrating or seeding: for a caller that has
+/// already confirmed the schema is current and must not change it
+/// (`mega2 import-repo remove`, plan-20260923 FU-21).
+pub(crate) async fn postgres_connection(
+    db_config: &DbConfig,
+) -> Result<DatabaseConnection, MegaError> {
     validate_database_config(db_config)?;
 
     let db_url = redact_db_url(&db_config.db_url);
