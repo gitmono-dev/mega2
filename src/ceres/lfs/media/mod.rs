@@ -1,6 +1,7 @@
 pub mod chunker;
 pub mod finalize;
 pub mod protocol;
+pub mod publication;
 pub mod scope;
 pub mod service;
 
@@ -440,9 +441,14 @@ mod tests {
         assert_eq!(again.manifest_id, published.manifest_id);
         let finalized = fx
             .scope
-            .object_key(MediaObjectKind::Finalized, &manifest.media_oid)
+            .object_key(MediaObjectKind::Finalized, &prepared.manifest_id)
             .unwrap();
         assert!(fx.service.exists(&finalized).await.unwrap());
+        let by_media = fx
+            .scope
+            .object_key(MediaObjectKind::Manifest, &manifest.media_oid)
+            .unwrap();
+        assert!(fx.service.exists(&by_media).await.unwrap());
     }
 
     #[tokio::test]
@@ -500,7 +506,7 @@ mod tests {
         assert!(!fx.service.exists(&lfs_key).await.unwrap());
         let finalized = fx
             .scope
-            .object_key(MediaObjectKind::Finalized, &manifest.media_oid)
+            .object_key(MediaObjectKind::Finalized, &prepared.manifest_id)
             .unwrap();
         assert!(!fx.service.exists(&finalized).await.unwrap());
         assert!(

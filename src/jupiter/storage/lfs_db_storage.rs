@@ -36,6 +36,24 @@ impl LfsDbStorage {
         }
     }
 
+    /// Insert-or-verify LFS object row for the same oid (MF-07 / C-04).
+    ///
+    /// Concurrent multi-layout finalize shares one oid: matching size/`exist`
+    /// succeeds; a conflicting size returns an error so callers can map Conflict.
+    pub async fn ensure_lfs_object(&self, object: lfs_objects::Model) -> Result<(), MegaError> {
+        self.new_lfs_object(object.clone()).await?;
+        let stored = self
+            .get_lfs_object(&object.oid)
+            .await?
+            .ok_or_else(|| MegaError::Other("lfs object missing after ensure".into()))?;
+        if stored.oid != object.oid || stored.size != object.size || stored.exist != object.exist {
+            return Err(MegaError::Other(
+                "lfs_objects metadata does not match the published fallback".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn get_lfs_object(&self, oid: &str) -> Result<Option<lfs_objects::Model>, MegaError> {
         let result = lfs_objects::Entity::find_by_id(oid)
             .one(self.get_connection())
@@ -121,5 +139,22 @@ mod tests {
         let got = storage.get_lfs_object(&row.oid).await.unwrap().unwrap();
         assert_eq!(got.size, 12);
         assert!(got.exist);
+    }
+
+    #[tokio::test]
+    async fn ensure_lfs_object_rejects_size_mismatch() {
+        let (_dir, storage) = storage().await;
+        let row = lfs_objects::Model {
+            oid: "b".repeat(64),
+            size: 12,
+            exist: true,
+        };
+        storage.ensure_lfs_object(row.clone()).await.unwrap();
+        let conflict = lfs_objects::Model {
+            oid: row.oid.clone(),
+            size: 99,
+            exist: true,
+        };
+        assert!(storage.ensure_lfs_object(conflict).await.is_err());
     }
 }

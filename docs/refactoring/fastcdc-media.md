@@ -44,6 +44,9 @@
 - Scope = 服务端 actor + canonical 绝对仓库路径；digest = SHA-256(`actor || 0x00 || repo`)。
   Actor 取 `AccessTokenUser` 的 `website_user_id`（非空）否则 `username`。请求体 actor/repository/`created_by` 不得覆盖。
 - Object key：`fastcdc-v2020-32k/{scope_digest}/{pending|chunk|manifest|finalized|page}/{id}`，存储路径 `media/` + key（Media 不走 3-level sharding）。旧 `v1/` 对象隔离保留。
+  - `finalized/{manifest_id}`：不可变身份（完整 `ManifestResponse`）
+  - `manifest/{media_oid}`：可替换 by-media 发现
+  - `page/{manifest_id}-p{n}`：不可变页 blob
 - 对外错误不泄漏 digest、object key 或认证信息。
 
 ## 持久分页状态（FC-16 / MF-08）
@@ -64,7 +67,7 @@
 - chunk 上传必须命中 pending 声明的 hash/length，并校验实际 SHA-256（≤ 256 KiB）。同 scope 同 hash 的正确对象可幂等复用；已存错误内容返回 Conflict。
 - 领域错误：`Invalid` / `NotFound` / `Conflict` / `Storage` / `Io` / `Json`。存储错误对外固定为 `media object store error`。
 
-## Finalize / fallback（FC-06 / MF-03）
+## Finalize / fallback / multi-layout publication（FC-06 / MF-03 / MF-07）
 
 - 同时最多 **2** 个 finalize（semaphore）；活跃排队上限 **128**（超限 429 + `Retry-After`）。
 - `POST …/manifests/{id}/finalize` **仅接受 sealed 会话**，返回 **202** `{task_id,manifest_id,state,status_url}`；`status_url` 为同前缀 `libra/media/v1/tasks/{task_id}`（客户端不得跨 origin 跟随或转发 token）。
@@ -72,13 +75,20 @@
 - 验证：按 sealed 页序遍历 `media_entry`，逐块 scoped 读并校验 length/hash；连续覆盖 `media_size`；整对象 SHA-256 须等于 `media_oid`。**不**要求新鲜 FastCDC 冷切边界相等。
 - 磁盘写与哈希在 `spawn_blocking`；单次 I/O ≤120s、无进展 ≤10min、lease 60s（约每 20s 续租）；持续进展不受整文件墙钟限制。
 - 缺失或损坏 chunk / gap / overlap / overflow：**不**写 LFS namespace、**不**写 `lfs_objects`、**不**发布 finalized；临时文件与 lease 在成功/失败/取消路径均释放。
-- 通过后：发布到 `lfs/{oid}`，`lfs_objects` 幂等插入，再写 `media/fastcdc-v2020-32k/{scope}/finalized/{media_oid}`（多布局原子发布见 MF-07）。
-- 已存在的 finalized 若 `manifest_id`/`media_oid` 不一致则 Conflict；重复 finalize 在内容一致时成功。
+- 通过后的发布顺序（C-04 / ADR-MF-05）：
+  1. 完整 LFS fallback `lfs/{oid}`（`put_stream_bounded`）+ `lfs_objects` 同 oid 幂等（大小一致才接受）；
+  2. 不可变身份记录 `media/…/finalized/{manifest_id}`（`put_metadata_atomic`，≤1 MiB 完整对象 PUT）；
+  3. 持久 `media_session.state=finalized`；
+  4. 可替换发现 `media/…/manifest/{media_oid}`（by-media；任一完整已发布布局可成为当前值，无需胜者 CAS）；
+  5. 仅在本调用**新写入**不可变记录且已可读后发 `lfs.media.finalized`。
+- 同 oid、不同合法布局（不同 `manifest_id`）可并发成功；同 id 重试返回等价 canonical 身份（`created_by` 不参与比较）。不得暴露半 JSON / 错 id。
+- `GET …/manifests/by-media/{oid}` 只返回会话已 `finalized` 的完整 `ManifestResponse`。固定 id HTTP 路由见 MF-04；此前可通过存储直读 `finalized/{manifest_id}`。
+- 不支持原子完整对象 PUT 的后端必须对 `put_metadata_atomic` 返回明确错误，禁止退化为边写边可见。
 
 ## 出站事件（plan-20260912 / WH-06，已交付）
 
-- 既有 finalize 路径在**本次实际写入 finalized manifest 成功**后发一次 `lfs.media.finalized`（契约见 [`storage-events.md`](storage-events.md)）：scope 只填服务端 `MediaScope` 的 canonical `repo_path`，data 为 `oid,size,manifest_id,transfer="fastcdc"`。
-- prepare / chunk / fallback 中间步骤不发；已存在 finalized 的 no-op 不发。
+- 既有 finalize 路径在**本次实际新写入 immutable finalized 记录成功且可读后**发一次 `lfs.media.finalized`（契约见 [`storage-events.md`](storage-events.md)）：scope 只填服务端 `MediaScope` 的 canonical `repo_path`，data 为 `oid,size,manifest_id,transfer="fastcdc"`。
+- prepare / chunk / fallback 中间步骤不发；同 id 重试（immutable 已存在）不发。
 - 认证不改：Media 路由仍全部要求 `AccessTokenUser`。
 
 ## HTTP / auth / OpenAPI（FC-07）

@@ -511,12 +511,7 @@ async fn load_published(
     scope: &MediaScope,
     oid: &str,
 ) -> Result<crate::ceres::lfs::media::protocol::ManifestResponse, MediaError> {
-    let key = match scope.object_key(MediaObjectKind::Finalized, oid) {
-        Ok(key) => key,
-        Err(_) => return Err(MediaError::NotFound),
-    };
-    let bytes = media.read_bytes(&key, MAX_ENVELOPE_SIZE).await?;
-    serde_json::from_slice(&bytes).map_err(|e| MediaError::Json(e.to_string()))
+    crate::ceres::lfs::media::publication::load_by_media(media, scope, oid).await
 }
 
 #[cfg(test)]

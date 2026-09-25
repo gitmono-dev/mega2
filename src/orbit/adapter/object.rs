@@ -39,6 +39,28 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         self.put_multipart(&path, data).await
     }
 
+    async fn put_metadata_atomic(
+        &self,
+        key: &ObjectKey,
+        bytes: Bytes,
+        _meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        use crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES;
+        if bytes.len() > MAX_METADATA_ATOMIC_BYTES {
+            return Err(IoOrbitError::Other(format!(
+                "atomic metadata put exceeds {MAX_METADATA_ATOMIC_BYTES} byte limit"
+            )));
+        }
+        let path = Self::checked_path(key)?;
+        // Single complete-object PUT (Local/S3/GCS via object_store). Never
+        // multipart: partial parts must not become edge-visible.
+        self.to_store()
+            .put(&path, PutPayload::from_bytes(bytes))
+            .await
+            .map_err(IoOrbitError::from)?;
+        Ok(())
+    }
+
     async fn get_stream(&self, key: &ObjectKey) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
         let path = Self::checked_path(key)?;
 

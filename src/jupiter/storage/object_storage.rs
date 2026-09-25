@@ -75,6 +75,26 @@ impl MegaObjectStorage for InMemoryObjectStorage {
         Ok(())
     }
 
+    async fn put_metadata_atomic(
+        &self,
+        key: &ObjectKey,
+        bytes: Bytes,
+        mut meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        use crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES;
+        if bytes.len() > MAX_METADATA_ATOMIC_BYTES {
+            return Err(IoOrbitError::Other(format!(
+                "atomic metadata put exceeds {MAX_METADATA_ATOMIC_BYTES} byte limit"
+            )));
+        }
+        meta.size = bytes.len() as i64;
+        self.objects
+            .lock()
+            .map_err(|_| IoOrbitError::Other("object storage lock poisoned".to_string()))?
+            .insert(key.clone(), (bytes, meta));
+        Ok(())
+    }
+
     async fn get_stream(&self, key: &ObjectKey) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
         let (bytes, meta) = self
             .objects

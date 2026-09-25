@@ -15,27 +15,21 @@ use std::{
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
-use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::{
-    callisto::lfs_objects,
-    ceres::lfs::{
-        digest::LfsDigest,
-        media::{
-            protocol::{
-                FinalizeAcceptedResponse, FinalizeTaskResponse, MAX_ENVELOPE_SIZE, ManifestError,
-                ManifestResponse, MediaManifest,
-            },
-            scope::{MediaObjectKind, MediaScope, redact_storage_error},
-            service::{MediaError, MediaService, map_store, scope_key, unix_now},
+    ceres::lfs::media::{
+        protocol::{
+            FinalizeAcceptedResponse, FinalizeTaskResponse, ManifestError, ManifestResponse,
+            MediaManifest,
         },
+        scope::MediaScope,
+        service::{MediaError, MediaService, unix_now},
     },
     jupiter::storage::{
         lfs_db_storage::LfsDbStorage,
         media_paging_storage::{MediaPagingStorage, TASK_COMPLETE, TASK_FAILED, TASK_PENDING},
     },
-    orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},
 };
 
 /// Persistent finalize concurrency (P-04b / ADR-MF-03).
@@ -396,13 +390,22 @@ async fn run_finalize_body(
             p.update(manifest.media_size, sealed.page_count, "fallback")
                 .await?;
         }
-        put_fallback_from_path(media, lfs_db, &manifest, &tmp_path).await?;
         check_cancel(&mut cancel)?;
         if let Some(p) = progress {
             p.update(manifest.media_size, sealed.page_count, "publish")
                 .await?;
         }
-        publish_finalized(media, scope, manifest_id, &manifest, now, emitter).await
+        crate::ceres::lfs::media::publication::publish_verified_layout(
+            media,
+            lfs_db,
+            scope,
+            manifest_id,
+            &manifest,
+            &tmp_path,
+            now,
+            emitter,
+        )
+        .await
     }
     .await;
 
@@ -551,115 +554,6 @@ async fn rebuild_and_verify(
     Ok(())
 }
 
-async fn put_fallback_from_path(
-    media: &MediaService,
-    lfs_db: &LfsDbStorage,
-    manifest: &MediaManifest,
-    path: &Path,
-) -> Result<(), MediaError> {
-    let key = ObjectKey {
-        namespace: ObjectNamespace::Lfs,
-        key: manifest.media_oid.clone(),
-    };
-    let file = tokio::fs::File::open(path).await?;
-    let stream: ObjectByteStream = Box::pin(ReaderStream::new(file));
-    let meta = ObjectMeta {
-        size: manifest.media_size as i64,
-        ..ObjectMeta::default()
-    };
-    media
-        .object_store()
-        .inner
-        .put_stream_bounded(&key, stream, meta)
-        .await
-        .map_err(map_store)?;
-
-    lfs_db
-        .new_lfs_object(lfs_objects::Model {
-            oid: manifest.media_oid.clone(),
-            size: manifest.media_size as i64,
-            exist: true,
-        })
-        .await
-        .map_err(map_db)?;
-
-    let stored = lfs_db
-        .get_lfs_object(&manifest.media_oid)
-        .await
-        .map_err(map_db)?
-        .ok_or(MediaError::NotFound)?;
-    if stored.oid != manifest.media_oid
-        || stored.size != manifest.media_size as i64
-        || !stored.exist
-    {
-        return Err(MediaError::Conflict(
-            "lfs_objects metadata does not match the published fallback".to_string(),
-        ));
-    }
-    if !media.exists(&key).await? {
-        return Err(MediaError::NotFound);
-    }
-    Ok(())
-}
-
-async fn publish_finalized(
-    media: &MediaService,
-    scope: &MediaScope,
-    manifest_id: &str,
-    manifest: &MediaManifest,
-    now: u64,
-    emitter: &crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
-) -> Result<ManifestResponse, MediaError> {
-    let response = ManifestResponse {
-        manifest_id: manifest_id.to_string(),
-        manifest: manifest.clone(),
-    };
-    let key = scope_key(scope, MediaObjectKind::Finalized, &manifest.media_oid)?;
-    if media.exists(&key).await? {
-        let existing = media.read_bytes(&key, MAX_ENVELOPE_SIZE).await?;
-        let parsed: ManifestResponse =
-            serde_json::from_slice(&existing).map_err(|e| MediaError::Json(e.to_string()))?;
-        if parsed.manifest_id != manifest_id || parsed.manifest.media_oid != manifest.media_oid {
-            return Err(MediaError::Conflict(
-                "finalized manifest does not match media oid or scope session".to_string(),
-            ));
-        }
-        return Ok(parsed);
-    }
-    let payload =
-        Bytes::from(serde_json::to_vec(&response).map_err(|e| MediaError::Json(e.to_string()))?);
-    if payload.len() > MAX_ENVELOPE_SIZE {
-        return Err(MediaError::Invalid(
-            "finalized manifest exceeds size limit".to_string(),
-        ));
-    }
-    media.put_bytes(&key, payload).await?;
-
-    // WH-06 (plan-20260912 / ADR-WH-04/05): exactly one `lfs.media.finalized`
-    // when THIS finalize actually put the finalized manifest (the exists
-    // no-op above returns before this point; intermediate chunk/fallback
-    // steps never emit). Scope metadata comes from the server-side
-    // MediaScope's canonical repository, never from the request body; the
-    // actor never leaves the process. A repeat cross-process finalize may
-    // still rewrite the fallback and re-notify (no uniqueness lock added).
-    let event = crate::jupiter::service::storage_event::CommittedEvent {
-        event_id: uuid::Uuid::new_v4(),
-        event_type: crate::jupiter::service::storage_event::EventType::LfsMediaFinalized,
-        occurred_at: now,
-        source: crate::jupiter::service::storage_event::EventSource::Lfs,
-        scope: crate::jupiter::service::storage_event::EventScope::Media {
-            repo_path: scope.repository().to_owned(),
-        },
-        data: crate::jupiter::service::storage_event::EventData::LfsMediaFinalized {
-            oid: manifest.media_oid.clone(),
-            size: manifest.media_size,
-            manifest_id: manifest_id.to_owned(),
-        },
-    };
-    let _ = emitter.try_emit(event);
-    Ok(response)
-}
-
 fn map_manifest(err: ManifestError) -> MediaError {
     match err {
         ManifestError::Invalid(msg) => MediaError::Invalid(msg),
@@ -682,11 +576,6 @@ fn map_paging(err: crate::jupiter::storage::media_paging_storage::MediaPagingErr
             MediaError::Conflict("stale media lease".into())
         }
     }
-}
-
-fn map_db(err: crate::common::errors::MegaError) -> MediaError {
-    let _ = redact_storage_error(&err);
-    MediaError::Storage
 }
 
 /// Test helper: put P-01a pages for a prepared manifest and seal.
@@ -722,10 +611,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        ceres::lfs::media::{
-            chunker,
-            protocol::{ChunkEntry, CreatedBy},
-            service::MediaService,
+        ceres::lfs::{
+            digest::LfsDigest,
+            media::{
+                chunker,
+                protocol::{ChunkEntry, CreatedBy},
+                scope::MediaObjectKind,
+                service::{MediaService, scope_key},
+            },
         },
         jupiter::{
             service::storage_event_emitter::StorageEventEmitter,
@@ -736,7 +629,10 @@ mod tests {
             },
             tests::test_db_connection,
         },
-        orbit_api::factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig},
+        orbit_api::{
+            factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig},
+            object_storage::{ObjectKey, ObjectNamespace},
+        },
     };
 
     /// Recording fake transport (WH-09 seam): exact bodies + call counter.

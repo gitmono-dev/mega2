@@ -191,7 +191,7 @@ impl MediaService {
             manifest: manifest.clone(),
         };
         let payload = encode_pending(&session)?;
-        self.put_bytes(&pending_key, payload).await?;
+        self.put_metadata(&pending_key, payload).await?;
         let missing_chunks = self.missing_chunks_unique(scope, &manifest.chunks).await?;
         Ok(PrepareResponse {
             manifest_id,
@@ -250,7 +250,7 @@ impl MediaService {
                 "page envelope exceeds size limit".into(),
             ));
         }
-        self.put_bytes(&key, Bytes::from(body)).await
+        self.put_metadata(&key, Bytes::from(body)).await
     }
 
     pub(crate) async fn seal_at(
@@ -591,6 +591,23 @@ impl MediaService {
         self.store
             .inner
             .put_stream_bounded(key, bytes.into_stream(), meta)
+            .await
+            .map_err(map_store)
+    }
+
+    /// ≤1 MiB complete-object metadata PUT (pages, pending, finalized, by-media).
+    pub(crate) async fn put_metadata(
+        &self,
+        key: &ObjectKey,
+        bytes: Bytes,
+    ) -> Result<(), MediaError> {
+        let meta = ObjectMeta {
+            size: bytes.len() as i64,
+            ..ObjectMeta::default()
+        };
+        self.store
+            .inner
+            .put_metadata_atomic(key, bytes, meta)
             .await
             .map_err(map_store)
     }

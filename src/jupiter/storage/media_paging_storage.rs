@@ -491,6 +491,41 @@ impl MediaPagingStorage {
         Ok(updated)
     }
 
+    /// Mark a sealed (or already finalized) session as `finalized` (MF-07 / C-04).
+    ///
+    /// Idempotent: sealed → finalized, finalized → finalized. Other states Conflict.
+    pub async fn mark_session_finalized(
+        &self,
+        scope_digest: &str,
+        manifest_id: &str,
+    ) -> Result<media_session::Model, MediaPagingError> {
+        let txn = self.get_connection().begin().await?;
+        let session = media_session::Entity::find()
+            .filter(media_session::Column::ScopeDigest.eq(scope_digest))
+            .filter(media_session::Column::ManifestId.eq(manifest_id))
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(MediaPagingError::NotFound)?;
+        if session.state == STATE_FINALIZED {
+            txn.commit().await?;
+            return Ok(session);
+        }
+        if session.state != STATE_SEALED {
+            return Err(MediaPagingError::Conflict(format!(
+                "cannot finalize session in state {}",
+                session.state
+            )));
+        }
+        let now = Self::now();
+        let mut am: media_session::ActiveModel = session.into();
+        am.state = Set(STATE_FINALIZED.to_owned());
+        am.updated_at = Set(now);
+        let updated = am.update(&txn).await?;
+        txn.commit().await?;
+        Ok(updated)
+    }
+
     /// Fetch a session by natural key.
     pub async fn get_session(
         &self,

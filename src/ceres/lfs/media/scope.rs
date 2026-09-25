@@ -25,7 +25,9 @@ pub enum ScopeError {
 pub enum MediaObjectKind {
     Pending,
     Chunk,
+    /// Replaceable by-media discovery record, keyed by `media_oid` (MF-07).
     Manifest,
+    /// Immutable identity record, keyed by `manifest_id` (ADR-MF-05 / MF-07).
     Finalized,
     /// Immutable page blob under `(manifest_id, page_no)`.
     Page,

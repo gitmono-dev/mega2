@@ -164,6 +164,9 @@ pub struct ObjectMeta {
 /// - The stream must be fully consumed by the caller.
 pub type ObjectByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
+/// Upper bound for [`MegaObjectStorage::put_metadata_atomic`] (ADR-MF-05).
+pub const MAX_METADATA_ATOMIC_BYTES: usize = 1024 * 1024;
+
 /// A streaming source of multiple objects.
 ///
 /// Each item yields:
@@ -230,6 +233,29 @@ pub trait MegaObjectStorage: Send + Sync {
     ) -> OrbitResult<()> {
         Err(IoOrbitError::Other(
             "bounded streaming write is not supported by this storage backend".to_string(),
+        ))
+    }
+
+    /// Atomically publish a complete ≤1 MiB metadata object (ADR-MF-05 / MF-07).
+    ///
+    /// Semantics:
+    /// - The entire payload is written as one complete-object PUT.
+    /// - Callers must not rely on edge-visible partial bodies; backends that
+    ///   cannot guarantee a complete-object PUT must return a clear error
+    ///   (default) and must **not** fall back to multipart / streaming write.
+    /// - Payloads larger than [`MAX_METADATA_ATOMIC_BYTES`] are rejected.
+    ///
+    /// Used for Media pages, pending envelopes, immutable finalized records,
+    /// and by-media discovery. Large LFS fallback blobs continue to use
+    /// [`Self::put_stream_bounded`].
+    async fn put_metadata_atomic(
+        &self,
+        _key: &ObjectKey,
+        _bytes: Bytes,
+        _meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        Err(IoOrbitError::Other(
+            "atomic metadata put is not supported by this storage backend".to_string(),
         ))
     }
 
@@ -636,6 +662,23 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("bounded streaming write is not supported")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_metadata_atomic_default_rejects_without_partial_write() {
+        let store = UnsupportedBoundedStore;
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Media,
+            key: "fastcdc-v2020-32k/scope/finalized/abc".to_string(),
+        };
+        let err = store
+            .put_metadata_atomic(&key, Bytes::from_static(b"{}"), ObjectMeta::default())
+            .await
+            .expect_err("unsupported backends must reject atomic metadata put");
+        assert!(
+            err.to_string()
+                .contains("atomic metadata put is not supported")
         );
     }
 }
