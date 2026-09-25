@@ -108,14 +108,32 @@ pub struct MissingChunksResponse {
     pub next_cursor: Option<String>,
 }
 
-/// Async finalize task stub (wire shape for MF-03/07).
+/// `POST …/manifests/{id}/finalize` accepted body (P-04a, HTTP 202).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizeAcceptedResponse {
+    pub task_id: String,
+    pub manifest_id: String,
+    pub state: String,
+    pub status_url: String,
+}
+
+/// `GET …/tasks/{task_id}` status body (P-04a).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalizeTaskResponse {
     pub task_id: String,
+    pub manifest_id: String,
     pub state: String,
     pub stage: String,
     pub bytes_verified: u64,
     pub pages_verified: i32,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Present when `state == "complete"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 /// `GET …/manifests/by-media/{oid}` body (`ManifestResponse`).

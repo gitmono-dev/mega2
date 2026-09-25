@@ -24,8 +24,8 @@ use crate::{
     ceres::lfs::media::{
         chunker, finalize,
         protocol::{
-            Capabilities, MAX_ENVELOPE_SIZE, ManifestPage, MediaManifest, MissingChunksResponse,
-            SealResponse,
+            Capabilities, FinalizeAcceptedResponse, FinalizeTaskResponse, MAX_ENVELOPE_SIZE,
+            ManifestPage, MediaManifest, MissingChunksResponse, SealResponse,
         },
         scope::{MediaObjectKind, MediaScope},
         service::{MediaError, MediaService},
@@ -43,6 +43,7 @@ pub fn media_routes() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(media_seal))
         .routes(routes!(media_missing))
         .routes(routes!(media_finalize))
+        .routes(routes!(media_get_task))
         .routes(routes!(media_get_manifest))
         .routes(routes!(media_get_chunk))
         .layer(DefaultBodyLimit::max(MAX_ENVELOPE_SIZE))
@@ -71,6 +72,14 @@ fn map_media_error(err: MediaError) -> Response {
         }
         MediaError::NotFound => media_json(StatusCode::NOT_FOUND, "not found"),
         MediaError::Conflict(msg) => media_json(StatusCode::CONFLICT, &msg),
+        MediaError::TooManyRequests => {
+            let mut response =
+                media_json(StatusCode::TOO_MANY_REQUESTS, "media finalize queue full");
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("5"));
+            response
+        }
         MediaError::Storage | MediaError::Io(_) => media_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             "media object store error",
@@ -349,11 +358,12 @@ pub async fn media_upload_chunk(
     path = "/libra/media/v1/manifests/{manifest_id}/finalize",
     params(("manifest_id" = String, Path)),
     responses(
-        (status = 200, description = "Finalized manifest", content_type = "application/json"),
-        (status = 400, description = "Verification failed"),
+        (status = 202, description = "Finalize task accepted", content_type = "application/json"),
+        (status = 400, description = "Session not sealed or invalid"),
         (status = 401, description = "Missing or invalid access token"),
         (status = 404, description = "Pending session not found"),
-        (status = 409, description = "Finalized identity conflict"),
+        (status = 409, description = "Permanent finalize failure"),
+        (status = 429, description = "Finalize queue full"),
         (status = 500, description = "Storage error")
     ),
     tag = MEDIA_TAG
@@ -369,16 +379,47 @@ pub async fn media_finalize(
         Err(err) => return map_media_error(err),
     };
     let media = media_service(&state);
-    match finalize::finalize(
-        &media,
-        &state.storage.lfs_service.lfs_storage,
-        &scope,
-        &manifest_id,
-        &state.storage.storage_event_emitter,
+    match finalize::enqueue_finalize(
+        media,
+        state.storage.lfs_service.lfs_storage.clone(),
+        scope,
+        manifest_id,
+        state.storage.storage_event_emitter.clone(),
     )
     .await
     {
-        Ok(published) => Json(published).into_response(),
+        Ok(accepted) => {
+            let mut response = Json::<FinalizeAcceptedResponse>(accepted).into_response();
+            *response.status_mut() = StatusCode::ACCEPTED;
+            response
+        }
+        Err(err) => map_media_error(err),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/libra/media/v1/tasks/{task_id}",
+    params(("task_id" = String, Path)),
+    responses(
+        (status = 200, description = "Finalize task status", content_type = "application/json"),
+        (status = 401, description = "Missing or invalid access token"),
+        (status = 404, description = "Task not found in this scope")
+    ),
+    tag = MEDIA_TAG
+)]
+pub async fn media_get_task(
+    State(state): State<MonoApiServiceState>,
+    AccessTokenUser(user): AccessTokenUser,
+    repo: Option<Extension<LfsRepoContext>>,
+    Path(task_id): Path<String>,
+) -> Response {
+    let scope = match media_scope(&user, repo) {
+        Ok(scope) => scope,
+        Err(err) => return map_media_error(err),
+    };
+    match finalize::task_status(&media_service(&state), &scope, &task_id).await {
+        Ok(status) => Json::<FinalizeTaskResponse>(status).into_response(),
         Err(err) => map_media_error(err),
     }
 }
@@ -499,7 +540,10 @@ mod tests {
             api_service::cache::GitObjectCache,
             lfs::{
                 digest::LfsDigest,
-                media::protocol::{ChunkEntry, CreatedBy, PrepareResponse},
+                media::protocol::{
+                    ChunkEntry, CreatedBy, FinalizeAcceptedResponse, FinalizeTaskResponse,
+                    ManifestPage, PrepareResponse,
+                },
             },
         },
         contract::policy::entitystore::SharedEntityStore,
@@ -518,6 +562,7 @@ mod tests {
         "/libra/media/v1/manifests/{manifest_id}/missing",
         "/libra/media/v1/manifests/{manifest_id}/chunks/{chunk_hash}",
         "/libra/media/v1/manifests/{manifest_id}/finalize",
+        "/libra/media/v1/tasks/{task_id}",
         "/libra/media/v1/manifests/by-media/{oid}",
         "/libra/media/v1/manifests/by-media/{oid}/chunks/{chunk_hash}",
     ];
@@ -1026,7 +1071,45 @@ mod tests {
                 .unwrap();
             assert_eq!(put.status(), StatusCode::OK, "chunk upload");
         }
-        let finalized = app
+        // MF-03: pages + seal before async finalize.
+        let pages = crate::ceres::lfs::media::protocol::split_pages(&manifest.chunks).unwrap();
+        for (page_no, entries) in pages.into_iter().enumerate() {
+            let page = ManifestPage {
+                page_no: page_no as u32,
+                entries,
+            };
+            let put_page = app
+                .clone()
+                .oneshot(with_repo(
+                    Request::put(format!(
+                        "/libra/media/v1/manifests/{}/pages/{}",
+                        prepared.manifest_id, page_no
+                    ))
+                    .header(AUTHORIZATION, format!("Bearer {alice}"))
+                    .header(CONTENT_TYPE, MEDIA_JSON)
+                    .body(Body::from(serde_json::to_vec(&page).unwrap()))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(put_page.status(), StatusCode::OK, "put page");
+        }
+        let sealed = app
+            .clone()
+            .oneshot(with_repo(
+                Request::post(format!(
+                    "/libra/media/v1/manifests/{}/seal",
+                    prepared.manifest_id
+                ))
+                .header(AUTHORIZATION, format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(sealed.status(), StatusCode::OK, "seal");
+
+        let accepted = app
             .clone()
             .oneshot(with_repo(
                 Request::post(format!(
@@ -1039,7 +1122,42 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(finalized.status(), StatusCode::OK, "HTTP finalize 200");
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED, "HTTP finalize 202");
+        let accepted: FinalizeAcceptedResponse = serde_json::from_slice(
+            &axum::body::to_bytes(accepted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let resp = app
+                    .clone()
+                    .oneshot(with_repo(
+                        Request::get(format!("/libra/media/v1/tasks/{}", accepted.task_id))
+                            .header(AUTHORIZATION, format!("Bearer {alice}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let st: FinalizeTaskResponse = serde_json::from_slice(
+                    &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                if st.state == "complete" || st.state == "failed" {
+                    return st;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("task finish");
+        assert_eq!(status.state, "complete", "async finalize completes");
+
         wh06_wait_calls(&transport, 1).await;
         let bodies = transport.bodies();
         assert_eq!(bodies.len(), 1, "exactly one finalized event");

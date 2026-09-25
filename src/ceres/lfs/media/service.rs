@@ -57,6 +57,9 @@ pub enum MediaError {
     Io(#[from] std::io::Error),
     #[error("media JSON error: {0}")]
     Json(String),
+    /// Finalize queue full (P-04b); map to HTTP 429.
+    #[error("media finalize queue full")]
+    TooManyRequests,
 }
 
 #[derive(Clone)]
@@ -462,6 +465,29 @@ impl MediaService {
         Ok(bytes)
     }
 
+    /// Scoped chunk read for finalize (MF-03): membership comes from the sealed
+    /// entry index — does **not** reload the pending envelope.
+    pub(crate) async fn read_chunk_for_entry(
+        &self,
+        scope: &MediaScope,
+        chunk_hash: &str,
+        expected_length: u64,
+    ) -> Result<Bytes, MediaError> {
+        let key = scope_key(scope, MediaObjectKind::Chunk, chunk_hash)?;
+        let bytes = self.read_existing_chunk(&key).await?;
+        if bytes.len() as u64 != expected_length {
+            return Err(MediaError::Invalid(
+                "chunk length mismatch during finalize".to_string(),
+            ));
+        }
+        if LfsDigest::sha256_of(&bytes).hex() != chunk_hash {
+            return Err(MediaError::Invalid(
+                "chunk hash mismatch during finalize".to_string(),
+            ));
+        }
+        Ok(bytes)
+    }
+
     pub(crate) async fn require_active_pending(
         &self,
         scope: &MediaScope,
@@ -472,6 +498,25 @@ impl MediaService {
         let session = self.load_pending(&key).await?;
         if is_expired(session.created_at_unix, now) {
             return Err(MediaError::Invalid("media session expired".to_string()));
+        }
+        Ok(session)
+    }
+
+    /// Require a sealed (or already finalized) paging session for finalize.
+    pub(crate) async fn require_sealed_session(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+    ) -> Result<crate::callisto::media_session::Model, MediaError> {
+        let session = self
+            .paging
+            .get_session(&scope.digest(), manifest_id)
+            .await
+            .map_err(map_paging)?;
+        if session.state != STATE_SEALED && session.state != STATE_FINALIZED {
+            return Err(MediaError::Invalid(
+                "finalize requires a sealed session".to_string(),
+            ));
         }
         Ok(session)
     }

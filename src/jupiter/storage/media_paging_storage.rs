@@ -519,6 +519,135 @@ impl MediaPagingStorage {
             .all(self.get_connection())
             .await?)
     }
+
+    /// Entries for a single page (ordinal ascending). Used by finalize page walks.
+    pub async fn list_entries_for_page(
+        &self,
+        scope_digest: &str,
+        manifest_id: &str,
+        page_no: i32,
+    ) -> Result<Vec<media_entry::Model>, MediaPagingError> {
+        Ok(media_entry::Entity::find()
+            .filter(media_entry::Column::ScopeDigest.eq(scope_digest))
+            .filter(media_entry::Column::ManifestId.eq(manifest_id))
+            .filter(media_entry::Column::PageNo.eq(page_no))
+            .order_by_asc(media_entry::Column::Ordinal)
+            .all(self.get_connection())
+            .await?)
+    }
+
+    /// Fetch a finalize task by public `task_id`.
+    pub async fn get_task(&self, task_id: &str) -> Result<media_task::Model, MediaPagingError> {
+        media_task::Entity::find()
+            .filter(media_task::Column::TaskId.eq(task_id))
+            .one(self.get_connection())
+            .await?
+            .ok_or(MediaPagingError::NotFound)
+    }
+
+    /// Count tasks in `pending` or `running` (queue + in-flight, P-04b).
+    pub async fn count_active_tasks(&self) -> Result<u64, MediaPagingError> {
+        use sea_orm::PaginatorTrait;
+        Ok(media_task::Entity::find()
+            .filter(
+                media_task::Column::State.is_in([TASK_PENDING.to_owned(), TASK_RUNNING.to_owned()]),
+            )
+            .count(self.get_connection())
+            .await?)
+    }
+
+    /// Mark failed with matching epoch; clears lease so another worker may reclaim.
+    pub async fn fail_task(
+        &self,
+        task_id: &str,
+        epoch: i64,
+        error_code: &str,
+        retryable: bool,
+    ) -> Result<media_task::Model, MediaPagingError> {
+        let db = self.get_connection();
+        let txn = db.begin().await?;
+        let task = media_task::Entity::find()
+            .filter(media_task::Column::TaskId.eq(task_id))
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(MediaPagingError::NotFound)?;
+        if task.lease_epoch != epoch {
+            return Err(MediaPagingError::StaleLease);
+        }
+        let now = Self::now();
+        let mut am: media_task::ActiveModel = task.into();
+        am.state = Set(TASK_FAILED.to_owned());
+        am.stage = Set("failed".into());
+        am.error_code = Set(Some(error_code.to_owned()));
+        am.retryable = Set(retryable);
+        am.lease_owner = Set(None);
+        am.expires_at = Set(None);
+        am.updated_at = Set(now);
+        let updated = am.update(&txn).await?;
+        txn.commit().await?;
+        Ok(updated)
+    }
+
+    /// Cancel a task (any epoch): failed + `cancelled`, lease released.
+    pub async fn cancel_task(&self, task_id: &str) -> Result<media_task::Model, MediaPagingError> {
+        let db = self.get_connection();
+        let txn = db.begin().await?;
+        let task = media_task::Entity::find()
+            .filter(media_task::Column::TaskId.eq(task_id))
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(MediaPagingError::NotFound)?;
+        if task.state == TASK_COMPLETE {
+            return Err(MediaPagingError::Conflict(
+                "cannot cancel a completed task".into(),
+            ));
+        }
+        let now = Self::now();
+        let mut am: media_task::ActiveModel = task.into();
+        am.state = Set(TASK_FAILED.to_owned());
+        am.stage = Set("cancelled".into());
+        am.error_code = Set(Some("cancelled".into()));
+        am.retryable = Set(false);
+        am.lease_owner = Set(None);
+        am.expires_at = Set(None);
+        am.updated_at = Set(now);
+        let updated = am.update(&txn).await?;
+        txn.commit().await?;
+        Ok(updated)
+    }
+
+    /// Reset a retryable failed task to `pending` for re-queue (same task_id).
+    pub async fn requeue_failed_task(
+        &self,
+        task_id: &str,
+    ) -> Result<media_task::Model, MediaPagingError> {
+        let db = self.get_connection();
+        let txn = db.begin().await?;
+        let task = media_task::Entity::find()
+            .filter(media_task::Column::TaskId.eq(task_id))
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(MediaPagingError::NotFound)?;
+        if task.state != TASK_FAILED || !task.retryable {
+            return Err(MediaPagingError::Conflict("task is not retryable".into()));
+        }
+        let now = Self::now();
+        let mut am: media_task::ActiveModel = task.into();
+        am.state = Set(TASK_PENDING.to_owned());
+        am.stage = Set("queued".into());
+        am.error_code = Set(None);
+        am.lease_owner = Set(None);
+        am.expires_at = Set(None);
+        am.bytes_verified = Set(0);
+        am.pages_verified = Set(0);
+        am.updated_at = Set(now);
+        let updated = am.update(&txn).await?;
+        txn.commit().await?;
+        Ok(updated)
+    }
 }
 
 #[cfg(test)]

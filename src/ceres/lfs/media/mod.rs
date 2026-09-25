@@ -399,6 +399,9 @@ mod tests {
                 .await
                 .unwrap();
         }
+        finalize::put_pages_and_seal(&fx.service, &fx.scope, &manifest, &prepared.manifest_id, 10)
+            .await
+            .unwrap();
         let published = finalize::finalize_at(
             &fx.service,
             &fx.lfs_db,
@@ -474,6 +477,10 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Seal with declared pages even if chunks are corrupt — finalize must reject.
+        finalize::put_pages_and_seal(&fx.service, &fx.scope, &manifest, &prepared.manifest_id, 22)
+            .await
+            .unwrap();
         assert!(
             finalize::finalize_at(
                 &fx.service,

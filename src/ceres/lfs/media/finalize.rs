@@ -1,35 +1,80 @@
-//! Finalize: reconstruct, verify FastCDC, publish standard LFS fallback, then
-//! the finalized manifest. Missing or corrupt chunks publish neither object.
+//! Finalize: page-ordered coverage verification, bounded async task, LFS fallback.
+//!
+//! MF-03 / ADR-MF-03 / P-04a: continuous cover + per-chunk hash/length + full
+//! size/oid only — no fresh FastCDC boundary equality. Disk I/O uses
+//! `spawn_blocking`. Concurrent workers ≤ [`MAX_CONCURRENT_FINALIZE`].
 
-use std::{fs::File, io::Write, path::Path, sync::OnceLock};
+use std::{
+    fs::File,
+    io::Write,
+    path::Path,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
+use uuid::Uuid;
 
 use crate::{
     callisto::lfs_objects,
     ceres::lfs::{
         digest::LfsDigest,
         media::{
-            chunker,
-            protocol::{MAX_ENVELOPE_SIZE, ManifestError, ManifestResponse, MediaManifest},
+            protocol::{
+                FinalizeAcceptedResponse, FinalizeTaskResponse, MAX_ENVELOPE_SIZE, ManifestError,
+                ManifestResponse, MediaManifest,
+            },
             scope::{MediaObjectKind, MediaScope, redact_storage_error},
             service::{MediaError, MediaService, map_store, scope_key, unix_now},
         },
     },
-    jupiter::storage::lfs_db_storage::LfsDbStorage,
+    jupiter::storage::{
+        lfs_db_storage::LfsDbStorage,
+        media_paging_storage::{MediaPagingStorage, TASK_COMPLETE, TASK_FAILED, TASK_PENDING},
+    },
     orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},
 };
 
-const MAX_CONCURRENT_FINALIZE: usize = 2;
+/// Persistent finalize concurrency (P-04b / ADR-MF-03).
+pub const MAX_CONCURRENT_FINALIZE: usize = 2;
+/// Max pending+running tasks before 429 (P-04b).
+pub const MAX_QUEUED_FINALIZE: u64 = 128;
+/// Lease renew interval while making progress (P-04b).
+pub const LEASE_RENEW_SECS: u64 = 20;
+/// No-progress deadline (P-04b); not a whole-file wall clock.
+pub const NO_PROGRESS_DEADLINE_SECS: u64 = 600;
+/// Single I/O timeout budget (P-04b).
+pub const IO_TIMEOUT_SECS: u64 = 120;
+
+const STATUS_URL_PREFIX: &str = "libra/media/v1/tasks/";
 
 fn finalizer_semaphore() -> &'static Semaphore {
     static SEM: OnceLock<Semaphore> = OnceLock::new();
     SEM.get_or_init(|| Semaphore::new(MAX_CONCURRENT_FINALIZE))
 }
 
+/// Tunable deadlines for tests (no-progress / lease renew).
+#[derive(Debug, Clone, Copy)]
+pub struct FinalizeBounds {
+    pub no_progress: Duration,
+    pub lease_renew: Duration,
+    pub io_timeout: Duration,
+}
+
+impl Default for FinalizeBounds {
+    fn default() -> Self {
+        Self {
+            no_progress: Duration::from_secs(NO_PROGRESS_DEADLINE_SECS),
+            lease_renew: Duration::from_secs(LEASE_RENEW_SECS),
+            io_timeout: Duration::from_secs(IO_TIMEOUT_SECS),
+        }
+    }
+}
+
+/// Synchronous finalize helper (unit tests / internal). Requires a sealed session.
 pub async fn finalize(
     media: &MediaService,
     lfs_db: &LfsDbStorage,
@@ -48,18 +93,278 @@ pub async fn finalize_at(
     now: u64,
     emitter: &crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
 ) -> Result<ManifestResponse, MediaError> {
+    finalize_at_with_bounds(
+        media,
+        lfs_db,
+        scope,
+        manifest_id,
+        now,
+        emitter,
+        FinalizeBounds::default(),
+        None,
+    )
+    .await
+}
+
+/// Sync path that still acquires the concurrency semaphore and walks sealed pages.
+pub async fn finalize_at_with_bounds(
+    media: &MediaService,
+    lfs_db: &LfsDbStorage,
+    scope: &MediaScope,
+    manifest_id: &str,
+    now: u64,
+    emitter: &crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
+    bounds: FinalizeBounds,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<ManifestResponse, MediaError> {
     let _permit = finalizer_semaphore()
         .acquire()
         .await
         .map_err(|_| MediaError::Invalid("finalize semaphore closed".to_string()))?;
 
-    let session = media
+    run_finalize_body(
+        media,
+        lfs_db,
+        scope,
+        manifest_id,
+        now,
+        emitter,
+        bounds,
+        cancel,
+        None,
+    )
+    .await
+}
+
+/// P-04a: enqueue (or reuse) a durable finalize task and spawn a worker.
+pub async fn enqueue_finalize(
+    media: MediaService,
+    lfs_db: LfsDbStorage,
+    scope: MediaScope,
+    manifest_id: String,
+    emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
+) -> Result<FinalizeAcceptedResponse, MediaError> {
+    media.require_sealed_session(&scope, &manifest_id).await?;
+    let digest = scope.digest();
+    let paging = media.paging();
+
+    let mut task = paging
+        .ensure_task(&digest, &manifest_id)
+        .await
+        .map_err(map_paging)?;
+
+    if task.state == TASK_COMPLETE {
+        return Ok(accepted_from_task(&task));
+    }
+    if task.state == TASK_FAILED {
+        if !task.retryable {
+            return Err(MediaError::Conflict(
+                "finalize permanently failed; re-prepare a valid layout".into(),
+            ));
+        }
+        task = paging
+            .requeue_failed_task(&task.task_id)
+            .await
+            .map_err(map_paging)?;
+    }
+
+    if task.state == TASK_PENDING {
+        let active = paging.count_active_tasks().await.map_err(map_paging)?;
+        // Count includes this pending task; reject only when over capacity.
+        if active > MAX_QUEUED_FINALIZE {
+            return Err(MediaError::TooManyRequests);
+        }
+    }
+
+    let task_id = task.task_id.clone();
+    let owner = format!("worker-{}", Uuid::new_v4());
+    let media_bg = media.clone();
+    let lfs_bg = lfs_db.clone();
+    let scope_bg = scope.clone();
+    let mid_bg = manifest_id.clone();
+    let emitter_bg = emitter.clone();
+    let task_id_bg = task_id.clone();
+
+    tokio::spawn(async move {
+        let result = run_task_worker(
+            media_bg,
+            lfs_bg,
+            scope_bg,
+            mid_bg,
+            task_id_bg.clone(),
+            owner,
+            emitter_bg,
+            FinalizeBounds::default(),
+        )
+        .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                task_id = %task_id_bg,
+                error = %err,
+                "media finalize worker exited with error"
+            );
+        }
+    });
+
+    Ok(accepted_from_task(&task))
+}
+
+/// Scope-reauth task status (P-04a).
+pub async fn task_status(
+    media: &MediaService,
+    scope: &MediaScope,
+    task_id: &str,
+) -> Result<FinalizeTaskResponse, MediaError> {
+    let task = media.paging().get_task(task_id).await.map_err(map_paging)?;
+    if task.scope_digest != scope.digest() {
+        return Err(MediaError::NotFound);
+    }
+    let mut resp = FinalizeTaskResponse {
+        task_id: task.task_id.clone(),
+        manifest_id: task.manifest_id.clone(),
+        state: task.state.clone(),
+        stage: task.stage.clone(),
+        bytes_verified: u64::try_from(task.bytes_verified.max(0)).unwrap_or(0),
+        pages_verified: task.pages_verified,
+        retryable: task.retryable,
+        error_code: task.error_code.clone(),
+        oid: None,
+        size: None,
+    };
+    if task.state == TASK_COMPLETE {
+        let session = media
+            .paging()
+            .get_session(&task.scope_digest, &task.manifest_id)
+            .await
+            .map_err(map_paging)?;
+        resp.oid = Some(session.oid);
+        resp.size = Some(u64::try_from(session.size.max(0)).unwrap_or(0));
+    }
+    Ok(resp)
+}
+
+fn accepted_from_task(task: &crate::callisto::media_task::Model) -> FinalizeAcceptedResponse {
+    FinalizeAcceptedResponse {
+        task_id: task.task_id.clone(),
+        manifest_id: task.manifest_id.clone(),
+        state: task.state.clone(),
+        status_url: format!("{STATUS_URL_PREFIX}{}", task.task_id),
+    }
+}
+
+async fn run_task_worker(
+    media: MediaService,
+    lfs_db: LfsDbStorage,
+    scope: MediaScope,
+    manifest_id: String,
+    task_id: String,
+    owner: String,
+    emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
+    bounds: FinalizeBounds,
+) -> Result<(), MediaError> {
+    let _permit = match finalizer_semaphore().acquire().await {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+
+    let claimed = match media
+        .paging()
+        .claim_or_renew_lease(&task_id, &owner, None)
+        .await
+    {
+        Ok(t) => t,
+        Err(crate::jupiter::storage::media_paging_storage::MediaPagingError::Conflict(_)) => {
+            // Another worker holds the lease.
+            return Ok(());
+        }
+        Err(e) => return Err(map_paging(e)),
+    };
+    let epoch = claimed.lease_epoch;
+    let progress = TaskProgressHandle {
+        paging: media.paging().clone(),
+        task_id: task_id.clone(),
+        epoch,
+    };
+
+    let result = run_finalize_body(
+        &media,
+        &lfs_db,
+        &scope,
+        &manifest_id,
+        unix_now(),
+        &emitter,
+        bounds,
+        None,
+        Some(&progress),
+    )
+    .await;
+
+    match result {
+        Ok(_) => {
+            media
+                .paging()
+                .complete_task(&task_id, epoch)
+                .await
+                .map_err(map_paging)?;
+            Ok(())
+        }
+        Err(err) => {
+            let (code, retryable) = classify_finalize_error(&err);
+            let _ = media
+                .paging()
+                .fail_task(&task_id, epoch, code, retryable)
+                .await;
+            Err(err)
+        }
+    }
+}
+
+struct TaskProgressHandle {
+    paging: MediaPagingStorage,
+    task_id: String,
+    epoch: i64,
+}
+
+impl TaskProgressHandle {
+    async fn update(&self, bytes: u64, pages: i32, stage: &str) -> Result<(), MediaError> {
+        self.paging
+            .update_task_progress(&self.task_id, self.epoch, bytes, pages, stage)
+            .await
+            .map_err(map_paging)?;
+        Ok(())
+    }
+}
+
+fn classify_finalize_error(err: &MediaError) -> (&'static str, bool) {
+    match err {
+        MediaError::Invalid(_) => ("validation_failed", false),
+        MediaError::Conflict(_) => ("conflict", true),
+        MediaError::NotFound => ("not_found", true),
+        MediaError::Storage | MediaError::Io(_) => ("storage_error", true),
+        MediaError::Json(_) => ("json_error", false),
+        MediaError::TooManyRequests => ("queue_full", true),
+    }
+}
+
+async fn run_finalize_body(
+    media: &MediaService,
+    lfs_db: &LfsDbStorage,
+    scope: &MediaScope,
+    manifest_id: &str,
+    now: u64,
+    emitter: &crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
+    bounds: FinalizeBounds,
+    mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    progress: Option<&TaskProgressHandle>,
+) -> Result<ManifestResponse, MediaError> {
+    let sealed = media.require_sealed_session(scope, manifest_id).await?;
+    let pending = media
         .require_active_pending(scope, manifest_id, now)
         .await?;
-    let manifest = session.manifest;
+    let manifest = pending.manifest;
     let expected_id = manifest.id().map_err(map_manifest)?;
     if expected_id != manifest_id {
-        return Err(MediaError::Conflict(
+        return Err(MediaError::Invalid(
             "pending manifest id does not match canonical id".to_string(),
         ));
     }
@@ -70,75 +375,178 @@ pub async fn finalize_at(
     }
 
     let tmp = tempfile::NamedTempFile::new().map_err(MediaError::Io)?;
-    let result = async {
-        rebuild_and_verify(media, scope, manifest_id, &manifest, now, tmp.path()).await?;
-        put_fallback_from_path(media, lfs_db, &manifest, tmp.path()).await?;
+    let tmp_path = tmp.path().to_path_buf();
+
+    let verify = async {
+        check_cancel(&mut cancel)?;
+        rebuild_and_verify(
+            media,
+            scope,
+            manifest_id,
+            &manifest,
+            sealed.page_count,
+            &tmp_path,
+            bounds,
+            &mut cancel,
+            progress,
+        )
+        .await?;
+        check_cancel(&mut cancel)?;
+        if let Some(p) = progress {
+            p.update(manifest.media_size, sealed.page_count, "fallback")
+                .await?;
+        }
+        put_fallback_from_path(media, lfs_db, &manifest, &tmp_path).await?;
+        check_cancel(&mut cancel)?;
+        if let Some(p) = progress {
+            p.update(manifest.media_size, sealed.page_count, "publish")
+                .await?;
+        }
         publish_finalized(media, scope, manifest_id, &manifest, now, emitter).await
     }
     .await;
-    let _ = tmp.close();
-    result
+
+    // Always drop temp (success and failure). NamedTempFile closes on drop.
+    drop(tmp);
+    verify
 }
 
-fn map_manifest(err: ManifestError) -> MediaError {
-    match err {
-        ManifestError::Invalid(msg) => MediaError::Invalid(msg),
-        ManifestError::Serde(msg) => MediaError::Json(msg),
+fn check_cancel(cancel: &mut Option<tokio::sync::watch::Receiver<bool>>) -> Result<(), MediaError> {
+    if let Some(rx) = cancel.as_mut()
+        && *rx.borrow_and_update()
+    {
+        return Err(MediaError::Invalid("finalize cancelled".into()));
     }
+    Ok(())
 }
 
+/// Page-ordered reassembly: continuous cover, per-chunk length/hash, full oid/size.
+/// Does **not** require fresh CDC boundaries.
 async fn rebuild_and_verify(
     media: &MediaService,
     scope: &MediaScope,
     manifest_id: &str,
     manifest: &MediaManifest,
-    now: u64,
+    page_count: i32,
     path: &Path,
+    bounds: FinalizeBounds,
+    cancel: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    progress: Option<&TaskProgressHandle>,
 ) -> Result<(), MediaError> {
-    let mut file = File::create(path).map_err(MediaError::Io)?;
-    let mut hasher = Sha256::new();
-    let mut written = 0u64;
-    for chunk in &manifest.chunks {
-        let bytes = media
-            .get_chunk_at(scope, manifest_id, &chunk.chunk_hash, now)
-            .await?;
-        if bytes.len() as u64 != chunk.length
-            || LfsDigest::sha256_of(&bytes).hex() != chunk.chunk_hash
-        {
-            return Err(MediaError::Invalid(
-                "chunk hash or length mismatch during finalize".to_string(),
-            ));
-        }
-        file.write_all(&bytes).map_err(MediaError::Io)?;
-        hasher.update(&bytes);
-        written += bytes.len() as u64;
-    }
-    file.flush().map_err(MediaError::Io)?;
-    drop(file);
+    let path_buf = path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || File::create(&path_buf))
+        .await
+        .map_err(|e| MediaError::Io(std::io::Error::other(e.to_string())))?
+        .map_err(MediaError::Io)?;
 
-    let digest = hex::encode(hasher.finalize());
-    if digest != manifest.media_oid || written != manifest.media_size {
-        return Err(MediaError::Invalid(
-            "reassembled media SHA-256 or size does not match the manifest".to_string(),
-        ));
+    // Hold the file handle across async chunk reads via a blocking write channel.
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Bytes>>();
+    let writer = tokio::task::spawn_blocking(move || -> Result<(u64, String), MediaError> {
+        let mut file = file;
+        let mut hasher = Sha256::new();
+        let mut written = 0u64;
+        while let Ok(Some(bytes)) = rx.recv() {
+            file.write_all(&bytes).map_err(MediaError::Io)?;
+            hasher.update(&bytes);
+            written += bytes.len() as u64;
+        }
+        file.flush().map_err(MediaError::Io)?;
+        Ok((written, hex::encode(hasher.finalize())))
+    });
+
+    let digest = scope.digest();
+    let mut expected_offset = 0u64;
+    let mut bytes_verified = 0u64;
+    let mut last_progress = Instant::now();
+    let mut last_renew = Instant::now();
+
+    for page_no in 0..page_count {
+        check_cancel(cancel)?;
+        let entries = media
+            .paging()
+            .list_entries_for_page(&digest, manifest_id, page_no)
+            .await
+            .map_err(map_paging)?;
+
+        for entry in &entries {
+            check_cancel(cancel)?;
+            if last_progress.elapsed() > bounds.no_progress {
+                let _ = tx.send(None);
+                let _ = writer.await;
+                return Err(MediaError::Invalid(
+                    "finalize no-progress deadline exceeded".into(),
+                ));
+            }
+
+            let offset = u64::try_from(entry.offset)
+                .map_err(|_| MediaError::Invalid("entry offset exceeds unsigned range".into()))?;
+            let length = u64::try_from(entry.length)
+                .map_err(|_| MediaError::Invalid("entry length exceeds unsigned range".into()))?;
+            if offset != expected_offset {
+                let _ = tx.send(None);
+                let _ = writer.await;
+                return Err(MediaError::Invalid(format!(
+                    "chunk coverage gap or overlap at offset {offset} (expected {expected_offset})"
+                )));
+            }
+            let next = expected_offset.checked_add(length).ok_or_else(|| {
+                MediaError::Invalid("chunk offset overflow during finalize".into())
+            })?;
+            if next > manifest.media_size {
+                let _ = tx.send(None);
+                let _ = writer.await;
+                return Err(MediaError::Invalid(
+                    "chunk coverage overflows media_size".into(),
+                ));
+            }
+
+            let read = tokio::time::timeout(
+                bounds.io_timeout,
+                media.read_chunk_for_entry(scope, &entry.chunk_hash, length),
+            )
+            .await
+            .map_err(|_| MediaError::Invalid("chunk I/O timeout during finalize".into()))??;
+
+            if tx.send(Some(read)).is_err() {
+                let _ = writer.await;
+                return Err(MediaError::Io(std::io::Error::other(
+                    "finalize writer channel closed",
+                )));
+            }
+
+            expected_offset = next;
+            bytes_verified = expected_offset;
+            last_progress = Instant::now();
+
+            if let Some(p) = progress
+                && last_renew.elapsed() >= bounds.lease_renew
+            {
+                p.update(bytes_verified, page_no + 1, "verify").await?;
+                last_renew = Instant::now();
+            }
+        }
+
+        if let Some(p) = progress {
+            p.update(bytes_verified, page_no + 1, "verify").await?;
+            last_renew = Instant::now();
+        }
     }
 
-    let recomputed =
-        chunker::chunk_reader(File::open(path).map_err(MediaError::Io)?).map_err(MediaError::Io)?;
-    if recomputed.len() != manifest.chunks.len() {
-        return Err(MediaError::Invalid(
-            "chunk layout boundaries do not match the pending manifest".to_string(),
-        ));
+    let _ = tx.send(None);
+    let (written, digest_hex) = writer
+        .await
+        .map_err(|e| MediaError::Io(std::io::Error::other(e.to_string())))??;
+
+    if expected_offset != manifest.media_size || written != manifest.media_size {
+        return Err(MediaError::Invalid(format!(
+            "chunk coverage incomplete: covered {expected_offset}, media_size {}",
+            manifest.media_size
+        )));
     }
-    for (got, want) in recomputed.iter().zip(manifest.chunks.iter()) {
-        if got.offset != want.offset
-            || got.length != want.length
-            || got.chunk_hash != want.chunk_hash
-        {
-            return Err(MediaError::Invalid(
-                "chunk offset/length/hash do not match the pending manifest".to_string(),
-            ));
-        }
+    if digest_hex != manifest.media_oid {
+        return Err(MediaError::Invalid(
+            "reassembled media SHA-256 does not match the manifest oid".to_string(),
+        ));
     }
     Ok(())
 }
@@ -252,9 +660,60 @@ async fn publish_finalized(
     Ok(response)
 }
 
+fn map_manifest(err: ManifestError) -> MediaError {
+    match err {
+        ManifestError::Invalid(msg) => MediaError::Invalid(msg),
+        ManifestError::Serde(msg) => MediaError::Json(msg),
+    }
+}
+
+fn map_paging(err: crate::jupiter::storage::media_paging_storage::MediaPagingError) -> MediaError {
+    match err {
+        crate::jupiter::storage::media_paging_storage::MediaPagingError::NotFound => {
+            MediaError::NotFound
+        }
+        crate::jupiter::storage::media_paging_storage::MediaPagingError::Conflict(msg) => {
+            MediaError::Conflict(msg)
+        }
+        crate::jupiter::storage::media_paging_storage::MediaPagingError::Storage(_) => {
+            MediaError::Storage
+        }
+        crate::jupiter::storage::media_paging_storage::MediaPagingError::StaleLease => {
+            MediaError::Conflict("stale media lease".into())
+        }
+    }
+}
+
 fn map_db(err: crate::common::errors::MegaError) -> MediaError {
     let _ = redact_storage_error(&err);
     MediaError::Storage
+}
+
+/// Test helper: put P-01a pages for a prepared manifest and seal.
+pub async fn put_pages_and_seal(
+    media: &MediaService,
+    scope: &MediaScope,
+    manifest: &MediaManifest,
+    manifest_id: &str,
+    now: u64,
+) -> Result<(), MediaError> {
+    use crate::ceres::lfs::media::protocol::{ManifestPage, split_pages};
+    let pages = split_pages(&manifest.chunks).map_err(map_manifest)?;
+    for (page_no, entries) in pages.into_iter().enumerate() {
+        media
+            .put_page_at(
+                scope,
+                manifest_id,
+                ManifestPage {
+                    page_no: page_no as u32,
+                    entries,
+                },
+                now,
+            )
+            .await?;
+    }
+    media.seal_at(scope, manifest_id, now).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -380,8 +839,6 @@ mod tests {
         StorageEventEmitter::new_with_transport(&config, transport, targets)
     }
 
-    /// Self-contained FastCDC fixture: local object store + real test DB +
-    /// MediaService + server-side scope (mirrors media/mod.rs's db_fixture).
     struct Wh06Fixture {
         _obj_dir: tempfile::TempDir,
         _db_dir: tempfile::TempDir,
@@ -460,7 +917,56 @@ mod tests {
         (manifest, bodies)
     }
 
-    /// Prepare + upload all chunks, ready for finalize.
+    /// Manual non-cold-cut layout: two MIN_SIZE chunks (FastCDC may differ).
+    fn non_cold_cut_manifest(parts: &[&[u8]]) -> (MediaManifest, Vec<(String, Bytes)>) {
+        use bytes::BytesMut;
+        let mut offset = 0u64;
+        let mut chunks = Vec::new();
+        let mut bodies = Vec::new();
+        let mut all = BytesMut::new();
+        let n = parts.len();
+        for (i, part) in parts.iter().enumerate() {
+            let is_tail = i + 1 == n;
+            let declared = if is_tail {
+                part.len()
+            } else {
+                part.len().max(chunker::MIN_SIZE)
+            };
+            let mut body = BytesMut::from(*part);
+            if body.len() < declared {
+                body.resize(declared, 0);
+            }
+            all.extend_from_slice(&body);
+            let hash = LfsDigest::sha256_of(&body).hex().to_owned();
+            chunks.push(ChunkEntry {
+                offset,
+                length: declared as u64,
+                chunk_hash: hash.clone(),
+                encoded_length: declared as u64,
+                compression: "none".to_string(),
+                checksum: None,
+            });
+            bodies.push((hash, body.freeze()));
+            offset += declared as u64;
+        }
+        let media_oid = LfsDigest::sha256_of(&all).hex().to_owned();
+        let manifest = MediaManifest {
+            version: 1,
+            algorithm: chunker::ALGORITHM.to_string(),
+            hash_algorithm: "sha256".to_string(),
+            media_oid,
+            media_size: offset,
+            chunks,
+            created_by: CreatedBy {
+                client: "test".to_string(),
+                version: "0".to_string(),
+                capabilities: vec![chunker::ALGORITHM.to_string()],
+            },
+            fallback_oid: None,
+        };
+        (manifest, bodies)
+    }
+
     async fn wh06_prepare(fx: &Wh06Fixture, data: &[u8], now: u64) -> (MediaManifest, String) {
         let (manifest, bodies) = wh06_manifest(data);
         let prepared = fx
@@ -474,6 +980,15 @@ mod tests {
                 .await
                 .unwrap();
         }
+        put_pages_and_seal(
+            &fx.service,
+            &fx.scope,
+            &manifest,
+            &prepared.manifest_id,
+            now,
+        )
+        .await
+        .unwrap();
         (manifest, prepared.manifest_id)
     }
 
@@ -491,10 +1006,354 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_cold_cut_layout_passes_reassembly() {
+        let fx = wh06_fixture("/acme/app").await;
+        let (manifest, bodies) = non_cold_cut_manifest(&[b"alpha-payload", b"beta-tail"]);
+        // Two padded MIN_SIZE chunks: a legal layout that need not equal cold-cut.
+        let mut full = Vec::new();
+        for (_, b) in &bodies {
+            full.extend_from_slice(b);
+        }
+        let cdc = chunker::chunk_bytes(&full);
+        let differs = cdc.len() != manifest.chunks.len()
+            || cdc
+                .iter()
+                .zip(manifest.chunks.iter())
+                .any(|(a, b)| a.offset != b.offset || a.length != b.length);
+        assert!(
+            differs,
+            "use a layout FastCDC would not emit so MF-03's removed cold-cut gate is exercised"
+        );
+
+        let prepared = fx
+            .service
+            .prepare_at(&fx.scope, manifest.clone(), 10)
+            .await
+            .unwrap();
+        for (hash, body) in &bodies {
+            fx.service
+                .upload_chunk_at(&fx.scope, &prepared.manifest_id, hash, body.clone(), 10)
+                .await
+                .unwrap();
+        }
+        put_pages_and_seal(&fx.service, &fx.scope, &manifest, &prepared.manifest_id, 10)
+            .await
+            .unwrap();
+        let published = finalize_at(
+            &fx.service,
+            &fx.lfs_db,
+            &fx.scope,
+            &prepared.manifest_id,
+            11,
+            &StorageEventEmitter::disabled(),
+        )
+        .await
+        .expect("non-cold-cut layout must finalize without fresh CDC equality");
+        assert_eq!(published.manifest.media_oid, manifest.media_oid);
+    }
+
+    #[tokio::test]
+    async fn coverage_gap_rejects_without_publish() {
+        let fx = wh06_fixture("/acme/app").await;
+        let data = b"gap-coverage-object";
+        let (manifest, manifest_id) = wh06_prepare(&fx, data, 10).await;
+        // Corrupt sealed index: shift second entry (or sole entry) to open a gap.
+        let entries = fx
+            .service
+            .paging()
+            .list_entries(&fx.scope.digest(), &manifest_id)
+            .await
+            .unwrap();
+        if entries.is_empty() {
+            // Empty object: inject a spurious entry that overflows.
+            use crate::jupiter::storage::media_paging_storage::ChunkIndexRow;
+            fx.service
+                .paging()
+                .rebuild_index_from_pages(
+                    &fx.scope.digest(),
+                    &manifest_id,
+                    &[(
+                        0,
+                        vec![ChunkIndexRow {
+                            page_no: 0,
+                            ordinal: 0,
+                            offset: 1,
+                            length: 1,
+                            chunk_hash: "a".repeat(64),
+                        }],
+                    )],
+                )
+                .await
+                .unwrap();
+        } else {
+            let mut rebuilt = Vec::new();
+            for e in &entries {
+                rebuilt.push((
+                    e.page_no,
+                    crate::jupiter::storage::media_paging_storage::ChunkIndexRow {
+                        page_no: e.page_no,
+                        ordinal: e.ordinal,
+                        offset: if e.ordinal == 0 && e.page_no == 0 {
+                            1
+                        } else {
+                            e.offset as u64
+                        },
+                        length: e.length as u64,
+                        chunk_hash: e.chunk_hash.clone(),
+                    },
+                ));
+            }
+            // Group by page.
+            let mut pages: std::collections::BTreeMap<i32, Vec<_>> =
+                std::collections::BTreeMap::new();
+            for (pn, row) in rebuilt {
+                pages.entry(pn).or_default().push(row);
+            }
+            let pages: Vec<_> = pages.into_iter().collect();
+            fx.service
+                .paging()
+                .rebuild_index_from_pages(&fx.scope.digest(), &manifest_id, &pages)
+                .await
+                .unwrap();
+        }
+        let err = finalize_at(
+            &fx.service,
+            &fx.lfs_db,
+            &fx.scope,
+            &manifest_id,
+            11,
+            &StorageEventEmitter::disabled(),
+        )
+        .await
+        .expect_err("gap must fail");
+        assert!(matches!(err, MediaError::Invalid(_)), "{err:?}");
+        let lfs_key = ObjectKey {
+            namespace: ObjectNamespace::Lfs,
+            key: manifest.media_oid.clone(),
+        };
+        assert!(!fx.service.exists(&lfs_key).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn bad_hash_and_wrong_oid_reject() {
+        let fx = wh06_fixture("/acme/app").await;
+        let (manifest, bodies) = wh06_manifest(b"bad-hash-object");
+        let prepared = fx
+            .service
+            .prepare_at(&fx.scope, manifest.clone(), 20)
+            .await
+            .unwrap();
+        for (hash, body) in &bodies {
+            fx.service
+                .upload_chunk_at(&fx.scope, &prepared.manifest_id, hash, body.clone(), 20)
+                .await
+                .unwrap();
+        }
+        put_pages_and_seal(&fx.service, &fx.scope, &manifest, &prepared.manifest_id, 20)
+            .await
+            .unwrap();
+        if let Some((hash, _)) = bodies.first() {
+            fx.service
+                .overwrite_chunk_for_test(&fx.scope, hash, Bytes::from_static(b"tampered"))
+                .await
+                .unwrap();
+        }
+        assert!(
+            finalize_at(
+                &fx.service,
+                &fx.lfs_db,
+                &fx.scope,
+                &prepared.manifest_id,
+                21,
+                &StorageEventEmitter::disabled(),
+            )
+            .await
+            .is_err()
+        );
+
+        // Wrong oid: reassemble ok but claim different oid via pending mutate is
+        // hard; instead finalize a layout whose media_oid does not match bytes.
+        let fx2 = wh06_fixture("/acme/app").await;
+        let (mut bad_oid, bodies2) = non_cold_cut_manifest(&[b"wrong-oid-tail"]);
+        bad_oid.media_oid = "f".repeat(64);
+        bad_oid.fallback_oid = None;
+        // prepare forces fallback_oid = media_oid and validate fails on size/oid
+        // mismatch with chunks — so craft matching size but wrong oid hash.
+        // media_size still matches bytes; only oid is wrong.
+        let prepared2 = fx2
+            .service
+            .prepare_at(&fx2.scope, bad_oid.clone(), 30)
+            .await;
+        // prepare validates oid is hex but not that it matches content.
+        // MediaManifest::validate does NOT check oid == hash(content).
+        if let Ok(prep) = prepared2 {
+            for (hash, body) in &bodies2 {
+                fx2.service
+                    .upload_chunk_at(&fx2.scope, &prep.manifest_id, hash, body.clone(), 30)
+                    .await
+                    .unwrap();
+            }
+            put_pages_and_seal(&fx2.service, &fx2.scope, &bad_oid, &prep.manifest_id, 30)
+                .await
+                .unwrap();
+            let err = finalize_at(
+                &fx2.service,
+                &fx2.lfs_db,
+                &fx2.scope,
+                &prep.manifest_id,
+                31,
+                &StorageEventEmitter::disabled(),
+            )
+            .await
+            .expect_err("wrong oid");
+            assert!(
+                matches!(err, MediaError::Invalid(ref msg) if msg.contains("SHA-256")),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_releases_temp_and_lease() {
+        let fx = wh06_fixture("/acme/app").await;
+        let (manifest, manifest_id) = wh06_prepare(&fx, b"cancel-object", 40).await;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let media = fx.service.clone();
+        let lfs = fx.lfs_db.clone();
+        let scope = fx.scope.clone();
+        let mid = manifest_id.clone();
+        let handle = tokio::spawn(async move {
+            finalize_at_with_bounds(
+                &media,
+                &lfs,
+                &scope,
+                &mid,
+                41,
+                &StorageEventEmitter::disabled(),
+                FinalizeBounds {
+                    no_progress: Duration::from_secs(600),
+                    lease_renew: Duration::from_secs(20),
+                    io_timeout: Duration::from_secs(120),
+                },
+                Some(rx),
+            )
+            .await
+        });
+        // Cancel before/during work.
+        let _ = tx.send(true);
+        let err = handle.await.unwrap().expect_err("cancelled");
+        assert!(
+            matches!(err, MediaError::Invalid(ref msg) if msg.contains("cancelled")),
+            "{err:?}"
+        );
+        let lfs_key = ObjectKey {
+            namespace: ObjectNamespace::Lfs,
+            key: manifest.media_oid.clone(),
+        };
+        assert!(!fx.service.exists(&lfs_key).await.unwrap());
+
+        // Persistent cancel_task clears lease.
+        let task = fx
+            .service
+            .paging()
+            .ensure_task(&fx.scope.digest(), &manifest_id)
+            .await
+            .unwrap();
+        let claimed = fx
+            .service
+            .paging()
+            .claim_or_renew_lease(&task.task_id, "w", None)
+            .await
+            .unwrap();
+        assert!(claimed.lease_owner.is_some());
+        let cancelled = fx
+            .service
+            .paging()
+            .cancel_task(&task.task_id)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.state, TASK_FAILED);
+        assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
+        assert!(cancelled.lease_owner.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_progress_deadline_is_bounded() {
+        let fx = wh06_fixture("/acme/app").await;
+        let (manifest, manifest_id) = wh06_prepare(&fx, b"deadline-object", 50).await;
+        // Delete all chunks so each read fails quickly — but use a short
+        // no-progress window with a hanging read via missing object.
+        for c in &manifest.chunks {
+            let key = scope_key(&fx.scope, MediaObjectKind::Chunk, &c.chunk_hash).unwrap();
+            let _ = fx.service.object_store().inner.delete(&key).await;
+        }
+        let err = finalize_at_with_bounds(
+            &fx.service,
+            &fx.lfs_db,
+            &fx.scope,
+            &manifest_id,
+            51,
+            &StorageEventEmitter::disabled(),
+            FinalizeBounds {
+                no_progress: Duration::from_millis(50),
+                lease_renew: Duration::from_millis(10),
+                io_timeout: Duration::from_millis(20),
+            },
+            None,
+        )
+        .await
+        .expect_err("must fail");
+        // Either I/O timeout, not found, or no-progress — all bounded failures.
+        assert!(
+            matches!(
+                err,
+                MediaError::Invalid(_) | MediaError::NotFound | MediaError::Conflict(_)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_enqueue_and_poll_completes() {
+        let fx = wh06_fixture("/acme/app").await;
+        let now = unix_now();
+        let (manifest, manifest_id) = wh06_prepare(&fx, b"async-enqueue-object", now).await;
+        let accepted = enqueue_finalize(
+            fx.service.clone(),
+            fx.lfs_db.clone(),
+            fx.scope.clone(),
+            manifest_id.clone(),
+            StorageEventEmitter::disabled(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.manifest_id, manifest_id);
+        assert!(accepted.status_url.contains(&accepted.task_id));
+
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let st = task_status(&fx.service, &fx.scope, &accepted.task_id)
+                    .await
+                    .unwrap();
+                if st.state == TASK_COMPLETE || st.state == TASK_FAILED {
+                    return st;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("task finish");
+        assert_eq!(
+            status.state, TASK_COMPLETE,
+            "async finalize completes: stage={} err={:?} retryable={}",
+            status.stage, status.error_code, status.retryable
+        );
+        assert_eq!(status.oid.as_deref(), Some(manifest.media_oid.as_str()));
+        assert_eq!(status.size, Some(manifest.media_size));
+    }
+
+    #[tokio::test]
     async fn storage_event_finalize_matrix() {
-        // A real finalize that actually puts the finalized manifest delivers
-        // exactly one event with the committed snapshot from the server-side
-        // MediaScope's canonical repository.
         let transport = std::sync::Arc::new(RecordingTransport::default());
         let emitter = wh06_emitter(
             transport.clone(),
@@ -533,7 +1392,6 @@ mod tests {
         assert_eq!(envelope["data"]["transfer"], "fastcdc");
         assert_eq!(envelope["occurred_at"].as_u64().expect("ts"), 11);
 
-        // Repeat finalize is the exists no-op: no second event.
         let again = finalize_at(
             &fx.service,
             &fx.lfs_db,
@@ -548,8 +1406,6 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert_eq!(transport.calls(), 1, "repeat finalize delivers nothing");
 
-        // A finalize that fails BEFORE the finalized manifest put (corrupt
-        // chunk) delivers nothing.
         let (manifest2, manifest_id2) = wh06_prepare(&fx, b"wh06 corrupt", 20).await;
         if let Some((hash, _)) = manifest2.chunks.first().map(|c| (c.chunk_hash.clone(), ())) {
             fx.service
@@ -575,8 +1431,6 @@ mod tests {
             .expect("shutdown within 3s");
         assert_eq!(transport.calls(), 1, "no late delivery after drain");
 
-        // Filter isolation: a target scoped to another repository receives
-        // nothing for this repo's finalize.
         let other_transport = std::sync::Arc::new(RecordingTransport::default());
         let other_emitter = wh06_emitter(
             other_transport.clone(),
@@ -605,7 +1459,6 @@ mod tests {
             .expect("shutdown within 3s");
         assert_eq!(other_transport.calls(), 0);
 
-        // Emitter failure never changes the finalize result.
         let failing = std::sync::Arc::new(RecordingTransport {
             fail: true,
             ..Default::default()

@@ -17,7 +17,7 @@
   - seal：`POST …/manifests/{id}/seal` → `{manifest_id, seal_generation, page_count}`
   - missing：`GET …/manifests/{id}/missing?cursor=` → `{hashes, next_cursor}`
   - upload：`PUT …/manifests/{id}/chunks/{hash}`（`application/octet-stream`）
-  - finalize：`POST …/manifests/{id}/finalize`（MF-03/07 深化异步任务）
+  - finalize：`POST …/manifests/{id}/finalize` → 202 任务（MF-03）；`GET …/tasks/{task_id}` 轮询
   - get：`GET …/manifests/by-media/{oid}` → `{manifest_id, manifest}`
   - chunk download：`GET …/manifests/by-media/{oid}/chunks/{hash}`
 
@@ -64,12 +64,15 @@
 - chunk 上传必须命中 pending 声明的 hash/length，并校验实际 SHA-256（≤ 256 KiB）。同 scope 同 hash 的正确对象可幂等复用；已存错误内容返回 Conflict。
 - 领域错误：`Invalid` / `NotFound` / `Conflict` / `Storage` / `Io` / `Json`。存储错误对外固定为 `media object store error`。
 
-## Finalize / fallback（FC-06）
+## Finalize / fallback（FC-06 / MF-03）
 
-- 同时最多 **2** 个 finalize（semaphore）。按 pending 声明的顺序逐块读取，写入临时文件并增量 SHA-256。
-- 校验整对象 `media_oid`/`media_size` 后，再跑一遍 `fastcdc-v2020-32k`：offset/length/hash 必须与 manifest 完全一致（冷切门；合法非冷切布局由 MF-03 放开）。
-- 缺失或损坏 chunk：**不**写 LFS namespace、**不**写 `lfs_objects`、**不**发布 finalized manifest；临时文件在成功和失败路径都删除。
-- 通过后：发布到 `lfs/{oid}`，`lfs_objects` 幂等插入，再写 `media/fastcdc-v2020-32k/{scope}/finalized/{media_oid}`。
+- 同时最多 **2** 个 finalize（semaphore）；活跃排队上限 **128**（超限 429 + `Retry-After`）。
+- `POST …/manifests/{id}/finalize` **仅接受 sealed 会话**，返回 **202** `{task_id,manifest_id,state,status_url}`；`status_url` 为同前缀 `libra/media/v1/tasks/{task_id}`（客户端不得跨 origin 跟随或转发 token）。
+- `GET …/tasks/{task_id}` 每请求重新做 scope 认证，返回 `state/bytes_verified/pages_verified/retryable/error_code`；`complete` 另含 `oid/size`。
+- 验证：按 sealed 页序遍历 `media_entry`，逐块 scoped 读并校验 length/hash；连续覆盖 `media_size`；整对象 SHA-256 须等于 `media_oid`。**不**要求新鲜 FastCDC 冷切边界相等。
+- 磁盘写与哈希在 `spawn_blocking`；单次 I/O ≤120s、无进展 ≤10min、lease 60s（约每 20s 续租）；持续进展不受整文件墙钟限制。
+- 缺失或损坏 chunk / gap / overlap / overflow：**不**写 LFS namespace、**不**写 `lfs_objects`、**不**发布 finalized；临时文件与 lease 在成功/失败/取消路径均释放。
+- 通过后：发布到 `lfs/{oid}`，`lfs_objects` 幂等插入，再写 `media/fastcdc-v2020-32k/{scope}/finalized/{media_oid}`（多布局原子发布见 MF-07）。
 - 已存在的 finalized 若 `manifest_id`/`media_oid` 不一致则 Conflict；重复 finalize 在内容一致时成功。
 
 ## 出站事件（plan-20260912 / WH-06，已交付）
