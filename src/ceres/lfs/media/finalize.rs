@@ -101,6 +101,7 @@ pub async fn finalize_at(
 }
 
 /// Sync path that still acquires the concurrency semaphore and walks sealed pages.
+#[allow(clippy::too_many_arguments)] // finalize pipeline context; keep flat call site
 pub async fn finalize_at_with_bounds(
     media: &MediaService,
     lfs_db: &LfsDbStorage,
@@ -246,6 +247,7 @@ fn accepted_from_task(task: &crate::callisto::media_task::Model) -> FinalizeAcce
     }
 }
 
+#[allow(clippy::too_many_arguments)] // worker owns media+lease+emitter context
 async fn run_task_worker(
     media: MediaService,
     lfs_db: LfsDbStorage,
@@ -340,6 +342,7 @@ fn classify_finalize_error(err: &MediaError) -> (&'static str, bool) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // sealed-page verify + publish inputs
 async fn run_finalize_body(
     media: &MediaService,
     lfs_db: &LfsDbStorage,
@@ -425,6 +428,7 @@ fn check_cancel(cancel: &mut Option<tokio::sync::watch::Receiver<bool>>) -> Resu
 
 /// Page-ordered reassembly: continuous cover, per-chunk length/hash, full oid/size.
 /// Does **not** require fresh CDC boundaries.
+#[allow(clippy::too_many_arguments)] // reassembly needs pages, bounds, progress, cancel
 async fn rebuild_and_verify(
     media: &MediaService,
     scope: &MediaScope,

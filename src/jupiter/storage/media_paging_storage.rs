@@ -84,6 +84,8 @@ impl MediaPagingStorage {
     }
 
     /// Insert or return the existing pending session for `(scope, manifest_id)`.
+    // Session row carries algorithm/oid/size/page metadata in one upsert.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_pending_session(
         &self,
         scope_digest: &str,
@@ -187,12 +189,11 @@ impl MediaPagingStorage {
                 .filter(media_entry::Column::ChunkHash.eq(&e.chunk_hash))
                 .one(txn)
                 .await?
+                && prior.length as u64 != e.length
             {
-                if prior.length as u64 != e.length {
-                    return Err(MediaPagingError::Conflict(
-                        "chunk hash length conflict across pages".into(),
-                    ));
-                }
+                return Err(MediaPagingError::Conflict(
+                    "chunk hash length conflict across pages".into(),
+                ));
             }
         }
 
@@ -281,7 +282,7 @@ impl MediaPagingStorage {
         length: u64,
         limit: u64,
     ) -> Result<Vec<media_entry::Model>, MediaPagingError> {
-        let limit = limit.min(4096) as u64;
+        let limit = limit.min(4096);
         let end = offset
             .checked_add(length)
             .ok_or_else(|| MediaPagingError::Conflict("range overflow".into()))?;
@@ -387,12 +388,14 @@ impl MediaPagingStorage {
             if task.lease_epoch != epoch {
                 return Err(MediaPagingError::StaleLease);
             }
-        } else if task.lease_owner.is_some() && !expired && task.state == TASK_RUNNING {
-            if task.lease_owner.as_deref() != Some(owner) {
-                return Err(MediaPagingError::Conflict(
-                    "lease held by another owner".into(),
-                ));
-            }
+        } else if task.lease_owner.is_some()
+            && !expired
+            && task.state == TASK_RUNNING
+            && task.lease_owner.as_deref() != Some(owner)
+        {
+            return Err(MediaPagingError::Conflict(
+                "lease held by another owner".into(),
+            ));
         }
 
         let new_epoch = if expected_epoch.is_some() {

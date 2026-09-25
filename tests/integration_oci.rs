@@ -549,7 +549,10 @@ fn integration_oci_docker_gated() {
         }
     }
 
-    let env = OciEnv::with_config_append(&token_oci_append(true));
+    // Docker Engine only attaches registry credentials after `/v2/` challenges.
+    // With anonymous_access=true, ping returns 200 and subsequent push uploads
+    // omit Authorization (creds=Missing), so this gated IT uses closed ping.
+    let env = OciEnv::with_config_append(&token_oci_append(false));
     let (mut service, port, _stdout, stderr) =
         boot_service_http(&env, &[("MEGA_GIT__PUSH_AUTH", "token")]);
     let registry = format!("127.0.0.1:{port}");

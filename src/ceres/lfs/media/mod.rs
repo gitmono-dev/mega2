@@ -559,7 +559,7 @@ mod tests {
             .get_chunk_at(&scope, &prepared.manifest_id, &bodies[0].0, 101)
             .await
             .unwrap();
-        assert!(cache.len() >= 1);
+        assert!(!cache.is_empty());
 
         // TTL must still fail on cache hit.
         assert!(matches!(
@@ -655,5 +655,69 @@ mod tests {
                 .await,
             Err(MediaError::Conflict(_))
         ));
+    }
+
+    /// C-08 upgrade/recovery drill: new algorithm namespace writes must not
+    /// delete or rewrite retained `v1/` Media objects or standard LFS blobs.
+    #[tokio::test]
+    async fn c08_upgrade_retains_legacy_v1_and_standard_lfs() {
+        let fx = db_fixture().await;
+        let legacy_scope = "a".repeat(64);
+        let legacy_id = "b".repeat(64);
+        let legacy_key = ObjectKey {
+            namespace: ObjectNamespace::Media,
+            key: format!("v1/{legacy_scope}/finalized/{legacy_id}"),
+        };
+        let legacy_body = Bytes::from_static(b"legacy-v1-finalized-retained");
+        fx.service
+            .put_metadata(&legacy_key, legacy_body.clone())
+            .await
+            .unwrap();
+
+        let lfs_oid = "d".repeat(64);
+        let lfs_key = ObjectKey {
+            namespace: ObjectNamespace::Lfs,
+            key: lfs_oid.clone(),
+        };
+        let lfs_body = Bytes::from_static(b"standard-lfs-object-retained");
+        fx.service
+            .put_bytes(&lfs_key, lfs_body.clone())
+            .await
+            .unwrap();
+
+        let data = b"c08-new-namespace-prepare";
+        let (manifest, _bodies) = manifest_from_bytes(data);
+        let prepared = fx
+            .service
+            .prepare_at(&fx.scope, manifest, 10)
+            .await
+            .unwrap();
+        let pending_key = fx
+            .scope
+            .object_key(MediaObjectKind::Pending, &prepared.manifest_id)
+            .unwrap();
+        assert!(
+            pending_key.key.starts_with("fastcdc-v2020-32k/"),
+            "new writes must use algorithm namespace, got {}",
+            pending_key.key
+        );
+        assert!(!pending_key.key.starts_with("v1/"));
+        assert!(fx.service.exists(&pending_key).await.unwrap());
+
+        let retained_legacy = fx
+            .service
+            .read_bytes(&legacy_key, legacy_body.len())
+            .await
+            .unwrap();
+        assert_eq!(retained_legacy, legacy_body);
+        assert!(fx.service.exists(&legacy_key).await.unwrap());
+
+        let retained_lfs = fx
+            .service
+            .read_bytes(&lfs_key, lfs_body.len())
+            .await
+            .unwrap();
+        assert_eq!(retained_lfs, lfs_body);
+        assert!(fx.service.exists(&lfs_key).await.unwrap());
     }
 }

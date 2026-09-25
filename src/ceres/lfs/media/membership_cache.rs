@@ -59,8 +59,8 @@ impl MembershipRecord {
         ENTRY_OVERHEAD
             + self
                 .lengths
-                .iter()
-                .map(|(h, _)| h.len().saturating_add(PER_HASH_OVERHEAD))
+                .keys()
+                .map(|h| h.len().saturating_add(PER_HASH_OVERHEAD))
                 .sum::<usize>()
     }
 }
@@ -242,7 +242,7 @@ mod tests {
             cache.insert(key("s", &format!("x{i}")), record_with_n(4, None));
         }
         assert!(
-            cache.peek(&key("s", "old")).is_some() || cache.len() >= 1,
+            cache.peek(&key("s", "old")).is_some() || !cache.is_empty(),
             "cache still holds entries under budget"
         );
         assert!(cache.billed_bytes() <= 12 * 1024);

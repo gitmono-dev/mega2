@@ -27,6 +27,7 @@ use crate::{
 };
 
 /// Publish a verified layout. Caller has already reassembled and verified bytes.
+#[allow(clippy::too_many_arguments)] // publication needs media, DB, scope, layout, event
 pub async fn publish_verified_layout(
     media: &MediaService,
     lfs_db: &LfsDbStorage,

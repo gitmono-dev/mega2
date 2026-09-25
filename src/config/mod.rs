@@ -246,6 +246,31 @@ mod test {
         );
     }
 
+    /// The `config` crate may emit cwd-relative paths when TMPDIR sits outside
+    /// the repo (e.g. `/media/eli/data/tmp` → `../tmp/.tmp…/file`).
+    fn assert_message_mentions_path(message: &str, path: &Path) {
+        let abs = path.to_string_lossy();
+        if message.contains(abs.as_ref()) {
+            return;
+        }
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf-8 file name");
+        let parent = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let mentioned = message
+            .lines()
+            .any(|line| line.contains(file) && (parent.is_empty() || line.contains(parent)));
+        assert!(
+            mentioned,
+            "error message must mention profile path (abs or cwd-relative)\npath={abs}\nmessage={message}"
+        );
+    }
+
     #[test]
     fn test_mega_base() {
         let lock = env_lock();
@@ -558,7 +583,9 @@ mod test {
         .expect_err("profile type conflict should fail");
         let message = err.to_string();
 
-        assert!(message.contains(profile_path.to_str().expect("utf-8 profile path")));
+        // `config` may emit cwd-relative paths (e.g. ../tmp/.tmpX/…) when TMPDIR
+        // shares a parent with the repo; match abs or unique temp leaf + filename.
+        assert_message_mentions_path(&message, &profile_path);
         assert!(message.contains("log.print_std"));
         assert!(message.contains("expected a boolean"));
         assert!(message.contains("value is redacted"));
@@ -594,7 +621,7 @@ mod test {
         let message = err.to_string();
 
         assert!(message.contains("TOML parse error"));
-        assert!(message.contains(profile_path.to_str().expect("utf-8 profile path")));
+        assert_message_mentions_path(&message, &profile_path);
         assert!(message.contains("value is redacted"));
         assert!(message.contains("config source line redacted"));
         let redacted_key_with_assignment = format!("{} =", "password");

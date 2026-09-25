@@ -52,6 +52,15 @@
   - `page/{manifest_id}-p{n}`：不可变页 blob
 - 对外错误不泄漏 digest、object key 或认证信息。
 
+## Upgrade / recovery（C-08 / MF-06）
+
+- **激活顺序：** 先发布本仓 MF-06，再 Libra FL-06，再 MF-05，最后 FL-05。服务端发布只依赖本仓测试与共享静态向量，不等待未来客户端。
+- **命名空间切换：** 新写入一律落在 `media/fastcdc-v2020-32k/…`。既有 `media/v1/…` 对象**不读写、不自动删除**；标准 LFS `lfs/{oid}` 与 `lfs_objects` 行保留。同 oid 可在新空间重新 finalize，不受旧 `v1` finalized 阻止。
+- **补偿恢复（活动数据不可仅 revert 代码）：** 停写新 Media → 回切到匹配的一对旧二进制与旧 `v1` 空间语义 → 继续服务保留的 `v1` 对象与标准 LFS。若活动数据已写入新空间，不得只把代码回退到旧前缀而指望读到新对象。
+- **清理：** 旧 `v1` 空间与布局 GC 属 `DEFER-MF-03`，须另行显式运维，不在本协议激活范围内。
+- **发布声明边界：** 无真 interop（MF-05 / Libra FL 未完成）时，只可声明**本仓服务端能力已发布**；双仓收口保持 blocked。
+- **演练证据：** `ceres::lfs::media::tests::c08_upgrade_retains_legacy_v1_and_standard_lfs`（feature `fastcdc`）种植 `v1/` 与标准 LFS 对象后做新命名空间 `prepare`，断言旧对象字节不变且新 pending 落在 `fastcdc-v2020-32k/`。
+
 ## 持久分页状态（FC-16 / MF-08）
 
 服务库三表（迁移 `m20260925_000100_media_paging`）：
@@ -113,3 +122,5 @@
 ## 双仓 interop gate（FC-15）
 
 默认 `cargo test --all` **不**要求 sibling Libra checkout。真实 client/server 证据只在显式 ignored target 下执行（见既有 `integration_fastcdc_libra` 说明）。feature-off 时 Media 能力探测为 404，Libra 选择标准 LFS fallback。
+
+**MF-06（目标 v0.40.10，发布前竞争 patch；origin 已占 v0.40.9）状态：** 服务端家族（配方、分页协议、覆盖验证、多布局原子发布、固定 id 读取）已按本契约上线；MF-05 / Libra FL 真 interop 与效果轴仍未交付，不得宣称双仓收口完成。

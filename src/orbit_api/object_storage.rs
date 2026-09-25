@@ -15,7 +15,8 @@ pub struct ObjectKey {
     /// - git: sha1/sha256
     /// - lfs: sha256
     /// - log: path like 2025/03/worker.log
-    /// - media: `v1/{scope}/{kind}/{id}` (unsharded under namespace `media`)
+    /// - media: `fastcdc-v2020-32k/{scope}/{kind}/{id}` (unsharded under
+    ///   namespace `media`; legacy `v1/…` retained unread, C-08)
     pub key: String,
 }
 
