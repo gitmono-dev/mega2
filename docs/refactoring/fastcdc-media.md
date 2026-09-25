@@ -25,7 +25,16 @@
 - Object key：`v1/{scope_digest}/{pending|chunk|manifest|finalized}/{id}`，存储路径 `media/` + key（Media 不走 3-level sharding）。
 - 对外错误不泄漏 digest、object key 或认证信息。
 
-## 生命周期（FC-05 prepare / upload / resume）
+## 持久分页状态（FC-16 / MF-08）
+
+服务库新增三表（迁移 `m20260925_000100_media_paging`，可幂等 `IF NOT EXISTS`）：
+
+- `media_session`：`(scope_digest, manifest_id)` 会话；`pending|sealed|finalized`；`seal_generation` 供缺块 cursor 绑定。
+- `media_entry`：派生 chunk 索引（`page_no/ordinal/offset/length/chunk_hash`），跨页 hash→length 冲突拒绝；offset 覆盖查询有界（≤4096）。
+- `media_task`：异步 finalize 任务与 lease（`lease_epoch` fencing）；旧 epoch 不可推进进度或提交 finalized。
+
+对象存储中的 sealed 页仍是权威页内容；索引可从页重建。`down` 不删除任务数据（compensating：停写后切回旧命名空间）。
+
 
 - `prepare` 只接受已 `validate` 的 manifest，并**强制** `fallback_oid = media_oid`。
 - pending 对象：`media/v1/{scope}/pending/{manifest_id}`，逻辑 TTL **24 小时**，JSON ≤ **10 MiB**。过期 session 不能继续 upload/get。

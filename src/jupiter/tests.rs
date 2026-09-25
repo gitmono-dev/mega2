@@ -196,6 +196,8 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         webhook_storage: WebhookStorage { base: base.clone() },
         audit_storage: AuditStorage { base: base.clone() },
         oci_db_storage: OciDbStorage { base: base.clone() },
+        media_paging_storage:
+            crate::jupiter::storage::media_paging_storage::MediaPagingStorage::new(base.clone()),
     };
 
     apply_migrations(&connection, true).await.unwrap();

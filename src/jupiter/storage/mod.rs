@@ -14,6 +14,7 @@ pub mod group_storage;
 pub mod init;
 pub mod issue_storage;
 pub mod lfs_db_storage;
+pub mod media_paging_storage;
 pub mod mono_storage;
 pub mod notification_storage;
 pub mod object_storage;
@@ -56,6 +57,7 @@ use crate::{
             init::database_connection,
             issue_storage::IssueStorage,
             lfs_db_storage::LfsDbStorage,
+            media_paging_storage::MediaPagingStorage,
             mono_storage::MonoStorage,
             notification_storage::NotificationStorage,
             object_storage::MegaObjectStorageWrapper,
@@ -87,6 +89,7 @@ pub struct AppService {
     pub webhook_storage: WebhookStorage,
     pub audit_storage: AuditStorage,
     pub oci_db_storage: OciDbStorage,
+    pub media_paging_storage: MediaPagingStorage,
 }
 
 impl AppService {
@@ -113,6 +116,7 @@ impl AppService {
             webhook_storage: WebhookStorage { base: mock.clone() },
             audit_storage: AuditStorage { base: mock.clone() },
             oci_db_storage: OciDbStorage { base: mock.clone() },
+            media_paging_storage: MediaPagingStorage::new(mock.clone()),
         })
     }
 }
@@ -198,6 +202,7 @@ impl Storage {
         let webhook_storage = WebhookStorage { base: base.clone() };
         let audit_storage = AuditStorage { base: base.clone() };
         let oci_db_storage = OciDbStorage { base: base.clone() };
+        let media_paging_storage = MediaPagingStorage::new(base.clone());
         let oci_service = OciService {
             oci_storage: oci_db_storage.clone(),
             obj_storage: object_store.clone(),
@@ -251,6 +256,7 @@ impl Storage {
             webhook_storage: webhook_storage.clone(),
             audit_storage,
             oci_db_storage,
+            media_paging_storage,
         };
         let push_queue_service =
             PushQueueService::new(base.clone(), config.monorepo.push_policy.clone())
