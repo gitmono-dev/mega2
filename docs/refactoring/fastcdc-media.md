@@ -2,101 +2,91 @@
 
 本文记录 `fastcdc` feature 下 Media 协议的服务端契约。这不是标准 Git LFS 扩展，也不是标准 Git BLAKE3 互通。`media_oid`、chunk hash 与 fallback OID 属于 **LFS SHA-256** digest domain，不受仓库 `monorepo.object_format` / Git `HashKind` 影响。
 
-## 协议（FC-02）
+## 协议（FC-02 / MF-02）
 
-- 算法：`fastcdc-v2020-32k`（`fastcdc = "=3.2.1"`，v2020，Normalization::Level1，seed=0，min/avg/max = 32/64/256 KiB）。旧 `fastcdc-v1`（512 KiB / 2 MiB / 8 MiB）命名空间保留不读写。
+- 算法：`fastcdc-v2020-32k`（`fastcdc = "=3.2.1"`，v2020，Normalization::Level1，seed=0，min/avg/max = 32/64/256 KiB）。旧 `fastcdc-v1` / 对象前缀 `v1/` 命名空间保留不读写、不自动删除。
 - Manifest：`version=1`，`hash_algorithm=sha256`，chunk `compression` 固定 `none` 且 `encoded_length == length`。
-- Canonical ID：SHA-256（小写 hex）over JSON of `(version, algorithm, hash_algorithm, media_oid, media_size, chunks)`。`created_by` 与 `fallback_oid` 不进入 identity；分页边界不参与身份。
-- 容量：不设文件字节数/总 chunk 数/总 manifest 大小产品上限。单页 ≤4096 条且紧凑 entries ≤960 KiB；Media metadata 包装（摘要/页/状态）≤ **1 MiB**（`MAX_ENVELOPE_SIZE`）；单 chunk ≤ 256 KiB；完整 LFS 流不受页限额。
+- 块限制：非尾块 `32768..=262144`；尾块 `1..=262144`；空文件零块。不设总 chunk 数或全文件字节产品上限。
+- Canonical ID：SHA-256（小写 hex）over JSON of `(version, algorithm, hash_algorithm, media_oid, media_size, chunks)`。`created_by` 与 `fallback_oid` 不进入 identity；分页边界不参与身份（P-01）。
+- 包装上限：Media metadata 单页/摘要/状态请求响应含包装 ≤ **1 MiB**（`MAX_ENVELOPE_SIZE`）；单页最多 **4096** 条且紧凑 entries JSON ≤ **960 KiB**（P-01a）；chunk payload ≤ 256 KiB；`created_by` ≤ 4096 bytes。完整 LFS 流不受页限额约束。
 - `fallback_oid` 若存在必须等于 `media_oid`。
-- HTTP 形状（路由由 FC-07 注册，路径以 Libra client 为准）：
+- HTTP 形状（路径以 Libra client 为准）：
   - capabilities：`GET <repo>.git/info/lfs/libra/media/v1/capabilities`
   - prepare：`POST …/manifests` → `{manifest_id, missing_chunks}`（唯一 hash 差集；exists 并发 ≤16）
-  - page：`PUT …/manifests/{id}/pages/{page_no}`
-  - seal：`POST …/manifests/{id}/seal`
-  - missing：`GET …/manifests/{id}/missing?cursor=…`
+  - page：`PUT …/manifests/{id}/pages/{page_no}`（幂等；内容冲突 409）
+  - seal：`POST …/manifests/{id}/seal` → `{manifest_id, seal_generation, page_count}`
+  - missing：`GET …/manifests/{id}/missing?cursor=` → `{hashes, next_cursor}`
   - upload：`PUT …/manifests/{id}/chunks/{hash}`（`application/octet-stream`）
-  - finalize：`POST …/manifests/{id}/finalize`
+  - finalize：`POST …/manifests/{id}/finalize`（MF-03/07 深化异步任务）
   - get：`GET …/manifests/by-media/{oid}` → `{manifest_id, manifest}`
   - chunk download：`GET …/manifests/by-media/{oid}/chunks/{hash}`
 
-## Scope / key（FC-03）
+## Capabilities（共享表）
+
+`Capabilities::v1()` 同时保留旧字段名并输出共享表字段：
+
+| 字段 | 值 |
+| --- | --- |
+| version | `"1"` |
+| batch_exists / supports_batch_exists | true |
+| range_read / supports_range_read | false |
+| standard_lfs_fallback / supports_standard_lfs_fallback | true |
+| supports_manifest_id_read | true |
+| manifest_paging | `"v1"` |
+| max_page_entries | 4096 |
+| max_page_bytes / max_manifest_size | 1048576 |
+| chunk_algorithms | `["fastcdc-v2020-32k"]` |
+| max_chunk_size | 262144 |
+
+## Scope / key（FC-03 / C-08）
 
 - Namespace 字符串 `media` 只追加，不改 git/lfs/log/artifact/attachment/oci。
 - Scope = 服务端 actor + canonical 绝对仓库路径；digest = SHA-256(`actor || 0x00 || repo`)。
   Actor 取 `AccessTokenUser` 的 `website_user_id`（非空）否则 `username`。请求体 actor/repository/`created_by` 不得覆盖。
-- Object key：`fastcdc-v2020-32k/{scope_digest}/{pending|chunk|manifest|finalized}/{id}`，存储路径 `media/` + key（Media 不走 3-level sharding）。旧前缀 `v1/` 保留不读写、不自动删除。
+- Object key：`fastcdc-v2020-32k/{scope_digest}/{pending|chunk|manifest|finalized|page}/{id}`，存储路径 `media/` + key（Media 不走 3-level sharding）。旧 `v1/` 对象隔离保留。
 - 对外错误不泄漏 digest、object key 或认证信息。
 
 ## 持久分页状态（FC-16 / MF-08）
 
-服务库新增三表（迁移 `m20260925_000100_media_paging`，可幂等 `IF NOT EXISTS`）：
+服务库三表（迁移 `m20260925_000100_media_paging`）：
 
-- `media_session`：`(scope_digest, manifest_id)` 会话；`pending|sealed|finalized`；`seal_generation` 供缺块 cursor 绑定。
-- `media_entry`：派生 chunk 索引（`page_no/ordinal/offset/length/chunk_hash`），跨页 hash→length 冲突拒绝；offset 覆盖查询有界（≤4096）。
-- `media_task`：异步 finalize 任务与 lease（`lease_epoch` fencing）；旧 epoch 不可推进进度或提交 finalized。
+- `media_session`：`(scope_digest, manifest_id)`；`pending|sealed|finalized`；`seal_generation` 绑定缺块 cursor。
+- `media_entry`：派生 chunk 索引；跨页 hash→length 冲突拒绝。
+- `media_task`：异步 finalize lease（MF-03/07）。
 
-对象存储中的 sealed 页仍是权威页内容；索引可从页重建。`down` 不删除任务数据（compensating：停写后切回旧命名空间）。
+`prepare` 在对象存储写入 pending 的同时 `upsert_pending_session`；`put_page` / `seal` / `missing` 走 `MediaPagingStorage` + page blob。
 
-## 生命周期（FC-05 prepare / upload / resume）
+## Prepare / chunk（FC-05）
 
-- `prepare` 只接受已 `validate` 的 manifest，并**强制** `fallback_oid = media_oid`；写入 `MediaPagingStorage` pending 会话。
-- pending 对象：`media/fastcdc-v2020-32k/{scope}/pending/{manifest_id}`，逻辑 TTL **24 小时**，JSON ≤ **1 MiB**。过期 session 不能继续 upload/get。
-- `missing_chunks` / missing cursor 按 scoped chunk key 检查存在性；重复 `chunk_hash` 在响应中去重（保序）；exists 并发 ≤16。
+- `prepare` 只接受已 `validate` 的 manifest（≤1 MiB 包装），并**强制** `fallback_oid = media_oid`；按 P-01a 计算 `page_count`。
+- pending 对象：`media/fastcdc-v2020-32k/{scope}/pending/{manifest_id}`，逻辑 TTL **24 小时**。过期 session 不能继续 upload/get。
+- `missing_chunks` 按 scoped chunk key 检查存在性（并发 ≤16）；重复 `chunk_hash` 在响应中去重（保序）。
 - chunk 上传必须命中 pending 声明的 hash/length，并校验实际 SHA-256（≤ 256 KiB）。同 scope 同 hash 的正确对象可幂等复用；已存错误内容返回 Conflict。
-- finalize 前只能通过 pending/sealed 声明的 hash 读取 chunk，不能按任意 hash 取对象。
 - 领域错误：`Invalid` / `NotFound` / `Conflict` / `Storage` / `Io` / `Json`。存储错误对外固定为 `media object store error`。
 
 ## Finalize / fallback（FC-06）
 
-- 同时最多 **2** 个 finalize（semaphore）。按 pending 声明的顺序逐块读取（≤256 KiB），写入临时文件并增量 SHA-256。
-- 校验整对象 `media_oid`/`media_size` 后，再跑一遍 `fastcdc-v2020-32k`：offset/length/hash 必须与 manifest 完全一致（MF-03 将改为覆盖验证、不再要求新鲜 CDC 边界）。
+- 同时最多 **2** 个 finalize（semaphore）。按 pending 声明的顺序逐块读取，写入临时文件并增量 SHA-256。
+- 校验整对象 `media_oid`/`media_size` 后，再跑一遍 `fastcdc-v2020-32k`：offset/length/hash 必须与 manifest 完全一致（冷切门；合法非冷切布局由 MF-03 放开）。
 - 缺失或损坏 chunk：**不**写 LFS namespace、**不**写 `lfs_objects`、**不**发布 finalized manifest；临时文件在成功和失败路径都删除。
-- 通过后：`put_stream_bounded` 发布到 `lfs/{oid}`，`lfs_objects` 以 `ON CONFLICT (oid) DO NOTHING` 幂等插入，重新读取 metadata 并确认对象存在，然后才写 `media/fastcdc-v2020-32k/{scope}/finalized/{media_oid}`。
+- 通过后：发布到 `lfs/{oid}`，`lfs_objects` 幂等插入，再写 `media/fastcdc-v2020-32k/{scope}/finalized/{media_oid}`。
 - 已存在的 finalized 若 `manifest_id`/`media_oid` 不一致则 Conflict；重复 finalize 在内容一致时成功。
 
 ## 出站事件（plan-20260912 / WH-06，已交付）
 
-- 既有 finalize 路径在**本次实际写入 finalized manifest 成功**后发一次 `lfs.media.finalized`（契约见 [`storage-events.md`](storage-events.md)）：scope 只填服务端 `MediaScope` 的 canonical `repo_path`（HTTP 上通常带 `.git` 后缀），data 为 `oid,size,manifest_id,transfer="fastcdc"`；`event_id` 为 UUID v4。
-- prepare / chunk / fallback 中间步骤不发；已存在 finalized 的 no-op 不发；finalize 中途失败不发。existing-check 与 put 非原子，并发 finalize（同进程或跨进程）可重复通知（本计划不新增唯一性锁/表）。
-- 认证不改：Media 路由仍全部要求 `AccessTokenUser` 的 DB access token；匿名与静态 push token 请求仍 401 且零事件。storage-only 的 `push_auth=none` 不影响独立 ingest token 的认证与租户归属。
-- 测试：`finalize::tests::storage_event_finalize_matrix`（真实 service finalize / no-op / 部分失败 / repo 过滤 / emitter 故障）、`lfs_media::tests::storage_event_auth_reachability`（匿名 / 静态 token / DB token 三类请求）、进程级 `integration_storage_events_media`（feature-on/off 两个独立 target-dir 二进制的路由与认证矩阵）。
+- 既有 finalize 路径在**本次实际写入 finalized manifest 成功**后发一次 `lfs.media.finalized`（契约见 [`storage-events.md`](storage-events.md)）：scope 只填服务端 `MediaScope` 的 canonical `repo_path`，data 为 `oid,size,manifest_id,transfer="fastcdc"`。
+- prepare / chunk / fallback 中间步骤不发；已存在 finalized 的 no-op 不发。
+- 认证不改：Media 路由仍全部要求 `AccessTokenUser`。
 
 ## HTTP / auth / OpenAPI（FC-07）
 
-- Feature-on 时挂在当前 LFS mount 下：逻辑前缀 `libra/media/v1`。仓库 URL `<repo>.git` 的外部路径是 `<repo>.git/info/lfs/libra/media/v1/...`；OpenAPI 登记为 `/api/v1/lfs/libra/media/v1/...`。Feature-off 不注册这些路由（运行时 404，schema 中也不出现）。
-- **每一条** Media 路由（含 capabilities）都要求 `AccessTokenUser`（Bearer）。不复用标准 LFS objects 的「batch 后裸 URL 可不再认证」例外。
-- 仓库路径取 URI 改写前保存在 `LfsRepoContext` 的原始前缀（例如 `/acme/app.git`）。缺少合法前缀 → 400。
-- Body 上限在 handler 前拒绝：JSON/摘要/页路由 `DefaultBodyLimit` **1 MiB**；chunk PUT 路由 **256 KiB**。另有 `Content-Length` 中间件在读 body 前返回 413。
+- Feature-on 时挂在当前 LFS mount 下：逻辑前缀 `libra/media/v1`。OpenAPI 登记为 `/api/v1/lfs/libra/media/v1/...`。
+- **每一条** Media 路由（含 capabilities）都要求 `AccessTokenUser`（Bearer）。
+- Body 上限：JSON/metadata 路由 `DefaultBodyLimit` **1 MiB**；chunk PUT 路由 **256 KiB**。另有 `Content-Length` 中间件在读 body 前返回 413。
 - 错误：Invalid/Json → 400，NotFound → 404，Conflict → 409，Storage/Io → 500 且 body 固定 `media object store error`。
-- Capabilities JSON 来自 `Capabilities::v1()`：`fastcdc-v2020-32k`、sha256、1 MiB envelope、`batch_exists`/`supports_batch_exists`、`range_read=false`、`standard_lfs_fallback`、`supports_manifest_id_read=true`、`manifest_paging="v1"`、`max_page_entries=4096`、`max_page_bytes=1048576`。
-- 普通 LFS `/objects`、`/locks`、`/objects/batch` 行为不变。
 
-固定 fixture：`src/ceres/lfs/media/fixtures/`（合法 `valid_v1.json` / 空文件 `empty.json` / 非法 version 与 fallback）。`valid_v1.json` 字节 SHA-256：`20226243095e92274b3683f4c09bcd12ae35d245b073b38296a2a895c13b8c9d`。
+固定 fixture：`src/ceres/lfs/media/fixtures/`（合法 `valid_v1.json` / 空文件 `empty.json` / 非法 version 与 fallback）。`valid_v1.json` 字节 SHA-256：`09ae74a7f69da0bbd2b3df12d8f4bb85413b8ba34ec5de123f68141219ac3b96`。
 
 ## 双仓 interop gate（FC-15）
 
-默认 `cargo test --all` **不**要求 sibling Libra checkout。真实 client/server 证据只在显式 ignored target 下执行：
-
-```bash
-export LIBRA_DIR=/path/to/libra          # 干净 checkout，HEAD == LIBRA_INTEROP_REV
-export LIBRA_INTEROP_REV=d1aafb23dccb77408ac43786b173f1c9a0d760aa
-source .env.test
-cargo test -p mega2 --features fastcdc --test integration_fastcdc_libra \
-  -- --ignored --exact mega2_libra_fastcdc_interop --test-threads=1
-```
-
-Harness 启动 `--features fastcdc` 的 `service http`，写入仅当前测试可读的 ready-file（JSON：`lfs_url` 必须为 `<repo>.git/info/lfs/` 且带尾 `/`，加一次性 `token`），再精确运行 Libra `mega2_fastcdc_http_interop`。缺失 `LIBRA_DIR`、脏树、错误 revision 或没有 `cargo` 时失败，不得 SKIP-green。token 与完整 URL 不会写入失败输出或计划证据。
-
-Feature-off 对照（独立 target dir 构建未启用 feature 的 binary）：
-
-```bash
-CARGO_TARGET_DIR="$PWD/target/fastcdc-off" cargo build -p mega2
-export MEGA2_FASTCDC_OFF_BIN="$PWD/target/fastcdc-off/debug/mega2"
-source .env.test
-cargo test -p mega2 --features fastcdc --test integration_fastcdc_libra \
-  -- --ignored --exact mega2_fastcdc_feature_off_falls_back --test-threads=1
-```
-
-feature-off 时 `<repo>.git/info/lfs/libra/media/v1/capabilities` 为 404，Libra `media probe` 选择标准 LFS fallback。这不是标准 Git FastCDC 互通。
-
+默认 `cargo test --all` **不**要求 sibling Libra checkout。真实 client/server 证据只在显式 ignored target 下执行（见既有 `integration_fastcdc_libra` 说明）。feature-off 时 Media 能力探测为 404，Libra 选择标准 LFS fallback。
