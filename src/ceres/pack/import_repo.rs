@@ -20,6 +20,7 @@ use git_internal::{
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -148,7 +149,7 @@ impl RepoHandler for ImportRepo {
     ) -> Result<(), MegaError> {
         self.storage
             .import_service
-            .save_entry(self.repo.repo_id, entry_list)
+            .save_entry(self.repo.repo_id, &self.repo.repo_path, entry_list)
             .await
     }
 
@@ -370,33 +371,29 @@ impl RepoHandler for ImportRepo {
             return Ok(());
         }
         // Tags are written right after unpack, one ref at a time, with the
-        // receive-pack CAS (plan-20260923 ADR-FU-08 items 2 and 4).
-        let storage = self.storage.git_db_storage();
-        let conn = storage.get_connection();
-        let applied = match refs.command_type {
-            CommandType::Create => {
-                storage
-                    .create_ref_if_absent(self.repo.repo_id, refs.clone().into(), conn)
-                    .await
+        // receive-pack CAS (plan-20260923 ADR-FU-08 items 2 and 4), each in
+        // its own transaction behind the liveness lock (ADR-FU-09 item 5).
+        let txn = self
+            .storage
+            .git_db_storage()
+            .get_connection()
+            .begin()
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let applied = match self.write_tag_ref_in_txn(refs, &txn).await {
+            Ok(applied) => applied,
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return Err(GitError::CustomError(e.to_string()));
             }
-            CommandType::Delete => {
-                storage
-                    .remove_ref_if_unchanged(self.repo.repo_id, &refs.ref_name, &refs.old_id, conn)
-                    .await
-            }
-            CommandType::Update => {
-                storage
-                    .update_ref_if_unchanged(
-                        self.repo.repo_id,
-                        &refs.ref_name,
-                        &refs.old_id,
-                        &refs.new_id,
-                        conn,
-                    )
-                    .await
-            }
+        };
+        if applied {
+            txn.commit()
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+        } else {
+            let _ = txn.rollback().await;
         }
-        .map_err(|e| GitError::CustomError(e.to_string()))?;
         if !applied {
             return Err(GitError::CustomError(
                 ImportRepoError::StaleRef {
@@ -436,50 +433,22 @@ impl RepoHandler for ImportRepo {
     }
 
     async fn traverses_tree_and_update_filepath(&self) -> Result<(), MegaError> {
-        // Prefer the branch tip from this receive-pack (same as `attach_to_monorepo_parent`).
-        // DB `import_refs` is not updated until the attach transaction, so reading HEAD only
-        // from the DB would still see the pre-push tip during finalize.
-        let from_commands = {
-            let cmds = self
-                .command_list
-                .lock()
-                .expect("command_list lock poisoned");
-            cmds.iter()
-                .find(|c| c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id))
-                .map(|c| c.new_id.clone())
+        // A repository removed meanwhile is refused before any object is read
+        // (plan-20260923 ADR-FU-09 item 5).
+        if !import_repo_is_live(&self.storage, self.repo.repo_id, &self.repo.repo_path).await? {
+            return Err(ImportRepoError::Removed {
+                path: self.repo.repo_path.clone(),
+            }
+            .into());
+        }
+        let pairs = match self.filepath_pairs().await {
+            Ok(pairs) => pairs,
+            Err(error) => return Err(self.removed_or(error).await),
         };
-        let current_head = match from_commands {
-            Some(h) => h,
-            None => self.refs_with_head_hash().await?.0,
-        };
-        let commit = Commit::from_git_model(
-            self.storage
-                .git_db_storage()
-                .get_commit_by_hash(self.repo.repo_id, &current_head)
-                .await?
-                .unwrap(),
-        );
-
-        let root_tree = Tree::from_git_model(
-            self.storage
-                .git_db_storage()
-                .get_tree_by_hash(self.repo.repo_id, &commit.tree_id.to_string())
-                .await?
-                .unwrap()
-                .clone(),
-        );
-        let pairs = collect_git_blob_filepaths(
-            self.storage.git_db_storage(),
-            self.repo.repo_id,
-            root_tree,
-            PathBuf::new(),
-        )
-        .await?;
         self.storage
             .git_db_storage()
-            .update_git_blob_filepaths(self.repo.repo_id, pairs)
-            .await?;
-        Ok(())
+            .update_import_blob_filepaths_fenced(self.repo.repo_id, &self.repo.repo_path, pairs)
+            .await
     }
 }
 
@@ -497,8 +466,7 @@ pub(crate) async fn collect_git_blob_filepaths(
                 storage
                     .get_tree_by_hash(repo_id, &item.id.to_string())
                     .await?
-                    .unwrap()
-                    .clone(),
+                    .ok_or_else(|| MegaError::NotFound(format!("tree {}", item.id)))?,
             );
             pairs.extend(
                 collect_git_blob_filepaths(storage.clone(), repo_id, child, path.join(item.name))
@@ -507,7 +475,7 @@ pub(crate) async fn collect_git_blob_filepaths(
         } else {
             pairs.push((
                 item.id.to_string(),
-                path.join(item.name).to_str().unwrap().to_string(),
+                path.join(item.name).to_string_lossy().into_owned(),
             ));
         }
     }
@@ -515,6 +483,88 @@ pub(crate) async fn collect_git_blob_filepaths(
 }
 
 impl ImportRepo {
+    /// One receive-pack tag write inside `txn`: the liveness lock, then
+    /// exactly one CAS statement; whether the CAS applied.
+    pub(crate) async fn write_tag_ref_in_txn(
+        &self,
+        refs: &RefCommand,
+        txn: &DatabaseTransaction,
+    ) -> Result<bool, MegaError> {
+        let storage = self.storage.git_db_storage();
+        storage
+            .lock_live_import_repo(txn, self.repo.repo_id, &self.repo.repo_path)
+            .await?;
+        match refs.command_type {
+            CommandType::Create => {
+                storage
+                    .create_ref_if_absent(self.repo.repo_id, refs.clone().into(), txn)
+                    .await
+            }
+            CommandType::Delete => {
+                storage
+                    .remove_ref_if_unchanged(self.repo.repo_id, &refs.ref_name, &refs.old_id, txn)
+                    .await
+            }
+            CommandType::Update => {
+                storage
+                    .update_ref_if_unchanged(
+                        self.repo.repo_id,
+                        &refs.ref_name,
+                        &refs.old_id,
+                        &refs.new_id,
+                        txn,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// `(blob_id, path)` of every blob under this push's head.
+    async fn filepath_pairs(&self) -> Result<Vec<(String, String)>, MegaError> {
+        // Prefer the branch tip from this receive-pack (same as `attach_to_monorepo_parent`).
+        // DB `import_refs` is not updated until the attach transaction, so reading HEAD only
+        // from the DB would still see the pre-push tip during finalize.
+        let from_commands = {
+            let cmds = self
+                .command_list
+                .lock()
+                .expect("command_list lock poisoned");
+            cmds.iter()
+                .find(|c| c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id))
+                .map(|c| c.new_id.clone())
+        };
+        let current_head = match from_commands {
+            Some(h) => h,
+            None => self.refs_with_head_hash().await?.0,
+        };
+        let git_db = self.storage.git_db_storage();
+        let commit = Commit::from_git_model(
+            git_db
+                .get_commit_by_hash(self.repo.repo_id, &current_head)
+                .await?
+                .ok_or_else(|| MegaError::NotFound(format!("commit {current_head}")))?,
+        );
+        let root_tree = Tree::from_git_model(
+            git_db
+                .get_tree_by_hash(self.repo.repo_id, &commit.tree_id.to_string())
+                .await?
+                .ok_or_else(|| MegaError::NotFound(format!("tree {}", commit.tree_id)))?,
+        );
+        collect_git_blob_filepaths(git_db, self.repo.repo_id, root_tree, PathBuf::new()).await
+    }
+
+    /// `IMPORT_REPO_REMOVED` when the repository is gone (the sweep took the
+    /// objects), else `error`.
+    async fn removed_or(&self, error: MegaError) -> MegaError {
+        match import_repo_is_live(&self.storage, self.repo.repo_id, &self.repo.repo_path).await {
+            Ok(false) => ImportRepoError::Removed {
+                path: self.repo.repo_path.clone(),
+            }
+            .into(),
+            _ => error,
+        }
+    }
+
     /// Whether this push's branch commands are already in effect: every
     /// Create / Update ref points at its `new_id` and every Delete ref is gone.
     async fn attach_refs_applied(&self, payload: &AttachPayload) -> Result<bool, MegaError> {
@@ -659,7 +709,20 @@ impl ImportRepo {
         };
 
         match wait {
-            QueueWaitResult::Replayed { .. } => Ok(()),
+            // Refs already in effect, but a delete-only round replayed after a
+            // detach also reads as applied: the repository must still be live.
+            QueueWaitResult::Replayed { .. } => {
+                if import_repo_is_live(&self.storage, self.repo.repo_id, &self.repo.repo_path)
+                    .await?
+                {
+                    Ok(())
+                } else {
+                    Err(ImportRepoError::Removed {
+                        path: self.repo.repo_path.clone(),
+                    }
+                    .into())
+                }
+            }
             QueueWaitResult::Abandoned { id } => Err(MegaError::Other(format!(
                 "attach wait abandoned for push_queue id {id}"
             ))),
@@ -943,8 +1006,6 @@ async fn sweep_ledger_row(
     actor: &str,
     budget: &mut u32,
 ) -> Result<RowSweep, MegaError> {
-    use sea_orm::TransactionTrait;
-
     if row.state == CleanupState::Swept {
         return Ok(RowSweep::Swept);
     }
@@ -1134,11 +1195,15 @@ fn attach_refusal(payload: &AttachPayload, id: i64, message: &str) -> MegaError 
     let occupied = ImportRepoError::PathOccupied {
         path: payload.repo_path.clone(),
     };
+    let removed = ImportRepoError::Removed {
+        path: payload.repo_path.clone(),
+    };
     let stale = payload.commands.iter().map(|c| ImportRepoError::StaleRef {
         ref_name: c.ref_name.clone(),
         expected: c.old_id.clone(),
     });
-    if let Some(typed) = std::iter::once(occupied)
+    if let Some(typed) = [occupied, removed]
+        .into_iter()
         .chain(stale)
         .find(|candidate| candidate.to_string() == message)
     {
@@ -1286,7 +1351,10 @@ mod tests {
                 repo::Repo,
             },
         },
-        common::utils::{ZERO_ID, generate_id},
+        common::{
+            errors::{ImportRepoError, MegaError},
+            utils::{ZERO_ID, generate_id},
+        },
         config::RedisConfig,
         jupiter::{
             migration::apply_migrations,
@@ -1358,9 +1426,15 @@ mod tests {
         .unwrap();
         let commit = Commit::from_tree_id(tree.id, vec![], message);
         storage
+            .git_db_storage()
+            .register_import_repo(repo.clone().into())
+            .await
+            .unwrap();
+        storage
             .import_service
             .save_entry(
                 repo_id,
+                &repo.repo_path,
                 vec![
                     MetaAttached {
                         inner: readme.into(),
@@ -1856,6 +1930,7 @@ mod tests {
             .import_service
             .save_entry(
                 repo.repo_id,
+                &repo.repo_path,
                 vec![MetaAttached {
                     inner: c2.clone().into(),
                     meta: EntryMeta::new(),
@@ -2624,11 +2699,6 @@ mod tests {
 
     async fn fu17_mount(storage: &Storage, path: &str) -> Repo {
         let (repo, _commit, create) = seed_import_repo_with_main_tip(storage, path).await;
-        storage
-            .git_db_storage()
-            .save_git_repo(repo.clone().into())
-            .await
-            .unwrap();
         fu13_push(storage, &repo, vec![create]).await.unwrap();
         repo
     }
@@ -3039,11 +3109,6 @@ mod tests {
         // A registered child (no attach yet) and an alias row of the parent.
         let (child, _, _) =
             seed_import_repo_with_main_tip(&storage, "/third-party/fu17-parent/child").await;
-        storage
-            .git_db_storage()
-            .save_git_repo(child.clone().into())
-            .await
-            .unwrap();
         storage
             .git_db_storage()
             .save_git_repo(crate::callisto::git_repo::Model {
@@ -3668,13 +3733,7 @@ mod tests {
         let storage = wired_storage_with_monorepo(&temp).await;
         let path = "/third-party/fu17-b3";
         let parent = fu17_mount(&storage, path).await;
-        let (child, _, _) =
-            seed_import_repo_with_main_tip(&storage, "/third-party/fu17-b3/child").await;
-        storage
-            .git_db_storage()
-            .save_git_repo(child.clone().into())
-            .await
-            .unwrap();
+        seed_import_repo_with_main_tip(&storage, "/third-party/fu17-b3/child").await;
         // Past the entry's pre-check (a child registered in between): B3's
         // own re-check refuses and the refusal reaches the caller typed.
         let err = detach_import_repo(&storage, disabled_cache().await, parent.repo_id, path, None)
@@ -3864,5 +3923,561 @@ mod tests {
             CleanupState::Swept
         );
         assert_eq!(fu17_objects(&storage, older_repo).await, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // plan-20260923 FU-18: the receive-pack write fence.
+    // ---------------------------------------------------------------------
+
+    async fn fu18_import_repo(
+        storage: &Storage,
+        repo: &Repo,
+        commands: Vec<RefCommand>,
+    ) -> ImportRepo {
+        ImportRepo {
+            storage: storage.clone(),
+            repo: repo.clone(),
+            command_list: Mutex::new(commands),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        }
+    }
+
+    /// A registered repository with `main` mounted at `path`; its tip.
+    async fn fu18_mount(storage: &Storage, path: &str) -> (Repo, String) {
+        let (repo, c1, create) = seed_import_repo_with_main_tip(storage, path).await;
+        fu13_push(storage, &repo, vec![create]).await.unwrap();
+        (repo, c1.id.to_string())
+    }
+
+    fn fu18_removed(path: &str) -> String {
+        ImportRepoError::Removed {
+            path: path.to_owned(),
+        }
+        .to_string()
+    }
+
+    async fn fu18_file_paths(storage: &Storage, repo_id: i64) -> Vec<(String, String)> {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        storage
+            .git_db_storage()
+            .get_connection()
+            .query_all_raw(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "SELECT blob_id, file_path FROM git_blob WHERE repo_id = {repo_id} ORDER BY blob_id"
+                ),
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get("", "blob_id").unwrap(),
+                    row.try_get("", "file_path").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fu18_receive_pack_writes_fenced() {
+        use crate::jupiter::storage::git_db_storage::fu18_support::import_refs_count;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let git_db = storage.git_db_storage();
+        let conn = git_db.get_connection().clone();
+        let path = "/third-party/fu18-rp";
+        let (repo, c1) = fu18_mount(&storage, path).await;
+        let branch = |old: &str, new: &str, name: &str| {
+            RefCommand::new(old.to_owned(), new.to_owned(), name.to_owned())
+        };
+        // While live: a delete-only round (Done, replayable later) and a tag.
+        fu13_push(
+            &storage,
+            &repo,
+            vec![branch(ZERO_ID, &c1, "refs/heads/topic")],
+        )
+        .await
+        .unwrap();
+        fu13_push(
+            &storage,
+            &repo,
+            vec![branch(&c1, ZERO_ID, "refs/heads/topic")],
+        )
+        .await
+        .unwrap();
+        let ir = fu18_import_repo(&storage, &repo, vec![]).await;
+        ir.update_refs(&branch(ZERO_ID, &c1, "refs/tags/v1"))
+            .await
+            .unwrap();
+
+        // Detached, not swept: the objects are still there.
+        let cleanup_id =
+            detach_import_repo(&storage, disabled_cache().await, repo.repo_id, path, None)
+                .await
+                .unwrap()
+                .expect("cleanup id");
+        let root = fu17_root(&storage).await;
+        let file_paths = fu18_file_paths(&storage, repo.repo_id).await;
+        let audits = format!(
+            "SELECT count(*) AS n FROM audit_logs WHERE target_id = {}",
+            repo.repo_id
+        );
+        let audit_rows = fu17_count(&storage, &audits).await;
+        let rounds = "SELECT count(*) AS n FROM push_queue";
+        let removed = fu18_removed(path);
+
+        // Tag writes, one transaction each.
+        for tag in [
+            branch(ZERO_ID, &c1, "refs/tags/v2"),
+            branch(&c1, &"2".repeat(40), "refs/tags/v1"),
+            branch(&c1, ZERO_ID, "refs/tags/v1"),
+        ] {
+            assert_eq!(ir.update_refs(&tag).await.unwrap_err().to_string(), removed);
+        }
+        // A fresh delete-only round reaches B3's fence.
+        assert_eq!(
+            fu13_push(
+                &storage,
+                &repo,
+                vec![branch(&c1, ZERO_ID, "refs/heads/main")]
+            )
+            .await
+            .unwrap_err(),
+            removed
+        );
+        // The replay of the Done delete-only round answers without B3.
+        let before = fu17_count(&storage, rounds).await;
+        assert_eq!(
+            fu13_push(
+                &storage,
+                &repo,
+                vec![branch(&c1, ZERO_ID, "refs/heads/topic")]
+            )
+            .await
+            .unwrap_err(),
+            removed
+        );
+        assert_eq!(fu17_count(&storage, rounds).await, before, "no new round");
+        // A stale first mount of another branch.
+        assert_eq!(
+            fu13_push(
+                &storage,
+                &repo,
+                vec![branch(ZERO_ID, &c1, "refs/heads/topic2")]
+            )
+            .await
+            .unwrap_err(),
+            removed
+        );
+        // The file_path step: pre-check and the fenced chunk writer.
+        let finalize =
+            fu18_import_repo(&storage, &repo, vec![branch(&c1, &c1, "refs/heads/main")]).await;
+        assert_eq!(
+            finalize
+                .traverses_tree_and_update_filepath()
+                .await
+                .unwrap_err()
+                .to_string(),
+            removed
+        );
+        let readme = Blob::from_content("hello from import repo").id.to_string();
+        assert_eq!(
+            git_db
+                .update_import_blob_filepaths_fenced(repo.repo_id, path, vec![(readme, "x".into())])
+                .await
+                .unwrap_err()
+                .to_string(),
+            removed
+        );
+
+        assert_eq!(import_refs_count(&conn, repo.repo_id).await, 0);
+        assert_eq!(
+            fu17_root(&storage).await,
+            root,
+            "the leaf is not mounted again"
+        );
+        assert_eq!(fu17_count(&storage, &audits).await, audit_rows);
+        assert_eq!(fu18_file_paths(&storage, repo.repo_id).await, file_paths);
+
+        // Swept: the objects are gone, the file_path step still answers
+        // REMOVED instead of failing on a missing commit.
+        assert!(matches!(
+            fu17_remove(&storage, path, None, Some(cleanup_id)).await.unwrap(),
+            RemoveOutcome::Removed { repo_id, .. } if repo_id == repo.repo_id
+        ));
+        assert_eq!(fu17_objects(&storage, repo.repo_id).await, 0);
+        assert_eq!(
+            finalize
+                .traverses_tree_and_update_filepath()
+                .await
+                .unwrap_err()
+                .to_string(),
+            removed
+        );
+    }
+
+    #[tokio::test]
+    async fn fu18_tag_lock_serializes_with_detach() {
+        use sea_orm::TransactionTrait;
+
+        use crate::jupiter::storage::git_db_storage::fu18_support::{
+            blocked_by_me, import_refs_count, park_detach, single_connection,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let git_db = storage.git_db_storage();
+        let conn = git_db.get_connection().clone();
+
+        // The tag first: the detach waits for it, then deletes the tag with
+        // the repository's other refs.
+        let path = "/third-party/fu18-tag";
+        let (repo, c1) = fu18_mount(&storage, path).await;
+        let ir = fu18_import_repo(&storage, &repo, vec![]).await;
+        let tag = conn.begin().await.unwrap();
+        assert!(
+            ir.write_tag_ref_in_txn(
+                &RefCommand::new(ZERO_ID.to_owned(), c1.clone(), "refs/tags/held".to_owned()),
+                &tag,
+            )
+            .await
+            .unwrap()
+        );
+        let detach_storage = storage.clone();
+        let repo_id = repo.repo_id;
+        let detaching = tokio::spawn(async move {
+            detach_import_repo(
+                &detach_storage,
+                disabled_cache().await,
+                repo_id,
+                "/third-party/fu18-tag",
+                None,
+            )
+            .await
+        });
+        assert!(
+            blocked_by_me(&tag, false).await,
+            "the detach waits on the tag"
+        );
+        tag.commit().await.unwrap();
+        assert!(detaching.await.unwrap().unwrap().is_some());
+        assert_eq!(import_refs_count(&conn, repo.repo_id).await, 0);
+        assert!(
+            git_db
+                .find_git_repo_exact_match(path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // The detach first (parked at its import_refs delete): the tag waits
+        // on it and then lands nothing.
+        let path2 = "/third-party/fu18-tag2";
+        let (repo2, c2) = fu18_mount(&storage, path2).await;
+        let single = single_connection(&conn).await;
+        let parked = park_detach(&single, repo2.repo_id).await;
+        let detach_storage = storage.clone();
+        let repo2_id = repo2.repo_id;
+        let detaching = tokio::spawn(async move {
+            detach_import_repo(
+                &detach_storage,
+                disabled_cache().await,
+                repo2_id,
+                "/third-party/fu18-tag2",
+                None,
+            )
+            .await
+        });
+        assert!(
+            blocked_by_me(&parked, false).await,
+            "the detach parks at its import_refs delete"
+        );
+        let tag_storage = storage.clone();
+        let tag_repo = repo2.clone();
+        let tagging = tokio::spawn(async move {
+            fu18_import_repo(&tag_storage, &tag_repo, vec![])
+                .await
+                .update_refs(&RefCommand::new(
+                    ZERO_ID.to_owned(),
+                    c2,
+                    "refs/tags/late".to_owned(),
+                ))
+                .await
+                .map_err(|e| e.to_string())
+        });
+        assert!(
+            blocked_by_me(&parked, true).await,
+            "the tag waits on the detach"
+        );
+        parked.commit().await.unwrap();
+        assert!(detaching.await.unwrap().unwrap().is_some());
+        assert_eq!(tagging.await.unwrap().unwrap_err(), fu18_removed(path2));
+        assert_eq!(import_refs_count(&conn, repo2.repo_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn fu18_unpack_refusal_keeps_code() {
+        use git_internal::hash::ObjectHash;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        use crate::jupiter::storage::git_db_storage::fu18_support::object_counts;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu18-unpack";
+        let (repo, _) = fu18_mount(&storage, path).await;
+        assert!(matches!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Removed { .. }
+        ));
+        // A stale unpack: the batch is refused with its stable code, not
+        // wrapped as a generic save failure.
+        let ir = Arc::new(fu18_import_repo(&storage, &repo, vec![]).await);
+        let (entries, rx) = unbounded_channel();
+        let (_pack_ids, rx_pack) = unbounded_channel::<ObjectHash>();
+        entries
+            .send(MetaAttached {
+                inner: Blob::from_content("fu18 unpack").into(),
+                meta: EntryMeta::new(),
+            })
+            .unwrap();
+        drop(entries);
+        let refused = ir.receiver_handler(rx, rx_pack).await.unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                MegaError::ImportRepo(ImportRepoError::Removed { .. })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.to_string(), fu18_removed(path));
+        assert_eq!(
+            object_counts(storage.git_db_storage().get_connection(), repo.repo_id).await,
+            [0, 0, 0, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn fu18_filepath_errors_not_panics() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let readme = Blob::from_content("hello from import repo").id.to_string();
+
+        // Live and complete: the step writes as before.
+        let (live, c1) = fu18_mount(&storage, "/third-party/fu18-fp-live").await;
+        let main = |old: &str, new: &str| {
+            RefCommand::new(old.to_owned(), new.to_owned(), "refs/heads/main".to_owned())
+        };
+        fu18_import_repo(&storage, &live, vec![main(&c1, &c1)])
+            .await
+            .traverses_tree_and_update_filepath()
+            .await
+            .unwrap();
+        assert!(
+            fu18_file_paths(&storage, live.repo_id)
+                .await
+                .contains(&(readme.clone(), "README.md".to_owned()))
+        );
+
+        // Live but the head commit is unknown: an error naming it, no panic.
+        let (repo, c1) = fu18_mount(&storage, "/third-party/fu18-fp").await;
+        let unknown = "e".repeat(40);
+        let missing = fu18_import_repo(&storage, &repo, vec![main(&c1, &unknown)])
+            .await
+            .traverses_tree_and_update_filepath()
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, MegaError::NotFound(_)), "{missing:?}");
+        assert!(missing.to_string().contains(&unknown), "{missing}");
+
+        // Live, the head commit present but a tree missing (the root, then a
+        // subtree): errors naming the tree, no panic.
+        let (broken, b1) = fu18_mount(&storage, "/third-party/fu18-fp-trees").await;
+        let ghost = Tree::from_tree_items(vec![TreeItem {
+            mode: TreeItemMode::Blob,
+            id: Blob::from_content("fu18 ghost").id,
+            name: "ghost.txt".to_string(),
+        }])
+        .unwrap();
+        let root = Tree::from_tree_items(vec![TreeItem {
+            mode: TreeItemMode::Tree,
+            id: ghost.id,
+            name: "sub".to_string(),
+        }])
+        .unwrap();
+        let with_ghost = Commit::from_tree_id(root.id, vec![], "fu18 ghost subtree");
+        storage
+            .import_service
+            .save_entry(
+                broken.repo_id,
+                &broken.repo_path,
+                vec![
+                    MetaAttached {
+                        inner: root.into(),
+                        meta: EntryMeta::new(),
+                    },
+                    MetaAttached {
+                        inner: with_ghost.clone().into(),
+                        meta: EntryMeta::new(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let subtree = fu18_import_repo(
+            &storage,
+            &broken,
+            vec![main(&b1, &with_ghost.id.to_string())],
+        )
+        .await
+        .traverses_tree_and_update_filepath()
+        .await
+        .unwrap_err();
+        assert!(matches!(subtree, MegaError::NotFound(_)), "{subtree:?}");
+        assert!(
+            subtree.to_string().contains(&ghost.id.to_string()),
+            "{subtree}"
+        );
+        let b1_tree = Commit::from_git_model(
+            storage
+                .git_db_storage()
+                .get_commit_by_hash(broken.repo_id, &b1)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .tree_id
+        .to_string();
+        fu17_exec(
+            &storage,
+            &format!(
+                "DELETE FROM git_tree WHERE repo_id = {} AND tree_id = '{b1_tree}'",
+                broken.repo_id
+            ),
+        )
+        .await;
+        let root_missing = fu18_import_repo(&storage, &broken, vec![main(&b1, &b1)])
+            .await
+            .traverses_tree_and_update_filepath()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(root_missing, MegaError::NotFound(_)),
+            "{root_missing:?}"
+        );
+        assert!(
+            root_missing.to_string().contains(&b1_tree),
+            "{root_missing}"
+        );
+
+        // Detached: a missing object reads as REMOVED.
+        detach_import_repo(
+            &storage,
+            disabled_cache().await,
+            repo.repo_id,
+            &repo.repo_path,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("cleanup id");
+        let ir = fu18_import_repo(&storage, &repo, vec![]).await;
+        assert_eq!(
+            ir.removed_or(MegaError::NotFound("tree x".into()))
+                .await
+                .to_string(),
+            fu18_removed(&repo.repo_path)
+        );
+
+        // Detached: the step answers before reading any object. With the
+        // commit and tree tables locked by another transaction, a read would
+        // wait; the liveness check reads only `git_repo`.
+        use sea_orm::{ConnectionTrait, TransactionTrait};
+        let conn = storage.git_db_storage().get_connection().clone();
+        let holder = conn.begin().await.unwrap();
+        holder
+            .execute_unprepared("LOCK TABLE git_commit, git_tree IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let finalize = fu18_import_repo(&storage, &repo, vec![main(&c1, &c1)]).await;
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            finalize.traverses_tree_and_update_filepath(),
+        )
+        .await;
+        holder.rollback().await.unwrap();
+        assert_eq!(
+            answered
+                .expect("no object read before the liveness check")
+                .unwrap_err()
+                .to_string(),
+            fu18_removed(&repo.repo_path)
+        );
+    }
+
+    #[test]
+    fn fu18_attach_refusal_rebuilds_removed() {
+        let payload = AttachPayload {
+            op: AttachOp::Attach,
+            repo_id: 1,
+            repo_path: "/third-party/x".to_owned(),
+            commands: vec![],
+        };
+        let refused = super::attach_refusal(&payload, 9, &fu18_removed("/third-party/x"));
+        assert!(
+            matches!(
+                refused,
+                MegaError::ImportRepo(ImportRepoError::Removed { ref path })
+                    if path == "/third-party/x"
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// The repository goes away after the step's liveness check but before
+    /// its object reads (here: while they wait on a table lock): the missing
+    /// commit reads as REMOVED, not as a missing object.
+    #[tokio::test]
+    async fn fu18_filepath_removed_between_check_and_reads() {
+        use sea_orm::{ConnectionTrait, TransactionTrait};
+
+        use crate::jupiter::storage::git_db_storage::fu18_support::blocked_by_me;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu18-fp-race";
+        let (repo, c1) = fu18_mount(&storage, path).await;
+        let conn = storage.git_db_storage().get_connection().clone();
+        let holder = conn.begin().await.unwrap();
+        holder
+            .execute_unprepared("LOCK TABLE git_commit IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let step_storage = storage.clone();
+        let step_repo = repo.clone();
+        let step = tokio::spawn(async move {
+            let head = RefCommand::new(c1.clone(), c1, "refs/heads/main".to_owned());
+            fu18_import_repo(&step_storage, &step_repo, vec![head])
+                .await
+                .traverses_tree_and_update_filepath()
+                .await
+                .map_err(|e| e.to_string())
+        });
+        assert!(
+            blocked_by_me(&holder, false).await,
+            "the step passed its liveness check and waits on the commit read"
+        );
+        // What a detach and a sweep delete, committed while the step waits.
+        for sql in [
+            format!("DELETE FROM git_repo WHERE id = {}", repo.repo_id),
+            format!("DELETE FROM git_commit WHERE repo_id = {}", repo.repo_id),
+        ] {
+            holder.execute_unprepared(&sql).await.unwrap();
+        }
+        holder.commit().await.unwrap();
+        assert_eq!(step.await.unwrap().unwrap_err(), fu18_removed(path));
     }
 }

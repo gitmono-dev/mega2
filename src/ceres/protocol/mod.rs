@@ -14,7 +14,10 @@ use tokio::sync::RwLock;
 use crate::{
     ceres::{
         api_service::state::ProtocolApiState,
-        pack::{RepoHandler, import_repo::ImportRepo, monorepo::Monorepo, push_chain},
+        pack::{
+            RepoHandler, import_repo::ImportRepo, monorepo::Monorepo,
+            path_policy::check_import_repo_leaf, push_chain,
+        },
     },
     common::{
         errors::{MegaError, ProtocolError},
@@ -243,6 +246,10 @@ impl SmartSession {
             let raw_path = repo_path_to_str(&self.repo_path)?;
             let path_str = canonicalize_mono_ref_path(raw_path)
                 .map_err(|e| ProtocolError::InvalidInput(e.to_string()))?;
+            // plan-20260923 ADR-FU-08 item 7: only a path strictly below
+            // `import_dir` is an ImportRepo; checked before any lookup, relabel
+            // or registration, for both services.
+            check_import_repo_leaf(&config.monorepo, &path_str).map_err(MegaError::from)?;
             let path_buf = PathBuf::from(&path_str);
             // Prefer canonical lookup; fall back to the raw path so pre-TP-08
             // aliased `git_repo` rows remain reachable under the same repo_id.
@@ -272,7 +279,8 @@ impl SmartSession {
                     }
                     ServiceType::ReceivePack => {
                         let repo = Repo::new(path_buf, false)?;
-                        storage.save_git_repo(repo.clone().into()).await?;
+                        // Ancestor lifecycle fence (ADR-FU-09 item 2).
+                        storage.register_import_repo(repo.clone().into()).await?;
                         repo
                     }
                 }

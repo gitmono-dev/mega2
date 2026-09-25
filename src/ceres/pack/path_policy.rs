@@ -2,7 +2,10 @@
 //! classifier shared by path provisioning, product writes and receive-pack.
 
 use crate::{
-    common::{errors::PathPolicyError, utils::canonicalize_mono_ref_path},
+    common::{
+        errors::{ImportRepoError, PathPolicyError},
+        utils::canonicalize_mono_ref_path,
+    },
     config::MonoConfig,
 };
 
@@ -64,6 +67,69 @@ pub fn strict_creation_path_input(input: &str) -> Result<String, PathPolicyError
             "path must be an absolute path without '.' or '..' segments",
         )),
     }
+}
+
+/// ImportRepo leaf check (plan-20260923 ADR-FU-08 item 7, ADR-FU-10 item 1):
+/// `canonical_path` must be canonical, free of NUL and component-level
+/// strictly below `import_dir`, so `import_dir` itself is never an
+/// ImportRepo. Protocol dispatch calls it right after TP-08 canonicalization,
+/// before any lookup or registration.
+pub fn check_import_repo_leaf(
+    config: &MonoConfig,
+    canonical_path: &str,
+) -> Result<(), ImportRepoError> {
+    if canonical_path.contains('\0') {
+        return Err(leaf_invalid(canonical_path, "path must not contain NUL"));
+    }
+    if canonicalize_mono_ref_path(canonical_path).ok().as_deref() != Some(canonical_path) {
+        return Err(leaf_invalid(canonical_path, "path is not canonical"));
+    }
+    let import_dir = config.import_dir.to_string_lossy();
+    if canonical_path == import_dir {
+        return Err(leaf_invalid(
+            canonical_path,
+            "the ImportRepo directory itself is not an ImportRepo; push to a path below it",
+        ));
+    }
+    if !is_same_or_under(canonical_path, &import_dir) {
+        return Err(leaf_invalid(
+            canonical_path,
+            &format!("an ImportRepo path must lie strictly below {import_dir:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Strict ImportRepo path input for the cleanup API and the operator CLI
+/// (ADR-FU-10 item 1): NUL and `\` are refused, the raw input must already be
+/// canonical (no `..`, repeated or trailing slashes), then the leaf check.
+pub fn strict_import_repo_leaf_input(
+    config: &MonoConfig,
+    raw: &str,
+) -> Result<String, ImportRepoError> {
+    if raw.contains('\0') {
+        return Err(leaf_invalid(raw, "path must not contain NUL"));
+    }
+    if raw.contains('\\') {
+        return Err(leaf_invalid(raw, "path must use '/' as the separator"));
+    }
+    match canonicalize_mono_ref_path(raw) {
+        Ok(canonical) if canonical == raw => {}
+        Ok(canonical) => {
+            return Err(leaf_invalid(
+                raw,
+                &format!("path must be canonical (did you mean {canonical:?}?)"),
+            ));
+        }
+        Err(_) => {
+            return Err(leaf_invalid(
+                raw,
+                "path must be an absolute path without '.' or '..' segments",
+            ));
+        }
+    }
+    check_import_repo_leaf(config, raw)?;
+    Ok(raw.to_owned())
 }
 
 /// True when `canonical_path` is `import_dir` or below it (component-level).
@@ -145,6 +211,13 @@ pub fn not_allowed(config: &MonoConfig, path: &str) -> PathPolicyError {
         path: path.to_owned(),
         allowed_roots,
         import_dir: config.import_dir.to_string_lossy().into_owned(),
+    }
+}
+
+fn leaf_invalid(path: &str, reason: &str) -> ImportRepoError {
+    ImportRepoError::PathInvalid {
+        path: path.to_owned(),
+        reason: reason.to_owned(),
     }
 }
 
@@ -339,5 +412,148 @@ mod tests {
             strict_creation_path_input("/").expect("root is canonical"),
             "/"
         );
+    }
+
+    fn assert_leaf_invalid(result: Result<impl std::fmt::Debug, ImportRepoError>, what: &str) {
+        match result {
+            Err(error @ ImportRepoError::PathInvalid { .. }) => {
+                let text = error.to_string();
+                assert!(
+                    text.starts_with("IMPORT_REPO_PATH_INVALID: "),
+                    "{what}: {text}"
+                );
+                assert!(
+                    !text.contains('\n') && !text.contains('\0'),
+                    "{what}: {text:?}"
+                );
+            }
+            other => panic!("{what}: expected PathInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_repo_leaf_core() {
+        let flat = config(&["third-party", "project"], "/third-party");
+        for path in [
+            "/third-party",
+            "/project/x",
+            "/third-partyx",
+            "/third-party/a\0b",
+            "/third-party/",
+            "/",
+        ] {
+            assert_leaf_invalid(check_import_repo_leaf(&flat, path), path);
+        }
+        for path in ["/third-party/a", "/third-party/a/b"] {
+            check_import_repo_leaf(&flat, path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        }
+        let nested = config(&["third-party"], "/third-party/vendor");
+        for path in ["/third-party", "/third-party/vendor", "/third-party/x"] {
+            assert_leaf_invalid(check_import_repo_leaf(&nested, path), path);
+        }
+        check_import_repo_leaf(&nested, "/third-party/vendor/x").expect("below import_dir");
+    }
+
+    #[test]
+    fn import_repo_leaf_strict_input() {
+        let config = config(&["third-party", "project"], "/third-party");
+        for raw in [
+            "/third-party/a/../b",
+            "/third-party//a",
+            "/third-party/a/",
+            "/third-party\\a",
+            "third-party/a",
+            " /third-party/a",
+            "/third-party/a\0",
+            "/third-party",
+            "",
+        ] {
+            assert_leaf_invalid(strict_import_repo_leaf_input(&config, raw), raw);
+        }
+        match strict_import_repo_leaf_input(&config, "/third-party/a/") {
+            Err(ImportRepoError::PathInvalid { reason, .. }) => {
+                assert!(
+                    reason.contains("did you mean \"/third-party/a\""),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected a did-you-mean reason, got {other:?}"),
+        }
+        assert_eq!(
+            strict_import_repo_leaf_input(&config, "/third-party/a").expect("canonical leaf"),
+            "/third-party/a"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_repo_leaf_dispatch_serves_canonical_path() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        use crate::{
+            ceres::{
+                api_service::state::ProtocolApiState,
+                protocol::{ServiceType, SmartSession, TransportProtocol},
+            },
+            common::errors::ProtocolError,
+            jupiter::storage::{
+                base_storage::StorageConnector,
+                git_db_storage::fu18_support::{test_cache, wired_storage},
+            },
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = wired_storage(temp.path()).await;
+        let state = ProtocolApiState {
+            storage: storage.clone(),
+            git_object_cache: test_cache().await,
+            entity_store: storage.entity_store(),
+        };
+        let session = |path: &str, service| {
+            SmartSession::new(PathBuf::from(path), service, TransportProtocol::Http)
+        };
+        // The check runs after TP-08 canonicalization: alias spellings of a
+        // leaf are served under the canonical path.
+        for (path, service) in [
+            ("/third-party/fu18-leaf/", ServiceType::ReceivePack),
+            ("/third-party//fu18-leaf/", ServiceType::UploadPack),
+        ] {
+            session(path, service)
+                .repo_handler_with_commands(&state, vec![])
+                .await
+                .map(|_| ())
+                .unwrap_or_else(|e| panic!("{path}: {e:?}"));
+        }
+        // ... and before any lookup or registration: the import directory
+        // itself and NUL are refused for both services.
+        for (path, service) in [
+            ("/third-party/", ServiceType::ReceivePack),
+            ("/third-party", ServiceType::UploadPack),
+            ("/third-party/a\0b", ServiceType::ReceivePack),
+        ] {
+            match session(path, service)
+                .repo_handler_with_commands(&state, vec![])
+                .await
+                .map(|_| ())
+            {
+                Err(ProtocolError::InvalidInput(message)) => assert!(
+                    message.starts_with("IMPORT_REPO_PATH_INVALID: "),
+                    "{path:?}: {message}"
+                ),
+                other => panic!("{path:?}: expected IMPORT_REPO_PATH_INVALID, got {other:?}"),
+            }
+        }
+        let rows: Vec<String> = storage
+            .git_db_storage()
+            .get_connection()
+            .query_all_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT repo_path FROM git_repo ORDER BY repo_path",
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get("", "repo_path").unwrap())
+            .collect();
+        assert_eq!(rows, vec!["/third-party/fu18-leaf".to_owned()]);
     }
 }

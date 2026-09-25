@@ -1527,6 +1527,17 @@ impl PushQueueService {
         message: String,
     ) -> Result<ExecuteOutcome, MegaError> {
         PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+        self.b3_attach_fail_unsaved(txn, id, message).await
+    }
+
+    /// Refuse an attach round that has written nothing yet (before SAVEPOINT
+    /// `b3_kind`): persist the row `Failed`.
+    async fn b3_attach_fail_unsaved(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        id: i64,
+        message: String,
+    ) -> Result<ExecuteOutcome, MegaError> {
         let updated =
             PushQueueStorage::mark_failed_if_running_in_txn(&txn, id, "AttachFailure", &message)
                 .await?;
@@ -1967,6 +1978,23 @@ impl PushQueueService {
                 .await;
         }
 
+        // plan-20260923 ADR-FU-09 item 5: the repository must still be live,
+        // whatever the round (first mount, update, delete-only). Its row stays
+        // share-locked until this round commits; a detached repository is
+        // refused before any other check and before any write.
+        let git_db = ctx.storage.git_db_storage();
+        if let Err(error) = git_db
+            .lock_live_import_repo(&txn, payload.repo_id, &repo_path)
+            .await
+        {
+            let MegaError::ImportRepo(removed) = error else {
+                return Err(error);
+            };
+            return self
+                .b3_attach_fail_unsaved(txn, row.id, removed.to_string())
+                .await;
+        }
+
         // A delete-only batch never touches the mount, so neither the
         // materialization precheck nor the ownership gate below protects
         // anything for it (and both would refuse deletes that worked before):
@@ -2015,7 +2043,6 @@ impl PushQueueService {
         // this ImportRepo's mount only with a provenance record, or in the
         // legacy `.gitkeep`-only shape of a repository that already has
         // branches (backfilled here); such a push writes refs only.
-        let git_db = ctx.storage.git_db_storage();
         if delete_only {
             return self
                 .b3_attach_update_refs(txn, row, &payload, &git_db, &expected_commit)
@@ -5842,9 +5869,15 @@ mod tests {
         .unwrap();
         let commit = Commit::from_tree_id(tree.id, vec![], "wh03 import commit");
         storage
+            .git_db_storage()
+            .register_import_repo(repo.clone().into())
+            .await
+            .unwrap();
+        storage
             .import_service
             .save_entry(
                 repo_id,
+                &repo.repo_path,
                 vec![
                     MetaAttached {
                         inner: readme.into(),
@@ -6309,7 +6342,7 @@ mod tests {
     /// A child of `parent` (same tree) stored in the ImportRepo tables.
     async fn fu13_next_commit(
         storage: &crate::jupiter::storage::Storage,
-        repo_id: i64,
+        repo: &crate::ceres::protocol::repo::Repo,
         parent: &git_internal::internal::object::commit::Commit,
         message: &str,
     ) -> git_internal::internal::object::commit::Commit {
@@ -6321,7 +6354,8 @@ mod tests {
         storage
             .import_service
             .save_entry(
-                repo_id,
+                repo.repo_id,
+                &repo.repo_path,
                 vec![MetaAttached {
                     inner: commit.clone().into(),
                     meta: EntryMeta::new(),
@@ -6381,7 +6415,7 @@ mod tests {
         );
         let root = fu13_root(&storage).await;
 
-        let c2 = fu13_next_commit(&storage, repo.repo_id, &c1, "fu13 second").await;
+        let c2 = fu13_next_commit(&storage, &repo, &c1, "fu13 second").await;
         let c2_id = c2.id.to_string();
         let second = fu13_attach(
             &storage,
@@ -6420,7 +6454,7 @@ mod tests {
         .await;
         assert!(matches!(nested, ExecuteOutcome::Done { .. }), "{nested:?}");
         let root = fu13_root(&storage).await;
-        let c3 = fu13_next_commit(&storage, repo.repo_id, &c2, "fu13 third").await;
+        let c3 = fu13_next_commit(&storage, &repo, &c2, "fu13 third").await;
         let c3_id = c3.id.to_string();
         let third = fu13_attach(
             &storage,
@@ -6653,7 +6687,7 @@ mod tests {
         forget(repo.repo_id).await.unwrap();
         assert!(!fu13_has_provenance(&storage, repo.repo_id, &repo.repo_path).await);
         let root = fu13_root(&storage).await;
-        let c2 = fu13_next_commit(&storage, repo.repo_id, &c1, "fu13 legacy second").await;
+        let c2 = fu13_next_commit(&storage, &repo, &c1, "fu13 legacy second").await;
         let c2_id = c2.id.to_string();
         let update = fu13_attach(
             &storage,
@@ -6731,7 +6765,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let d2 = fu13_next_commit(&storage, dir_repo.repo_id, &d1, "fu13 dir second").await;
+        let d2 = fu13_next_commit(&storage, &dir_repo, &d1, "fu13 dir second").await;
         let d2_id = d2.id.to_string();
         let occupied = fu13_attach(
             &storage,
@@ -7006,11 +7040,6 @@ mod tests {
         path: &str,
     ) -> (crate::ceres::protocol::repo::Repo, String) {
         let (repo, c1, _) = wh03_seed_import_repo(storage, path).await;
-        storage
-            .git_db_storage()
-            .save_git_repo(repo.clone().into())
-            .await
-            .unwrap();
         (repo, c1.id.to_string())
     }
 
@@ -8042,5 +8071,175 @@ mod tests {
             "{detached:?}"
         );
         assert_eq!(fu16_rows(&storage, decoy.repo_id).await, (0, 0));
+    }
+
+    // ---------------------------------------------------------------------
+    // plan-20260923 FU-18: the liveness fence of B3 attach.
+    // ---------------------------------------------------------------------
+
+    fn fu18_removed(path: &str) -> String {
+        crate::common::errors::ImportRepoError::Removed {
+            path: path.to_owned(),
+        }
+        .to_string()
+    }
+
+    /// A refused round: `Failed` / `AttachFailure` with `message`, persisted.
+    async fn fu18_assert_refused(
+        storage: &crate::jupiter::storage::Storage,
+        outcome: &ExecuteOutcome,
+        message: &str,
+    ) {
+        let ExecuteOutcome::Failed {
+            id,
+            failure,
+            message: got,
+        } = outcome
+        else {
+            panic!("expected a refused round, got {outcome:?}");
+        };
+        assert_eq!(failure, "AttachFailure");
+        assert_eq!(got, message);
+        let row = storage
+            .push_queue_service
+            .storage()
+            .get_by_id(*id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, PushQueueStatusEnum::Failed);
+        assert_eq!(row.error_message.as_deref(), Some(message));
+    }
+
+    async fn fu18_audits(storage: &crate::jupiter::storage::Storage, repo_id: i64) -> i64 {
+        fu16_count(
+            storage,
+            format!("SELECT count(*) AS n FROM audit_logs WHERE target_id = {repo_id}"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn fu18_stale_attach_after_detach_is_removed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let path = "/third-party/fu18-stale";
+        let (repo, c1) = fu16_mount(&storage, path).await;
+        let (_, detached) = fu16_detach(&storage, &repo).await;
+        assert!(
+            matches!(detached, ExecuteOutcome::Done { .. }),
+            "{detached:?}"
+        );
+        // No sweep: the commits are still there, so only the fence stops a
+        // first mount from rebuilding the leaf.
+        let root = fu13_root(&storage).await;
+        let audits = fu18_audits(&storage, repo.repo_id).await;
+        let stale = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/topic", "Create", ZERO_ID, &c1)],
+            &c1,
+        )
+        .await;
+        fu18_assert_refused(&storage, &stale, &fu18_removed(path)).await;
+        assert!(matches!(
+            fu16_leaf(&storage, path).await,
+            ImportLeaf::Absent
+        ));
+        assert_eq!(fu13_root(&storage).await, root);
+        assert_eq!(fu16_rows(&storage, repo.repo_id).await, (0, 0));
+        assert_eq!(fu18_audits(&storage, repo.repo_id).await, audits);
+    }
+
+    #[tokio::test]
+    async fn fu18_stale_attach_after_reimport_is_removed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let path = "/third-party/fu18-reimport";
+        let (r1, c1) = fu16_mount(&storage, path).await;
+        let (_, detached) = fu16_detach(&storage, &r1).await;
+        assert!(
+            matches!(detached, ExecuteOutcome::Done { .. }),
+            "{detached:?}"
+        );
+        let (r2, _) = fu16_mount(&storage, path).await;
+        let root = fu13_root(&storage).await;
+        let r2_rows = fu16_rows(&storage, r2.repo_id).await;
+        // R1's provenance record would pass the update-mode gate: only the
+        // fence keeps an orphan ref of R1 out.
+        let stale = fu13_attach(
+            &storage,
+            &r1,
+            vec![fu12_cmd("refs/heads/topic2", "Create", ZERO_ID, &c1)],
+            &c1,
+        )
+        .await;
+        fu18_assert_refused(&storage, &stale, &fu18_removed(path)).await;
+        assert_eq!(fu16_rows(&storage, r1.repo_id).await, (0, 0));
+        assert_eq!(fu16_rows(&storage, r2.repo_id).await, r2_rows);
+        assert_eq!(fu13_root(&storage).await, root);
+    }
+
+    #[tokio::test]
+    async fn fu18_stale_delete_only_after_detach_is_removed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let path = "/third-party/fu18-delete";
+        let (repo, c1) = fu16_mount(&storage, path).await;
+        let (_, detached) = fu16_detach(&storage, &repo).await;
+        assert!(
+            matches!(detached, ExecuteOutcome::Done { .. }),
+            "{detached:?}"
+        );
+        let root = fu13_root(&storage).await;
+        let stale = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/main", "Delete", &c1, ZERO_ID)],
+            ZERO_ID,
+        )
+        .await;
+        fu18_assert_refused(&storage, &stale, &fu18_removed(path)).await;
+        assert_eq!(fu13_root(&storage).await, root);
+        assert_eq!(fu16_rows(&storage, repo.repo_id).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn fu18_removed_outranks_materialization_precheck() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let path = "/third-party/fu18-prec";
+        let (repo, c1) = fu16_mount(&storage, path).await;
+        let (_, detached) = fu16_detach(&storage, &repo).await;
+        assert!(
+            matches!(detached, ExecuteOutcome::Done { .. }),
+            "{detached:?}"
+        );
+        // An ancestor with a materialized main ref (DEFER-FU-13/20 shape):
+        // the precheck would refuse with its I3 text.
+        storage
+            .mono_storage()
+            .save_refs(
+                crate::callisto::mega_refs::Model::new(
+                    "/third-party",
+                    MEGA_BRANCH_NAME.to_owned(),
+                    "a".repeat(40),
+                    "b".repeat(40),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let root = fu13_root(&storage).await;
+        let stale = fu13_attach(
+            &storage,
+            &repo,
+            vec![fu12_cmd("refs/heads/topic", "Create", ZERO_ID, &c1)],
+            &c1,
+        )
+        .await;
+        fu18_assert_refused(&storage, &stale, &fu18_removed(path)).await;
+        assert_eq!(fu13_root(&storage).await, root);
     }
 }

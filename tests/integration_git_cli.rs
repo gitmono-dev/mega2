@@ -6134,3 +6134,104 @@ fn import_repo_detach_then_clone_404() {
     );
     fu10_shutdown(service, &stderr_path);
 }
+
+/// plan-20260923 FU-18 (ADR-FU-08 item 7): the import directory itself is not
+/// an ImportRepo. Advertisement, upload-pack, a pack-less receive-pack and a
+/// real push at `/third-party` are refused with `IMPORT_REPO_PATH_INVALID`
+/// before any lookup or registration; a push to a two-level leaf below it still
+/// works and only adds that leaf's directories under the import root.
+#[test]
+fn import_root_push_rejected() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+    let env = GitCliEnv::new();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let case_dir = env.case_dir.as_path();
+    let db = env.database.db_url.clone();
+    let root_url = trunk_subpath_url(port, "/");
+    let root_main = fu13_remote_ref(case_dir, &root_url, "refs/heads/main");
+    let names = |clone: &str, tree: &str| -> std::collections::BTreeSet<String> {
+        git_stdout_no_auth(case_dir, &["-C", clone, "ls-tree", "--name-only", tree])
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    git_ok_no_auth(case_dir, &["clone", &root_url, "fu18-root-before"]);
+    let top_before = names("fu18-root-before", "HEAD");
+    let import_before = names("fu18-root-before", "HEAD:third-party");
+
+    let headers = probe_receive_pack_headers(port, "/third-party", None);
+    assert!(headers.starts_with("HTTP/1.1 400"), "{headers}");
+    let (headers, body) = probe_upload_pack_body(port, "/third-party");
+    assert!(headers.starts_with("HTTP/1.1 400"), "{headers}");
+    assert!(body.contains("IMPORT_REPO_PATH_INVALID"), "{body}");
+    let body = post_packless_receive_pack_commands(
+        port,
+        "/third-party",
+        "unused",
+        &[(ZERO_SHA1, &"1".repeat(40), "refs/heads/main")],
+    );
+    assert!(body.contains("IMPORT_REPO_PATH_INVALID"), "{body}");
+    git_ok_no_auth(case_dir, &["init", "-b", "main", "fu18-root"]);
+    configure_git_identity_no_auth(case_dir, "fu18-root");
+    fu13_commit(case_dir, "fu18-root", "root\n", "root");
+    let push = fu13_push(
+        case_dir,
+        "fu18-root",
+        &trunk_subpath_url(port, "/third-party"),
+        &["HEAD:refs/heads/main"],
+    );
+    assert!(
+        !push.status.success(),
+        "a push to the import root must fail"
+    );
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    assert!(stderr.contains("400"), "{stderr}");
+    // Nothing registered, stored or mounted.
+    assert!(
+        fu15_repo_rows(&db)
+            .iter()
+            .all(|(_, path)| path != "/third-party" && path != "/third-party/"),
+        "{:?}",
+        fu15_repo_rows(&db)
+    );
+    assert_eq!(fu15_exec(&db, "SELECT 1 FROM import_refs"), 0);
+    for table in ["git_commit", "git_tree", "git_blob", "git_tag"] {
+        assert_eq!(
+            fu15_exec(&db, &format!("SELECT 1 FROM {table}")),
+            0,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        fu13_remote_ref(case_dir, &root_url, "refs/heads/main"),
+        root_main
+    );
+
+    // A two-level leaf below the import root is an ImportRepo as before.
+    let leaf_url = trunk_subpath_url(port, "/third-party/fu18-owner/fu18-repo");
+    git_ok_no_auth(case_dir, &["init", "-b", "main", "fu18-leaf"]);
+    configure_git_identity_no_auth(case_dir, "fu18-leaf");
+    fu13_commit(case_dir, "fu18-leaf", "leaf\n", "leaf");
+    git_cli::assert_git_success(
+        &fu13_push(case_dir, "fu18-leaf", &leaf_url, &["HEAD:refs/heads/main"]),
+        "leaf push",
+    );
+    git_ok_no_auth(case_dir, &["clone", &leaf_url, "fu18-leaf-clone"]);
+    git_ok_no_auth(case_dir, &["clone", &root_url, "fu18-root-after"]);
+    assert_eq!(names("fu18-root-after", "HEAD"), top_before);
+    let mut import_expected = import_before;
+    import_expected.insert("fu18-owner".to_owned());
+    assert_eq!(
+        names("fu18-root-after", "HEAD:third-party"),
+        import_expected
+    );
+    assert_eq!(
+        names("fu18-root-after", "HEAD:third-party/fu18-owner"),
+        ["fu18-repo".to_owned()].into_iter().collect()
+    );
+    fu10_shutdown(service, &stderr_path);
+}

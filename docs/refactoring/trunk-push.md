@@ -406,6 +406,15 @@ C 段移出临界区（硬约束 7）后，文件路径索引变为最终一致�
 - merge：`{cl_link}`（CL 状态仍在库中可查，无需快照）。
 - attach：`{repo 上下文, 完整命令描述符}`——**分支 create/update/delete 的完整列表**（`import_repo.rs:450-475/550-573` 应用的是完整快照，仅存仓库上下文无法在崩溃后重放分支级变更）。操作标识为**确定性导出**而非调用方令牌：attach 由 receive-pack 自动触发（`protocol/mod.rs:175-216` 构造 `ImportRepo`，`RefCommand` 无请求 id，`import_refs.rs:50-59`；git 重试也无法携带令牌），故 `operation_id = hash(仓库标识 ‖ 规范化命令描述符)`——git 重试发送相同命令序列，导出值自然一致，收养/回放由此闭合。
   - **`op`：attach 或 detach**（[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-09 第 1–3 条，FU-16）：载荷的可选字段 `op` 取 `attach`（缺省；FU-16 之前写入的行都没有该字段，反序列化为 `attach`，attach 行序列化时也省略它，与既有行逐字节一致）或 `detach`。detach 行复用 `kind = attach`，载荷只含 `{repo_id, repo_path, commands: [], op: "detach"}`，操作标识为域分离的 `sha256("import_repo.detach\0" ‖ repo_id ‖ "\0" ‖ 规范路径)`，与任何 attach 标识不同；同一仓库重复 detach 按 `(kind, path, operation_id)` 回放 `Done`，重新导入得到新 `repo_id`、因而是新标识。
+  - **receive-pack 写路径存活栅栏**（[`plan-20260923.md`](../plan/plan-20260923.md) ADR-FU-09 第 2、5 条，ADR-FU-08 第 7 条，FU-18）：原语 `lock_live_import_repo(txn, repo_id, repo_path)` = `SELECT id FROM git_repo WHERE id = $1 AND repo_path = $2 FOR SHARE`（绑定参数；`repo_path` 是调用方解析该行所用的路径，Git 面即规范路径）。ImportRepo 的每一次元数据写都在自己的事务里先取该锁，行不存在 → `IMPORT_REPO_REMOVED`、本次写不落行：
+    - 协议分派：进入 ImportRepo 分支的路径（以 `import_dir` 为组件前缀）在 TP-08 规范化之后、任何查找 / 别名自愈 / 注册之前调用叶子校验 `check_import_repo_leaf`（拒绝 `import_dir` 本身、非规范形式与含 NUL 的路径 → `IMPORT_REPO_PATH_INVALID`，两种服务都适用；SSH 的相对写法照旧走 Monorepo 分支，计划 `DEFER-FU-37`）；首次注册 `register_import_repo` 在同一事务内按 `id` 顺序对全部已注册的严格祖先行取 `FOR SHARE` 后插入（祖先生命周期栅栏：父仓库的 detach 要么等子仓提交后以 `IMPORT_REPO_HAS_CHILDREN` 拒绝，要么先提交、子仓作为独立导入注册）。
+    - unpack：`ImportService::save_entry` 每批一个事务——对象字节先写对象存储（事务外），再锁、四表按唯一键排序、固定表序插入；死锁或串行化失败重试整个事务（事务已中止，语句级重试无效）。批的拒绝原样透传到分支 `ng` 行。
+    - tag：每个 ref 一个事务，锁后恰一条 CAS 语句。
+    - `file_path`：先无锁存活预检（失败即在读任何对象之前返回）；对象缺失时再检存活（仓库已被清理则为 `IMPORT_REPO_REMOVED`，否则为 `Not Found` 错误而非 panic）；更新按 `blob_id` 排序、每块 ≤ 1000 行一个带锁事务。
+    - B3 attach（首次挂载、更新、仅删除）：见下方 B3 伪代码中的「存活栅栏」；已完成的仅删除轮次被重放时（不经 B3）同样先做存活检查。
+    - 与 detach 的两种串行结果：写事务先取得共享锁 → detach 的 `FOR UPDATE` 等它提交，其 `import_refs` 行随 detach 自己的 `DELETE` 删除、对象行随后由清扫（FU-17）删除；detach 先提交 → 写取锁失败、不落行。两侧都依赖 READ COMMITTED（普通 `begin()`，代码与配置都未改隔离级别）：在 REPEATABLE READ 下被阻塞的 `FOR SHARE` 会变成 `40001`，detach 的子仓检查会读到旧快照。
+    - 锁序：`MONO_WRITE_LOCK` 只作为 B3 事务的第一把锁；**B3 之外持有共享锁的写事务（unpack 批、tag、`file_path` 分块、注册）不得跨越 `enqueue_and_wait` / `execute_b3`，也不得在事务打开期间再取第二个连接池连接**（否则会形成 PostgreSQL 看不见的应用层死锁）——修改 `finalize_receive_pack`、`receiver_handler`、`ImportService::save_entry` 时须按此复核。B3 attach 自己取的共享锁不参与等待环：与它冲突的只有 detach，二者在同一 `MONO_WRITE_LOCK` 下串行；B3 首次挂载在持有 `MONO_WRITE_LOCK` 时经连接池构建挂载树是 FU-18 之前既有的池耗尽风险（计划 `DEFER-FU-36`）。detach 等待共享锁持有者期间持有 `MONO_WRITE_LOCK`、写队列停滞，时长以一批 / 一个 tag / 一块 / 一次注册为界（被新共享锁越过的情形见计划 `DEFER-FU-32`）。
+    - 已知限制：别名祖先行不在祖先栅栏内（`DEFER-FU-10`）；review 策略的 `POST /api/v1/repo/clone` 错误面（`DEFER-FU-29`）；FU-18 之前遗留的孤儿行不回填（`DEFER-FU-34`）。
 
 执行逻辑仍由调用方在 B3 内按 kind 分派（ADR-TP-04 的同步模型）；载荷的持久化使崩溃后的两种恢复路径成为可能：行仍活跃（`Queued/Running`）时重试**收养**（1.11）；行已被 reaper 终态化（`Failed`，无继任）时重试**以原行持久化载荷新建队列行**——描述符完全可执行，无需原连接。这是 ADR-TP-04「同步阻塞、真实结果」的直接推论。
 
@@ -810,6 +819,11 @@ B3. 执行轮次（单事务；B3 首句是 fencing，见下）
         -- operation_id 为内容寻址指纹（hash(仓库标识 ‖ 命令描述符)）。
         -- **`op = attach`（缺省）**：分支命令批到达本分支；只含删除的批同样入队、只做 ref CAS
         -- （FU-13 起，plan-20260923 ADR-FU-08 第 1 条）。
+        -- **存活栅栏（FU-18，ADR-FU-09 第 5 条）**：在删除批 / 更新 / 首次挂载的分流、
+        -- 物化预检与 SAVEPOINT `b3_kind` 之前，`SELECT id FROM git_repo WHERE id = $1
+        -- AND repo_path = $2 FOR SHARE` 把仓库行共享锁到本轮提交；行不存在（已被
+        -- detach）→ 终态 `Failed` / `AttachFailure`、`error_message` 为
+        -- `IMPORT_REPO_REMOVED` 原文、无写，先于物化预检的 I3 文本。
         -- **目标路径、其严格非根祖先、或其任何已物化后代 → 拒绝**：
         -- attach 只更新根 ref 与对象，不更新 `main@P`、祖先 main 行、
         -- 也不推进/墓碑化后代 main 行（`attach_to_monorepo_parent_in_txn`

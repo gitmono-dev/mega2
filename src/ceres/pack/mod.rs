@@ -176,6 +176,11 @@ pub trait RepoHandler: Send + Sync + 'static {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::error!("Task {} save_entry Err: {:?}", i, e);
+                    // A typed ImportRepo refusal (IMPORT_REPO_REMOVED) keeps its
+                    // stable code on the client's ref lines.
+                    if matches!(e, MegaError::ImportRepo(_)) {
+                        return Err(e);
+                    }
                     return Err(MegaError::Other(format!(
                         "Failed to save entry in repository in task {}: {}",
                         i, e

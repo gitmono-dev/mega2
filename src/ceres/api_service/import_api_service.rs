@@ -495,7 +495,7 @@ impl ApiHandler for ImportApiService {
             });
             self.storage
                 .import_service
-                .save_entry(self.repo.repo_id, entries)
+                .save_entry(self.repo.repo_id, &self.repo.repo_path, entries)
                 .await?;
 
             // Update ref to new commit id

@@ -1,6 +1,6 @@
 [package]
 name = "mega2"
-version = "0.40.6"
+version = "0.40.7"
 edition = "2024"
 # Two [[bin]] targets exist; keep `cargo run -p mega2` unambiguous.
 default-run = "mega2"

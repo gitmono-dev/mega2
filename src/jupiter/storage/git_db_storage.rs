@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ops::Deref};
+use std::{collections::BTreeMap, ops::Deref};
 
 use futures::Stream;
 use sea_orm::{
@@ -15,11 +15,14 @@ use crate::{
         sea_orm_active_enums::RefTypeEnum,
     },
     common::{
-        errors::MegaError,
+        errors::{ImportRepoError, MegaError},
         utils::{canonicalize_mono_ref_path, escape_like, generate_id},
     },
     contract::api::common::Pagination,
-    jupiter::storage::base_storage::{BaseStorage, StorageConnector},
+    jupiter::storage::{
+        base_storage::{BaseStorage, StorageConnector},
+        mono_storage::MonoStorage,
+    },
 };
 
 #[derive(Clone)]
@@ -416,22 +419,32 @@ impl GitDbStorage {
 
         let collapsed = last_wins_filepaths(pairs);
         for chunk in collapsed.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
-            let blob_ids: Vec<String> = chunk.iter().map(|(id, _)| id.clone()).collect();
-            let mut case = CaseStatement::new();
-            for (blob_id, file_path) in chunk {
-                case = case.case(
-                    Expr::col(git_blob::Column::BlobId).eq(blob_id.clone()),
-                    file_path.clone(),
-                );
-            }
-            case = case.finally(Expr::col(git_blob::Column::FilePath));
+            update_filepath_chunk(repo_id, chunk, self.get_connection()).await?;
+        }
+        Ok(())
+    }
 
-            git_blob::Entity::update_many()
-                .col_expr(git_blob::Column::FilePath, case.into())
-                .filter(git_blob::Column::RepoId.eq(repo_id))
-                .filter(git_blob::Column::BlobId.is_in(blob_ids))
-                .exec(self.get_connection())
-                .await?;
+    /// `update_git_blob_filepaths` for a receive-pack of the live ImportRepo
+    /// `(repo_id, repo_path)` (plan-20260923 ADR-FU-09 item 5): each chunk of
+    /// at most 1000 blobs, in `blob_id` order, is one transaction that takes
+    /// the liveness lock first, so a detach waits for at most one chunk. The
+    /// first refused chunk stops the walk with `IMPORT_REPO_REMOVED`; chunks
+    /// already written only touch rows the sweep deletes.
+    pub async fn update_import_blob_filepaths_fenced(
+        &self,
+        repo_id: i64,
+        repo_path: &str,
+        pairs: Vec<(String, String)>,
+    ) -> Result<(), MegaError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let collapsed = last_wins_filepaths(pairs);
+        for chunk in collapsed.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+            let txn = self.get_connection().begin().await?;
+            self.lock_live_import_repo(&txn, repo_id, repo_path).await?;
+            update_filepath_chunk(repo_id, chunk, &txn).await?;
+            txn.commit().await?;
         }
         Ok(())
     }
@@ -484,6 +497,44 @@ impl GitDbStorage {
         tracing::debug!("{}", query.build(DbBackend::Postgres).to_string());
         let result = query.one(self.get_connection()).await?;
         Ok(result)
+    }
+
+    /// First registration of an ImportRepo row (plan-20260923 ADR-FU-09 item
+    /// 2, ancestor lifecycle fence): one transaction share-locks every
+    /// registered strict ancestor, in `id` order, then inserts. A parent's
+    /// detach (`FOR UPDATE` on its own row) therefore either waits for the
+    /// child to commit and then refuses with `IMPORT_REPO_HAS_CHILDREN`, or
+    /// has committed first and the child registers as an independent import.
+    pub async fn register_import_repo(&self, repo: git_repo::Model) -> Result<(), MegaError> {
+        let txn = self.get_connection().begin().await?;
+        self.register_import_repo_in_txn(&txn, repo).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// `register_import_repo` inside a caller's transaction.
+    pub async fn register_import_repo_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        repo: git_repo::Model,
+    ) -> Result<(), MegaError> {
+        let ancestors = MonoStorage::strict_non_root_ancestor_paths(&repo.repo_path);
+        if !ancestors.is_empty() {
+            git_repo::Entity::find()
+                .select_only()
+                .column(git_repo::Column::Id)
+                .filter(git_repo::Column::RepoPath.is_in(ancestors))
+                .order_by_asc(git_repo::Column::Id)
+                .lock_shared()
+                .into_tuple::<i64>()
+                .all(txn)
+                .await?;
+        }
+        git_repo::Entity::insert(repo.into_active_model())
+            .exec(txn)
+            .await
+            .map_err(|e| MegaError::Other(format!("Failed to insert git_repo: {e}")))?;
+        Ok(())
     }
 
     pub async fn save_git_repo(&self, repo: git_repo::Model) -> Result<(), MegaError> {
@@ -1014,6 +1065,57 @@ impl GitDbStorage {
         Ok(report)
     }
 
+    /// Share-lock the live ImportRepo row `(repo_id, repo_path)` until `txn`
+    /// ends (plan-20260923 ADR-FU-09 item 5). Every receive-pack write of the
+    /// repository takes it first in its own transaction: a detach (`FOR
+    /// UPDATE`, then `DELETE`) waits for the write to commit, or has committed
+    /// and the write lands no row. `repo_path` is the path the caller resolved
+    /// the row by (canonical on the Git face); no such row is
+    /// `IMPORT_REPO_REMOVED`.
+    pub async fn lock_live_import_repo(
+        &self,
+        txn: &DatabaseTransaction,
+        repo_id: i64,
+        repo_path: &str,
+    ) -> Result<(), MegaError> {
+        let live = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM git_repo WHERE id = $1 AND repo_path = $2 FOR SHARE",
+                [repo_id.into(), repo_path.into()],
+            ))
+            .await?;
+        match live {
+            Some(_) => Ok(()),
+            None => Err(ImportRepoError::Removed {
+                path: repo_path.to_owned(),
+            }
+            .into()),
+        }
+    }
+
+    /// Insert object rows of one kind inside `txn`, in chunks, skipping rows
+    /// that already exist. No statement-level retry: after a deadlock or
+    /// serialization failure PostgreSQL has aborted the transaction, so the
+    /// caller retries the whole transaction.
+    pub async fn insert_import_objects_in_txn<E, A>(
+        &self,
+        models: Vec<A>,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), MegaError>
+    where
+        E: EntityTrait,
+        A: ActiveModelTrait<Entity = E> + Send + Clone,
+    {
+        for chunk in models.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+            E::insert_many(chunk.to_vec())
+                .on_conflict(OnConflict::new().do_nothing().to_owned())
+                .exec_without_returning(txn)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Whether other ImportRepos live below `path` (plan-20260923 ADR-FU-10
     /// item 3). A row whose canonical form is `path` itself, such as a `path/`
     /// alias the FU-15 migration left in place, is the same split identity and
@@ -1135,12 +1237,202 @@ fn pending_cleanups_query(path: &str) -> sea_orm::Select<import_repo_cleanups::E
         .limit(CLEANUP_RESUME_BATCH)
 }
 
+/// The last path of each blob, in `blob_id` order (deterministic chunks; the
+/// rows of one chunk are still locked in the order of the UPDATE's plan).
 fn last_wins_filepaths(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
-    let mut map = HashMap::with_capacity(pairs.len());
+    let mut map = BTreeMap::new();
     for (blob_id, file_path) in pairs {
         map.insert(blob_id, file_path);
     }
     map.into_iter().collect()
+}
+
+async fn update_filepath_chunk<C: ConnectionTrait>(
+    repo_id: i64,
+    chunk: &[(String, String)],
+    conn: &C,
+) -> Result<(), MegaError> {
+    let blob_ids: Vec<String> = chunk.iter().map(|(id, _)| id.clone()).collect();
+    let mut case = CaseStatement::new();
+    for (blob_id, file_path) in chunk {
+        case = case.case(
+            Expr::col(git_blob::Column::BlobId).eq(blob_id.clone()),
+            file_path.clone(),
+        );
+    }
+    case = case.finally(Expr::col(git_blob::Column::FilePath));
+    git_blob::Entity::update_many()
+        .col_expr(git_blob::Column::FilePath, case.into())
+        .filter(git_blob::Column::RepoId.eq(repo_id))
+        .filter(git_blob::Column::BlobId.is_in(blob_ids))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+/// Test support shared by the FU-18 fence tests of several modules
+/// (`src/jupiter/tests.rs` is outside that card's write set). Lock-wait polls
+/// run on the lock holder's own transaction and discard the per-transaction
+/// `pg_stat_activity` snapshot first; every helper stays within the test
+/// pool's two connections plus one single-connection pool.
+#[cfg(test)]
+pub(crate) mod fu18_support {
+    use std::{path::Path, sync::Arc};
+
+    use sea_orm::{
+        ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, Statement,
+        TransactionTrait,
+    };
+
+    use crate::{
+        ceres::api_service::cache::GitObjectCache,
+        config::RedisConfig,
+        jupiter::{
+            redis::init_connection,
+            service::{
+                git_service::GitService, import_service::ImportService, mono_service::MonoService,
+            },
+            storage::{Storage, object_storage::mock_object_storage},
+            tests::test_storage,
+        },
+    };
+
+    /// A test storage with the real Git, Monorepo and ImportRepo services and
+    /// an initialized Monorepo.
+    pub(crate) async fn wired_storage(temp: &Path) -> Storage {
+        let mut storage = test_storage(temp).await;
+        let git_service = GitService {
+            obj_storage: mock_object_storage(),
+        };
+        storage.git_service = git_service.clone();
+        storage.mono_service = MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service: git_service.clone(),
+        };
+        storage.import_service = ImportService {
+            git_db_storage: storage.git_db_storage(),
+            git_service,
+        };
+        storage
+            .mono_service
+            .init_monorepo(&storage.config().monorepo)
+            .await
+            .unwrap();
+        storage
+    }
+
+    pub(crate) async fn test_cache() -> Arc<GitObjectCache> {
+        let url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+        let connection = init_connection(&RedisConfig { url })
+            .await
+            .expect("redis connection");
+        Arc::new(GitObjectCache {
+            connection,
+            prefix: "fu18".to_string(),
+        })
+    }
+
+    /// A pool of one connection with the options of `conn`'s pool (this
+    /// test's schema and backend tag included).
+    pub(crate) async fn single_connection(conn: &DatabaseConnection) -> DatabaseConnection {
+        let options = conn.get_postgres_connection_pool().connect_options();
+        let pool = sea_orm::sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(120))
+            .connect_with((*options).clone())
+            .await
+            .unwrap();
+        sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(pool)
+    }
+
+    /// Whether some backend waits on a lock this holder's backend holds
+    /// (`transitive`: waits on a backend that itself waits on the holder),
+    /// polled for up to ten seconds.
+    pub(crate) async fn blocked_by_me<C: ConnectionTrait>(holder: &C, transitive: bool) -> bool {
+        let sql = if transitive {
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity w \
+             JOIN pg_stat_activity d ON d.pid = ANY(pg_blocking_pids(w.pid)) \
+             WHERE w.datname = current_database() AND w.wait_event_type = 'Lock' \
+             AND pg_backend_pid() = ANY(pg_blocking_pids(d.pid))) AS v"
+        } else {
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+             AND pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS v"
+        };
+        for _ in 0..200 {
+            // Inside a transaction `pg_stat_activity` is a snapshot taken at
+            // its first read: discard it before every poll.
+            holder
+                .execute_unprepared("SELECT pg_stat_clear_snapshot()")
+                .await
+                .unwrap();
+            let row = holder
+                .query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+                .await
+                .unwrap()
+                .unwrap();
+            if row.try_get::<bool>("", "v").unwrap() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Hold one `import_refs` row of `repo_id` for update on `single`: a real
+    /// detach of that repository then takes its own row lock and parks at
+    /// its `DELETE FROM import_refs`, holding the repository row `FOR UPDATE`.
+    pub(crate) async fn park_detach(
+        single: &DatabaseConnection,
+        repo_id: i64,
+    ) -> DatabaseTransaction {
+        let txn = single.begin().await.unwrap();
+        let held = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM import_refs WHERE repo_id = $1 ORDER BY id LIMIT 1 FOR UPDATE",
+                [repo_id.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            held.is_some(),
+            "repository {repo_id} needs an import_refs row"
+        );
+        txn
+    }
+
+    /// Rows of `repo_id` in `git_commit`, `git_tree`, `git_blob`, `git_tag`.
+    pub(crate) async fn object_counts<C: ConnectionTrait>(conn: &C, repo_id: i64) -> [i64; 4] {
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT (SELECT count(*) FROM git_commit WHERE repo_id = $1) AS c, \
+                 (SELECT count(*) FROM git_tree WHERE repo_id = $1) AS t, \
+                 (SELECT count(*) FROM git_blob WHERE repo_id = $1) AS b, \
+                 (SELECT count(*) FROM git_tag WHERE repo_id = $1) AS g",
+                [repo_id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        ["c", "t", "b", "g"].map(|column| row.try_get::<i64>("", column).unwrap())
+    }
+
+    pub(crate) async fn import_refs_count<C: ConnectionTrait>(conn: &C, repo_id: i64) -> i64 {
+        conn.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM import_refs WHERE repo_id = $1",
+            [repo_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -1860,20 +2152,6 @@ mod tests {
             .map(|row| row.id)
     }
 
-    /// A pool of one connection with the options of `conn`'s pool (this
-    /// test's schema and backend tag included).
-    async fn fu17_single_connection(conn: &DatabaseConnection) -> DatabaseConnection {
-        let options = conn.get_postgres_connection_pool().connect_options();
-        let pool = sea_orm::sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .min_connections(1)
-            .acquire_timeout(std::time::Duration::from_secs(120))
-            .connect_with((*options).clone())
-            .await
-            .unwrap();
-        sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(pool)
-    }
-
     /// Sequential scans of this schema's object tables, all backends. The
     /// autocommit `pg_stat_force_next_flush()` makes this backend flush its
     /// pending counters when it next goes idle outside a transaction, which
@@ -2067,7 +2345,7 @@ mod tests {
         // production: on a pool of one connection, whose statistics are
         // flushed on demand, sweeping three batches of the decoy (most of
         // `git_blob`) adds no sequential scan of any object table.
-        let single = fu17_single_connection(conn).await;
+        let single = fu18_support::single_connection(conn).await;
         let before = fu17_seq_scans(&single).await;
         let report = git_db
             .sweep_import_repo_objects(decoy, 3, &single)
@@ -2443,5 +2721,195 @@ mod tests {
             "the blocked batch affected 0 rows; the remaining 1500 rows took 2 batches: {report:?}"
         );
         assert_eq!(git_db.get_obj_count_by_repo_id(target).await, 0);
+    }
+
+    fn fu18_repo(path: &str) -> git_repo::Model {
+        crate::ceres::protocol::repo::Repo::new(std::path::PathBuf::from(path), false)
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn fu18_lock_live_import_repo_holds_share_lock() {
+        let git_db = storage().await;
+        let conn = git_db.get_connection();
+        let path = "/third-party/fu18-lock";
+        let repo = fu18_repo(path);
+        let id = repo.id;
+        git_db.register_import_repo(repo).await.unwrap();
+
+        let holder = conn.begin().await.unwrap();
+        git_db
+            .lock_live_import_repo(&holder, id, path)
+            .await
+            .expect("live row");
+        for (repo_id, locked_path) in [(id + 1, path), (id, "/third-party/other")] {
+            let error = git_db
+                .lock_live_import_repo(&holder, repo_id, locked_path)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "IMPORT_REPO_REMOVED: {locked_path:?} was removed; push again to import it anew"
+                )
+            );
+        }
+        // A share lock: another writer of the repository takes it too.
+        let other = conn.begin().await.unwrap();
+        other
+            .execute_unprepared("SET LOCAL lock_timeout = '100ms'")
+            .await
+            .unwrap();
+        git_db
+            .lock_live_import_repo(&other, id, path)
+            .await
+            .expect("share locks are compatible");
+        other.rollback().await.unwrap();
+        // It outlives the statement: a writer of the row itself waits.
+        let writer = conn.begin().await.unwrap();
+        writer
+            .execute_unprepared("SET LOCAL lock_timeout = '100ms'")
+            .await
+            .unwrap();
+        let blocked = writer
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE git_repo SET updated_at = now() WHERE id = $1",
+                [id.into()],
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(blocked.contains("lock"), "{blocked}");
+        writer.rollback().await.unwrap();
+        holder.commit().await.unwrap();
+        conn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE git_repo SET updated_at = now() WHERE id = $1",
+            [id.into()],
+        ))
+        .await
+        .expect("free after commit");
+    }
+
+    #[tokio::test]
+    async fn fu18_child_registration_fenced_by_parent() {
+        use crate::ceres::pack::import_repo::detach_import_repo;
+
+        let temp = TempDir::new().unwrap();
+        let storage = fu18_support::wired_storage(temp.path()).await;
+        let git_db = storage.git_db_storage();
+        let conn = git_db.get_connection().clone();
+
+        // I1, the registration first: it share-locks the grandparent row,
+        // the parent's detach waits, then sees the child and refuses.
+        let p1 = "/third-party/fu18-p1";
+        let parent1 = fu18_repo(p1);
+        let parent1_id = parent1.id;
+        git_db.register_import_repo(parent1).await.unwrap();
+        let registering = conn.begin().await.unwrap();
+        git_db
+            .register_import_repo_in_txn(&registering, fu18_repo("/third-party/fu18-p1/sub/c"))
+            .await
+            .unwrap();
+        let detach_storage = storage.clone();
+        let detaching = tokio::spawn(async move {
+            detach_import_repo(
+                &detach_storage,
+                fu18_support::test_cache().await,
+                parent1_id,
+                "/third-party/fu18-p1",
+                None,
+            )
+            .await
+        });
+        assert!(
+            fu18_support::blocked_by_me(&registering, false).await,
+            "the detach waits on the registering child"
+        );
+        registering.commit().await.unwrap();
+        let refused = detaching.await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                MegaError::ImportRepo(ImportRepoError::HasChildren { ref path }) if path == p1
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            git_db
+                .find_git_repo_exact_match(p1)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            git_db
+                .find_git_repo_exact_match("/third-party/fu18-p1/sub/c")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // I2, the detach first: it holds the parent row for update (parked
+        // at its DELETE FROM import_refs); the child registration waits on
+        // it and then registers as an independent import.
+        let p2 = "/third-party/fu18-p2";
+        let parent2 = fu18_repo(p2);
+        let parent2_id = parent2.id;
+        git_db.register_import_repo(parent2).await.unwrap();
+        git_db
+            .save_ref(
+                parent2_id,
+                sample_ref(parent2_id, "refs/heads/main", &"c".repeat(40)),
+            )
+            .await
+            .unwrap();
+        let single = fu18_support::single_connection(&conn).await;
+        let parked = fu18_support::park_detach(&single, parent2_id).await;
+        let detach_storage = storage.clone();
+        let detaching = tokio::spawn(async move {
+            detach_import_repo(
+                &detach_storage,
+                fu18_support::test_cache().await,
+                parent2_id,
+                "/third-party/fu18-p2",
+                None,
+            )
+            .await
+        });
+        assert!(
+            fu18_support::blocked_by_me(&parked, false).await,
+            "the detach parks at its import_refs delete"
+        );
+        let register_db = git_db.clone();
+        let registering = tokio::spawn(async move {
+            register_db
+                .register_import_repo(fu18_repo("/third-party/fu18-p2/sub/c"))
+                .await
+        });
+        assert!(
+            fu18_support::blocked_by_me(&parked, true).await,
+            "the child registration waits on the detach"
+        );
+        parked.commit().await.unwrap();
+        assert!(detaching.await.unwrap().unwrap().is_some());
+        registering.await.unwrap().expect("registers independently");
+        assert!(
+            git_db
+                .find_git_repo_exact_match(p2)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            git_db
+                .find_git_repo_exact_match("/third-party/fu18-p2/sub/c")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(fu18_support::import_refs_count(&conn, parent2_id).await, 0);
     }
 }
