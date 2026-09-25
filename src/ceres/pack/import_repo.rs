@@ -24,7 +24,10 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    callisto::sea_orm_active_enums::RefTypeEnum,
+    callisto::{
+        import_repo_cleanups::{self, CleanupState},
+        sea_orm_active_enums::{ActorTypeEnum, AuditActionEnum, RefTypeEnum, TargetTypeEnum},
+    },
     ceres::{
         api_service::cache::GitObjectCache,
         pack::RepoHandler,
@@ -46,7 +49,14 @@ use crate::{
                 detach_operation_id, normalize_attach_commands,
             },
         },
-        storage::{Storage, base_storage::StorageConnector, git_db_storage::GitDbStorage},
+        storage::{
+            Storage,
+            audit_storage::{AuditStorage, IMPORT_REPO_REMOVE_KIND},
+            base_storage::StorageConnector,
+            git_db_storage::{
+                CLEANUP_RESUME_BATCH, GitDbStorage, SWEEP_STATEMENT_BUDGET, SweepCounts,
+            },
+        },
         utils::converter::FromGitModel,
     },
 };
@@ -793,35 +803,267 @@ pub(crate) async fn detach_import_repo(
     }
 }
 
+/// Outcome of one cleanup request (plan-20260923 ADR-FU-10 item 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    /// The ledger row is `swept`, by this request or an earlier one.
+    Removed { repo_id: i64, cleanup_id: i64 },
+    /// Detached, but the sweep ran out of this request's budget: resend with
+    /// `cleanup_id`. Without a live repository it names the lowest row still
+    /// `detached` on the path.
+    Pending { repo_id: i64, cleanup_id: i64 },
+    /// New operation only: no live repository at the path and nothing pending.
+    Absent,
+}
+
+/// ImportRepo cleanup entry (plan-20260923 ADR-FU-09 items 4, 6, 7; ADR-FU-10
+/// items 3, 5). One request handles at most `CLEANUP_RESUME_BATCH` ledger
+/// rows and runs at most `SWEEP_STATEMENT_BUDGET` delete statements. A
+/// `continuation` names one ledger row to finish and never detaches a live
+/// repository. No product entry calls this yet (FU-20 / FU-21).
+pub(crate) async fn remove_import_repo(
+    storage: &Storage,
+    git_object_cache: Arc<GitObjectCache>,
+    canonical_path: &str,
+    requester: Option<String>,
+    continuation: Option<i64>,
+) -> Result<RemoveOutcome, MegaError> {
+    let path = crate::common::utils::canonicalize_mono_ref_path(canonical_path)?;
+    let actor = requester.clone().unwrap_or_else(|| "anonymous".to_owned());
+    let git_db = storage.git_db_storage();
+    let conn = git_db.get_connection();
+    let mut budget = SWEEP_STATEMENT_BUDGET;
+
+    if let Some(cleanup_id) = continuation {
+        // Only the ledger is consulted: a re-import at the same path has a
+        // new repo_id and is never touched.
+        let row = match git_db.cleanup_by_id(cleanup_id, conn).await? {
+            Some(row) if row.path == path => row,
+            _ => {
+                return Err(ImportRepoError::CleanupNotFound {
+                    path,
+                    cleanup_id: cleanup_id.to_string(),
+                }
+                .into());
+            }
+        };
+        return Ok(
+            match sweep_ledger_row(&git_db, &row, &actor, &mut budget).await? {
+                RowSweep::Swept => RemoveOutcome::Removed {
+                    repo_id: row.repo_id,
+                    cleanup_id: row.id,
+                },
+                RowSweep::OverBudget => RemoveOutcome::Pending {
+                    repo_id: row.repo_id,
+                    cleanup_id: row.id,
+                },
+            },
+        );
+    }
+
+    if let Some(live) = git_db.find_git_repo_exact_match(&path).await? {
+        // Write-free pre-check: nothing is enqueued for a parent with
+        // children. B3 re-checks under its own lock and stays the authority.
+        if git_db
+            .import_repo_has_children(live.id, &path, conn)
+            .await?
+        {
+            return Err(ImportRepoError::HasChildren { path }.into());
+        }
+        if let Some(cleanup_id) =
+            detach_import_repo(storage, git_object_cache, live.id, &path, requester).await?
+        {
+            let row = git_db
+                .cleanup_by_id(cleanup_id, conn)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other(format!(
+                        "cleanup ledger row {cleanup_id} missing after detach"
+                    ))
+                })?;
+            let mut handled = 0;
+            if row.state == CleanupState::Detached {
+                handled = 1;
+                if sweep_ledger_row(&git_db, &row, &actor, &mut budget).await?
+                    == RowSweep::OverBudget
+                {
+                    return Ok(RemoveOutcome::Pending {
+                        repo_id: row.repo_id,
+                        cleanup_id: row.id,
+                    });
+                }
+            }
+            // The request's own row is swept; what is left of the budget goes
+            // to older rows of the path, whose fate does not change the answer.
+            if let Resume::Remaining(next) =
+                resume_pending_for_path(&git_db, &path, &actor, &mut budget, handled).await?
+            {
+                tracing::info!(
+                    path = %path,
+                    cleanup_id = next.id,
+                    "older ImportRepo cleanups remain; the next request resumes them"
+                );
+            }
+            return Ok(RemoveOutcome::Removed {
+                repo_id: row.repo_id,
+                cleanup_id: row.id,
+            });
+        }
+        // Nothing was detached (the repository was gone when B3 locked its
+        // row, or the round replayed one that detached nothing): the ledger
+        // decides below.
+    }
+
+    Ok(
+        match resume_pending_for_path(&git_db, &path, &actor, &mut budget, 0).await? {
+            Resume::AllSwept => RemoveOutcome::Absent,
+            Resume::Remaining(row) => RemoveOutcome::Pending {
+                repo_id: row.repo_id,
+                cleanup_id: row.id,
+            },
+        },
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RowSweep {
+    Swept,
+    OverBudget,
+}
+
+/// Sweep one ledger row within what is left of `budget`; on completion the
+/// row turns `swept` together with its `phase: "swept"` audit row, in one
+/// short transaction outside the write lock. The row counts are evidence
+/// only: two requests sweeping the same row, or a crash between the deletes
+/// and the progress write, can leave them under- or over-counted; the state
+/// transition never depends on them.
+async fn sweep_ledger_row(
+    git_db: &GitDbStorage,
+    row: &import_repo_cleanups::Model,
+    actor: &str,
+    budget: &mut u32,
+) -> Result<RowSweep, MegaError> {
+    use sea_orm::TransactionTrait;
+
+    if row.state == CleanupState::Swept {
+        return Ok(RowSweep::Swept);
+    }
+    let conn = git_db.get_connection();
+    let report = git_db
+        .sweep_import_repo_objects(row.repo_id, *budget, conn)
+        .await?;
+    *budget = budget.saturating_sub(report.statements);
+    let total = SweepCounts::from_json(row.rows_deleted.as_ref()).saturating_add(report.deleted);
+    if !report.complete {
+        // Another request may have finished this row meanwhile; a `pending`
+        // answer must never name a swept row.
+        if git_db
+            .cleanup_by_id(row.id, conn)
+            .await?
+            .is_some_and(|now| now.state == CleanupState::Swept)
+        {
+            return Ok(RowSweep::Swept);
+        }
+        if report.statements > 0 {
+            git_db
+                .record_cleanup_progress(row.id, total.to_json(), conn)
+                .await?;
+        }
+        return Ok(RowSweep::OverBudget);
+    }
+    let txn = conn.begin().await?;
+    if git_db
+        .mark_cleanup_swept(row.id, total.to_json(), &txn)
+        .await?
+    {
+        AuditStorage::log_audit_in_txn(
+            &txn,
+            // Reserved actor: storage-only has no numeric user id.
+            0,
+            ActorTypeEnum::Human,
+            AuditActionEnum::Delete,
+            TargetTypeEnum::Repository,
+            row.repo_id,
+            Some(serde_json::json!({
+                "kind": IMPORT_REPO_REMOVE_KIND,
+                "cleanup_id": row.id,
+                "path": row.path,
+                "requester": actor,
+                "phase": "swept",
+                "rows_deleted": total.to_json(),
+            })),
+        )
+        .await?;
+    } else {
+        tracing::debug!(
+            cleanup_id = row.id,
+            "cleanup already marked swept by another request"
+        );
+    }
+    txn.commit().await?;
+    Ok(RowSweep::Swept)
+}
+
+enum Resume {
+    AllSwept,
+    Remaining(import_repo_cleanups::Model),
+}
+
+/// Sweep the oldest `detached` ledger rows of `path`, at most
+/// `CLEANUP_RESUME_BATCH - handled` of them, in index order. `Remaining`
+/// names the lowest row still `detached` afterwards.
+async fn resume_pending_for_path(
+    git_db: &GitDbStorage,
+    path: &str,
+    actor: &str,
+    budget: &mut u32,
+    handled: usize,
+) -> Result<Resume, MegaError> {
+    let conn = git_db.get_connection();
+    let room = (CLEANUP_RESUME_BATCH as usize).saturating_sub(handled);
+    let page = git_db.pending_cleanups_by_path(path, conn).await?;
+    for row in page.iter().take(room) {
+        if sweep_ledger_row(git_db, row, actor, budget).await? == RowSweep::OverBudget {
+            return Ok(Resume::Remaining(row.clone()));
+        }
+    }
+    if page.len() > room {
+        return Ok(Resume::Remaining(page[room].clone()));
+    }
+    if page.len() == CLEANUP_RESUME_BATCH as usize {
+        // A full page proves nothing about the rest: one more bounded read.
+        return Ok(
+            match git_db
+                .pending_cleanups_by_path(path, conn)
+                .await?
+                .into_iter()
+                .next()
+            {
+                Some(next) => Resume::Remaining(next),
+                None => Resume::AllSwept,
+            },
+        );
+    }
+    Ok(Resume::AllSwept)
+}
+
 /// The cleanup id behind a finished detach round `id`: its own ledger row, or
 /// else the latest ledger row an earlier detach of `repo_id` at `path` wrote
 /// (a `Done` row without a ledger row detached nothing: the repository was
-/// already gone, or the row predates FU-16). Ledger reads move to a storage
-/// primitive with FU-17, which owns the ledger's read side.
+/// already gone, or the row predates FU-16).
 async fn resolve_cleanup_id(
     storage: &Storage,
     id: i64,
     repo_id: i64,
     path: &str,
 ) -> Result<Option<i64>, MegaError> {
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
-
-    use crate::callisto::import_repo_cleanups;
-
     let git_db = storage.git_db_storage();
     let conn = git_db.get_connection();
-    if import_repo_cleanups::Entity::find_by_id(id)
-        .one(conn)
-        .await?
-        .is_some()
-    {
+    if git_db.cleanup_by_id(id, conn).await?.is_some() {
         return Ok(Some(id));
     }
-    Ok(import_repo_cleanups::Entity::find()
-        .filter(import_repo_cleanups::Column::RepoId.eq(repo_id))
-        .filter(import_repo_cleanups::Column::Path.eq(path))
-        .order_by_desc(import_repo_cleanups::Column::Id)
-        .one(conn)
+    Ok(git_db
+        .latest_cleanup_for(repo_id, path, conn)
         .await?
         .map(|row| row.id))
 }
@@ -1027,7 +1269,10 @@ mod tests {
         ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, TransactionTrait,
     };
 
-    use super::{ImportRepo, collect_git_blob_filepaths};
+    use super::{
+        ImportRepo, RemoveOutcome, RowSweep, SWEEP_STATEMENT_BUDGET, collect_git_blob_filepaths,
+        detach_import_repo, remove_import_repo, sweep_ledger_row,
+    };
     use crate::{
         callisto::{
             git_blob, git_tree, import_refs, push_queue, queue_control,
@@ -2371,5 +2616,1253 @@ mod tests {
             ..payload
         };
         assert_eq!(serde_json::to_value(&detach).unwrap()["op"], "detach");
+    }
+
+    // ---------------------------------------------------------------------
+    // plan-20260923 FU-17: sweep, resume and the cleanup entry.
+    // ---------------------------------------------------------------------
+
+    async fn fu17_mount(storage: &Storage, path: &str) -> Repo {
+        let (repo, _commit, create) = seed_import_repo_with_main_tip(storage, path).await;
+        storage
+            .git_db_storage()
+            .save_git_repo(repo.clone().into())
+            .await
+            .unwrap();
+        fu13_push(storage, &repo, vec![create]).await.unwrap();
+        repo
+    }
+
+    async fn fu17_remove(
+        storage: &Storage,
+        path: &str,
+        requester: Option<&str>,
+        continuation: Option<i64>,
+    ) -> Result<RemoveOutcome, crate::common::errors::MegaError> {
+        remove_import_repo(
+            storage,
+            disabled_cache().await,
+            path,
+            requester.map(str::to_owned),
+            continuation,
+        )
+        .await
+    }
+
+    async fn fu17_audit(
+        storage: &Storage,
+        repo_id: i64,
+        phase: &str,
+    ) -> Vec<crate::callisto::audit_logs::Model> {
+        use crate::callisto::{audit_logs, sea_orm_active_enums::AuditActionEnum};
+        audit_logs::Entity::find()
+            .filter(audit_logs::Column::TargetId.eq(repo_id))
+            .filter(audit_logs::Column::Action.eq(AuditActionEnum::Delete))
+            .all(storage.git_db_storage().get_connection())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| {
+                row.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("phase"))
+                    .and_then(|p| p.as_str())
+                    == Some(phase)
+            })
+            .collect()
+    }
+
+    async fn fu17_ledger(
+        storage: &Storage,
+        id: i64,
+    ) -> crate::callisto::import_repo_cleanups::Model {
+        let git_db = storage.git_db_storage();
+        git_db
+            .cleanup_by_id(id, git_db.get_connection())
+            .await
+            .unwrap()
+            .expect("ledger row")
+    }
+
+    async fn fu17_objects(storage: &Storage, repo_id: i64) -> usize {
+        storage
+            .git_db_storage()
+            .get_obj_count_by_repo_id(repo_id)
+            .await
+    }
+
+    async fn fu17_count(storage: &Storage, sql: &str) -> i64 {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        storage
+            .git_db_storage()
+            .get_connection()
+            .query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap()
+    }
+
+    async fn fu17_exec(storage: &Storage, sql: &str) {
+        use sea_orm::ConnectionTrait;
+        storage
+            .git_db_storage()
+            .get_connection()
+            .execute_unprepared(sql)
+            .await
+            .unwrap();
+    }
+
+    async fn fu17_root(storage: &Storage) -> String {
+        storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap()
+            .ref_commit_hash
+    }
+
+    fn fu17_counts(commit: u64, tree: u64, blob: u64, tag: u64) -> serde_json::Value {
+        serde_json::json!({ "git_commit": commit, "git_tree": tree, "git_blob": blob, "git_tag": tag })
+    }
+
+    #[tokio::test]
+    async fn fu17_swept_ledger_and_audit() {
+        use crate::callisto::{
+            import_repo_cleanups::CleanupState, sea_orm_active_enums::ActorTypeEnum,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu17-audit";
+        let repo = fu17_mount(&storage, path).await;
+        let RemoveOutcome::Removed {
+            repo_id,
+            cleanup_id,
+        } = fu17_remove(&storage, path, Some("ci-token"), None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected Removed");
+        };
+        assert_eq!(repo_id, repo.repo_id);
+
+        let ledger = fu17_ledger(&storage, cleanup_id).await;
+        assert_eq!(ledger.state, CleanupState::Swept);
+        assert_eq!(ledger.rows_deleted, Some(fu17_counts(1, 1, 1, 0)));
+        assert!(ledger.swept_at.is_some());
+        assert_eq!(ledger.requester, "ci-token");
+        assert_eq!(fu17_objects(&storage, repo_id).await, 0);
+        assert!(
+            storage
+                .git_db_storage()
+                .find_git_repo_exact_match(path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .git_db_storage()
+                .get_ref(repo_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let detached = fu17_audit(&storage, repo_id, "detached").await;
+        assert_eq!(detached.len(), 1, "{detached:?}");
+        assert_eq!(
+            detached[0].metadata,
+            Some(serde_json::json!({
+                "kind": "import_repo.remove",
+                "cleanup_id": cleanup_id,
+                "path": path,
+                "requester": "ci-token",
+                "phase": "detached",
+            }))
+        );
+        let swept = fu17_audit(&storage, repo_id, "swept").await;
+        assert_eq!(swept.len(), 1, "{swept:?}");
+        assert_eq!(swept[0].actor_id, 0);
+        assert_eq!(swept[0].actor_type, ActorTypeEnum::Human);
+        assert_eq!(
+            swept[0].metadata,
+            Some(serde_json::json!({
+                "kind": "import_repo.remove",
+                "cleanup_id": cleanup_id,
+                "path": path,
+                "requester": "ci-token",
+                "phase": "swept",
+                "rows_deleted": fu17_counts(1, 1, 1, 0),
+            }))
+        );
+
+        // Idempotent: nothing left to do, and a continuation of a swept row
+        // answers without writing.
+        assert_eq!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Absent
+        );
+        assert_eq!(
+            fu17_remove(&storage, path, None, Some(cleanup_id))
+                .await
+                .unwrap(),
+            RemoveOutcome::Removed {
+                repo_id,
+                cleanup_id
+            }
+        );
+        assert_eq!(fu17_audit(&storage, repo_id, "swept").await.len(), 1);
+        assert_eq!(
+            fu17_ledger(&storage, cleanup_id).await.swept_at,
+            ledger.swept_at
+        );
+    }
+
+    #[tokio::test]
+    async fn fu17_remove_resumes_after_crash() {
+        use crate::callisto::{audit_logs, import_repo_cleanups::CleanupState};
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu17-crash";
+        let repo = fu17_mount(&storage, path).await;
+        // Detach committed, sweep never ran (a crash between the two).
+        let cleanup_id =
+            detach_import_repo(&storage, disabled_cache().await, repo.repo_id, path, None)
+                .await
+                .unwrap()
+                .expect("cleanup id");
+        let ledger = fu17_ledger(&storage, cleanup_id).await;
+        assert_eq!(ledger.state, CleanupState::Detached);
+        assert_eq!(ledger.requester, "anonymous");
+        assert_eq!(fu17_objects(&storage, repo.repo_id).await, 3);
+        assert!(
+            storage
+                .git_db_storage()
+                .find_git_repo_exact_match(path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let queue_rows = fu17_count(&storage, "SELECT count(*) AS n FROM push_queue").await;
+        // The resume reads the ledger only: audit rows are not consulted.
+        audit_logs::Entity::delete_many()
+            .filter(audit_logs::Column::TargetId.eq(repo.repo_id))
+            .exec(storage.git_db_storage().get_connection())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fu17_remove(&storage, path, Some("operator-cli"), None)
+                .await
+                .unwrap(),
+            RemoveOutcome::Absent
+        );
+        assert_eq!(fu17_objects(&storage, repo.repo_id).await, 0);
+        let ledger = fu17_ledger(&storage, cleanup_id).await;
+        assert_eq!(ledger.state, CleanupState::Swept);
+        assert_eq!(ledger.rows_deleted, Some(fu17_counts(1, 1, 1, 0)));
+        assert_eq!(
+            ledger.requester, "anonymous",
+            "the ledger keeps the detacher"
+        );
+        let swept = fu17_audit(&storage, repo.repo_id, "swept").await;
+        assert_eq!(swept.len(), 1);
+        assert_eq!(
+            swept[0].metadata.as_ref().and_then(|m| m.get("requester")),
+            Some(&serde_json::json!("operator-cli")),
+            "the audit row names who swept"
+        );
+        assert_eq!(
+            fu17_count(&storage, "SELECT count(*) AS n FROM push_queue").await,
+            queue_rows,
+            "a resume never enqueues"
+        );
+        assert_eq!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Absent
+        );
+        assert_eq!(fu17_audit(&storage, repo.repo_id, "swept").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fu17_continuation_never_touches_reimport() {
+        use crate::callisto::import_repo_cleanups::CleanupState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu17-reimport";
+        let r1 = fu17_mount(&storage, path).await;
+        let c1 = detach_import_repo(&storage, disabled_cache().await, r1.repo_id, path, None)
+            .await
+            .unwrap()
+            .expect("cleanup id");
+        // An older pending cleanup of the same path: a continuation of c1
+        // handles c1 alone.
+        let c0 = c1 - 1;
+        let repo0 = fu17_pending_row(&storage, c0, path).await;
+        // A re-import at the same path while R1's sweep is pending.
+        let r2 = fu17_mount(&storage, path).await;
+        assert_ne!(r2.repo_id, r1.repo_id);
+        let root = fu17_root(&storage).await;
+        let r2_refs = storage.git_db_storage().get_ref(r2.repo_id).await.unwrap();
+        assert!(!r2_refs.is_empty());
+        let queue_rows = fu17_count(&storage, "SELECT count(*) AS n FROM push_queue").await;
+
+        assert_eq!(
+            fu17_remove(&storage, path, Some("operator-cli"), Some(c1))
+                .await
+                .unwrap(),
+            RemoveOutcome::Removed {
+                repo_id: r1.repo_id,
+                cleanup_id: c1
+            }
+        );
+        assert_eq!(fu17_objects(&storage, r1.repo_id).await, 0);
+        assert_eq!(
+            fu17_ledger(&storage, c0).await.state,
+            CleanupState::Detached
+        );
+        assert_eq!(fu17_objects(&storage, repo0).await, 1);
+        assert!(fu17_audit(&storage, repo0, "swept").await.is_empty());
+        assert_eq!(
+            fu17_objects(&storage, r2.repo_id).await,
+            3,
+            "the re-import keeps its rows, including the shared readme blob"
+        );
+        assert_eq!(
+            storage
+                .git_db_storage()
+                .find_git_repo_exact_match(path)
+                .await
+                .unwrap()
+                .map(|row| row.id),
+            Some(r2.repo_id)
+        );
+        assert_eq!(
+            storage.git_db_storage().get_ref(r2.repo_id).await.unwrap(),
+            r2_refs
+        );
+        assert_eq!(fu17_root(&storage).await, root);
+        assert_eq!(
+            fu17_count(&storage, "SELECT count(*) AS n FROM push_queue").await,
+            queue_rows,
+            "a continuation never detaches or enqueues"
+        );
+
+        // Unknown or foreign cleanup ids are refused without writes.
+        let err = fu17_remove(&storage, path, None, Some(999_999))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("IMPORT_REPO_CLEANUP_NOT_FOUND"), "{err}");
+        let foreign = generate_id();
+        storage
+            .git_db_storage()
+            .insert_cleanup_in_txn(
+                foreign,
+                "/third-party/elsewhere",
+                1,
+                "anonymous",
+                storage.git_db_storage().get_connection(),
+            )
+            .await
+            .unwrap();
+        let err = fu17_remove(&storage, path, None, Some(foreign))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("IMPORT_REPO_CLEANUP_NOT_FOUND"), "{err}");
+        assert_eq!(fu17_objects(&storage, r2.repo_id).await, 3);
+
+        let swept_rows = fu17_audit(&storage, r1.repo_id, "swept").await.len();
+        assert_eq!(
+            fu17_remove(&storage, path, None, Some(c1)).await.unwrap(),
+            RemoveOutcome::Removed {
+                repo_id: r1.repo_id,
+                cleanup_id: c1
+            }
+        );
+        assert_eq!(
+            fu17_audit(&storage, r1.repo_id, "swept").await.len(),
+            swept_rows
+        );
+        assert_eq!(
+            fu17_ledger(&storage, c0).await.state,
+            CleanupState::Detached
+        );
+        // A path-only request now removes the re-import under a new id, and
+        // resumes c0 as an older row of the path.
+        let RemoveOutcome::Removed {
+            repo_id,
+            cleanup_id,
+        } = fu17_remove(&storage, path, None, None).await.unwrap()
+        else {
+            panic!("expected Removed");
+        };
+        assert_eq!(repo_id, r2.repo_id);
+        assert_ne!(cleanup_id, c1);
+        assert_eq!(fu17_ledger(&storage, c0).await.state, CleanupState::Swept);
+        assert_eq!(fu17_objects(&storage, repo0).await, 0);
+    }
+
+    async fn fu17_write_snapshot(
+        storage: &Storage,
+        repo_id: i64,
+    ) -> (i64, i64, i64, i64, usize, String, usize) {
+        (
+            fu17_count(storage, "SELECT count(*) AS n FROM push_queue").await,
+            fu17_count(storage, "SELECT count(*) AS n FROM audit_logs").await,
+            fu17_count(storage, "SELECT count(*) AS n FROM import_repo_cleanups").await,
+            fu17_count(storage, "SELECT count(*) AS n FROM git_repo").await,
+            storage
+                .git_db_storage()
+                .get_ref(repo_id)
+                .await
+                .unwrap()
+                .len(),
+            fu17_root(storage).await,
+            fu17_objects(storage, repo_id).await,
+        )
+    }
+
+    #[tokio::test]
+    async fn fu17_remove_has_children_no_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu17-parent";
+        let parent = fu17_mount(&storage, path).await;
+        // A registered child (no attach yet) and an alias row of the parent.
+        let (child, _, _) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/fu17-parent/child").await;
+        storage
+            .git_db_storage()
+            .save_git_repo(child.clone().into())
+            .await
+            .unwrap();
+        storage
+            .git_db_storage()
+            .save_git_repo(crate::callisto::git_repo::Model {
+                id: generate_id(),
+                repo_path: "/third-party/fu17-parent/".to_owned(),
+                repo_name: "alias".to_owned(),
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+            })
+            .await
+            .unwrap();
+        let before = fu17_write_snapshot(&storage, parent.repo_id).await;
+        let err = fu17_remove(&storage, path, None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("IMPORT_REPO_HAS_CHILDREN"), "{err}");
+        assert_eq!(
+            fu17_write_snapshot(&storage, parent.repo_id).await,
+            before,
+            "no write of any kind"
+        );
+
+        fu17_exec(
+            &storage,
+            &format!("DELETE FROM git_repo WHERE id = {}", child.repo_id),
+        )
+        .await;
+        assert!(matches!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Removed { repo_id, .. } if repo_id == parent.repo_id
+        ));
+        assert_eq!(
+            fu17_count(
+                &storage,
+                "SELECT count(*) AS n FROM git_repo WHERE repo_path = '/third-party/fu17-parent/'"
+            )
+            .await,
+            1,
+            "the alias row is not a child and is left alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn fu17_remove_keeps_shared_blob_and_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        use futures::StreamExt;
+
+        let a = fu17_mount(&storage, "/third-party/fu17-a").await;
+        let b = fu17_mount(&storage, "/third-party/fu17-ab").await;
+        // The Monorepo's own placeholder blob, also registered under A: the
+        // sweep drops A's row, the Monorepo keeps its row and the bytes.
+        let gitkeep_id = Blob::from_content("Placeholder file for /third-party directory")
+            .id
+            .to_string();
+        assert_eq!(
+            storage
+                .mono_storage()
+                .get_mega_blobs_by_hashes(vec![gitkeep_id.clone()])
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "init_monorepo wrote the placeholder"
+        );
+        let readme_id = Blob::from_content("hello from import repo").id.to_string();
+        storage
+            .git_db_storage()
+            .batch_save_model::<git_blob::Entity, git_blob::ActiveModel>(vec![
+                git_blob::Model {
+                    id: generate_id(),
+                    repo_id: a.repo_id,
+                    blob_id: gitkeep_id.clone(),
+                    name: None,
+                    size: 0,
+                    created_at: chrono::Utc::now().naive_utc(),
+                    pack_id: String::new(),
+                    file_path: String::new(),
+                    pack_offset: 0,
+                    is_delta_in_pack: false,
+                }
+                .into_active_model(),
+            ])
+            .await
+            .unwrap();
+        let mega_blobs = fu17_count(&storage, "SELECT count(*) AS n FROM mega_blob").await;
+        let root_before = fu17_root(&storage).await;
+        let b_refs = storage.git_db_storage().get_ref(b.repo_id).await.unwrap();
+
+        let RemoveOutcome::Removed {
+            repo_id: a_removed,
+            cleanup_id: a_cleanup,
+        } = fu17_remove(&storage, "/third-party/fu17-a", None, None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected Removed");
+        };
+        assert_eq!(a_removed, a.repo_id);
+        // The Monorepo side is untouched: its blob rows (and the object
+        // store) keep every shared byte; the sibling that shares the readme
+        // content and the path prefix keeps its rows, refs and registration.
+        assert_eq!(
+            fu17_count(&storage, "SELECT count(*) AS n FROM mega_blob").await,
+            mega_blobs
+        );
+        assert_ne!(
+            fu17_root(&storage).await,
+            root_before,
+            "the mount was removed"
+        );
+        assert_eq!(fu17_objects(&storage, a.repo_id).await, 0);
+        assert_eq!(fu17_objects(&storage, b.repo_id).await, 3);
+        assert_eq!(
+            fu17_ledger(&storage, a_cleanup).await.rows_deleted,
+            Some(fu17_counts(1, 1, 2, 0)),
+            "A's two blob rows (readme and placeholder) were the ones deleted"
+        );
+        // Shared bytes stay readable through the Monorepo and the object store.
+        assert_eq!(
+            storage
+                .mono_storage()
+                .get_mega_blobs_by_hashes(vec![gitkeep_id.clone()])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            storage
+                .git_service
+                .get_object_as_bytes(&gitkeep_id)
+                .await
+                .is_ok()
+        );
+        assert!(
+            storage
+                .git_service
+                .get_object_as_bytes(&readme_id)
+                .await
+                .is_ok()
+        );
+        // The sibling still serves a clone: its commit and its blob rows,
+        // including the readme it shares with the removed repository, are
+        // what upload-pack streams.
+        let b_commits: Vec<_> = storage
+            .git_db_storage()
+            .get_commits_by_repo_id(b.repo_id)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(b_commits.len(), 1);
+        let b_blobs: Vec<String> = storage
+            .git_db_storage()
+            .get_blobs_by_repo_id(b.repo_id)
+            .await
+            .unwrap()
+            .filter_map(|row| async move { row.ok().map(|m| m.blob_id) })
+            .collect()
+            .await;
+        assert!(b_blobs.contains(&readme_id), "{b_blobs:?}");
+        let a_blobs: Vec<_> = storage
+            .git_db_storage()
+            .get_blobs_by_repo_id(a.repo_id)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(a_blobs.is_empty());
+        assert_eq!(
+            storage.git_db_storage().get_ref(b.repo_id).await.unwrap(),
+            b_refs
+        );
+        assert!(
+            storage
+                .git_db_storage()
+                .find_git_repo_exact_match("/third-party/fu17-ab")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            fu17_count(
+                &storage,
+                &format!(
+                    "SELECT count(*) AS n FROM import_repo_cleanups WHERE repo_id = {}",
+                    b.repo_id
+                )
+            )
+            .await,
+            0
+        );
+        assert!(matches!(
+            fu17_remove(&storage, "/third-party/fu17-ab", None, None)
+                .await
+                .unwrap(),
+            RemoveOutcome::Removed { repo_id, .. } if repo_id == b.repo_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn fu17_pending_rechecks_ledger_before_answering() {
+        use crate::callisto::import_repo_cleanups::CleanupState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let git_db = storage.git_db_storage();
+        let path = "/third-party/fu17-race";
+        let id = generate_id();
+        let repo_id = fu17_pending_row(&storage, id, path).await;
+        let stale = fu17_ledger(&storage, id).await;
+        assert_eq!(stale.state, CleanupState::Detached);
+        // Another sweeper finishes the row while this request still holds
+        // the snapshot it read; this request has no budget left.
+        assert!(
+            git_db
+                .mark_cleanup_swept(id, fu17_counts(0, 0, 1, 0), git_db.get_connection())
+                .await
+                .unwrap()
+        );
+        let mut budget = 0u32;
+        assert_eq!(
+            sweep_ledger_row(&git_db, &stale, "late", &mut budget)
+                .await
+                .unwrap(),
+            RowSweep::Swept,
+            "a pending answer never names a swept row"
+        );
+        assert_eq!(
+            fu17_objects(&storage, repo_id).await,
+            1,
+            "no budget, no delete"
+        );
+        assert_eq!(
+            fu17_ledger(&storage, id).await.rows_deleted,
+            Some(fu17_counts(0, 0, 1, 0)),
+            "the other sweeper's counts stand"
+        );
+        assert!(fu17_audit(&storage, repo_id, "swept").await.is_empty());
+    }
+
+    async fn fu17_pending_row(storage: &Storage, id: i64, path: &str) -> i64 {
+        let repo_id = generate_id();
+        let git_db = storage.git_db_storage();
+        git_db
+            .insert_cleanup_in_txn(id, path, repo_id, "anonymous", git_db.get_connection())
+            .await
+            .unwrap();
+        git_db
+            .batch_save_model::<git_blob::Entity, git_blob::ActiveModel>(vec![
+                git_blob::Model {
+                    id: generate_id(),
+                    repo_id,
+                    blob_id: format!("{id:040x}"),
+                    name: None,
+                    size: 0,
+                    created_at: chrono::Utc::now().naive_utc(),
+                    pack_id: String::new(),
+                    file_path: String::new(),
+                    pack_offset: 0,
+                    is_delta_in_pack: false,
+                }
+                .into_active_model(),
+            ])
+            .await
+            .unwrap();
+        repo_id
+    }
+
+    #[tokio::test]
+    async fn fu17_resume_budget_paginates() {
+        use crate::callisto::import_repo_cleanups::CleanupState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let git_db = storage.git_db_storage();
+        let path = "/third-party/fu17-page";
+        let base = generate_id();
+        let mut repos = Vec::new();
+        for i in 1..=17 {
+            repos.push(fu17_pending_row(&storage, base + i, path).await);
+        }
+        // Decoys: swept rows on the path, pending rows elsewhere.
+        for i in 18..=20 {
+            fu17_pending_row(&storage, base + i, path).await;
+            assert!(
+                git_db
+                    .mark_cleanup_swept(base + i, fu17_counts(0, 0, 1, 0), git_db.get_connection())
+                    .await
+                    .unwrap()
+            );
+        }
+        for i in 21..=22 {
+            fu17_pending_row(&storage, base + i, "/third-party/fu17-other").await;
+        }
+        let detached_on = |path: &'static str| {
+            format!(
+                "SELECT count(*) AS n FROM import_repo_cleanups WHERE path = '{path}' AND state = 'detached'"
+            )
+        };
+
+        assert_eq!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Pending {
+                repo_id: repos[16],
+                cleanup_id: base + 17
+            }
+        );
+        for i in 1..=16 {
+            assert_eq!(
+                fu17_ledger(&storage, base + i).await.state,
+                CleanupState::Swept,
+                "{i}"
+            );
+        }
+        assert_eq!(
+            fu17_ledger(&storage, base + 17).await.state,
+            CleanupState::Detached
+        );
+        assert_eq!(fu17_objects(&storage, repos[16]).await, 1);
+        assert_eq!(fu17_count(&storage, &detached_on(path)).await, 1);
+        assert_eq!(
+            fu17_count(&storage, &detached_on("/third-party/fu17-other")).await,
+            2
+        );
+
+        assert_eq!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Absent
+        );
+        assert_eq!(
+            fu17_ledger(&storage, base + 17).await.state,
+            CleanupState::Swept
+        );
+        assert_eq!(fu17_objects(&storage, repos[16]).await, 0);
+        assert_eq!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Absent
+        );
+
+        // Exactly one full page: no spurious Pending.
+        let path2 = "/third-party/fu17-page2";
+        let base2 = generate_id();
+        for i in 1..=16 {
+            fu17_pending_row(&storage, base2 + i, path2).await;
+        }
+        assert_eq!(
+            fu17_remove(&storage, path2, None, None).await.unwrap(),
+            RemoveOutcome::Absent
+        );
+        assert_eq!(fu17_count(&storage, &detached_on(path2)).await, 0);
+    }
+
+    #[tokio::test]
+    async fn fu17_sweep_budget_pending() {
+        use crate::callisto::import_repo_cleanups::CleanupState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu17-budget";
+        let repo = fu17_mount(&storage, path).await;
+        // 100 500 more blobs: more than the 100 statements of one request.
+        let base = generate_id();
+        fu17_exec(
+            &storage,
+            &format!(
+                "INSERT INTO git_blob (id, repo_id, blob_id, name, size, created_at, pack_id, file_path, pack_offset, is_delta_in_pack) \
+                 SELECT {base} + g, {}, 'f' || lpad(g::text, 39, '0'), NULL, 0, now(), '', '', 0, false \
+                 FROM generate_series(1, 100500) g",
+                repo.repo_id
+            ),
+        )
+        .await;
+        fu17_exec(&storage, "ANALYZE git_blob").await;
+        let queue_rows = fu17_count(&storage, "SELECT count(*) AS n FROM push_queue").await;
+
+        let RemoveOutcome::Pending {
+            repo_id,
+            cleanup_id,
+        } = fu17_remove(&storage, path, Some("operator-cli"), None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected Pending");
+        };
+        assert_eq!(repo_id, repo.repo_id);
+        // 1 (commit) + 1 (tree) + 98 (blob batches) statements.
+        assert_eq!(fu17_objects(&storage, repo_id).await, 2501);
+        let ledger = fu17_ledger(&storage, cleanup_id).await;
+        assert_eq!(ledger.state, CleanupState::Detached);
+        assert_eq!(ledger.rows_deleted, Some(fu17_counts(1, 1, 98_000, 0)));
+        assert!(fu17_audit(&storage, repo_id, "swept").await.is_empty());
+        assert!(
+            storage
+                .git_db_storage()
+                .find_git_repo_exact_match(path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fu17_count(&storage, "SELECT count(*) AS n FROM push_queue").await,
+            queue_rows + 1
+        );
+
+        assert_eq!(
+            fu17_remove(&storage, path, Some("operator-cli"), Some(cleanup_id))
+                .await
+                .unwrap(),
+            RemoveOutcome::Removed {
+                repo_id,
+                cleanup_id
+            }
+        );
+        let ledger = fu17_ledger(&storage, cleanup_id).await;
+        assert_eq!(ledger.state, CleanupState::Swept);
+        assert_eq!(ledger.rows_deleted, Some(fu17_counts(1, 1, 100_501, 0)));
+        assert!(ledger.swept_at.is_some());
+        let swept = fu17_audit(&storage, repo_id, "swept").await;
+        assert_eq!(swept.len(), 1);
+        assert_eq!(
+            swept[0]
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("rows_deleted")),
+            Some(&fu17_counts(1, 1, 100_501, 0))
+        );
+        assert_eq!(fu17_objects(&storage, repo_id).await, 0);
+        assert_eq!(
+            fu17_count(&storage, "SELECT count(*) AS n FROM push_queue").await,
+            queue_rows + 1,
+            "a continuation never enqueues"
+        );
+        assert_eq!(
+            fu17_remove(&storage, path, None, Some(cleanup_id))
+                .await
+                .unwrap(),
+            RemoveOutcome::Removed {
+                repo_id,
+                cleanup_id
+            }
+        );
+        assert_eq!(fu17_audit(&storage, repo_id, "swept").await.len(), 1);
+        assert_eq!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn fu17_fresh_detach_resumes_older_rows() {
+        use crate::callisto::import_repo_cleanups::CleanupState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        // (a) A pending cleanup of an earlier import at the path: the request
+        // that removes the re-import sweeps its own row and then the older one.
+        let path = "/third-party/fu17-older";
+        let r1 = fu17_mount(&storage, path).await;
+        let c1 = detach_import_repo(&storage, disabled_cache().await, r1.repo_id, path, None)
+            .await
+            .unwrap()
+            .expect("cleanup id");
+        let r2 = fu17_mount(&storage, path).await;
+        let RemoveOutcome::Removed {
+            repo_id,
+            cleanup_id,
+        } = fu17_remove(&storage, path, None, None).await.unwrap()
+        else {
+            panic!("expected Removed");
+        };
+        assert_eq!(repo_id, r2.repo_id);
+        assert_ne!(cleanup_id, c1);
+        assert_eq!(fu17_ledger(&storage, c1).await.state, CleanupState::Swept);
+        assert_eq!(fu17_objects(&storage, r1.repo_id).await, 0);
+        assert_eq!(fu17_objects(&storage, r2.repo_id).await, 0);
+
+        // (b) The 16-row cap counts the fresh detach: 16 older rows leave one.
+        let path2 = "/third-party/fu17-older16";
+        let fresh = fu17_mount(&storage, path2).await;
+        let base = generate_id();
+        let mut repos = Vec::new();
+        for i in 1..=16 {
+            repos.push(fu17_pending_row(&storage, base + i, path2).await);
+        }
+        let RemoveOutcome::Removed {
+            repo_id,
+            cleanup_id,
+        } = fu17_remove(&storage, path2, None, None).await.unwrap()
+        else {
+            panic!("expected Removed");
+        };
+        assert_eq!(repo_id, fresh.repo_id);
+        assert_eq!(
+            fu17_ledger(&storage, cleanup_id).await.state,
+            CleanupState::Swept
+        );
+        for i in 1..=15 {
+            assert_eq!(
+                fu17_ledger(&storage, base + i).await.state,
+                CleanupState::Swept,
+                "{i}"
+            );
+        }
+        assert_eq!(
+            fu17_ledger(&storage, base + 16).await.state,
+            CleanupState::Detached
+        );
+        assert_eq!(fu17_objects(&storage, repos[15]).await, 1);
+        assert_eq!(
+            fu17_remove(&storage, path2, None, None).await.unwrap(),
+            RemoveOutcome::Absent
+        );
+        assert_eq!(
+            fu17_ledger(&storage, base + 16).await.state,
+            CleanupState::Swept
+        );
+        assert_eq!(fu17_objects(&storage, repos[15]).await, 0);
+    }
+
+    #[tokio::test]
+    async fn fu17_swept_by_another_request_writes_no_second_audit() {
+        use crate::callisto::import_repo_cleanups::CleanupState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let git_db = storage.git_db_storage();
+        let path = "/third-party/fu17-loser";
+        let id = generate_id();
+        let repo_id = fu17_pending_row(&storage, id, path).await;
+        let stale = fu17_ledger(&storage, id).await;
+        assert_eq!(stale.state, CleanupState::Detached);
+        // Another request marks the row swept while this one still sweeps
+        // from its snapshot: this one loses the mark and writes no audit row.
+        assert!(
+            git_db
+                .mark_cleanup_swept(id, fu17_counts(0, 0, 9, 0), git_db.get_connection())
+                .await
+                .unwrap()
+        );
+        let mut budget = SWEEP_STATEMENT_BUDGET;
+        assert_eq!(
+            sweep_ledger_row(&git_db, &stale, "loser", &mut budget)
+                .await
+                .unwrap(),
+            RowSweep::Swept
+        );
+        assert_eq!(
+            fu17_objects(&storage, repo_id).await,
+            0,
+            "the sweep itself ran"
+        );
+        assert!(fu17_audit(&storage, repo_id, "swept").await.is_empty());
+        assert_eq!(
+            fu17_ledger(&storage, id).await.rows_deleted,
+            Some(fu17_counts(0, 0, 9, 0)),
+            "the winner's counts stand"
+        );
+    }
+
+    #[tokio::test]
+    async fn fu17_budget_exhausted_between_rows() {
+        use crate::callisto::import_repo_cleanups::CleanupState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let git_db = storage.git_db_storage();
+        let path = "/third-party/fu17-between";
+        // Row 1 needs exactly the whole budget; row 2 is next in line.
+        let (id1, repo1) = (generate_id(), generate_id());
+        git_db
+            .insert_cleanup_in_txn(id1, path, repo1, "anonymous", git_db.get_connection())
+            .await
+            .unwrap();
+        let base = generate_id();
+        fu17_exec(
+            &storage,
+            &format!(
+                "INSERT INTO git_blob (id, repo_id, blob_id, name, size, created_at, pack_id, file_path, pack_offset, is_delta_in_pack) \
+                 SELECT {base} + g, {repo1}, 'e' || lpad(g::text, 39, '0'), NULL, 0, now(), '', '', 0, false \
+                 FROM generate_series(1, 100000) g"
+            ),
+        )
+        .await;
+        fu17_exec(&storage, "ANALYZE git_blob").await;
+        let id2 = id1 + 1;
+        let repo2 = fu17_pending_row(&storage, id2, path).await;
+
+        assert_eq!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Pending {
+                repo_id: repo2,
+                cleanup_id: id2
+            }
+        );
+        let row1 = fu17_ledger(&storage, id1).await;
+        assert_eq!(
+            row1.state,
+            CleanupState::Swept,
+            "exactly 100 statements finish row 1"
+        );
+        assert_eq!(row1.rows_deleted, Some(fu17_counts(0, 0, 100_000, 0)));
+        assert_eq!(fu17_objects(&storage, repo1).await, 0);
+        let row2 = fu17_ledger(&storage, id2).await;
+        assert_eq!(row2.state, CleanupState::Detached);
+        assert_eq!(row2.rows_deleted, None, "no budget left: no progress write");
+        assert_eq!(fu17_objects(&storage, repo2).await, 1);
+
+        assert_eq!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Absent
+        );
+        assert_eq!(fu17_ledger(&storage, id2).await.state, CleanupState::Swept);
+        assert_eq!(fu17_objects(&storage, repo2).await, 0);
+    }
+
+    #[tokio::test]
+    async fn fu17_b3_refusal_surfaces_typed_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu17-b3";
+        let parent = fu17_mount(&storage, path).await;
+        let (child, _, _) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/fu17-b3/child").await;
+        storage
+            .git_db_storage()
+            .save_git_repo(child.clone().into())
+            .await
+            .unwrap();
+        // Past the entry's pre-check (a child registered in between): B3's
+        // own re-check refuses and the refusal reaches the caller typed.
+        let err = detach_import_repo(&storage, disabled_cache().await, parent.repo_id, path, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("IMPORT_REPO_HAS_CHILDREN"), "{err}");
+        assert!(
+            storage
+                .git_db_storage()
+                .find_git_repo_exact_match(path)
+                .await
+                .unwrap()
+                .is_some_and(|row| row.id == parent.repo_id)
+        );
+        assert_eq!(
+            fu17_count(
+                &storage,
+                &format!(
+                    "SELECT count(*) AS n FROM import_repo_cleanups WHERE repo_id = {}",
+                    parent.repo_id
+                )
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            fu17_count(
+                &storage,
+                "SELECT count(*) AS n FROM push_queue WHERE status = 'Failed'"
+            )
+            .await,
+            1,
+            "the refused round is a Failed queue row"
+        );
+    }
+
+    /// One budget of 100 statements per request, shared by the request's own
+    /// detach and the older rows of the path it resumes.
+    #[tokio::test]
+    async fn fu17_budget_shared_with_older_rows() {
+        use crate::callisto::import_repo_cleanups::CleanupState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu17-shared";
+        // The fresh repository costs exactly 90 statements (one commit batch,
+        // one tree batch, 88 blob batches for 87 501 blobs); 11 older rows of
+        // one blob each follow: 10 fit the request, the 11th does not.
+        let fresh = fu17_mount(&storage, path).await;
+        let base = generate_id();
+        fu17_exec(
+            &storage,
+            &format!(
+                "INSERT INTO git_blob (id, repo_id, blob_id, name, size, created_at, pack_id, file_path, pack_offset, is_delta_in_pack) \
+                 SELECT {base} + g, {}, 'd' || lpad(g::text, 39, '0'), NULL, 0, now(), '', '', 0, false \
+                 FROM generate_series(1, 87500) g",
+                fresh.repo_id
+            ),
+        )
+        .await;
+        fu17_exec(&storage, "ANALYZE git_blob").await;
+        let ledger_base = generate_id();
+        let mut older = Vec::new();
+        for i in 1..=11 {
+            older.push(fu17_pending_row(&storage, ledger_base + i, path).await);
+        }
+
+        let RemoveOutcome::Removed {
+            repo_id,
+            cleanup_id,
+        } = fu17_remove(&storage, path, None, None).await.unwrap()
+        else {
+            panic!("expected Removed");
+        };
+        assert_eq!(repo_id, fresh.repo_id);
+        let own = fu17_ledger(&storage, cleanup_id).await;
+        assert_eq!(own.state, CleanupState::Swept);
+        assert_eq!(own.rows_deleted, Some(fu17_counts(1, 1, 87_501, 0)));
+        for i in 1..=10 {
+            assert_eq!(
+                fu17_ledger(&storage, ledger_base + i).await.state,
+                CleanupState::Swept,
+                "{i}"
+            );
+        }
+        assert_eq!(
+            fu17_ledger(&storage, ledger_base + 11).await.state,
+            CleanupState::Detached,
+            "the 100th statement went to the 10th older row"
+        );
+        assert_eq!(fu17_objects(&storage, older[10]).await, 1);
+        assert_eq!(
+            fu17_remove(&storage, path, None, None).await.unwrap(),
+            RemoveOutcome::Absent
+        );
+        assert_eq!(
+            fu17_ledger(&storage, ledger_base + 11).await.state,
+            CleanupState::Swept
+        );
+        assert_eq!(fu17_objects(&storage, older[10]).await, 0);
+    }
+
+    /// The repository disappears between the entry's write-free pre-check and
+    /// B3 (here: a concurrent delete of its row, which B3's row lock waits
+    /// for): the detach round is `Done` without a ledger row, and the entry
+    /// answers from the path's ledger.
+    #[tokio::test]
+    async fn fu17_detach_lost_race_falls_back_to_ledger() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+
+        use crate::callisto::import_repo_cleanups::CleanupState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let path = "/third-party/fu17-lost-race";
+        let live = fu17_mount(&storage, path).await;
+        let older = generate_id();
+        let older_repo = fu17_pending_row(&storage, older, path).await;
+        let rounds = format!("SELECT count(*) AS n FROM push_queue WHERE path = '{path}'");
+        let before = fu17_count(&storage, &rounds).await;
+
+        let conn = storage.git_db_storage().get_connection().clone();
+        let deleting = conn.begin().await.unwrap();
+        deleting
+            .execute_unprepared(&format!("DELETE FROM git_repo WHERE id = {}", live.repo_id))
+            .await
+            .unwrap();
+        let entry_storage = storage.clone();
+        let removing =
+            tokio::spawn(async move { fu17_remove(&entry_storage, path, None, None).await });
+        let mut waited = false;
+        for _ in 0..200 {
+            // Inside a transaction `pg_stat_activity` is a snapshot taken at
+            // its first read: discard it before every poll.
+            deleting
+                .execute_unprepared("SELECT pg_stat_clear_snapshot()")
+                .await
+                .unwrap();
+            let row = deleting
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                     AND pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS v",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            if row.try_get::<bool>("", "v").unwrap() {
+                waited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(waited, "B3 waits on the row being deleted");
+        deleting.commit().await.unwrap();
+
+        assert_eq!(
+            removing.await.unwrap().unwrap(),
+            RemoveOutcome::Absent,
+            "nothing detached: the ledger answers"
+        );
+        assert_eq!(
+            fu17_count(
+                &storage,
+                &format!(
+                    "SELECT count(*) AS n FROM import_repo_cleanups WHERE repo_id = {}",
+                    live.repo_id
+                )
+            )
+            .await,
+            0
+        );
+        assert_eq!(fu17_count(&storage, &rounds).await, before + 1);
+        assert_eq!(
+            fu17_count(
+                &storage,
+                &format!("{rounds} AND status = 'Done' AND kind = 'attach'")
+            )
+            .await,
+            before + 1,
+            "the detach round is Done"
+        );
+        assert_eq!(
+            fu17_ledger(&storage, older).await.state,
+            CleanupState::Swept
+        );
+        assert_eq!(fu17_objects(&storage, older_repo).await, 0);
     }
 }

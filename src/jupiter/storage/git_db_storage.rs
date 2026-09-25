@@ -2,9 +2,9 @@ use std::{collections::HashMap, ops::Deref};
 
 use futures::Stream;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr,
-    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
-    Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    DbBackend, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, QueryTrait, Set, Statement, TransactionTrait,
     sea_query::{CaseStatement, Expr, ExprTrait, OnConflict},
 };
 
@@ -14,7 +14,10 @@ use crate::{
         import_repo_cleanups::{self, CleanupState},
         sea_orm_active_enums::RefTypeEnum,
     },
-    common::{errors::MegaError, utils::generate_id},
+    common::{
+        errors::MegaError,
+        utils::{canonicalize_mono_ref_path, escape_like, generate_id},
+    },
     contract::api::common::Pagination,
     jupiter::storage::base_storage::{BaseStorage, StorageConnector},
 };
@@ -829,6 +832,300 @@ impl GitDbStorage {
 
 /// Ledger rows one cleanup request resumes at most (ADR-FU-09 item 6).
 pub const CLEANUP_RESUME_BATCH: u64 = 16;
+/// Rows one sweep statement deletes at most (plan-20260923 ADR-FU-09 item 4).
+pub const SWEEP_BATCH_ROWS: i64 = 1000;
+/// Delete statements one cleanup request runs at most, shared by every ledger
+/// row it handles (ADR-FU-09 item 6). Probes are reads and do not count.
+pub const SWEEP_STATEMENT_BUDGET: u32 = 100;
+/// Rows of the child check read at most (plan-20260923 ADR-FU-10 item 3).
+pub const CHILD_CHECK_PAGE: usize = 64;
+/// Planner settings of each sweep step (its own short transaction). With
+/// sequential and bitmap scans off, the plans left for `WHERE repo_id = $1
+/// LIMIT n` are index scans on a `repo_id`-leading index, which stop after
+/// `n` live rows of that repository whatever the statistics say. Left on, a
+/// repository estimated to be much of the table plans as a sequential scan
+/// that reads the whole table once the repository is empty, and a small
+/// estimate can plan as a bitmap scan that reads every entry of the
+/// repository before the limit applies.
+pub(crate) const SWEEP_PLANNER_SETTINGS: &str =
+    "SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off";
+
+/// Rows a sweep deleted per object table; the `rows_deleted` shape of the
+/// cleanup ledger and of the `phase: "swept"` audit row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SweepCounts {
+    pub git_commit: u64,
+    pub git_tree: u64,
+    pub git_blob: u64,
+    pub git_tag: u64,
+}
+
+impl SweepCounts {
+    pub fn saturating_add(self, other: SweepCounts) -> SweepCounts {
+        SweepCounts {
+            git_commit: self.git_commit.saturating_add(other.git_commit),
+            git_tree: self.git_tree.saturating_add(other.git_tree),
+            git_blob: self.git_blob.saturating_add(other.git_blob),
+            git_tag: self.git_tag.saturating_add(other.git_tag),
+        }
+    }
+
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "git_commit": self.git_commit,
+            "git_tree": self.git_tree,
+            "git_blob": self.git_blob,
+            "git_tag": self.git_tag,
+        })
+    }
+
+    /// `None`, a non-object, or any malformed value reads the whole set as
+    /// zero (the ledger's writers always emit the four keys).
+    pub fn from_json(value: Option<&serde_json::Value>) -> SweepCounts {
+        value
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// What one call of [`GitDbStorage::sweep_import_repo_objects`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Every table probed empty under a fresh snapshot.
+    pub complete: bool,
+    /// Delete statements this call ran (at most the budget it was given).
+    pub statements: u32,
+    pub max_rows_per_statement: u64,
+    pub deleted: SweepCounts,
+}
+
+/// Object tables in sweep order (ADR-FU-09 item 4). Eight literal statements:
+/// no table name is ever formatted into SQL.
+#[derive(Clone, Copy)]
+enum SweepTable {
+    Commit,
+    Tree,
+    Blob,
+    Tag,
+}
+
+impl SweepTable {
+    const ORDER: [SweepTable; 4] = [Self::Commit, Self::Tree, Self::Blob, Self::Tag];
+
+    /// Whether any row of `repo_id` is left; under `SWEEP_PLANNER_SETTINGS`
+    /// one step of a `repo_id`-leading index.
+    const fn probe_sql(self) -> &'static str {
+        match self {
+            Self::Commit => "SELECT 1 AS k FROM git_commit WHERE repo_id = $1 LIMIT 1",
+            Self::Tree => "SELECT 1 AS k FROM git_tree WHERE repo_id = $1 LIMIT 1",
+            Self::Blob => "SELECT 1 AS k FROM git_blob WHERE repo_id = $1 LIMIT 1",
+            Self::Tag => "SELECT 1 AS k FROM git_tag WHERE repo_id = $1 LIMIT 1",
+        }
+    }
+
+    /// One batch: under `SWEEP_PLANNER_SETTINGS` a `repo_id`-leading index
+    /// picks at most `$2` primary keys and the outer scan deletes by primary
+    /// key. The outer `repo_id + 0 = $1` keeps any other repository's row out
+    /// by construction; no `repo_id` index can serve it, so the outer scan
+    /// cannot read the whole repository to find the batch.
+    const fn delete_sql(self) -> &'static str {
+        match self {
+            Self::Commit => {
+                "DELETE FROM git_commit WHERE id = ANY (ARRAY(\
+                 SELECT id FROM git_commit WHERE repo_id = $1 LIMIT $2)) AND repo_id + 0 = $1"
+            }
+            Self::Tree => {
+                "DELETE FROM git_tree WHERE id = ANY (ARRAY(\
+                 SELECT id FROM git_tree WHERE repo_id = $1 LIMIT $2)) AND repo_id + 0 = $1"
+            }
+            Self::Blob => {
+                "DELETE FROM git_blob WHERE id = ANY (ARRAY(\
+                 SELECT id FROM git_blob WHERE repo_id = $1 LIMIT $2)) AND repo_id + 0 = $1"
+            }
+            Self::Tag => {
+                "DELETE FROM git_tag WHERE id = ANY (ARRAY(\
+                 SELECT id FROM git_tag WHERE repo_id = $1 LIMIT $2)) AND repo_id + 0 = $1"
+            }
+        }
+    }
+
+    fn slot(self, counts: &mut SweepCounts) -> &mut u64 {
+        match self {
+            Self::Commit => &mut counts.git_commit,
+            Self::Tree => &mut counts.git_tree,
+            Self::Blob => &mut counts.git_blob,
+            Self::Tag => &mut counts.git_tag,
+        }
+    }
+}
+
+impl GitDbStorage {
+    /// Out-of-lock batched sweep of one detached ImportRepo's object rows
+    /// (plan-20260923 ADR-FU-09 item 4). A table is complete only when a
+    /// fresh-snapshot probe finds no row of `repo_id`; only deletes count
+    /// against `statement_budget`. Each step (a probe, then at most one
+    /// delete) is its own short transaction on the pool: every batch commits
+    /// on its own and the planner settings end with the step.
+    pub async fn sweep_import_repo_objects(
+        &self,
+        repo_id: i64,
+        statement_budget: u32,
+        conn: &DatabaseConnection,
+    ) -> Result<SweepReport, MegaError> {
+        let mut report = SweepReport::default();
+        for table in SweepTable::ORDER {
+            loop {
+                // A short transaction per step scopes the planner settings;
+                // the probe and the batch each still read a fresh snapshot.
+                let txn = begin_sweep_step(conn).await?;
+                let present = txn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        table.probe_sql(),
+                        [repo_id.into()],
+                    ))
+                    .await?
+                    .is_some();
+                if !present {
+                    txn.commit().await?;
+                    break;
+                }
+                if report.statements >= statement_budget {
+                    txn.commit().await?;
+                    return Ok(report);
+                }
+                let affected = txn
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        table.delete_sql(),
+                        [repo_id.into(), SWEEP_BATCH_ROWS.into()],
+                    ))
+                    .await?
+                    .rows_affected();
+                txn.commit().await?;
+                report.statements += 1;
+                *table.slot(&mut report.deleted) += affected;
+                report.max_rows_per_statement =
+                    std::cmp::max(report.max_rows_per_statement, affected);
+            }
+        }
+        report.complete = true;
+        Ok(report)
+    }
+
+    /// Whether other ImportRepos live below `path` (plan-20260923 ADR-FU-10
+    /// item 3). A row whose canonical form is `path` itself, such as a `path/`
+    /// alias the FU-15 migration left in place, is the same split identity and
+    /// not a child. A full page of such aliases leaves the rest unknown, so it
+    /// counts as having children.
+    pub async fn import_repo_has_children<C: ConnectionTrait>(
+        &self,
+        repo_id: i64,
+        path: &str,
+        conn: &C,
+    ) -> Result<bool, MegaError> {
+        let rows = conn
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT repo_path FROM git_repo WHERE repo_path LIKE $1 ESCAPE '\\' AND id <> $2 LIMIT $3",
+                [
+                    format!("{}/%", escape_like(path)).into(),
+                    repo_id.into(),
+                    (CHILD_CHECK_PAGE as i64).into(),
+                ],
+            ))
+            .await?;
+        for row in &rows {
+            let below: String = row.try_get("", "repo_path")?;
+            if canonicalize_mono_ref_path(&below).ok().as_deref() != Some(path) {
+                return Ok(true);
+            }
+        }
+        Ok(rows.len() == CHILD_CHECK_PAGE)
+    }
+
+    /// One ledger row by its primary key (the cleanup id).
+    pub async fn cleanup_by_id<C: ConnectionTrait>(
+        &self,
+        cleanup_id: i64,
+        conn: &C,
+    ) -> Result<Option<import_repo_cleanups::Model>, MegaError> {
+        Ok(import_repo_cleanups::Entity::find_by_id(cleanup_id)
+            .one(conn)
+            .await?)
+    }
+
+    /// The ledger row an earlier detach of `repo_id` at `path` wrote, if any.
+    /// A repository is detached once (the row is inserted in the transaction
+    /// that deletes its `git_repo` row), so it has at most one ledger row and
+    /// the first state that holds it answers. At most two queries, the
+    /// `detached` one first; each reads that path's rows in one state through
+    /// the `(path, state, id)` index when the planner takes it, or scans the
+    /// ledger when that segment is a sizeable share of it (from about 30 %):
+    /// at worst two scans of the ledger, which holds one row per detach ever
+    /// made. Only `resolve_cleanup_id` reaches it, for a round that detached
+    /// nothing, fresh or replayed (B3 found the repository already gone, or
+    /// the row predates FU-16): a round that detached answers with its own
+    /// ledger row.
+    pub async fn latest_cleanup_for<C: ConnectionTrait>(
+        &self,
+        repo_id: i64,
+        path: &str,
+        conn: &C,
+    ) -> Result<Option<import_repo_cleanups::Model>, MegaError> {
+        for state in [CleanupState::Detached, CleanupState::Swept] {
+            if let Some(row) = latest_cleanup_query(repo_id, path, state).one(conn).await? {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Cumulative rows a request deleted before it ran out of budget, kept on
+    /// the still-`detached` row so the next request adds to it. `false` when
+    /// the row is already swept or unknown; `mark_cleanup_swept` stays the only
+    /// `detached -> swept` transition. The counts are evidence, not state:
+    /// concurrent sweepers of one row, or a crash between the deletes and this
+    /// write, can leave them under- or over-counted.
+    pub async fn record_cleanup_progress<C: ConnectionTrait>(
+        &self,
+        cleanup_id: i64,
+        rows_deleted: serde_json::Value,
+        conn: &C,
+    ) -> Result<bool, MegaError> {
+        let result = import_repo_cleanups::Entity::update_many()
+            .col_expr(
+                import_repo_cleanups::Column::RowsDeleted,
+                Expr::value(rows_deleted),
+            )
+            .filter(import_repo_cleanups::Column::Id.eq(cleanup_id))
+            .filter(import_repo_cleanups::Column::State.eq(CleanupState::Detached))
+            .exec(conn)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+}
+
+/// One sweep step's transaction, with `SWEEP_PLANNER_SETTINGS` in force.
+async fn begin_sweep_step(conn: &DatabaseConnection) -> Result<DatabaseTransaction, MegaError> {
+    let txn = conn.begin().await?;
+    txn.execute_unprepared(SWEEP_PLANNER_SETTINGS).await?;
+    Ok(txn)
+}
+
+fn latest_cleanup_query(
+    repo_id: i64,
+    path: &str,
+    state: CleanupState,
+) -> sea_orm::Select<import_repo_cleanups::Entity> {
+    import_repo_cleanups::Entity::find()
+        .filter(import_repo_cleanups::Column::Path.eq(path))
+        .filter(import_repo_cleanups::Column::State.eq(state))
+        .filter(import_repo_cleanups::Column::RepoId.eq(repo_id))
+        .order_by_desc(import_repo_cleanups::Column::Id)
+        .limit(1)
+}
 
 fn pending_cleanups_query(path: &str) -> sea_orm::Select<import_repo_cleanups::Entity> {
     import_repo_cleanups::Entity::find()
@@ -1471,5 +1768,680 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    fn commit_row(repo_id: i64, n: u32) -> git_commit::Model {
+        git_commit::Model {
+            id: generate_id(),
+            repo_id,
+            commit_id: format!("{n:040x}"),
+            tree: "a".repeat(40),
+            parents_id: serde_json::json!([]),
+            author: None,
+            committer: None,
+            content: None,
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        }
+    }
+
+    fn tree_row(repo_id: i64, n: u32) -> git_tree::Model {
+        git_tree::Model {
+            id: generate_id(),
+            repo_id,
+            tree_id: format!("{n:040x}"),
+            sub_trees: Vec::new(),
+            size: 0,
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        }
+    }
+
+    async fn fu17_fill(
+        git_db: &GitDbStorage,
+        repo_id: i64,
+        commits: u32,
+        trees: u32,
+        blobs: u32,
+        tags: u32,
+    ) {
+        git_db
+            .batch_save_model::<git_commit::Entity, git_commit::ActiveModel>(
+                (0..commits)
+                    .map(|n| commit_row(repo_id, n).into_active_model())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        git_db
+            .batch_save_model::<git_tree::Entity, git_tree::ActiveModel>(
+                (0..trees)
+                    .map(|n| tree_row(repo_id, n).into_active_model())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        git_db
+            .batch_save_model::<git_blob::Entity, git_blob::ActiveModel>(
+                (0..blobs)
+                    .map(|n| blob_row(repo_id, &format!("{n:040x}"), "").into_active_model())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        git_db
+            .batch_save_model::<git_tag::Entity, git_tag::ActiveModel>(
+                (0..tags)
+                    .map(|n| {
+                        tag_row(repo_id, &format!("{n:040x}"), &format!("v{n}")).into_active_model()
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn fu17_repo_id(git_db: &GitDbStorage, path: &str) -> i64 {
+        git_db
+            .find_git_repo_exact_match(path)
+            .await
+            .unwrap()
+            .expect(path)
+            .id
+    }
+
+    async fn fu17_latest(git_db: &GitDbStorage, repo_id: i64, path: &str) -> Option<i64> {
+        git_db
+            .latest_cleanup_for(repo_id, path, git_db.get_connection())
+            .await
+            .unwrap()
+            .map(|row| row.id)
+    }
+
+    /// A pool of one connection with the options of `conn`'s pool (this
+    /// test's schema and backend tag included).
+    async fn fu17_single_connection(conn: &DatabaseConnection) -> DatabaseConnection {
+        let options = conn.get_postgres_connection_pool().connect_options();
+        let pool = sea_orm::sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(120))
+            .connect_with((*options).clone())
+            .await
+            .unwrap();
+        sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(pool)
+    }
+
+    /// Sequential scans of this schema's object tables, all backends. The
+    /// autocommit `pg_stat_force_next_flush()` makes this backend flush its
+    /// pending counters when it next goes idle outside a transaction, which
+    /// is before that statement completes; the read that follows sees them.
+    async fn fu17_seq_scans(single: &DatabaseConnection) -> i64 {
+        single
+            .execute_unprepared("SELECT pg_stat_force_next_flush()")
+            .await
+            .unwrap();
+        single
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT coalesce(sum(seq_scan), 0)::bigint AS n FROM pg_stat_user_tables \
+                 WHERE schemaname = current_schema() \
+                 AND relname IN ('git_commit', 'git_tree', 'git_blob', 'git_tag')",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap()
+    }
+
+    /// `count` repositories of one row in each object table; the first id.
+    async fn fu17_crowd(git_db: &GitDbStorage, count: i64) -> i64 {
+        let base = generate_id();
+        git_db
+            .batch_save_model::<git_commit::Entity, git_commit::ActiveModel>(
+                (0..count)
+                    .map(|i| commit_row(base + i, 0).into_active_model())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        git_db
+            .batch_save_model::<git_tree::Entity, git_tree::ActiveModel>(
+                (0..count)
+                    .map(|i| tree_row(base + i, 0).into_active_model())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        git_db
+            .batch_save_model::<git_blob::Entity, git_blob::ActiveModel>(
+                (0..count)
+                    .map(|i| blob_row(base + i, &format!("{i:040x}"), "").into_active_model())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        git_db
+            .batch_save_model::<git_tag::Entity, git_tag::ActiveModel>(
+                (0..count)
+                    .map(|i| tag_row(base + i, &format!("{i:040x}"), "v0").into_active_model())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        base
+    }
+
+    /// The probe and the batch of every table, under the custom and the
+    /// generic plan, in a sweep step's transaction: an index scan on a
+    /// `repo_id`-leading index (the batch then deleting by primary key), never
+    /// a sequential or bitmap scan, never a sort.
+    async fn fu17_assert_sweep_plans(git_db: &GitDbStorage, repo_id: i64) {
+        for table in SweepTable::ORDER {
+            let (name, indexes): (&str, &[&str]) = match table {
+                SweepTable::Commit => ("git_commit", &["uniq_c_git_repo_id", "idx_ic_repo_id"]),
+                SweepTable::Tree => ("git_tree", &["uniq_t_git_repo", "idx_t_repo_id"]),
+                SweepTable::Blob => ("git_blob", &["uniq_b_git_repo"]),
+                SweepTable::Tag => ("git_tag", &["uniq_gtag_repo_tag"]),
+            };
+            let steps = [
+                (
+                    table.probe_sql(),
+                    "bigint",
+                    repo_id.to_string(),
+                    format!("on {name}"),
+                ),
+                (
+                    table.delete_sql(),
+                    "bigint, bigint",
+                    format!("{repo_id}, {SWEEP_BATCH_ROWS}"),
+                    format!("on {name} {name}_1"),
+                ),
+            ];
+            for (sql, types, args, scanned) in steps {
+                let txn = begin_sweep_step(git_db.get_connection()).await.unwrap();
+                txn.execute_unprepared(&format!("PREPARE fu17_step ({types}) AS {sql}"))
+                    .await
+                    .unwrap();
+                for mode in ["force_custom_plan", "force_generic_plan"] {
+                    txn.execute_unprepared(&format!("SET LOCAL plan_cache_mode = {mode}"))
+                        .await
+                        .unwrap();
+                    let plan: Vec<String> = txn
+                        .query_all_raw(Statement::from_string(
+                            DbBackend::Postgres,
+                            format!("EXPLAIN EXECUTE fu17_step({args})"),
+                        ))
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
+                        .collect();
+                    let context = format!("{name} {mode} repo {repo_id}: {plan:?}");
+                    assert!(
+                        plan.iter().any(|line| line.contains("Index")
+                            && indexes.iter().any(
+                                |index| line.contains(&format!("Scan using {index} {scanned}"))
+                            )),
+                        "{context}"
+                    );
+                    assert!(
+                        plan.iter()
+                            .any(|line| line.contains("Index Cond: (repo_id = ")),
+                        "{context}"
+                    );
+                    if sql == table.probe_sql() {
+                        assert!(
+                            !plan.iter().any(|line| line.contains("Filter:")),
+                            "{context}"
+                        );
+                    }
+                    if sql == table.delete_sql() {
+                        assert!(
+                            plan.iter().any(|line| line
+                                .contains(&format!("Index Scan using {name}_pkey on {name} "))),
+                            "{context}"
+                        );
+                        assert!(
+                            plan.iter()
+                                .any(|line| line.contains("Index Cond: (id = ANY")),
+                            "{context}"
+                        );
+                    }
+                    assert!(
+                        !plan.iter().any(|line| line.contains("Seq Scan")
+                            || line.contains("Bitmap")
+                            || line.contains("Sort")),
+                        "{context}"
+                    );
+                }
+                txn.execute_unprepared("DEALLOCATE fu17_step")
+                    .await
+                    .unwrap();
+                txn.rollback().await.unwrap();
+            }
+        }
+    }
+
+    async fn fu17_analyze(git_db: &GitDbStorage) {
+        git_db
+            .get_connection()
+            .execute_unprepared(
+                "ANALYZE git_commit; ANALYZE git_tree; ANALYZE git_blob; ANALYZE git_tag",
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fu17_sweep_bounded_and_complete() {
+        let git_db = storage().await;
+        let conn = git_db.get_connection();
+        let target = generate_id();
+        let decoy = generate_id();
+        let cut = generate_id();
+        // An exact multiple, a small table, a table spanning three batches,
+        // an empty one; a decoy repository that is most of `git_blob`, and
+        // later a crowd of 300 one-row repositories that makes one repository
+        // a small estimate.
+        fu17_fill(&git_db, target, 1000, 3, 2500, 7).await;
+        fu17_fill(&git_db, decoy, 0, 0, 50_000, 5).await;
+        fu17_fill(&git_db, cut, 0, 0, 2500, 0).await;
+        // Three statistics snapshots: before this test's ANALYZE (autovacuum
+        // may or may not have run), analyzed with three repositories (a small
+        // share and most of a table), analyzed again with the crowd.
+        fu17_assert_sweep_plans(&git_db, target).await;
+        fu17_analyze(&git_db).await;
+        for repo_id in [target, decoy] {
+            fu17_assert_sweep_plans(&git_db, repo_id).await;
+        }
+        let crowd = fu17_crowd(&git_db, 300).await;
+        fu17_analyze(&git_db).await;
+        for repo_id in [target, decoy, crowd] {
+            fu17_assert_sweep_plans(&git_db, repo_id).await;
+        }
+        // The sweep runs its steps that way, each its own transaction as in
+        // production: on a pool of one connection, whose statistics are
+        // flushed on demand, sweeping three batches of the decoy (most of
+        // `git_blob`) adds no sequential scan of any object table.
+        let single = fu17_single_connection(conn).await;
+        let before = fu17_seq_scans(&single).await;
+        let report = git_db
+            .sweep_import_repo_objects(decoy, 3, &single)
+            .await
+            .unwrap();
+        assert_eq!((report.statements, report.deleted.git_blob), (3, 3000));
+        assert_eq!(fu17_seq_scans(&single).await, before);
+        // And the settings ended with each step: the pooled connection plans
+        // later queries as usual.
+        let settings = single
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT current_setting('enable_seqscan') AS seq, \
+                 current_setting('enable_bitmapscan') AS bitmap",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.try_get::<String>("", "seq").unwrap(), "on");
+        assert_eq!(settings.try_get::<String>("", "bitmap").unwrap(), "on");
+
+        let report = git_db
+            .sweep_import_repo_objects(target, SWEEP_STATEMENT_BUDGET, conn)
+            .await
+            .unwrap();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(
+            report.deleted,
+            SweepCounts {
+                git_commit: 1000,
+                git_tree: 3,
+                git_blob: 2500,
+                git_tag: 7,
+            }
+        );
+        // 1 + 1 + 3 + 1: an exact multiple costs no extra statement (the
+        // probe decides, not a short batch).
+        assert_eq!(report.statements, 6);
+        assert_eq!(report.max_rows_per_statement, 1000);
+        assert!(report.max_rows_per_statement <= SWEEP_BATCH_ROWS as u64);
+        assert_eq!(git_db.get_obj_count_by_repo_id(target).await, 0);
+        assert_eq!(
+            git_db.get_obj_count_by_repo_id(decoy).await,
+            47_005,
+            "another repository's rows are never touched"
+        );
+
+        // No budget on a repository that still has rows: nothing happens.
+        let none = git_db
+            .sweep_import_repo_objects(cut, 0, conn)
+            .await
+            .unwrap();
+        assert!(!none.complete);
+        assert_eq!((none.statements, none.deleted), (0, SweepCounts::default()));
+        // The budget cuts a table mid-way; the next call finishes it.
+        let first = git_db
+            .sweep_import_repo_objects(cut, 2, conn)
+            .await
+            .unwrap();
+        assert!(!first.complete);
+        assert_eq!((first.statements, first.deleted.git_blob), (2, 2000));
+        let second = git_db
+            .sweep_import_repo_objects(cut, SWEEP_STATEMENT_BUDGET, conn)
+            .await
+            .unwrap();
+        assert!(second.complete);
+        assert_eq!((second.statements, second.deleted.git_blob), (1, 500));
+
+        // A swept repository costs no statement, even with no budget at all.
+        let again = git_db
+            .sweep_import_repo_objects(target, 0, conn)
+            .await
+            .unwrap();
+        assert!(again.complete);
+        assert_eq!(again.statements, 0);
+        assert_eq!(again.deleted, SweepCounts::default());
+
+        assert_eq!(SWEEP_BATCH_ROWS, 1000);
+        assert_eq!(SWEEP_STATEMENT_BUDGET, 100);
+        assert_eq!(CLEANUP_RESUME_BATCH, 16);
+    }
+
+    #[tokio::test]
+    async fn fu17_child_query_escapes_and_excludes_aliases() {
+        let git_db = storage().await;
+        let conn = git_db.get_connection();
+        for path in [
+            "/third-party/a_b",
+            "/third-party/a_b/",
+            "/third-party/a_b/.",
+            "/third-party/a_bc",
+            "/third-party/a_bc/child",
+            "/third-party/aXb/child",
+            "/third-party/p%q",
+            "/third-party/pZZq/child",
+            "/third-party/a",
+            "/third-party/ab",
+            "/third-party/ab/x",
+        ] {
+            save_repo(&git_db, path).await;
+        }
+        let a_b = fu17_repo_id(&git_db, "/third-party/a_b").await;
+        let pq = fu17_repo_id(&git_db, "/third-party/p%q").await;
+        let a = fu17_repo_id(&git_db, "/third-party/a").await;
+        // `_` and `%` are literal; `/a` does not match `/ab`; the alias
+        // spellings of the target itself are not children.
+        for (repo_id, path) in [
+            (a_b, "/third-party/a_b"),
+            (pq, "/third-party/p%q"),
+            (a, "/third-party/a"),
+        ] {
+            assert!(
+                !git_db
+                    .import_repo_has_children(repo_id, path, conn)
+                    .await
+                    .unwrap(),
+                "{path}"
+            );
+        }
+        save_repo(&git_db, "/third-party/a_b/real").await;
+        assert!(
+            git_db
+                .import_repo_has_children(a_b, "/third-party/a_b", conn)
+                .await
+                .unwrap()
+        );
+        let real = fu17_repo_id(&git_db, "/third-party/a_b/real").await;
+        assert!(
+            !git_db
+                .import_repo_has_children(real, "/third-party/a_b/real", conn)
+                .await
+                .unwrap()
+        );
+
+        // A full page of aliases leaves the rest unknown: conservative.
+        save_repo(&git_db, "/third-party/z").await;
+        let z = fu17_repo_id(&git_db, "/third-party/z").await;
+        for k in 0..CHILD_CHECK_PAGE - 1 {
+            save_repo(&git_db, &format!("/third-party/z/{}", "./".repeat(k))).await;
+        }
+        assert!(
+            !git_db
+                .import_repo_has_children(z, "/third-party/z", conn)
+                .await
+                .unwrap()
+        );
+        save_repo(
+            &git_db,
+            &format!("/third-party/z/{}", "./".repeat(CHILD_CHECK_PAGE - 1)),
+        )
+        .await;
+        assert!(
+            git_db
+                .import_repo_has_children(z, "/third-party/z", conn)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn fu17_ledger_reads_and_progress() {
+        let git_db = storage().await;
+        let conn = git_db.get_connection();
+        let (p, q) = ("/third-party/p", "/third-party/q");
+        for (id, path, repo_id) in [(10, p, 3), (20, p, 1), (30, p, 2), (40, q, 1)] {
+            git_db
+                .insert_cleanup_in_txn(id, path, repo_id, "anonymous", conn)
+                .await
+                .unwrap();
+        }
+        assert!(
+            git_db
+                .mark_cleanup_swept(20, serde_json::json!({ "git_blob": 1 }), conn)
+                .await
+                .unwrap()
+        );
+
+        let by_id = git_db.cleanup_by_id(20, conn).await.unwrap().unwrap();
+        assert_eq!(by_id.state, CleanupState::Swept);
+        assert!(git_db.cleanup_by_id(99, conn).await.unwrap().is_none());
+        // The row of that repository at that path, in either state.
+        assert_eq!(fu17_latest(&git_db, 1, p).await, Some(20));
+        assert_eq!(fu17_latest(&git_db, 2, p).await, Some(30));
+        assert_eq!(fu17_latest(&git_db, 1, q).await, Some(40));
+        assert_eq!(fu17_latest(&git_db, 3, p).await, Some(10));
+        assert_eq!(fu17_latest(&git_db, 4, p).await, None);
+        // At scale: 1000 swept and 200 detached rows of other repositories on
+        // one path, the target being the oldest swept row, so both queries
+        // cross the path's whole history. With these statistics the generic
+        // plan is a range read of the (path, state, id) index; this pins that
+        // the index serves the lookup, not a plan for every ledger shape.
+        let history = "/third-party/history";
+        let mut rows: Vec<_> = (1001..=2000i64)
+            .map(|id| cleanup_row(id, history, CleanupState::Swept))
+            .collect();
+        rows.extend((2001..=2200i64).map(|id| cleanup_row(id, history, CleanupState::Detached)));
+        for chunk in rows.chunks(500) {
+            import_repo_cleanups::Entity::insert_many(chunk.to_vec())
+                .exec(conn)
+                .await
+                .unwrap();
+        }
+        conn.execute_unprepared("ANALYZE import_repo_cleanups")
+            .await
+            .unwrap();
+        assert_eq!(fu17_latest(&git_db, 1001, history).await, Some(1001));
+        assert_eq!(fu17_latest(&git_db, 2200, history).await, Some(2200));
+        assert_eq!(fu17_latest(&git_db, 5000, history).await, None);
+        let stmt =
+            latest_cleanup_query(1001, history, CleanupState::Swept).build(DbBackend::Postgres);
+        let txn = conn.begin().await.unwrap();
+        txn.execute_unprepared(&format!(
+            "PREPARE fu17_latest (text, text, bigint, bigint) AS {}",
+            stmt.sql
+        ))
+        .await
+        .unwrap();
+        txn.execute_unprepared("SET LOCAL plan_cache_mode = force_generic_plan")
+            .await
+            .unwrap();
+        let plan: Vec<String> = txn
+            .query_all_raw(Statement::from_string(
+                DbBackend::Postgres,
+                format!("EXPLAIN EXECUTE fu17_latest('{history}', 'swept', 1001, 1)"),
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
+            .collect();
+        txn.rollback().await.unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_import_repo_cleanups_path_state_id")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|line| line.contains("Seq Scan on import_repo_cleanups")),
+            "{plan:?}"
+        );
+
+        // Progress lands only on a row that is still detached, and does not
+        // change its state.
+        let progress =
+            serde_json::json!({ "git_commit": 0, "git_tree": 0, "git_blob": 7, "git_tag": 0 });
+        assert!(
+            git_db
+                .record_cleanup_progress(10, progress.clone(), conn)
+                .await
+                .unwrap()
+        );
+        let row = git_db.cleanup_by_id(10, conn).await.unwrap().unwrap();
+        assert_eq!(row.state, CleanupState::Detached);
+        assert_eq!(row.rows_deleted, Some(progress));
+        assert!(
+            git_db
+                .pending_cleanups_by_path(p, conn)
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.id == 10)
+        );
+        assert!(
+            !git_db
+                .record_cleanup_progress(20, serde_json::json!({ "git_blob": 9 }), conn)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            git_db
+                .cleanup_by_id(20, conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .rows_deleted,
+            Some(serde_json::json!({ "git_blob": 1 }))
+        );
+
+        assert_eq!(SweepCounts::from_json(None), SweepCounts::default());
+        assert_eq!(
+            SweepCounts::from_json(Some(&serde_json::json!({ "git_blob": "x" }))),
+            SweepCounts::default()
+        );
+        assert_eq!(
+            SweepCounts::from_json(Some(
+                &serde_json::json!({ "git_commit": 5, "git_tree": 2, "git_blob": "x" })
+            )),
+            SweepCounts::default(),
+            "one malformed value zeroes the whole set"
+        );
+        assert_eq!(
+            SweepCounts::from_json(Some(&serde_json::json!({ "git_blob": 3 }))),
+            SweepCounts {
+                git_blob: 3,
+                ..SweepCounts::default()
+            }
+        );
+        assert_eq!(
+            SweepCounts {
+                git_commit: 1,
+                git_blob: 2,
+                ..SweepCounts::default()
+            }
+            .to_json(),
+            serde_json::json!({ "git_commit": 1, "git_tree": 0, "git_blob": 2, "git_tag": 0 })
+        );
+    }
+
+    /// Two sweepers of one repository: the batch that waited on the other's
+    /// row locks deletes nothing, and the probe, not that short batch, says
+    /// whether the table is done.
+    #[tokio::test]
+    async fn fu17_sweep_survives_a_blocked_batch() {
+        let git_db = storage().await;
+        let conn = git_db.get_connection().clone();
+        let target = generate_id();
+        fu17_fill(&git_db, target, 0, 0, 2500, 0).await;
+        fu17_analyze(&git_db).await;
+
+        // The other sweeper: one batch deleted, under the same planner
+        // settings, but not committed.
+        let holder = begin_sweep_step(&conn).await.unwrap();
+        let held = holder
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                SweepTable::Blob.delete_sql(),
+                [target.into(), SWEEP_BATCH_ROWS.into()],
+            ))
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(held, 1000);
+        let sweeper = git_db.clone();
+        let sweep = tokio::spawn(async move {
+            sweeper
+                .sweep_import_repo_objects(target, SWEEP_STATEMENT_BUDGET, sweeper.get_connection())
+                .await
+                .unwrap()
+        });
+        let mut waited = false;
+        for _ in 0..200 {
+            // Inside a transaction `pg_stat_activity` is a snapshot taken at
+            // its first read: discard it before every poll.
+            holder
+                .execute_unprepared("SELECT pg_stat_clear_snapshot()")
+                .await
+                .unwrap();
+            let row = holder
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                     AND pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS v",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            if row.try_get::<bool>("", "v").unwrap() {
+                waited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(waited, "the sweep waited on the other sweeper's batch");
+        holder.commit().await.unwrap();
+        let report = sweep.await.unwrap();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(report.deleted.git_blob, 1500, "{report:?}");
+        assert_eq!(
+            report.statements, 3,
+            "the blocked batch affected 0 rows; the remaining 1500 rows took 2 batches: {report:?}"
+        );
+        assert_eq!(git_db.get_obj_count_by_repo_id(target).await, 0);
     }
 }

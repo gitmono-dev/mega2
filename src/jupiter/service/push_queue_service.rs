@@ -289,43 +289,6 @@ async fn has_branch_ref_in_txn(txn: &DatabaseTransaction, repo_id: i64) -> Resul
         .unwrap_or(false))
 }
 
-/// Rows of the child check read at most (plan-20260923 ADR-FU-10 item 3).
-const CHILD_CHECK_PAGE: usize = 64;
-
-/// Whether other ImportRepos live below `path` (plan-20260923 ADR-FU-10 item
-/// 3). A row whose canonical form is `path` itself, such as a `path/` alias
-/// the FU-15 migration left in place, is the same split identity and not a
-/// child. A full page of such aliases leaves the rest unknown, so it counts as
-/// having children.
-async fn import_repo_has_children_in_txn(
-    txn: &DatabaseTransaction,
-    repo_id: i64,
-    path: &str,
-) -> Result<bool, MegaError> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-
-    use crate::common::utils::{canonicalize_mono_ref_path, escape_like};
-
-    let rows = txn
-        .query_all_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT repo_path FROM git_repo WHERE repo_path LIKE $1 ESCAPE '\\' AND id <> $2 LIMIT $3",
-            [
-                format!("{}/%", escape_like(path)).into(),
-                repo_id.into(),
-                (CHILD_CHECK_PAGE as i64).into(),
-            ],
-        ))
-        .await?;
-    for row in &rows {
-        let below: String = row.try_get("", "repo_path")?;
-        if canonicalize_mono_ref_path(&below).ok().as_deref() != Some(path) {
-            return Ok(true);
-        }
-    }
-    Ok(rows.len() == CHILD_CHECK_PAGE)
-}
-
 /// Trees from `root_tree` down to the parent of the leaf at `path`, read in
 /// the B3 transaction, with the name of each step down.
 async fn import_leaf_chain_in_txn(
@@ -1636,7 +1599,12 @@ impl PushQueueService {
                 .b3_detach_finish(txn, row, ctx, &expected_commit, None)
                 .await;
         }
-        if import_repo_has_children_in_txn(&txn, payload.repo_id, repo_path).await? {
+        if ctx
+            .storage
+            .git_db_storage()
+            .import_repo_has_children(payload.repo_id, repo_path, &txn)
+            .await?
+        {
             let refused = ImportRepoError::HasChildren {
                 path: repo_path.to_owned(),
             };
@@ -7984,7 +7952,9 @@ mod tests {
 
         let txn = conn.begin().await.unwrap();
         assert!(
-            !import_repo_has_children_in_txn(&txn, repo.repo_id, &repo.repo_path)
+            !storage
+                .git_db_storage()
+                .import_repo_has_children(repo.repo_id, &repo.repo_path, &txn)
                 .await
                 .unwrap()
         );
@@ -8022,12 +7992,16 @@ mod tests {
             .unwrap();
         let txn = conn.begin().await.unwrap();
         assert!(
-            import_repo_has_children_in_txn(&txn, repo.repo_id, &repo.repo_path)
+            storage
+                .git_db_storage()
+                .import_repo_has_children(repo.repo_id, &repo.repo_path, &txn)
                 .await
                 .unwrap()
         );
         assert!(
-            !import_repo_has_children_in_txn(&txn, child.repo_id, &child.repo_path)
+            !storage
+                .git_db_storage()
+                .import_repo_has_children(child.repo_id, &child.repo_path, &txn)
                 .await
                 .unwrap()
         );
