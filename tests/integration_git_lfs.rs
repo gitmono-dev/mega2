@@ -956,7 +956,7 @@ fn assert_pinned_git_lfs(token: &str) {
         .unwrap_or_default()
         .to_string();
     assert_eq!(
-        version, "git-lfs/3.7.1",
+        version, "git-lfs/3.8.0",
         "git-cli runner must provide the pinned Git LFS version"
     );
 }
@@ -981,7 +981,7 @@ fn assert_host_git_lfs_pinned() {
         .unwrap_or_default()
         .to_string();
     assert_eq!(
-        version, "git-lfs/3.7.1",
+        version, "git-lfs/3.8.0",
         "host git-lfs used by trunk LFS IT must be the pinned version"
     );
 }

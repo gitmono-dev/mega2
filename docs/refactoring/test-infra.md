@@ -65,8 +65,8 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker/
    `${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}`。启栈前应：
    `mkdir -p "$dir" && chmod 1777 "$dir"`（保证测试 UID 可写）。若目录缺失，
    Docker bind 可能以 `root:root` 自动创建，随后未提权的 cargo 进程分配子目录
-   会 `EACCES`——因此本地与 CI 启动脚本都必须先 mkdir（`config-validation.yml`
-   的 `validate-config` 已在 `--profile git up` 前执行）。用例只在该根下分配子目录并清理。变更
+   会 `EACCES`——因此本地启动脚本必须先 mkdir（`./scripts/dev-test.sh up-full` 会先执行；历史上的 CI
+   `config-validation.yml` 的 `validate-config` 也在 `--profile git up` 前执行）。用例只在该根下分配子目录并清理。变更
    `MEGA2_IT_GIT_WORKDIR` 后必须 `--force-recreate git-cli`（或整栈），
    否则 host 与容器挂载会静默分叉。`git-cli` 在 `profiles: ["git"]` 下，默认
    `up -d --wait` **不会**启动它（避免数据面-only 开发循环误拉 runner；
@@ -108,11 +108,12 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker/
 
 - 通过 compose 提供的客户端（如 git-cli runner）必须在登记条目中写明**固定版本字符串**，
   并用 Verification 断言容器内 `git --version`（及同类工具）等于该 pin。
-- CI 宿主机客户端（`git-protocol-smoke.yml`）固定版本（与 job `env` / summary 断言同源）：
+- CI 宿主机客户端（`git-protocol-smoke.yml`；**历史登记**：该 workflow 已不在 `.github/workflows/`（仅剩 `docker.yml`），本文其它「CI 入口」中的 `config-validation.yml` 同样只是历史登记）固定版本（与 job `env` / summary 断言同源）：
   - CI git 固定版本：`2.53.0`（2026-08-31 起；随 self-hosted runner 迁移由 `2.55.0` 改为跟随 runner 机器实际安装的 git 版本，不再随 GitHub `ubuntu-latest` 镜像滚动。宿主机 git 由 runner 机器管理员维护、workflow 不 apt 升级，因此升级 runner 机器 git 时必须同步显式上调这个 pin——`git-protocol-smoke` 在 `Install and pin git` 步骤直接失败，正是为了逼出这次显式决定）
   - CI git-lfs 固定版本：`3.7.1`（runner 机器未预装；由 `Install and pin git / git-lfs` 步骤按此 pin 下载固定 GitHub release 制品自动安装）
   实际 `git --version` / `git lfs version` 解析出的版本号必须与上述 pin 完全相等，否则 job 失败；
   两个版本输出写入 `$GITHUB_STEP_SUMMARY`。
+- 本机宿主 git-lfs（现状，2026-09-26）：`tests/integration_git_lfs.rs` 的 `assert_host_git_lfs_pinned`（PATH 优先 `~/.local/bin`）断言宿主 git-lfs 为 `git-lfs/3.8.0`（只断言 git-lfs，不断言宿主 git 的版本）。这是上文「宿主 git 只作本地实验、不作固定版本门」的例外：`integration_git_lfs` 的 trunk LFS 与 storage-events 用例直接调用宿主 git / git-lfs。
 - 升级镜像 tag / digest 或 pin 值必须是显式 PR 动作，并同步更新登记条目。
 
 ## 已登记服务
@@ -133,7 +134,7 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker/
 | profiles | 无；两者均参与默认 `up -d --wait`。`rustfs-init` 在 `rustfs` healthy 后幂等创建 **`mega2`** 与 **`monoui`** 桶，再以 healthcheck 报告就绪（纯 one-shot exit 会让 `--wait` 失败） |
 | depends_on | `rustfs-init` → `rustfs` 且 `condition: service_healthy` |
 | 清理 | `docker compose -p mega2-it -f docker/docker-compose.test.yml down -v`；零残留按 project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MEGA2_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs、`rustfs-init`（建桶）与 git-cli 的栈；执行面含 `cargo test -p mega2 --test integration_vault`、`--test integration_website_auth`、`--test integration_git_cli`（本 job **不**跑本仓 SMTP 投递门）；job 末尾 `if: always()` 下 `-p mega2-it --profile git --profile app --profile web down -v` |
+| CI 入口 | （历史登记，该 workflow 已不在仓库中）`.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MEGA2_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs、`rustfs-init`（建桶）与 git-cli 的栈；执行面含 `cargo test -p mega2 --test integration_vault`、`--test integration_website_auth`、`--test integration_git_cli`（本 job **不**跑本仓 SMTP 投递门）；job 末尾 `if: always()` 下 `-p mega2-it --profile git --profile app --profile web down -v` |
 | secret | 公开测试凭据 `rustfs` / `rustfs_secret`（仅测试栈，与 `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` 及 `.env.test.example` 对齐）；CI 对同类凭据使用 `::add-mask::` |
 | 降级 | 无客户端版本 pin 需求；本地可不启 rustfs（相关 gate 自行 skip/opt-in） |
 
@@ -143,50 +144,50 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker/
 
 git-cli 固定版本: `git version 2.49.1`
 
-git-cli runner git-lfs 固定版本: `git-lfs/3.7.1`（GM-05 起随镜像内置；healthcheck 断言前缀）
+git-cli runner git-lfs 固定版本: `git-lfs/3.8.0`（GM-05 起随镜像内置；healthcheck 断言前缀；2026-09-26 由 `3.7.1` 升级，与 `assert_host_git_lfs_pinned` 断言的宿主 pin 同步）
 
 | 项 | 值 |
 |---|---|
 | 服务名 | `git-cli` |
-| 镜像 | `mega2-git-cli:3.7.1`（本地构建，`build: Dockerfile.git-cli`，GM-05 起）。基底为原登记的固定 digest `alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26`，叠加 sha256 校验安装的 git-lfs `3.7.1` 与 `gitcli`（uid 1000）用户；无 `latest`，git pin 不变 |
+| 镜像 | `mega2-git-cli:3.8.0`（本地构建，`build: Dockerfile.git-cli`，GM-05 起）。基底为原登记的固定 digest `alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26`，叠加 sha256 校验安装的 git-lfs `3.8.0` 与 `gitcli`（uid 1000）用户；无 `latest`，git pin 不变 |
 | 固定版本字符串 | 见上文 `git-cli 固定版本`（容器内 `git --version` 必须与该字符串完全相等）；`git lfs version` 输出必须以上文 git-lfs pin 前缀开头 |
 | 端口 | 无独立端口映射；经 `host.docker.internal` 访问宿主 `127.0.0.1` 高位端口 |
-| healthcheck | `CMD-SHELL git --version >/dev/null && git lfs version \| grep -q '^git-lfs/3[.]7[.]1 '`（见 `docker/docker-compose.test.yml`） |
+| healthcheck | `CMD-SHELL git --version >/dev/null && git lfs version \| grep -q '^git-lfs/3[.]8[.]0 '`（见 `docker/docker-compose.test.yml`） |
 | entrypoint / init | `entrypoint: ["sleep","infinity"]`（常驻供 `exec`）；`init: true`（回收 exec 超时包装器遗留的 git/ssh 子进程，GM-08 起） |
 | 网络 | **加入 `networks.default`**；`extra_hosts: host.docker.internal:host-gateway`。Harness 将 git remote URL 映射为 `http://host.docker.internal:<port>/`（容器 runner）或 `127.0.0.1`（宿主机 opt-in runner）；宿主侧 curl/TcpStream 仍用 loopback（ADR-IT-01 修订） |
-| 卷 / 工作目录 | 挂载共享宿主路径 `${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}` → 容器 `/work`（`working_dir: /work`）。**启栈前应由宿主机预创建且对测试 UID 可写**（推荐 `mkdir -p "$dir" && chmod 1777 "$dir"`）。若缺失，Docker 可能以 `root:root` 自动建目录，导致后续未提权进程 `EACCES`；CI `validate-config` 已在 `--profile git up` 前 mkdir（见「CI 入口」）。该路径跨用例可见；用例只在其下自建**子目录**并清理。相对路径按 compose 文件所在目录（仓库根）解析，与 harness `git_cli_workdir()` 对齐（不以 `bin/` CWD 为准）。**`MEGA2_IT_GIT_WORKDIR` 仅在容器创建时解析**：改根路径必须用同一环境变量值执行 `docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --force-recreate git-cli`（或整栈 recreate）；已在跑的栈上事后 `export` 新值不会改挂载 |
+| 卷 / 工作目录 | 挂载共享宿主路径 `${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}` → 容器 `/work`（`working_dir: /work`）。**启栈前应由宿主机预创建且对测试 UID 可写**（推荐 `mkdir -p "$dir" && chmod 1777 "$dir"`）。若缺失，Docker 可能以 `root:root` 自动建目录，导致后续未提权进程 `EACCES`；`./scripts/dev-test.sh up-full` 会在 `--profile git up` 前 mkdir（历史上的 CI `validate-config` 也如此，见「CI 入口」）。该路径跨用例可见；用例只在其下自建**子目录**并清理。相对路径按 compose 文件所在目录（仓库根）解析，与 harness `git_cli_workdir()` 对齐（不以 `bin/` CWD 为准）。**`MEGA2_IT_GIT_WORKDIR` 仅在容器创建时解析**：改根路径必须用同一环境变量值执行 `docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --force-recreate git-cli`（或整栈 recreate）；已在跑的栈上事后 `export` 新值不会改挂载 |
 | 运行身份 | `user: "${MEGA2_IT_GIT_UID:-1000}:${MEGA2_IT_GIT_GID:-1000}"`（Compose 可解析的数值默认，不依赖 Bash 未 export 的 `$UID`）。默认 `1000:1000` 对齐常见 CI runner；本地若 `id -u` 不是 1000，启栈前必须 `export MEGA2_IT_GIT_UID=$(id -u) MEGA2_IT_GIT_GID=$(id -g)`。变更 UID/GID 后需要 `--force-recreate git-cli` |
 | profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`；验收路径显式 `--profile git`） |
 | depends_on | 无 |
 | 清理 | `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git down -v`（或整栈 `down -v`）；零残留按 project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config`：mkdir 工作根、导出 `MEGA2_IT_GIT_UID/GID=$(id -u/g)` 后 `--profile git up -d --wait`，再跑 `cargo test -p mega2 --test integration_git_cli -- --test-threads=1`；`.github/workflows/git-protocol-smoke.yml` 在协议路径变更时同样先拉起 `git-cli`，再以 `cargo test -p mega2 --release --test integration_git_cli` 跑同一 target（复用本 job 的 release 构建；补 allowlist A 未含协议路径的覆盖缺口），其后用宿主机 git（pin 见「客户端版本确定性规则」）跑脚本矩阵；该 job `timeout-minutes: 60`（release 构建 + cargo gate + shell smoke） |
+| CI 入口 | （历史登记，该 workflow 已不在仓库中）`.github/workflows/config-validation.yml` 的 `validate-config`：mkdir 工作根、导出 `MEGA2_IT_GIT_UID/GID=$(id -u/g)` 后 `--profile git up -d --wait`，再跑 `cargo test -p mega2 --test integration_git_cli -- --test-threads=1`；`.github/workflows/git-protocol-smoke.yml` 在协议路径变更时同样先拉起 `git-cli`，再以 `cargo test -p mega2 --release --test integration_git_cli` 跑同一 target（复用本 job 的 release 构建；补 allowlist A 未含协议路径的覆盖缺口），其后用宿主机 git（pin 见「客户端版本确定性规则」）跑脚本矩阵；该 job `timeout-minutes: 60`（release 构建 + cargo gate + shell smoke） |
 | secret | **不**注入任何 secret；凭据由用例经 credential helper / env 注入 |
-| 目标 OS / 降级 | **Linux + macOS Docker Desktop**（bridge + `host.docker.internal`）。compose `git-cli`（pin `git version 2.49.1`）是唯一验收 runner。宿主机 `git` 仅当显式 `MEGA2_IT_ALLOW_HOST_GIT=1` 时用于本地实验，且不得冒充固定版本门 |
+| 目标 OS / 降级 | **Linux + macOS Docker Desktop**（bridge + `host.docker.internal`）。compose `git-cli`（pin `git version 2.49.1`）是唯一验收 runner。宿主机 `git` 仅当显式 `MEGA2_IT_ALLOW_HOST_GIT=1` 时用于本地实验，且不得冒充固定版本门（例外：`integration_git_lfs` 断言宿主 git-lfs 版本，见上文「本机宿主 git-lfs」） |
 
-### git-smoke（linked 栈级 git 协议 smoke，profile `git`）
+### git-smoke（linked 栈级 git 协议 smoke，profile `smoke`）
 
-与 `git-cli`（bridge + `host.docker.internal`，供 cargo-native harness 自起服务）不同，`git-smoke` **加入 `networks.default`**，直接对 compose 常驻的 `mega2`（profile `app`）跑 `scripts/git_protocol_smoke.sh` 的 push/pull 矩阵。它把「项目镜像 + 其它镜像 link 在一起」的完整 compose 测试环境落到 git 协议面：ls-remote / clone / fetch / shallow / blobless / push CL / tag-reject / LFS。
+`git-cli` 与 `git-smoke` 都在默认 bridge 网络上；区别在于 `git-cli` 经 `host.docker.internal` 访问 cargo-native harness 在宿主上自起的服务，而 `git-smoke` 直接对 compose 常驻的 `mega2`（profile `app`）跑 `scripts/git_protocol_smoke.sh` 的 push/pull 矩阵。它把「项目镜像 + 其它镜像 link 在一起」的完整 compose 测试环境落到 git 协议面：ls-remote / clone / fetch / shallow / blobless / push CL / tag-reject / LFS。
 
 git-smoke 固定版本: `git version 2.49.1`（与 git-cli 同基底）
 
-git-smoke runner git-lfs 固定版本: `git-lfs/3.7.1`
+git-smoke runner git-lfs 固定版本: `git-lfs/3.8.0`
 
 | 项 | 值 |
 |---|---|
 | 服务名 | `git-smoke` |
-| 镜像 | `mega2-git-smoke:3.7.1`（本地构建，`build: Dockerfile.git-smoke`）。基底为固定 digest `alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26`，叠加 sha256 校验安装的 git-lfs `3.7.1`、`bash`（smoke 脚本需要）、`postgresql-client`（psql 用于 seed access_token）与 `ripgrep`（脚本 ref 断言）；无 `latest`，git pin 不变 |
+| 镜像 | `mega2-git-smoke:3.8.0`（本地构建，`build: Dockerfile.git-smoke`）。基底为固定 digest `alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26`，叠加 sha256 校验安装的 git-lfs `3.8.0`、`bash`（smoke 脚本需要）、`postgresql-client`（psql 用于 seed access_token）与 `ripgrep`（脚本 ref 断言）；无 `latest`，git pin 不变 |
 | 固定版本字符串 | 见上文 `git-smoke 固定版本`（容器内 `git --version` 必须与该字符串完全相等）；`git lfs version` 输出必须以上文 git-lfs pin 前缀开头 |
 | 端口 | 无独立端口映射；通过 `networks.default` 访问 `mega2:8000` |
-| healthcheck | `CMD-SHELL git --version >/dev/null && git lfs version \| grep -q '^git-lfs/3[.]7[.]1 '`（见 `docker/docker-compose.test.yml`） |
+| healthcheck | `CMD-SHELL git --version >/dev/null && git lfs version \| grep -q '^git-lfs/3[.]8[.]0 '`（见 `docker/docker-compose.test.yml`） |
 | entrypoint / init | `entrypoint: ["/bin/bash","-c","exec sleep infinity"]`（常驻供 `exec`）；`init: true` |
 | 网络 | **加入 `networks.default`**（与 `git-cli` 相同 bridge；`git-smoke` 访问 compose 内 `mega2` DNS 名） |
 | 卷 / 工作目录 | 挂载共享宿主路径 `${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}` → 容器 `/work`（`working_dir: /work`）；另以只读挂载 mega2 仓库根 → `/repo`（供 `scripts/git_protocol_smoke.sh` 在容器内执行） |
-| 运行身份 | 默认 `1000:1000`（镜像内建 `gitsmoke` 用户）；如需对齐宿主 UID 可 `export MEGA2_IT_GIT_UID/GID` 后 `--force-recreate git-smoke` |
-| profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`；须与 `--profile app` 同启，因 `depends_on: mega2`） |
+| 运行身份 | `root`（compose 未设 `user:`，镜像最终为 `USER root`；镜像内另有 `gitsmoke`（uid 1000）passwd 条目供 git / ssh 使用）；`MEGA2_IT_GIT_UID/GID` 对它不起作用 |
+| profiles | `profiles: ["smoke"]`（**不**参与默认 `up -d --wait`；须与 `--profile app` 同启，因 `depends_on: mega2`） |
 | depends_on | `mega2`（`condition: service_healthy`）——因此 `git-smoke` 必须与 `--profile app` 一起 `up` |
 | 环境 | `MEGA2_HTTP_REPO_URL=http://mega2:8000/`（默认指向 linked mega2）；`MEGA2_GIT_SMOKE_PUSH=1`；`MEGA2_GIT_SMOKE_LFS=0`；`MEGA2_IT_SEED_TOKEN`（receive-pack Basic Auth 种子） |
-| 清理 | `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git down -v`（或整栈 `down -v`）；零残留按 project label 判定 |
-| 运行示例 | 先 `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile git up -d --wait`，再在 compose `postgres` 里 seed 一个 access_token（与 CI 相同），最后 `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git exec -T git-smoke bash -c 'export MEGA2_HTTP_REPO_URL="http://ci-smoke:<token>@mega2:8000/"; export MEGA2_GIT_SMOKE_PUSH=1; bash /repo/scripts/git_protocol_smoke.sh'` |
+| 清理 | `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile smoke down -v`（或整栈 `down -v`）；零残留按 project label 判定 |
+| 运行示例 | 先 `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile smoke up -d --wait`，再在 compose `postgres` 里 seed 一个 access_token（与历史 CI 相同），最后 `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile smoke exec -T git-smoke bash -c 'export MEGA2_HTTP_REPO_URL="http://ci-smoke:<token>@mega2:8000/"; export MEGA2_GIT_SMOKE_PUSH=1; bash /repo/scripts/git_protocol_smoke.sh'` |
 | secret | **不**注入任何 secret；token 由 seed 步骤写入 compose `postgres`，经 URL 注入 |
 | 目标 OS / 降级 | 跨平台（bridge 网络，非 host 网络）；macOS/Windows Docker Desktop 亦可跑。git pin 与 `git-cli` 一致 |
 
@@ -206,7 +207,7 @@ git-smoke runner git-lfs 固定版本: `git-lfs/3.7.1`
 | profiles | `profiles: ["app"]`：**不**参与默认 `up -d --wait`；显式 `--profile app` |
 | depends_on | `postgres`、`redis`（`service_healthy`）。`MEGA_OAUTH__WEBSITE_API_BASE_URL=http://website-next:7001`；`MEGA_OAUTH__ALLOWED_CORS_ORIGINS` 保留既有 IT origin 并含 `http://127.0.0.1:17001`。不声明对 `website-next` 的 `depends_on`：该服务仅属 `web` profile，而 `mega2` 属 `app`；跨 profile 依赖会使 app-only smoke 无法解析。会话联调使用下方规定的 web-first 启动顺序；不依赖 RustFS。 |
 | 清理 | `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app down -v`（或与 `--profile git` 一并） |
-| CI 入口 | `.github/workflows/config-validation.yml`：先检查并 checkout sibling website application checkout，在数据面 `up` 后用 `Dockerfile.it-runtime` 打 `mega2:local`，再以 `--profile app --profile web up -d --wait` 同启服务，探测 `19180/api/openapi.json` 与 `17001/api/auth/get-session`；job 运行 `WEBSITE_IT=1 cargo test -p mega2 --test integration_website_auth -- --test-threads=1`，并在 `if: always()` 带两个 profile `down -v`。 |
+| CI 入口 | （历史登记，该 workflow 已不在仓库中）`.github/workflows/config-validation.yml`：先检查并 checkout sibling website application checkout，在数据面 `up` 后用 `Dockerfile.it-runtime` 打 `mega2:local`，再以 `--profile app --profile web up -d --wait` 同启服务，探测 `19180/api/openapi.json` 与 `17001/api/auth/get-session`；job 运行 `WEBSITE_IT=1 cargo test -p mega2 --test integration_website_auth -- --test-threads=1`，并在 `if: always()` 带两个 profile `down -v`。 |
 | secret | 无注入生产 secret；DB 使用公开测试口令 `mega2_test_password`（用户/库名均为 `mega2`） |
 | 降级 / 黑盒 | 栈级 smoke：`integration_compose_mega2_http_smoke`（端口未监听时 soft-skip）。隔离黑盒仍用 `CARGO_BIN_EXE` |
 
@@ -279,7 +280,7 @@ harness 变量 `MEGA2_IT_SCORPIO_WORKDIR`（默认 `/tmp/mega2-scorpiofs`）与 
 | depends_on / 会话联调顺序 | `website-db-init` → `postgres`（`service_healthy`）；`website-collab` 独立健康检查；`website-next` → `postgres` + `website-db-init`（`service_completed_successfully`）+ `website-collab`（`service_healthy`）+ **`rustfs-init`（`service_healthy`，FS-02：确保保留名 `monoui` 桶已建）**；初始化失败时 Next 不会启动。没有 `mega2` 跨 profile 依赖 |
 | 对象存储 env（FS-02） | `STORAGE_PROVIDER=s3`，`S3_BUCKET=monoui`，`S3_ENDPOINT=http://rustfs:9000`，`S3_PUBLIC_URL=http://127.0.0.1:19000/monoui`，`S3_FORCE_PATH_STYLE=true`，凭据 `rustfs` / `rustfs_secret`；该 bucket 名为兼容性保留值；若检出 sibling 仓库 website application checkout，实现说明位于 `docs/implementation/workspace-storage-backend.md` |
 | 清理 | `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile web down -v`；`-v` 删除 Postgres 数据卷后 `website` 库与 schema 不保留，零残留仍按 compose project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling website application checkout。构建 `mega2:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth`，并在 `if: always()` 使用相同 profile `down -v`。 |
+| CI 入口 | （历史登记，该 workflow 已不在仓库中）`.github/workflows/config-validation.yml` 强制 checkout sibling website application checkout。构建 `mega2:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth`，并在 `if: always()` 使用相同 profile `down -v`。 |
 | secret | `BETTER_AUTH_SECRET` 是仅用于本地 IT 的公开固定值；不得替换为或记录生产 secret |
 | 邮件 env（website 侧） | website frontend 自管 `EMAIL_PROVIDER=test`（内存记录，无云调用）等；本仓不登记、不启动 SMTP 捕获服务 |
 | 性能 | 首次 source build 预算 ≤ 20 分钟；默认 profile 不构建、不启动该服务 |

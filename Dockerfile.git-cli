@@ -1,15 +1,15 @@
 FROM alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
 
 ARG TARGETARCH
-ARG GIT_LFS_VERSION=3.7.1
+ARG GIT_LFS_VERSION=3.8.0
 
 USER root
 
 RUN set -eux; \
     arch="${TARGETARCH:-$(uname -m)}"; \
     case "$arch" in \
-        amd64|x86_64) arch=amd64; sha256=1c0b6ee5200ca708c5cebebb18fdeb0e1c98f1af5c1a9cba205a4c0ab5a5ec08 ;; \
-        arm64|aarch64) arch=arm64; sha256=73a9c90eeb4312133a63c3eaee0c38c019ea7bfa0953d174809d25b18588dd8d ;; \
+        amd64|x86_64) arch=amd64; sha256=e455e00f15d9b95661b8d53498ffb0c3367962cf1ec73c31ab7369516cd6ab8d ;; \
+        arm64|aarch64) arch=arm64; sha256=ac9c8efac980bb0505ead384d087e2acb6486fd8498691a2165fa174ec6118c2 ;; \
         *) echo "unsupported git-lfs architecture: $arch" >&2; exit 1 ;; \
     esac; \
     archive="git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz"; \

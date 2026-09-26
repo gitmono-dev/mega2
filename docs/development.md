@@ -112,7 +112,7 @@ docker compose -p mega2-it -f docker/docker-compose.test.yml \
 
 # 3) 注入连接串并跑全量（含黑盒 + 模块集成）
 cp -n .env.test.example .env.test
-# 若要跑 RustFS / S3-compatible smoke，取消 .env.test 中 MEGA_OBJECT_STORAGE__* 注释后重新 source
+# RustFS / S3-compatible smoke 只需 RustFS 已启动（上一步已含），无需改 .env.test（用例自行设置 S3 环境）
 source .env.test
 cargo test --all
 ```
@@ -365,6 +365,102 @@ cp .env.test.example .env.test
 ```
 
 零残留可按 compose project label 检查卷与网络为空（见 `test-infra.md`）。
+
+## 调试汇总：本机环境导致的测试失败
+
+下面两类失败都与代码无关，而是本机工具版本或网络代理造成的；表现像代码回归，排查时容易走弯路。先用本节的自检命令确认是不是环境问题，再看代码。
+
+### git-lfs 版本与钉住版本不一致
+
+**现象**：`integration_git_lfs` 的 4 个用例（`integration_git_lfs_storage_events_basic_upload`、`integration_git_lfs_storage_events_presigned_gap`、`integration_git_lfs_trunk_push_auth_none_round_trip`、`integration_git_lfs_trunk_push_auth_token_round_trip`）失败，断言信息为：
+
+```text
+host git-lfs used by trunk LFS IT must be the pinned version
+  left: "git-lfs/3.8.0"
+ right: "git-lfs/3.7.1"
+```
+
+**原因**：测试要求两处 git-lfs 与钉住版本完全相等——宿主机的 `git lfs version`（`tests/integration_git_lfs.rs` 的 `assert_host_git_lfs_pinned`，PATH 优先 `~/.local/bin`），以及 compose `git-cli` runner 容器内的版本（`assert_pinned_git_lfs`）。宿主 git-lfs 由 Homebrew 自动升级后，与仓库钉住的版本不再一致。
+
+**解决**：钉住版本自 v0.40.13（2026-09-26）起为 `3.8.0`。以后宿主 git-lfs 再升级时，把钉住版本整体上调，而不是降级宿主：
+
+1. 同步修改所有钉住位置：`tests/integration_git_lfs.rs` 的两处断言；`Dockerfile.git-cli` 与 `Dockerfile.git-smoke` 的 `GIT_LFS_VERSION` 和 amd64 / arm64 两个 `sha256`；两个 compose 文件的镜像标签与 healthcheck；[`test-infra.md`](./refactoring/test-infra.md) 的登记条目。注意 healthcheck 写成正则 `3[.]8[.]0`，按 `3.8.0` 字面搜索会漏掉。`sha256` 取自 GitHub release 的 asset digest（输出里已去掉 `sha256:` 前缀）：
+
+```bash
+version=3.8.0
+gh api "repos/git-lfs/git-lfs/releases/tags/v${version}" \
+  --jq '.assets[] | select(.name | test("^git-lfs-linux-(amd64|arm64)-")) | "\(.name) \(.digest | ltrimstr("sha256:"))"'
+```
+
+2. 重建 runner 镜像并只替换 `git-cli` 容器（构建会下载 git-lfs 发布包并用上面的 `sha256` 校验）。与上文「git 工作目录 EACCES / 挂载分叉」相同，先准备工作目录并导出 UID / GID：
+
+```bash
+dir="${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}"
+mkdir -p "$dir" && chmod 1777 "$dir"
+export MEGA2_IT_GIT_UID="$(id -u)" MEGA2_IT_GIT_GID="$(id -g)"
+docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git build git-cli
+docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git up -d --wait --no-deps git-cli
+# 若也要跑 linked 栈级 smoke，同样重建 git-smoke（它依赖 profile app 的 mega2）：
+docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile smoke build git-smoke
+```
+
+**自检**：
+
+```bash
+PATH="$HOME/.local/bin:$PATH" git lfs version           # 宿主（与测试相同的 PATH 顺序）
+docker exec mega2-it-git-cli-1 git lfs version          # compose runner
+```
+
+两者的版本号都应等于钉住版本；只要有一个不等，`integration_git_lfs` 就会失败。
+
+### 系统代理（Clash Verge）导致 S3 冒烟返回 502
+
+**现象**：`integration_object_storage_s3_compatible_smoke` 失败，而直连 RustFS 正常：
+
+```text
+Generic S3 error: Error performing PUT http://127.0.0.1:19000/mega2/... after 10 retries ...
+Server returned non-2xx status code: 502 Bad Gateway
+```
+
+同样把对象存储指向 `127.0.0.1:19000` 的 `integration_git_lfs_storage_events_presigned_gap` 也可能因此失败（钉住版本不一致时，它会先在版本断言处失败，掩盖这个问题）。
+
+**原因**（两层叠加）：
+
+1. **mega2 不读系统代理的例外列表。** 测试以 `env_clear()` 启动 mega2 子进程，`NO_PROXY` 传不进去；mega2 的 HTTP 栈（reqwest → hyper-util）在 macOS 上只读取系统代理的 HTTP / HTTPS 地址，不读「忽略这些主机与域的代理设置」（`ExceptionsList`）。因此即使系统设置里已把 `127.0.0.1` 列为例外，发往本机 RustFS 的请求仍会交给代理（例如 Clash Verge 的 `127.0.0.1:7897`）。
+2. **代理没有把回环地址设为直连。** 代理把 `127.0.0.1` 转发到远端节点，远端访问不到本机，于是返回 502。Clash Verge 2.x 中写在「扩展配置」（原 Merge）里的 `prepend-rules` **不会生效**——自 v1.7.x 起前置 / 后置规则移到订阅右键菜单的「编辑规则」里。
+
+**解决**：在 Clash Verge 的订阅上右键 →「编辑规则」→「添加前置规则」，代理策略都选 `DIRECT`：
+
+| 规则类型 | 规则内容 |
+|---|---|
+| IP-CIDR | `127.0.0.0/8`（必需，RustFS 在 `127.0.0.1:19000`） |
+| DOMAIN | `localhost` |
+| IP-CIDR6 | `::1/128` |
+| IP-CIDR | `192.168.0.0/16`、`10.0.0.0/8`、`172.16.0.0/12` |
+
+也可以用「扩展脚本」把这些规则插到 `config.rules` 最前面，或在跑测试时临时关闭系统代理。
+
+**自检**：
+
+```bash
+scutil --proxy | grep -E 'HTTP(S)?(Enable|Proxy|Port)'   # 系统代理是否开启、端口
+# RustFS 须已就绪，否则下面的冒烟会直接跳过；已在运行时这一步立即返回，未就绪时它会失败
+docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --wait rustfs rustfs-init
+# 经系统代理访问 RustFS 健康检查：200 表示代理对回环地址直连，502 表示代理没有直连
+port="$(scutil --proxy | awk '/HTTPPort/{print $3}')"
+env -u NO_PROXY -u no_proxy curl -sS -x "http://127.0.0.1:${port}" -o /dev/null -w '%{http_code}\n' http://127.0.0.1:19000/health
+# 单独重跑 S3 冒烟
+source .env.test && cargo test -p mega2 --test integration_vault integration_object_storage_s3_compatible_smoke -- --nocapture
+```
+
+该用例在连不上 `127.0.0.1:19000` 时会打印 `... requires RustFS ... skipping` 并直接返回，结果同样显示通过；只有输出里没有这行时，通过才说明 S3 路径真正跑过。
+
+**调试陷阱**：`curl -x <代理>` 仍然遵守环境变量 `NO_PROXY`。当前 shell 的 `NO_PROXY` 含 `127.0.0.1` 时，curl 实际是直连，会得出「代理工作正常」的错误结论；验证代理时务必用 `env -u NO_PROXY -u no_proxy` 去掉它。
+
+### 其它已知的本机噪音
+
+- macOS 上 `cargo build --tests` 可能输出 `warning: linker stderr: ld: __eh_frame section too large ...` 的链接器提示。它是平台链接器的输出，不是代码问题，但 cargo 会把它计为 1 个 warning（`linker_messages`），因此仓库要求的 `cargo build --tests` 0 警告在 macOS 上仍不满足——这也是 plan-20260923「计划完成门」保持未勾的原因。
+- 这些环境问题在 [`plan-20260923.md`](./plan/plan-20260923.md) 中登记为 `DEP-FU-05`（本机基线环境失败）。
 
 ## 相关文档
 

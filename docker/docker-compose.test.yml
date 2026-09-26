@@ -95,7 +95,7 @@ services:
   # `export MEGA2_IT_GIT_UID=$(id -u) MEGA2_IT_GIT_GID=$(id -g)`
   # when the test process is not 1000.
   git-cli:
-    image: mega2-git-cli:3.7.1
+    image: mega2-git-cli:3.8.0
     build:
       context: ..
       dockerfile: Dockerfile.git-cli
@@ -118,7 +118,7 @@ services:
     # Override the image's `git` entrypoint so the container stays up for `exec`.
     entrypoint: ["sleep", "infinity"]
     healthcheck:
-      test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]7[.]1 '"]
+      test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]8[.]0 '"]
       interval: 2s
       timeout: 5s
       retries: 20
@@ -138,8 +138,8 @@ services:
   #
   # Then drive the smoke from the host:
   #   docker compose -p mega2-it -f docker/docker-compose.test.yml \
-  #     --profile smoke exec -T git-smoke \
-  #     bash scripts/git_protocol_smoke.sh
+  #     --profile app --profile smoke exec -T git-smoke \
+  #     bash /repo/scripts/git_protocol_smoke.sh
   # (with MEGA2_HTTP_REPO_URL=http://mega2:8000/ and a seeded token).
   #
   # NOTE: git-smoke lives in its own `smoke` profile (not `git`) so that
@@ -148,7 +148,7 @@ services:
   # project invalid whenever the `git` profile is active but `app` is not
   # ("service git-smoke depends on undefined service mega2").
   git-smoke:
-    image: mega2-git-smoke:3.7.1
+    image: mega2-git-smoke:3.8.0
     build:
       context: ..
       dockerfile: Dockerfile.git-smoke
@@ -174,7 +174,7 @@ services:
       - ..:/repo:ro
     working_dir: /work
     healthcheck:
-      test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]7[.]1 '"]
+      test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]8[.]0 '"]
       interval: 2s
       timeout: 5s
       retries: 20

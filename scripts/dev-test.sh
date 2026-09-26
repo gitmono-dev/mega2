@@ -67,7 +67,7 @@ cmd_full() {
   mega2_it_up_full
   mega2_it_ensure_env_test
   mega2_it_info "cargo test --all $*"
-  mega2_it_info "tip: uncomment MEGA_OBJECT_STORAGE__* in .env.test for RustFS S3 smoke"
+  mega2_it_info "tip: the RustFS S3 smoke only needs RustFS up (it sets its own S3 env); no .env.test change needed"
   cargo test --all "$@"
 }
 
