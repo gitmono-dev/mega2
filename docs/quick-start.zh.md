@@ -48,7 +48,7 @@ git add hello.md && git commit -m "add hello.md"
 git push origin main
 ```
 
-只能推送到 `main`，其它分支以及 Git 客户端发起的 Tag 推送都会被拒绝。请通过 HTTP API 或 Libra 命令 `libra mega2 browser` 创建、查看和删除 Tag；完整操作规则见[使用指南](./user-guide.zh.md)。
+Monorepo 路径只能推送到 `main`，其它分支以及 Git 客户端发起的 Tag 推送都会被拒绝（`/third-party` 下的 ImportRepo 不受此限，见下文「迁移现有 Git 仓库」）。请通过 HTTP API 或 Libra 命令 `libra mega2 browser` 创建、查看和删除 Tag；完整操作规则见[使用指南](./user-guide.zh.md)。
 
 ### 3. API 读回与 Swagger UI
 
@@ -118,9 +118,32 @@ git push mega2 --tags    # 推送全部 tag
 git clone http://127.0.0.1:9000/third-party/your-repo
 ```
 
+ImportRepo 可以持续更新，新的提交与 Tag 再推送一次即可：
+
+```bash
+cd /path/to/your-repo
+echo "next" >> CHANGELOG.md
+git add CHANGELOG.md && git commit -m "next change"
+git tag -a v1.1 -m "v1.1"
+git push mega2 --all
+git push mega2 --tags
+```
+
+`--all` 与 `--tags` 只推送本地已有的分支与 Tag。推送被拒时（通常 Git 客户端先以 `fetch first` 拒绝；服务端广告之后才被其它推送改动的 ref 以 `IMPORT_REPO_STALE_REF` 拒绝），先 `git fetch mega2`，合并或变基后再推送；Tag 冲突需要单独处理。
+
+要让 ImportRepo 跟随上游的全部分支与 Tag，改用下文 brewfs 示例的 `--mirror` 克隆，之后每次同步运行 `git fetch --prune origin && git push --mirror mega2`。`--mirror` 会让 ImportRepo 与镜像克隆完全一致：上游没有的分支与 Tag（例如上面直接推到 mega2 的 `v1.1`）会被删除或强制覆盖。仓库使用 Git LFS 时，每次同步依次运行 `git fetch --prune origin`、`git lfs fetch --all origin`、`git lfs push --all mega2` 与 `git push --mirror mega2`，把 LFS 对象也传到 mega2。上游缺少部分 LFS 对象时（如 brewfs），`git lfs fetch` 以非零退出是预期情况，不要因此中止：像 brewfs 示例那样设置 `git config lfs.allowincompletepush true` 后继续执行后两步。
+
+不再需要时可以清理。本评估栈是 `push_auth=none`，HTTP 清理端点对合法请求一律回 403，请回到 compose 文件所在目录，在 mega2 容器内运行运维 CLI（`-e MEGA_LOG__PRINT_STD=false` 让 stdout 只剩结局行）：
+
+```bash
+docker compose -f $COMPOSE exec -T -e MEGA_LOG__PRINT_STD=false mega2 mega2 import-repo remove --path /third-party/your-repo --yes
+```
+
+再次推送需要 0.40.2 及以上的镜像，`mega2 import-repo remove` 需要 0.40.11 及以上；更早拉取的栈请先重新运行 `docker compose -f $COMPOSE up -d --wait` 拉取当前镜像。成功时输出 `removed /third-party/your-repo (repo_id=<n>, cleanup_id=<n>)` 并以 0 退出；之后该路径的 clone 回 404，再次推送会导入为一个新仓库。输出 `pending …`（退出码 3）时，按 stderr 的提示用 `--cleanup-id` 续做。在 `exec -T` 下按 Ctrl-C 只会结束 compose 客户端，容器内的清理会继续运行，不要立即重跑。其它结局与退出码、保留策略，以及需要 token 的 HTTP 清理，见使用指南的[「ImportRepo 生命周期」](./user-guide.zh.md#26-importrepo-生命周期)。
+
 两种路径语义不要混淆：
 
-- `/third-party/**`（ImportRepo）：多分支、客户端 tag 合法——适合托管第三方依赖源码、迁入已有仓库。
+- `/third-party/**`（ImportRepo）：多分支、客户端 tag 合法，可以持续推送更新，也可以清理——适合托管第三方依赖源码、迁入已有仓库。
 - 其它路径（Monorepo）：公开分支只有 `main`，Git 客户端不能推送 Tag。已有仓库的多分支历史不能直接推入 Monorepo 子路径；详见[使用指南](./user-guide.zh.md)。
 
 ## 示例：镜像 GitHub 仓库（brewfs）

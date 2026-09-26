@@ -48,7 +48,7 @@ git add hello.md && git commit -m "add hello.md"
 git push origin main
 ```
 
-Pushes to branches other than `main` and tag pushes from Git clients are rejected. Create, list, and delete tags through the HTTP API or the Libra command `libra mega2 browser`; see the [User Guide](./user-guide.md).
+On Monorepo paths, pushes to branches other than `main` and tag pushes from Git clients are rejected (ImportRepos under `/third-party` are exempt, see "Migrate an existing Git repository" below). Create, list, and delete tags through the HTTP API or the Libra command `libra mega2 browser`; see the [User Guide](./user-guide.md).
 
 ### 3. Read back over the API + Swagger UI
 
@@ -118,9 +118,32 @@ You can then clone or fetch it as usual:
 git clone http://127.0.0.1:9000/third-party/your-repo
 ```
 
+An ImportRepo can keep being updated; push new commits and tags again:
+
+```bash
+cd /path/to/your-repo
+echo "next" >> CHANGELOG.md
+git add CHANGELOG.md && git commit -m "next change"
+git tag -a v1.1 -m "v1.1"
+git push mega2 --all
+git push mega2 --tags
+```
+
+`--all` and `--tags` push only the branches and tags you have locally. If a push is rejected (usually the Git client rejects it first with `fetch first`; a ref that another push changed after the server's advertisement is rejected with `IMPORT_REPO_STALE_REF`), run `git fetch mega2`, merge or rebase, and push again; a conflicting tag has to be resolved on its own.
+
+To make the ImportRepo follow all upstream branches and tags, use a `--mirror` clone as in the brewfs example below and run `git fetch --prune origin && git push --mirror mega2` for each sync. `--mirror` makes the ImportRepo an exact copy of the mirror clone: branches and tags that upstream does not have (such as `v1.1`, pushed straight to mega2 above) are deleted or force-overwritten. If the repository uses Git LFS, run `git fetch --prune origin`, `git lfs fetch --all origin`, `git lfs push --all mega2` and `git push --mirror mega2` in that order for each sync, so the LFS objects reach mega2 too. When upstream is missing some LFS objects (as brewfs is), `git lfs fetch` exits non-zero, which is expected; do not stop there: set `git config lfs.allowincompletepush true` as in the brewfs example and run the last two steps.
+
+When you no longer need it, remove it. This evaluation stack runs with `push_auth=none`, where the HTTP removal endpoint answers 403 to every valid request, so go back to the directory of the compose file and run the operator CLI inside the mega2 container (`-e MEGA_LOG__PRINT_STD=false` leaves only the outcome line on stdout):
+
+```bash
+docker compose -f $COMPOSE exec -T -e MEGA_LOG__PRINT_STD=false mega2 mega2 import-repo remove --path /third-party/your-repo --yes
+```
+
+The second push needs an image of 0.40.2 or later, and `mega2 import-repo remove` needs 0.40.11 or later; for a stack pulled earlier, re-run `docker compose -f $COMPOSE up -d --wait` first to pull the current image. A successful run prints `removed /third-party/your-repo (repo_id=<n>, cleanup_id=<n>)` and exits 0; afterwards a clone of the path returns 404, and pushing again imports it as a new repository. If it prints `pending …` (exit code 3), continue with `--cleanup-id` as stderr suggests. Under `exec -T`, Ctrl-C only ends the Compose client while the removal in the container keeps running, so do not rerun right away. Other outcomes and exit codes, retention, and HTTP removal with a token are in the User Guide's ["ImportRepo lifecycle"](./user-guide.md#26-importrepo-lifecycle).
+
 The two path types have different rules:
 
-- `/third-party/**` (ImportRepo): multiple branches and client tags are allowed. Use this path for third-party dependencies or repositories you are migrating.
+- `/third-party/**` (ImportRepo): multiple branches and client tags are allowed, later pushes update it, and it can be removed. Use this path for third-party dependencies or repositories you are migrating.
 - All other paths (Monorepo): `main` is the only public branch, and Git-client tag operations are rejected. You cannot push a multi-branch repository directly into a Monorepo subpath.
 
 ## Example: mirror a GitHub repository (brewfs)
