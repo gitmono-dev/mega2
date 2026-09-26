@@ -459,7 +459,7 @@ source .env.test && cargo test -p mega2 --test integration_vault integration_obj
 
 ### 其它已知的本机噪音
 
-- macOS 上 `cargo build --tests` 可能输出 `warning: linker stderr: ld: __eh_frame section too large ...` 的链接器提示。它是平台链接器的输出，不是代码问题，但 cargo 会把它计为 1 个 warning（`linker_messages`），因此仓库要求的 `cargo build --tests` 0 警告在 macOS 上仍不满足——这也是 plan-20260923「计划完成门」保持未勾的原因。
+- macOS 上 `cargo build --tests` 可能输出 `warning: linker stderr: ld: __eh_frame section too large ...` 的链接器提示。它是平台链接器的输出，不是代码问题，cargo 会把它计为 1 个 warning（`linker_messages`）；按用户决定（2026-09-26）它视为平台噪音，不计入 `cargo build --tests` 的 0 警告门禁，无需处理。
 - 这些环境问题在 [`plan-20260923.md`](./plan/plan-20260923.md) 中登记为 `DEP-FU-05`（本机基线环境失败）。
 
 ## 相关文档
