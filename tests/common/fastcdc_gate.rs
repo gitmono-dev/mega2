@@ -10,8 +10,8 @@ use std::{
     process::Command,
 };
 
-/// Pinned Libra commit recorded as `LIBRA_INTEROP_REV` after LB-01.
-pub const DEFAULT_LIBRA_INTEROP_REV: &str = "d1aafb23dccb77408ac43786b173f1c9a0d760aa";
+/// Pinned Libra commit for MF-05 (FL-04 range export release tip `v0.30.4`).
+pub const DEFAULT_LIBRA_INTEROP_REV: &str = "8c870c4d41eff9bff33dd3adf4b34189fc9ca1fe";
 
 pub fn expected_libra_rev() -> String {
     std::env::var("LIBRA_INTEROP_REV").unwrap_or_else(|_| DEFAULT_LIBRA_INTEROP_REV.to_string())
@@ -79,7 +79,7 @@ pub fn require_cargo() {
     );
 }
 
-/// Fail closed when `LIBRA_DIR` is missing, dirty, or not the LB-01 revision.
+/// Fail closed when `LIBRA_DIR` is missing, dirty, or not the MF-05 pin.
 pub fn require_libra_checkout() -> PathBuf {
     require_cargo();
     let dir = std::env::var("LIBRA_DIR").unwrap_or_else(|_| {
@@ -94,13 +94,18 @@ pub fn require_libra_checkout() -> PathBuf {
     let test_src = dir.join("tests/media_fastcdc_test.rs");
     let src = fs::read_to_string(&test_src).unwrap_or_else(|err| {
         panic!(
-            "LIBRA_DIR is missing LB-01 tests/media_fastcdc_test.rs ({}): {err}",
+            "LIBRA_DIR is missing tests/media_fastcdc_test.rs ({}): {err}",
             test_src.display()
         )
     });
     assert!(
-        src.contains("fn mega2_fastcdc_http_interop"),
-        "LIBRA_DIR {} does not contain LB-01 test mega2_fastcdc_http_interop",
+        src.contains("fn monoengine_fastcdc_http_interop"),
+        "LIBRA_DIR {} does not contain FL-04 test monoengine_fastcdc_http_interop",
+        dir.display()
+    );
+    assert!(
+        src.contains("pinned range export must succeed against finalized Media"),
+        "LIBRA_DIR {} is missing FL-04 range-export asserts required by MF-05",
         dir.display()
     );
 

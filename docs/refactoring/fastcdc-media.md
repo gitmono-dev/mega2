@@ -123,4 +123,11 @@
 
 默认 `cargo test --all` **不**要求 sibling Libra checkout。真实 client/server 证据只在显式 ignored target 下执行（见既有 `integration_fastcdc_libra` 说明）。feature-off 时 Media 能力探测为 404，Libra 选择标准 LFS fallback。
 
-**MF-06（目标 v0.40.10，发布前竞争 patch；origin 已占 v0.40.9）状态：** 服务端家族（配方、分页协议、覆盖验证、多布局原子发布、固定 id 读取）已按本契约上线；MF-05 / Libra FL 真 interop 与效果轴仍未交付，不得宣称双仓收口完成。
+**MF-05 pin：** Libra `v0.30.4` / `8c870c4d41eff9bff33dd3adf4b34189fc9ca1fe`（FL-04 range export）。
+Harness 设置 `LIBRA_DIR` 为该 tip 的干净 checkout，驱动 Libra
+`monoengine_fastcdc_http_interop`（`MONOENGINE_FASTCDC_READY_FILE`），覆盖
+prior→上传→固定 id 范围导出；feature-off 伴生用例验证标准 LFS 回退。
+不得缺配置 SKIP-green。C-06 / P-05 大对象效果数字与资源预算见本卡发布证据与
+Libra FL-05 收口。
+
+**MF-06（v0.40.10 家族发布）状态：** 服务端家族（配方、分页协议、覆盖验证、多布局原子发布、固定 id 读取）已按本契约上线；MF-05 真 interop 在独立 patch 收口。

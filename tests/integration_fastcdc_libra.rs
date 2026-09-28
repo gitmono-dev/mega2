@@ -395,10 +395,11 @@ fn mega2_libra_fastcdc_interop() {
             "--",
             "--ignored",
             "--exact",
-            "mega2_fastcdc_http_interop",
+            "monoengine_fastcdc_http_interop",
             "--nocapture",
         ])
-        .env("MEGA2_FASTCDC_READY_FILE", &ready.path)
+        // Libra FL-04+ reads MONOENGINE_FASTCDC_READY_FILE (LB-01 MEGA2_* name retired).
+        .env("MONOENGINE_FASTCDC_READY_FILE", &ready.path)
         .env("CARGO_TERM_COLOR", "never")
         .stdout(Stdio::from(create_log_file(&child_stdout)))
         .stderr(Stdio::from(create_log_file(&child_stderr)));
@@ -409,8 +410,16 @@ fn mega2_libra_fastcdc_interop() {
     let stderr = fastcdc_gate::redact_secrets(&read_log(&child_stderr), &token, &lfs_url);
     assert!(
         status.success(),
-        "Libra mega2_fastcdc_http_interop failed ({status})\nstdout:\n{stdout}\nstderr:\n{stderr}\nservice stderr:\n{}",
+        "Libra monoengine_fastcdc_http_interop failed ({status})\nstdout:\n{stdout}\nstderr:\n{stderr}\nservice stderr:\n{}",
         fastcdc_gate::redact_secrets(&read_log(&stderr_path), &token, &lfs_url)
+    );
+    // Fail closed if the child somehow SKIP-greened or ran a chunk-only path
+    // without the FL-04 range export asserts (C-06/P-05 consumers).
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.contains("test monoengine_fastcdc_http_interop")
+            && (combined.contains("... ok") || combined.contains("test result: ok")),
+        "Libra child must report monoengine_fastcdc_http_interop ok (no SKIP-green)\n{combined}"
     );
 
     drop(ready);
