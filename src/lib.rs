@@ -37,8 +37,9 @@ pub mod readonly_ops {
 }
 
 /// Internal seam for the ImportRepo detach IT (plan-20260923 FU-16): detach
-/// without the sweep, which the product entry (POST /api/v1/import-repo/remove,
-/// FU-20) cannot do. Not a supported API.
+/// without the sweep, which neither product entry (POST
+/// /api/v1/import-repo/remove, FU-20; `mega2 import-repo remove`, FU-21) can
+/// do. Not a supported API.
 #[doc(hidden)]
 pub mod import_repo_ops {
     pub use crate::ceres::pack::import_repo::detach_for_integration_test;

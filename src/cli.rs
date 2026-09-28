@@ -87,11 +87,14 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
     // the recording handler before any config I/O so a signal arriving during
     // startup is captured, never default-terminating the process. One-shot
     // commands keep the process-exit handler installed at the old point.
-    let async_signal_service = cmd == "service"
+    // The ImportRepo cleanup CLI records it the same way so it can report
+    // where it stopped and exit 130 (plan-20260923 FU-21).
+    let async_signal_service = (cmd == "service"
         && matches!(
             subcommand_args.subcommand_name(),
             Some("http" | "ssh" | "multi")
-        );
+        ))
+        || cmd == "import-repo";
     if async_signal_service {
         install_ctrlc_handler(true);
     }
@@ -391,6 +394,114 @@ mod tests {
             *rx.borrow(),
             "a signal recorded before subscription must be retained"
         );
+    }
+
+    #[test]
+    fn import_repo_remove_cli_parses() {
+        let matches = cli()
+            .no_binary_name(true)
+            .try_get_matches_from([
+                "--config",
+                "/etc/mega2/config.toml",
+                "import-repo",
+                "remove",
+                "--path",
+                "/third-party/acme/lib",
+                "--yes",
+            ])
+            .expect("import-repo remove parses");
+        assert_eq!(
+            matches.get_one::<PathBuf>("config"),
+            Some(&PathBuf::from("/etc/mega2/config.toml"))
+        );
+        let (cmd, args) = matches.subcommand().expect("import-repo");
+        assert_eq!(cmd, "import-repo");
+        let (sub, remove) = args.subcommand().expect("remove");
+        assert_eq!(sub, "remove");
+        assert_eq!(
+            remove.get_one::<String>("path").map(String::as_str),
+            Some("/third-party/acme/lib")
+        );
+        assert!(remove.get_flag("yes"));
+        assert_eq!(remove.get_one::<u32>("max-rounds"), Some(&1000));
+        assert_eq!(remove.get_one::<i64>("cleanup-id"), None);
+
+        let matches = cli()
+            .no_binary_name(true)
+            .try_get_matches_from([
+                "import-repo",
+                "remove",
+                "--path",
+                "/third-party/a",
+                "--cleanup-id",
+                "42",
+                "--max-rounds",
+                "5",
+                "--yes",
+            ])
+            .expect("continuation parses");
+        let remove = matches
+            .subcommand_matches("import-repo")
+            .and_then(|args| args.subcommand_matches("remove"))
+            .expect("remove");
+        assert_eq!(remove.get_one::<u32>("max-rounds"), Some(&5));
+        assert_eq!(remove.get_one::<i64>("cleanup-id"), Some(&42));
+
+        for argv in [
+            vec!["import-repo", "remove", "--path", "/third-party/a"],
+            vec!["import-repo", "remove", "--yes"],
+            vec!["import-repo"],
+            vec![
+                "import-repo",
+                "remove",
+                "--path",
+                "/third-party/a",
+                "--yes",
+                "--max-rounds",
+                "0",
+            ],
+            vec![
+                "import-repo",
+                "remove",
+                "--path",
+                "/third-party/a",
+                "--yes",
+                "--cleanup-id",
+                "0",
+            ],
+            vec![
+                "import-repo",
+                "remove",
+                "--path",
+                "/third-party/a",
+                "--yes",
+                "--cleanup-id",
+                "x",
+            ],
+            vec![
+                "import-repo",
+                "remove",
+                "--path",
+                "/third-party/a",
+                "--yes",
+                "--config",
+                "c.toml",
+            ],
+            vec![
+                "import-repo",
+                "remove",
+                "--path",
+                "/third-party/a",
+                "/third-party/b",
+                "--yes",
+            ],
+        ] {
+            let error = cli()
+                .no_binary_name(true)
+                .try_get_matches_from(&argv)
+                .expect_err("usage error");
+            assert_eq!(error.exit_code(), 2, "{argv:?}");
+        }
     }
 
     /// plan-20260923 FU-08: `path provision --server <URL> <PATH>` parses

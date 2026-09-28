@@ -24,7 +24,7 @@ Use `libra mega2 browser --server https://mega2.example.com` to browse a remote 
 
 Mega2 provides trunk-based Git storage and hosting for monorepos. Regular Monorepo paths expose `refs/heads/main` as the public trunk; Git clients cannot push other branches or tags. Use the HTTP API or Libra's terminal browser for supported Tag and directory operations. The open-source edition does not include the multi-branch Change List feature.
 
-Git metadata is stored in Postgres, while Git objects live in local or S3-compatible object storage. ImportRepos under `[monorepo].import_dir` (default `/third-party`) follow ordinary Git semantics, including multiple branches and client-managed tags, and can hold third-party repositories that need independent synchronization. See [Monorepo path policy and first use](docs/user-guide.md#25-monorepo-path-policy-and-first-use) for path provisioning and push rules.
+Git metadata is stored in Postgres, while Git objects live in local or S3-compatible object storage. ImportRepos under `[monorepo].import_dir` (default `/third-party`) follow ordinary Git semantics, including multiple branches and client-managed tags, and can hold third-party repositories that need independent synchronization. ImportRepos accept later pushes (branches and tags) and can be removed through `POST /api/v1/import-repo/remove` (which needs a push token; `push_auth=none` deployments run `mega2 import-repo remove` on the server instead); see [ImportRepo lifecycle](docs/user-guide.md#26-importrepo-lifecycle). See [Monorepo path policy and first use](docs/user-guide.md#25-monorepo-path-policy-and-first-use) for path provisioning and push rules.
 
 ### Agent Session Capture
 

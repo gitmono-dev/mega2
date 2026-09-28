@@ -397,7 +397,7 @@ async fn resolve_credential(
 /// Same two conditions `resolve_object_storage_secrets` short-circuits on, named
 /// so the read-only assembly can ask the question without opening a vault it may
 /// not need — and so the two cannot drift apart (UN-30).
-fn object_storage_needs_vault(config: &ObjectStorageConfig) -> bool {
+pub(crate) fn object_storage_needs_vault(config: &ObjectStorageConfig) -> bool {
     let s3_like = matches!(
         config.storage_type,
         crate::orbit_api::factory::ObjectStorageBackend::S3

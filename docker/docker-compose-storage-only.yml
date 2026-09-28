@@ -203,7 +203,7 @@ services:
   # For in-network LFS smoke (git-smoke → mega2), recreate with:
   #   --env-file config/compose.env.storage-only.lfs-innetwork
   git-smoke:
-    image: mega2-git-smoke:3.7.1
+    image: mega2-git-smoke:3.8.0
     build:
       context: ..
       dockerfile: Dockerfile.git-smoke
@@ -222,7 +222,7 @@ services:
       - ..:/repo:ro
     working_dir: /work
     healthcheck:
-      test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]7[.]1 '"]
+      test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]8[.]0 '"]
       interval: 2s
       timeout: 5s
       retries: 20

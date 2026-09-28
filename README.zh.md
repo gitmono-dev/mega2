@@ -24,7 +24,7 @@ Mega2 开源版以 **trunk / storage-only** 模式运行，不提供 Web UI 或 
 
 Mega2 为 monorepo 提供 trunk-based Git 存储与托管。普通 monorepo 路径以 `refs/heads/main` 为公开主干；Git 客户端不能推送其它分支或 Tag，受支持的 Tag 与目录操作通过 HTTP API 或 Libra 终端浏览器完成。开源版不包含依赖多分支的 Change List。
 
-Git 元数据存于 Postgres，Git 对象存于本地或 S3-compatible 对象存储。`[monorepo].import_dir`（默认 `/third-party`）下的 ImportRepo 遵循普通 Git 语义，可使用多个分支和客户端 Tag，适合存放需要独立同步的第三方仓库。新路径开通与推送规则见[Monorepo 路径策略](docs/user-guide.zh.md#25-monorepo-路径策略与首次使用)。
+Git 元数据存于 Postgres，Git 对象存于本地或 S3-compatible 对象存储。`[monorepo].import_dir`（默认 `/third-party`）下的 ImportRepo 遵循普通 Git 语义，可使用多个分支和客户端 Tag，适合存放需要独立同步的第三方仓库。ImportRepo 接受后续推送（分支与 tag），并可经 `POST /api/v1/import-repo/remove` 清理（需要 push token；`push_auth=none` 的部署在服务器上运行 `mega2 import-repo remove`），见[ImportRepo 生命周期](docs/user-guide.zh.md#26-importrepo-生命周期)。新路径开通与推送规则见[Monorepo 路径策略](docs/user-guide.zh.md#25-monorepo-路径策略与首次使用)。
 
 ### Agent Session Capture
 

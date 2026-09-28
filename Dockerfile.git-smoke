@@ -1,10 +1,9 @@
 # Linked git protocol smoke runner for the compose test stack.
 #
-# Unlike `git-cli` (which uses `network_mode: host` for the cargo-native
-# black-box harness that spawns its own service on the host), this image is
-# designed to join `networks.default` and exercise push/pull against the
-# compose-hosted `mega2` service over the internal bridge network
-# (http://mega2:8000/).
+# Both runners sit on the default bridge network. `git-cli` reaches the
+# service that the cargo-native black-box harness spawns on the host through
+# `host.docker.internal`; this image instead exercises push/pull against the
+# compose-hosted `mega2` service (http://mega2:8000/).
 #
 # It extends the pinned alpine/git base (same git + git-lfs versions as
 # `git-cli`) and adds:
@@ -12,15 +11,15 @@
 #     arrays) that Alpine's /bin/sh does not provide.
 #   - postgresql-client: the smoke flow seeds a one-off access_token row into
 #     the compose `postgres` service before running the push/delete matrix
-#     (same pattern as the git-protocol-smoke CI job).
+#     (same pattern as the former git-protocol-smoke CI job).
 #
 # Build context = mega2 repo root:
-#   docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git build git-smoke
+#   docker compose -p mega2-it -f docker/docker-compose.test.yml --profile app --profile smoke build git-smoke
 
 FROM alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
 
 ARG TARGETARCH
-ARG GIT_LFS_VERSION=3.7.1
+ARG GIT_LFS_VERSION=3.8.0
 
 USER root
 
@@ -38,8 +37,8 @@ RUN set -eux; \
 RUN set -eux; \
     arch="${TARGETARCH:-$(uname -m)}"; \
     case "$arch" in \
-        amd64|x86_64) arch=amd64; sha256=1c0b6ee5200ca708c5cebebb18fdeb0e1c98f1af5c1a9cba205a4c0ab5a5ec08 ;; \
-        arm64|aarch64) arch=arm64; sha256=73a9c90eeb4312133a63c3eaee0c38c019ea7bfa0953d174809d25b18588dd8d ;; \
+        amd64|x86_64) arch=amd64; sha256=e455e00f15d9b95661b8d53498ffb0c3367962cf1ec73c31ab7369516cd6ab8d ;; \
+        arm64|aarch64) arch=arm64; sha256=ac9c8efac980bb0505ead384d087e2acb6486fd8498691a2165fa174ec6118c2 ;; \
         *) echo "unsupported git-lfs architecture: $arch" >&2; exit 1 ;; \
     esac; \
     archive="git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz"; \

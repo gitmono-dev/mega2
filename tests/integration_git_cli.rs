@@ -6079,9 +6079,10 @@ fn import_repo_alias_row_served_after_migration() {
 }
 
 // ---------------------------------------------------------------------------
-// plan-20260923 FU-16: the atomic detach primitive (no product entry yet,
-// driven here through the service-layer test hook) removes an ImportRepo, and
-// the service then answers 404 for it.
+// plan-20260923 FU-16: the atomic detach primitive removes an ImportRepo, and
+// the service then answers 404 for it. Driven through the service-layer test
+// hook because both product entries — POST /api/v1/import-repo/remove (FU-20)
+// and `mega2 import-repo remove` (FU-21) — always sweep after detaching.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -6233,5 +6234,1291 @@ fn import_root_push_rejected() {
         names("fu18-root-after", "HEAD:third-party/fu18-owner"),
         ["fu18-repo".to_owned()].into_iter().collect()
     );
+    fu10_shutdown(service, &stderr_path);
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260923 FU-21: `mega2 import-repo remove` (ADR-FU-11). The CLI runs as
+// a child of this test with the case service's database, Redis, object root,
+// base dir and cache dir. Every run asserts that the vault key file under the
+// base dir is untouched. All SQL below uses bound parameters.
+// ---------------------------------------------------------------------------
+
+const FU21_UNREACHABLE: [(&str, &str); 2] = [
+    (
+        "MEGA_DATABASE__DB_URL",
+        "postgres://fu21:fu21@127.0.0.1:1/none",
+    ),
+    ("MEGA_REDIS__URL", "redis://127.0.0.1:1"),
+];
+
+#[derive(Debug)]
+struct Fu21Output {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Fu21VaultKey {
+    bytes: Vec<u8>,
+    ino: u64,
+    mode: u32,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    entries: std::collections::BTreeSet<String>,
+}
+
+fn fu21_vault_key(env: &GitCliEnv) -> Option<Fu21VaultKey> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = env.base_dir.join("vault");
+    let path = dir.join("core_key.json");
+    let meta = fs::metadata(&path).ok()?;
+    let entries = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    Some(Fu21VaultKey {
+        bytes: fs::read(&path).ok()?,
+        ino: meta.ino(),
+        mode: meta.mode(),
+        mtime: (meta.mtime(), meta.mtime_nsec()),
+        ctime: (meta.ctime(), meta.ctime_nsec()),
+        entries,
+    })
+}
+
+/// Wait until the key file's ctime is older than the timestamp resolution a
+/// rewrite would need to show.
+fn fu21_settle_vault_key(env: &GitCliEnv) {
+    let Some(key) = fu21_vault_key(env) else {
+        return;
+    };
+    let changed = Duration::new(key.ctime.0.max(0) as u64, key.ctime.1.max(0) as u32);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock");
+    let settle = Duration::from_millis(1100);
+    if let Some(age) = now.checked_sub(changed)
+        && age < settle
+    {
+        sleep(settle - age);
+    }
+}
+
+fn fu21_command(
+    env: &GitCliEnv,
+    trunk: bool,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> Command {
+    let mut command = env.full_config_command();
+    if trunk {
+        command.envs(trunk_boot_env());
+    }
+    command.envs(extra_env.iter().copied());
+    command.args(["import-repo", "remove"]).args(args);
+    command
+}
+
+/// Run a child to completion with a 300 s watchdog.
+fn fu21_run(mut command: Command) -> Fu21Output {
+    let dir = tempfile::tempdir().expect("output dir");
+    let out = dir.path().join("stdout");
+    let err = dir.path().join("stderr");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(create_log_file(&out)))
+        .stderr(Stdio::from(create_log_file(&err)));
+    let mut child = command.spawn().expect("spawn mega2");
+    fu21_wait(&mut child, &out, &err, Duration::from_secs(300))
+}
+
+fn fu21_wait(child: &mut Child, out: &Path, err: &Path, timeout: Duration) -> Fu21Output {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll mega2") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "mega2 did not exit within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+                read_log(out),
+                read_log(err)
+            );
+        }
+        sleep(Duration::from_millis(100));
+    };
+    Fu21Output {
+        code: status.code().unwrap_or(-1),
+        stdout: read_log(out),
+        stderr: read_log(err),
+    }
+}
+
+fn fu21_cli_with(
+    env: &GitCliEnv,
+    trunk: bool,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> Fu21Output {
+    fu21_settle_vault_key(env);
+    let before = fu21_vault_key(env);
+    let output = fu21_run(fu21_command(env, trunk, extra_env, args));
+    assert_eq!(
+        fu21_vault_key(env),
+        before,
+        "mega2 import-repo remove must not write, rewrite or chmod the vault key file"
+    );
+    output
+}
+
+fn fu21_cli(env: &GitCliEnv, args: &[&str]) -> Fu21Output {
+    fu21_cli_with(env, true, &[], args)
+}
+
+/// A CLI child that is interrupted by the test.
+struct Fu21Child {
+    child: Child,
+    out: PathBuf,
+    err: PathBuf,
+    _dir: TempDir,
+    before: Option<Fu21VaultKey>,
+}
+
+fn fu21_spawn(env: &GitCliEnv, args: &[&str]) -> Fu21Child {
+    fu21_settle_vault_key(env);
+    let before = fu21_vault_key(env);
+    let dir = tempfile::tempdir().expect("output dir");
+    let out = dir.path().join("stdout");
+    let err = dir.path().join("stderr");
+    let mut command = fu21_command(env, true, &[], args);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(create_log_file(&out)))
+        .stderr(Stdio::from(create_log_file(&err)));
+    Fu21Child {
+        child: command.spawn().expect("spawn mega2"),
+        out,
+        err,
+        _dir: dir,
+        before,
+    }
+}
+
+impl Drop for Fu21Child {
+    /// A panicking case must not leave the CLI running; a reaped child keeps
+    /// its status, so this is a no-op after `wait`.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Fu21Child {
+    fn sigint(&self) {
+        // SAFETY: plain kill(2) on the pid of a child this test spawned.
+        let rc = unsafe { libc::kill(self.child.id() as i32, libc::SIGINT) };
+        assert_eq!(rc, 0, "kill -INT");
+    }
+
+    fn wait(mut self, env: &GitCliEnv, timeout: Duration) -> Fu21Output {
+        let output = fu21_wait(&mut self.child, &self.out, &self.err, timeout);
+        assert_eq!(
+            fu21_vault_key(env),
+            self.before,
+            "mega2 import-repo remove must not write, rewrite or chmod the vault key file"
+        );
+        output
+    }
+}
+
+/// A transaction held by the test on its own runtime and connection.
+struct Fu21Hold {
+    rt: tokio::runtime::Runtime,
+    txn: Option<sea_orm::DatabaseTransaction>,
+    _db: sea_orm::DatabaseConnection,
+}
+
+impl Fu21Hold {
+    fn hold(db_url: &str, sql: &str, values: Vec<sea_orm::Value>) -> Self {
+        use sea_orm::TransactionTrait;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("hold runtime");
+        let (db, txn) = rt.block_on(async {
+            let db = Database::connect(db_url).await.expect("hold connect");
+            let txn = db.begin().await.expect("hold begin");
+            txn.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("{sql}: {err}"));
+            (db, txn)
+        });
+        Self {
+            rt,
+            txn: Some(txn),
+            _db: db,
+        }
+    }
+
+    fn release(mut self) {
+        if let Some(txn) = self.txn.take() {
+            self.rt.block_on(txn.rollback()).expect("hold rollback");
+        }
+    }
+}
+
+impl Drop for Fu21Hold {
+    /// On a panic the transaction is rolled back on its own runtime, not
+    /// dropped outside one.
+    fn drop(&mut self) {
+        if let Some(txn) = self.txn.take() {
+            let _ = self.rt.block_on(txn.rollback());
+        }
+    }
+}
+
+fn fu21_scalar(db_url: &str, sql: &str, values: Vec<sea_orm::Value>) -> Option<i64> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect: {err}"));
+        db.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: {err}"))
+        .and_then(|row| row.try_get::<Option<i64>>("", "n").expect("column n"))
+    })
+}
+
+fn fu21_count(db_url: &str, sql: &str, values: Vec<sea_orm::Value>) -> i64 {
+    fu21_scalar(db_url, sql, values).unwrap_or(0)
+}
+
+fn fu21_exec(db_url: &str, sql: &str, values: Vec<sea_orm::Value>) {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect: {err}"));
+        db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: {err}"));
+    })
+}
+
+fn fu21_repo_id(db_url: &str, path: &str) -> Option<i64> {
+    fu21_scalar(
+        db_url,
+        "SELECT id AS n FROM git_repo WHERE repo_path = $1",
+        vec![path.into()],
+    )
+}
+
+/// A `git_repo` row with no refs, objects or mount (B3's row-only detach).
+fn fu21_insert_repo_row(db_url: &str, path: &str) -> i64 {
+    let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+    fu21_scalar(
+        db_url,
+        "INSERT INTO git_repo (id, repo_path, repo_name, created_at, updated_at) \
+         SELECT COALESCE(MAX(id), 0) + 1, $1, $2, now(), now() FROM git_repo RETURNING id AS n",
+        vec![path.into(), name.into()],
+    )
+    .expect("inserted git_repo id")
+}
+
+/// `(path, repo_id, state, requester, rows_deleted.git_blob)` of a ledger row.
+fn fu21_ledger(db_url: &str, id: i64) -> Option<(String, i64, String, String, i64)> {
+    with_runtime(async {
+        let db = Database::connect(db_url).await.expect("connect");
+        db.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT path, repo_id, state, requester, \
+             COALESCE((rows_deleted->>'git_blob')::bigint, 0) AS blobs \
+             FROM import_repo_cleanups WHERE id = $1",
+            vec![id.into()],
+        ))
+        .await
+        .expect("ledger query")
+        .map(|row| {
+            (
+                row.try_get("", "path").expect("path"),
+                row.try_get("", "repo_id").expect("repo_id"),
+                row.try_get("", "state").expect("state"),
+                row.try_get("", "requester").expect("requester"),
+                row.try_get("", "blobs").expect("blobs"),
+            )
+        })
+    })
+}
+
+fn fu21_ledger_for_repo(db_url: &str, repo_id: i64) -> Option<i64> {
+    fu21_scalar(
+        db_url,
+        "SELECT id AS n FROM import_repo_cleanups WHERE repo_id = $1 ORDER BY id DESC LIMIT 1",
+        vec![repo_id.into()],
+    )
+}
+
+fn fu21_audit_rows(db_url: &str, cleanup_id: i64, phase: &str, requester: &str) -> i64 {
+    fu21_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM audit_logs \
+         WHERE metadata->>'kind' = 'import_repo.remove' AND metadata->>'cleanup_id' = $1 \
+         AND metadata->>'phase' = $2 AND metadata->>'requester' = $3",
+        vec![
+            cleanup_id.to_string().into(),
+            phase.into(),
+            requester.into(),
+        ],
+    )
+}
+
+fn fu21_detach_rows(db_url: &str) -> i64 {
+    fu21_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM push_queue WHERE payload->>'op' = $1",
+        vec!["detach".into()],
+    )
+}
+
+fn fu21_queue_rows(db_url: &str) -> i64 {
+    fu21_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM push_queue",
+        vec![],
+    )
+}
+
+fn fu21_object_rows(db_url: &str, repo_id: i64) -> i64 {
+    fu21_count(
+        db_url,
+        "SELECT ((SELECT COUNT(*) FROM git_commit WHERE repo_id = $1) \
+         + (SELECT COUNT(*) FROM git_tree WHERE repo_id = $1) \
+         + (SELECT COUNT(*) FROM git_blob WHERE repo_id = $1) \
+         + (SELECT COUNT(*) FROM git_tag WHERE repo_id = $1))::bigint AS n",
+        vec![repo_id.into()],
+    )
+}
+
+fn fu21_blob_rows(db_url: &str, repo_id: i64) -> i64 {
+    fu21_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM git_blob WHERE repo_id = $1",
+        vec![repo_id.into()],
+    )
+}
+
+fn fu21_public_tables(db_url: &str) -> i64 {
+    fu21_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM pg_tables WHERE schemaname = $1",
+        vec!["public".into()],
+    )
+}
+
+/// `count` more `git_blob` rows for `repo_id`, then fresh planner statistics.
+fn fu21_seed_blobs(db_url: &str, repo_id: i64, count: i64) {
+    fu21_exec(
+        db_url,
+        "INSERT INTO git_blob (id, repo_id, blob_id, name, size, created_at, pack_id, file_path, pack_offset, is_delta_in_pack) \
+         SELECT m.base + g, $1, 'f' || lpad(g::text, 39, '0'), NULL, 0, now(), '', '', 0, false \
+         FROM generate_series(1, $2::bigint) AS g, (SELECT COALESCE(MAX(id), 0) AS base FROM git_blob) AS m",
+        vec![repo_id.into(), count.into()],
+    );
+    fu21_exec(db_url, "ANALYZE git_blob", vec![]);
+}
+
+/// Counts of `git_repo`, ledger, `push_queue`, cleanup audit and
+/// `import_refs` rows.
+fn fu21_snapshot(db_url: &str) -> [i64; 5] {
+    [
+        "SELECT COUNT(*)::bigint AS n FROM git_repo",
+        "SELECT COUNT(*)::bigint AS n FROM import_repo_cleanups",
+        "SELECT COUNT(*)::bigint AS n FROM push_queue",
+        "SELECT COUNT(*)::bigint AS n FROM audit_logs WHERE metadata->>'kind' = 'import_repo.remove'",
+        "SELECT COUNT(*)::bigint AS n FROM import_refs",
+    ]
+    .map(|sql| fu21_count(db_url, sql, vec![]))
+}
+
+fn fu21_wait_count(
+    db_url: &str,
+    sql: &str,
+    values: Vec<sea_orm::Value>,
+    at_least: i64,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if fu21_count(db_url, sql, values.clone()) >= at_least {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
+/// A statement starting with `prefix` waits on a lock.
+fn fu21_wait_statement_lock(db_url: &str, prefix: &str, timeout: Duration) -> bool {
+    fu21_wait_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM pg_stat_activity \
+         WHERE wait_event_type = 'Lock' AND datname = current_database() AND query LIKE $1",
+        vec![format!("{prefix}%").into()],
+        1,
+        timeout,
+    )
+}
+
+/// At least `n` sessions wait for the monorepo write lock.
+fn fu21_wait_advisory_waiters(db_url: &str, n: i64, timeout: Duration) -> bool {
+    fu21_wait_count(
+        db_url,
+        "SELECT COUNT(*)::bigint AS n FROM pg_locks \
+         WHERE locktype = 'advisory' AND NOT granted AND classid::bigint = $1 \
+         AND objid::bigint = $2 \
+         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        vec![1_297_043_024_i64.into(), 1_229_867_349_i64.into()],
+        n,
+        timeout,
+    )
+}
+
+fn fu21_push(env: &GitCliEnv, port: u16, name: &str) -> i64 {
+    let case_dir = env.case_dir.as_path();
+    let path = format!("/third-party/{name}");
+    git_ok_no_auth(case_dir, &["init", "-b", "main", name]);
+    configure_git_identity_no_auth(case_dir, name);
+    fu13_commit(case_dir, name, "v1\n", "v1");
+    fu21_repush(env, port, name);
+    fu21_repo_id(&env.database.db_url, &path).expect("pushed repository")
+}
+
+/// Push the local repository `name` again (after its removal).
+fn fu21_repush(env: &GitCliEnv, port: u16, name: &str) -> i64 {
+    let path = format!("/third-party/{name}");
+    let url = trunk_subpath_url(port, &path);
+    git_cli::assert_git_success(
+        &fu13_push(
+            env.case_dir.as_path(),
+            name,
+            &url,
+            &["HEAD:refs/heads/main"],
+        ),
+        "push",
+    );
+    fu21_repo_id(&env.database.db_url, &path).expect("pushed repository")
+}
+
+fn fu21_clone_ok(env: &GitCliEnv, port: u16, path: &str, dir: &str) -> bool {
+    trunk_host_git(
+        env.case_dir.as_path(),
+        &["clone", &trunk_subpath_url(port, path), dir],
+    )
+    .status
+    .success()
+}
+
+fn fu21_assert_gone(env: &GitCliEnv, port: u16, path: &str, dir: &str) {
+    let (headers, body) = probe_upload_pack_body(port, path);
+    assert!(headers.starts_with("HTTP/1.1 404"), "{path}: {headers}");
+    assert!(body.contains("Repository not found."), "{body}");
+    assert!(
+        !fu21_clone_ok(env, port, path, dir),
+        "{path} must not clone"
+    );
+    assert_eq!(fu21_repo_id(&env.database.db_url, path), None);
+}
+
+/// The FU-16 hook: detach without the sweep, recorded as `anonymous`.
+fn fu21_hook_detach(env: &GitCliEnv, path: &str) -> i64 {
+    let mut config =
+        mega2_core::config::Config::new(env.full_config_path.to_str().expect("utf-8 config path"))
+            .expect("load config");
+    config.database.db_type = "postgres".to_owned();
+    config.database.db_url = env.database.db_url.clone();
+    config.redis.url = integration_redis_url();
+    config.object_storage.storage_type =
+        mega2_core::orbit_api::factory::ObjectStorageBackend::Local;
+    config.object_storage.local.root_dir = env.object_root.to_string_lossy().into_owned();
+    config.monorepo.push_policy = mega2_core::config::PushPolicy::Trunk;
+    with_runtime(mega2_core::import_repo_ops::detach_for_integration_test(
+        config, path,
+    ))
+    .expect("detach")
+    .expect("a cleanup id")
+}
+
+/// Removes the case's directory under the shared Git work root when the case
+/// ends, panics included (ER-13).
+struct Fu21CaseDir(PathBuf);
+
+impl Drop for Fu21CaseDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fu21_env() -> (GitCliEnv, Fu21CaseDir) {
+    let env = GitCliEnv::new();
+    let case = Fu21CaseDir(env.case_dir.clone());
+    (env, case)
+}
+
+fn fu21_skip() -> bool {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
+        return true;
+    }
+    false
+}
+
+#[test]
+fn import_repo_remove_cli_requires_yes() {
+    if fu21_skip() {
+        return;
+    }
+    let (env, _case) = fu21_env();
+    let db = env.database.db_url.clone();
+    let scratch = env.temp_dir.path().join("fu21-scratch");
+    fs::create_dir_all(&scratch).expect("scratch");
+    let scratch_base = scratch.join("base");
+    let scratch_cache = scratch.join("cache");
+    let scratch_cmd = |cwd: &Path| {
+        let mut command = isolated_command(cwd, &scratch_base, &scratch_cache);
+        command.env("MEGA_LOG__PRINT_STD", "true");
+        command
+    };
+
+    // (a) and (b): clap refuses before any config is read.
+    let a = fu21_cli(&env, &["--path", "/third-party/fu21-yes"]);
+    let mut b_cmd = scratch_cmd(&scratch);
+    b_cmd
+        .arg("--config")
+        .arg(scratch.join("missing.toml"))
+        .args(["import-repo", "remove", "--path", "/third-party/x"]);
+    let b = fu21_run(b_cmd);
+    for output in [&a, &b] {
+        assert_eq!(output.code, 2, "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            output
+                .stderr
+                .starts_with("error: the following required arguments were not provided:"),
+            "{output:?}"
+        );
+        assert!(
+            output.stderr.lines().any(|line| line.trim() == "--yes"),
+            "{output:?}"
+        );
+    }
+    assert!(!b.stderr.contains("does not exist"), "{b:?}");
+
+    // (c) no config source at all: nothing is generated.
+    let mut c_cmd = scratch_cmd(&scratch);
+    c_cmd.args(["import-repo", "remove", "--path", "/third-party/x", "--yes"]);
+    let c = fu21_run(c_cmd);
+    assert_eq!(c.code, 1, "{c:?}");
+    assert!(c.stderr.contains("no config file was found"), "{c:?}");
+
+    // (d) a config found in the working directory is not a named config.
+    let cwdcase = scratch.join("cwdcase");
+    fs::create_dir_all(cwdcase.join("config")).expect("cwd config dir");
+    fs::copy(&env.full_config_path, cwdcase.join("config/config.toml")).expect("copy config");
+    let mut d_cmd = scratch_cmd(&cwdcase);
+    d_cmd
+        .env("MEGA_DATABASE__DB_URL", &db)
+        .env("MEGA_REDIS__URL", integration_redis_url())
+        .envs(trunk_boot_env())
+        .args(["import-repo", "remove", "--path", "/third-party/x", "--yes"]);
+    let d = fu21_run(d_cmd);
+    assert_eq!(d.code, 1, "{d:?}");
+    assert_eq!(
+        d.stderr,
+        "import-repo remove: refusing a config that was not named (source: cwd); pass --config \
+         <path> or set MEGA_CONFIG\n"
+    );
+
+    // (e) a database this build has not migrated: refused, never migrated.
+    let e = fu21_cli(&env, &["--path", "/third-party/fu21-yes", "--yes"]);
+    assert_eq!(e.code, 1, "{e:?}");
+    assert!(
+        e.stderr
+            .starts_with("import-repo remove: the database schema is behind this mega2 build ("),
+        "{e:?}"
+    );
+    assert_eq!(fu21_public_tables(&db), 0, "the CLI must never migrate");
+    assert!(!env.base_dir.join("etc").exists());
+    assert!(!env.base_dir.join("vault").exists());
+    assert!(!scratch_base.join("etc").exists());
+    assert!(!scratch_base.join("vault").exists());
+
+    // (f) a live repository and no --yes: nothing happens.
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let repo = fu21_push(&env, port, "fu21-yes");
+    let before = fu21_snapshot(&db);
+    let f = fu21_cli(&env, &["--path", "/third-party/fu21-yes"]);
+    assert_eq!(f.code, 2, "{f:?}");
+    assert_eq!(fu21_snapshot(&db), before);
+    assert_eq!(fu21_repo_id(&db, "/third-party/fu21-yes"), Some(repo));
+    assert!(fu21_clone_ok(
+        &env,
+        port,
+        "/third-party/fu21-yes",
+        "fu21-yes-clone"
+    ));
+    fu10_shutdown(service, &stderr_path);
+
+    // (g) the CLI never seeds: with the service stopped and the queue_control
+    // row gone, an absent run leaves it gone.
+    fu21_exec(&db, "DELETE FROM queue_control", vec![]);
+    let g = fu21_cli(&env, &["--path", "/third-party/fu21-none", "--yes"]);
+    assert_eq!(g.code, 0, "{g:?}");
+    assert_eq!(g.stdout, "absent /third-party/fu21-none\n");
+    assert_eq!(
+        fu21_count(
+            &db,
+            "SELECT COUNT(*)::bigint AS n FROM queue_control",
+            vec![]
+        ),
+        0,
+        "the CLI must never seed queue_control"
+    );
+}
+
+#[test]
+fn import_repo_remove_cli_invalid_path() {
+    if fu21_skip() {
+        return;
+    }
+    let (env, _case) = fu21_env();
+    let db = env.database.db_url.clone();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    fu21_push(&env, port, "fu21-inv");
+    let before = fu21_snapshot(&db);
+
+    for path in [
+        "/third-party",
+        "/project/fu21-inv",
+        "/third-party/fu21-inv/",
+        "/third-party//fu21-inv",
+        "/third-party/./fu21-inv",
+        "/third-party/x/../fu21-inv",
+        "third-party/fu21-inv",
+        "/third-party\\fu21-inv",
+        " /third-party/fu21-inv",
+        "/third-party/fu21-inv ",
+        "",
+    ] {
+        let output = fu21_cli_with(&env, true, &FU21_UNREACHABLE, &["--path", path, "--yes"]);
+        assert_eq!(output.code, 1, "{path:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{path:?}: {output:?}");
+        assert_eq!(output.stderr.lines().count(), 1, "{path:?}: {output:?}");
+        assert!(
+            output.stderr.starts_with("IMPORT_REPO_PATH_INVALID: "),
+            "{path:?}: {output:?}"
+        );
+        let expected = match path {
+            "/third-party" => Some(
+                "IMPORT_REPO_PATH_INVALID: \"/third-party\": the ImportRepo directory itself is \
+                 not an ImportRepo; push to a path below it",
+            ),
+            "/project/fu21-inv" => Some(
+                "IMPORT_REPO_PATH_INVALID: \"/project/fu21-inv\": an ImportRepo path must lie \
+                 strictly below \"/third-party\"",
+            ),
+            "/third-party/fu21-inv/" => Some(
+                "IMPORT_REPO_PATH_INVALID: \"/third-party/fu21-inv/\": path must be canonical \
+                 (did you mean \"/third-party/fu21-inv\"?)",
+            ),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            assert_eq!(output.stderr, format!("{expected}\n"));
+        }
+    }
+
+    let valid = ["--path", "/third-party/fu21-inv", "--yes"];
+    let review = fu21_cli_with(&env, false, &FU21_UNREACHABLE, &valid);
+    let redis_ref: Vec<(&str, &str)> = FU21_UNREACHABLE
+        .iter()
+        .copied()
+        .filter(|(key, _)| *key != "MEGA_REDIS__URL")
+        .chain([(
+            "MEGA_REDIS__URL",
+            "vault://secret/config/it/redis/url#value",
+        )])
+        .collect();
+    let redis = fu21_cli_with(&env, true, &redis_ref, &valid);
+    let mut s3_env = FU21_UNREACHABLE.to_vec();
+    s3_env.extend([
+        ("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible"),
+        (
+            "MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID",
+            "vault://secret/config/it/object_storage/access_key_id#value",
+        ),
+        ("MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY", "fu21-literal"),
+        ("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1"),
+        ("MEGA_OBJECT_STORAGE__S3__BUCKET", "fu21"),
+        (
+            "MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL",
+            "http://127.0.0.1:1",
+        ),
+    ]);
+    let s3 = fu21_cli_with(&env, true, &s3_env, &valid);
+    for (output, expected) in [
+        (
+            &review,
+            "import-repo remove: ImportRepo cleanup needs a storage-only deployment \
+             (git.push_auth = \"token\" or \"none\")",
+        ),
+        (
+            &redis,
+            "import-repo remove: redis.url is a vault:// SecretRef and this command never opens \
+             the vault; supply a literal value for this run (MEGA_REDIS__URL)",
+        ),
+        (
+            &s3,
+            "import-repo remove: object_storage.s3 credentials are vault:// SecretRefs and this \
+             command never opens the vault; supply literal values for this run \
+             (MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID, MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY)",
+        ),
+    ] {
+        assert_eq!(output.code, 1, "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(output.stderr, format!("{expected}\n"));
+    }
+
+    let real = fu21_cli(&env, &["--path", "/third-party", "--yes"]);
+    assert_eq!(real.code, 1, "{real:?}");
+    assert!(
+        real.stderr
+            .starts_with("IMPORT_REPO_PATH_INVALID: \"/third-party\": the ImportRepo directory"),
+        "{real:?}"
+    );
+    assert_eq!(fu21_snapshot(&db), before);
+    assert!(fu21_clone_ok(
+        &env,
+        port,
+        "/third-party/fu21-inv",
+        "fu21-inv-clone"
+    ));
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn import_repo_remove_cli_removes() {
+    if fu21_skip() {
+        return;
+    }
+    let (env, _case) = fu21_env();
+    let db = env.database.db_url.clone();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let path = "/third-party/fu21-rm";
+    let r1 = fu21_push(&env, port, "fu21-rm");
+    fu21_seed_blobs(&db, r1, 100_500);
+    assert_eq!(fu21_blob_rows(&db, r1), 100_501);
+
+    // A parent with a registered child is refused until the child is gone.
+    let parent = "/third-party/fu21-par";
+    let child = "/third-party/fu21-par/c";
+    fu21_insert_repo_row(&db, parent);
+    fu21_insert_repo_row(&db, child);
+    let counts = (
+        fu21_detach_rows(&db),
+        fu21_count(
+            &db,
+            "SELECT COUNT(*)::bigint AS n FROM import_repo_cleanups",
+            vec![],
+        ),
+    );
+    let refused = fu21_cli(&env, &["--path", parent, "--yes"]);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert_eq!(
+        refused.stderr,
+        "IMPORT_REPO_HAS_CHILDREN: \"/third-party/fu21-par\" contains other ImportRepos; remove \
+         them first\n"
+    );
+    assert_eq!(
+        (
+            fu21_detach_rows(&db),
+            fu21_count(
+                &db,
+                "SELECT COUNT(*)::bigint AS n FROM import_repo_cleanups",
+                vec![]
+            )
+        ),
+        counts
+    );
+    for target in [child, parent] {
+        let id = fu21_repo_id(&db, target).expect("row");
+        let output = fu21_cli(&env, &["--path", target, "--yes"]);
+        assert_eq!(output.code, 0, "{output:?}");
+        let cleanup = fu21_ledger_for_repo(&db, id).expect("ledger row");
+        assert_eq!(
+            output.stdout,
+            format!("removed {target} (repo_id={id}, cleanup_id={cleanup})\n")
+        );
+    }
+
+    // The populated repository: several rounds in one process.
+    let output = fu21_cli(&env, &["--path", path, "--yes"]);
+    assert_eq!(output.code, 0, "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let c1 = fu21_ledger_for_repo(&db, r1).expect("ledger row");
+    assert_eq!(
+        output.stdout,
+        format!("removed {path} (repo_id={r1}, cleanup_id={c1})\n")
+    );
+    assert_eq!(
+        fu21_ledger(&db, c1),
+        Some((
+            path.to_owned(),
+            r1,
+            "swept".to_owned(),
+            "operator-cli".to_owned(),
+            100_501
+        ))
+    );
+    fu21_assert_gone(&env, port, path, "fu21-rm-after");
+    assert_eq!(fu21_object_rows(&db, r1), 0);
+    assert_eq!(
+        fu21_count(
+            &db,
+            "SELECT COUNT(*)::bigint AS n FROM import_refs WHERE repo_id = $1",
+            vec![r1.into()]
+        ),
+        0
+    );
+    assert_eq!(
+        fu21_count(
+            &db,
+            "SELECT COUNT(*)::bigint AS n FROM push_queue WHERE id = $1 AND requester = $2",
+            vec![c1.into(), "operator-cli".into()]
+        ),
+        1
+    );
+    assert_eq!(fu21_audit_rows(&db, c1, "detached", "operator-cli"), 1);
+    assert_eq!(fu21_audit_rows(&db, c1, "swept", "operator-cli"), 1);
+    assert_eq!(
+        fu21_count(
+            &db,
+            "SELECT COUNT(*)::bigint AS n FROM audit_logs WHERE metadata->>'kind' = \
+             'import_repo.remove' AND metadata->>'cleanup_id' = $1 AND metadata->>'requester' <> $2",
+            vec![c1.to_string().into(), "operator-cli".into()]
+        ),
+        0
+    );
+
+    // Pushing again imports a new repository.
+    let r2 = fu21_repush(&env, port, "fu21-rm");
+    assert_ne!(r2, r1);
+    assert!(fu21_clone_ok(&env, port, path, "fu21-rm-again"));
+
+    // A paused queue refuses the detach, an untyped failure before anything
+    // is recorded: exit 1 with the error, no outcome line, nothing written.
+    let before = fu21_snapshot(&db);
+    fu21_exec(
+        &db,
+        "UPDATE queue_control SET paused = $1 WHERE id = 1",
+        vec![true.into()],
+    );
+    let paused = fu21_cli(&env, &["--path", path, "--yes"]);
+    fu21_exec(
+        &db,
+        "UPDATE queue_control SET paused = $1 WHERE id = 1",
+        vec![false.into()],
+    );
+    assert_eq!(paused.code, 1, "{paused:?}");
+    assert!(paused.stdout.is_empty(), "{paused:?}");
+    assert!(paused.stderr.contains("push_queue is paused"), "{paused:?}");
+    assert!(!paused.stderr.contains("cleanup"), "{paused:?}");
+    assert_eq!(fu21_snapshot(&db), before);
+    assert_eq!(fu21_repo_id(&db, path), Some(r2));
+    assert!(fu21_clone_ok(&env, port, path, "fu21-rm-paused"));
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn import_repo_remove_cli_absent() {
+    if fu21_skip() {
+        return;
+    }
+    let (env, _case) = fu21_env();
+    let db = env.database.db_url.clone();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let never = "/third-party/fu21-never";
+
+    let before = fu21_snapshot(&db);
+    let output = fu21_cli(&env, &["--path", never, "--yes"]);
+    assert_eq!(output.code, 0, "{output:?}");
+    assert_eq!(output.stdout, format!("absent {never}\n"));
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(fu21_snapshot(&db), before);
+
+    // With logs on stdout the outcome is still the last line.
+    let output = fu21_cli_with(
+        &env,
+        true,
+        &[("MEGA_LOG__PRINT_STD", "true"), ("MEGA_LOG__LEVEL", "info")],
+        &["--path", never, "--yes"],
+    );
+    assert_eq!(output.code, 0, "{output:?}");
+    assert!(output.stdout.lines().count() >= 2, "{output:?}");
+    assert_eq!(
+        output.stdout.lines().last(),
+        Some(format!("absent {never}").as_str())
+    );
+
+    // Control characters are escaped on stdout.
+    let output = fu21_cli(
+        &env,
+        &["--path", "/third-party/fu21-a\tb\u{1b}[2J", "--yes"],
+    );
+    assert_eq!(output.code, 0, "{output:?}");
+    assert_eq!(output.stdout, "absent /third-party/fu21-a\\tb\\u{1b}[2J\n");
+    assert!(
+        output
+            .stdout
+            .trim_end_matches('\n')
+            .chars()
+            .all(|c| !c.is_control()),
+        "{output:?}"
+    );
+    assert_eq!(fu21_snapshot(&db), before);
+
+    // Drain: an anonymous detach left R1's rows; R2 was imported since.
+    let path = "/third-party/fu21-drain";
+    let r1 = fu21_push(&env, port, "fu21-drain");
+    fu21_seed_blobs(&db, r1, 100_500);
+    let c1 = fu21_hook_detach(&env, path);
+    let r2 = fu21_repush(&env, port, "fu21-drain");
+    assert_ne!(r2, r1);
+    let output = fu21_cli(&env, &["--path", path, "--yes"]);
+    assert_eq!(output.code, 0, "{output:?}");
+    let c2 = fu21_ledger_for_repo(&db, r2).expect("ledger row for R2");
+    assert_eq!(
+        output.stdout,
+        format!("removed {path} (repo_id={r2}, cleanup_id={c2})\n")
+    );
+    assert_eq!(
+        fu21_ledger(&db, c1),
+        Some((
+            path.to_owned(),
+            r1,
+            "swept".to_owned(),
+            "anonymous".to_owned(),
+            100_501
+        ))
+    );
+    let (_, _, state, requester, _) = fu21_ledger(&db, c2).expect("C2");
+    assert_eq!(
+        (state.as_str(), requester.as_str()),
+        ("swept", "operator-cli")
+    );
+    assert_eq!(fu21_audit_rows(&db, c1, "detached", "anonymous"), 1);
+    assert_eq!(fu21_audit_rows(&db, c1, "swept", "operator-cli"), 1);
+    assert_eq!(fu21_detach_rows(&db), 2);
+    assert_eq!(fu21_object_rows(&db, r1), 0);
+    assert_eq!(fu21_object_rows(&db, r2), 0);
+    assert_eq!(fu21_repo_id(&db, path), None);
+
+    // Drained: a repeat writes nothing.
+    let drained = fu21_snapshot(&db);
+    let output = fu21_cli(&env, &["--path", path, "--yes"]);
+    assert_eq!(output.code, 0, "{output:?}");
+    assert_eq!(output.stdout, format!("absent {path}\n"));
+    assert_eq!(fu21_snapshot(&db), drained);
+
+    // The drain runs while a re-import is live: anonymous detaches left R3,
+    // R4 and R5, and R6 is imported. Continuing C3 drains the others from the
+    // ledger and never detaches R6.
+    let r3 = fu21_repush(&env, port, "fu21-drain");
+    let c3 = fu21_hook_detach(&env, path);
+    let r4 = fu21_repush(&env, port, "fu21-drain");
+    let c4 = fu21_hook_detach(&env, path);
+    let r5 = fu21_repush(&env, port, "fu21-drain");
+    let c5 = fu21_hook_detach(&env, path);
+    let r6 = fu21_repush(&env, port, "fu21-drain");
+    let n6 = fu21_object_rows(&db, r6);
+    assert!(n6 > 0);
+    let queue = fu21_queue_rows(&db);
+    let detaches = fu21_detach_rows(&db);
+    let state = |id: i64| fu21_ledger(&db, id).map(|row| row.2);
+
+    // --max-rounds also stops the drain, naming the row it would continue.
+    let c3_arg = c3.to_string();
+    let one = fu21_cli(
+        &env,
+        &[
+            "--path",
+            path,
+            "--yes",
+            "--cleanup-id",
+            &c3_arg,
+            "--max-rounds",
+            "1",
+        ],
+    );
+    assert_eq!(one.code, 3, "{one:?}");
+    assert_eq!(
+        one.stdout,
+        format!("pending {path} (repo_id={r4}, cleanup_id={c4})\n")
+    );
+    assert_eq!(
+        one.stderr,
+        format!(
+            "import-repo remove: cleanup {c4} is not finished after 1 rounds; resume with \
+             --cleanup-id {c4}\n"
+        )
+    );
+    assert_eq!(state(c3).as_deref(), Some("swept"));
+    assert_eq!(state(c4).as_deref(), Some("detached"));
+    assert_eq!(state(c5).as_deref(), Some("detached"));
+
+    let c4_arg = c4.to_string();
+    let rest = fu21_cli(&env, &["--path", path, "--yes", "--cleanup-id", &c4_arg]);
+    assert_eq!(rest.code, 0, "{rest:?}");
+    assert_eq!(
+        rest.stdout,
+        format!("removed {path} (repo_id={r4}, cleanup_id={c4})\n")
+    );
+    for (repo, id) in [(r3, c3), (r4, c4), (r5, c5)] {
+        let (_, row_repo, state, requester, _) = fu21_ledger(&db, id).expect("ledger row");
+        assert_eq!(
+            (row_repo, state.as_str(), requester.as_str()),
+            (repo, "swept", "anonymous")
+        );
+        assert_eq!(fu21_audit_rows(&db, id, "swept", "operator-cli"), 1);
+        assert_eq!(fu21_object_rows(&db, repo), 0);
+    }
+    assert_eq!(fu21_repo_id(&db, path), Some(r6));
+    assert_eq!(fu21_ledger_for_repo(&db, r6), None);
+    assert_eq!(fu21_object_rows(&db, r6), n6);
+    assert_eq!(fu21_queue_rows(&db), queue);
+    assert_eq!(fu21_detach_rows(&db), detaches);
+    assert!(fu21_clone_ok(&env, port, path, "fu21-drain-r6"));
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn import_repo_remove_cli_pending() {
+    if fu21_skip() {
+        return;
+    }
+    let (env, _case) = fu21_env();
+    let db = env.database.db_url.clone();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let path = "/third-party/fu21-pend";
+    let r1 = fu21_push(&env, port, "fu21-pend");
+    fu21_seed_blobs(&db, r1, 200_500);
+    let b0 = fu21_blob_rows(&db, r1);
+    assert_eq!(b0, 200_501);
+
+    // Run A: one round, then exit 3 with the handle.
+    let a = fu21_cli(&env, &["--path", path, "--yes", "--max-rounds", "1"]);
+    let c1 = fu21_ledger_for_repo(&db, r1).expect("ledger row");
+    assert_eq!(a.code, 3, "{a:?}");
+    assert_eq!(
+        a.stdout,
+        format!("pending {path} (repo_id={r1}, cleanup_id={c1})\n")
+    );
+    assert_eq!(
+        a.stderr,
+        format!(
+            "import-repo remove: cleanup {c1} is not finished after 1 rounds; resume with \
+             --cleanup-id {c1}\n"
+        )
+    );
+    let pending = Some((
+        path.to_owned(),
+        r1,
+        "detached".to_owned(),
+        "operator-cli".to_owned(),
+        98_000,
+    ));
+    assert_eq!(fu21_ledger(&db, c1), pending);
+    assert_eq!(fu21_blob_rows(&db, r1), b0 - 98_000);
+    assert_eq!(fu21_repo_id(&db, path), None);
+    let (headers, _) = probe_upload_pack_body(port, path);
+    assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
+    assert_eq!(fu21_detach_rows(&db), 1);
+
+    // Runs C and D while C1 is still detached: refused, nothing changes.
+    let unknown = fu21_count(
+        &db,
+        "SELECT (COALESCE(MAX(id), 0) + 1000000)::bigint AS n FROM push_queue",
+        vec![],
+    );
+    let other = "/third-party/fu21-other";
+    for (target, id) in [(path, unknown), (other, c1)] {
+        let output = fu21_cli(
+            &env,
+            &["--path", target, "--yes", "--cleanup-id", &id.to_string()],
+        );
+        assert_eq!(output.code, 1, "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(
+            output.stderr,
+            format!("IMPORT_REPO_CLEANUP_NOT_FOUND: no cleanup \"{id}\" for \"{target}\"\n")
+        );
+        assert_eq!(fu21_ledger(&db, c1), pending);
+        assert_eq!(fu21_blob_rows(&db, r1), b0 - 98_000);
+    }
+
+    // A re-import; the continuation finishes C1 and leaves R2 alone.
+    let r2 = fu21_repush(&env, port, "fu21-pend");
+    assert!(fu21_clone_ok(&env, port, path, "fu21-pend-r2"));
+    let n2 = fu21_object_rows(&db, r2);
+    let queue = fu21_queue_rows(&db);
+    let b = fu21_cli(
+        &env,
+        &["--path", path, "--yes", "--cleanup-id", &c1.to_string()],
+    );
+    assert_eq!(b.code, 0, "{b:?}");
+    assert_eq!(
+        b.stdout,
+        format!("removed {path} (repo_id={r1}, cleanup_id={c1})\n")
+    );
+    let (_, _, state, _, blobs) = fu21_ledger(&db, c1).expect("C1");
+    assert_eq!((state.as_str(), blobs), ("swept", 200_501));
+    assert_eq!(fu21_repo_id(&db, path), Some(r2));
+    assert_eq!(fu21_object_rows(&db, r2), n2);
+    assert!(fu21_clone_ok(&env, port, path, "fu21-pend-r2-again"));
+    assert_eq!(fu21_queue_rows(&db), queue);
+    assert_eq!(fu21_audit_rows(&db, c1, "swept", "operator-cli"), 1);
+    fu10_shutdown(service, &stderr_path);
+}
+
+#[test]
+fn import_repo_remove_cli_interrupted() {
+    if fu21_skip() {
+        return;
+    }
+    let (env, _case) = fu21_env();
+    let db = env.database.db_url.clone();
+    let (service, port, _stdout, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &trunk_boot_env());
+    let path = "/third-party/fu21-int";
+    let r1 = fu21_push(&env, port, "fu21-int");
+
+    // Phase B: the detach has committed and the sweep is frozen on git_tree.
+    let hold = Fu21Hold::hold(
+        &db,
+        "SELECT id FROM git_tree WHERE repo_id = $1 FOR UPDATE",
+        vec![r1.into()],
+    );
+    let child = fu21_spawn(&env, &["--path", path, "--yes"]);
+    assert!(
+        fu21_wait_statement_lock(&db, "DELETE FROM git_tree", Duration::from_secs(60)),
+        "the sweep never reached git_tree"
+    );
+    child.sigint();
+    sleep(Duration::from_secs(2));
+    hold.release();
+    let b = child.wait(&env, Duration::from_secs(30));
+    let c1 = fu21_ledger_for_repo(&db, r1).expect("ledger row");
+    assert_eq!(b.code, 130, "{b:?}");
+    assert_eq!(
+        b.stdout,
+        format!("interrupted {path} (repo_id={r1}, cleanup_id={c1})\n")
+    );
+    assert!(
+        b.stderr.contains(&format!("resume with --cleanup-id {c1}")),
+        "{b:?}"
+    );
+    assert_eq!(fu21_repo_id(&db, path), None);
+    assert_eq!(
+        fu21_ledger(&db, c1).map(|row| row.2),
+        Some("detached".to_owned())
+    );
+    let (headers, _) = probe_upload_pack_body(port, path);
+    assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
+
+    // Phase A: the detach is blocked before its commit.
+    let r2 = fu21_repush(&env, port, "fu21-int");
+    let hold = Fu21Hold::hold(
+        &db,
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        vec![1_297_043_024_i32.into(), 1_229_867_349_i32.into()],
+    );
+    let child = fu21_spawn(&env, &["--path", path, "--yes"]);
+    assert!(
+        fu21_wait_advisory_waiters(&db, 1, Duration::from_secs(60)),
+        "the detach never waited for the write lock"
+    );
+    child.sigint();
+    let _ = fu21_wait_advisory_waiters(&db, 2, Duration::from_secs(5));
+    hold.release();
+    let a = child.wait(&env, Duration::from_secs(30));
+    assert_eq!(a.code, 130, "{a:?}");
+    assert_eq!(a.stdout, format!("interrupted {path}\n"));
+    assert!(
+        a.stderr
+            .contains("interrupted before a cleanup was recorded"),
+        "{a:?}"
+    );
+    assert_eq!(fu21_repo_id(&db, path), Some(r2));
+    assert_eq!(fu21_ledger_for_repo(&db, r2), None);
+    assert!(fu21_clone_ok(&env, port, path, "fu21-int-r2"));
+
+    // Resume C1 (R2 stays live), then remove R2.
+    let resumed = fu21_cli(
+        &env,
+        &["--path", path, "--yes", "--cleanup-id", &c1.to_string()],
+    );
+    assert_eq!(resumed.code, 0, "{resumed:?}");
+    assert_eq!(
+        resumed.stdout,
+        format!("removed {path} (repo_id={r1}, cleanup_id={c1})\n")
+    );
+    assert_eq!(fu21_repo_id(&db, path), Some(r2));
+    assert_eq!(
+        fu21_ledger(&db, c1).map(|row| row.2),
+        Some("swept".to_owned())
+    );
+    assert_eq!(fu21_object_rows(&db, r1), 0);
+    let queue_idle = fu21_wait_count(
+        &db,
+        "SELECT (COUNT(*) = 0)::int::bigint AS n FROM push_queue WHERE status IN ('Queued', 'Running')",
+        vec![],
+        1,
+        Duration::from_secs(30),
+    );
+    assert!(
+        queue_idle,
+        "the service reaper did not settle the orphaned queue row"
+    );
+    let last = fu21_cli(&env, &["--path", path, "--yes"]);
+    assert_eq!(last.code, 0, "{last:?}");
+    let c2 = fu21_ledger_for_repo(&db, r2).expect("ledger row for R2");
+    assert_eq!(
+        last.stdout,
+        format!("removed {path} (repo_id={r2}, cleanup_id={c2})\n")
+    );
+    assert_eq!(fu21_repo_id(&db, path), None);
     fu10_shutdown(service, &stderr_path);
 }
