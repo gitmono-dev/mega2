@@ -651,6 +651,16 @@ impl RepoHandler for Monorepo {
     /// The existing single-object [`GitObjectCache::get_tree`] is reused rather than
     /// adding a batch API, so the proven miss/fetch/write-back path — including its
     /// corrupt-entry eviction — stays the only thing that has to be correct.
+    ///
+    /// FAILURE SEMANTICS — this must stay lenient. The previous implementation was
+    /// `storage.get_trees_by_hashes(hashes)` and it returned however many rows came
+    /// back; `traverse` then descended `for t in trees`. An earlier version of this
+    /// function collected into a `Result` and propagated any single failure with `?`,
+    /// which turned one unreadable tree into an abort of the whole walk. The pack
+    /// counter and the entries actually sent then disagreed and the encoder killed the
+    /// request: `not all objects are encoded, process:0, total:560472`, surfacing to
+    /// the client as `HTTP 400 / expected 'packfile'`. A missing subtree degrades the
+    /// pack; it must not fail the clone.
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError> {
         if hashes.is_empty() {
             return Ok(Vec::new());
@@ -663,14 +673,16 @@ impl RepoHandler for Monorepo {
         let hash_kind = self.object_hash_kind()?;
         let cache = self.git_object_cache.clone();
         let storage = self.storage.clone();
+        let requested = hashes.len();
 
-        stream::iter(hashes)
+        let results: Vec<Result<Tree, (String, MegaError)>> = stream::iter(hashes)
             .map(|hash| {
                 let cache = cache.clone();
                 let storage = storage.clone();
                 async move {
-                    let oid = ObjectHash::from_hex_for_kind(hash_kind, &hash)
-                        .map_err(|e| MegaError::Other(format!("bad tree oid {hash}: {e}")))?;
+                    let oid = ObjectHash::from_hex_for_kind(hash_kind, &hash).map_err(|e| {
+                        (hash.clone(), MegaError::Other(format!("bad tree oid: {e}")))
+                    })?;
                     let tree = cache
                         .get_tree(oid, |oid| {
                             let storage = storage.clone();
@@ -687,13 +699,42 @@ impl RepoHandler for Monorepo {
                                     })
                             }
                         })
-                        .await?;
-                    Ok::<Tree, MegaError>(Arc::unwrap_or_clone(tree))
+                        .await
+                        .map_err(|e| (hash.clone(), e))?;
+                    Ok::<Tree, (String, MegaError)>(Arc::unwrap_or_clone(tree))
                 }
             })
             .buffer_unordered(TREE_FETCH_CONCURRENCY)
-            .try_collect::<Vec<_>>()
-            .await
+            .collect::<Vec<_>>()
+            .await;
+
+        // Keep the successful reads and log the rest; never propagate. See the
+        // FAILURE SEMANTICS note above — an error here aborts the whole walk and the
+        // pack then fails its object-count assertion.
+        let mut trees = Vec::with_capacity(results.len());
+        let mut failed = 0usize;
+        for r in results {
+            match r {
+                Ok(t) => trees.push(t),
+                Err((hash, e)) => {
+                    failed += 1;
+                    tracing::warn!(
+                        tree = %hash,
+                        error = %e,
+                        "tree read failed during pack walk; skipping this subtree"
+                    );
+                }
+            }
+        }
+        if failed > 0 {
+            tracing::warn!(
+                requested,
+                ok = trees.len(),
+                failed,
+                "pack walk missing subtrees; the pack will be incomplete"
+            );
+        }
+        Ok(trees)
     }
 
     async fn get_blobs_by_hashes(
