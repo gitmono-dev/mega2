@@ -58,6 +58,17 @@ pub trait RepoHandler: Send + Sync + 'static {
         1
     }
 
+    /// Concurrency limit for object-store reads while gathering blobs for an
+    /// upload-pack response. `0` means unbounded.
+    ///
+    /// The default preserves the historical hardcoded width of 16 so other
+    /// handlers are unaffected; `Monorepo` reads it from `PackConfig` because
+    /// at 16 the clone path is dominated by object-store round trips rather
+    /// than by anything else.
+    fn blob_fetch_concurrency(&self) -> usize {
+        16
+    }
+
     /// Optional extra timing key-values to be included in the final receive-pack report.
     /// Implementations may return an empty vec.
     ///
@@ -439,6 +450,12 @@ pub trait RepoHandler: Send + Sync + 'static {
         exist_objs: &mut HashSet<String>,
         sender: Option<&tokio::sync::mpsc::Sender<MetaAttached<Entry, EntryMeta>>>,
     ) -> Result<(), MegaError> {
+        // `for_each_concurrent` treats a bare `usize` as `Some(n)`, and `Some(0)`
+        // would admit no futures at all — so an unbounded setting has to become
+        // `None`, not `Some(0)`.
+        let configured = self.blob_fetch_concurrency();
+        let concurrency = (configured != 0).then_some(configured);
+
         let mut search_tree_ids = vec![];
         let mut search_blob_ids = vec![];
 
@@ -455,32 +472,46 @@ pub trait RepoHandler: Send + Sync + 'static {
 
         if let Some(sender) = sender {
             let blobs = self.get_blobs_by_hashes(search_blob_ids.clone()).await?;
-            let blobs_ext_data = self
-                .get_blob_metadata_by_hashes(search_blob_ids.clone())
-                .await?;
 
-            let default_meta = EntryMeta::default();
+            // EntryMeta (pack_id / pack_offset / file_path / is_delta) is consumed in
+            // exactly one place: `sort::magic_sort` reads `meta.file_path` to cluster
+            // likely delta pairs into one search window. `magic_sort` runs only on the
+            // windowed path — `PackEncoder::encode` dispatches to `parallel_encode`
+            // when `window_size == 0` and to `inner_encode` (the only caller of
+            // magic_sort) otherwise. This deployment encodes with `window_size == 0`
+            // (see `Monorepo::incremental_pack`), so nothing reads the meta and the
+            // per-directory `get_blob_metadata_by_hashes` query was paying one DB
+            // round trip per directory for data that was then discarded.
+            //
+            // DELTA COUPLING: raising `window_size` above zero makes this
+            // load-bearing again. Without the metadata every entry carries
+            // `EntryMeta::new()` (file_path = None), so magic_sort falls through to
+            // its content-signature branch and delta hit rate silently degrades.
+            // Restore the query in the same change that enables the delta window.
+            let meta = EntryMeta::new();
             blobs
-                .try_for_each_concurrent(16, |(_, stream, _)| async {
-                    let data = stream
-                        .try_fold(Vec::new(), |mut acc, bytes| async move {
-                            acc.extend_from_slice(&bytes);
-                            Ok(acc)
-                        })
-                        .await?;
-                    let blob = Blob::from_content_bytes(data);
-                    let ext_data = blobs_ext_data
-                        .get(&blob.id.to_string())
-                        .unwrap_or(&default_meta);
-                    sender
-                        .send(MetaAttached {
-                            inner: blob.into(),
-                            meta: ext_data.to_owned(),
-                        })
-                        .await
-                        .map_err(|e| IoOrbitError::Other(format!("pack entry send failed: {e}")))?;
+                .try_for_each_concurrent(concurrency, |(_, stream, _)| {
+                    let meta = meta.clone();
+                    async move {
+                        let data = stream
+                            .try_fold(Vec::new(), |mut acc, bytes| async move {
+                                acc.extend_from_slice(&bytes);
+                                Ok(acc)
+                            })
+                            .await?;
+                        let blob = Blob::from_content_bytes(data);
+                        sender
+                            .send(MetaAttached {
+                                inner: blob.into(),
+                                meta,
+                            })
+                            .await
+                            .map_err(|e| {
+                                IoOrbitError::Other(format!("pack entry send failed: {e}"))
+                            })?;
 
-                    Ok(())
+                        Ok(())
+                    }
                 })
                 .await?;
         }

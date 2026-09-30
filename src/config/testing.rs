@@ -177,6 +177,7 @@ impl TestConfigBuilder {
                 clean_cache_after_decode: true,
                 channel_message_size: 1_000_000,
                 save_entry_concurrency: 1,
+                blob_fetch_concurrency: 16,
             },
             lfs: LFSConfig {
                 local: LFSLocalConfig {

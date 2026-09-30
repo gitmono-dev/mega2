@@ -699,6 +699,20 @@ pub struct PackConfig {
     /// Set to 0 to disable the limit (unbounded).
     #[serde(default = "default_save_entry_concurrency")]
     pub save_entry_concurrency: usize,
+    /// Max concurrent object-store reads while gathering blobs for an
+    /// upload-pack response.
+    ///
+    /// This was hardcoded to 16 in `RepoHandler::traverse`, and at that width it
+    /// dominated clone wall time: a full clone moves ~550k blobs, so 16-way
+    /// concurrency serialises them into ~34k batches. Measured on the ACK
+    /// deployment, `git-upload-pack` took 81 s to produce its first byte, and
+    /// 550_000 / 16 × ~2.4 ms per object-store read accounts for essentially all
+    /// of it.
+    ///
+    /// Set to 0 to disable the limit (unbounded), matching
+    /// `save_entry_concurrency`.
+    #[serde(default = "default_blob_fetch_concurrency")]
+    pub blob_fetch_concurrency: usize,
 }
 
 impl Default for PackConfig {
@@ -710,12 +724,20 @@ impl Default for PackConfig {
             clean_cache_after_decode: true,
             channel_message_size: 1_000_000,
             save_entry_concurrency: default_save_entry_concurrency(),
+            blob_fetch_concurrency: default_blob_fetch_concurrency(),
         }
     }
 }
 
 fn default_save_entry_concurrency() -> usize {
     1
+}
+
+/// 64 rather than the historical hardcoded 16 — narrow enough not to stampede a
+/// single object store from one clone, wide enough to stop being the wall-time
+/// bottleneck. Operators can raise or lower it per deployment.
+fn default_blob_fetch_concurrency() -> usize {
+    64
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

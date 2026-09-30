@@ -6,8 +6,9 @@ use std::{
 
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt, stream};
 use git_internal::hash::HashKind;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
@@ -34,6 +35,13 @@ const NUL: char = '\0';
 
 pub const PKT_LINE_END_MARKER: &[u8; 4] = b"0000";
 pub const PKT_LINE_DELIMITER: &[u8; 4] = b"0001";
+
+/// Bound on the bridge channel between a spawned pack generator and the response
+/// body. Each slot holds one encoded pack chunk, so this is what stops a fast
+/// encoder from buffering an entire pack in memory when the client reads slowly —
+/// backpressure, not a throughput knob. Small enough to bound memory, large enough
+/// that the encoder is not stalled waiting for the writer to drain.
+const PACK_BRIDGE_CHANNEL: usize = 16;
 
 // see https://git-scm.com/docs/protocol-capabilities
 // Only advertise capabilities that are parsed, acted on, and covered by tests.
@@ -255,6 +263,10 @@ impl SmartSession {
 
         if have.is_empty() {
             if let Some(depth) = deepen_depth {
+                // Shallow deliberately keeps the synchronous call: its `shallow`
+                // lines are part of `protocol_buf`, which is written ahead of the
+                // pack, so the response cannot be framed until the traversal has
+                // produced them.
                 let (stream, shallows) = repo_handler
                     .shallow_pack(want, depth, deepen_relative)
                     .await
@@ -264,9 +276,50 @@ impl SmartSession {
                 pack_data = stream;
                 shallow_commits = shallows;
             } else {
-                pack_data = repo_handler.full_pack(want).await.map_err(|e| {
-                    ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
-                })?;
+                // A plain clone: NAK does not depend on the pack (it only says
+                // "no common commits", which is already known from an empty `have`),
+                // so build it now and generate the pack behind a channel. The
+                // response can then be framed and flushed immediately instead of
+                // after the whole pack is built.
+                //
+                // This matters because the silence, not the work, is what breaks
+                // clients. `full_pack` used to be awaited here, and it yields
+                // nothing until its traversal finishes — measured at 81 s to first
+                // byte on the ACK deployment. Any client with an idle read timeout
+                // aborts during that window: libra's HTTP client defaults to 60 s
+                // (libra/src/internal/protocol/https_client.rs) and died on every
+                // attempt, while git (no such cap) merely waited. The server was
+                // correct throughout; only its reporting was broken.
+                //
+                // Trade-off: once the NAK is written the status is committed, so a
+                // pack-generation failure can no longer surface as a clean HTTP
+                // error — the client sees a truncated pack instead. That is
+                // acceptable here because a truncated pack is detectable by the
+                // client (the trailer is missing) whereas an 81 s silence is not
+                // distinguishable from a hang.
+                let (pack_tx, pack_rx) = mpsc::channel(PACK_BRIDGE_CHANNEL);
+                let handler = repo_handler.clone();
+                tokio::spawn(async move {
+                    match handler.full_pack(want).await {
+                        Ok(mut stream) => {
+                            while let Some(chunk) = stream.next().await {
+                                if pack_tx.send(chunk).await.is_err() {
+                                    // The client is gone. Stop pulling so the
+                                    // encoder can wind down instead of blocking on
+                                    // a channel nobody reads.
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "pack generation failed after the response was already framed"
+                            );
+                        }
+                    }
+                });
+                pack_data = ReceiverStream::new(pack_rx);
             }
             add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
         } else {

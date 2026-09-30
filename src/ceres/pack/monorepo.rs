@@ -98,6 +98,42 @@ fn trunk_align_finalize_err(err: MegaError) -> MegaError {
     MegaError::Other(inner.to_owned())
 }
 
+/// Start pack encoding and hand back the pack byte stream, with a watcher bound to
+/// the encoder task.
+///
+/// Why call sites cannot just do `encoder.encode_async(rx).await?`: that runs the
+/// encoder in a SPAWNED task, and git-internal's `send_data` is
+/// `sender.send(data).await.unwrap()`. A client that goes away mid-pack (idle
+/// timeout, ^C, dropped clone) makes that send fail, which **panics** the task.
+/// Every call site here used to discard the returned `JoinHandle`, so the panic
+/// vanished into a detached task while the client silently got a truncated pack
+/// and the log said nothing. The HTTP status is already committed once the pack is
+/// streaming, so this cannot change the response — it exists so the failure is
+/// diagnosable instead of invisible.
+async fn spawn_pack_encoder(
+    encoder: PackEncoder,
+    entry_rx: mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
+    stream_rx: mpsc::Receiver<Vec<u8>>,
+    repo_path: &std::path::Path,
+) -> Result<ReceiverStream<Vec<u8>>, MegaError> {
+    let handle = encoder
+        .encode_async(entry_rx)
+        .await
+        .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
+    let repo = repo_path.display().to_string();
+    tokio::spawn(async move {
+        if let Err(join_err) = handle.await {
+            tracing::error!(
+                repo = %repo,
+                panicked = join_err.is_panic(),
+                error = %join_err,
+                "pack encoder task ended abnormally; the client's pack is truncated"
+            );
+        }
+    });
+    Ok(ReceiverStream::new(stream_rx))
+}
+
 #[async_trait]
 impl RepoHandler for Monorepo {
     fn is_monorepo(&self) -> bool {
@@ -110,6 +146,14 @@ impl RepoHandler for Monorepo {
 
     fn save_entry_concurrency(&self) -> usize {
         self.storage.config().pack.save_entry_concurrency
+    }
+
+    /// Object-store read width while gathering pack blobs. Sourced from config
+    /// because the historical hardcoded 16 was the dominant term in clone wall
+    /// time: a full clone moves ~550k blobs, so 16-way concurrency turns it into
+    /// ~34k sequential batches.
+    fn blob_fetch_concurrency(&self) -> usize {
+        self.storage.config().pack.blob_fetch_concurrency
     }
 
     fn sync_commands_after_unpack(&self, commands: &[RefCommand]) {
@@ -340,10 +384,7 @@ impl RepoHandler for Monorepo {
             0,
             stream_tx,
         );
-        encoder
-            .encode_async(entry_rx)
-            .await
-            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
+        let pack_stream = spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.path).await?;
 
         // Two commits may share one tree (e.g. net-zero roll-ups); every
         // object must appear exactly once in the pack.
@@ -366,7 +407,7 @@ impl RepoHandler for Monorepo {
         }
         drop(entry_tx);
 
-        Ok((ReceiverStream::new(stream_rx), shallow_commits))
+        Ok((pack_stream, shallow_commits))
     }
 
     fn supports_filtered_fetch(&self) -> bool {
@@ -469,10 +510,7 @@ impl RepoHandler for Monorepo {
             0,
             stream_tx,
         );
-        encoder
-            .encode_async(entry_rx)
-            .await
-            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
+        let pack_stream = spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.path).await?;
 
         for c in want_commits {
             self.traverse_trees_only(
@@ -491,7 +529,7 @@ impl RepoHandler for Monorepo {
         }
         drop(entry_tx);
 
-        Ok(ReceiverStream::new(stream_rx))
+        Ok(pack_stream)
     }
 
     async fn incremental_pack(
@@ -588,10 +626,7 @@ impl RepoHandler for Monorepo {
             0,
             stream_tx,
         );
-        encoder
-            .encode_async(entry_rx)
-            .await
-            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
+        let pack_stream = spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.path).await?;
         // todo: For now, send metadata only for blob objects.
         // Two want commits may share one tree (e.g. server-synthesized roll-up
         // history); every object must appear exactly once in the pack.
@@ -614,19 +649,69 @@ impl RepoHandler for Monorepo {
         }
         drop(entry_tx);
 
-        Ok(ReceiverStream::new(stream_rx))
+        Ok(pack_stream)
     }
 
+    /// Tree reads for the pack walk, routed through the shared Redis object cache.
+    ///
+    /// Tree oids are content addresses, so a cached entry can never be stale — the
+    /// key changes whenever the content does. That is exactly the invalidation
+    /// behaviour this path needs, and it is why no TTL tuning or explicit
+    /// invalidation is required: a new commit produces new tree oids for the
+    /// subtrees it changed and reuses the old oids verbatim for the rest, so
+    /// unchanged subtrees keep hitting their existing entries while only the
+    /// changed spine is recomputed.
+    ///
+    /// This is the read the traversal hammers hardest: `traverse` calls it once per
+    /// directory and `traverse_for_count` calls it again for the same directories,
+    /// and before this every one of those was a DB round trip on every clone.
+    ///
+    /// The existing single-object [`GitObjectCache::get_tree`] is reused rather than
+    /// adding a batch API, so the proven miss/fetch/write-back path — including its
+    /// corrupt-entry eviction — stays the only thing that has to be correct.
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError> {
-        Ok(self
-            .storage
-            .mono_storage()
-            .get_trees_by_hashes(hashes)
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Trees are read from Postgres, not from the object store, so this is its
+        // own width rather than `blob_fetch_concurrency`.
+        const TREE_FETCH_CONCURRENCY: usize = 32;
+
+        let hash_kind = self.object_hash_kind()?;
+        let cache = self.git_object_cache.clone();
+        let storage = self.storage.clone();
+
+        stream::iter(hashes)
+            .map(|hash| {
+                let cache = cache.clone();
+                let storage = storage.clone();
+                async move {
+                    let oid = ObjectHash::from_hex_for_kind(hash_kind, &hash)
+                        .map_err(|e| MegaError::Other(format!("bad tree oid {hash}: {e}")))?;
+                    let tree = cache
+                        .get_tree(oid, |oid| {
+                            let storage = storage.clone();
+                            async move {
+                                storage
+                                    .mono_storage()
+                                    .get_trees_by_hashes(vec![oid.to_string()])
+                                    .await?
+                                    .into_iter()
+                                    .next()
+                                    .map(Tree::from_mega_model)
+                                    .ok_or_else(|| {
+                                        MegaError::Other(format!("tree {oid} not found"))
+                                    })
+                            }
+                        })
+                        .await?;
+                    Ok::<Tree, MegaError>(Arc::unwrap_or_clone(tree))
+                }
+            })
+            .buffer_unordered(TREE_FETCH_CONCURRENCY)
+            .try_collect::<Vec<_>>()
             .await
-            .unwrap()
-            .into_iter()
-            .map(Tree::from_mega_model)
-            .collect())
     }
 
     async fn get_blobs_by_hashes(
@@ -792,10 +877,9 @@ impl Monorepo {
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
         let encoder =
             PackEncoder::new_with_hash_kind(self.object_hash_kind()?, obj_num, 0, stream_tx);
-        encoder
-            .encode_async(entry_rx)
+        let pack_stream = spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.path)
             .await
-            .map_err(|e| GitError::CustomError(format!("pack encode failed: {e}")))?;
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
 
         for tree_model in tree_models {
             entry_tx
@@ -809,8 +893,13 @@ impl Monorepo {
 
         let default_meta = EntryMeta::default();
         let blobs = self.storage.git_service.get_objects_stream(blob_hashes);
+        // Same configurable width as `RepoHandler::traverse`; this fallback path
+        // (taken only when the wanted commits are unknown to the server) shares the
+        // same object-store bottleneck.
+        let configured = self.blob_fetch_concurrency();
+        let concurrency = (configured != 0).then_some(configured);
         blobs
-            .try_for_each_concurrent(16, |(_, stream, _)| {
+            .try_for_each_concurrent(concurrency, |(_, stream, _)| {
                 let entry_tx = entry_tx.clone();
                 let blob_meta = &blob_meta;
                 let default_meta = &default_meta;
@@ -841,7 +930,7 @@ impl Monorepo {
             .map_err(|e| GitError::CustomError(format!("blob stream failed: {e}")))?;
         drop(entry_tx);
 
-        Ok(ReceiverStream::new(stream_rx))
+        Ok(pack_stream)
     }
 
     /// All branch commands update CL `mega_refs` in **one** DB transaction (same idea as import’s single-txn metadata commit).
