@@ -496,6 +496,8 @@ pub trait RepoHandler: Send + Sync + 'static {
         let mut search_tree_ids = vec![];
         let mut search_blob_ids = vec![];
 
+        let tree_item_count = tree.tree_items.len();
+        let subtrees_n = tree_item_count;
         for item in &tree.tree_items {
             let hash = item.id.to_string();
             if exist_objs.insert(hash.clone()) {
@@ -508,7 +510,16 @@ pub trait RepoHandler: Send + Sync + 'static {
         }
 
         if let Some(sender) = sender {
+            // Phase timing, kept until the ~65 s clone is explained. Two rounds of
+            // "read the code, widen the obvious limit" both failed to move the total,
+            // so the next change is chosen from a measurement rather than a guess:
+            // `open` is the wait for the object store to answer, `drain` is reading
+            // the returned streams and pushing entries into the encoder.
+            let t_open = std::time::Instant::now();
             let blobs = self.get_blobs_by_hashes(search_blob_ids.clone()).await?;
+            let open_us = t_open.elapsed().as_micros();
+            let blobs_n = search_blob_ids.len();
+            let t_drain = std::time::Instant::now();
 
             // EntryMeta (pack_id / pack_offset / file_path / is_delta) is consumed in
             // exactly one place: `sort::magic_sort` reads `meta.file_path` to cluster
@@ -551,9 +562,23 @@ pub trait RepoHandler: Send + Sync + 'static {
                     }
                 })
                 .await?;
+            tracing::info!(
+                blobs = blobs_n,
+                open_ms = open_us as f64 / 1000.0,
+                drain_ms = t_drain.elapsed().as_millis() as u64,
+                concurrency = configured,
+                "traverse: blob phase"
+            );
         }
 
+        let t_trees = std::time::Instant::now();
         let trees = self.get_trees_by_hashes(search_tree_ids).await?;
+        tracing::info!(
+            items = tree_item_count,
+            subtrees = subtrees_n,
+            trees_ms = t_trees.elapsed().as_millis() as u64,
+            "traverse: tree phase"
+        );
         for t in trees {
             self.traverse(t, exist_objs, sender).await?;
         }
