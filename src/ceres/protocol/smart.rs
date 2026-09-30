@@ -135,6 +135,10 @@ impl SmartSession {
         let mut deepen_depth: Option<u32> = None;
         let mut deepen_relative = false;
         let mut shallow_commits: Vec<String> = Vec::new();
+        // `filter <spec>` from the request body (protocol v0). git sends it alongside
+        // the want lines; the parser below used to drop it in the `other` arm with an
+        // error log, which is why `--filter=blob:none` never had any effect here.
+        let mut filter_spec: Option<String> = None;
 
         let mut read_first_line = false;
         loop {
@@ -169,6 +173,24 @@ impl SmartSession {
                 b"have" => {
                     let oid = self.parse_pkt_object_id(&dst, 5, "have")?;
                     have.insert(oid);
+                }
+                b"filt" => {
+                    // "filter <spec>" — the payload after the command word.
+                    if !dst.starts_with(b"filter ") {
+                        return Err(ProtocolError::InvalidInput(
+                            "malformed filter line in upload-pack".to_owned(),
+                        ));
+                    }
+                    let spec = core::str::from_utf8(&dst[7..])
+                        .map_err(|_| {
+                            ProtocolError::InvalidInput("filter spec is not valid UTF-8".to_owned())
+                        })?
+                        .trim()
+                        .to_owned();
+                    if spec.is_empty() {
+                        return Err(ProtocolError::InvalidInput("empty filter spec".to_owned()));
+                    }
+                    filter_spec = Some(spec);
                 }
                 b"done" => break,
                 b"deep" => {
@@ -261,6 +283,33 @@ impl SmartSession {
             ));
         }
 
+        // Filter guards, mirroring the v2 path's fail-closed semantics: an unsupported
+        // spec or an unimplemented combination must be an explicit error, never a
+        // silent full pack. (Serving a full pack for a filtered request would hide a
+        // 40x transfer difference from the client.)
+        if let Some(spec) = &filter_spec {
+            if !repo_handler.supports_filtered_fetch() {
+                return Err(ProtocolError::InvalidInput(
+                    "filter is not supported for this repository".to_owned(),
+                ));
+            }
+            if deepen_depth.is_some() {
+                return Err(ProtocolError::InvalidInput(
+                    "shallow fetch with a filter is not supported".to_owned(),
+                ));
+            }
+            if !have.is_empty() {
+                return Err(ProtocolError::InvalidInput(
+                    "filtered fetch with non-empty have is not supported".to_owned(),
+                ));
+            }
+            if spec != "blob:none" {
+                return Err(ProtocolError::InvalidInput(format!(
+                    "unsupported filter spec: {spec}"
+                )));
+            }
+        }
+
         if have.is_empty() {
             if let Some(depth) = deepen_depth {
                 // Shallow deliberately keeps the synchronous call: its `shallow`
@@ -275,6 +324,38 @@ impl SmartSession {
                     })?;
                 pack_data = stream;
                 shallow_commits = shallows;
+            } else if let Some(spec) = filter_spec.clone() {
+                // blob:none clone: trees and commits only, no blob content. Same
+                // channel pattern as the plain clone below — NAK first, generation
+                // behind the bridge — because a filtered walk still takes seconds and
+                // the client should not be staring at a dead connection meanwhile.
+                //
+                // This is the v0 counterpart of `filtered_pack`'s v2 wiring. The point
+                // of wiring it is `libra clone --no-checkout --filter=blob:none`: the
+                // index needs paths and oids (both live in the trees), and file content
+                // reaches the workspace through the MST/2 snapshot instead, so shipping
+                // every historical blob was pure waste — 450k objects where ~10k do the
+                // job on this fixture.
+                let (pack_tx, pack_rx) = mpsc::channel(PACK_BRIDGE_CHANNEL);
+                let handler = repo_handler.clone();
+                tokio::spawn(async move {
+                    match handler.filtered_pack(want, Vec::new(), &spec).await {
+                        Ok(mut stream) => {
+                            while let Some(chunk) = stream.next().await {
+                                if pack_tx.send(chunk).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "filtered pack generation failed after the response was already framed"
+                            );
+                        }
+                    }
+                });
+                pack_data = ReceiverStream::new(pack_rx);
             } else {
                 // A plain clone: NAK does not depend on the pack (it only says
                 // "no common commits", which is already known from an empty `have`),
