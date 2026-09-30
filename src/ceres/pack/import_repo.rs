@@ -166,8 +166,17 @@ impl RepoHandler for ImportRepo {
                 .map_err(|e| GitError::CustomError(e.to_string()))?;
 
         let repo_id = self.repo.repo_id;
+        let blob_fetch_concurrency = self.blob_fetch_concurrency();
         tokio::spawn(async move {
-            if let Err(e) = process_objects(repo_id, git_service, storage, entry_tx).await {
+            if let Err(e) = process_objects(
+                repo_id,
+                git_service,
+                storage,
+                entry_tx,
+                blob_fetch_concurrency,
+            )
+            .await
+            {
                 tracing::error!(?e, "process_blobs failed");
             }
         });
@@ -317,7 +326,10 @@ impl RepoHandler for ImportRepo {
         &self,
         hashes: Vec<String>,
     ) -> Result<MultiObjectByteStream<'_>, MegaError> {
-        Ok(self.storage.git_service.get_objects_stream(hashes))
+        Ok(self
+            .storage
+            .git_service
+            .get_objects_stream(hashes, self.blob_fetch_concurrency()))
     }
 
     async fn get_blob_metadata_by_hashes(
@@ -665,6 +677,7 @@ async fn process_objects(
     git_service: GitService,
     storage: GitDbStorage,
     entry_tx: Sender<MetaAttached<Entry, EntryMeta>>,
+    blob_fetch_concurrency: usize,
 ) -> Result<(), MegaError> {
     let mut commit_stream = storage.get_commits_by_repo_id(repo_id).await?;
 
@@ -708,10 +721,14 @@ async fn process_objects(
         }
     }
 
+    // Same 0-means-unbounded convention as the rest of the pack path: 0 is passed
+    // through to both callees, which each interpret it as "no limit". They take
+    // different shapes because `get_objects_stream` wants a plain count while
+    // `for_each_concurrent` treats a bare `usize` as `Some(n)`.
     let entry_tx = entry_tx.clone();
     git_service
-        .get_objects_stream(bids)
-        .try_for_each_concurrent(16, |(_, stream, _)| {
+        .get_objects_stream(bids, blob_fetch_concurrency)
+        .try_for_each_concurrent(blob_fetch_concurrency, |(_, stream, _)| {
             let sender_clone = entry_tx.clone();
             async move {
                 let data = stream

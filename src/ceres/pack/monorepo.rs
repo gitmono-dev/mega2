@@ -700,7 +700,13 @@ impl RepoHandler for Monorepo {
         &self,
         hashes: Vec<String>,
     ) -> Result<MultiObjectByteStream<'_>, MegaError> {
-        Ok(self.storage.git_service.get_objects_stream(hashes))
+        // Width belongs to the fetch, not to the consumer: passing it here is what
+        // makes `blob_fetch_concurrency` affect the number of S3 reads in flight
+        // rather than only how fast an already-16-wide stream is drained.
+        Ok(self
+            .storage
+            .git_service
+            .get_objects_stream(hashes, self.blob_fetch_concurrency()))
     }
 
     async fn get_blob_metadata_by_hashes(
@@ -879,7 +885,10 @@ impl Monorepo {
         }
 
         let default_meta = EntryMeta::default();
-        let blobs = self.storage.git_service.get_objects_stream(blob_hashes);
+        let blobs = self
+            .storage
+            .git_service
+            .get_objects_stream(blob_hashes, self.blob_fetch_concurrency());
         // Same configurable width as `RepoHandler::traverse`; this fallback path
         // (taken only when the wanted commits are unknown to the server) shares the
         // same object-store bottleneck.

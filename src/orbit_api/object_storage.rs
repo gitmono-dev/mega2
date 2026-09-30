@@ -337,7 +337,9 @@ pub trait MegaObjectStorage: Send + Sync {
     ///
     /// # Parameters
     /// - `keys`: Object identifiers to fetch
-    /// - `concurrency`: Maximum number of concurrent fetches
+    /// - `concurrency`: `Some(n)` bounds in-flight fetches to `n`; `None` is unbounded.
+    ///   Callers map their own `0 = unbounded` convention to `None` — a bare `0` here
+    ///   would admit no futures at all and yield an empty stream.
     ///
     /// # Returns
     /// A stream yielding objects as they become available.
@@ -351,14 +353,21 @@ pub trait MegaObjectStorage: Send + Sync {
     /// - Bulk object export
     /// - Git blob streaming
     /// - Feeding downstream encoders or pack writers
-    fn get_many(&self, keys: Vec<ObjectKey>, concurrency: usize) -> MultiObjectByteStream<'_> {
+    fn get_many(
+        &self,
+        keys: Vec<ObjectKey>,
+        concurrency: Option<usize>,
+    ) -> MultiObjectByteStream<'_> {
+        // `usize::MAX` is the unbounded case: `buffer_unordered` then admits every
+        // future as it is produced, which is what `None` is documented to mean.
+        let width = concurrency.unwrap_or(usize::MAX);
         Box::pin(
             futures::stream::iter(keys)
                 .map(move |key| async move {
                     let (stream, meta) = self.get_stream(&key).await?;
                     Ok((key, stream, meta))
                 })
-                .buffer_unordered(concurrency),
+                .buffer_unordered(width),
         )
     }
 

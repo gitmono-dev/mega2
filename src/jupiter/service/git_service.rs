@@ -107,13 +107,31 @@ impl GitService {
         Ok(data)
     }
 
-    pub fn get_objects_stream(&self, hashes: Vec<String>) -> MultiObjectByteStream<'_> {
+    /// Stream a set of objects, fetched with `concurrency` reads in flight.
+    ///
+    /// `concurrency` is a caller decision, not a constant here: it was hardcoded to 16
+    /// and that single number dominated clone wall time. Measured on the ACK
+    /// deployment, the pack walk spends ~51 s in object fetch against ~1 s of actual
+    /// encoding, because 16-way reads across 400 directories (125 blobs each, walked
+    /// serially) serialise into thousands of round trips.
+    ///
+    /// A caller that widens its own consumer limit without widening this one gets no
+    /// benefit at all — the consumer limit only bounds how fast the already-limited
+    /// stream is drained.
+    pub fn get_objects_stream(
+        &self,
+        hashes: Vec<String>,
+        concurrency: usize,
+    ) -> MultiObjectByteStream<'_> {
         // Filter out obviously invalid object ids early to avoid spurious backend requests.
         // Callers that need strict validation should validate up-front and return 4xx.
         let hashes = hashes
             .into_iter()
             .filter(|h| is_full_hex_object_id(h))
             .collect::<Vec<_>>();
+        // `buffer_unordered(0)` admits no futures at all, so an unbounded request has
+        // to become `None` rather than `Some(0)`.
+        let concurrency = (concurrency != 0).then_some(concurrency);
         self.obj_storage.inner.get_many(
             hashes
                 .into_iter()
@@ -122,7 +140,7 @@ impl GitService {
                     key: hash,
                 })
                 .collect(),
-            16,
+            concurrency,
         )
     }
 
