@@ -537,9 +537,17 @@ pub trait RepoHandler: Send + Sync + 'static {
             // its content-signature branch and delta hit rate silently degrades.
             // Restore the query in the same change that enables the delta window.
             let meta = EntryMeta::new();
+            // The authoritative hash kind for this repo. `Blob::from_content_bytes`
+            // resolves it from a thread-local, which is not set on the async worker
+            // running this loop, so hashing has to be done explicitly here.
+            let hash_kind = self.object_hash_kind()?;
+            let hash_us = std::sync::atomic::AtomicU64::new(0);
+            let hash_calls = std::sync::atomic::AtomicU64::new(0);
             blobs
                 .try_for_each_concurrent(concurrency, |(_, stream, _)| {
                     let meta = meta.clone();
+                    let hash_us = &hash_us;
+                    let hash_calls = &hash_calls;
                     async move {
                         let data = stream
                             .try_fold(Vec::new(), |mut acc, bytes| async move {
@@ -547,7 +555,31 @@ pub trait RepoHandler: Send + Sync + 'static {
                                 Ok(acc)
                             })
                             .await?;
-                        let blob = Blob::from_content_bytes(data);
+                        // `Blob::from_content_bytes` reaches
+                        // `ObjectHash::from_type_and_data`, which builds the git header
+                        // into a scratch `Vec` and copies the ENTIRE payload into it
+                        // before hashing — so every blob is copied once more on top of
+                        // the read above. git-internal documents the replacement four
+                        // lines up: `from_type_and_data_for_kind` "streams the header
+                        // instead of copying the payload". At 550k blobs that copy is a
+                        // per-object cost that no amount of read concurrency removes,
+                        // which is exactly the shape of the drain measurement.
+                        let t = std::time::Instant::now();
+                        let id = ObjectHash::from_type_and_data_for_kind(
+                            hash_kind,
+                            git_internal::internal::object::types::ObjectType::Blob,
+                            &data,
+                        )
+                        .map_err(|e| {
+                            // The stream's error type is IoOrbitError, not MegaError.
+                            IoOrbitError::Other(format!("blob hash failed: {e}"))
+                        })?;
+                        hash_us.fetch_add(
+                            t.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        hash_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let blob = Blob { id, data };
                         sender
                             .send(MetaAttached {
                                 inner: blob.into(),
@@ -566,6 +598,8 @@ pub trait RepoHandler: Send + Sync + 'static {
                 blobs = blobs_n,
                 open_ms = open_us as f64 / 1000.0,
                 drain_ms = t_drain.elapsed().as_millis() as u64,
+                hash_ms = hash_us.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+                hash_calls = hash_calls.load(std::sync::atomic::Ordering::Relaxed),
                 concurrency = configured,
                 "traverse: blob phase"
             );
