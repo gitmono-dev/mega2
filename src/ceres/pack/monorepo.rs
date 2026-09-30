@@ -8,7 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt, stream};
 use git_internal::{
     errors::GitError,
     hash::{HashKind, ObjectHash},
@@ -96,42 +96,6 @@ fn trunk_align_finalize_err(err: MegaError) -> MegaError {
     }
     let inner = aligned.strip_prefix("Other error: ").unwrap_or(&aligned);
     MegaError::Other(inner.to_owned())
-}
-
-/// Start pack encoding and hand back the pack byte stream, with a watcher bound to
-/// the encoder task.
-///
-/// Why call sites cannot just do `encoder.encode_async(rx).await?`: that runs the
-/// encoder in a SPAWNED task, and git-internal's `send_data` is
-/// `sender.send(data).await.unwrap()`. A client that goes away mid-pack (idle
-/// timeout, ^C, dropped clone) makes that send fail, which **panics** the task.
-/// Every call site here used to discard the returned `JoinHandle`, so the panic
-/// vanished into a detached task while the client silently got a truncated pack
-/// and the log said nothing. The HTTP status is already committed once the pack is
-/// streaming, so this cannot change the response — it exists so the failure is
-/// diagnosable instead of invisible.
-async fn spawn_pack_encoder(
-    encoder: PackEncoder,
-    entry_rx: mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
-    stream_rx: mpsc::Receiver<Vec<u8>>,
-    repo_path: &std::path::Path,
-) -> Result<ReceiverStream<Vec<u8>>, MegaError> {
-    let handle = encoder
-        .encode_async(entry_rx)
-        .await
-        .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
-    let repo = repo_path.display().to_string();
-    tokio::spawn(async move {
-        if let Err(join_err) = handle.await {
-            tracing::error!(
-                repo = %repo,
-                panicked = join_err.is_panic(),
-                error = %join_err,
-                "pack encoder task ended abnormally; the client's pack is truncated"
-            );
-        }
-    });
-    Ok(ReceiverStream::new(stream_rx))
 }
 
 #[async_trait]
@@ -384,7 +348,13 @@ impl RepoHandler for Monorepo {
             0,
             stream_tx,
         );
-        let pack_stream = spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.path).await?;
+        let pack_stream = super::spawn_pack_encoder(
+            encoder,
+            entry_rx,
+            stream_rx,
+            self.path.to_str().unwrap_or("<monorepo>"),
+        )
+        .await?;
 
         // Two commits may share one tree (e.g. net-zero roll-ups); every
         // object must appear exactly once in the pack.
@@ -510,7 +480,13 @@ impl RepoHandler for Monorepo {
             0,
             stream_tx,
         );
-        let pack_stream = spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.path).await?;
+        let pack_stream = super::spawn_pack_encoder(
+            encoder,
+            entry_rx,
+            stream_rx,
+            self.path.to_str().unwrap_or("<monorepo>"),
+        )
+        .await?;
 
         for c in want_commits {
             self.traverse_trees_only(
@@ -626,7 +602,13 @@ impl RepoHandler for Monorepo {
             0,
             stream_tx,
         );
-        let pack_stream = spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.path).await?;
+        let pack_stream = super::spawn_pack_encoder(
+            encoder,
+            entry_rx,
+            stream_rx,
+            self.path.to_str().unwrap_or("<monorepo>"),
+        )
+        .await?;
         // todo: For now, send metadata only for blob objects.
         // Two want commits may share one tree (e.g. server-synthesized roll-up
         // history); every object must appear exactly once in the pack.
@@ -877,9 +859,14 @@ impl Monorepo {
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
         let encoder =
             PackEncoder::new_with_hash_kind(self.object_hash_kind()?, obj_num, 0, stream_tx);
-        let pack_stream = spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.path)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let pack_stream = super::spawn_pack_encoder(
+            encoder,
+            entry_rx,
+            stream_rx,
+            self.path.to_str().unwrap_or("<monorepo>"),
+        )
+        .await
+        .map_err(|e| GitError::CustomError(e.to_string()))?;
 
         for tree_model in tree_models {
             entry_tx

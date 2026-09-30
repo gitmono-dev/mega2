@@ -45,6 +45,43 @@ pub mod monorepo;
 pub mod push_chain;
 pub mod trunk_provenance;
 
+/// Start pack encoding and hand back the pack byte stream, with a watcher bound to
+/// the encoder task.
+///
+/// Why call sites cannot just do `encoder.encode_async(rx).await?`: that runs the
+/// encoder in a SPAWNED task, and git-internal's `send_data` is
+/// `sender.send(data).await.unwrap()`. A client that goes away mid-pack (idle
+/// timeout, ^C, dropped clone) makes that send fail, which **panics** the task.
+/// Every call site used to discard the returned `JoinHandle`, so the panic vanished
+/// into a detached task while the client silently got a truncated pack and the log
+/// said nothing. The HTTP status is already committed once the pack is streaming,
+/// so this cannot change the response — it exists so the failure is diagnosable
+/// instead of invisible.
+pub(crate) async fn spawn_pack_encoder(
+    encoder: git_internal::internal::pack::encode::PackEncoder,
+    entry_rx: tokio::sync::mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
+    stream_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    repo: &str,
+) -> Result<ReceiverStream<Vec<u8>>, MegaError> {
+    let handle = encoder
+        .encode_async(entry_rx)
+        .await
+        .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
+    // Owned so the watcher can outlive the caller's borrow of the handler.
+    let repo = repo.to_owned();
+    tokio::spawn(async move {
+        if let Err(join_err) = handle.await {
+            tracing::error!(
+                repo = %repo,
+                panicked = join_err.is_panic(),
+                error = %join_err,
+                "pack encoder task ended abnormally; the client's pack is truncated"
+            );
+        }
+    });
+    Ok(ReceiverStream::new(stream_rx))
+}
+
 #[async_trait]
 pub trait RepoHandler: Send + Sync + 'static {
     fn is_monorepo(&self) -> bool;

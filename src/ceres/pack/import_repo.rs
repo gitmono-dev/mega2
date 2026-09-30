@@ -160,7 +160,10 @@ impl RepoHandler for ImportRepo {
         let total = storage.get_obj_count_by_repo_id(self.repo.repo_id).await;
         let encoder =
             PackEncoder::new_with_hash_kind(self.object_hash_kind()?, total, 0, stream_tx);
-        encoder.encode_async(entry_rx).await?;
+        let pack_stream =
+            super::spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.repo.repo_id.to_string())
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
 
         let repo_id = self.repo.repo_id;
         tokio::spawn(async move {
@@ -169,7 +172,7 @@ impl RepoHandler for ImportRepo {
             }
         });
 
-        Ok(ReceiverStream::new(stream_rx))
+        Ok(pack_stream)
     }
 
     async fn incremental_pack(
@@ -270,10 +273,9 @@ impl RepoHandler for ImportRepo {
             0,
             stream_tx,
         );
-        encoder
-            .encode_async(entry_rx)
-            .await
-            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
+        let pack_stream =
+            super::spawn_pack_encoder(encoder, entry_rx, stream_rx, &self.repo.repo_id.to_string())
+                .await?;
 
         // Every object must appear exactly once in the pack; two want commits
         // may share one tree.
@@ -296,7 +298,7 @@ impl RepoHandler for ImportRepo {
         }
         drop(entry_tx);
 
-        Ok(ReceiverStream::new(stream_rx))
+        Ok(pack_stream)
     }
 
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError> {
