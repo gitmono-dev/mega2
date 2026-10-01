@@ -2,6 +2,7 @@
 name = "mega2"
 version = "0.40.15"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 # Two [[bin]] targets exist; keep `cargo run -p mega2` unambiguous.
 default-run = "mega2"
 
