@@ -140,6 +140,16 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profil
 
 容器内的环回中继让 `127.0.0.1:9000`（HTTP）、`127.0.0.1:2222`（SSH）、`127.0.0.1:29000`（RustFS）与宿主机地址一致。
 
+opt-in case（需要切换 mega2 配置的 case）一律经宿主侧 helper 运行，helper 用 `trap` 保证无论成败都把 mega2 恢复为默认配置并比对 compose config hash：
+
+```bash
+scripts/bb_optin_run.sh <none|gc|local> <script> '<case>' target/tmp/<log>
+scripts/bb_optin_run.sh --selftest local target/tmp/<log>   # 自测：桩命令退出 1
+```
+
+- `scripts/bb_optin_run.sh` 退出码 0：case 通过，且 mega2 已恢复默认配置（log 含 `bb-optin: restored mega2 (config hash match)`）。
+- `scripts/bb_optin_run.sh` 退出码 1：case 失败，且 mega2 已恢复默认配置。
+
 ### 8.1 Compose 黑盒 Git 协议 smoke（`git` 客户端）
 
 Trunk / storage-only 协议冒烟使用 **`scripts/git_protocol_smoke_storage_only.sh`**，经 compose `--profile smoke` 的 `git-smoke` 容器内真实 **`git` / `git-lfs` / `ssh`** 调用已发布端口。这是 **compose 黑盒**，与 cargo `CARGO_BIN_EXE` 黑盒分层并存；**不要**用 `libra` 作协议客户端，也**不要**在 trunk 上跑 review/CL 语义的 `scripts/git_protocol_smoke.sh`。
