@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1
+# Interop black-box smoke runner for the storage-only compose stack
+# (docs/plan/plan-20261001.md, ADR-BB-02).
+#
+# Stage `base` (BB-01): pinned debian:trixie-slim (glibc 2.41; the official
+# libra Linux binary needs glibc >= 2.39) plus the client toolchain used by the OCI,
+# Artifacts and Libra smoke scripts. The git-lfs and oras archives are pinned
+# by version and sha256 (a digest mismatch fails the build); Debian packages
+# come from the pinned base image's apt sources.
+#
+# Build context = mega2 repo root:
+#   docker build -f Dockerfile.interop-smoke --target base -t mega2-interop-smoke:base .
+
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS base
+
+ARG TARGETARCH
+ARG GIT_LFS_VERSION=3.8.0
+ARG ORAS_VERSION=1.3.4
+# Pinned official SHA-256 digests per architecture. GIT_LFS_SHA256 / ORAS_SHA256
+# default to the digest for the build architecture; passing a value overrides
+# it (used by the checksum failure-path tests).
+ARG GIT_LFS_SHA256_AMD64=e455e00f15d9b95661b8d53498ffb0c3367962cf1ec73c31ab7369516cd6ab8d
+ARG GIT_LFS_SHA256_ARM64=ac9c8efac980bb0505ead384d087e2acb6486fd8498691a2165fa174ec6118c2
+ARG ORAS_SHA256_AMD64=f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
+ARG ORAS_SHA256_ARM64=15702c6e3a4a56a8bd8ac5c17efdbcab56d9bada661ccbcf017f5b10c1d89399
+ARG GIT_LFS_SHA256=""
+ARG ORAS_SHA256=""
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        bash ca-certificates curl git jq openssh-client openssl ripgrep shellcheck socat; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    arch="${TARGETARCH:-$(uname -m)}"; \
+    case "$arch" in \
+        amd64|x86_64) arch=amd64; default_sha="$GIT_LFS_SHA256_AMD64" ;; \
+        arm64|aarch64) arch=arm64; default_sha="$GIT_LFS_SHA256_ARM64" ;; \
+        *) echo "unsupported git-lfs architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    GIT_LFS_SHA256="${GIT_LFS_SHA256:-$default_sha}"; \
+    archive="git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz"; \
+    curl -fsSL -o "/tmp/$archive" "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/$archive"; \
+    echo "${GIT_LFS_SHA256}  /tmp/$archive" | sha256sum -c -; \
+    tar -xzf "/tmp/$archive" -C /tmp; \
+    install -m 0755 "/tmp/git-lfs-${GIT_LFS_VERSION}/git-lfs" /usr/local/bin/git-lfs; \
+    rm -rf "/tmp/$archive" "/tmp/git-lfs-${GIT_LFS_VERSION}"; \
+    test "$(git lfs version | cut -d' ' -f1)" = "git-lfs/${GIT_LFS_VERSION}"
+
+RUN set -eux; \
+    arch="${TARGETARCH:-$(uname -m)}"; \
+    case "$arch" in \
+        amd64|x86_64) arch=amd64; default_sha="$ORAS_SHA256_AMD64" ;; \
+        arm64|aarch64) arch=arm64; default_sha="$ORAS_SHA256_ARM64" ;; \
+        *) echo "unsupported oras architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    ORAS_SHA256="${ORAS_SHA256:-$default_sha}"; \
+    archive="oras_${ORAS_VERSION}_linux_${arch}.tar.gz"; \
+    curl -fsSL -o "/tmp/$archive" "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/$archive"; \
+    echo "${ORAS_SHA256}  /tmp/$archive" | sha256sum -c -; \
+    tar -xzf "/tmp/$archive" -C /usr/local/bin oras; \
+    chmod 0755 /usr/local/bin/oras; \
+    rm -f "/tmp/$archive"; \
+    oras version | grep -q "Version:[[:space:]]*${ORAS_VERSION}"
+
+COPY <<'EOF' /usr/local/bin/interop-smoke-selfcheck
+#!/usr/bin/env bash
+# Verifies every client tool the interop smoke scripts rely on is executable.
+set -u
+missing=0
+for tool in bash curl git git-lfs jq ssh ssh-keyscan openssl rg shellcheck socat oras; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "interop-smoke-selfcheck: missing $tool" >&2
+        missing=1
+    fi
+done
+if [ "$missing" -ne 0 ]; then
+    exit 1
+fi
+echo "interop-smoke-selfcheck: ok"
+EOF
+
+RUN chmod 0755 /usr/local/bin/interop-smoke-selfcheck \
+    && useradd -m -u 1000 -s /bin/bash interop
+
+# Default: stay up for `docker compose exec`. A plain `docker run IMAGE CMD`
+# overrides this (used by the verification commands).
+CMD ["sleep", "infinity"]
