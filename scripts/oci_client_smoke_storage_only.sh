@@ -167,9 +167,37 @@ case_oci_chunked_upload() {
     [ "$(oci_header "$d/h4" docker-content-digest)" = "$dg" ] || { echo "Docker-Content-Digest mismatch" >&2; return 1; }
 }
 
+# oci_put_blob <repo> <file>: monolithic upload, prints the HTTP status.
+oci_put_blob() {
+    oci_curl -u "bb:$TOKEN" -X POST -o /dev/null -w '%{http_code}' \
+        -H 'Content-Type: application/octet-stream' --data-binary @"$2" \
+        "$MEGA2_BASE_URL/v2/$1/blobs/uploads/?digest=$(oci_digest "$2")"
+}
+
+# --- BB-15 OCI cross-repo blob mount ------------------------------------
+case_oci_cross_repo_mount() {
+    local d="$WORK/mount" src="bb-$RUN_ID/mount-src" dst="bb-$RUN_ID/mount-dst" code dg
+    oci_case_begin
+    mkdir -p "$d"
+    head -c 512 /dev/urandom > "$d/blob"
+    dg=$(oci_digest "$d/blob")
+    code=$(oci_put_blob "$src" "$d/blob")
+    [ "$code" = 201 ] || { echo "source upload returned $code" >&2; return 1; }
+    code=$(oci_curl -u "bb:$TOKEN" -X POST -o /dev/null -w '%{http_code}' \
+        "$MEGA2_BASE_URL/v2/$dst/blobs/uploads/?mount=$dg&from=$src")
+    [ "$code" = 201 ] || { echo "mount from a source holding the blob returned $code" >&2; return 1; }
+    code=$(oci_curl -I -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/$dst/blobs/$dg")
+    [ "$code" = 200 ] || { echo "HEAD of the mounted blob returned $code" >&2; return 1; }
+    code=$(oci_curl -u "bb:$TOKEN" -X POST -D "$d/h" -o /dev/null -w '%{http_code}' \
+        "$MEGA2_BASE_URL/v2/$dst/blobs/uploads/?mount=$dg&from=bb-$RUN_ID/mount-empty")
+    [ "$code" = 202 ] || { echo "mount from a source without the blob returned $code" >&2; return 1; }
+    [ -n "$(oci_header "$d/h" docker-upload-uuid)" ] || { echo "fallback session without Docker-Upload-UUID" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
 run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
 run_case "OCI chunked blob upload" case_oci_chunked_upload
+run_case "OCI cross-repo blob mount" case_oci_cross_repo_mount
 
 finish
