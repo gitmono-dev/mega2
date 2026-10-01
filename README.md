@@ -1,12 +1,32 @@
-# mega2
+# Mega2: Monorepo Engine and Git Server for AI Agents
+
+> An open-source, trunk-based monorepo storage and Git hosting server written in Rust, with Git Smart HTTP, Git LFS, an OCI container registry, build-artifact storage, and Agent Session Capture.
 
 English · [中文](README.zh.md)
+
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Docker Image](https://img.shields.io/badge/docker-genedna%2Fmega2-2496ED.svg)](https://hub.docker.com/r/genedna/mega2)
 
 The first-generation [Mega](https://github.com/web3infra-foundation/mega) established the foundation for our monorepo and Git-hosting platform. **Mega2 is the second-generation engine built for AI agents**, with two core capabilities: a **Monorepo engine** and **Agent Session Capture**.
 
 The open-source edition of Mega2 runs in **trunk / storage-only** mode and does not include a Web UI or Change List. Mega2 provides the server-side monorepo storage and APIs; Libra provides a terminal interface for interactive browsing.
 
 Start with the [Quick Start](docs/quick-start.md), then see the [documentation index](docs/README.md) for user, operator, and contributor guides. Repository and push behavior is covered in the [User Guide](docs/user-guide.md); contribution checks are in the [Contributing Guide](docs/contributing.md).
+
+## At a glance
+
+| Item | Details |
+|---|---|
+| What it is | Monorepo engine and Git hosting server for AI agents |
+| Language | Rust (edition 2024), a single Cargo package `mega2` |
+| Mode | Trunk / storage-only: `refs/heads/main` is the public trunk |
+| Protocols and interfaces | Git Smart HTTP, read-only SSH, Git LFS, OCI Distribution (`/v2`), HTTP API |
+| API docs | OpenAPI: `/api/openapi.json`; Swagger UI: `/swagger-ui` |
+| Storage | Postgres for metadata; local filesystem or S3-compatible object storage for Git objects, LFS, artifacts, and images |
+| Image | Docker Hub [`genedna/mega2`](https://hub.docker.com/r/genedna/mega2), default HTTP port `9000` |
+| Not included | Web UI, Change List, multi-branch monorepo workflows |
+| Companion tools | [Libra](https://libra.tools) (agent-side version control and terminal browser), [ScorpioFS](https://github.com/gitmono-dev/scorpiofs) (monorepo filesystem mount) |
+| License | MIT OR Apache-2.0 |
 
 ## Recommended Agent setup
 
@@ -39,7 +59,7 @@ Agent Session Capture is an optional HTTP capability, separate from Git push. Wh
 
 ## Quick start with Compose
 
-The evaluation stack pulls the official release image from Docker Hub (`genedna/mega2:latest`) — no source build, no bootstrap. Pick the compose file for your platform (they differ in how artifact presigned URLs are made reachable from the host — see [`docs/deployment.md`](docs/deployment.md)):
+The evaluation stack pulls the official release image from Docker Hub (`genedna/mega2:latest`) — no source build, no bootstrap. Pick the compose file for your platform (they differ in how artifact presigned URLs are made reachable from the host — see the [Deployment Guide](docs/deployment.md)):
 
 ```bash
 # macOS with OrbStack
@@ -48,7 +68,7 @@ docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
 docker compose -f linux-mega2-compose.yml up -d --wait
 ```
 
-HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see the [Deployment Guide](docs/deployment.md). Start with the [`Quick Start`](docs/quick-start.md); for migration, LFS, OCI, and artifact examples, see [`Usage Recipes`](docs/recipes.md).
+HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see the [Deployment Guide](docs/deployment.md) and [`docs/deploy-trunk.md`](docs/deploy-trunk.md). Start and push with the [Quick Start](docs/quick-start.md), then see [Usage Recipes](docs/recipes.md) for repository migration, LFS, OCI, and build-artifact examples.
 
 For local development and tests, see the [Contributing Guide](docs/contributing.md).
 
@@ -78,7 +98,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 source .env.test && cargo test --all
 ```
 
-Details: [`AGENTS.md`](AGENTS.md) and the [Contributing Guide](docs/contributing.md).
+Details: [`AGENTS.md`](AGENTS.md), the [Contributing Guide](docs/contributing.md), and [`docs/plan/README.md`](docs/plan/README.md).
 
 ## Documentation
 
@@ -91,3 +111,14 @@ Details: [`AGENTS.md`](AGENTS.md) and the [Contributing Guide](docs/contributing
 | [`docs/contributing.md`](docs/contributing.md) | Local development, contribution process, code conventions, and integration tests |
 
 Configuration, deployment, architecture, and subsystem references are linked from the [documentation index](docs/README.md).
+
+## License
+
+Mega2 is dual-licensed under MIT and Apache-2.0 (`MIT OR Apache-2.0`); you may choose either license:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License 2.0](LICENSE-APACHE)
+
+Third-party code copied directly into this repository, if any, is declared in [`LICENSE-THIRD-PARTY`](LICENSE-THIRD-PARTY).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project, as defined in the Apache-2.0 license, shall be dual-licensed as above, without any additional terms or conditions.

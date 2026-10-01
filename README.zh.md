@@ -1,12 +1,32 @@
-# mega2
+# Mega2：面向 AI Agent 的 Monorepo 引擎与 Git 托管服务
+
+> 用 Rust 编写的开源 trunk-based monorepo 存储与 Git 托管服务端，支持 Git Smart HTTP、Git LFS、OCI 镜像仓库、构建产物存储和 Agent 会话捕获（Agent Session Capture）。
 
 [English](README.md) · 中文
+
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
+[![Docker Image](https://img.shields.io/badge/docker-genedna%2Fmega2-2496ED.svg)](https://hub.docker.com/r/genedna/mega2)
 
 第一代 [Mega](https://github.com/web3infra-foundation/mega) 奠定了 monorepo 与 Git 托管平台的基础。**Mega2 是面向 Agent 的第二代引擎**，以 **Monorepo 引擎**和 **Agent Session Capture（Agent 会话捕获）**为两项核心能力。
 
 Mega2 开源版以 **trunk / storage-only** 模式运行，不提供 Web UI 或 Change List。它负责服务端的 monorepo 存储与 API；交互式浏览可使用 Libra 提供的终端命令。
 
 从[快速开始](docs/quick-start.zh.md)启动本地实例，再到[文档索引](docs/README.zh.md)查找用户、运维和开发指南。仓库与推送规则见[使用指南](docs/user-guide.zh.md)；贡献流程与检查要求见[贡献指南](docs/contributing.zh.md)。
+
+## 项目概览
+
+| 项目 | 说明 |
+|---|---|
+| 定位 | 面向 AI Agent 的 monorepo 引擎与 Git 托管服务端 |
+| 语言 | Rust（edition 2024），单个 Cargo 包 `mega2` |
+| 运行模式 | trunk / storage-only：公开主干为 `refs/heads/main` |
+| 协议与接口 | Git Smart HTTP、只读 SSH、Git LFS、OCI Distribution（`/v2`）、HTTP API |
+| API 文档 | OpenAPI：`/api/openapi.json`；Swagger UI：`/swagger-ui` |
+| 存储 | Postgres 保存元数据；本地文件系统或 S3-compatible 对象存储保存 Git 对象、LFS、产物和镜像 |
+| 镜像 | Docker Hub [`genedna/mega2`](https://hub.docker.com/r/genedna/mega2)，默认 HTTP 端口 `9000` |
+| 不包含 | Web UI、Change List、多分支 monorepo 工作流 |
+| 配套工具 | [Libra](https://libra.tools)（Agent 侧版本控制与终端浏览器）、[ScorpioFS](https://github.com/gitmono-dev/scorpiofs)（monorepo 文件系统挂载） |
+| 许可证 | MIT OR Apache-2.0 |
 
 ## 面向 Agent 的推荐组合
 
@@ -39,7 +59,7 @@ Agent Session Capture 是独立于 Git push 的可选 HTTP 能力。在 storage-
 
 ## 用 Compose 快速启动
 
-评估栈直接从 Docker Hub 拉取正式发布镜像（`genedna/mega2:latest`），不构建源码、不需要 bootstrap。按平台选择 compose 文件（两者让 artifact 预签名 URL 对宿主机可达的方式不同，见 [`docs/deployment.zh.md`](docs/deployment.zh.md)）：
+评估栈直接从 Docker Hub 拉取正式发布镜像（`genedna/mega2:latest`），不构建源码、不需要 bootstrap。按平台选择 compose 文件（两者让 artifact 预签名 URL 对宿主机可达的方式不同，见[部署指南](docs/deployment.zh.md)）：
 
 ```bash
 # macOS + OrbStack
@@ -48,7 +68,7 @@ docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
 docker compose -f linux-mega2-compose.yml up -d --wait
 ```
 
-HTTP：`http://127.0.0.1:9000/`。这是仅限本机的匿名设置（`push_auth=none`，绑定 `127.0.0.1`）；token 鉴权或共享部署见 [`docs/deployment.zh.md`](docs/deployment.zh.md) 与 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。先按[快速开始](docs/quick-start.zh.md)启动并推送，再查看[进阶使用场景](docs/recipes.zh.md)中的仓库迁移、LFS、OCI 和构建产物示例。
+HTTP：`http://127.0.0.1:9000/`。这是仅限本机的匿名设置（`push_auth=none`，绑定 `127.0.0.1`）；token 鉴权或共享部署见[部署指南](docs/deployment.zh.md)与 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。先按[快速开始](docs/quick-start.zh.md)启动并推送，再查看[进阶使用场景](docs/recipes.zh.md)中的仓库迁移、LFS、OCI 和构建产物示例。
 
 本地开发与测试见[贡献指南](docs/contributing.zh.md)。
 
@@ -78,7 +98,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 source .env.test && cargo test --all
 ```
 
-细节见 [`AGENTS.md`](AGENTS.md) 与 [`docs/plan/README.md`](docs/plan/README.md)。
+细节见 [`AGENTS.md`](AGENTS.md)、[贡献指南](docs/contributing.zh.md)与 [`docs/plan/README.md`](docs/plan/README.md)。
 
 ## 文档
 
@@ -91,3 +111,14 @@ source .env.test && cargo test --all
 | [`docs/contributing.zh.md`](docs/contributing.zh.md) | 本地开发、贡献流程、代码约定与集成测试 |
 
 配置、部署、架构和子系统参考文档见[文档索引](docs/README.zh.md)。
+
+## 许可证
+
+Mega2 采用 MIT 与 Apache-2.0 双许可证（`MIT OR Apache-2.0`），使用者可任选其一：
+
+- [MIT 许可证](LICENSE-MIT)
+- [Apache 许可证 2.0](LICENSE-APACHE)
+
+直接复制进本仓库的第三方代码（如有）在 [`LICENSE-THIRD-PARTY`](LICENSE-THIRD-PARTY) 中声明。
+
+除非另有明确说明，你有意提交并纳入本项目的任何贡献，按照 Apache-2.0 许可证的定义，均按上述双许可证授权，不附加任何其他条款或条件。
