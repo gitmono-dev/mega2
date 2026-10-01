@@ -19,7 +19,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "oci client"
-require_tools curl jq oras sha256sum mktemp date rm perl awk tr timeout rg grep
+require_tools curl jq oras sha256sum mktemp date rm perl awk tr timeout rg grep head tail cut
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
@@ -125,8 +125,51 @@ case_oci_reject_unauth_push() {
     [ "$(jq -r '.errors[0].code' "$dir/tags.json")" = NAME_UNKNOWN ] || { echo "tags/list error code is not NAME_UNKNOWN" >&2; return 1; }
 }
 
+# --- OCI helpers (introduced with BB-14) --------------------------------
+# oci_abs <location>: absolute URL for a Location header value. Only paths
+# under this registry's /v2/ are accepted, so the push token is never sent
+# to another origin.
+oci_abs() {
+    case "$1" in
+        /v2/*) printf '%s%s' "$MEGA2_BASE_URL" "$1" ;;
+        "$MEGA2_BASE_URL"/v2/*) printf '%s' "$1" ;;
+        *) echo "refusing a Location outside $MEGA2_BASE_URL/v2/ (value not shown)" >&2; return 1 ;;
+    esac
+}
+oci_digest() { printf 'sha256:%s' "$(sha256sum < "$1" | cut -d' ' -f1)"; }
+
+# --- BB-14 OCI chunked blob upload --------------------------------------
+case_oci_chunked_upload() {
+    local d="$WORK/chunked" repo="bb-$RUN_ID/chunked" code loc dg
+    oci_case_begin
+    mkdir -p "$d"
+    head -c 3000 /dev/urandom > "$d/blob"
+    head -c 1500 "$d/blob" > "$d/part1"
+    tail -c 1500 "$d/blob" > "$d/part2"
+    dg=$(oci_digest "$d/blob")
+    code=$(oci_curl -u "bb:$TOKEN" -X POST -D "$d/h0" -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/blobs/uploads/")
+    [ "$code" = 202 ] || { echo "upload init returned $code" >&2; return 1; }
+    loc=$(oci_abs "$(oci_header "$d/h0" location)") || return 1
+    code=$(oci_curl -u "bb:$TOKEN" -X PATCH -D "$d/h1" -o /dev/null -w '%{http_code}' \
+        -H 'Content-Type: application/octet-stream' -H 'Content-Range: 0-1499' --data-binary @"$d/part1" "$loc")
+    [ "$code" = 202 ] || { echo "first PATCH returned $code" >&2; return 1; }
+    loc=$(oci_abs "$(oci_header "$d/h1" location)") || return 1
+    code=$(oci_curl -u "bb:$TOKEN" -X PATCH -D "$d/h2" -o /dev/null -w '%{http_code}' \
+        -H 'Content-Type: application/octet-stream' -H 'Content-Range: 1500-2999' --data-binary @"$d/part2" "$loc")
+    [ "$code" = 202 ] || { echo "second PATCH returned $code" >&2; return 1; }
+    loc=$(oci_abs "$(oci_header "$d/h2" location)") || return 1
+    code=$(oci_curl -u "bb:$TOKEN" -D "$d/h3" -o /dev/null -w '%{http_code}' "$loc")
+    [ "$code" = 204 ] || { echo "upload status GET returned $code" >&2; return 1; }
+    [ "$(oci_header "$d/h3" range)" = "0-2999" ] || { echo "status Range is '$(oci_header "$d/h3" range)'" >&2; return 1; }
+    case "$loc" in *\?*) loc="$loc&digest=$dg" ;; *) loc="$loc?digest=$dg" ;; esac
+    code=$(oci_curl -u "bb:$TOKEN" -X PUT -D "$d/h4" -o /dev/null -w '%{http_code}' "$loc")
+    [ "$code" = 201 ] || { echo "completing PUT returned $code" >&2; return 1; }
+    [ "$(oci_header "$d/h4" docker-content-digest)" = "$dg" ] || { echo "Docker-Content-Digest mismatch" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
 run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
+run_case "OCI chunked blob upload" case_oci_chunked_upload
 
 finish
