@@ -19,7 +19,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "oci client"
-require_tools curl jq oras sha256sum mktemp date rm perl awk tr
+require_tools curl jq oras sha256sum mktemp date rm perl awk tr timeout rg grep
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
@@ -38,8 +38,36 @@ code=$(curl -sS --connect-timeout 3 --max-time 5 -o /dev/null -w '%{http_code}' 
 export REGISTRY RUN_ID WORK TOKEN MEGA2_BASE_URL
 
 # --- shared OCI helpers -------------------------------------------------
-# oci_curl: curl with bounded connection and total time.
-oci_curl() { curl -sS --connect-timeout 5 --max-time 30 "$@"; }
+# Every case has one deadline (OCI_CASE_BUDGET seconds, default 60) set by
+# oci_case_begin; oci_curl and oci_t only get the time that is left.
+OCI_CASE_BUDGET="${OCI_CASE_BUDGET:-60}"
+oci_case_begin() { OCI_DEADLINE=$((SECONDS + OCI_CASE_BUDGET)); }
+oci_left() { echo $(( ${OCI_DEADLINE:-$((SECONDS + OCI_CASE_BUDGET))} - SECONDS )); }
+# oci_t <cmd...>: run a command within the remaining case budget.
+oci_t() {
+    local left
+    left=$(oci_left)
+    [ "$left" -gt 0 ] || { echo "case budget exhausted" >&2; return 124; }
+    timeout "$left" "$@"
+}
+# oci_curl: curl with a 5 s connect timeout and the remaining case budget.
+oci_curl() {
+    local left
+    left=$(oci_left)
+    [ "$left" -gt 0 ] || { echo "case budget exhausted" >&2; return 124; }
+    curl -sS --connect-timeout 5 --max-time "$left" "$@"
+}
+# oci_run <outfile> <cmd...>: run within the budget, keep stdout+stderr in
+# <outfile>, and print it redacted when the command fails.
+oci_run() {
+    local out="$1"
+    shift
+    if oci_t "$@" > "$out" 2>&1; then
+        return 0
+    fi
+    redact "$TOKEN" < "$out" >&2
+    return 1
+}
 # oci_header <file> <name>: exact value of a response header (case-insensitive name).
 oci_header() {
     awk -v n="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" \
@@ -49,6 +77,7 @@ oci_header() {
 # --- BB-11 OCI ping -----------------------------------------------------
 case_oci_ping() {
     local hdr="$WORK/ping.hdr" code
+    oci_case_begin
     code=$(oci_curl -D "$hdr" -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/")
     [ "$code" = 200 ] || { echo "anonymous GET /v2/ returned $code" >&2; return 1; }
     [ "$(oci_header "$hdr" docker-distribution-api-version)" = "registry/2.0" ] \
@@ -58,6 +87,29 @@ case_oci_ping() {
     [ -n "$(oci_header "$hdr" www-authenticate)" ] || { echo "401 without WWW-Authenticate" >&2; return 1; }
 }
 
+# --- BB-12 OCI oras push and pull ---------------------------------------
+case_oci_oras_push_pull() {
+    local dir="$WORK/oras" ref="$REGISTRY/bb-$RUN_ID/oras:v1" pushed fetched
+    oci_case_begin
+    mkdir -p "$dir/src" "$dir/out"
+    export DOCKER_CONFIG="$dir/docker"
+    printf 'bb oras one %s\n' "$RUN_ID" > "$dir/src/one.txt"
+    printf 'bb oras two %s\n' "$RUN_ID" > "$dir/src/two.txt"
+    printf '%s' "$TOKEN" | oci_run "$dir/login.out" oras login --plain-http -u bb --password-stdin "$REGISTRY"
+    (cd "$dir/src" && oci_run "$dir/push.out" oras push --plain-http "$ref" one.txt two.txt)
+    pushed=$(rg -o '^Digest: (sha256:[0-9a-f]{64})$' -r '$1' "$dir/push.out")
+    [ "$(printf '%s\n' "$pushed" | grep -c '^sha256:')" = 1 ] || { echo "push output does not hold exactly one Digest line" >&2; return 1; }
+    (cd "$dir/out" && oci_run "$dir/pull.out" oras pull --plain-http "$ref")
+    for f in one.txt two.txt; do
+        [ "$(sha256sum < "$dir/src/$f")" = "$(sha256sum < "$dir/out/$f")" ] \
+            || { echo "pulled $f differs from the pushed file" >&2; return 1; }
+    done
+    oci_run "$dir/desc.json" oras manifest fetch --plain-http --descriptor "$ref"
+    fetched=$(jq -r .digest "$dir/desc.json")
+    [ "$pushed" = "$fetched" ] || { echo "push digest $pushed != descriptor digest $fetched" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
+run_case "OCI oras push and pull" case_oci_oras_push_pull
 
 finish
