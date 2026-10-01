@@ -1,4 +1,4 @@
-# Documentation
+# Mega2 Documentation
 
 English · [中文](README.zh.md)
 
@@ -13,7 +13,7 @@ Choose a guide by task. The quick start and user guide cover day-to-day use; con
 | Capability | Description | Further reading |
 |---|---|---|
 | Monorepo engine | Hosts code trees and Git repositories. Use Git clients for clone, fetch, and push; use Libra browser for basic remote directory browsing and tag operations. | [User Guide](user-guide.md) |
-| Agent Session Capture | Optional HTTP capability for ingesting and querying Agent sessions, events, checkpoints, transcripts, and file operations. It is separate from Git push and requires explicit enablement plus an ingest token in storage-only mode. | [Agent Capture configuration and API](refactoring/agent-capture.md) · [Deployment Guide](deployment.md) |
+| Agent Session Capture | Optional HTTP capability for ingesting and querying Agent sessions, events, checkpoints, transcripts, and file operations. It is separate from Git push and requires explicit enablement plus an ingest token in storage-only mode. | [Agent Capture configuration and API](refactoring/agent-capture.md) (Chinese) · [Deployment Guide](deployment.md) |
 
 Other capabilities—including LFS, OCI, build artifacts, Vault, notifications, and configuration—are covered in [Usage Recipes](recipes.md), the [User Guide](user-guide.md), and the [Configuration Reference](configuration.md).
 
@@ -30,20 +30,21 @@ Other capabilities—including LFS, OCI, build artifacts, Vault, notifications, 
 | Task | Guide |
 |---|---|
 | Find config sources, SecretRef, hot reload, and validation behavior | [Configuration Reference](configuration.md); full settings are in [`../config/config.toml`](../config/config.toml) |
-| Deploy or harden a trunk / storage-only service | [Deployment Guide](deployment.md) |
-| Review authorization behavior or initialize the Monorepo directory layout | [Architecture Guide](architecture.md) · [Initialization Manual](manual/monorepo-init.md) |
+| Deploy or harden a trunk / storage-only service | [Deployment Guide](deployment.md); operating rules are in the [trunk deployment manual](deploy-trunk.md) (Chinese) |
+| Configure authorization or initialize the Monorepo directory layout | [Authentication and authorization manual](manual/authz.md) (Chinese) · [Architecture](architecture.md) · [Initialization Manual](manual/monorepo-init.md) |
 
 ## Development and contributions
 
 | Task | Guide |
 |---|---|
-| Build locally, run tests, and start integration-test services | [Contributing Guide](contributing.md) |
+| Build locally, run tests, and start integration-test services | [Local development and testing](development.md) (Chinese) · [Contributing Guide](contributing.md) |
 | Understand module boundaries, storage, and the write path | [Architecture](architecture.md) |
 | Prepare a change, run the required checks, or add a module | [Contributing Guide](contributing.md); repository conventions are in [`../AGENTS.md`](../AGENTS.md) |
-| Review error handling and service boundaries | [Architecture](architecture.md) |
+| Look up how error types map to HTTP status codes | [Error model](errors.md) (Chinese) · [Architecture](architecture.md) |
 
 ## Subsystem references and project records
 
-- Subsystem implementation notes and planning records are kept under `refactoring/` and `plan/`; check the current source and config for shipped behavior.
-- Product-gap analysis and follow-up records are archived under `gap/`.
-- [OOM / SIGKILL troubleshooting notes](debug-oom-kill-monitoring.md): diagnosing and monitoring terminated test processes on the author's machine.
+- [`refactoring/`](refactoring/README.md) (Chinese): contracts and implementation records for subsystems such as configuration, protocols, storage, Vault, and notifications. Some documents record how a subsystem evolved; check the current source and config for shipped behavior.
+- [`plan/`](plan/README.md) (Chinese): task cards, roadmaps, and plan templates. Plans record decisions and scheduled work, not the current implementation state.
+- [`gap/`](gap/README.md) (Chinese): competitive gap analysis and follow-up leads.
+- [OOM / SIGKILL troubleshooting notes](debug-oom-kill-monitoring.md) (Chinese): an internal troubleshooting record (not a user guide) for diagnosing and monitoring terminated test processes on the author's machine.

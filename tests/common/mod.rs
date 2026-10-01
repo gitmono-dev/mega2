@@ -1,6 +1,6 @@
 // Shared black-box test config generation (integration.md Phase 0).
 //
-// These helpers only emit TOML / copy the repo default config; they do NOT
+// These helpers only emit TOML / copy the repo review sample config; they do NOT
 // import the `mega2-core` crate, so black-box tests that drive the real
 // CLI binary via `CARGO_BIN_EXE_mega2` stay decoupled from the library.
 //
@@ -16,19 +16,19 @@ pub fn write_full_config(path: &Path) {
     // the git/SSH/LFS IT harness and seeded cedar fixtures still use the
     // stable `benjamin_747` principal. Keep IT configs aligned with those
     // fixtures without rewriting every case.
-    let text = include_str!("../../config/config.toml").replacen(
+    let text = include_str!("../../config/config-review.toml").replacen(
         r#"admin = ["mega2"]"#,
         r#"admin = ["benjamin_747"]"#,
         1,
     );
     assert!(
         text.contains(r#"admin = ["benjamin_747"]"#),
-        "IT config rewrite expected admin = [\"mega2\"] in config/config.toml"
+        "IT config rewrite expected admin = [\"mega2\"] in config/config-review.toml"
     );
     fs::write(path, text).expect("write full config");
 }
 
-/// Write the repo default config into `case_dir/config.toml` (ADR-GM-05 layout).
+/// Write the repo review sample config into `case_dir/config.toml` (ADR-GM-05 layout).
 #[allow(
     dead_code,
     reason = "SSH case layout helper; unused by vault/HTTP targets that share common/mod.rs"
@@ -40,7 +40,7 @@ pub fn write_case_config(case_dir: &Path) -> std::path::PathBuf {
     path
 }
 
-/// Write the repo default `config/config.toml`, then append extra TOML.
+/// Write the repo review sample `config/config-review.toml`, then append extra TOML.
 ///
 /// Used by GM-03 to inject a per-case `[git] anonymous_access = false` block
 /// without modifying the checked-in sample config (which has no `[git]`).
@@ -54,14 +54,14 @@ pub fn write_full_config_with_append(path: &Path, append: &str) {
         return;
     }
     // Keep the IT admin rewrite in sync with `write_full_config`.
-    let mut body = include_str!("../../config/config.toml").replacen(
+    let mut body = include_str!("../../config/config-review.toml").replacen(
         r#"admin = ["mega2"]"#,
         r#"admin = ["benjamin_747"]"#,
         1,
     );
     assert!(
         body.contains(r#"admin = ["benjamin_747"]"#),
-        "IT config rewrite expected admin = [\"mega2\"] in config/config.toml"
+        "IT config rewrite expected admin = [\"mega2\"] in config/config-review.toml"
     );
     if !body.ends_with('\n') {
         body.push('\n');

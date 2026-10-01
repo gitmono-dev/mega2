@@ -2,7 +2,7 @@
 
 本文是 `push_policy=trunk` 与 storage-only HTTP 的运维操作手册。用户可见的路径、分支、Tag 和推送规则见[使用指南](./user-guide.zh.md)；N 分流、不变式、墓碑和路径索引的设计细节见 [`refactoring/trunk-push.md`](./refactoring/trunk-push.md)。配置键以 `config/config.toml` 为准。
 
-> **范围**：不接入 mega2 用户系统、不使用 Issue / Change List、不走评审门控的存储与分发部署。默认形态仍是 `push_policy=review`；未改配置的既有部署行为不变。
+> **范围**：不接入 mega2 用户系统、不使用 Issue / Change List、不走评审门控的存储与分发部署。`push_policy` 默认为 `trunk`，`config/config.toml` 默认配置使用 `push_auth = "none"`（仅限本机或受信网络）；仍需 CL / 评审管线的部署须显式设置 `push_policy = "review"`，示例见 `config/config-review.toml`。
 
 该部署形态提供 Monorepo Git 服务；Agent Session Capture 是独立的可选 HTTP 接口，需单独启用和配置 ingest token，不会由 Git push 自动产生会话记录。配置条件与数据接口见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
 

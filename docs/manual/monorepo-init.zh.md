@@ -1,6 +1,6 @@
 [English](monorepo-init.md) · 中文
 
-# Monorepo 初始化与目录结构设置手册
+# Mega2 Monorepo 初始化与目录结构设置手册
 
 本文面向运维与开发者，说明 mega2 在 **Monorepo 初始化**时如何生成目录结构、如何通过配置定制，以及初始化后的实际产物。产品规则（单公开分支、tag 限制、ImportRepo 例外）以 [使用指南](../user-guide.zh.md) 为准，本文不重复其规则细节。
 

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use super::{
     AgentCaptureConfig, ArtifactGcConfig, BlameConfig, CedarConfig, Config, DbConfig, GitConfig,
     LFSConfig, LFSLocalConfig, LFSSshConfig, LogConfig, MonoConfig, OciConfig, PackConfig,
-    RedisConfig, StorageEventsConfig,
+    PushPolicy, RedisConfig, StorageEventsConfig,
     secret::{SecretRef, SecretResolver},
 };
 use crate::common::errors::MegaError;
@@ -169,7 +169,12 @@ impl TestConfigBuilder {
                 connect_timeout: 30,
                 sqlx_logging: false,
             },
-            monorepo: MonoConfig::default(),
+            // Fixtures built on this config exercise the review morphology
+            // (CL pipeline, OAuth push chain); trunk cases opt in explicitly.
+            monorepo: MonoConfig {
+                push_policy: PushPolicy::Review,
+                ..MonoConfig::default()
+            },
             pack: PackConfig {
                 pack_decode_mem_size: "4G".to_string(),
                 pack_decode_disk_size: "20%".to_string(),

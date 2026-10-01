@@ -1,4 +1,6 @@
-# Local sample config for mega2.
+# Review-morphology sample config for mega2 (CL pipeline + OAuth/UserStorage push chain).
+# The default morphology is trunk / storage-only; see config/config.toml.
+# This file sets push_policy = "review" explicitly and omits [git].push_auth.
 # Load order is: --config, MEGA_CONFIG, ./config/config.toml,
 # ${mega_base}/etc/config.toml, then generated default config.
 # Optional profiles use config.<profile>.toml next to the selected base config
@@ -94,11 +96,9 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 object_format = "sha1"
 
 # Push morphology: "trunk" (default, MonoWriteQueue) or "review" (CL pipeline).
-# Restart-required. Trunk fail-closed startup: cedar.enforcement must be "off",
-# no open CLs, empty non-terminal push_queue on policy change, and git.push_auth
-# must be an explicit "token" or "none" (set in [git] below). For the review
-# morphology see config/config-review.toml.
-# push_policy = "trunk"
+# Restart-required. This sample selects review with omitted push_auth
+# (existing OAuth/UserStorage chain).
+push_policy = "review"
 # Trunk-only first-parent chain bound. Review morphology keeps MAX_CL_CHAIN_COMMITS=250.
 # max_push_commits = 250
 
@@ -302,17 +302,15 @@ fail_closed = false
 enforcement = "off"
 
 # Git protocol / trunk push authentication (TP-15 config surface; authenticator is TP-19).
-# Trunk (the default push_policy) requires an explicit push_auth: "none" accepts
-# anonymous pushes and is for local / trusted networks only; use "token" with
-# [[git.push_tokens]] for shared or internet-facing deployments.
-# Omitted push_auth = OAuth/UserStorage chain (review morphology only).
+# Omitted push_auth = existing OAuth/UserStorage chain (review morphology only).
+# Explicit "token" | "none" requires monorepo.push_policy = "trunk".
 # Credentials via ${file:...} or vault://secret/config/<profile>/git/push_tokens/<name>#value.
 # SSH read (upload-pack): storage-only + anonymous_access=true → auth_none (no UserStorage key).
 # none + anonymous_access=false is fail-closed. Review never Accepts auth_none (keeps publickey push).
-[git]
-anonymous_access = true
-push_auth = "none"
-ssh_receive_pack = false
+# [git]
+# anonymous_access = true
+# push_auth = "token"
+# ssh_receive_pack = false
 # [[git.push_tokens]]
 # name = "team-foo"
 # token = "${file:/run/secrets/team_foo_token}"

@@ -1380,7 +1380,7 @@ review 形态保留 `MAX_CL_CHAIN_COMMITS = 250` 常量不动——其唯一含�
 
 ```toml
 [monorepo]
-push_policy = "review"          # "review"（默认，CL 管线）| "trunk"（直推）
+push_policy = "trunk"           # "trunk"（默认，直推）| "review"（CL 管线）
 ```
 
 登记为 `restart_required_fields`（与 `import_dir` 同，`config/reload.rs:697`）。启动期 fail-closed 校验六条：

@@ -6,6 +6,7 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 [![Docker Image](https://img.shields.io/badge/docker-genedna%2Fmega2-2496ED.svg)](https://hub.docker.com/r/genedna/mega2)
+[![Website](https://img.shields.io/badge/website-gitmega.ai-0A7BBB.svg)](https://gitmega.ai)
 
 第一代 [Mega](https://github.com/web3infra-foundation/mega) 奠定了 monorepo 与 Git 托管平台的基础。**Mega2 是面向 Agent 的第二代引擎**，以 **Monorepo 引擎**和 **Agent Session Capture（Agent 会话捕获）**为两项核心能力。
 
@@ -18,6 +19,7 @@ Mega2 开源版以 **trunk / storage-only** 模式运行，不提供 Web UI 或 
 | 项目 | 说明 |
 |---|---|
 | 定位 | 面向 AI Agent 的 monorepo 引擎与 Git 托管服务端 |
+| 主页 | [gitmega.ai](https://gitmega.ai) |
 | 语言 | Rust（edition 2024），单个 Cargo 包 `mega2` |
 | 运行模式 | trunk / storage-only：公开主干为 `refs/heads/main` |
 | 协议与接口 | Git Smart HTTP、只读 SSH、Git LFS、OCI Distribution（`/v2`）、HTTP API |
@@ -108,9 +110,12 @@ source .env.test && cargo test --all
 | [`docs/quick-start.zh.md`](docs/quick-start.zh.md) | 启动本地 Compose 栈并完成首次推送 |
 | [`docs/recipes.zh.md`](docs/recipes.zh.md) | 仓库迁移、LFS、OCI、产物和数据持久化示例 |
 | [`docs/user-guide.zh.md`](docs/user-guide.zh.md) | Git、HTTP API、Libra 和 CLI 使用说明 |
+| [`docs/configuration.zh.md`](docs/configuration.zh.md) | 配置来源、SecretRef、Profile、热加载与校验 |
+| [`docs/deployment.zh.md`](docs/deployment.zh.md) | 部署与加固 trunk / storage-only 服务 |
+| [`docs/architecture.zh.md`](docs/architecture.zh.md) | 模块边界、数据存储与写入流程 |
 | [`docs/contributing.zh.md`](docs/contributing.zh.md) | 本地开发、贡献流程、代码约定与集成测试 |
 
-配置、部署、架构和子系统参考文档见[文档索引](docs/README.zh.md)。
+子系统参考与项目记录见[文档索引](docs/README.zh.md)。
 
 ## 许可证
 

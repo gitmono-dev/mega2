@@ -20,7 +20,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY mega2.itbin /usr/local/bin/mega2
-COPY config/config.toml /etc/mega2/config.toml
+COPY config/config-review.toml /etc/mega2/config.toml
 RUN chmod 755 /usr/local/bin/mega2
 
 ENV MEGA_BASE_DIR=/var/lib/mega2 \

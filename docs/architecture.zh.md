@@ -1,6 +1,6 @@
 [English](architecture.md) · 中文
 
-# 架构设计
+# Mega2 架构设计
 
 Mega 是第一代 Monorepo 平台；mega2 是面向 Agent 的第二代引擎，核心能力是 Monorepo 引擎和可选的 Agent Session Capture。面向 Agent 的推荐实践是配合 [ScorpioFS](https://github.com/gitmono-dev/scorpiofs)（将 Monorepo 挂载为本地文件系统）与 [Libra](https://libra.tools)（Agent 版本控制工作流及终端浏览）。本文描述 mega2 的模块划分、存储分层、写入路径、认证授权与机密管理、协议面挂载、配置与热加载。事实基线是当前 checkout 的源码；代码引用以 `src/...` 内联路径标注。
 
@@ -90,7 +90,7 @@ mega2 是服务 Agent 工作流的第二代 Mega 引擎；第一代 Mega 项目�
 
 **所有对 `main` 的写入由 MonoWriteQueue 全局序列化**（`src/jupiter/service/push_queue_service.rs`，载体是 Postgres `push_queue` 表 + `PushQueueService`）。Git push、产品 API 写（`create-entry` / `delete-entry` / `move-entry` / `edit/save`）、CL merge、import attach 共用同一个 tip 权威——队列序就是 `main` 的推进序，不存在第二条能绕过它的写路径。序列化带来的直接后果：并发推送按入队序逐个落地，冲突在执行期以「当前 tip」重查而非入队时快照判定。
 
-**review 与 trunk 模式共用同一条队列，区别在于推送入队前是否经过 CL 管线。**在 review（默认模式）下，分支推送先生成 CL（`refs/cl/*`），评审并 merge 后再入队。在 trunk 模式下（本仓库交付的模式），推送和产品 API 写直接入队以推进 path tip，不创建 CL。切换模式时会执行 fail-closed 启动检查：Cedar 必须为 off、不能有未关闭的 CL、队列必须排空，且必须显式设置 `push_auth`。检查失败会阻止启动，不只是发出警告。完整清单见 [`deploy-trunk.md`](./deploy-trunk.md) 第 1 节。`Config::validate` 和 `AppContext::new` 都会执行检查（`src/context/mod.rs:128`），因此绕过 CLI 启动服务也会受到同样的校验。
+**review 与 trunk 模式共用同一条队列，区别在于推送入队前是否经过 CL 管线。**在 review 模式下，分支推送先生成 CL（`refs/cl/*`），评审并 merge 后再入队。在 trunk 模式下（默认模式，也是本仓库交付的模式），推送和产品 API 写直接入队以推进 path tip，不创建 CL。切换模式时会执行 fail-closed 启动检查：Cedar 必须为 off、不能有未关闭的 CL、队列必须排空，且必须显式设置 `push_auth`。检查失败会阻止启动，不只是发出警告。完整清单见 [`deploy-trunk.md`](./deploy-trunk.md) 第 1 节。`Config::validate` 和 `AppContext::new` 都会执行检查（`src/context/mod.rs:128`），因此绕过 CLI 启动服务也会受到同样的校验。
 
 深入阅读：[`refactoring/trunk-push.md`](./refactoring/trunk-push.md)（队列设计、单 commit 与多 commit 推送规则、不变式）、[`deploy-trunk.md`](./deploy-trunk.md)（模式切换与运维）。
 

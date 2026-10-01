@@ -1,6 +1,6 @@
 English · [中文](architecture.zh.md)
 
-# Architecture
+# Mega2 Architecture
 
 The original Mega was the first-generation monorepo platform; Mega2 is the second-generation engine built for Agents. Its core capabilities are the Monorepo engine and optional Agent Session Capture. The recommended Agent setup combines Mega2 with [ScorpioFS](https://github.com/gitmono-dev/scorpiofs), which mounts Monorepo paths as a local filesystem, and [Libra](https://libra.tools), which provides Agent version-control workflows and terminal browsing. This document maps Mega2's modules, storage layers, write path, protocol surfaces, and configuration reload flow. It reflects the source in this checkout; inline `src/...` paths point to the relevant implementation.
 
@@ -91,7 +91,7 @@ See the [Configuration Guide](./configuration.md) for storage-related settings a
 
 **All writes to `main` are globally serialized by MonoWriteQueue** (`src/jupiter/service/push_queue_service.rs`, backed by the Postgres `push_queue` table + `PushQueueService`). Git push, product API writes (`create-entry` / `delete-entry` / `move-entry` / `edit/save`), CL merges, and import attach share a single tip authority — queue order *is* `main`'s advance order, and no second write path can bypass it. A direct consequence: concurrent pushes land one by one in enqueue order, and conflicts are re-checked against the *current* tip at execution time rather than an enqueue-time snapshot.
 
-**Review and trunk modes share the same queue. They differ in whether a push passes through the CL pipeline first.** In review mode (the default), branch pushes become CLs (`refs/cl/*`) and enter the queue after review and merge. In trunk mode (the mode shipped by this repository), pushes and product API writes enter the queue directly and advance path tips without creating CLs. Mode-switch checks fail closed: Cedar must be off, there must be no open CLs, the queue must be drained, and `push_auth` must be explicit. Violations stop startup; they are not warnings. The [Deployment Guide](./deployment.md) describes the shipped service shape and startup requirements. Both `Config::validate` and `AppContext::new` enforce these checks (`src/context/mod.rs:128`), including service paths that bypass the CLI.
+**Review and trunk modes share the same queue. They differ in whether a push passes through the CL pipeline first.** In review mode, branch pushes become CLs (`refs/cl/*`) and enter the queue after review and merge. In trunk mode (the default and the mode shipped by this repository), pushes and product API writes enter the queue directly and advance path tips without creating CLs. Mode-switch checks fail closed: Cedar must be off, there must be no open CLs, the queue must be drained, and `push_auth` must be explicit. Violations stop startup; they are not warnings. The [Deployment Guide](./deployment.md) describes the shipped service shape and startup requirements. Both `Config::validate` and `AppContext::new` enforce these checks (`src/context/mod.rs:128`), including service paths that bypass the CLI.
 
 For user-visible push behavior, see the [User Guide](./user-guide.md); deployment requirements are in the [Deployment Guide](./deployment.md).
 

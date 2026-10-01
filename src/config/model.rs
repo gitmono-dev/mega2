@@ -406,10 +406,10 @@ impl MonoObjectFormat {
 #[serde(rename_all = "lowercase")]
 pub enum PushPolicy {
     /// Review morphology: push does not enter MonoWriteQueue (CL pipeline).
-    #[default]
     Review,
-    /// Trunk morphology: push enters MonoWriteQueue (test switch in TP-03;
-    /// full protocol wiring is later cards).
+    /// Trunk morphology (default): push enters MonoWriteQueue. Requires an
+    /// explicit `git.push_auth`.
+    #[default]
     Trunk,
 }
 
@@ -422,8 +422,8 @@ pub struct MonoConfig {
     pub object_format: MonoObjectFormat,
     #[serde(default)]
     pub rename: RenameConfig,
-    /// Runtime push morphology. Default `review` keeps existing CL semantics
-    /// (hard constraint 8). Restart-required; fail-closed startup checks
+    /// Runtime push morphology. Default `trunk` (storage-only); `review`
+    /// keeps the CL pipeline. Restart-required; fail-closed startup checks
     /// live in [`crate::config::validate`].
     #[serde(default)]
     pub push_policy: PushPolicy,

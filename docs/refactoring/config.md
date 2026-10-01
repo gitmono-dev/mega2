@@ -58,8 +58,8 @@ output includes the field's winning source).
 
 ## Push morphology and trunk authentication
 
-`[monorepo].push_policy` is `"review"` (default, CL pipeline) or `"trunk"`
-(MonoWriteQueue). `[monorepo].max_push_commits` (default 250) bounds first-parent
+`[monorepo].push_policy` is `"trunk"` (default, MonoWriteQueue) or `"review"`
+(CL pipeline; sample in `config/config-review.toml`). `[monorepo].max_push_commits` (default 250) bounds first-parent
 chain length in trunk morphology only; review morphology keeps the
 `MAX_CL_CHAIN_COMMITS` constant. Both fields are restart-required.
 

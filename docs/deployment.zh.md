@@ -1,6 +1,6 @@
 [English](deployment.md) · 中文
 
-# 部署指南
+# Mega2 部署指南
 
 mega2 是面向 Agent 的第二代 Mega 引擎，其 Monorepo 服务是核心能力，Agent Session Capture 是可选接口。开源版以 **trunk / storage-only** 模式部署，不提供 Web UI；Libra 命令 `libra mega2 browser` 提供基础的终端目录浏览及受支持的 Tag 操作。本文说明安装、运行时行为、鉴权和模式切换。仓库与推送规则见[使用指南](./user-guide.zh.md)，配置项以带注释的 [`config/config.toml`](../config/config.toml) 为准。
 

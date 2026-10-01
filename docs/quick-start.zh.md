@@ -1,4 +1,4 @@
-# 快速开始
+# Mega2 快速开始
 
 [English](quick-start.md) · 中文
 

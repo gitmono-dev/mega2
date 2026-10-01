@@ -213,6 +213,9 @@ services:
       MEGA_LOG__LEVEL: info
     volumes:
       - mega2-data:/var/lib/mega2
+      # The website stack runs the review morphology (OAuth session chain);
+      # the image default config is trunk / storage-only.
+      - ../config/config-review.toml:/etc/mega2/config.toml:ro
     ports:
       - "127.0.0.1:19180:8000"
     healthcheck:

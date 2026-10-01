@@ -1,9 +1,10 @@
 [package]
 name = "mega2"
-version = "0.40.15"
+version = "0.41.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Monorepo engine and Git hosting server for AI agents: trunk-based storage, Git Smart HTTP, Git LFS, OCI registry, and Agent Session Capture"
+homepage = "https://gitmega.ai"
 repository = "https://github.com/gitmono-dev/mega2"
 keywords = ["monorepo", "git-server", "ai-agents", "git-lfs", "oci-registry"]
 # Two [[bin]] targets exist; keep `cargo run -p mega2` unambiguous.

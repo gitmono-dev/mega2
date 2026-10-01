@@ -6,6 +6,7 @@ English · [中文](README.zh.md)
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Docker Image](https://img.shields.io/badge/docker-genedna%2Fmega2-2496ED.svg)](https://hub.docker.com/r/genedna/mega2)
+[![Website](https://img.shields.io/badge/website-gitmega.ai-0A7BBB.svg)](https://gitmega.ai)
 
 The first-generation [Mega](https://github.com/web3infra-foundation/mega) established the foundation for our monorepo and Git-hosting platform. **Mega2 is the second-generation engine built for AI agents**, with two core capabilities: a **Monorepo engine** and **Agent Session Capture**.
 
@@ -18,6 +19,7 @@ Start with the [Quick Start](docs/quick-start.md), then see the [documentation i
 | Item | Details |
 |---|---|
 | What it is | Monorepo engine and Git hosting server for AI agents |
+| Website | [gitmega.ai](https://gitmega.ai) |
 | Language | Rust (edition 2024), a single Cargo package `mega2` |
 | Mode | Trunk / storage-only: `refs/heads/main` is the public trunk |
 | Protocols and interfaces | Git Smart HTTP, read-only SSH, Git LFS, OCI Distribution (`/v2`), HTTP API |
@@ -68,7 +70,7 @@ docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
 docker compose -f linux-mega2-compose.yml up -d --wait
 ```
 
-HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see the [Deployment Guide](docs/deployment.md) and [`docs/deploy-trunk.md`](docs/deploy-trunk.md). Start and push with the [Quick Start](docs/quick-start.md), then see [Usage Recipes](docs/recipes.md) for repository migration, LFS, OCI, and build-artifact examples.
+HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see the [Deployment Guide](docs/deployment.md) and [`docs/deploy-trunk.md`](docs/deploy-trunk.md) (Chinese). Start and push with the [Quick Start](docs/quick-start.md), then see [Usage Recipes](docs/recipes.md) for repository migration, LFS, OCI, and build-artifact examples.
 
 For local development and tests, see the [Contributing Guide](docs/contributing.md).
 
@@ -98,7 +100,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 source .env.test && cargo test --all
 ```
 
-Details: [`AGENTS.md`](AGENTS.md), the [Contributing Guide](docs/contributing.md), and [`docs/plan/README.md`](docs/plan/README.md).
+Details: [`AGENTS.md`](AGENTS.md), the [Contributing Guide](docs/contributing.md), and [`docs/plan/README.md`](docs/plan/README.md) (Chinese).
 
 ## Documentation
 
@@ -108,9 +110,12 @@ Details: [`AGENTS.md`](AGENTS.md), the [Contributing Guide](docs/contributing.md
 | [`docs/quick-start.md`](docs/quick-start.md) | Start the local Compose stack and make your first push |
 | [`docs/recipes.md`](docs/recipes.md) | Repository migration, LFS, OCI, artifacts, and persistent data |
 | [`docs/user-guide.md`](docs/user-guide.md) | Git, HTTP API, Libra, and CLI usage |
+| [`docs/configuration.md`](docs/configuration.md) | Config sources, SecretRef, profiles, hot reload, and validation |
+| [`docs/deployment.md`](docs/deployment.md) | Deploying and hardening a trunk / storage-only service |
+| [`docs/architecture.md`](docs/architecture.md) | Module boundaries, storage, and the write path |
 | [`docs/contributing.md`](docs/contributing.md) | Local development, contribution process, code conventions, and integration tests |
 
-Configuration, deployment, architecture, and subsystem references are linked from the [documentation index](docs/README.md).
+Subsystem references and project records are linked from the [documentation index](docs/README.md).
 
 ## License
 

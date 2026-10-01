@@ -1,4 +1,4 @@
-# Quick Start
+# Mega2 Quick Start
 
 English · [中文](quick-start.zh.md)
 

@@ -56,7 +56,7 @@ static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 // 注意这里同时保存两份配置：
 // - bootstrap_config_path：只包含 `[database]`，用于验证 `config secret set/check`
 //   只走 DB + Vault bootstrap，不触发完整 AppContext。
-// - full_config_path：来自仓库默认 `config/config.toml`，通过环境变量覆盖到测试数据库、
+// - full_config_path：来自仓库 review 样例 `config/config-review.toml`，通过环境变量覆盖到测试数据库、
 //   本地对象存储和 redis.url SecretRef，用于验证 `config validate --resolve-secrets`。
 struct VaultCliEnv {
     temp_dir: TempDir,
@@ -84,8 +84,8 @@ impl VaultCliEnv {
         // 不依赖 Redis、对象存储、邮件或 HTTP service 的完整初始化链路。
         write_bootstrap_config(&bootstrap_config_path, &database.db_url);
 
-        // 完整配置从仓库默认配置复制出来，再由 command_with_config 注入环境变量覆盖。
-        // 这样既验证真实配置结构可加载，也避免测试修改仓库里的 config/config.toml。
+        // 完整配置从仓库 review 样例配置复制出来，再由 command_with_config 注入环境变量覆盖。
+        // 这样既验证真实配置结构可加载，也避免测试修改仓库里的 config/config-review.toml。
         common::write_full_config(&full_config_path);
 
         Self {
@@ -981,7 +981,7 @@ fn integration_error_redaction_does_not_leak_db_password() {
     let cache_dir = temp_dir.path().join("cache");
     let object_root = temp_dir.path().join("objects");
     let config_path = temp_dir.path().join("config.toml");
-    fs::write(&config_path, include_str!("../config/config.toml")).expect("write config");
+    fs::write(&config_path, include_str!("../config/config-review.toml")).expect("write config");
 
     let port = reserve_free_port();
     let stdout_path = temp_dir.path().join("service.out");

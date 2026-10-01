@@ -1,6 +1,6 @@
 [English](contributing.md) · 中文
 
-# 贡献指南
+# Mega2 贡献指南
 
 本文说明如何为 mega2 贡献代码，包括如何提出改动、准备开发环境、运行提交检查并遵循仓库约定。当前 checkout 与 [`../AGENTS.md`](../AGENTS.md) 是事实来源；如果本文与源码或 `AGENTS.md` 冲突，请按事实来源执行，并提 Issue 修正文档。
 
@@ -28,7 +28,7 @@
 `full` / `gates` 等），避免手贴命令漏步骤；共享逻辑在
 [`../scripts/lib/mega2-it.sh`](../scripts/lib/mega2-it.sh)。测试 env 模板是
 [`../.env.test.example`](../.env.test.example)（`dev-test.sh` 会自动生成本地
-`.env.test`，不提交）。
+`.env.test`，不提交）。可用流程见 `./scripts/dev-test.sh --help`。
 
 ## 3. 提交前三门禁
 
@@ -43,8 +43,9 @@ source .env.test && cargo test --all
 
 要求：fmt 无 diff（nightly  toolchain，因 `rustfmt.toml` 可能启用不稳定选项）；
 clippy 0 warning 0 error，不得用 blanket `#[allow(...)]` 绕过；测试全过，
-不得通过 `#[ignore]` / 删断言来变绿。`.env.test` 缺失时先按
-[`development.md`](development.md) 生成，不要跳过 source。
+不得通过 `#[ignore]` / 删断言来变绿。`.env.test` 缺失时先运行
+`./scripts/dev-test.sh up-full` 生成并准备本地测试环境（详见
+[`development.md`](development.md)），不要跳过 source。
 
 ## 4. 代码约定（摘要）
 
@@ -98,8 +99,9 @@ New DB Entity / Migration」）：
 - **事实基线**：文档只陈述当前 checkout 可验证的事实；计划文档不宣称实现完成。
 - **链接而非复制**：配置键表、token 值、命令 flag 列表等有权威出处的内容
   （[`../config/config.toml`](../config/config.toml)、
-  [`refactoring/config.md`](refactoring/config.md)、[`deploy-trunk.md`](deploy-trunk.md)、
-  [`user-guide.zh.md`](user-guide.zh.md)、[`development.md`](development.md)、
+  [`refactoring/config.md`](refactoring/config.md)、[`deployment.zh.md`](deployment.zh.md)、
+  [`deploy-trunk.md`](deploy-trunk.md)、[`user-guide.zh.md`](user-guide.zh.md)、
+  [`development.md`](development.md)、[`../scripts/dev-test.sh`](../scripts/dev-test.sh)、
   [`../AGENTS.md`](../AGENTS.md)）一律链接，不在新文档里复制数值。
 - **中英双语**：英文是默认文件（如 `foo.md`），中文放在同名的 `.zh.md` 旁
   （如 `foo.zh.md`）。两版结构保持一致、内容同步；英文应符合英文技术文档的表达习惯，不逐句直译。文件顶部放语言切换行，格式参照
@@ -142,6 +144,6 @@ Mega 是第一代 Monorepo 平台，mega2 是面向 Agent 的第二代引擎，�
   [`user-guide.zh.md`](user-guide.zh.md) · [`configuration.zh.md`](configuration.zh.md) ·
   [`deployment.zh.md`](deployment.zh.md) · [`architecture.zh.md`](architecture.zh.md)
 - [`../AGENTS.md`](../AGENTS.md) — 门禁、代码约定、常见陷阱、任务卡发布的权威出处
-- [`development.md`](development.md) — 本地开发与测试
-- [`plan/README.md`](plan/README.md) — 计划文档规则
-- [`../README.zh.md`](../README.zh.md) — 项目总览（Contributing 一节是本文的英文摘要）
+- [`development.md`](development.md) — 本地开发与测试；入口脚本为 [`../scripts/dev-test.sh`](../scripts/dev-test.sh)
+- [`plan/README.md`](plan/README.md) — 计划文档规则；模板见 [`plan/plan-template.md`](plan/plan-template.md) 与 [`plan/plan-template.en.md`](plan/plan-template.en.md)
+- [`../README.zh.md`](../README.zh.md) — 项目总览（“贡献”一节是本文的摘要）

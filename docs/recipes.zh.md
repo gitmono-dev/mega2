@@ -1,4 +1,4 @@
-# 进阶使用场景
+# Mega2 进阶使用场景
 
 [English](recipes.md) · 中文
 

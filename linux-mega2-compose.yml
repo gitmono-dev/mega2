@@ -47,30 +47,30 @@
 # reverse proxy; use token or OAuth authentication for any shared or
 # internet-facing deployment.
 #
-# mega2 本機試用環境 — Linux Docker 版本。
+# mega2 本机试用环境 — Linux Docker 版本。
 #
-# 前置需求：Linux 上的 Docker Engine 與 Docker Compose plugin。
-# macOS + OrbStack 請改用 `macos-orbstack-mega2-compose.yml`。
+# 前置需求：Linux 上的 Docker Engine 与 Docker Compose plugin。
+# macOS + OrbStack 请改用 `macos-orbstack-mega2-compose.yml`。
 #
-# 為什麼與 macOS/OrbStack 版本不同：artifact 预签名 URL 的 host 參與 SigV4
-# 簽名，同一個位址必須同時對 mega2 容器（SDK + 簽名）和宿主機客戶端（直連
-# 下載 blob）可達。Linux Docker 沒有 `*.orb.local` DNS，因此本檔案改為：
-#   - 把 Postgres/Redis/RustFS 發佈到 127.0.0.1（埠 15433/16380/29000），
-#   - mega2 以 `network_mode: host` 執行，
-# 使 `http://127.0.0.1:29000` 成為雙側共用的唯一 endpoint。mega2 的 API
-# 直接綁定 127.0.0.1:9000（host networking 下無埠映射）。
+# 为什么与 macOS/OrbStack 版本不同：artifact 预签名 URL 的 host 参与 SigV4
+# 签名，同一个地址必须同时对 mega2 容器（SDK + 签名）和宿主机客户端（直连
+# 下载 blob）可达。Linux Docker 没有 `*.orb.local` DNS，因此本文件改为：
+#   - 把 Postgres/Redis/RustFS 发布到 127.0.0.1（端口 15433/16380/29000），
+#   - mega2 以 `network_mode: host` 运行，
+# 使 `http://127.0.0.1:29000` 成为双侧共用的唯一 endpoint。mega2 的 API
+# 直接绑定 127.0.0.1:9000（host networking 下无端口映射）。
 #
-# 快速啟動：
+# 快速启动：
 #   docker compose -f linux-mega2-compose.yml up -d --wait
 #
-# 存取位址：
+# 访问地址：
 #   Mega2 API / Git Smart HTTP: http://127.0.0.1:9000
 #   OpenAPI document:           http://127.0.0.1:9000/api/openapi.json
 #   RustFS S3 endpoint:         http://127.0.0.1:29000
 #
-# 這是僅限本機使用的匿名 Git HTTP 寫入設定：`push_auth=none` 代表 clone、
-# fetch 與 push 都不需要 token，因此 mega2 只綁定 127.0.0.1。請勿改成
-# 0.0.0.0 或透過反向代理公開；共用或網際網路部署必須改用 token 或 OAuth。
+# 这是仅限本机使用的匿名 Git HTTP 写入设置：`push_auth=none` 代表 clone、
+# fetch 与 push 都不需要 token，因此 mega2 只绑定 127.0.0.1。请勿改成
+# 0.0.0.0 或通过反向代理公开；共用或互联网部署必须改用 token 或 OAuth。
 name: mega2-linux
 
 services:

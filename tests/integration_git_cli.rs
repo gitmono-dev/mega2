@@ -4608,8 +4608,8 @@ fn path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
 }
 
-/// Complete expected worktree for `MegaModelConverter::init` against the default
-/// `config/config.toml` monorepo settings (`admin = ["benjamin_747"]`, the eight
+/// Complete expected worktree for `MegaModelConverter::init` against the review sample
+/// `config/config-review.toml` monorepo settings (`admin = ["benjamin_747"]`, the eight
 /// `root_dirs`). Kept in sync with `src/jupiter/utils/converter.rs::init_trees`.
 fn expected_init_monorepo_fixture() -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut out = BTreeMap::new();

@@ -43,10 +43,10 @@ root_dirs = ["third-party", "project", "doc", "release", "toolchains"]
 # Values: sha1 (default; standard Git), sha256, blake3.
 # sha256 and blake3 are git-internal / Libra extensions, not stock Git.
 object_format = "sha1"
-# Push morphology: "review" (default, CL pipeline) or "trunk" (MonoWriteQueue).
+# Push morphology: "trunk" (default, MonoWriteQueue) or "review" (CL pipeline).
 # Restart-required. Trunk requires cedar.enforcement="off", no open CLs, and
-# an explicit git.push_auth of "token" or "none".
-# push_policy = "review"
+# an explicit git.push_auth of "token" or "none" (see [git] below).
+# push_policy = "trunk"
 # Trunk-only first-parent chain bound. Review morphology keeps MAX_CL_CHAIN_COMMITS=250.
 # max_push_commits = 250
 
@@ -97,12 +97,14 @@ interval_secs = 3600
 grace_secs = 86400
 batch_limit = 100
 
-# Git protocol / trunk push authentication. Omitted push_auth = OAuth/UserStorage
-# (review only). "token" | "none" requires monorepo.push_policy = "trunk".
-# [git]
-# anonymous_access = true
-# push_auth = "token"
-# ssh_receive_pack = false
+# Git protocol / trunk push authentication. Trunk (the default) requires an
+# explicit push_auth: "none" accepts anonymous pushes (local / trusted networks
+# only); use "token" with [[git.push_tokens]] for shared deployments. Omitted
+# push_auth = OAuth/UserStorage (review only).
+[git]
+anonymous_access = true
+push_auth = "none"
+ssh_receive_pack = false
 # [[git.push_tokens]]
 # name = "team-foo"
 # token = "${{file:/run/secrets/team_foo_token}}"

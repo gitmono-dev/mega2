@@ -1,0 +1,21 @@
+# Mega2
+
+> Mega2 is a monorepo engine and Git hosting server for AI agents, written in Rust. It runs as a trunk / storage-only service that hosts a monorepo over Git Smart HTTP, with Git LFS, an OCI registry, build artifacts, and optional Agent Session Capture for ingesting and querying agent sessions. Licensed MIT OR Apache-2.0. Website: https://gitmega.ai. Repository: https://github.com/gitmono-dev/mega2.
+
+## Docs
+
+- [README](https://github.com/gitmono-dev/mega2/blob/main/README.md): project overview, Compose quick start, contribution process, and license
+- [Quick Start](https://github.com/gitmono-dev/mega2/blob/main/docs/quick-start.md): start the local Compose stack and make a first push
+- [User Guide](https://github.com/gitmono-dev/mega2/blob/main/docs/user-guide.md): Git, HTTP API, Libra, and CLI usage
+- [Usage Recipes](https://github.com/gitmono-dev/mega2/blob/main/docs/recipes.md): repository migration, LFS, OCI, artifacts, and persistent data
+- [Configuration Reference](https://github.com/gitmono-dev/mega2/blob/main/docs/configuration.md): config sources, SecretRef, profiles, hot reload, and validation
+- [Deployment Guide](https://github.com/gitmono-dev/mega2/blob/main/docs/deployment.md): deploying and hardening a trunk / storage-only service
+- [Architecture](https://github.com/gitmono-dev/mega2/blob/main/docs/architecture.md): module boundaries, storage, and the write path
+- [Contributing Guide](https://github.com/gitmono-dev/mega2/blob/main/docs/contributing.md): development environment, submit gates, and code conventions
+- [AGENTS.md](https://github.com/gitmono-dev/mega2/blob/main/AGENTS.md): build commands, required checks, and conventions for coding agents
+
+## Optional
+
+- [README (Chinese)](https://github.com/gitmono-dev/mega2/blob/main/README.zh.md): Chinese project overview
+- [Documentation index](https://github.com/gitmono-dev/mega2/blob/main/docs/README.md): index of user, operator, and developer documentation
+- [Subsystem references](https://github.com/gitmono-dev/mega2/blob/main/docs/refactoring/README.md): subsystem contracts and implementation records (Chinese)

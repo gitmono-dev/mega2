@@ -1,4 +1,4 @@
-# 使用指南
+# Mega2 使用指南
 
 [English](user-guide.md) · 中文
 

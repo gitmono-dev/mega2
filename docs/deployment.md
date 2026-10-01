@@ -1,6 +1,6 @@
 English · [中文](deployment.zh.md)
 
-# Deployment Guide
+# Mega2 Deployment Guide
 
 Mega2 is the second-generation Mega engine built for Agents. Its Monorepo service is a core capability; Agent Session Capture is an optional API. The open-source edition is deployed in **trunk / storage-only** mode and has no Web UI; Libra's `libra mega2 browser` provides basic terminal directory browsing and supported tag operations. This guide covers installation, runtime behavior, authentication, and mode changes. Repository and push behavior is summarized in the [User Guide](./user-guide.md). The commented [`config.toml`](../config/config.toml) lists the configuration keys.
 

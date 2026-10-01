@@ -3,7 +3,7 @@
 
 use super::{
     AgentCaptureConfig, AgentCaptureIngestTokenConfig, DEFAULT_MAX_PUSH_COMMITS, GitConfig,
-    GithubSyncBinding, GithubSyncConfig, PushAuth, PushPolicy, PushTokenConfig,
+    GithubSyncBinding, GithubSyncConfig, MonoConfig, PushAuth, PushPolicy, PushTokenConfig,
     StorageEventsConfig, reload::ConfigHandle, testing::isolated_config, token_path_authorizes,
     validate,
 };
@@ -30,7 +30,10 @@ fn valid_config() -> super::Config {
 }
 
 #[test]
-fn defaults_are_review_250_and_omitted_push_auth() {
+fn defaults_are_trunk_250_and_omitted_push_auth() {
+    assert_eq!(PushPolicy::default(), PushPolicy::Trunk);
+    assert_eq!(MonoConfig::default().push_policy, PushPolicy::Trunk);
+    // The isolated test fixture opts into review explicitly.
     let config = valid_config();
     assert_eq!(config.monorepo.push_policy, PushPolicy::Review);
     assert_eq!(config.monorepo.max_push_commits, DEFAULT_MAX_PUSH_COMMITS);
@@ -289,19 +292,25 @@ fn push_token_file_placeholder_expands_through_config_load() {
     let dir = tempfile::tempdir().expect("temp dir");
     let secret = dir.path().join("token");
     std::fs::write(&secret, "loaded-secret").expect("write secret");
-    let mut content = super::template::config_init_template(dir.path());
-    content = content.replace("# push_policy = \"review\"", "push_policy = \"trunk\"");
-    content.push_str(&format!(
-        r#"
-[git]
-push_auth = "token"
+    let template = super::template::config_init_template(dir.path());
+    let none_auth = "push_auth = \"none\"\nssh_receive_pack = false\n";
+    assert!(
+        template.contains(none_auth),
+        "init template must carry trunk [git]"
+    );
+    let content = template.replacen(
+        none_auth,
+        &format!(
+            r#"push_auth = "token"
 ssh_receive_pack = false
 [[git.push_tokens]]
 name = "ci"
 token = "${{file:{}}}"
 "#,
-        secret.display()
-    ));
+            secret.display()
+        ),
+        1,
+    );
     let loaded = super::Config::load_str(&content).expect("load");
     assert_eq!(loaded.git.push_tokens[0].token, "loaded-secret");
     loaded.validate().expect("expanded token must validate");

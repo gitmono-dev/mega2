@@ -1,6 +1,6 @@
 English · [中文](monorepo-init.zh.md)
 
-# Monorepo Initialization and Directory Layout
+# Mega2 Monorepo Initialization and Directory Layout
 
 This manual explains how mega2 creates the initial Monorepo tree, how to
 configure its top-level directories, and what the first commit contains. For

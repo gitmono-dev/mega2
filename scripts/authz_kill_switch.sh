@@ -1808,7 +1808,7 @@ EOF
   # --- UN-41 gate 15: format-drift config (missing enforcement) ---
   local drift_dir="$tmp/drift"
   mkdir -p "$drift_dir"
-  cp -- "$SCRIPT_DIR/../config/config.toml" "$drift_dir/config.toml"
+  cp -- "$SCRIPT_DIR/../config/config-review.toml" "$drift_dir/config.toml"
   # profile required; strip enforcement from base
   python3 - "$drift_dir/config.toml" <<'PY'
 import re, sys
@@ -1834,7 +1834,7 @@ PY
   # --- UN-41 gate 16: MEGA_PROFILE missing ---
   local ok_dir="$tmp/okcfg"
   mkdir -p "$ok_dir"
-  cp -- "$SCRIPT_DIR/../config/config.toml" "$ok_dir/config.toml"
+  cp -- "$SCRIPT_DIR/../config/config-review.toml" "$ok_dir/config.toml"
   python3 - "$ok_dir/config.toml" <<'PY'
 import re, sys
 path = sys.argv[1]

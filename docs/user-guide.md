@@ -1,4 +1,4 @@
-# User Guide
+# Mega2 User Guide
 
 English · [中文](user-guide.zh.md)
 
@@ -185,7 +185,7 @@ Error types and HTTP status mapping are centralized in `crate::common::errors`.
 Both surfaces require storage-only mode and their own config switch. If either condition is missing, the route is not mounted and returns 404; enabling either switch outside storage-only mode prevents startup.
 
 - **OCI Distribution `/v2`**: mounted when storage-only and `[oci].enabled=true`; serves as a container registry (`docker login` reuses push tokens — there is no separate token service). See the [Deployment Guide](./deployment.md) for enablement and usage.
-- **Agent Session Capture `/api/v1/agent-capture`**: an optional API for ingesting and querying Agent sessions, events, checkpoints, transcripts, and file operations. It is mounted only in storage-only mode when `[agent_capture].enabled=true` and at least one `[[agent_capture.ingest_tokens]]` is configured. It uses separate ingest tokens and is independent of Git push; a Git push does not create a session capture record. See the [configuration and API reference](./refactoring/agent-capture.md).
+- **Agent Session Capture `/api/v1/agent-capture`**: an optional API for ingesting and querying Agent sessions, events, checkpoints, transcripts, and file operations. It is mounted only in storage-only mode when `[agent_capture].enabled=true` and at least one `[[agent_capture.ingest_tokens]]` is configured. It uses separate ingest tokens and is independent of Git push; a Git push does not create a session capture record. See the [configuration and API reference](./refactoring/agent-capture.md) (Chinese).
 
 ## 6. Using mega2 with Libra
 

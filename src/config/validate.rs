@@ -2667,10 +2667,14 @@ mod tests {
         );
     }
 
-    const SHIPPED_CONFIGS: [(&str, &str); 3] = [
+    const SHIPPED_CONFIGS: [(&str, &str); 4] = [
         (
             "config/config.toml",
             include_str!("../../config/config.toml"),
+        ),
+        (
+            "config/config-review.toml",
+            include_str!("../../config/config-review.toml"),
         ),
         (
             "config/config-storage-only.toml",

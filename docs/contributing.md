@@ -1,6 +1,6 @@
 English · [中文](contributing.zh.md)
 
-# Contributing Guide
+# Mega2 Contributing Guide
 
 This guide explains how to contribute code to mega2: how to propose a change,
 prepare the development environment, run the required checks, and follow the
@@ -19,8 +19,10 @@ implementation:
    [`plan/plan-template.en.md`](plan/plan-template.en.md) and save the working
    plan as `docs/plan/plan-YYYYMMDD.md`. Do not
    delete mandatory sections; write `N/A` and the reason when a section does
-   not apply. The operational plan archive remains Chinese-first; follow the
-   repository rules in [`../AGENTS.md`](../AGENTS.md).
+   not apply. The canonical template is
+   [`plan/plan-template.md`](plan/plan-template.md) (Chinese), and plan rules
+   (naming, fact baseline, task cards, index registration) are in
+   [`plan/README.md`](plan/README.md) (Chinese).
 3. **Implement only after the plan is reviewed.** Split the work into
    independently executable task cards (clear scope / dependencies / file
    targets / acceptance criteria / verification commands), add tests and docs,
@@ -33,7 +35,9 @@ replace the verification commands on a task card.
 
 ## 2. Development environment
 
-Use the unified entry script [`../scripts/dev-test.sh`](../scripts/dev-test.sh)
+Environment setup, the Compose data plane, the integration-test stack, and
+troubleshooting are documented in [`development.md`](development.md)
+(Chinese); this guide does not repeat them. Use the unified entry script [`../scripts/dev-test.sh`](../scripts/dev-test.sh)
 to prepare the Compose data plane and run tests (`up-full` / `basic` / `full` /
 `gates`, etc.). Its shared logic is in
 [`../scripts/lib/mega2-it.sh`](../scripts/lib/mega2-it.sh). The test
@@ -58,7 +62,8 @@ may enable unstable options); clippy exits with 0 warnings and 0 errors, with
 no blanket `#[allow(...)]` bypasses; all tests pass — never force green with
 `#[ignore]` or deleted asserts. If `.env.test` is missing, run
 `./scripts/dev-test.sh up-full` to generate and populate the local test
-environment; do not skip the `source`.
+environment (details in [`development.md`](development.md) (Chinese)); do not
+skip the `source`.
 
 ## 4. Code conventions (summary)
 
@@ -117,13 +122,20 @@ listed here:
 
 - **Plan documents:** use the English contributor template
   [`plan/plan-template.en.md`](plan/plan-template.en.md); do not invent your
-  own format. The operational plan archive remains Chinese-first.
+  own format. Rules for templates, naming, fact baseline, task-card
+  executability, and index/status sync are in
+  [`plan/README.md`](plan/README.md) (Chinese); the plan archive remains
+  Chinese-first.
 - **Fact baseline:** documents only state what is verifiable in the current
   checkout; plan documents never claim an implementation is complete.
 - **Link, don't copy:** content with an authoritative home — full config key
   tables, token values, command flag lists
   ([`../config/config.toml`](../config/config.toml),
-  [`deployment.md`](deployment.md), [`user-guide.md`](user-guide.md),
+  [`refactoring/config.md`](refactoring/config.md),
+  [`deployment.md`](deployment.md),
+  [`deploy-trunk.md`](deploy-trunk.md) (Chinese),
+  [`user-guide.md`](user-guide.md),
+  [`development.md`](development.md) (Chinese),
   [`../scripts/dev-test.sh`](../scripts/dev-test.sh),
   [`../AGENTS.md`](../AGENTS.md)) — is
   always linked, never re-printed in a new document.
@@ -179,7 +191,10 @@ release"):
   [`deployment.md`](deployment.md) · [`architecture.md`](architecture.md)
 - [`../AGENTS.md`](../AGENTS.md) — authoritative home for gates, code
   conventions, common pitfalls, and the task-card release flow
-- [`../scripts/dev-test.sh`](../scripts/dev-test.sh) — local development and testing entry point
-- [`plan/plan-template.en.md`](plan/plan-template.en.md) — English plan template
+- [`development.md`](development.md) (Chinese) — local development and testing;
+  entry script: [`../scripts/dev-test.sh`](../scripts/dev-test.sh)
+- [`plan/README.md`](plan/README.md) (Chinese) — plan document rules; templates:
+  [`plan/plan-template.md`](plan/plan-template.md) (Chinese) and
+  [`plan/plan-template.en.md`](plan/plan-template.en.md)
 - [`../README.md`](../README.md) — project overview (its Contributing section
-  is the English summary of this document)
+  is a summary of this document)
