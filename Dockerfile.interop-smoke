@@ -87,3 +87,25 @@ RUN chmod 0755 /usr/local/bin/interop-smoke-selfcheck \
 # Default: stay up for `docker compose exec`. A plain `docker run IMAGE CMD`
 # overrides this (used by the verification commands).
 CMD ["sleep", "infinity"]
+
+# Final stage (BB-06): the official libra client from libra.tools. The
+# installer verifies its Ed25519-signed stable manifest and the binary's
+# sha256 (LIBRA_REQUIRE_CHECKSUM=1); fallback installs are never enabled.
+# LIBRA_VERSION empty = latest stable; LIBRA_CACHE_BUST forces a fresh layer
+# so a rebuild picks up a newer stable release.
+FROM base AS final
+
+ARG LIBRA_VERSION=""
+ARG LIBRA_CACHE_BUST=""
+
+RUN set -eu; \
+    echo "libra cache bust: ${LIBRA_CACHE_BUST:-none}"; \
+    curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh -o /tmp/libra-install.sh; \
+    sha256sum /tmp/libra-install.sh; \
+    LIBRA_REQUIRE_CHECKSUM=1 LIBRA_NO_TUI=1 LIBRA_HOME=/tmp/libra-home \
+        sh /tmp/libra-install.sh -d /usr/local/bin --no-modify-path --no-alias ${LIBRA_VERSION:+-v "$LIBRA_VERSION"}; \
+    rm -rf /tmp/libra-install.sh /tmp/libra-home; \
+    mkdir -p /etc/interop-smoke; \
+    libra --version > /etc/interop-smoke/libra-version; \
+    test -s /etc/interop-smoke/libra-version; \
+    cat /etc/interop-smoke/libra-version
