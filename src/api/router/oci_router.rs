@@ -1180,7 +1180,8 @@ mod tests {
     async fn state(anonymous_access: bool) -> MonoApiServiceState {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut config = isolated_config(temp_dir.path().join("config"));
-        config.database = test_db_config(temp_dir.path()).await;
+        let (db_config, _db_schema) = test_db_config(temp_dir.path()).await;
+        config.database = db_config;
         config.git = GitConfig {
             anonymous_access,
             push_auth: Some(PushAuth::Token),
@@ -2886,7 +2887,8 @@ mod tests {
     ) -> MonoApiServiceState {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut config = isolated_config(temp_dir.path().join("config"));
-        config.database = test_db_config(temp_dir.path()).await;
+        let (db_config, _db_schema) = test_db_config(temp_dir.path()).await;
+        config.database = db_config;
         config.git = GitConfig {
             anonymous_access: true,
             push_auth: Some(PushAuth::Token),
@@ -3216,7 +3218,8 @@ mod tests {
         let blocking = BlockingTransport::new();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut config = isolated_config(temp_dir.path().join("config"));
-        config.database = test_db_config(temp_dir.path()).await;
+        let (db_config, _db_schema) = test_db_config(temp_dir.path()).await;
+        config.database = db_config;
         config.git = GitConfig {
             anonymous_access: true,
             push_auth: Some(PushAuth::Token),

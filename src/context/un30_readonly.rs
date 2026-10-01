@@ -126,7 +126,7 @@ fn un30_other_query_parameters_are_preserved() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un30_a_write_through_the_read_only_connection_is_refused_by_the_server() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let db_config = crate::jupiter::tests::test_db_config(temp.path()).await;
+    let (db_config, _db_schema) = crate::jupiter::tests::test_db_config(temp.path()).await;
 
     // Prepare a table through a normal connection, so the write below fails for
     // being a write rather than for having nowhere to go.
@@ -190,7 +190,7 @@ async fn un30_a_write_through_the_read_only_connection_is_refused_by_the_server(
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un30_the_read_only_connection_runs_no_migration() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let db_config = crate::jupiter::tests::test_db_config(temp.path()).await;
+    let (db_config, _db_schema) = crate::jupiter::tests::test_db_config(temp.path()).await;
 
     let read_only = read_only_database_connection(&db_config)
         .await
@@ -238,7 +238,7 @@ async fn table_count(connection: &sea_orm::DatabaseConnection) -> i64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un30_building_the_read_facade_writes_no_sidebar() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let db_config = crate::jupiter::tests::test_db_config(temp.path()).await;
+    let (db_config, _db_schema) = crate::jupiter::tests::test_db_config(temp.path()).await;
     let writable = Arc::new(
         crate::jupiter::storage::init::database_connection(&db_config)
             .await

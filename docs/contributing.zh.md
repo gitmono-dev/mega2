@@ -86,7 +86,10 @@ New DB Entity / Migration」）：
    `storage/mod.rs` re-export。
 4. 用 `crate::jupiter::tests::test_db_connection` +
    `crate::jupiter::migration::apply_migrations` 写 `#[cfg(test)]` 覆盖
-   （范例见 `notification/dispatcher.rs::tests`）。
+   （范例见 `notification/dispatcher.rs::tests`）。helper 建的 per-test schema
+   随连接一起 drop，仍被持有的则在用例线程结束时 drop；`test_db_config` 则返回
+   `TestSchemaGuard`，必须绑定到用例结束（`let (db_config, _schema) = ...`，
+   不能写 `_`）。
 
 ## 6. 文档约定
 

@@ -223,7 +223,12 @@ concrete backend is built through `crate::jupiter::storage::object_storage::buil
 5. **Test DB helpers.** Tests requiring a database use
    `crate::jupiter::tests::test_db_connection(<TempDir path>)` followed by
    `crate::jupiter::migration::apply_migrations(&db, true).await`. Reuse
-   these helpers instead of constructing connections by hand.
+   these helpers instead of constructing connections by hand. Each call
+   creates a `mega2_test_<pid>_<n>` schema that is dropped with the
+   connection (or when the test thread ends, if something still holds it);
+   `test_db_config` returns `(DbConfig, TestSchemaGuard)` and the guard must
+   stay bound for the whole test (`_schema`, never `_`), or the schema is
+   dropped under the connection.
 6. **Allocator cfg.** Don't touch the `#[global_allocator]` blocks in
    `main.rs` unless intentionally changing allocators on a platform.
 7. **`unwrap()` in non‑test code.** Avoid introducing new `unwrap`/`expect`

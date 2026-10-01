@@ -274,19 +274,27 @@ mod tests {
         }
     }
 
-    async fn test_vault() -> (tempfile::TempDir, VaultCore) {
+    async fn test_vault() -> (
+        tempfile::TempDir,
+        VaultCore,
+        crate::jupiter::tests::TestSchemaGuard,
+    ) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let db_config = crate::jupiter::tests::test_db_config(temp_dir.path()).await;
+        let (db_config, schema) = crate::jupiter::tests::test_db_config(temp_dir.path()).await;
         let vault =
             VaultCore::from_database_config(&db_config, temp_dir.path().join("core_key.json"))
                 .await
                 .expect("vault");
-        (temp_dir, vault)
+        (temp_dir, vault, schema)
     }
 
-    async fn test_readonly_vault() -> (tempfile::TempDir, VaultCore) {
+    async fn test_readonly_vault() -> (
+        tempfile::TempDir,
+        VaultCore,
+        crate::jupiter::tests::TestSchemaGuard,
+    ) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let db_config = crate::jupiter::tests::test_db_config(temp_dir.path()).await;
+        let (db_config, schema) = crate::jupiter::tests::test_db_config(temp_dir.path()).await;
         let key_path = temp_dir.path().join("core_key.json");
         let _writable = VaultCore::from_database_config(&db_config, key_path.clone())
             .await
@@ -300,7 +308,7 @@ mod tests {
         let vault = VaultCore::open_readonly(storage, key_path)
             .await
             .expect("readonly vault");
-        (temp_dir, vault)
+        (temp_dir, vault, schema)
     }
 
     async fn test_redis() -> ConnectionManager {
@@ -311,7 +319,7 @@ mod tests {
     async fn ensure_initializes_once_and_reloads() {
         let _serial = TEST_SERIAL.lock().await;
         clear_held();
-        let (_temp, vault) = test_vault().await;
+        let (_temp, vault, _schema) = test_vault().await;
         let redis = test_redis().await;
 
         let first = ensure(&enabled_config(), &vault, redis.clone())
@@ -366,7 +374,7 @@ mod tests {
     async fn disabled_does_not_generate_or_write() {
         let _serial = TEST_SERIAL.lock().await;
         clear_held();
-        let (_temp, vault) = test_vault().await;
+        let (_temp, vault, _schema) = test_vault().await;
 
         let mut marker = Map::new();
         marker.insert("value".to_string(), Value::String("leave-me".to_string()));
@@ -396,7 +404,7 @@ mod tests {
     async fn delete_then_rebootstrap_yields_new_key() {
         let _serial = TEST_SERIAL.lock().await;
         clear_held();
-        let (_temp, vault) = test_vault().await;
+        let (_temp, vault, _schema) = test_vault().await;
 
         let redis = test_redis().await;
         let first = ensure(&enabled_config(), &vault, redis.clone())
@@ -421,7 +429,7 @@ mod tests {
     async fn concurrent_bootstrap_converges() {
         let _serial = TEST_SERIAL.lock().await;
         clear_held();
-        let (_temp, vault) = test_vault().await;
+        let (_temp, vault, _schema) = test_vault().await;
         let redis = test_redis().await;
 
         let left = {
@@ -465,7 +473,7 @@ mod tests {
         clear_held();
         let redis = test_redis().await;
 
-        let (_temp, vault) = test_vault().await;
+        let (_temp, vault, _schema) = test_vault().await;
         let mut corrupt = Map::new();
         corrupt.insert("value".to_string(), Value::String("not-a-key".to_string()));
         vault
@@ -491,7 +499,7 @@ mod tests {
         );
 
         clear_held();
-        let (_temp_ro, readonly) = test_readonly_vault().await;
+        let (_temp_ro, readonly, _schema_ro) = test_readonly_vault().await;
         assert!(
             ensure(&enabled_config(), &readonly, redis).await.is_err(),
             "unwritable vault must fail closed"
@@ -592,7 +600,7 @@ mod tests {
     async fn logs_generated_branch() {
         let _serial = TEST_SERIAL.lock().await;
         clear_held();
-        let (_temp, vault) = test_vault().await;
+        let (_temp, vault, _schema) = test_vault().await;
         let redis = test_redis().await;
 
         let capture = LogCapture::start();
@@ -622,7 +630,7 @@ mod tests {
     async fn logs_loaded_branch_same_public_key() {
         let _serial = TEST_SERIAL.lock().await;
         clear_held();
-        let (_temp, vault) = test_vault().await;
+        let (_temp, vault, _schema) = test_vault().await;
         let redis = test_redis().await;
 
         let generated = ensure(&enabled_config(), &vault, redis.clone())
@@ -658,7 +666,7 @@ mod tests {
     async fn private_key_never_leaks() {
         let _serial = TEST_SERIAL.lock().await;
         clear_held();
-        let (_temp, vault) = test_vault().await;
+        let (_temp, vault, _schema) = test_vault().await;
         let redis = test_redis().await;
 
         let capture = LogCapture::start();
@@ -714,7 +722,7 @@ mod tests {
 
         clear_held();
         let _ = take_generated_openssh();
-        let (_temp_ro, readonly) = test_readonly_vault().await;
+        let (_temp_ro, readonly, _schema_ro) = test_readonly_vault().await;
         let capture = LogCapture::start();
         let vault_err = ensure(&enabled_config(), &readonly, redis)
             .await

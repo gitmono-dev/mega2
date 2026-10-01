@@ -107,7 +107,11 @@ listed here:
 4. Cover it with `#[cfg(test)]` tests using
    `crate::jupiter::tests::test_db_connection` +
    `crate::jupiter::migration::apply_migrations` (example:
-   `notification/dispatcher.rs::tests`).
+   `notification/dispatcher.rs::tests`). The helper's per-test schema is
+   dropped with the connection, or when the test thread ends if something
+   still holds it; `test_db_config` returns a `TestSchemaGuard` instead,
+   which must stay bound for the whole test
+   (`let (db_config, _schema) = ...`, never `_`).
 
 ## 6. Documentation conventions
 

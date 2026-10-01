@@ -1126,7 +1126,8 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime");
-        let db_config = runtime.block_on(crate::jupiter::tests::test_db_config(temp_dir.path()));
+        let (db_config, _db_schema) =
+            runtime.block_on(crate::jupiter::tests::test_db_config(temp_dir.path()));
 
         // AppContext derives the vault key path from MEGA_BASE_DIR; point it
         // at the temp dir so this test's vault stays isolated (GC-09).

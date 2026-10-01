@@ -316,6 +316,22 @@ docker compose -p mega2-it -f docker/docker-compose.test.yml \
   --profile git up -d --force-recreate --wait git-cli
 ```
 
+**测试 schema 堆积（`mega2_test_*`）**
+
+库内单元测试经 `crate::jupiter::tests::test_db_connection` / `test_db_config`
+为每个用例在 `mega2` 库里建一个 `mega2_test_<pid>_<n>` schema。该 schema 随用例的
+连接（或 `test_db_config` 返回的 `TestSchemaGuard`）一起 `DROP SCHEMA ... CASCADE`，
+panic 路径同样释放；用例线程结束时仍被持有的 schema（例如 vault 的连接池）也在那时释放；早于该守卫的运行留下的 schema 会一直累积，表现为
+`could not resize shared memory segment ... No space left on device`、Postgres 重启失败。
+先看数量，再用脚本清理（破坏性；默认只报告，且跳过仍在运行的测试进程的 schema）：
+
+```bash
+docker compose -p mega2-it -f docker/docker-compose.test.yml exec -T postgres \
+  psql -U mega2 -d mega2 -Atc "select count(*) from pg_namespace where nspname like 'mega2\_test\_%'"
+./scripts/drop_test_schemas.sh                   # 只报告
+./scripts/drop_test_schemas.sh --apply --vacuum  # 真正 drop 并回收系统目录
+```
+
 **website 邮件未进 Mailpit**
 
 ```bash

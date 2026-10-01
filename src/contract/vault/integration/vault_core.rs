@@ -1817,7 +1817,7 @@ mod tests {
         let _capture = tracing::subscriber::set_default(subscriber);
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let db_config = test_db_config(temp_dir.path()).await;
+        let (db_config, _db_schema) = test_db_config(temp_dir.path()).await;
         let key_path = temp_dir.path().join(CORE_KEY_FILE);
         let sentinel = "do-not-log-this-vault-secret-7f3a9c";
 
@@ -2172,7 +2172,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_vault_core_from_database_config_does_not_need_full_storage() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
-        let db_config = test_db_config(temp_dir.path()).await;
+        let (db_config, _db_schema) = test_db_config(temp_dir.path()).await;
         let key_path = temp_dir.path().join(CORE_KEY_FILE);
 
         let vault_core = VaultCore::from_database_config(&db_config, key_path)
@@ -2185,7 +2185,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_vault_reset_wipes_storage_and_backups_key_file() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
-        let db_config = test_db_config(temp_dir.path()).await;
+        let (db_config, _db_schema) = test_db_config(temp_dir.path()).await;
         let key_path = temp_dir.path().join(CORE_KEY_FILE);
 
         let vault_core = VaultCore::from_database_config(&db_config, key_path.clone())
@@ -2410,7 +2410,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_restore_key_verifies_and_replaces_key_file() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
-        let db_config = test_db_config(temp_dir.path()).await;
+        let (db_config, _db_schema) = test_db_config(temp_dir.path()).await;
         let key_path = temp_dir.path().join(CORE_KEY_FILE);
         let vault_storage = vault_storage_for_config(&db_config).await;
         let vault_core = VaultCore::config(vault_storage, key_path.clone())
@@ -2452,7 +2452,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_restore_key_rejects_backup_that_does_not_unlock_vault() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
-        let db_config = test_db_config(temp_dir.path()).await;
+        let (db_config, _db_schema) = test_db_config(temp_dir.path()).await;
         let key_path = temp_dir.path().join(CORE_KEY_FILE);
         let vault_storage = vault_storage_for_config(&db_config).await;
         VaultCore::config(vault_storage, key_path.clone())

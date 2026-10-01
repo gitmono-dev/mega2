@@ -18,11 +18,17 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use crate::{config::Config, context::ReadOnlyContext, notification::service::NotificationService};
 
 /// A config pointed at `db_config`'s database with a local object store.
-async fn read_only_config(temp: &std::path::Path) -> (Config, crate::config::DbConfig) {
-    let db_config = crate::jupiter::tests::test_db_config(temp).await;
+async fn read_only_config(
+    temp: &std::path::Path,
+) -> (
+    Config,
+    crate::config::DbConfig,
+    crate::jupiter::tests::TestSchemaGuard,
+) {
+    let (db_config, schema) = crate::jupiter::tests::test_db_config(temp).await;
     let mut config = crate::config::testing::isolated_config(temp.join("config"));
     config.database = db_config.clone();
-    (config, db_config)
+    (config, db_config, schema)
 }
 
 async fn migrated(db_config: &crate::config::DbConfig) -> DatabaseConnection {
@@ -53,7 +59,7 @@ async fn scalar(connection: &DatabaseConnection, sql: &str) -> i64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_the_read_only_assembly_installs_no_notification_service() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let (config, db_config) = read_only_config(temp.path()).await;
+    let (config, db_config, _db_schema) = read_only_config(temp.path()).await;
     drop(migrated(&db_config).await);
 
     let before = NotificationService::active();
@@ -88,7 +94,7 @@ async fn un43_the_read_only_assembly_installs_no_notification_service() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_an_unreachable_redis_does_not_stop_the_read_only_assembly() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let (mut config, db_config) = read_only_config(temp.path()).await;
+    let (mut config, db_config, _db_schema) = read_only_config(temp.path()).await;
     drop(migrated(&db_config).await);
     // Port 1 has nothing on it, on purpose.
     config.redis.url = "redis://127.0.0.1:1".to_string();
@@ -130,7 +136,7 @@ async fn un43_an_unreachable_redis_does_not_stop_the_read_only_assembly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_the_read_only_assembly_seeds_nothing() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let (config, db_config) = read_only_config(temp.path()).await;
+    let (config, db_config, _db_schema) = read_only_config(temp.path()).await;
     let observer = migrated(&db_config).await;
 
     assert_eq!(
@@ -206,7 +212,7 @@ async fn sidebar_table_exists(connection: &DatabaseConnection) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_a_needed_vault_is_opened_read_only_and_unchanged() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let (mut config, db_config) = read_only_config(temp.path()).await;
+    let (mut config, db_config, _db_schema) = read_only_config(temp.path()).await;
     let observer = migrated(&db_config).await;
     let key_path = temp.path().join("core_key.json");
 
