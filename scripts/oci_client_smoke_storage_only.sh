@@ -19,7 +19,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "oci client"
-require_tools curl jq oras sha256sum mktemp date rm perl
+require_tools curl jq oras sha256sum mktemp date rm perl awk tr
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
@@ -36,5 +36,28 @@ code=$(curl -sS --connect-timeout 3 --max-time 5 -o /dev/null -w '%{http_code}' 
 [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || smoke_die "$MEGA2_BASE_URL/v2/ is not reachable"
 
 export REGISTRY RUN_ID WORK TOKEN MEGA2_BASE_URL
+
+# --- shared OCI helpers -------------------------------------------------
+# oci_curl: curl with bounded connection and total time.
+oci_curl() { curl -sS --connect-timeout 5 --max-time 30 "$@"; }
+# oci_header <file> <name>: exact value of a response header (case-insensitive name).
+oci_header() {
+    awk -v n="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" \
+        'tolower($1) == n":" {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); print; exit}' "$1"
+}
+
+# --- BB-11 OCI ping -----------------------------------------------------
+case_oci_ping() {
+    local hdr="$WORK/ping.hdr" code
+    code=$(oci_curl -D "$hdr" -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/")
+    [ "$code" = 200 ] || { echo "anonymous GET /v2/ returned $code" >&2; return 1; }
+    [ "$(oci_header "$hdr" docker-distribution-api-version)" = "registry/2.0" ] \
+        || { echo "Docker-Distribution-API-Version is not registry/2.0" >&2; return 1; }
+    code=$(oci_curl -D "$hdr" -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer bb-invalid-token' "$MEGA2_BASE_URL/v2/")
+    [ "$code" = 401 ] || { echo "invalid Bearer returned $code" >&2; return 1; }
+    [ -n "$(oci_header "$hdr" www-authenticate)" ] || { echo "401 without WWW-Authenticate" >&2; return 1; }
+}
+
+run_case "OCI ping" case_oci_ping
 
 finish
