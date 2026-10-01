@@ -109,7 +109,24 @@ case_oci_oras_push_pull() {
     [ "$pushed" = "$fetched" ] || { echo "push digest $pushed != descriptor digest $fetched" >&2; return 1; }
 }
 
+# --- BB-13 OCI reject unauthenticated push ------------------------------
+case_oci_reject_unauth_push() {
+    local dir="$WORK/unauth" repo="bb-$RUN_ID/unauth" code
+    oci_case_begin
+    mkdir -p "$dir"
+    export DOCKER_CONFIG="$dir/docker"
+    printf 'unauth\n' > "$dir/f.txt"
+    if (cd "$dir" && oci_t oras push --debug --plain-http "$REGISTRY/$repo:v1" f.txt) > "$dir/push.out" 2>&1; then
+        echo "unauthenticated oras push succeeded" >&2; return 1
+    fi
+    rg -q 'Response Status: "401 Unauthorized"' "$dir/push.out" || { echo "push failure did not mention 401" >&2; redact "$TOKEN" < "$dir/push.out" >&2; return 1; }
+    code=$(oci_curl -o "$dir/tags.json" -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/tags/list")
+    [ "$code" = 404 ] || { echo "tags/list returned $code" >&2; return 1; }
+    [ "$(jq -r '.errors[0].code' "$dir/tags.json")" = NAME_UNKNOWN ] || { echo "tags/list error code is not NAME_UNKNOWN" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
+run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
 
 finish
