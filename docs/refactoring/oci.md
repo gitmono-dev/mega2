@@ -191,4 +191,5 @@ DELETE /uploads/{uuid}        → 按 seq 删分片 + 删行 → 204
 | `src/jupiter/storage/oci_db_storage.rs` | 元数据 CRUD |
 | `config/config-storage-only.toml` `[oci]` | 样例启用 |
 | `scripts/oci_smoke_storage_only.sh` | 宿主机 docker CLI live smoke |
+| `scripts/oci_client_smoke_storage_only.sh` | compose 栈内 `interop-smoke` 的 oras / curl 黑盒 smoke（[plan-20261001](../plan/plan-20261001.md)；运行方式见 [`deploy-trunk.md`](../deploy-trunk.md) §10.4） |
 | `tests/integration_oci.rs` | 进程级黑盒 IT |

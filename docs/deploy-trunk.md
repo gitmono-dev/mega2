@@ -385,3 +385,15 @@ HTTP 明文 registry（如本机 compose `http://127.0.0.1:9000`）需在客户�
 
 manifest/blob `DELETE` 路由存在但恒返回 OCI `UNSUPPORTED`（405）。`_catalog` / referrers 未实现。
 
+### 10.4 Compose 黑盒（oras / curl）
+
+[plan-20261001](plan/plan-20261001.md) 的 OCI 黑盒脚本 `scripts/oci_client_smoke_storage_only.sh` 在 `interop-smoke` 容器内运行（客户端为 `oras` 与 `curl`，不用 libra），经容器内环回中继访问 `http://127.0.0.1:9000/v2/`。先按 §8 启动栈与 `interop-smoke`，单 case 运行并把结果 tee 到本地（输出与退出码契约：`==> / PASS: / FAIL: / SKIP:`，末行 `oci client smoke storage_only summary: …`；0 通过，1 有失败，2 前置错误或 case 名未匹配）：
+
+```bash
+mkdir -p target/tmp; set -o pipefail
+CASE='OCI ping'   # 换成要跑的 case 名
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T -e MEGA2_SMOKE_CASE="$CASE" interop-smoke bash /repo/scripts/oci_client_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-oci-case.log
+```
+
+不设 `MEGA2_SMOKE_CASE` 时整跑全部默认栈 case；opt-in case（auth-none）只经 `scripts/bb_optin_run.sh none oci_client_smoke_storage_only.sh '<case>' <log>` 运行。
+
