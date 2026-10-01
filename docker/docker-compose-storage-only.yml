@@ -227,6 +227,51 @@ services:
       timeout: 5s
       retries: 20
 
+  # Interop black-box runner (docs/plan/plan-20261001.md, ADR-BB-02 / ADR-BB-09):
+  # oras, curl, jq, libra (libra.tools stable), git, git-lfs, ssh. Only started
+  # with `--profile interop`. On start it opens three loopback relays so the
+  # runner sees the same addresses as the host:
+  #   127.0.0.1:9000  -> mega2:8000   (HTTP; libra only sends credentials to
+  #                                    https or loopback hosts)
+  #   127.0.0.1:2222  -> mega2:2222   (SSH)
+  #   127.0.0.1:29000 -> rustfs:9000  (presigned URLs signed for the host port)
+  interop-smoke:
+    image: mega2-interop-smoke:local
+    build:
+      context: ..
+      dockerfile: Dockerfile.interop-smoke
+    profiles: ["interop"]
+    init: true
+    depends_on:
+      mega2:
+        condition: service_healthy
+    environment:
+      MEGA2_BASE_URL: http://127.0.0.1:9000
+      MEGA2_SSH_URL: ssh://git@127.0.0.1:2222
+      MEGA2_IT_SEED_TOKEN: mega2-storage-only-local-dev-token-0001
+    volumes:
+      - ${MEGA2_IT_INTEROP_WORKDIR:-/tmp/mega2-trunk-interop}:/work
+      - ..:/repo:ro
+    working_dir: /work
+    command:
+      - bash
+      - -c
+      - |
+        socat TCP-LISTEN:9000,bind=127.0.0.1,fork,reuseaddr TCP:mega2:8000 &
+        socat TCP-LISTEN:2222,bind=127.0.0.1,fork,reuseaddr TCP:mega2:2222 &
+        socat TCP-LISTEN:29000,bind=127.0.0.1,fork,reuseaddr TCP:rustfs:9000 &
+        exec sleep infinity
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS -o /dev/null http://127.0.0.1:9000/api/openapi.json
+          && curl -sS -o /dev/null http://127.0.0.1:29000/
+          && ssh-keyscan -T 3 -p 2222 127.0.0.1 >/dev/null 2>&1
+      interval: 2s
+      timeout: 10s
+      retries: 30
+
 secrets:
   mega2-push-token:
     # Override for real deployments: MEGA2_PUSH_TOKEN_FILE=/path/to/secret

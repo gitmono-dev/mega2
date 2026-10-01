@@ -191,6 +191,28 @@ git-smoke runner git-lfs 固定版本: `git-lfs/3.8.0`
 | secret | **不**注入任何 secret；token 由 seed 步骤写入 compose `postgres`，经 URL 注入 |
 | 目标 OS / 降级 | 跨平台（bridge 网络，非 host 网络）；macOS/Windows Docker Desktop 亦可跑。git pin 与 `git-cli` 一致 |
 
+### interop-smoke（storage-only 栈互通黑盒 runner，profile `interop`）
+
+`docker/docker-compose-storage-only.yml`（项目 `mega2-trunk`）里的互通黑盒 runner，供 [`plan-20261001`](../plan/plan-20261001.md) 的 OCI / Artifacts / Libra 三个 smoke 脚本使用。与 `git-smoke` 并存、互不替代：`git-smoke` 只用 `git` 观察 Git 协议面，`interop-smoke` 用 `oras` / `curl` / `jq` / `libra` 观察其余公开面。
+
+interop-smoke libra 版本: 构建时 libra.tools 最新 stable（镜像内 `/etc/interop-smoke/libra-version` 记录实际版本，下限 `0.30.8`）
+
+| 项 | 值 |
+|---|---|
+| 服务名 | `interop-smoke` |
+| 镜像 | `mega2-interop-smoke:local`（本地构建，`build: Dockerfile.interop-smoke`）。`base` 阶段为固定 digest 的 `debian:trixie-slim`（glibc 2.41，libra 官方二进制要求 ≥ 2.39）+ bash / curl / git / jq / openssh-client / openssl / ripgrep / shellcheck / socat，git-lfs `3.8.0` 与 oras `1.3.4` 按固定 sha256 校验；最终阶段用 libra.tools 官方安装器（`LIBRA_REQUIRE_CHECKSUM=1`）安装 libra |
+| 端口 | 无宿主端口映射。容器内以 socat 建三条只绑定 `127.0.0.1` 的环回中继：`9000 → mega2:8000`、`2222 → mega2:2222`、`29000 → rustfs:9000`，使 runner 看到与宿主机相同的地址（libra 只对 https 或环回地址附带凭据；presigned URL 签名主机为 `127.0.0.1:29000`） |
+| healthcheck | 三条中继均可达：`curl` 拉 `http://127.0.0.1:9000/api/openapi.json`、`curl` 访问 `http://127.0.0.1:29000/`、`ssh-keyscan -p 2222 127.0.0.1` |
+| entrypoint / init | `command` 启动三个 socat 后 `exec sleep infinity`（常驻供 `exec`）；`init: true` |
+| 网络 | 默认 `mega2-trunk-network` |
+| 卷 / 工作目录 | `${MEGA2_IT_INTEROP_WORKDIR:-/tmp/mega2-trunk-interop}` → `/work`（`working_dir: /work`）；仓库根只读挂载到 `/repo` |
+| 环境 | `MEGA2_BASE_URL=http://127.0.0.1:9000`、`MEGA2_SSH_URL=ssh://git@127.0.0.1:2222`、`MEGA2_IT_SEED_TOKEN`（与 git-smoke 相同的公开本地开发 token） |
+| profiles | `profiles: ["interop"]`（**不**参与默认 `up -d --wait`） |
+| depends_on | `mega2`（`condition: service_healthy`） |
+| 清理 | `docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop down`（加 `-v` 为破坏性清卷） |
+| 运行示例 | `docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop up -d --wait --build interop-smoke`，再 `… --profile interop exec -T interop-smoke bash /repo/scripts/<smoke>.sh` |
+| secret | 不注入 secret；token 为公开本地开发值，脚本输出经 `redact` 脱敏 |
+
 ### mega2（compose 常驻 HTTP，profile `app`）
 
 被测产品进程进入 compose 拓扑的登记条目。**与 cargo 黑盒分层并存**：`bin/tests/integration_*.rs` 仍通过 `CARGO_BIN_EXE_mega2` 按用例拉起隔离进程（唯一端口 / 临时 `MEGA_BASE_DIR` / 隔离 DB）；本服务提供**栈级常驻** `service http`，供 compose smoke、手工联调与 CI 健康探针使用，**不**替代 per-case 隔离门。

@@ -132,6 +132,14 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
 # push token 默认: mega2-storage-only-local-dev-token-0001
 ```
 
+互通黑盒 runner `interop-smoke`（profile `interop`，[plan-20261001](plan/plan-20261001.md)；登记见 [test-infra](refactoring/test-infra.md)）不随默认 `up` 启动，需要时单独构建并启动：
+
+```bash
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop up -d --wait --build interop-smoke
+```
+
+容器内的环回中继让 `127.0.0.1:9000`（HTTP）、`127.0.0.1:2222`（SSH）、`127.0.0.1:29000`（RustFS）与宿主机地址一致。
+
 ### 8.1 Compose 黑盒 Git 协议 smoke（`git` 客户端）
 
 Trunk / storage-only 协议冒烟使用 **`scripts/git_protocol_smoke_storage_only.sh`**，经 compose `--profile smoke` 的 `git-smoke` 容器内真实 **`git` / `git-lfs` / `ssh`** 调用已发布端口。这是 **compose 黑盒**，与 cargo `CARGO_BIN_EXE` 黑盒分层并存；**不要**用 `libra` 作协议客户端，也**不要**在 trunk 上跑 review/CL 语义的 `scripts/git_protocol_smoke.sh`。
