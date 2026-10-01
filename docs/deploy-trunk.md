@@ -149,6 +149,8 @@ scripts/bb_optin_run.sh --selftest local target/tmp/<log>   # 自测：桩命令
 
 - `scripts/bb_optin_run.sh` 退出码 0：case 通过，且 mega2 已恢复默认配置（log 含 `bb-optin: restored mega2 (config hash match)`）。
 - `scripts/bb_optin_run.sh` 退出码 1：case 失败，且 mega2 已恢复默认配置。
+- `scripts/bb_optin_run.sh` 退出码 2：参数或前置错误（未知模式、env-file 缺失、另一个 helper 持有栈锁），未切栈。
+- `scripts/bb_optin_run.sh` 退出码 3：恢复失败（config hash 不符或 mega2 不健康），需人工执行 `docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml up -d --wait --force-recreate mega2`。
 
 ### 8.1 Compose 黑盒 Git 协议 smoke（`git` 客户端）
 
@@ -382,3 +384,4 @@ HTTP 明文 registry（如本机 compose `http://127.0.0.1:9000`）需在客户�
 | 跨仓 mount | 目标写授权 + 源读授权。 |
 
 manifest/blob `DELETE` 路由存在但恒返回 OCI `UNSUPPORTED`（405）。`_catalog` / referrers 未实现。
+
