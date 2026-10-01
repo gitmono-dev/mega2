@@ -146,6 +146,9 @@ Trunk / storage-only 协议冒烟使用 **`scripts/git_protocol_smoke_storage_on
 
 产品 **API 写 → Git 可见性** 另用 **`scripts/api_write_smoke_storage_only.sh`**（`curl` + `git`；同样禁止 `libra` 客户端）：
 
+> 作用域注记（2026-10-02，plan-20261001 ADR-BB-03）：本条约束 Git 协议 smoke 与 API 写 smoke 的客户端；Libra↔mega2 互通黑盒（`scripts/libra_smoke_storage_only.sh`）以 libra 作被测客户端，见 [plan-20261001](plan/plan-20261001.md)。
+
+
 ```bash
 TOKEN='mega2-storage-only-local-dev-token-0001'
 docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile smoke \
