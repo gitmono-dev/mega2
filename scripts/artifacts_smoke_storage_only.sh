@@ -279,11 +279,31 @@ case_art_commit_missing_objects() {
     [ "$code" = 404 ] || { echo "GET sets/{id} for the uncommitted set returned $code" >&2; return 1; }
 }
 
+# --- BB-37 ART commit replay and conflict -------------------------------
+case_art_commit_replay_conflict() {
+    local d="$WORK/bb37" ns="bb37-$RUN_ID" dir="bb37/$RUN_ID" set_id oid size code
+    mkdir -p "$d"
+    art_case_begin
+    set_id=$(art_set_id)
+    printf 'bb37 %s\n' "$RUN_ID" > "$d/obj"
+    read -r oid _ <<< "$(art_seed "$ns" "$dir/a.txt" "$d/obj" null "$set_id")"
+    [ -n "$oid" ] || { echo "seed commit failed" >&2; return 1; }
+    size=$(wc -c < "$d/obj" | tr -d ' ')
+    art_commit_body "$ns" "$dir/a.txt" "$oid" "$size" "$set_id" > "$d/replay.json"
+    code=$(art_post commit "$d/replay.json" "$d/replay.out")
+    [ "$code" = 200 ] || { echo "replaying the same manifest returned $code" >&2; return 1; }
+    jq -e '.status == "ok"' "$d/replay.out" > /dev/null || { echo "replay status is $(art_show .status "$d/replay.out"), want \"ok\"" >&2; return 1; }
+    art_commit_body "$ns" "$dir/b.txt" "$oid" "$size" "$set_id" > "$d/conflict.json"
+    code=$(art_post commit "$d/conflict.json" "$d/conflict.out")
+    [ "$code" = 409 ] || { echo "a different manifest for the same artifact_set_id returned $code" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
 run_case "ART presigned download" case_art_presigned_download
 run_case "ART reject unauthenticated write" case_art_reject_unauth_write
 run_case "ART commit with missing objects" case_art_commit_missing_objects
+run_case "ART commit replay and conflict" case_art_commit_replay_conflict
 
 finish
