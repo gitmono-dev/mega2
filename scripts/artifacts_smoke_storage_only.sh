@@ -20,7 +20,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "artifacts"
-require_tools curl jq sha256sum mktemp date rm perl head
+require_tools curl jq sha256sum mktemp date rm perl head od tr wc mkdir
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
@@ -78,6 +78,83 @@ case_art_discovery() {
     jq -e '.transfers.signed_url_get == true' "$out" > /dev/null || { echo "transfers.signed_url_get is $(art_show .transfers.signed_url_get "$out"), want true" >&2; return 1; }
 }
 
+# art_oid: a random RFC 4122 version-4 UUID (artifact object ids are UUIDs).
+art_oid() {
+    local hex variant
+    hex=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    variant=$(printf '%x' $(( (0x${hex:16:1} & 0x3) | 0x8 )))
+    printf '%s-%s-4%s-%s%s-%s\n' "${hex:0:8}" "${hex:8:4}" "${hex:13:3}" "$variant" "${hex:17:3}" "${hex:20:12}"
+}
+# The push token reaches curl through a 0600 header file, never argv.
+ART_AUTH_HEADER="$WORK/auth.header"
+(umask 077; printf 'Authorization: Bearer %s\n' "$TOKEN" > "$ART_AUTH_HEADER") || smoke_die "cannot write the auth header file"
+# art_post <endpoint> <json file> <out file>: authenticated JSON POST below
+# $ART_API; prints the HTTP status.
+art_post() {
+    art_curl -H @"$ART_AUTH_HEADER" -H 'Content-Type: application/json' --data @"$2" -o "$3" -w '%{http_code}' "$ART_API/$1"
+}
+# art_set_id: a run-scoped artifact_set_id (ADR-BB-07).
+art_set_id() {
+    printf 'set-%s-%s\n' "$RUN_ID" "$(art_oid)"
+}
+# art_origin <url>: scheme://authority of a URL, redacted for messages.
+art_origin() {
+    local rest="${1#*://}"
+    printf '%s://%s\n' "${1%%://*}" "${rest%%[/?#]*}" | redact "$TOKEN"
+}
+# art_presigned <url>: the URL's query (fragment ignored) carries SigV4 query
+# authentication with a non-empty signature.
+art_presigned() {
+    local url="${1%%#*}" query
+    query="${url#*\?}"
+    [ "$query" != "$url" ] || return 1
+    case "&$query&" in *"&X-Amz-Algorithm=AWS4-HMAC-SHA256&"*) ;; *) return 1 ;; esac
+    case "&$query&" in *"&X-Amz-Signature="[!\&]*) return 0 ;; *) return 1 ;; esac
+}
+# art_batch_body <ns> <path> <oid> <size> and art_commit_body <ns> <path>
+# <oid> <size> <artifact_set_id>: one-object request bodies (object_type
+# snapshot).
+art_batch_body() {
+    jq -n --arg ns "$1" --arg path "$2" --arg oid "$3" --argjson size "$4" \
+        '{namespace: $ns, object_type: "snapshot", intent: "upload", objects: [{path: $path, oid: $oid, size: $size}]}'
+}
+art_commit_body() {
+    jq -n --arg ns "$1" --arg path "$2" --arg oid "$3" --argjson size "$4" --arg set "$5" \
+        '{namespace: $ns, object_type: "snapshot", artifact_set_id: $set, files: [{path: $path, oid: $oid, size: $size}]}'
+}
+
+# --- BB-32 ART presigned upload and commit ------------------------------
+case_art_presigned_upload_commit() {
+    local d="$WORK/bb32" ns="bb32-$RUN_ID" path="bb32/$RUN_ID/obj.txt" oid size code href ctype set_id
+    mkdir -p "$d"
+    art_case_begin
+    oid=$(art_oid)
+    set_id=$(art_set_id)
+    printf 'bb32 presigned upload %s\n' "$RUN_ID" > "$d/obj"
+    size=$(wc -c < "$d/obj" | tr -d ' ')
+    art_batch_body "$ns" "$path" "$oid" "$size" > "$d/batch.json"
+    code=$(art_post batch "$d/batch.json" "$d/batch.out")
+    [ "$code" = 200 ] || { echo "batch returned $code" >&2; return 1; }
+    jq -e '.objects[0].exists == false' "$d/batch.out" > /dev/null || { echo "batch reported exists=$(art_show .objects[0].exists "$d/batch.out") for a new oid, want false" >&2; return 1; }
+    href=$(jq -r '.objects[0].actions.upload.href // empty' "$d/batch.out")
+    [ -n "$href" ] || { echo "batch returned no presigned upload href" >&2; return 1; }
+    [ "$(art_origin "$href")" = http://127.0.0.1:29000 ] || { echo "upload href host is $(art_origin "$href"), want http://127.0.0.1:29000" >&2; return 1; }
+    art_presigned "$href" || { echo "upload href carries no SigV4 query signature" >&2; return 1; }
+    ctype=$(jq -r '.objects[0].actions.upload.header["Content-Type"] // "application/octet-stream"' "$d/batch.out")
+    [[ "$ctype" =~ ^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$ ]] || { echo "upload Content-Type header is not a plain media type" >&2; return 1; }
+    code=$(art_curl -X PUT -H "Content-Type: $ctype" --data-binary @"$d/obj" -o /dev/null -w '%{http_code}' "$href")
+    [[ "$code" =~ ^2[0-9][0-9]$ ]] || { echo "presigned PUT returned $code" >&2; return 1; }
+    art_commit_body "$ns" "$path" "$oid" "$size" "$set_id" > "$d/commit.json"
+    code=$(art_post commit "$d/commit.json" "$d/commit.out")
+    [ "$code" = 200 ] || { echo "commit returned $code" >&2; return 1; }
+    jq -e '.status == "ok"' "$d/commit.out" > /dev/null || { echo "commit status is $(art_show .status "$d/commit.out"), want \"ok\"" >&2; return 1; }
+    jq -e --arg id "$set_id" '.artifact_set_id == $id' "$d/commit.out" > /dev/null || { echo "commit returned artifact_set_id $(art_show .artifact_set_id "$d/commit.out"), want the run-scoped id it sent" >&2; return 1; }
+    code=$(art_curl -o "$d/sets.json" -w '%{http_code}' "$ART_API/sets?namespace=$ns&object_type=snapshot")
+    [ "$code" = 200 ] || { echo "anonymous GET sets returned $code" >&2; return 1; }
+    jq -e --arg id "$set_id" 'any(.sets[]; .artifact_set_id == $id)' "$d/sets.json" > /dev/null || { echo "anonymous GET sets does not list the committed set" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
+run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 
 finish
