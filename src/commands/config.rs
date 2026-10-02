@@ -1381,6 +1381,7 @@ mod tests {
                 access_key_id: access_key_ref.as_uri().to_string(),
                 secret_access_key: secret_key_ref.as_uri().to_string(),
                 endpoint_url: String::new(),
+                public_endpoint_url: String::new(),
             },
             ..Default::default()
         };

@@ -1290,6 +1290,12 @@ fn validate_s3_config(
         require_non_empty("object_storage.s3.endpoint_url", &s3.endpoint_url)?;
         validate_http_url("object_storage.s3.endpoint_url", &s3.endpoint_url)?;
     }
+    if !s3.public_endpoint_url.is_empty() {
+        validate_origin_url(
+            "object_storage.s3.public_endpoint_url",
+            &s3.public_endpoint_url,
+        )?;
+    }
 
     Ok(())
 }
@@ -1379,6 +1385,59 @@ fn require_non_empty_path(field_path: &str, value: &Path) -> Result<(), MegaErro
         return Err(MegaError::Other(format!("{field_path} must not be empty")));
     }
 
+    Ok(())
+}
+
+/// An http(s) origin: scheme, host and optional port only. Userinfo (even an
+/// empty `@`), a query, a fragment, whitespace and any path other than `/` are
+/// rejected on the raw value, before URL parsing can normalize them away, so
+/// the value can be used as a presigning endpoint without leaking credentials
+/// or changing the signed path.
+fn validate_origin_url(field_path: &str, value: &str) -> Result<(), MegaError> {
+    validate_http_url(field_path, value)?;
+    let url = Url::parse(value)
+        .map_err(|e| MegaError::Other(format!("{field_path} must be a valid URL: {e}")))?;
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(MegaError::Other(format!(
+            "{field_path} must include a host"
+        )));
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(MegaError::Other(format!(
+            "{field_path} must not contain whitespace or control characters"
+        )));
+    }
+    let Some(rest) = ["http://", "https://"].into_iter().find_map(|prefix| {
+        value
+            .get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .map(|_| &value[prefix.len()..])
+    }) else {
+        return Err(MegaError::Other(format!(
+            "{field_path} must start with http:// or https://"
+        )));
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len()));
+    if authority.contains('@') {
+        return Err(MegaError::Other(format!(
+            "{field_path} must not contain credentials"
+        )));
+    }
+    if tail.contains('?') {
+        return Err(MegaError::Other(format!(
+            "{field_path} must not contain a query"
+        )));
+    }
+    if tail.contains('#') {
+        return Err(MegaError::Other(format!(
+            "{field_path} must not contain a fragment"
+        )));
+    }
+    if !matches!(tail, "" | "/") {
+        return Err(MegaError::Other(format!(
+            "{field_path} must not contain a path"
+        )));
+    }
     Ok(())
 }
 
@@ -1812,6 +1871,7 @@ fn is_sensitive_source_field_path(field_path: &str) -> bool {
             | "object_storage.s3.access_key_id"
             | "object_storage.s3.secret_access_key"
             | "object_storage.s3.endpoint_url"
+            | "object_storage.s3.public_endpoint_url"
             | "notification.webhook.token_ref"
     )
 }
@@ -2023,6 +2083,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "access_key_id",
             "secret_access_key",
             "endpoint_url",
+            "public_endpoint_url",
         ]),
         "object_storage.gcs" => Some(&["bucket"]),
         "object_storage.local" => Some(&["root_dir"]),
@@ -3040,6 +3101,108 @@ mod tests {
         assert!(err.to_string().contains("max_files"));
     }
 
+    fn pub_ep_cfg_config(public_endpoint_url: &str) -> Config {
+        let mut config = valid_config();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3Compatible,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "mega2".to_string(),
+                access_key_id: "ak".to_string(),
+                secret_access_key: "sk".to_string(),
+                endpoint_url: "http://rustfs:9000".to_string(),
+                public_endpoint_url: public_endpoint_url.to_string(),
+            },
+            ..Default::default()
+        };
+        config
+    }
+
+    fn pub_ep_cfg_error(public_endpoint_url: &str) -> String {
+        pub_ep_cfg_config(public_endpoint_url)
+            .validate()
+            .expect_err("public_endpoint_url must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn pub_ep_cfg_accepts_origin() {
+        for value in [
+            "http://127.0.0.1:29000",
+            "https://s3.example.com/",
+            "HTTP://127.0.0.1:29000",
+            "http://[::1]:29000/",
+        ] {
+            let result = pub_ep_cfg_config(value).validate();
+            assert!(result.is_ok(), "{value}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn pub_ep_cfg_rejects_non_url() {
+        for value in [
+            "not-a-url",
+            "http:/127.0.0.1:29000",
+            "http:127.0.0.1:29000",
+            " http://127.0.0.1:29000",
+            "http://127.0.0.1:\t29000",
+        ] {
+            let err = pub_ep_cfg_error(value);
+            assert!(
+                err.contains("object_storage.s3.public_endpoint_url"),
+                "{value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn pub_ep_cfg_rejects_userinfo() {
+        for value in [
+            "http://user:secret@127.0.0.1:29000",
+            "http://@127.0.0.1:29000",
+            "http://:@127.0.0.1:29000",
+        ] {
+            let err = pub_ep_cfg_error(value);
+            assert!(
+                err.contains("must not contain credentials"),
+                "{value}: {err}"
+            );
+            assert!(!err.contains('@'), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn pub_ep_cfg_rejects_query() {
+        let err = pub_ep_cfg_error("http://127.0.0.1:29000?x=1");
+        assert!(err.contains("must not contain a query"), "{err}");
+    }
+
+    #[test]
+    fn pub_ep_cfg_rejects_fragment() {
+        let err = pub_ep_cfg_error("http://127.0.0.1:29000#f");
+        assert!(err.contains("must not contain a fragment"), "{err}");
+    }
+
+    #[test]
+    fn pub_ep_cfg_rejects_non_root_path() {
+        for value in [
+            "http://127.0.0.1:29000/prefix",
+            "http://127.0.0.1:29000/prefix/..",
+            "http://127.0.0.1:29000/.",
+            "http://127.0.0.1:29000\\",
+        ] {
+            let err = pub_ep_cfg_error(value);
+            assert!(err.contains("must not contain a path"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn pub_ep_cfg_sensitive_source_field() {
+        assert!(is_sensitive_source_field_path(
+            "object_storage.s3.public_endpoint_url"
+        ));
+    }
+
     #[test]
     fn config_validate_accepts_omitted_unused_object_storage_sections() {
         let mut config = valid_config();
@@ -3051,6 +3214,7 @@ mod tests {
                 access_key_id: "ak".to_string(),
                 secret_access_key: "sk".to_string(),
                 endpoint_url: "http://127.0.0.1:9000".to_string(),
+                public_endpoint_url: String::new(),
             },
             ..Default::default()
         };
@@ -3113,6 +3277,7 @@ mod tests {
                 access_key_id: "key".to_string(),
                 secret_access_key: "secret".to_string(),
                 endpoint_url: String::new(),
+                public_endpoint_url: String::new(),
             },
             ..Default::default()
         };
@@ -3137,6 +3302,7 @@ mod tests {
                 secret_access_key:
                     "vault://secret/config/prod/object_storage/secret_access_key#value".to_string(),
                 endpoint_url: String::new(),
+                public_endpoint_url: String::new(),
             },
             ..Default::default()
         };
@@ -3157,6 +3323,7 @@ mod tests {
                 access_key_id: "vault://secret/config/prod/object-storage/access#value".to_string(),
                 secret_access_key: "secret".to_string(),
                 endpoint_url: String::new(),
+                public_endpoint_url: String::new(),
             },
             ..Default::default()
         };
@@ -3183,6 +3350,7 @@ mod tests {
                 access_key_id: "AKIA-example".to_string(),
                 secret_access_key: "vault://secret/config/prod/mail/password#value".to_string(),
                 endpoint_url: String::new(),
+                public_endpoint_url: String::new(),
             },
             ..Default::default()
         };
@@ -3209,6 +3377,7 @@ mod tests {
                 access_key_id: "key".to_string(),
                 secret_access_key: "secret".to_string(),
                 endpoint_url: String::new(),
+                public_endpoint_url: String::new(),
             },
             ..Default::default()
         };
@@ -3231,6 +3400,7 @@ mod tests {
                 access_key_id: "key".to_string(),
                 secret_access_key: "secret".to_string(),
                 endpoint_url: "http://localhost:9000".to_string(),
+                public_endpoint_url: String::new(),
             },
             ..Default::default()
         };

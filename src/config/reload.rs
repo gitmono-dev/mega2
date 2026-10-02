@@ -817,6 +817,13 @@ fn collect_object_storage_restart_fields(
             .restart_required_fields
             .push("object_storage.s3.endpoint_url");
     }
+    if current.object_storage.s3.public_endpoint_url
+        != candidate.object_storage.s3.public_endpoint_url
+    {
+        report
+            .restart_required_fields
+            .push("object_storage.s3.public_endpoint_url");
+    }
     if current.object_storage.gcs.bucket != candidate.object_storage.gcs.bucket {
         report
             .restart_required_fields
@@ -1279,6 +1286,26 @@ mod tests {
                 batch_limit: 100,
             }
         );
+    }
+
+    #[test]
+    fn pub_ep_cfg_reload_requires_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let current = isolated_config(temp_dir.path().join("current"));
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.object_storage.s3.public_endpoint_url = "http://127.0.0.1:29000".to_string();
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(
+            report.restart_required_fields,
+            vec!["object_storage.s3.public_endpoint_url"]
+        );
+        assert!(snapshot.object_storage.s3.public_endpoint_url.is_empty());
     }
 
     #[test]

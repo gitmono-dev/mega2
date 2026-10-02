@@ -1241,6 +1241,7 @@ async fn build_publication_store(
                 region: "us-east-1".into(),
                 bucket: "mega2".into(),
                 endpoint_url: "http://127.0.0.1:19000".into(),
+                public_endpoint_url: String::new(),
                 access_key_id: "rustfs".into(),
                 secret_access_key: "rustfs_secret".into(),
             },

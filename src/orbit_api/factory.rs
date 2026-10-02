@@ -15,6 +15,11 @@ pub struct S3Config {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub endpoint_url: String,
+    /// Optional endpoint used only to sign presigned URLs on the `s3compatible`
+    /// backend. It must be reachable by the clients that follow those URLs; data
+    /// reads and writes keep using `endpoint_url`. Empty = sign with `endpoint_url`.
+    #[serde(default)]
+    pub public_endpoint_url: String,
 }
 
 impl std::fmt::Debug for S3Config {
@@ -143,6 +148,7 @@ mod tests {
             access_key_id: "AKIA_EXAMPLE".into(),
             secret_access_key: "super-secret-value".into(),
             endpoint_url: String::new(),
+            public_endpoint_url: String::new(),
         };
         let dbg = format!("{cfg:?}");
         assert!(
@@ -221,6 +227,7 @@ bucket = "mega2"
             access_key_id: "a".into(),
             secret_access_key: "s".into(),
             endpoint_url: String::new(),
+            public_endpoint_url: String::new(),
         };
         assert!(
             cfg.validate().is_ok(),
