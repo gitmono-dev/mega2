@@ -154,7 +154,37 @@ case_art_presigned_upload_commit() {
     jq -e --arg id "$set_id" 'any(.sets[]; .artifact_set_id == $id)' "$d/sets.json" > /dev/null || { echo "anonymous GET sets does not list the committed set" >&2; return 1; }
 }
 
+# art_server_put <oid> <file>: authenticated fallback PUT objects/{oid};
+# prints the HTTP status.
+art_server_put() {
+    art_curl -H @"$ART_AUTH_HEADER" -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$2" \
+        -o /dev/null -w '%{http_code}' "$ART_API/objects/$1"
+}
+
+# --- BB-33 ART server PUT upload and commit -----------------------------
+case_art_server_put_commit() {
+    local d="$WORK/bb33" ns="bb33-$RUN_ID" path="bb33/$RUN_ID/obj.txt" oid size code set_id
+    mkdir -p "$d"
+    art_case_begin
+    oid=$(art_oid)
+    set_id=$(art_set_id)
+    printf 'bb33 server put %s\n' "$RUN_ID" > "$d/obj"
+    size=$(wc -c < "$d/obj" | tr -d ' ')
+    code=$(art_server_put "$oid" "$d/obj")
+    [ "$code" = 204 ] || { echo "fallback PUT returned $code" >&2; return 1; }
+    art_batch_body "$ns" "$path" "$oid" "$size" > "$d/batch.json"
+    code=$(art_post batch "$d/batch.json" "$d/batch.out")
+    [ "$code" = 200 ] || { echo "batch returned $code" >&2; return 1; }
+    jq -e '.objects[0].exists == true' "$d/batch.out" > /dev/null || { echo "batch reported exists=$(art_show .objects[0].exists "$d/batch.out") after the fallback PUT, want true" >&2; return 1; }
+    art_commit_body "$ns" "$path" "$oid" "$size" "$set_id" > "$d/commit.json"
+    code=$(art_post commit "$d/commit.json" "$d/commit.out")
+    [ "$code" = 200 ] || { echo "commit returned $code" >&2; return 1; }
+    jq -e '.status == "ok"' "$d/commit.out" > /dev/null || { echo "commit status is $(art_show .status "$d/commit.out"), want \"ok\"" >&2; return 1; }
+    jq -e --arg id "$set_id" '.artifact_set_id == $id' "$d/commit.out" > /dev/null || { echo "commit returned artifact_set_id $(art_show .artifact_set_id "$d/commit.out"), want the run-scoped id it sent" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
+run_case "ART server PUT upload and commit" case_art_server_put_commit
 
 finish
