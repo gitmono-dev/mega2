@@ -32,6 +32,7 @@ impl std::fmt::Debug for S3Config {
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"[REDACTED]")
             .field("endpoint_url", &self.endpoint_url)
+            .field("public_endpoint_url", &self.public_endpoint_url)
             .finish()
     }
 }

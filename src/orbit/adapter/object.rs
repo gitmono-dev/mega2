@@ -116,7 +116,10 @@ impl MegaObjectStorage for ObjectStoreAdapter {
 
         let url = match &self.store {
             BackendStore::S3(s3) => Some(
-                s3.signed_url(method, &path, expires_in)
+                self.presign_store
+                    .as_ref()
+                    .unwrap_or(s3)
+                    .signed_url(method, &path, expires_in)
                     .await
                     .map_err(IoOrbitError::from)?
                     .to_string(),

@@ -218,3 +218,9 @@ mega2 对 orbit 的"实现 crate 项目引用"实际上**只落在一处**——
 - multipart 聚合成固定 **8 MiB** part，最后一块可更小；stream 错误或 `complete` 失败时 `abort`，不发布半成品。
 - 既有 `put_stream` 策略不变（Git/LFS/Artifact/Attachment 仍走原来的 SinglePut/Multipart/idempotent 分支）。
 
+## presign 签名端点（2026-10-02，plan-20261001 FIX-BB-02）
+
+- `object_storage.s3.public_endpoint_url`（可选，默认空）只影响 **presigned URL 的签名主机**：`s3compatible` 后端在它非空时额外构建一个仅用于签名的 `AmazonS3`（`ObjectStoreAdapter::presign_store`），`signed_url`（artifacts presigned GET / PUT、LFS presigned 传输）改用它签名；数据读写仍走 `endpoint_url` 构建的 store。
+- 签名是本地计算，不发网络请求；SigV4 签名覆盖 `host`，所以客户端必须用签名时的主机访问该 URL。该端点必须对跟随 URL 的客户端可达，并指向与 `endpoint_url` 同一个对象存储。
+- `s3`（AWS）后端忽略该字段，仍用区域端点签名；GCS / local 无此概念。
+- 配置校验（FIX-BB-01）只接受 http(s) origin：拒绝 userinfo、query、fragment 与非根路径；该键变化需重启。

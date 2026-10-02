@@ -42,6 +42,10 @@ pub struct ObjectStoreAdapter {
     pub store: BackendStore,
     /// The upload strategy used when writing new objects.
     pub upload_strategy: UploadStrategy,
+    /// S3-compatible only: a store used just to sign presigned URLs against a
+    /// client-reachable endpoint (`object_storage.s3.public_endpoint_url`).
+    /// `None` signs with `store`.
+    pub presign_store: Option<Arc<AmazonS3>>,
 }
 
 /// Supported backend implementations for object storage.
@@ -570,6 +574,7 @@ mod tests {
         let adapter = ObjectStoreAdapter {
             store: BackendStore::Local(Arc::new(store)),
             upload_strategy: UploadStrategy::SinglePut,
+            presign_store: None,
         };
         let key = ObjectKey {
             namespace: ObjectNamespace::Lfs,
@@ -594,6 +599,7 @@ mod tests {
         let adapter = ObjectStoreAdapter {
             store: BackendStore::Local(Arc::new(store)),
             upload_strategy: UploadStrategy::SinglePut,
+            presign_store: None,
         };
         let key = ObjectKey {
             namespace: ObjectNamespace::Lfs,
