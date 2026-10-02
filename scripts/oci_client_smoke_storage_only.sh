@@ -311,6 +311,32 @@ case_oci_image_index() {
         || { echo "index platforms are not linux/amd64 and linux/arm64" >&2; return 1; }
 }
 
+# --- BB-20 OCI reject manifest with unknown blob ------------------------
+case_oci_manifest_unknown_blob() {
+    local d="$WORK/unknown" repo="bb-$RUN_ID/unknown" cfg_dg cfg_size missing code
+    oci_case_begin
+    mkdir -p "$d"
+    printf '{}' > "$d/config.json"
+    code=$(oci_put_blob "$repo" "$d/config.json")
+    [ "$code" = 201 ] || { echo "config blob upload returned $code" >&2; return 1; }
+    cfg_dg=$(oci_digest "$d/config.json")
+    cfg_size=$(wc -c < "$d/config.json" | tr -d ' ')
+    head -c 64 /dev/urandom > "$d/never-uploaded"
+    missing=$(oci_digest "$d/never-uploaded")
+    jq -n --arg c "$cfg_dg" --argjson cs "$cfg_size" --arg l "$missing" '{
+        schemaVersion: 2,
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        config: {mediaType: "application/vnd.oci.image.config.v1+json", digest: $c, size: $cs},
+        layers: [{mediaType: "application/vnd.oci.image.layer.v1.tar", digest: $l, size: 64}]}' > "$d/manifest.json"
+    code=$(oci_curl -u "bb:$TOKEN" -X PUT -o "$d/put.json" -w '%{http_code}' \
+        -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary @"$d/manifest.json" \
+        "$MEGA2_BASE_URL/v2/$repo/manifests/v1")
+    [ "$code" = 400 ] || { echo "manifest PUT returned $code" >&2; return 1; }
+    [ "$(jq -r '.errors[0].code' "$d/put.json")" = MANIFEST_BLOB_UNKNOWN ] || { echo "error code is not MANIFEST_BLOB_UNKNOWN" >&2; return 1; }
+    code=$(oci_curl -I -H 'Accept: application/vnd.oci.image.manifest.v1+json' -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/manifests/v1")
+    [ "$code" = 404 ] || { echo "HEAD of the rejected tag returned $code" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
 run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
@@ -320,5 +346,6 @@ run_case "OCI manifest HEAD and conditional GET" case_oci_manifest_head_304
 run_case "OCI blob range" case_oci_blob_range
 run_case "OCI tags list pagination" case_oci_tags_pagination
 run_case "OCI image index manifest" case_oci_image_index
+run_case "OCI reject manifest with unknown blob" case_oci_manifest_unknown_blob
 
 finish

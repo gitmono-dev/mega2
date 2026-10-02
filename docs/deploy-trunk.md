@@ -395,7 +395,7 @@ CASE='OCI ping'   # 换成要跑的 case 名
 docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T -e MEGA2_SMOKE_CASE="$CASE" interop-smoke bash /repo/scripts/oci_client_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-oci-case.log
 ```
 
-已登记 case：`OCI ping`、`OCI oras push and pull`、`OCI reject unauthenticated push`、`OCI chunked blob upload`、`OCI cross-repo blob mount`、`OCI manifest HEAD and conditional GET`、`OCI blob range`、`OCI tags list pagination`、`OCI image index manifest`。
+已登记 case：`OCI ping`、`OCI oras push and pull`、`OCI reject unauthenticated push`、`OCI chunked blob upload`、`OCI cross-repo blob mount`、`OCI manifest HEAD and conditional GET`、`OCI blob range`、`OCI tags list pagination`、`OCI image index manifest`、`OCI reject manifest with unknown blob`。
 
 不设 `MEGA2_SMOKE_CASE` 时整跑全部默认栈 case；opt-in case（auth-none）只经 `scripts/bb_optin_run.sh none oci_client_smoke_storage_only.sh '<case>' <log>` 运行。
 
