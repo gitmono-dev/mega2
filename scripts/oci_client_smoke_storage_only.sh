@@ -337,6 +337,27 @@ case_oci_manifest_unknown_blob() {
     [ "$code" = 404 ] || { echo "HEAD of the rejected tag returned $code" >&2; return 1; }
 }
 
+# --- BB-21 OCI delete unsupported ---------------------------------------
+case_oci_delete_unsupported() {
+    local d="$WORK/delete" repo="bb-$RUN_ID/delete" dg layer code accept
+    oci_case_begin
+    accept='Accept: application/vnd.oci.image.manifest.v1+json'
+    dg=$(oci_oras_push "$repo:v1" "$d")
+    code=$(oci_curl -H "$accept" -o "$d/manifest.json" -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/manifests/$dg")
+    [ "$code" = 200 ] || { echo "manifest GET returned $code" >&2; return 1; }
+    layer=$(jq -r '.layers[0].digest' "$d/manifest.json")
+    [[ "$layer" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "manifest has no valid layer digest" >&2; return 1; }
+    code=$(oci_curl -I -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/blobs/$layer")
+    [ "$code" = 200 ] || { echo "layer blob HEAD before DELETE returned $code" >&2; return 1; }
+    code=$(oci_curl -u "bb:$TOKEN" -X DELETE -o "$d/del-m.json" -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/manifests/$dg")
+    [ "$code" = 405 ] || { echo "manifest DELETE returned $code" >&2; return 1; }
+    [ "$(jq -r '.errors[0].code' "$d/del-m.json")" = UNSUPPORTED ] || { echo "manifest DELETE code is not UNSUPPORTED" >&2; return 1; }
+    code=$(oci_curl -u "bb:$TOKEN" -X DELETE -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/blobs/$layer")
+    [ "$code" = 405 ] || { echo "blob DELETE returned $code" >&2; return 1; }
+    code=$(oci_curl -H "$accept" -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/manifests/$dg")
+    [ "$code" = 200 ] || { echo "manifest GET after DELETE returned $code" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
 run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
@@ -347,5 +368,6 @@ run_case "OCI blob range" case_oci_blob_range
 run_case "OCI tags list pagination" case_oci_tags_pagination
 run_case "OCI image index manifest" case_oci_image_index
 run_case "OCI reject manifest with unknown blob" case_oci_manifest_unknown_blob
+run_case "OCI delete unsupported" case_oci_delete_unsupported
 
 finish
