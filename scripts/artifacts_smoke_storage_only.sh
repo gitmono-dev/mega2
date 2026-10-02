@@ -236,9 +236,27 @@ case_art_presigned_download() {
     art_presigned "$href" || { echo "mode=link href carries no SigV4 query signature" >&2; return 1; }
 }
 
+# --- BB-35 ART reject unauthenticated write -----------------------------
+case_art_reject_unauth_write() {
+    local d="$WORK/bb35" ns="bb35-$RUN_ID" path="bb35/$RUN_ID/obj.txt" oid code
+    mkdir -p "$d"
+    art_case_begin
+    oid=$(art_oid)
+    printf 'bb35\n' > "$d/obj"
+    art_batch_body "$ns" "$path" "$oid" 5 > "$d/batch.json"
+    code=$(art_curl -H 'Content-Type: application/json' --data @"$d/batch.json" -o /dev/null -w '%{http_code}' "$ART_API/batch")
+    [ "$code" = 401 ] || { echo "batch without a token returned $code" >&2; return 1; }
+    art_commit_body "$ns" "$path" "$oid" 5 "$(art_set_id)" > "$d/commit.json"
+    code=$(art_curl -H 'Content-Type: application/json' --data @"$d/commit.json" -o /dev/null -w '%{http_code}' "$ART_API/commit")
+    [ "$code" = 401 ] || { echo "commit without a token returned $code" >&2; return 1; }
+    code=$(art_curl -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$d/obj" -o /dev/null -w '%{http_code}' "$ART_API/objects/$oid")
+    [ "$code" = 401 ] || { echo "fallback PUT without a token returned $code" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
 run_case "ART presigned download" case_art_presigned_download
+run_case "ART reject unauthenticated write" case_art_reject_unauth_write
 
 finish
