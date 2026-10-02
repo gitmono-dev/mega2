@@ -19,7 +19,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "oci client"
-require_tools curl jq oras sha256sum mktemp date rm perl awk tr timeout rg grep head tail cut wc
+require_tools curl jq oras sha256sum mktemp date rm perl awk tr timeout rg grep head tail cut wc cmp
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
@@ -229,11 +229,30 @@ case_oci_manifest_head_304() {
     [ "$code" = 304 ] || { echo "conditional GET returned $code" >&2; return 1; }
 }
 
+# --- BB-17 OCI blob range -----------------------------------------------
+case_oci_blob_range() {
+    local d="$WORK/range" repo="bb-$RUN_ID/range" dg code
+    oci_case_begin
+    mkdir -p "$d"
+    head -c 100 /dev/urandom > "$d/blob"
+    dg=$(oci_digest "$d/blob")
+    code=$(oci_put_blob "$repo" "$d/blob")
+    [ "$code" = 201 ] || { echo "blob upload returned $code" >&2; return 1; }
+    code=$(oci_curl -H 'Range: bytes=0-9' -D "$d/h" -o "$d/part" -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/blobs/$dg")
+    [ "$code" = 206 ] || { echo "Range GET returned $code" >&2; return 1; }
+    [ "$(oci_header "$d/h" content-range)" = "bytes 0-9/100" ] || { echo "Content-Range is '$(oci_header "$d/h" content-range)'" >&2; return 1; }
+    [ "$(wc -c < "$d/part" | tr -d ' ')" = 10 ] || { echo "Range body is not 10 bytes" >&2; return 1; }
+    head -c 10 "$d/blob" | cmp -s - "$d/part" || { echo "Range body differs from the first 10 blob bytes" >&2; return 1; }
+    code=$(oci_curl -H 'Range: bytes=100-' -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/blobs/$dg")
+    [ "$code" = 416 ] || { echo "out-of-range GET returned $code" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
 run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
 run_case "OCI chunked blob upload" case_oci_chunked_upload
 run_case "OCI cross-repo blob mount" case_oci_cross_repo_mount
 run_case "OCI manifest HEAD and conditional GET" case_oci_manifest_head_304
+run_case "OCI blob range" case_oci_blob_range
 
 finish
