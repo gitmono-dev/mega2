@@ -408,3 +408,19 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profil
 
 不设 `MEGA2_SMOKE_CASE` 时整跑全部默认栈 case；opt-in case（auth-none）只经 `scripts/bb_optin_run.sh none oci_client_smoke_storage_only.sh '<case>' <log>` 运行。
 
+## 11. storage-only Artifacts 协议黑盒（curl）
+
+[plan-20261001](plan/plan-20261001.md) 的 Artifacts 黑盒脚本 `scripts/artifacts_smoke_storage_only.sh` 在 `interop-smoke` 容器内运行（客户端为 `curl`，不用 libra），经容器内环回中继访问 `http://127.0.0.1:9000/api/v1/repos/<repo>/artifacts/`；每次运行都在带 `RUN_ID` 的 repo 与 namespace 下读写，可在脏卷上重跑。先按 §8 启动栈与 `interop-smoke`，整跑或单 case 运行并把结果 tee 到本地（输出与退出码契约：`==> / PASS: / FAIL: / SKIP:`，末行 `artifacts smoke storage_only summary: …`；0 通过，1 有失败，2 前置错误或 case 名未匹配）：
+
+```bash
+mkdir -p target/tmp; set -o pipefail
+# 整跑全部默认栈 case（尚未登记 case 时输出 0 passed 并退出 0）
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T interop-smoke bash /repo/scripts/artifacts_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-art-all.log
+# 单 case：CASE 取下方「已登记 case」中的名字
+CASE='<case>'
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T -e MEGA2_SMOKE_CASE="$CASE" interop-smoke bash /repo/scripts/artifacts_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-art-case.log
+```
+
+已登记 case：尚无（随各 case 卡登记）。
+
+不设 `MEGA2_SMOKE_CASE` 时整跑全部默认栈 case；opt-in case（auth-none、GC、本地存储）只经 `scripts/bb_optin_run.sh <none|gc|local> artifacts_smoke_storage_only.sh '<case>' <log>` 运行。
