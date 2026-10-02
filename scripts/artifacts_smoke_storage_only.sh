@@ -465,6 +465,28 @@ case_art_conditional_get_head() {
     [ "$code" = 302 ] || { echo "GET with a non-matching If-None-Match returned $code" >&2; return 1; }
 }
 
+# --- BB-45 ART anonymous write (none) -----------------------------------
+# Opt-in (MEGA2_SMOKE_AUTH_NONE=1): run through
+# `scripts/bb_optin_run.sh none ...`, whose config sets push_auth = "none".
+case_art_anonymous_write_none() {
+    local d="$WORK/bb45" ns="bb45-$RUN_ID" path="bb45/$RUN_ID/obj.bin" oid size code set_id
+    mkdir -p "$d"
+    art_case_begin
+    oid=$(art_oid)
+    set_id=$(art_set_id)
+    head -c 1024 /dev/urandom > "$d/obj"
+    size=$(wc -c < "$d/obj" | tr -d ' ')
+    code=$(art_curl -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$d/obj" \
+        -o /dev/null -w '%{http_code}' "$ART_API/objects/$oid")
+    [ "$code" = 204 ] || { echo "anonymous fallback PUT returned $code" >&2; return 1; }
+    art_commit_body "$ns" "$path" "$oid" "$size" "$set_id" > "$d/commit.json"
+    code=$(art_curl -H 'Content-Type: application/json' --data @"$d/commit.json" -o "$d/commit.out" -w '%{http_code}' "$ART_API/commit")
+    [ "$code" = 200 ] || { echo "anonymous commit returned $code" >&2; return 1; }
+    jq -e --arg id "$set_id" '.status == "ok" and .artifact_set_id == $id' "$d/commit.out" > /dev/null || { echo "anonymous commit status is $(art_show .status "$d/commit.out"), want \"ok\" for the run-scoped id" >&2; return 1; }
+    art_download "$ART_API/objects/$oid" "$d/got" || return 1
+    cmp -s "$d/obj" "$d/got" || { echo "anonymously read bytes differ from the upload" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -479,5 +501,6 @@ run_case "ART set detail" case_art_set_detail
 run_case "ART repo isolation" case_art_repo_isolation
 run_case "ART input validation" case_art_input_validation
 run_case "ART conditional GET and HEAD" case_art_conditional_get_head
+optin_case "ART anonymous write (none)" MEGA2_SMOKE_AUTH_NONE case_art_anonymous_write_none
 
 finish
