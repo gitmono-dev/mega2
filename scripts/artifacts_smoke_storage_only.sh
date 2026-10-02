@@ -364,6 +364,37 @@ case_art_resolve_file() {
     [ "$code" = 404 ] || { echo "resolve-file for an absent path returned $code" >&2; return 1; }
 }
 
+# --- BB-41 ART set detail -----------------------------------------------
+case_art_set_detail() {
+    local d="$WORK/bb41" ns="bb41-$RUN_ID" oid1 oid2 size1 size2 code set_id
+    mkdir -p "$d"
+    art_case_begin
+    oid1=$(art_oid)
+    oid2=$(art_oid)
+    set_id=$(art_set_id)
+    printf 'bb41 one %s\n' "$RUN_ID" > "$d/one"
+    printf 'bb41 two, longer %s\n' "$RUN_ID" > "$d/two"
+    size1=$(wc -c < "$d/one" | tr -d ' ')
+    size2=$(wc -c < "$d/two" | tr -d ' ')
+    code=$(art_server_put "$oid1" "$d/one")
+    [ "$code" = 204 ] || { echo "fallback PUT of file one returned $code" >&2; return 1; }
+    code=$(art_server_put "$oid2" "$d/two")
+    [ "$code" = 204 ] || { echo "fallback PUT of file two returned $code" >&2; return 1; }
+    jq -n --arg ns "$ns" --arg set "$set_id" --arg dir "bb41/$RUN_ID" --arg o1 "$oid1" --arg o2 "$oid2" --argjson s1 "$size1" --argjson s2 "$size2" \
+        '{namespace: $ns, object_type: "snapshot", artifact_set_id: $set,
+          files: [{path: "\($dir)/one.txt", oid: $o1, size: $s1}, {path: "\($dir)/sub/two.txt", oid: $o2, size: $s2}]}' > "$d/commit.json"
+    code=$(art_post commit "$d/commit.json" "$d/commit.out")
+    [ "$code" = 200 ] || { echo "commit returned $code" >&2; return 1; }
+    jq -e --arg id "$set_id" '.status == "ok" and .artifact_set_id == $id' "$d/commit.out" > /dev/null || { echo "commit status is $(art_show .status "$d/commit.out"), want \"ok\" for the run-scoped id" >&2; return 1; }
+    code=$(art_curl -o "$d/detail.json" -w '%{http_code}' "$ART_API/sets/$set_id?namespace=$ns&object_type=snapshot")
+    [ "$code" = 200 ] || { echo "GET sets/{id} returned $code" >&2; return 1; }
+    jq -e --slurpfile req "$d/commit.json" \
+        '([.files[] | {path, oid, size}] | sort_by(.path)) == ($req[0].files | sort_by(.path))' "$d/detail.json" > /dev/null \
+        || { echo "set detail files $(art_show '[.files[] | {path, oid, size}]' "$d/detail.json") differ from the commit request" >&2; return 1; }
+    code=$(art_curl -o /dev/null -w '%{http_code}' "$ART_API/sets/$(art_set_id)?namespace=$ns&object_type=snapshot")
+    [ "$code" = 404 ] || { echo "GET sets/{id} for an unknown id returned $code" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -374,5 +405,6 @@ run_case "ART commit replay and conflict" case_art_commit_replay_conflict
 run_case "ART list sets pagination" case_art_list_sets_pagination
 run_case "ART metadata filters" case_art_metadata_filters
 run_case "ART resolve file" case_art_resolve_file
+run_case "ART set detail" case_art_set_detail
 
 finish
