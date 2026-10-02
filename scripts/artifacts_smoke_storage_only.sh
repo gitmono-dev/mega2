@@ -20,7 +20,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "artifacts"
-require_tools curl jq sha256sum mktemp date rm perl head od tr wc mkdir cut
+require_tools curl jq sha256sum mktemp date rm perl head od tr wc mkdir cut cmp
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
@@ -395,6 +395,33 @@ case_art_set_detail() {
     [ "$code" = 404 ] || { echo "GET sets/{id} for an unknown id returned $code" >&2; return 1; }
 }
 
+# --- BB-42 ART repo isolation -------------------------------------------
+case_art_repo_isolation() {
+    local d="$WORK/bb42" ns="bb42-$RUN_ID" oid b_oid code enc_api b_api
+    mkdir -p "$d"
+    art_case_begin
+    printf 'bb42 repo a %s\n' "$RUN_ID" > "$d/a"
+    read -r oid _ <<< "$(art_seed "$ns" "bb42/$RUN_ID/a.txt" "$d/a")"
+    [ -n "$oid" ] || { echo "seed commit failed" >&2; return 1; }
+    # Repo B serves its own committed object, so its 404 for A's object is
+    # isolation rather than an unavailable repo.
+    b_api="$MEGA2_BASE_URL/api/v1/repos/bb-art-other-$RUN_ID/artifacts"
+    printf 'bb42 repo b %s\n' "$RUN_ID" > "$d/b-own"
+    read -r b_oid _ <<< "$(ART_API="$b_api" art_seed "$ns" "bb42/$RUN_ID/b-own.txt" "$d/b-own")"
+    [ -n "$b_oid" ] || { echo "seed commit under repo B failed" >&2; return 1; }
+    art_download "$b_api/objects/$b_oid" "$d/b-own.got" || { echo "repo B cannot read its own object" >&2; return 1; }
+    cmp -s "$d/b-own" "$d/b-own.got" || { echo "repo B returned different bytes for its own object" >&2; return 1; }
+    code=$(art_curl -o /dev/null -w '%{http_code}' "$b_api/objects/$oid")
+    [ "$code" = 404 ] || { echo "reading repo A's object under repo B returned $code" >&2; return 1; }
+    # A repo name with a slash travels as one %2F-encoded path segment.
+    enc_api="$MEGA2_BASE_URL/api/v1/repos/bb-org-$RUN_ID%2Fproject/artifacts"
+    head -c 2048 /dev/urandom > "$d/b"
+    read -r oid _ <<< "$(ART_API="$enc_api" art_seed "$ns" "bb42/$RUN_ID/b.bin" "$d/b")"
+    [ -n "$oid" ] || { echo "seed commit under org%2Fproject failed" >&2; return 1; }
+    art_download "$enc_api/objects/$oid" "$d/b.got" || return 1
+    cmp -s "$d/b" "$d/b.got" || { echo "bytes downloaded under org%2Fproject differ from the upload" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -406,5 +433,6 @@ run_case "ART list sets pagination" case_art_list_sets_pagination
 run_case "ART metadata filters" case_art_metadata_filters
 run_case "ART resolve file" case_art_resolve_file
 run_case "ART set detail" case_art_set_detail
+run_case "ART repo isolation" case_art_repo_isolation
 
 finish
