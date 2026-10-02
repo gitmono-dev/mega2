@@ -422,6 +422,28 @@ case_art_repo_isolation() {
     cmp -s "$d/b" "$d/b.got" || { echo "bytes downloaded under org%2Fproject differ from the upload" >&2; return 1; }
 }
 
+# --- BB-43 ART input validation -----------------------------------------
+case_art_input_validation() {
+    local d="$WORK/bb43" ns="bb43-$RUN_ID" dir="bb43/$RUN_ID" oid code
+    mkdir -p "$d"
+    art_case_begin
+    oid=$(art_oid)
+    art_batch_body "$ns" "$dir/../escape.txt" "$oid" 1 > "$d/dotdot.json"
+    code=$(art_post batch "$d/dotdot.json" "$d/dotdot.out")
+    [ "$code" = 400 ] || { echo "a path with .. returned $code" >&2; return 1; }
+    art_batch_body "$ns" "/$dir/abs.txt" "$oid" 1 > "$d/abs.json"
+    code=$(art_post batch "$d/abs.json" "$d/abs.out")
+    [ "$code" = 400 ] || { echo "a path starting with / returned $code" >&2; return 1; }
+    art_batch_body "$ns" "$dir/ok.txt" not-a-uuid 1 > "$d/oid.json"
+    code=$(art_post batch "$d/oid.json" "$d/oid.out")
+    [ "$code" = 400 ] || { echo "a non-UUID oid returned $code" >&2; return 1; }
+    jq -n --arg ns "$ns" --arg set "$(art_set_id)" --arg dir "$dir" --arg o1 "$(art_oid)" --arg o2 "$(art_oid)" \
+        '{namespace: $ns, object_type: "snapshot", artifact_set_id: $set,
+          files: [{path: "\($dir)/dup.txt", oid: $o1, size: 1}, {path: "\($dir)/dup.txt", oid: $o2, size: 1}]}' > "$d/dup.json"
+    code=$(art_post commit "$d/dup.json" "$d/dup.out")
+    [ "$code" = 400 ] || { echo "a commit with a duplicate path returned $code" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -434,5 +456,6 @@ run_case "ART metadata filters" case_art_metadata_filters
 run_case "ART resolve file" case_art_resolve_file
 run_case "ART set detail" case_art_set_detail
 run_case "ART repo isolation" case_art_repo_isolation
+run_case "ART input validation" case_art_input_validation
 
 finish
