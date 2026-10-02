@@ -149,7 +149,7 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profil
 
 容器内的环回中继让 `127.0.0.1:9000`（HTTP）、`127.0.0.1:2222`（SSH）、`127.0.0.1:29000`（RustFS）与宿主机地址一致。
 
-opt-in case（需要切换 mega2 配置的 case）一律经宿主侧 helper 运行，helper 用 `trap` 保证无论成败都把 mega2 恢复为默认配置并比对 compose config hash：
+opt-in case（需要切换 mega2 配置的 case）一律经宿主侧 helper 运行，helper 用 `trap` 保证无论成败都把 mega2 恢复为默认配置；切换后与恢复后都读取运行中 mega2 容器的 compose config hash 标签，分别与切换配置、默认配置的 hash 比对（[plan-20261001](plan/plan-20261001.md) FIX-BB-07）：
 
 ```bash
 scripts/bb_optin_run.sh <none|gc|local> <script> '<case>' target/tmp/<log>
@@ -157,9 +157,9 @@ scripts/bb_optin_run.sh --selftest local target/tmp/<log>   # 自测：桩命令
 ```
 
 - `scripts/bb_optin_run.sh` 退出码 0：case 通过，且 mega2 已恢复默认配置（log 含 `bb-optin: restored mega2 (config hash match)`）。
-- `scripts/bb_optin_run.sh` 退出码 1：case 失败，且 mega2 已恢复默认配置。
+- `scripts/bb_optin_run.sh` 退出码 1：case 失败，或切换后运行中 mega2 容器的 compose config hash 标签不是切换配置的 hash（case 未运行）；两种情况下 mega2 都已恢复默认配置。
 - `scripts/bb_optin_run.sh` 退出码 2：参数或前置错误（未知模式、env-file 缺失、另一个 helper 持有栈锁），未切栈。
-- `scripts/bb_optin_run.sh` 退出码 3：恢复失败（config hash 不符或 mega2 不健康），需人工执行 `docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml up -d --wait --force-recreate mega2`。
+- `scripts/bb_optin_run.sh` 退出码 3：恢复失败（运行中 mega2 的 config hash 不是默认配置的 hash，或 mega2 不健康），需人工执行 `docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml up -d --wait --force-recreate mega2`。
 
 ### 8.1 Compose 黑盒 Git 协议 smoke（`git` 客户端）
 

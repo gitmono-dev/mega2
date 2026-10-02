@@ -14,9 +14,11 @@
 #
 # The case runs inside the `interop-smoke` service with its opt-in switch set
 # (MEGA2_SMOKE_AUTH_NONE / MEGA2_SMOKE_ARTIFACTS_GC / MEGA2_SMOKE_LOCAL_STORAGE)
-# and its output is tee'd to <log>. An EXIT trap recreates mega2 with the
-# default configuration and compares its compose config hash with the one
-# recorded before the switch.
+# and its output is tee'd to <log>. After the switch, and again after an
+# EXIT trap recreates mega2 with the default configuration, the helper reads
+# the compose config-hash label of the running mega2 container: it must equal
+# the switched configuration's hash before the case runs, and the default
+# configuration's hash (recorded before the switch) after restoration.
 #
 # <script> must be one of the three plan-20261001 smoke entrypoints, and a
 # zero exit is only accepted when the log holds `PASS: <case>`.
@@ -25,14 +27,19 @@
 # `bb-optin-selftest-case-ran`, reads the artifacts discovery document and
 # prints `bb-optin-selftest-signed_url_put=<value>`, then exits 1.
 #
-# Exit codes: 0 = case passed and stack restored; 1 = case failed and stack
+# Exit codes: 0 = case passed and stack restored; 1 = case failed, or the
+# switch did not take effect and the case did not run, and the stack was
 # restored; 2 = argument or precondition error (unknown mode, missing env
 # file, stack lock held) and nothing was switched; 3 = restoration failed
-# (config hash mismatch or mega2 not healthy) and needs manual recovery.
+# (the running mega2's config hash is not the default one, or mega2 is not
+# healthy) and needs manual recovery.
 #
 # Test-only knobs: MEGA2_OPTIN_CONFIG_DIR overrides the env-file directory
 # (default `config`); MEGA2_OPTIN_FAULT_RESTORE=hash|unhealthy forces the
-# post-restore hash check or health wait to report failure.
+# post-restore hash check or health wait to report failure, and =stale skips
+# the restoring recreate so the check sees the still-switched container;
+# MEGA2_OPTIN_FAULT_SWITCH=stale skips the switching recreate so the switch
+# check sees the still-default container.
 #
 # Only one helper run may own the mega2-trunk stack at a time: a lock
 # directory is held from the initial config hash through restoration.
@@ -44,6 +51,7 @@ cd "$ROOT"
 COMPOSE=(docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml)
 CONFIG_DIR="${MEGA2_OPTIN_CONFIG_DIR:-config}"
 FAULT="${MEGA2_OPTIN_FAULT_RESTORE:-}"
+SWITCH_FAULT="${MEGA2_OPTIN_FAULT_SWITCH:-}"
 
 selftest=0
 if [ "${1:-}" = "--selftest" ]; then
@@ -123,6 +131,13 @@ config_hash() {
     "$@" config --hash mega2 | awk '{print $2}'
 }
 
+# Compose stores the service config hash on the container it created.
+running_hash() {
+    local id
+    id=$("${COMPOSE[@]}" ps -q mega2) && [ -n "$id" ] || return 1
+    docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$id"
+}
+
 default_hash=$(config_hash "${COMPOSE[@]}")
 say "bb-optin: config hash before: $default_hash"
 
@@ -130,10 +145,13 @@ say "bb-optin: config hash before: $default_hash"
 restore() {
     local rc=$?
     set +e
-    "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate mega2 >> "$log" 2>&1
-    local up_rc=$?
+    local up_rc=0
+    if [ "$FAULT" != "stale" ]; then
+        "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate mega2 >> "$log" 2>&1
+        up_rc=$?
+    fi
     local after
-    after=$(config_hash "${COMPOSE[@]}")
+    after=$(running_hash)
     if [ "$FAULT" = "unhealthy" ]; then up_rc=99; fi
     if [ "$FAULT" = "hash" ]; then after="fault-injected"; fi
     rmdir "$LOCK_DIR"
@@ -146,13 +164,20 @@ restore() {
 }
 trap restore EXIT
 
-"${COMPOSE[@]}" "${switched_args[@]}" up -d --wait --no-deps --force-recreate mega2 >> "$log" 2>&1
+if [ "$SWITCH_FAULT" != "stale" ]; then
+    "${COMPOSE[@]}" "${switched_args[@]}" up -d --wait --no-deps --force-recreate mega2 >> "$log" 2>&1
+fi
 switched_hash=$(config_hash "${COMPOSE[@]}" "${switched_args[@]}")
 if [ "$switched_hash" = "$default_hash" ]; then
     say "bb-optin: switch did not change the mega2 config (hash $switched_hash)"
     exit 1
 fi
-say "bb-optin: switched config hash $default_hash != $switched_hash"
+running=$(running_hash || true)
+if [ "$running" != "$switched_hash" ]; then
+    say "bb-optin: running mega2 config hash ${running:-<none>} is not the switched $switched_hash"
+    exit 1
+fi
+say "bb-optin: switched config hash $default_hash != $running"
 
 set +e
 if [ "$selftest" -eq 1 ]; then
