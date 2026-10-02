@@ -247,6 +247,29 @@ case_oci_blob_range() {
     [ "$code" = 416 ] || { echo "out-of-range GET returned $code" >&2; return 1; }
 }
 
+# --- BB-18 OCI tags list pagination -------------------------------------
+case_oci_tags_pagination() {
+    local d="$WORK/tags" repo="bb-$RUN_ID/tags" code link
+    oci_case_begin
+    oci_oras_push "$repo:t1" "$d" >/dev/null
+    oci_run "$d/tag.out" oras tag --plain-http "$REGISTRY/$repo:t1" t2 t3
+    code=$(oci_curl -D "$d/h1" -o "$d/p1.json" -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/tags/list?n=2")
+    [ "$code" = 200 ] || { echo "tags/list n=2 returned $code" >&2; return 1; }
+    [ "$(jq -r .name "$d/p1.json")" = "$repo" ] || { echo "first page names another repository" >&2; return 1; }
+    [ "$(jq -c .tags "$d/p1.json")" = '["t1","t2"]' ] || { echo "first page tags are $(jq -c .tags "$d/p1.json")" >&2; return 1; }
+    link=$(oci_header "$d/h1" link)
+    case "$link" in *'rel="next"'*) ;; *) echo "first page without a rel=\"next\" Link" >&2; return 1 ;; esac
+    link=${link#<}; link=${link%%>*}
+    code=$(oci_curl -D "$d/h2" -o "$d/p2.json" -w '%{http_code}' "$(oci_abs "$link")")
+    [ "$code" = 200 ] || { echo "following Link returned $code" >&2; return 1; }
+    [ "$(jq -r .name "$d/p2.json")" = "$repo" ] || { echo "second page names another repository" >&2; return 1; }
+    [ "$(jq -c .tags "$d/p2.json")" = '["t3"]' ] || { echo "second page tags are $(jq -c .tags "$d/p2.json")" >&2; return 1; }
+    if grep -qi '^link:' "$d/h2"; then echo "last page still has a Link header" >&2; return 1; fi
+    code=$(oci_curl -o "$d/bad.json" -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/tags/list?n=abc")
+    [ "$code" = 400 ] || { echo "n=abc returned $code" >&2; return 1; }
+    [ "$(jq -r '.errors[0].code' "$d/bad.json")" = PAGINATION_NUMBER_INVALID ] || { echo "n=abc error code mismatch" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
 run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
@@ -254,5 +277,6 @@ run_case "OCI chunked blob upload" case_oci_chunked_upload
 run_case "OCI cross-repo blob mount" case_oci_cross_repo_mount
 run_case "OCI manifest HEAD and conditional GET" case_oci_manifest_head_304
 run_case "OCI blob range" case_oci_blob_range
+run_case "OCI tags list pagination" case_oci_tags_pagination
 
 finish
