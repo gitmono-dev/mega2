@@ -176,6 +176,13 @@ secret_access_key = ""
 # set this to the service endpoint.
 endpoint_url = "http://localhost:9000"
 
+# Optional host used only to sign presigned URLs (artifact and LFS transfers)
+# on the s3compatible backend, for clients that cannot reach endpoint_url
+# (e.g. a container-network address). It must be a bare http(s) origin with
+# no credentials, query, fragment or path; empty = sign with endpoint_url.
+# Real AWS S3 ignores it. Changing it requires a restart.
+# public_endpoint_url = "http://127.0.0.1:29000"
+
 
 [object_storage.gcs]
 # Name of the GCS bucket

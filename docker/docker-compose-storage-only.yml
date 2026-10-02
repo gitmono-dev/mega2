@@ -136,6 +136,10 @@ services:
       MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY: ${MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY:-rustfs_secret}
       # In-network endpoint (sample file uses host 127.0.0.1:29000 for bare-metal).
       MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: ${MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL:-http://rustfs:9000}
+      # Presigned URLs (artifacts / LFS) are signed for the host-published RustFS
+      # port so host clients can follow them (docs/refactoring/orbit.md).
+      # In-network LFS smoke: the lfs-innetwork env-file signs for rustfs:9000.
+      MEGA_OBJECT_STORAGE__S3__PUBLIC_ENDPOINT_URL: ${MEGA_OBJECT_STORAGE__S3__PUBLIC_ENDPOINT_URL:-http://127.0.0.1:29000}
       MEGA_LOG__PRINT_STD: "true"
       MEGA_LOG__LEVEL: info
       # Host-facing LFS / capability URLs (published on 127.0.0.1:9000).
@@ -199,7 +203,9 @@ services:
   # Persist host log: tee to target/tmp/so-smoke-*.log (see docs/deploy-trunk.md).
   # Review/CL smoke remains scripts/git_protocol_smoke.sh (do not use on trunk).
   #
-  # NOTE: LFS hrefs use MEGA_HTTP__PUBLIC_BASE_URL (default host 127.0.0.1:9000).
+  # NOTE: LFS hrefs use MEGA_HTTP__PUBLIC_BASE_URL (default host 127.0.0.1:9000)
+  # and presigned object URLs use MEGA_OBJECT_STORAGE__S3__PUBLIC_ENDPOINT_URL
+  # (default host 127.0.0.1:29000).
   # For in-network LFS smoke (git-smoke → mega2), recreate with:
   #   --env-file config/compose.env.storage-only.lfs-innetwork
   git-smoke:

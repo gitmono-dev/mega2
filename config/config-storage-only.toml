@@ -283,6 +283,16 @@ bucket = "mega2"
 access_key_id = "rustfs"
 secret_access_key = "rustfs_secret"
 endpoint_url = "http://127.0.0.1:29000"
+# public_endpoint_url (optional): host used only to sign presigned URLs
+# (artifacts / LFS); every client that follows those URLs must reach it.
+# Bare http(s) origin, empty = sign with endpoint_url, restart to change.
+# Unset here because endpoint_url above is already host-reachable; compose
+# switches endpoint_url to rustfs:9000 and therefore sets
+# MEGA_OBJECT_STORAGE__S3__PUBLIC_ENDPOINT_URL=http://127.0.0.1:29000.
+# public_endpoint_url(可选):仅用于 presigned URL(artifacts / LFS)的签名主机,
+# 跟随 URL 的客户端必须可达;只能是 http(s) origin,空 = 用 endpoint_url 签名,
+# 修改需重启.此处 endpoint_url 已是宿主可达地址,无需设置;compose 把
+# endpoint 改成 rustfs:9000,因此默认设为 http://127.0.0.1:29000.
 
 [cedar]
 # Authorization enforcement: "off" | "shadow" | "enforce".

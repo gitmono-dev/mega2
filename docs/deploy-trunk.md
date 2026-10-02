@@ -132,6 +132,15 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
 # push token 默认: mega2-storage-only-local-dev-token-0001
 ```
 
+presigned URL 签名主机（[plan-20261001](plan/plan-20261001.md) FIX-BB-03）：mega2 在网内经 `http://rustfs:9000` 读写对象，compose 默认把 `MEGA_OBJECT_STORAGE__S3__PUBLIC_ENDPOINT_URL` 设为 `http://127.0.0.1:29000`，artifacts / LFS 的 presigned URL 按宿主发布的 RustFS 端口签名，宿主机客户端可以直接跟随（键语义见 [orbit](refactoring/orbit.md)；网内 LFS 见 §8.1）。宿主侧往返检查（batch → presigned PUT → commit → 跟随 302 下载 → 比对 sha256，整轮限时 60 秒，可用 `MEGA2_PRESIGN_CHECK_BUDGET` 调整）：
+
+```bash
+MEGA2_BASE_URL=http://127.0.0.1:9000 MEGA2_IT_SEED_TOKEN="$(cat secrets/mega2-push-token.local)" \
+  scripts/artifacts_presign_host_check.sh
+```
+
+脚本逐步打印 `presign-put: <status>`、`commit-status: <status>`、`sha256 match`；只有上传 URL 与下载跳转目标都按 `MEGA2_PRESIGN_ORIGIN`（默认 `http://127.0.0.1:29000`）签名、presigned PUT 为 2xx、commit 为 `ok`、下载内容 sha256 一致时退出 0，缺少工具或 token 时退出 2；token 不回显，签名 URL 打印时去掉 query。
+
 互通黑盒 runner `interop-smoke`（profile `interop`，[plan-20261001](plan/plan-20261001.md)；登记见 [test-infra](refactoring/test-infra.md)）不随默认 `up` 启动，需要时单独构建并启动：
 
 ```bash
@@ -215,7 +224,7 @@ docker compose -p mega2-trunk \
 
 切回默认 token 样例：去掉第二个 `-f`，再 `--force-recreate mega2`。
 
-LFS 网内 URL（ADR-SO-04）：`--env-file config/compose.env.storage-only.lfs-innetwork` 把 `MEGA_HTTP__PUBLIC_BASE_URL` / `MEGA_LFS__SSH__HTTP_URL` 设为 `http://mega2:8000`，供 `git-smoke` 容器内 LFS href 可达。opt-in case：`HTTP LFS push and pull (trunk)`（需 `MEGA2_GIT_SMOKE_PUSH=1` + `MEGA2_GIT_SMOKE_LFS=1` + token）。
+LFS 网内 URL（ADR-SO-04）：`--env-file config/compose.env.storage-only.lfs-innetwork` 把 `MEGA_HTTP__PUBLIC_BASE_URL` / `MEGA_LFS__SSH__HTTP_URL` 设为 `http://mega2:8000`，并设 `MEGA_OBJECT_STORAGE__S3__PUBLIC_ENDPOINT_URL=http://rustfs:9000`（presigned LFS URL 改按网内 RustFS 签名，plan-20261001 FIX-BB-03），供 `git-smoke` 容器内 LFS href 可达。opt-in case：`HTTP LFS push and pull (trunk)`（需 `MEGA2_GIT_SMOKE_PUSH=1` + `MEGA2_GIT_SMOKE_LFS=1` + token）。
 
 ```bash
 docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml \
