@@ -264,7 +264,7 @@ EOF
 # → {"artifact_set_id":"...","status":"ok","missing_objects":[]}
 ```
 
-确认 `missing_objects` 为空；其中列出的对象未能在存储中找到，因此不会加入已提交的 Artifact Set。要读回文件，请使用预签名下载 URL；`curl -L` 会跟随重定向并连接到 RustFS：
+确认 `status` 为 `ok` 且 `missing_objects` 为空。只要有一个对象在存储中找不到，这次 commit 就整体不提交：响应为 `status: "missing_objects"`，并列出缺失的 oid；补传这些对象后重新 commit。要读回文件，请使用预签名下载 URL；`curl -L` 会跟随重定向并连接到 RustFS：
 
 ```bash
 # 列出集合 / 把文件解析为对象 id

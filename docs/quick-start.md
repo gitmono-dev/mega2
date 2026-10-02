@@ -264,7 +264,7 @@ EOF
 # → {"artifact_set_id":"...","status":"ok","missing_objects":[]}
 ```
 
-Confirm that `missing_objects` is empty. Any object listed there was missing from storage and was left out of the committed set. To download a file, use its presigned URL; `curl -L` follows the redirect to RustFS:
+Confirm that `status` is `ok` and `missing_objects` is empty. If even one object is missing from storage, nothing is committed: the response has `status: "missing_objects"` and lists the missing oids; upload them and commit again. To download a file, use its presigned URL; `curl -L` follows the redirect to RustFS:
 
 ```bash
 # List sets / resolve a file to its object id

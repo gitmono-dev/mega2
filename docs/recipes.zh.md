@@ -167,7 +167,7 @@ EOF
 # → {"artifact_set_id":"...","status":"ok","missing_objects":[]}
 ```
 
-`missing_objects` 必须为空——出现在其中的对象说明对象存储里没找到，commit 只登记了其余对象。回读验证；下载同样走预签名，`curl -L` 会跟随 302 直连 RustFS：
+`missing_objects` 必须为空——只要有对象在对象存储里找不到，整次 commit 都不提交：响应（仍是 HTTP 200）为 `status: "missing_objects"`，并列出缺失的 oid；补传后重新 commit。回读验证；下载同样走预签名，`curl -L` 会跟随 302 直连 RustFS：
 
 ```bash
 # 列出集合 / 把文件解析为对象 id

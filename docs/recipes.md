@@ -167,7 +167,7 @@ EOF
 # → {"artifact_set_id":"...","status":"ok","missing_objects":[]}
 ```
 
-`missing_objects` must be empty — any object listed there was not found in the object storage and the commit recorded only the rest. Read the set back; downloads are presigned too, so `curl -L` follows the 302 straight to RustFS:
+`missing_objects` must be empty — if any object was not found in the object storage, nothing is committed: the response (still HTTP 200) has `status: "missing_objects"` and lists the missing oids; upload them and commit again. Read the set back; downloads are presigned too, so `curl -L` follows the 302 straight to RustFS:
 
 ```bash
 # List sets / resolve a file to its object id
