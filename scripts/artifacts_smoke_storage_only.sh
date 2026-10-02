@@ -327,6 +327,24 @@ case_art_list_sets_pagination() {
     [ "$code" = 400 ] || { echo "a forged cursor returned $code" >&2; return 1; }
 }
 
+# --- BB-39 ART metadata filters -----------------------------------------
+case_art_metadata_filters() {
+    local d="$WORK/bb39" ns="bb39-$RUN_ID" set_a set_b code
+    mkdir -p "$d"
+    art_case_begin
+    printf 'bb39 a %s\n' "$RUN_ID" > "$d/a"
+    printf 'bb39 b %s\n' "$RUN_ID" > "$d/b"
+    read -r _ set_a <<< "$(art_seed "$ns" "bb39/$RUN_ID/a.txt" "$d/a" "{\"run_id\":\"run-a-$RUN_ID\",\"commit_sha\":\"sha-a-$RUN_ID\"}")"
+    read -r _ set_b <<< "$(art_seed "$ns" "bb39/$RUN_ID/b.txt" "$d/b" "{\"run_id\":\"run-b-$RUN_ID\",\"commit_sha\":\"sha-b-$RUN_ID\"}")"
+    [ -n "$set_a" ] && [ -n "$set_b" ] || { echo "seed commits failed" >&2; return 1; }
+    code=$(art_curl -o "$d/run.json" -w '%{http_code}' "$ART_API/sets?namespace=$ns&object_type=snapshot&run_id=run-a-$RUN_ID")
+    [ "$code" = 200 ] || { echo "run_id filter returned $code" >&2; return 1; }
+    jq -e --arg id "$set_a" '[.sets[].artifact_set_id] == [$id]' "$d/run.json" > /dev/null || { echo "run_id filter returned $(art_show '[.sets[].artifact_set_id]' "$d/run.json"), want only the run-a set" >&2; return 1; }
+    code=$(art_curl -o "$d/sha.json" -w '%{http_code}' "$ART_API/sets?namespace=$ns&object_type=snapshot&commit_sha=sha-b-$RUN_ID")
+    [ "$code" = 200 ] || { echo "commit_sha filter returned $code" >&2; return 1; }
+    jq -e --arg id "$set_b" '[.sets[].artifact_set_id] == [$id]' "$d/sha.json" > /dev/null || { echo "commit_sha filter returned $(art_show '[.sets[].artifact_set_id]' "$d/sha.json"), want only the sha-b set" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -335,5 +353,6 @@ run_case "ART reject unauthenticated write" case_art_reject_unauth_write
 run_case "ART commit with missing objects" case_art_commit_missing_objects
 run_case "ART commit replay and conflict" case_art_commit_replay_conflict
 run_case "ART list sets pagination" case_art_list_sets_pagination
+run_case "ART metadata filters" case_art_metadata_filters
 
 finish
