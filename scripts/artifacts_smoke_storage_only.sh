@@ -345,6 +345,25 @@ case_art_metadata_filters() {
     jq -e --arg id "$set_b" '[.sets[].artifact_set_id] == [$id]' "$d/sha.json" > /dev/null || { echo "commit_sha filter returned $(art_show '[.sets[].artifact_set_id]' "$d/sha.json"), want only the sha-b set" >&2; return 1; }
 }
 
+# --- BB-40 ART resolve file ---------------------------------------------
+case_art_resolve_file() {
+    local d="$WORK/bb40" ns="bb40-$RUN_ID" path="bb40/$RUN_ID/same.txt" old_oid new_oid code
+    mkdir -p "$d"
+    art_case_begin
+    printf 'bb40 first %s\n' "$RUN_ID" > "$d/v1"
+    printf 'bb40 second, different bytes %s\n' "$RUN_ID" > "$d/v2"
+    read -r old_oid _ <<< "$(art_seed "$ns" "$path" "$d/v1")"
+    read -r new_oid _ <<< "$(art_seed "$ns" "$path" "$d/v2")"
+    [ -n "$old_oid" ] && [ -n "$new_oid" ] || { echo "seed commits failed" >&2; return 1; }
+    code=$(art_curl -G -o "$d/resolve.json" -w '%{http_code}' --data-urlencode "namespace=$ns" \
+        --data-urlencode object_type=snapshot --data-urlencode "path=$path" "$ART_API/resolve-file")
+    [ "$code" = 200 ] || { echo "resolve-file returned $code" >&2; return 1; }
+    jq -e --arg oid "$new_oid" '.oid == $oid' "$d/resolve.json" > /dev/null || { echo "resolve-file returned oid $(art_show .oid "$d/resolve.json"), want the later set's oid" >&2; return 1; }
+    code=$(art_curl -G -o /dev/null -w '%{http_code}' --data-urlencode "namespace=$ns" \
+        --data-urlencode object_type=snapshot --data-urlencode "path=bb40/$RUN_ID/absent.txt" "$ART_API/resolve-file")
+    [ "$code" = 404 ] || { echo "resolve-file for an absent path returned $code" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -354,5 +373,6 @@ run_case "ART commit with missing objects" case_art_commit_missing_objects
 run_case "ART commit replay and conflict" case_art_commit_replay_conflict
 run_case "ART list sets pagination" case_art_list_sets_pagination
 run_case "ART metadata filters" case_art_metadata_filters
+run_case "ART resolve file" case_art_resolve_file
 
 finish
