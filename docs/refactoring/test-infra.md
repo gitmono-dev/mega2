@@ -205,7 +205,7 @@ interop-smoke libra 版本: 构建时 libra.tools 最新 stable（镜像内 `/et
 | 端口 | 无宿主端口映射。容器内以 socat 建三条只绑定 `127.0.0.1` 的环回中继：`9000 → mega2:8000`、`2222 → mega2:2222`、`29000 → rustfs:9000`，使 runner 看到与宿主机相同的地址（libra 只对 https 或环回地址附带凭据；presigned URL 签名主机为 `127.0.0.1:29000`） |
 | healthcheck | 三条中继均可达：`curl` 拉 `http://127.0.0.1:9000/api/openapi.json`、`curl` 访问 `http://127.0.0.1:29000/`、`ssh-keyscan -p 2222 127.0.0.1` |
 | entrypoint / init | `command` 启动三个 socat 后 `exec sleep infinity`（常驻供 `exec`）；`init: true` |
-| 网络 | 默认 `mega2-trunk-network` |
+| 网络 | compose 默认网络 `<项目名>_default`（项目 `mega2-trunk` 即 `mega2-trunk_default`），按项目隔离：以同一文件、不同 `-p` 起的栈互相解析不到服务名（[plan-20261001](../plan/plan-20261001.md) FIX-BB-06） |
 | 卷 / 工作目录 | `${MEGA2_IT_INTEROP_WORKDIR:-/tmp/mega2-trunk-interop}` → `/work`（`working_dir: /work`）；仓库根只读挂载到 `/repo` |
 | 环境 | `MEGA2_BASE_URL=http://127.0.0.1:9000`、`MEGA2_SSH_URL=ssh://git@127.0.0.1:2222`、`MEGA2_IT_SEED_TOKEN`（与 git-smoke 相同的公开本地开发 token） |
 | profiles | `profiles: ["interop"]`（**不**参与默认 `up -d --wait`） |

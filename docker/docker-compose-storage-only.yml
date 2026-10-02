@@ -9,6 +9,11 @@
 #   config/config-storage-only.toml
 #   docs/deploy-trunk.md
 #
+# 默认网络不固定名字，compose 为每个项目建 `<项目名>_default`（本栈为
+# `mega2-trunk_default`）：以本文件、不同 `-p` 起的另一套栈解析不到本栈的
+# postgres / redis / rustfs / mega2，也就碰不到本栈的数据库与对象存储；
+# 宿主端口仍须另用 override 错开（plan-20261001 FIX-BB-06）。
+#
 # 与 IT 栈并存时务必带不同项目名，且本文件端口不与
 # `docker/docker-compose.test.yml`（15432 / 16379 / 19000 / 19180）冲突:
 #
@@ -288,7 +293,3 @@ volumes:
   mega2-trunk-redis:
   mega2-trunk-rustfs:
   mega2-trunk-data:
-
-networks:
-  default:
-    name: mega2-trunk-network
