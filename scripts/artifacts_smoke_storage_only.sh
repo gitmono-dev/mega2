@@ -20,7 +20,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "artifacts"
-require_tools curl jq sha256sum mktemp date rm perl head od tr wc mkdir cut cmp
+require_tools curl jq sha256sum mktemp date rm perl head od tr wc mkdir cut cmp awk
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
@@ -444,6 +444,27 @@ case_art_input_validation() {
     [ "$code" = 400 ] || { echo "a commit with a duplicate path returned $code" >&2; return 1; }
 }
 
+# --- BB-44 ART conditional GET and HEAD ---------------------------------
+# On the S3-compatible stack the If-None-Match check runs before the presign 302.
+case_art_conditional_get_head() {
+    local d="$WORK/bb44" ns="bb44-$RUN_ID" oid code etag len
+    mkdir -p "$d"
+    art_case_begin
+    printf 'bb44 %s\n' "$RUN_ID" > "$d/obj"
+    read -r oid _ <<< "$(art_seed "$ns" "bb44/$RUN_ID/obj.txt" "$d/obj")"
+    [ -n "$oid" ] || { echo "seed commit failed" >&2; return 1; }
+    code=$(art_curl -I -D "$d/head.hdr" -o /dev/null -w '%{http_code}' "$ART_API/objects/$oid")
+    [ "$code" = 200 ] || { echo "HEAD returned $code" >&2; return 1; }
+    len=$(awk 'tolower($1) == "content-length:" {sub(/\r$/, "", $2); print $2; exit}' "$d/head.hdr")
+    [ "$len" = "$(wc -c < "$d/obj" | tr -d ' ')" ] || { echo "HEAD Content-Length is missing or differs from the object size" >&2; return 1; }
+    etag=$(awk 'tolower($1) == "etag:" {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); print; exit}' "$d/head.hdr")
+    [ -n "$etag" ] || { echo "HEAD has no ETag" >&2; return 1; }
+    code=$(art_curl -o /dev/null -w '%{http_code}' -H "If-None-Match: $etag" "$ART_API/objects/$oid")
+    [ "$code" = 304 ] || { echo "GET with the matching If-None-Match returned $code" >&2; return 1; }
+    code=$(art_curl -o /dev/null -w '%{http_code}' -H 'If-None-Match: W/"bb44-no-match"' "$ART_API/objects/$oid")
+    [ "$code" = 302 ] || { echo "GET with a non-matching If-None-Match returned $code" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -457,5 +478,6 @@ run_case "ART resolve file" case_art_resolve_file
 run_case "ART set detail" case_art_set_detail
 run_case "ART repo isolation" case_art_repo_isolation
 run_case "ART input validation" case_art_input_validation
+run_case "ART conditional GET and HEAD" case_art_conditional_get_head
 
 finish
