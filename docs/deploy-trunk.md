@@ -414,13 +414,13 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profil
 
 ```bash
 mkdir -p target/tmp; set -o pipefail
-# 整跑全部默认栈 case（尚未登记 case 时输出 0 passed 并退出 0）
+# 整跑全部已登记的默认栈 case（opt-in case 记为 SKIP）
 docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T interop-smoke bash /repo/scripts/artifacts_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-art-all.log
 # 单 case：CASE 取下方「已登记 case」中的名字
 CASE='<case>'
 docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T -e MEGA2_SMOKE_CASE="$CASE" interop-smoke bash /repo/scripts/artifacts_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-art-case.log
 ```
 
-已登记 case：尚无（随各 case 卡登记）。
+已登记 case：`ART discovery`。
 
 不设 `MEGA2_SMOKE_CASE` 时整跑全部默认栈 case；opt-in case（auth-none、GC、本地存储）只经 `scripts/bb_optin_run.sh <none|gc|local> artifacts_smoke_storage_only.sh '<case>' <log>` 运行。
