@@ -358,6 +358,16 @@ case_oci_delete_unsupported() {
     [ "$code" = 200 ] || { echo "manifest GET after DELETE returned $code" >&2; return 1; }
 }
 
+# --- BB-22 OCI catalog not implemented ----------------------------------
+case_oci_catalog_not_implemented() {
+    local d="$WORK/catalog" code
+    oci_case_begin
+    mkdir -p "$d"
+    code=$(oci_curl -o "$d/catalog.json" -w '%{http_code}' "$MEGA2_BASE_URL/v2/_catalog")
+    [ "$code" = 400 ] || { echo "GET /v2/_catalog returned $code" >&2; return 1; }
+    [ "$(jq -r '.errors[0].code' "$d/catalog.json")" = NAME_INVALID ] || { echo "_catalog error code is not NAME_INVALID" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
 run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
@@ -369,5 +379,6 @@ run_case "OCI tags list pagination" case_oci_tags_pagination
 run_case "OCI image index manifest" case_oci_image_index
 run_case "OCI reject manifest with unknown blob" case_oci_manifest_unknown_blob
 run_case "OCI delete unsupported" case_oci_delete_unsupported
+run_case "OCI catalog not implemented" case_oci_catalog_not_implemented
 
 finish
