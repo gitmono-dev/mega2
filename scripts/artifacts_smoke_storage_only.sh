@@ -20,7 +20,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "artifacts"
-require_tools curl jq sha256sum mktemp date rm perl head od tr wc mkdir
+require_tools curl jq sha256sum mktemp date rm perl head od tr wc mkdir cut
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
@@ -183,8 +183,62 @@ case_art_server_put_commit() {
     jq -e --arg id "$set_id" '.artifact_set_id == $id' "$d/commit.out" > /dev/null || { echo "commit returned artifact_set_id $(art_show .artifact_set_id "$d/commit.out"), want the run-scoped id it sent" >&2; return 1; }
 }
 
+# art_seed <ns> <path> <file> [<metadata json>] [<artifact_set_id>]: upload
+# <file> through the fallback PUT and commit it as a one-file snapshot set
+# under a run-scoped artifact_set_id (generated unless given); prints
+# "<oid> <artifact_set_id>".
+art_seed() {
+    local oid size code out set_id
+    out="$WORK/seed.$RANDOM$RANDOM"
+    oid=$(art_oid)
+    set_id="${5:-$(art_set_id)}"
+    size=$(wc -c < "$3" | tr -d ' ')
+    code=$(art_server_put "$oid" "$3")
+    [ "$code" = 204 ] || { echo "seed fallback PUT returned $code" >&2; return 1; }
+    art_commit_body "$1" "$2" "$oid" "$size" "$set_id" \
+        | jq --argjson meta "${4:-null}" 'if $meta == null then . else .metadata = $meta end' > "$out.json" || return 1
+    code=$(art_post commit "$out.json" "$out.out")
+    [ "$code" = 200 ] || { echo "seed commit returned $code" >&2; return 1; }
+    jq -e '.status == "ok"' "$out.out" > /dev/null || { echo "seed commit status is $(art_show .status "$out.out"), want \"ok\"" >&2; return 1; }
+    jq -e --arg id "$set_id" '.artifact_set_id == $id' "$out.out" > /dev/null || { echo "seed commit returned another artifact_set_id" >&2; return 1; }
+    printf '%s %s\n' "$oid" "$set_id"
+}
+
+# art_download <object url> <out file>: GET without following, require a
+# 302 whose Location is a SigV4-presigned URL on http://127.0.0.1:29000, then
+# fetch exactly that Location (no further redirects) into <out file>.
+art_download() {
+    local code location
+    art_curl -o /dev/null -w '%{http_code} %{redirect_url}\n' "$1" > "$2.redirect" || return 1
+    read -r code location < "$2.redirect"
+    [ "$code" = 302 ] || { echo "GET of the object without following returned $code, want 302" >&2; return 1; }
+    [ "$(art_origin "$location")" = http://127.0.0.1:29000 ] || { echo "Location host is $(art_origin "$location"), want http://127.0.0.1:29000" >&2; return 1; }
+    art_presigned "$location" || { echo "Location carries no SigV4 query signature" >&2; return 1; }
+    code=$(art_curl -o "$2" -w '%{http_code}' "$location") || return 1
+    [ "$code" = 200 ] || { echo "GET of the validated Location returned $code" >&2; return 1; }
+}
+
+# --- BB-34 ART presigned download ---------------------------------------
+case_art_presigned_download() {
+    local d="$WORK/bb34" ns="bb34-$RUN_ID" seed oid code href
+    mkdir -p "$d"
+    art_case_begin
+    head -c 4096 /dev/urandom > "$d/obj"
+    seed=$(art_seed "$ns" "bb34/$RUN_ID/obj.bin" "$d/obj") || return 1
+    read -r oid _ <<< "$seed"
+    art_download "$ART_API/objects/$oid" "$d/got" || return 1
+    [ "$(sha256sum < "$d/got" | cut -d' ' -f1)" = "$(sha256sum < "$d/obj" | cut -d' ' -f1)" ] || { echo "downloaded bytes differ from the upload" >&2; return 1; }
+    code=$(art_curl -o "$d/link.json" -w '%{http_code}' "$ART_API/objects/$oid?mode=link")
+    [ "$code" = 200 ] || { echo "mode=link returned $code" >&2; return 1; }
+    href=$(jq -r '.actions.download.href | strings' "$d/link.json")
+    [ -n "$href" ] || { echo "mode=link JSON has no actions.download.href string" >&2; return 1; }
+    [ "$(art_origin "$href")" = http://127.0.0.1:29000 ] || { echo "mode=link href host is $(art_origin "$href"), want http://127.0.0.1:29000" >&2; return 1; }
+    art_presigned "$href" || { echo "mode=link href carries no SigV4 query signature" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
+run_case "ART presigned download" case_art_presigned_download
 
 finish
