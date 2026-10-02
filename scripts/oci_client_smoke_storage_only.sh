@@ -19,7 +19,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "oci client"
-require_tools curl jq oras sha256sum mktemp date rm perl awk tr timeout rg grep head tail cut
+require_tools curl jq oras sha256sum mktemp date rm perl awk tr timeout rg grep head tail cut wc
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
@@ -194,10 +194,46 @@ case_oci_cross_repo_mount() {
     [ -n "$(oci_header "$d/h" docker-upload-uuid)" ] || { echo "fallback session without Docker-Upload-UUID" >&2; return 1; }
 }
 
+# oci_oras_push <repo:tag> <dir>: push one small file with oras; prints the
+# manifest digest reported by the push (its single `Digest:` line).
+oci_oras_push() {
+    local ref="$REGISTRY/$1" dir="$2"
+    mkdir -p "$dir"
+    export DOCKER_CONFIG="$dir/docker"
+    printf 'bb %s %s\n' "$1" "$RUN_ID" > "$dir/payload.txt"
+    printf '%s' "$TOKEN" | oci_run "$dir/login.out" oras login --plain-http -u bb --password-stdin "$REGISTRY" || return 1
+    (cd "$dir" && oci_run "$dir/push.out" oras push --plain-http "$ref" payload.txt) || return 1
+    local pushed
+    pushed=$(rg -o '^Digest: (sha256:[0-9a-f]{64})$' -r '$1' "$dir/push.out")
+    [ "$(printf '%s\n' "$pushed" | grep -c '^sha256:')" = 1 ] \
+        || { echo "push output does not hold exactly one Digest line" >&2; return 1; }
+    printf '%s\n' "$pushed"
+}
+
+# --- BB-16 OCI manifest HEAD and conditional GET ------------------------
+case_oci_manifest_head_304() {
+    local d="$WORK/head" repo="bb-$RUN_ID/head" accept dg code len etag
+    oci_case_begin
+    accept='Accept: application/vnd.oci.image.manifest.v1+json'
+    dg=$(oci_oras_push "$repo:v1" "$d")
+    code=$(oci_curl -H "$accept" -o "$d/manifest.json" -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/manifests/v1")
+    [ "$code" = 200 ] || { echo "GET manifest returned $code" >&2; return 1; }
+    code=$(oci_curl -I -H "$accept" -D "$d/h" -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/manifests/v1")
+    [ "$code" = 200 ] || { echo "HEAD manifest returned $code" >&2; return 1; }
+    [ "$(oci_header "$d/h" docker-content-digest)" = "$dg" ] || { echo "HEAD digest differs from the pushed digest" >&2; return 1; }
+    etag=$(oci_header "$d/h" etag)
+    [ -n "$etag" ] || { echo "HEAD without ETag" >&2; return 1; }
+    len=$(wc -c < "$d/manifest.json" | tr -d ' ')
+    [ "$(oci_header "$d/h" content-length)" = "$len" ] || { echo "Content-Length differs from manifest size $len" >&2; return 1; }
+    code=$(oci_curl -H "$accept" -H "If-None-Match: $etag" -o /dev/null -w '%{http_code}' "$MEGA2_BASE_URL/v2/$repo/manifests/v1")
+    [ "$code" = 304 ] || { echo "conditional GET returned $code" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
 run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
 run_case "OCI chunked blob upload" case_oci_chunked_upload
 run_case "OCI cross-repo blob mount" case_oci_cross_repo_mount
+run_case "OCI manifest HEAD and conditional GET" case_oci_manifest_head_304
 
 finish
