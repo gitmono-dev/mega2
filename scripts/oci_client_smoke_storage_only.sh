@@ -194,15 +194,16 @@ case_oci_cross_repo_mount() {
     [ -n "$(oci_header "$d/h" docker-upload-uuid)" ] || { echo "fallback session without Docker-Upload-UUID" >&2; return 1; }
 }
 
-# oci_oras_push <repo:tag> <dir>: push one small file with oras; prints the
-# manifest digest reported by the push (its single `Digest:` line).
+# oci_oras_push <repo:tag> <dir> [<os/arch>]: push one small file with oras
+# (as a single-platform manifest when <os/arch> is given); prints the manifest
+# digest reported by the push (its single `Digest:` line).
 oci_oras_push() {
-    local ref="$REGISTRY/$1" dir="$2"
+    local ref="$REGISTRY/$1" dir="$2" platform="${3:-}"
     mkdir -p "$dir"
     export DOCKER_CONFIG="$dir/docker"
     printf 'bb %s %s\n' "$1" "$RUN_ID" > "$dir/payload.txt"
     printf '%s' "$TOKEN" | oci_run "$dir/login.out" oras login --plain-http -u bb --password-stdin "$REGISTRY" || return 1
-    (cd "$dir" && oci_run "$dir/push.out" oras push --plain-http "$ref" payload.txt) || return 1
+    (cd "$dir" && oci_run "$dir/push.out" oras push --plain-http ${platform:+--artifact-platform "$platform"} "$ref" payload.txt) || return 1
     local pushed
     pushed=$(rg -o '^Digest: (sha256:[0-9a-f]{64})$' -r '$1' "$dir/push.out")
     [ "$(printf '%s\n' "$pushed" | grep -c '^sha256:')" = 1 ] \
@@ -270,6 +271,46 @@ case_oci_tags_pagination() {
     [ "$(jq -r '.errors[0].code' "$d/bad.json")" = PAGINATION_NUMBER_INVALID ] || { echo "n=abc error code mismatch" >&2; return 1; }
 }
 
+# --- BB-19 OCI image index manifest -------------------------------------
+case_oci_image_index() {
+    local d="$WORK/index" repo="bb-$RUN_ID/index" d1 d2 s1 s2 code ct arch
+    oci_case_begin
+    d1=$(oci_oras_push "$repo:amd64" "$d/amd64" linux/amd64)
+    d2=$(oci_oras_push "$repo:arm64" "$d/arm64" linux/arm64)
+    for arch in amd64 arm64; do
+        oci_run "$d/config-$arch.json" oras manifest fetch-config --plain-http "$REGISTRY/$repo:$arch"
+        [ "$(jq -c '{os, architecture}' "$d/config-$arch.json")" = "{\"os\":\"linux\",\"architecture\":\"$arch\"}" ] \
+            || { echo "the $arch manifest is not a linux/$arch single-platform manifest" >&2; return 1; }
+    done
+    oci_run "$d/desc1.json" oras manifest fetch --plain-http --descriptor "$REGISTRY/$repo:amd64"
+    oci_run "$d/desc2.json" oras manifest fetch --plain-http --descriptor "$REGISTRY/$repo:arm64"
+    [ "$(jq -r .digest "$d/desc1.json")" = "$d1" ] && [ "$(jq -r .digest "$d/desc2.json")" = "$d2" ] \
+        || { echo "fetched descriptors differ from the pushed digests" >&2; return 1; }
+    s1=$(jq -r .size "$d/desc1.json")
+    s2=$(jq -r .size "$d/desc2.json")
+    jq -n --arg d1 "$d1" --argjson s1 "$s1" --arg d2 "$d2" --argjson s2 "$s2" '{
+        schemaVersion: 2,
+        mediaType: "application/vnd.oci.image.index.v1+json",
+        manifests: [
+          {mediaType: "application/vnd.oci.image.manifest.v1+json", digest: $d1, size: $s1, platform: {architecture: "amd64", os: "linux"}},
+          {mediaType: "application/vnd.oci.image.manifest.v1+json", digest: $d2, size: $s2, platform: {architecture: "arm64", os: "linux"}}
+        ]}' > "$d/index.json"
+    code=$(oci_curl -u "bb:$TOKEN" -X PUT -o /dev/null -w '%{http_code}' \
+        -H 'Content-Type: application/vnd.oci.image.index.v1+json' --data-binary @"$d/index.json" \
+        "$MEGA2_BASE_URL/v2/$repo/manifests/index")
+    [ "$code" = 201 ] || { echo "index PUT returned $code" >&2; return 1; }
+    code=$(oci_curl -H 'Accept: application/vnd.oci.image.index.v1+json' -D "$d/h" -o "$d/got.json" -w '%{http_code}' \
+        "$MEGA2_BASE_URL/v2/$repo/manifests/index")
+    [ "$code" = 200 ] || { echo "index GET returned $code" >&2; return 1; }
+    ct=$(oci_header "$d/h" content-type)
+    [ "$ct" = "application/vnd.oci.image.index.v1+json" ] || { echo "index Content-Type is '$ct'" >&2; return 1; }
+    [ "$(jq '.manifests | length' "$d/got.json")" = 2 ] || { echo "index does not list 2 manifests" >&2; return 1; }
+    [ "$(jq -c '[.manifests[].digest]' "$d/got.json")" = "$(jq -cn --arg a "$d1" --arg b "$d2" '[$a, $b]')" ] \
+        || { echo "index manifests are not the two pushed manifests" >&2; return 1; }
+    [ "$(jq -c '[.manifests[].platform | "\(.os)/\(.architecture)"]' "$d/got.json")" = '["linux/amd64","linux/arm64"]' ] \
+        || { echo "index platforms are not linux/amd64 and linux/arm64" >&2; return 1; }
+}
+
 run_case "OCI ping" case_oci_ping
 run_case "OCI oras push and pull" case_oci_oras_push_pull
 run_case "OCI reject unauthenticated push" case_oci_reject_unauth_push
@@ -278,5 +319,6 @@ run_case "OCI cross-repo blob mount" case_oci_cross_repo_mount
 run_case "OCI manifest HEAD and conditional GET" case_oci_manifest_head_304
 run_case "OCI blob range" case_oci_blob_range
 run_case "OCI tags list pagination" case_oci_tags_pagination
+run_case "OCI image index manifest" case_oci_image_index
 
 finish
