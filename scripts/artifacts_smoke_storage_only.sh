@@ -253,10 +253,37 @@ case_art_reject_unauth_write() {
     [ "$code" = 401 ] || { echo "fallback PUT without a token returned $code" >&2; return 1; }
 }
 
+# --- BB-36 ART commit with missing objects ------------------------------
+# Any missing object aborts the whole commit: no artifact set or manifest is
+# committed, the set does not exist afterwards, and only the absent oid is
+# reported.
+case_art_commit_missing_objects() {
+    local d="$WORK/bb36" ns="bb36-$RUN_ID" present missing set_id size code
+    mkdir -p "$d"
+    art_case_begin
+    present=$(art_oid)
+    missing=$(art_oid)
+    set_id=$(art_set_id)
+    printf 'bb36 present %s\n' "$RUN_ID" > "$d/obj"
+    size=$(wc -c < "$d/obj" | tr -d ' ')
+    code=$(art_server_put "$present" "$d/obj")
+    [ "$code" = 204 ] || { echo "fallback PUT returned $code" >&2; return 1; }
+    jq -n --arg ns "$ns" --arg set "$set_id" --arg p "$present" --arg m "$missing" --arg dir "bb36/$RUN_ID" --argjson size "$size" \
+        '{namespace: $ns, object_type: "snapshot", artifact_set_id: $set,
+          files: [{path: "\($dir)/present.txt", oid: $p, size: $size}, {path: "\($dir)/missing.txt", oid: $m, size: 7}]}' > "$d/commit.json"
+    code=$(art_post commit "$d/commit.json" "$d/commit.out")
+    [ "$code" = 200 ] || { echo "commit returned $code" >&2; return 1; }
+    jq -e '.status == "missing_objects"' "$d/commit.out" > /dev/null || { echo "commit status is $(art_show .status "$d/commit.out"), want \"missing_objects\"" >&2; return 1; }
+    jq -e --arg m "$missing" '.missing_objects == [$m]' "$d/commit.out" > /dev/null || { echo "missing_objects is $(art_show .missing_objects "$d/commit.out"), want only the never-uploaded oid" >&2; return 1; }
+    code=$(art_curl -o /dev/null -w '%{http_code}' "$ART_API/sets/$set_id?namespace=$ns&object_type=snapshot")
+    [ "$code" = 404 ] || { echo "GET sets/{id} for the uncommitted set returned $code" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
 run_case "ART presigned download" case_art_presigned_download
 run_case "ART reject unauthenticated write" case_art_reject_unauth_write
+run_case "ART commit with missing objects" case_art_commit_missing_objects
 
 finish
