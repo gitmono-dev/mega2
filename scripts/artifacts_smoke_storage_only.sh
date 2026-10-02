@@ -298,6 +298,35 @@ case_art_commit_replay_conflict() {
     [ "$code" = 409 ] || { echo "a different manifest for the same artifact_set_id returned $code" >&2; return 1; }
 }
 
+# --- BB-38 ART list sets pagination -------------------------------------
+case_art_list_sets_pagination() {
+    local d="$WORK/bb38" ns="bb38-$RUN_ID" i code cursor seed
+    mkdir -p "$d"
+    art_case_begin
+    : > "$d/ids"
+    for i in 1 2 3; do
+        printf 'bb38 set %s %s\n' "$i" "$RUN_ID" > "$d/obj$i"
+        seed=$(art_seed "$ns" "bb38/$RUN_ID/obj$i.txt" "$d/obj$i") || return 1
+        printf '%s\n' "${seed#* }" >> "$d/ids"
+    done
+    code=$(art_curl -o "$d/page1.json" -w '%{http_code}' "$ART_API/sets?namespace=$ns&object_type=snapshot&limit=2")
+    [ "$code" = 200 ] || { echo "first page returned $code" >&2; return 1; }
+    jq -e '.sets | length == 2' "$d/page1.json" > /dev/null || { echo "limit=2 returned $(jq '.sets | length' "$d/page1.json") sets, want 2" >&2; return 1; }
+    cursor=$(jq -r '.next_cursor | strings' "$d/page1.json")
+    [ -n "$cursor" ] || { echo "first page has no next_cursor string" >&2; return 1; }
+    code=$(art_curl -G -o "$d/page2.json" -w '%{http_code}' --data-urlencode "namespace=$ns" \
+        --data-urlencode object_type=snapshot --data-urlencode limit=2 --data-urlencode "cursor=$cursor" "$ART_API/sets")
+    [ "$code" = 200 ] || { echo "second page returned $code" >&2; return 1; }
+    jq -e '.sets | length == 1' "$d/page2.json" > /dev/null || { echo "second page returned $(jq '.sets | length' "$d/page2.json") sets, want 1" >&2; return 1; }
+    jq -e '.next_cursor == null' "$d/page2.json" > /dev/null || { echo "second page still has a next_cursor" >&2; return 1; }
+    jq -e --slurpfile p2 "$d/page2.json" --rawfile ids "$d/ids" \
+        '([.sets[].artifact_set_id] + [$p2[0].sets[].artifact_set_id] | sort) == ($ids | split("\n") | map(select(length > 0)) | sort)' \
+        "$d/page1.json" > /dev/null || { echo "the two pages do not hold the three committed sets exactly once" >&2; return 1; }
+    code=$(art_curl -G -o /dev/null -w '%{http_code}' --data-urlencode "namespace=$ns" \
+        --data-urlencode object_type=snapshot --data-urlencode 'cursor=asets-v1|not-a-time|x' "$ART_API/sets")
+    [ "$code" = 400 ] || { echo "a forged cursor returned $code" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -305,5 +334,6 @@ run_case "ART presigned download" case_art_presigned_download
 run_case "ART reject unauthenticated write" case_art_reject_unauth_write
 run_case "ART commit with missing objects" case_art_commit_missing_objects
 run_case "ART commit replay and conflict" case_art_commit_replay_conflict
+run_case "ART list sets pagination" case_art_list_sets_pagination
 
 finish

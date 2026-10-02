@@ -421,6 +421,6 @@ CASE='<case>'
 docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T -e MEGA2_SMOKE_CASE="$CASE" interop-smoke bash /repo/scripts/artifacts_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-art-case.log
 ```
 
-已登记 case：`ART discovery`、`ART presigned upload and commit`、`ART server PUT upload and commit`、`ART presigned download`、`ART reject unauthenticated write`、`ART commit with missing objects`、`ART commit replay and conflict`。
+已登记 case：`ART discovery`、`ART presigned upload and commit`、`ART server PUT upload and commit`、`ART presigned download`、`ART reject unauthenticated write`、`ART commit with missing objects`、`ART commit replay and conflict`、`ART list sets pagination`。
 
 不设 `MEGA2_SMOKE_CASE` 时整跑全部默认栈 case；opt-in case（auth-none、GC、本地存储）只经 `scripts/bb_optin_run.sh <none|gc|local> artifacts_smoke_storage_only.sh '<case>' <log>` 运行。
