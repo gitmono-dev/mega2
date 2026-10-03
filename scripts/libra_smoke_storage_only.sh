@@ -664,6 +664,31 @@ case_libra_lfs_push_and_clone() {
     printf 'LFS round-trip sha256: %s\n' "$clone_hash"
 }
 
+case_libra_browser_list_root() {
+    local WORK="$WORK/browser-root" left code browser_names api_names
+    local deadline=$((SECONDS + 55))
+    mkdir "$WORK"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" / \
+        > "$WORK/browser.json" 2> "$WORK/browser.err" \
+        || { echo "libra browser root list failed" >&2; return 1; }
+    jq -e --arg server "$MEGA2_BASE_URL" \
+        '.ok == true and .command == "mega2 browser" and .data.path == "/" and .data.server == $server and (.data.items | type) == "array"' \
+        "$WORK/browser.json" > /dev/null \
+        || { echo "libra browser root JSON is invalid" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode 'path=/' \
+        -o "$WORK/tree.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e '.req_result == true and (.data.tree_items | type) == "array"' \
+        "$WORK/tree.json" > /dev/null \
+        || { echo "mega2 root tree response is invalid (HTTP $code)" >&2; return 1; }
+    browser_names=$(jq -c '[.data.items[].name] | sort' "$WORK/browser.json") || return 1
+    api_names=$(jq -c '[.data.tree_items[].name] | sort' "$WORK/tree.json") || return 1
+    [ "$browser_names" = "$api_names" ] \
+        || { echo "libra browser root names differ from the API" >&2; return 1; }
+    printf 'root entries matched: %s\n' "$(jq -r '.data.items | length' "$WORK/browser.json")"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -675,5 +700,6 @@ run_case "LIBRA reject non-main branch push" case_libra_reject_non_main_branch_p
 run_case "LIBRA clone SSH" case_libra_clone_ssh
 run_case "LIBRA reject SSH push" case_libra_reject_ssh_push
 run_case "LIBRA LFS push and clone" case_libra_lfs_push_and_clone
+run_case "LIBRA browser list root" case_libra_browser_list_root
 
 finish
