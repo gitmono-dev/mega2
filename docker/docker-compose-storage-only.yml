@@ -145,6 +145,12 @@ services:
       # port so host clients can follow them (docs/refactoring/orbit.md).
       # In-network LFS smoke: the lfs-innetwork env-file signs for rustfs:9000.
       MEGA_OBJECT_STORAGE__S3__PUBLIC_ENDPOINT_URL: ${MEGA_OBJECT_STORAGE__S3__PUBLIC_ENDPOINT_URL:-http://127.0.0.1:29000}
+      # Artifact GC, off by default (the code defaults). GC opt-in stack:
+      #   --env-file config/compose.env.storage-only.artifacts-gc
+      MEGA_ARTIFACTS_GC__ENABLE: ${MEGA_ARTIFACTS_GC__ENABLE:-false}
+      MEGA_ARTIFACTS_GC__INTERVAL_SECS: ${MEGA_ARTIFACTS_GC__INTERVAL_SECS:-3600}
+      MEGA_ARTIFACTS_GC__GRACE_SECS: ${MEGA_ARTIFACTS_GC__GRACE_SECS:-86400}
+      MEGA_ARTIFACTS_GC__BATCH_LIMIT: ${MEGA_ARTIFACTS_GC__BATCH_LIMIT:-100}
       MEGA_LOG__PRINT_STD: "true"
       MEGA_LOG__LEVEL: info
       # Host-facing LFS / capability URLs (published on 127.0.0.1:9000).

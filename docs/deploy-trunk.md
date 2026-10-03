@@ -421,6 +421,6 @@ CASE='<case>'
 docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T -e MEGA2_SMOKE_CASE="$CASE" interop-smoke bash /repo/scripts/artifacts_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-art-case.log
 ```
 
-已登记 case：`ART discovery`、`ART presigned upload and commit`、`ART server PUT upload and commit`、`ART presigned download`、`ART reject unauthenticated write`、`ART commit with missing objects`、`ART commit replay and conflict`、`ART list sets pagination`、`ART metadata filters`、`ART resolve file`、`ART set detail`、`ART repo isolation`、`ART input validation`、`ART conditional GET and HEAD`、`ART anonymous write (none)`。
+已登记 case：`ART discovery`、`ART presigned upload and commit`、`ART server PUT upload and commit`、`ART presigned download`、`ART reject unauthenticated write`、`ART commit with missing objects`、`ART commit replay and conflict`、`ART list sets pagination`、`ART metadata filters`、`ART resolve file`、`ART set detail`、`ART repo isolation`、`ART input validation`、`ART conditional GET and HEAD`、`ART anonymous write (none)`、`ART GC removes unreferenced object`。
 
-不设 `MEGA2_SMOKE_CASE` 时整跑全部默认栈 case；opt-in case（auth-none、GC、本地存储）只经 `scripts/bb_optin_run.sh <none|gc|local> artifacts_smoke_storage_only.sh '<case>' <log>` 运行。
+不设 `MEGA2_SMOKE_CASE` 时整跑全部默认栈 case；opt-in case（auth-none、GC、本地存储）只经 `scripts/bb_optin_run.sh <none|gc|local> artifacts_smoke_storage_only.sh '<case>' <log>` 运行。GC 模式使用 `config/compose.env.storage-only.artifacts-gc`（每 5 秒回收一次、宽限 1 秒，仅限实验室栈）；默认栈经 compose 透传的 `MEGA_ARTIFACTS_GC__*` 取代码默认值（关闭）。

@@ -487,6 +487,45 @@ case_art_anonymous_write_none() {
     cmp -s "$d/obj" "$d/got" || { echo "anonymously read bytes differ from the upload" >&2; return 1; }
 }
 
+# --- BB-46 ART GC removes unreferenced object ---------------------------
+# Opt-in (MEGA2_SMOKE_ARTIFACTS_GC=1): run through `scripts/bb_optin_run.sh gc
+# ...` (config/compose.env.storage-only.artifacts-gc: GC every 5 s, 1 s grace).
+# A batch hit refreshes last_seen_at, so the case waits two GC periods plus
+# the grace before each probe instead of polling. Budget: 175 s plus the
+# preflight keeps the run within the 180 s GC case budget.
+case_art_gc_unreferenced() {
+    local d="$WORK/bb46" ns="bb46-$RUN_ID" orphan size code seed kept attempt gone=no
+    local ART_CASE_BUDGET=175
+    mkdir -p "$d"
+    art_case_begin
+    orphan=$(art_oid)
+    printf 'bb46 orphan %s\n' "$RUN_ID" > "$d/orphan"
+    size=$(wc -c < "$d/orphan" | tr -d ' ')
+    code=$(art_server_put "$orphan" "$d/orphan")
+    [ "$code" = 204 ] || { echo "fallback PUT of the unreferenced object returned $code" >&2; return 1; }
+    # The object must be visible before GC can be shown to remove it.
+    art_batch_body "$ns" "bb46/$RUN_ID/orphan.txt" "$orphan" "$size" > "$d/batch.json"
+    code=$(art_post batch "$d/batch.json" "$d/batch0.out")
+    [ "$code" = 200 ] || { echo "batch returned $code" >&2; return 1; }
+    jq -e '.objects[0].exists == true' "$d/batch0.out" > /dev/null || { echo "the unreferenced object is not visible after the fallback PUT" >&2; return 1; }
+    head -c 2048 /dev/urandom > "$d/kept"
+    seed=$(art_seed "$ns" "bb46/$RUN_ID/kept.bin" "$d/kept") || return 1
+    read -r kept _ <<< "$seed"
+    for attempt in 1 2 3; do
+        sleep 13
+        code=$(art_post batch "$d/batch.json" "$d/batch.out")
+        [ "$code" = 200 ] || { echo "batch returned $code" >&2; return 1; }
+        if jq -e '.objects[0].exists == false' "$d/batch.out" > /dev/null; then
+            gone=yes
+            break
+        fi
+        echo "unreferenced object still present after probe $attempt" >&2
+    done
+    [ "$gone" = yes ] || { echo "GC did not remove the unreferenced object" >&2; return 1; }
+    art_download "$ART_API/objects/$kept" "$d/kept.got" || return 1
+    cmp -s "$d/kept" "$d/kept.got" || { echo "the committed object changed after GC" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -502,5 +541,6 @@ run_case "ART repo isolation" case_art_repo_isolation
 run_case "ART input validation" case_art_input_validation
 run_case "ART conditional GET and HEAD" case_art_conditional_get_head
 optin_case "ART anonymous write (none)" MEGA2_SMOKE_AUTH_NONE case_art_anonymous_write_none
+optin_case "ART GC removes unreferenced object" MEGA2_SMOKE_ARTIFACTS_GC case_art_gc_unreferenced
 
 finish
