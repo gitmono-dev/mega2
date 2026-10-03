@@ -285,10 +285,59 @@ case_libra_multi_commit_push_http() {
     printf 'main: %s -> %s (3 local commits, one push)\n' "$before_oid" "$after_oid"
 }
 
+case_libra_reject_unauthenticated_push() {
+    local WORK="$WORK/unauth-push" url="$MEGA2_BASE_URL/project" name="bb56-$RUN_ID.txt"
+    local before_ref after_ref before_oid after_oid left push_rc=0
+    local deadline=$((SECONDS + 55))
+    [[ "$MEGA2_BASE_URL" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] \
+        || { echo "unauthenticated push requires a loopback HTTP endpoint" >&2; return 1; }
+    unset MEGA2_IT_SEED_TOKEN
+    mkdir "$WORK" "$WORK/home" "$WORK/home/config"
+    export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/config"
+    export LIBRA_CONFIG_GLOBAL_DB="$WORK/home/config/config.db"
+    before_ref=$(timeout 10 git ls-remote "$url" refs/heads/main) || return 1
+    [[ "$before_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "git observer is missing refs/heads/main before unauthenticated push" >&2; return 1; }
+    before_oid=${before_ref%%$'\t'*}
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" clone "$url" "$WORK/push-clone" > "$WORK/clone.out" 2>&1 \
+        || { echo "libra HTTP clone for unauthenticated push failed" >&2; return 1; }
+    printf 'bb56 unauthenticated push %s\n' "$RUN_ID" > "$WORK/push-clone/$name"
+    (
+        run_remaining() {
+            local remaining=$((deadline - SECONDS))
+            [ "$remaining" -gt 0 ] || return 124
+            timeout "$remaining" "$@"
+        }
+        cd "$WORK/push-clone" || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.name 'Mega2 Smoke' || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.email 'mega2-smoke@example.invalid' || exit 1
+        run_remaining "$LIBRA_BIN" add "$name" || exit 1
+        run_remaining "$LIBRA_BIN" commit -m 'BB-56 unauthenticated push smoke' --no-gpg-sign || exit 1
+    ) > "$WORK/commit.out" 2>&1 \
+        || { echo "libra commit for unauthenticated push failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    (cd "$WORK/push-clone" && timeout "$left" "$LIBRA_BIN" push origin main < /dev/null) \
+        > "$WORK/push.out" 2>&1 || push_rc=$?
+    [ "$push_rc" -ne 0 ] && [ "$push_rc" -ne 124 ] \
+        || { echo "unauthenticated push did not fail promptly" >&2; return 1; }
+    grep -Fq 'fatal: authentication required' "$WORK/push.out" \
+        || { echo "unauthenticated push failed without a 401 auth rejection" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    after_ref=$(timeout "$left" git ls-remote "$url" refs/heads/main) || return 1
+    [[ "$after_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "git observer is missing refs/heads/main after unauthenticated push" >&2; return 1; }
+    after_oid=${after_ref%%$'\t'*}
+    [ "$after_oid" = "$before_oid" ] \
+        || { echo "git observer tip advanced after unauthenticated push" >&2; return 1; }
+    printf 'main unchanged: %s (push rejected with authentication required)\n' "$after_oid"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
 run_case "LIBRA trunk push HTTP" case_libra_trunk_push_http
 run_case "LIBRA multi-commit push HTTP" case_libra_multi_commit_push_http
+run_case "LIBRA reject unauthenticated push" case_libra_reject_unauthenticated_push
 
 finish
