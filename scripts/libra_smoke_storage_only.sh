@@ -133,7 +133,23 @@ case_libra_fetch_http() {
     printf 'origin/main: %s -> %s\n' "$before_oid" "$libra_oid"
 }
 
+case_libra_ls_remote_http() {
+    local url="$MEGA2_BASE_URL/project" git_ref libra_ref git_oid libra_oid
+    git_ref=$(timeout 10 git ls-remote "$url" refs/heads/main) || return 1
+    libra_ref=$(timeout 10 "$LIBRA_BIN" ls-remote "$url" refs/heads/main) || return 1
+    [[ "$git_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "git observer is missing refs/heads/main" >&2; return 1; }
+    [[ "$libra_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "libra ls-remote is missing refs/heads/main" >&2; return 1; }
+    git_oid=${git_ref%%$'\t'*}
+    libra_oid=${libra_ref%%$'\t'*}
+    [ "$git_oid" = "$libra_oid" ] \
+        || { echo "libra ls-remote main differs from git observer" >&2; return 1; }
+    printf '%s\n' "$libra_ref"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
+run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
 
 finish

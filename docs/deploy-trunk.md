@@ -436,4 +436,4 @@ CASE='<case>'
 docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T -e MEGA2_SMOKE_CASE="$CASE" interop-smoke bash /repo/scripts/libra_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-libra-case.log
 ```
 
-已登记 case：`LIBRA clone HTTP`、`LIBRA fetch HTTP`。clone case 在 `/project` 写入带 `RUN_ID` 的种子文件，并用只读 Git clone 对照 Libra 克隆的文件 SHA-256；fetch case 在克隆后新增服务端文件，以只读 Git `ls-remote` 对照 Libra 的 `origin/main`。客户端工作目录运行后清理。点名尚未登记的 case 退出 2。后续 BB-53..BB-64 逐卡登记互通场景。
+已登记 case：`LIBRA clone HTTP`、`LIBRA fetch HTTP`、`LIBRA ls-remote HTTP`。clone case 在 `/project` 写入带 `RUN_ID` 的种子文件，并用只读 Git clone 对照 Libra 克隆的文件 SHA-256；fetch case 在克隆后新增服务端文件，以只读 Git `ls-remote` 对照 Libra 的 `origin/main`；ls-remote case 对照两个客户端读取的 `refs/heads/main` OID。客户端工作目录运行后清理。点名尚未登记的 case 退出 2。后续 BB-54..BB-64 逐卡登记互通场景。
