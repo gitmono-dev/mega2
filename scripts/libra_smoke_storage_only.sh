@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Libra client black-box smoke for the storage-only compose stack
-# (docs/plan/plan-20261001.md, BB-50..BB-64). Runs inside interop-smoke;
+# (docs/plan/plan-20261001.md, BB-50..BB-75). Runs inside interop-smoke;
 # git is only a read-only observer (ADR-BB-03).
 #
 #   docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop \
@@ -207,9 +207,88 @@ case_libra_trunk_push_http() {
     printf 'main: %s -> %s\n' "$before_oid" "$after_oid"
 }
 
+case_libra_multi_commit_push_http() {
+    local WORK="$WORK/multi-push" url="$MEGA2_BASE_URL/project"
+    local token="${MEGA2_IT_SEED_TOKEN:-}"
+    local before_ref after_ref before_oid after_oid name expected_hash git_hash left i
+    local push_rc=0 scan_rc=0
+    local deadline=$((SECONDS + 55))
+    [[ "$MEGA2_BASE_URL" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] \
+        || { echo "multi-commit push requires a loopback HTTP endpoint" >&2; return 1; }
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK" "$WORK/home" "$WORK/home/config"
+    export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/config"
+    export LIBRA_CONFIG_GLOBAL_DB="$WORK/home/config/config.db"
+    before_ref=$(timeout 10 git ls-remote "$url" refs/heads/main) || return 1
+    [[ "$before_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "git observer is missing refs/heads/main before multi-commit push" >&2; return 1; }
+    before_oid=${before_ref%%$'\t'*}
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" clone "$url" "$WORK/push-clone" > "$WORK/clone.out" 2>&1 \
+        || { echo "libra HTTP clone for multi-commit push failed" >&2; return 1; }
+    (
+        run_remaining() {
+            local remaining=$((deadline - SECONDS))
+            [ "$remaining" -gt 0 ] || return 124
+            timeout "$remaining" "$@"
+        }
+        cd "$WORK/push-clone" || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.name 'Mega2 Smoke' || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.email 'mega2-smoke@example.invalid' || exit 1
+        prev_oid=$(run_remaining "$LIBRA_BIN" rev-parse HEAD) || exit 1
+        for i in 1 2 3; do
+            name="bb55-$RUN_ID-$i.txt"
+            printf 'bb55 commit %s %s\n' "$RUN_ID" "$i" > "$name"
+            run_remaining "$LIBRA_BIN" add "$name" || exit 1
+            run_remaining "$LIBRA_BIN" commit -m "BB-55 multi-commit smoke $i" --no-gpg-sign || exit 1
+            current_oid=$(run_remaining "$LIBRA_BIN" rev-parse HEAD) || exit 1
+            [ "$current_oid" != "$prev_oid" ] || exit 1
+            prev_oid=$current_oid
+        done
+    ) > "$WORK/commit.out" 2>&1 || { echo "libra multi-commit preparation failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" "$LIBRA_BIN" auth login \
+        --host "${MEGA2_BASE_URL#http://}" --with-token \
+        > "$WORK/auth.out" 2>&1 || { echo "libra loopback auth login failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    (cd "$WORK/push-clone" && timeout "$left" "$LIBRA_BIN" push origin main) \
+        > "$WORK/push.out" 2>&1 || push_rc=$?
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || scan_rc=$?
+    if [ "$scan_rc" -eq 0 ]; then
+        echo "multi-commit push token was persisted in the case work directory" >&2
+        return 1
+    fi
+    [ "$scan_rc" -eq 1 ] || { echo "cannot scan the multi-commit work directory" >&2; return 1; }
+    [ "$push_rc" -eq 0 ] || { echo "libra multi-commit HTTP push failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    after_ref=$(timeout "$left" git ls-remote "$url" refs/heads/main) || return 1
+    [[ "$after_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "git observer is missing refs/heads/main after multi-commit push" >&2; return 1; }
+    after_oid=${after_ref%%$'\t'*}
+    [ "$after_oid" != "$before_oid" ] \
+        || { echo "git observer tip did not advance after multi-commit push" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" git clone "$url" "$WORK/git-observer" > "$WORK/git-clone.out" 2>&1 \
+        || { echo "git observer clone after multi-commit push failed" >&2; return 1; }
+    for i in 1 2 3; do
+        name="bb55-$RUN_ID-$i.txt"
+        [ -f "$WORK/git-observer/$name" ] \
+            || { echo "git observer clone is missing multi-commit file $i" >&2; return 1; }
+        expected_hash=$(printf 'bb55 commit %s %s\n' "$RUN_ID" "$i" | sha256sum)
+        expected_hash=${expected_hash%% *}
+        git_hash=$(sha256sum "$WORK/git-observer/$name"); git_hash=${git_hash%% *}
+        [ "$expected_hash" = "$git_hash" ] \
+            || { echo "multi-commit file $i differs in git observer clone" >&2; return 1; }
+    done
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf 'main: %s -> %s (3 local commits, one push)\n' "$before_oid" "$after_oid"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
 run_case "LIBRA trunk push HTTP" case_libra_trunk_push_http
+run_case "LIBRA multi-commit push HTTP" case_libra_multi_commit_push_http
 
 finish
