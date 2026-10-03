@@ -16,6 +16,9 @@ source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "libra"
 require_tools git mkdir rm date timeout curl jq sha256sum cat grep
+if [ -z "$SMOKE_CASE_FILTER" ] || [ "$SMOKE_CASE_FILTER" = "LIBRA clone SSH" ]; then
+    require_tools ssh-keyscan ssh
+fi
 
 LIBRA_BIN="${MEGA2_LIBRA_BIN:-libra}"
 command -v "$LIBRA_BIN" >/dev/null 2>&1 || smoke_die "libra binary not found: $LIBRA_BIN"
@@ -435,6 +438,92 @@ case_libra_reject_non_main_branch_push() {
     printf 'remote branch absent: %s\n' "$branch"
 }
 
+case_libra_clone_ssh() {
+    local WORK="$WORK/ssh-clone" ssh_url="ssh://git@127.0.0.1:2222//project"
+    local url="$MEGA2_BASE_URL/project" name="bb59-$RUN_ID.txt"
+    local token="${MEGA2_IT_SEED_TOKEN:-}"
+    local kh code left seed_hash git_hash libra_hash git_oid ssh_ref ssh_oid clone_oid
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK" "$WORK/home" "$WORK/home/.ssh" "$WORK/home/config"
+    export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/config"
+    export LIBRA_CONFIG_GLOBAL_DB="$WORK/home/config/config.db"
+    kh="$WORK/home/.ssh/known_hosts"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" ssh-keyscan -T 5 -t ed25519 -p 2222 127.0.0.1 \
+        > "$kh" 2> "$WORK/keyscan.err" \
+        || { echo "SSH host key scan failed" >&2; return 1; }
+    grep -Fq '[127.0.0.1]:2222 ssh-ed25519 ' "$kh" \
+        || { echo "SSH host key scan did not return an ed25519 key" >&2; return 1; }
+    chmod 600 "$kh"
+    cat > "$WORK/ssh-client" <<'EOF'
+#!/usr/bin/env bash
+exec ssh -F /dev/null -o UserKnownHostsFile="$MEGA2_SMOKE_KNOWN_HOSTS" \
+    -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes "$@"
+EOF
+    chmod 700 "$WORK/ssh-client"
+    export MEGA2_SMOKE_KNOWN_HOSTS="$kh" LIBRA_SSH_COMMAND="$WORK/ssh-client"
+
+    printf 'bb59 SSH clone seed %s' "$RUN_ID" > "$WORK/seed.txt"
+    jq -n --arg name "$name" --arg content "$(cat "$WORK/seed.txt")" \
+        '{is_directory: false, name: $name, path: "/project", content: $content, skip_build: true}' \
+        > "$WORK/create.json"
+    printf 'Authorization: Bearer %s\n' "$token" > "$WORK/auth.header"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/create.json" \
+        -o "$WORK/create.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/create-entry") \
+        || return 1
+    rm "$WORK/auth.header"
+    if [ "$code" != 200 ] || ! jq -e '.req_result == true' "$WORK/create.out" > /dev/null; then
+        echo "SSH clone seed create-entry failed (HTTP $code)" >&2
+        return 1
+    fi
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" git clone "$url" "$WORK/git-observer" > "$WORK/git-clone.out" 2>&1 \
+        || { echo "git observer clone failed" >&2; return 1; }
+    while [ ! -f "$WORK/git-observer/$name" ]; do
+        left=$((deadline - SECONDS)); [ "$left" -gt 2 ] || return 124
+        sleep 1
+        left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+        timeout "$left" git -C "$WORK/git-observer" pull --ff-only \
+            > "$WORK/git-pull.out" 2>&1 \
+            || { echo "git observer could not read the SSH clone seed" >&2; return 1; }
+    done
+    git_oid=$(git -C "$WORK/git-observer" rev-parse HEAD) || return 1
+    while :; do
+        left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+        ssh_ref=$(timeout "$left" "$LIBRA_BIN" ls-remote "$ssh_url" refs/heads/main) \
+            || { echo "libra SSH ls-remote failed" >&2; return 1; }
+        [[ "$ssh_ref" == *$'\t'refs/heads/main ]] \
+            || { echo "libra SSH ls-remote is missing main" >&2; return 1; }
+        ssh_oid=${ssh_ref%%$'\t'*}
+        [ "$ssh_oid" = "$git_oid" ] && break
+        left=$((deadline - SECONDS)); [ "$left" -gt 2 ] \
+            || { echo "libra SSH tip did not catch up with git observer" >&2; return 124; }
+        sleep 1
+    done
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" clone "$ssh_url" "$WORK/libra-clone" \
+        > "$WORK/libra-clone.out" 2>&1 \
+        || { echo "libra SSH clone failed" >&2; return 1; }
+    clone_oid=$(cd "$WORK/libra-clone" && "$LIBRA_BIN" rev-parse HEAD) || return 1
+    [ "$clone_oid" = "$ssh_oid" ] \
+        || { echo "libra SSH clone tip differs from git observer" >&2; return 1; }
+    [ -f "$WORK/libra-clone/$name" ] \
+        || { echo "libra SSH clone is missing the seed file at tip $ssh_oid" >&2; return 1; }
+    [ -f "$WORK/git-observer/$name" ] \
+        || { echo "git observer clone is missing the seed file" >&2; return 1; }
+    seed_hash=$(sha256sum "$WORK/seed.txt"); seed_hash=${seed_hash%% *}
+    git_hash=$(sha256sum "$WORK/git-observer/$name"); git_hash=${git_hash%% *}
+    libra_hash=$(sha256sum "$WORK/libra-clone/$name"); libra_hash=${libra_hash%% *}
+    if [ "$seed_hash" != "$git_hash" ] || [ "$seed_hash" != "$libra_hash" ]; then
+        echo "SSH clone file differs from seed or git observer" >&2
+        return 1
+    fi
+    printf 'SSH clone seed sha256: %s\n' "$libra_hash"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -443,5 +532,6 @@ run_case "LIBRA multi-commit push HTTP" case_libra_multi_commit_push_http
 run_case "LIBRA reject unauthenticated push" case_libra_reject_unauthenticated_push
 run_case "LIBRA reject tag push" case_libra_reject_tag_push
 run_case "LIBRA reject non-main branch push" case_libra_reject_non_main_branch_push
+run_case "LIBRA clone SSH" case_libra_clone_ssh
 
 finish
