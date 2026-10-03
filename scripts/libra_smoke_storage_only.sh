@@ -15,7 +15,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "libra"
-require_tools git mktemp mkdir rm date timeout
+require_tools git mkdir rm date timeout curl jq sha256sum cat
 
 LIBRA_BIN="${MEGA2_LIBRA_BIN:-libra}"
 command -v "$LIBRA_BIN" >/dev/null 2>&1 || smoke_die "libra binary not found: $LIBRA_BIN"
@@ -35,14 +35,58 @@ MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"
 MEGA2_BASE_URL="${MEGA2_BASE_URL%/}"
 RUN_ID="$(date -u +%Y%m%dt%H%M%S)" || smoke_die "cannot build RUN_ID"
 RUN_ID="$RUN_ID$RANDOM"
-WORK="$(mktemp -d)" || smoke_die "cannot create a work directory"
+WORK="/work/bb-$RUN_ID"
+umask 077
+mkdir "$WORK" || smoke_die "cannot create a work directory"
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/home" || smoke_die "cannot create an isolated home"
+mkdir "$WORK/home" || smoke_die "cannot create an isolated home"
 export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/config"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 export LIBRA_BIN MEGA2_BASE_URL RUN_ID WORK
 
 timeout 5 git ls-remote "$MEGA2_BASE_URL/" > "$WORK/ls-remote" 2>/dev/null \
     || smoke_die "mega2 Git HTTP endpoint is not reachable with git ls-remote"
+
+case_libra_clone_http() {
+    local repo_path="/project" url="$MEGA2_BASE_URL/project" name="bb51-$RUN_ID.txt"
+    local auth="$WORK/auth.header" code seed_hash git_hash libra_hash left
+    local deadline=$((SECONDS + 55))
+    local token="${MEGA2_IT_SEED_TOKEN:-}"
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    printf 'Authorization: Bearer %s\n' "$token" > "$auth"
+    printf 'bb51 clone seed %s' "$RUN_ID" > "$WORK/seed.txt"
+    jq -n --arg path "$repo_path" --arg name "$name" --arg content "$(cat "$WORK/seed.txt")" \
+        '{is_directory: false, name: $name, path: $path, content: $content, skip_build: true}' \
+        > "$WORK/create.json"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$auth" \
+        -H 'Content-Type: application/json' --data @"$WORK/create.json" \
+        -o "$WORK/create.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/create-entry")
+    if [ "$code" != 200 ] || ! jq -e '.req_result == true' "$WORK/create.out" > /dev/null; then
+        echo "seed create-entry failed (HTTP $code)" >&2
+        return 1
+    fi
+
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" git clone "$url" "$WORK/git-observer" > "$WORK/git-clone.out" 2>&1 \
+        || { echo "git observer clone failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" clone "$url" "$WORK/libra-clone" > "$WORK/libra-clone.out" 2>&1 \
+        || { echo "libra HTTP clone failed" >&2; return 1; }
+    [ "$HOME" = "$WORK/home" ] && [[ "$HOME" == /work/bb-"$RUN_ID"/* ]] \
+        || { echo "libra HOME was not isolated under the run directory" >&2; return 1; }
+    printf 'libra home: %s\n' "$HOME"
+    [ -f "$WORK/git-observer/$name" ] \
+        || { echo "git observer clone is missing the seed file" >&2; return 1; }
+    [ -f "$WORK/libra-clone/$name" ] \
+        || { echo "libra clone is missing the seed file" >&2; return 1; }
+    seed_hash=$(sha256sum "$WORK/seed.txt"); seed_hash=${seed_hash%% *}
+    git_hash=$(sha256sum "$WORK/git-observer/$name"); git_hash=${git_hash%% *}
+    libra_hash=$(sha256sum "$WORK/libra-clone/$name"); libra_hash=${libra_hash%% *}
+    [ "$seed_hash" = "$git_hash" ] && [ "$seed_hash" = "$libra_hash" ] \
+        || { echo "seed.txt sha256 differs between the seed and clones" >&2; return 1; }
+}
+
+run_case "LIBRA clone HTTP" case_libra_clone_http
 
 finish
