@@ -260,7 +260,10 @@ impl ResponseObject {
                 operation: Operation::Upload,
                 ..
             } => {
-                actions.insert(Action::Upload, Link::new(upload_url));
+                let mut link = Link::new(upload_url);
+                link.header
+                    .insert("Content-Length".to_string(), meta.size.to_string());
+                actions.insert(Action::Upload, link);
                 // if use_tus {
                 //     actions.insert(
                 //         Action::Verify,

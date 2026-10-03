@@ -222,6 +222,16 @@ pub async fn lfs_process_batch(
             .parse_lfs_digest(algorithm)
             .map_err(|e| GitLFSError::GeneralError(e.to_string()))?;
         object.oid = digest.hex().to_string();
+        if request.operation == Operation::Upload && object.size < 0 {
+            response_objects.push(ResponseObject::failed_with_err(
+                &object,
+                ObjectError {
+                    code: 422,
+                    message: "Invalid LFS object size".to_owned(),
+                },
+            ));
+            continue;
+        }
         let meta_res = lfs_get_meta(&db_storage, &object.oid).await?;
         let meta = match meta_res {
             Some(meta) => meta,
@@ -246,6 +256,16 @@ pub async fn lfs_process_batch(
                 }
             }
         };
+        if request.operation == Operation::Upload && meta.size != object.size {
+            response_objects.push(ResponseObject::failed_with_err(
+                &object,
+                ObjectError {
+                    code: 422,
+                    message: "LFS object size does not match registered size".to_owned(),
+                },
+            ));
+            continue;
+        }
         let file_exist = lfs_object_exists(&file_storage, &meta.oid).await;
         let download_url = match lfs_download_url(&file_storage, &meta.oid, listen_addr).await {
             Ok(url) => url,
@@ -974,6 +994,32 @@ mod tests {
         assert!(res.actions.is_some());
         let actions = res.actions.unwrap();
         assert!(actions.contains_key(&Action::Download));
+        assert!(
+            !actions[&Action::Download]
+                .header
+                .contains_key("Content-Length")
+        );
+        assert!(res.error.is_none());
+    }
+
+    #[test]
+    fn response_object_upload_existing() {
+        let meta = MetaObject {
+            oid: "oid-existing".into(),
+            size: 20,
+            exist: true,
+        };
+        let res = ResponseObject::new(
+            &meta,
+            ResCondition {
+                file_exist: true,
+                operation: Operation::Upload,
+                use_tus: false,
+            },
+            "http://dl",
+            "http://ul",
+        );
+        assert!(res.actions.is_none());
         assert!(res.error.is_none());
     }
 
@@ -995,8 +1041,68 @@ mod tests {
             "http://ul",
         );
         let actions = res.actions.expect("upload should provide actions");
-        assert!(actions.contains_key(&Action::Upload));
+        assert_eq!(actions[&Action::Upload].header["Content-Length"], "20");
         assert!(res.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn lfs_batch_upload_size_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let service = LfsService {
+            lfs_storage: storage.lfs_db_storage(),
+            obj_storage: mock_object_storage(),
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
+        };
+        let content = b"lfs size validation";
+        let oid = LfsDigest::sha256_of(content).hex().to_string();
+        let batch = |size| BatchRequest {
+            operation: Operation::Upload,
+            transfers: Vec::new(),
+            objects: vec![RequestObject {
+                oid: oid.clone(),
+                size,
+                ..Default::default()
+            }],
+            hash_algo: "sha256".to_owned(),
+        };
+
+        let negative = lfs_process_batch(&service, batch(-1), "127.0.0.1:0")
+            .await
+            .expect("negative size should be an object error");
+        assert_eq!(negative.objects[0].error.as_ref().unwrap().code, 422);
+        assert!(
+            service
+                .lfs_storage
+                .get_lfs_object(&oid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let size = content.len() as i64;
+        let initial = lfs_process_batch(&service, batch(size), "127.0.0.1:0")
+            .await
+            .expect("valid size should provide upload action");
+        assert_eq!(
+            initial.objects[0].actions.as_ref().unwrap()[&Action::Upload].header["Content-Length"],
+            size.to_string()
+        );
+
+        let mismatch = lfs_process_batch(&service, batch(size + 1), "127.0.0.1:0")
+            .await
+            .expect("mismatched size should be an object error");
+        assert_eq!(mismatch.objects[0].error.as_ref().unwrap().code, 422);
+        assert!(mismatch.objects[0].actions.is_none());
+
+        let retry = lfs_process_batch(&service, batch(size), "127.0.0.1:0")
+            .await
+            .expect("same-size retry should provide upload action");
+        assert_eq!(
+            retry.objects[0].actions.as_ref().unwrap()[&Action::Upload].header["Content-Length"],
+            size.to_string()
+        );
     }
 
     #[test]
