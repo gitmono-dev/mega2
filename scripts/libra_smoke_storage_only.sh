@@ -378,6 +378,63 @@ case_libra_reject_tag_push() {
     printf 'remote tag absent: refs/tags/%s\n' "$tag"
 }
 
+case_libra_reject_non_main_branch_push() {
+    local WORK="$WORK/non-main-push" url="$MEGA2_BASE_URL/project"
+    local branch="refs/heads/bb-$RUN_ID" name="bb58-$RUN_ID.txt"
+    local token="${MEGA2_IT_SEED_TOKEN:-}"
+    local before_ref after_ref left push_rc=0 scan_rc=0
+    local deadline=$((SECONDS + 55))
+    [[ "$MEGA2_BASE_URL" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] \
+        || { echo "non-main push requires a loopback HTTP endpoint" >&2; return 1; }
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK" "$WORK/home" "$WORK/home/config"
+    export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/config"
+    export LIBRA_CONFIG_GLOBAL_DB="$WORK/home/config/config.db"
+    before_ref=$(timeout 10 git ls-remote "$url" "$branch") || return 1
+    [ -z "$before_ref" ] \
+        || { echo "git observer found the branch before push" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" clone "$url" "$WORK/push-clone" > "$WORK/clone.out" 2>&1 \
+        || { echo "libra HTTP clone for non-main push failed" >&2; return 1; }
+    printf 'bb58 non-main push %s\n' "$RUN_ID" > "$WORK/push-clone/$name"
+    (
+        run_remaining() {
+            local remaining=$((deadline - SECONDS))
+            [ "$remaining" -gt 0 ] || return 124
+            timeout "$remaining" "$@"
+        }
+        cd "$WORK/push-clone" || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.name 'Mega2 Smoke' || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.email 'mega2-smoke@example.invalid' || exit 1
+        run_remaining "$LIBRA_BIN" add "$name" || exit 1
+        run_remaining "$LIBRA_BIN" commit -m 'BB-58 non-main push smoke' --no-gpg-sign || exit 1
+    ) > "$WORK/commit.out" 2>&1 \
+        || { echo "libra commit for non-main push failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" "$LIBRA_BIN" auth login \
+        --host "${MEGA2_BASE_URL#http://}" --with-token \
+        > "$WORK/auth.out" 2>&1 || { echo "libra loopback auth login failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    (cd "$WORK/push-clone" && timeout "$left" "$LIBRA_BIN" push origin "main:$branch") \
+        > "$WORK/push.out" 2>&1 || push_rc=$?
+    [ "$push_rc" -ne 0 ] && [ "$push_rc" -ne 124 ] \
+        || { echo "non-main push did not fail promptly" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || scan_rc=$?
+    if [ "$scan_rc" -eq 0 ]; then
+        echo "non-main push token was persisted in the case work directory" >&2
+        return 1
+    fi
+    [ "$scan_rc" -eq 1 ] || { echo "cannot scan the non-main work directory" >&2; return 1; }
+    grep -Fq "trunk push rejects ref '$branch'" "$WORK/push.out" \
+        || { echo "non-main push failed without the server's trunk rejection" >&2; cat "$WORK/push.out" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    after_ref=$(timeout "$left" git ls-remote "$url" "$branch") || return 1
+    [ -z "$after_ref" ] \
+        || { echo "git observer found the rejected branch on the remote" >&2; return 1; }
+    printf 'remote branch absent: %s\n' "$branch"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -385,5 +442,6 @@ run_case "LIBRA trunk push HTTP" case_libra_trunk_push_http
 run_case "LIBRA multi-commit push HTTP" case_libra_multi_commit_push_http
 run_case "LIBRA reject unauthenticated push" case_libra_reject_unauthenticated_push
 run_case "LIBRA reject tag push" case_libra_reject_tag_push
+run_case "LIBRA reject non-main branch push" case_libra_reject_non_main_branch_push
 
 finish
