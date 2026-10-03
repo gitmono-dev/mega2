@@ -48,7 +48,7 @@ timeout 5 git ls-remote "$MEGA2_BASE_URL/" > "$WORK/ls-remote" 2>/dev/null \
     || smoke_die "mega2 Git HTTP endpoint is not reachable with git ls-remote"
 
 case_libra_clone_http() {
-    local repo_path="/project" url="$MEGA2_BASE_URL/project" name="bb51-$RUN_ID.txt"
+    local repo_path="/project" url="$MEGA2_BASE_URL/project" name="${1:-bb51}-$RUN_ID.txt"
     local auth="$WORK/auth.header" code seed_hash git_hash libra_hash left
     local deadline=$((SECONDS + 55))
     local token="${MEGA2_IT_SEED_TOKEN:-}"
@@ -87,6 +87,53 @@ case_libra_clone_http() {
         || { echo "seed.txt sha256 differs between the seed and clones" >&2; return 1; }
 }
 
+case_libra_fetch_http() {
+    local WORK="$WORK/fetch"
+    local url="$MEGA2_BASE_URL/project" name="bb52-fetch-$RUN_ID.txt"
+    local code before_ref before_oid clone_oid git_ref git_oid libra_oid left
+    local deadline=$((SECONDS + 55))
+    mkdir "$WORK" "$WORK/home"
+    export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/config"
+    case_libra_clone_http bb52-clone
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    before_ref=$(timeout "$left" git ls-remote "$url" refs/heads/main) || return 1
+    [[ "$before_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "git observer is missing refs/heads/main before create-entry" >&2; return 1; }
+    before_oid=${before_ref%%$'\t'*}
+    clone_oid=$(cd "$WORK/libra-clone" && "$LIBRA_BIN" rev-parse refs/remotes/origin/main) \
+        || return 1
+    [ "$clone_oid" = "$before_oid" ] \
+        || { echo "libra clone tip differs from git observer before create-entry" >&2; return 1; }
+    jq -n --arg name "$name" --arg content "bb52 fetch seed $RUN_ID" \
+        '{is_directory: false, name: $name, path: "/project", content: $content, skip_build: true}' \
+        > "$WORK/fetch-create.json"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/fetch-create.json" \
+        -o "$WORK/fetch-create.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/create-entry")
+    if [ "$code" != 200 ] || ! jq -e '.req_result == true' "$WORK/fetch-create.out" > /dev/null; then
+        echo "fetch seed create-entry failed (HTTP $code)" >&2
+        return 1
+    fi
+
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    git_ref=$(timeout "$left" git ls-remote "$url" refs/heads/main) || return 1
+    [[ "$git_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "git observer is missing refs/heads/main" >&2; return 1; }
+    git_oid=${git_ref%%$'\t'*}
+    [ "$git_oid" != "$before_oid" ] \
+        || { echo "git observer tip did not advance after create-entry" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    (cd "$WORK/libra-clone" && timeout "$left" "$LIBRA_BIN" fetch origin) \
+        > "$WORK/fetch.out" 2>&1 || { echo "libra HTTP fetch failed" >&2; return 1; }
+    libra_oid=$(cd "$WORK/libra-clone" && "$LIBRA_BIN" rev-parse refs/remotes/origin/main) \
+        || return 1
+    [ "$git_oid" = "$libra_oid" ] \
+        || { echo "libra origin/main differs from git observer tip" >&2; return 1; }
+    printf 'origin/main: %s -> %s\n' "$before_oid" "$libra_oid"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
+run_case "LIBRA fetch HTTP" case_libra_fetch_http
 
 finish
