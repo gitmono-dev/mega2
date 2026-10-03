@@ -505,9 +505,22 @@ EOF
         sleep 1
     done
     left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
-    timeout "$left" "$LIBRA_BIN" clone "$ssh_url" "$WORK/libra-clone" \
+    timeout "$left" "$LIBRA_BIN" clone --no-checkout "$ssh_url" "$WORK/libra-clone" \
         > "$WORK/libra-clone.out" 2>&1 \
         || { echo "libra SSH clone failed" >&2; return 1; }
+    (
+        run_remaining() {
+            local remaining=$((deadline - SECONDS))
+            [ "$remaining" -gt 0 ] || return 124
+            timeout "$remaining" "$@"
+        }
+        cd "$WORK/libra-clone" || exit 1
+        run_remaining "$LIBRA_BIN" remote set-url origin "$url" || exit 1
+        run_remaining "$LIBRA_BIN" restore -S -W . || exit 1
+        run_remaining "$LIBRA_BIN" remote set-url origin "$ssh_url" || exit 1
+        [ "$(run_remaining "$LIBRA_BIN" remote get-url origin)" = "$ssh_url" ] || exit 1
+    ) > "$WORK/hydrate.out" 2>&1 \
+        || { echo "libra SSH clone HTTP LFS hydration failed" >&2; redact "$token" < "$WORK/hydrate.out" >&2; return 1; }
     clone_oid=$(cd "$WORK/libra-clone" && "$LIBRA_BIN" rev-parse HEAD) || return 1
     [ "$clone_oid" = "$ssh_oid" ] \
         || { echo "libra SSH clone tip differs from git observer" >&2; return 1; }
