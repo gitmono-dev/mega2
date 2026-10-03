@@ -20,6 +20,9 @@ if [ -z "$SMOKE_CASE_FILTER" ] || [ "$SMOKE_CASE_FILTER" = "LIBRA clone SSH" ] \
     || [ "$SMOKE_CASE_FILTER" = "LIBRA reject SSH push" ]; then
     require_tools ssh-keyscan ssh
 fi
+if [ -z "$SMOKE_CASE_FILTER" ] || [ "$SMOKE_CASE_FILTER" = "LIBRA LFS push and clone" ]; then
+    require_tools head perl
+fi
 
 LIBRA_BIN="${MEGA2_LIBRA_BIN:-libra}"
 command -v "$LIBRA_BIN" >/dev/null 2>&1 || smoke_die "libra binary not found: $LIBRA_BIN"
@@ -590,6 +593,77 @@ EOF
     printf 'main unchanged: %s (SSH receive-pack disabled)\n' "$after_oid"
 }
 
+case_libra_lfs_push_and_clone() {
+    local WORK="$WORK/lfs" url="$MEGA2_BASE_URL/project" name="bb61-$RUN_ID.bin"
+    local token="${MEGA2_IT_SEED_TOKEN:-}"
+    local left original_hash clone_hash push_rc=0 scan_rc=0
+    local deadline=$((SECONDS + 55))
+    [[ "$MEGA2_BASE_URL" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] \
+        || { echo "LFS push requires a loopback HTTP endpoint" >&2; return 1; }
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK" "$WORK/home" "$WORK/home/config"
+    local HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/config"
+    local LIBRA_CONFIG_GLOBAL_DB="$WORK/home/config/config.db"
+    export HOME XDG_CONFIG_HOME LIBRA_CONFIG_GLOBAL_DB
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" clone "$url" "$WORK/push-clone" > "$WORK/clone.out" 2>&1 \
+        || { echo "libra HTTP clone for LFS push failed" >&2; return 1; }
+    head -c 1048575 /dev/urandom > "$WORK/push-clone/$name"
+    (
+        run_remaining() {
+            local remaining=$((deadline - SECONDS))
+            [ "$remaining" -gt 0 ] || return 124
+            timeout "$remaining" "$@"
+        }
+        cd "$WORK/push-clone" || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.name 'Mega2 Smoke' || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.email 'mega2-smoke@example.invalid' || exit 1
+        run_remaining "$LIBRA_BIN" lfs track '*.bin' || exit 1
+        run_remaining "$LIBRA_BIN" add .libra_attributes "$name" || exit 1
+        head -c 1 /dev/urandom >> "$name"
+        run_remaining "$LIBRA_BIN" commit -a -m 'BB-61 LFS round trip smoke' --no-gpg-sign || exit 1
+    ) > "$WORK/commit.out" 2>&1 \
+        || { echo "libra LFS commit preparation failed" >&2; return 1; }
+    original_hash=$(sha256sum "$WORK/push-clone/$name"); original_hash=${original_hash%% *}
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" "$LIBRA_BIN" auth login \
+        --host "${MEGA2_BASE_URL#http://}" --with-token \
+        > "$WORK/auth.out" 2>&1 || { echo "libra loopback auth login failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    (cd "$WORK/push-clone" && timeout "$left" "$LIBRA_BIN" push origin main) \
+        > "$WORK/push.out" 2>&1 || push_rc=$?
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || scan_rc=$?
+    [ "$scan_rc" -eq 1 ] \
+        || { echo "LFS push token was persisted or the work directory scan failed" >&2; return 1; }
+    if [ "$push_rc" -ne 0 ]; then
+        echo "libra LFS push failed" >&2
+        redact "$token" < "$WORK/push.out" >&2
+        return 1
+    fi
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" git clone --no-checkout "$url" "$WORK/git-observer" \
+        > "$WORK/git-clone.out" 2>&1 \
+        || { echo "git observer clone after LFS push failed" >&2; return 1; }
+    git -C "$WORK/git-observer" show "HEAD:$name" > "$WORK/pointer.txt" \
+        || { echo "git observer could not read the pushed file" >&2; return 1; }
+    grep -Fxq 'version https://git-lfs.github.com/spec/v1' "$WORK/pointer.txt" \
+        && grep -Fxq "oid sha256:$original_hash" "$WORK/pointer.txt" \
+        && grep -Fxq 'size 1048576' "$WORK/pointer.txt" \
+        || { echo "remote file is not a 1 MiB LFS pointer" >&2; return 1; }
+    printf 'LFS pointer verified: %s\n' "$name"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" clone "$url" "$WORK/fresh-clone" \
+        > "$WORK/fresh-clone.out" 2>&1 \
+        || { echo "libra fresh clone after LFS push failed" >&2; return 1; }
+    [ -f "$WORK/fresh-clone/$name" ] \
+        || { echo "libra fresh clone is missing the LFS file" >&2; return 1; }
+    clone_hash=$(sha256sum "$WORK/fresh-clone/$name"); clone_hash=${clone_hash%% *}
+    [ "$clone_hash" = "$original_hash" ] \
+        || { echo "libra fresh clone LFS content differs from the source" >&2; return 1; }
+    printf 'LFS round-trip sha256: %s\n' "$clone_hash"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -600,5 +674,6 @@ run_case "LIBRA reject tag push" case_libra_reject_tag_push
 run_case "LIBRA reject non-main branch push" case_libra_reject_non_main_branch_push
 run_case "LIBRA clone SSH" case_libra_clone_ssh
 run_case "LIBRA reject SSH push" case_libra_reject_ssh_push
+run_case "LIBRA LFS push and clone" case_libra_lfs_push_and_clone
 
 finish
