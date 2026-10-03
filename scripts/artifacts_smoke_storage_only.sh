@@ -526,6 +526,26 @@ case_art_gc_unreferenced() {
     cmp -s "$d/kept" "$d/kept.got" || { echo "the committed object changed after GC" >&2; return 1; }
 }
 
+# --- BB-47 ART proxied download range (local) ---------------------------
+# Opt-in (MEGA2_SMOKE_LOCAL_STORAGE=1): run through `scripts/bb_optin_run.sh
+# local ...`; local storage has no presign, so mega2 serves the bytes itself.
+case_art_proxied_range_local() {
+    local d="$WORK/bb47" ns="bb47-$RUN_ID" oid code size
+    mkdir -p "$d"
+    art_case_begin
+    printf '0123456789abcdef bb47 %s\n' "$RUN_ID" > "$d/obj"
+    size=$(wc -c < "$d/obj" | tr -d ' ')
+    read -r oid _ <<< "$(art_seed "$ns" "bb47/$RUN_ID/obj.txt" "$d/obj")"
+    [ -n "$oid" ] || { echo "seed commit failed" >&2; return 1; }
+    code=$(art_curl -o "$d/part" -w '%{http_code}' -H 'Range: bytes=0-3' "$ART_API/objects/$oid")
+    [ "$code" = 206 ] || { echo "Range bytes=0-3 returned $code" >&2; return 1; }
+    printf '0123' | cmp -s - "$d/part" || { echo "Range bytes=0-3 did not return the first four bytes" >&2; return 1; }
+    code=$(art_curl -o /dev/null -w '%{http_code}' -H "Range: bytes=$((size + 10))-$((size + 20))" "$ART_API/objects/$oid")
+    [ "$code" = 416 ] || { echo "an out-of-range Range returned $code" >&2; return 1; }
+    code=$(art_curl -o /dev/null -w '%{http_code}' "$ART_API/objects/$oid?mode=link")
+    [ "$code" = 400 ] || { echo "mode=link on local storage returned $code" >&2; return 1; }
+}
+
 run_case "ART discovery" case_art_discovery
 run_case "ART presigned upload and commit" case_art_presigned_upload_commit
 run_case "ART server PUT upload and commit" case_art_server_put_commit
@@ -542,5 +562,6 @@ run_case "ART input validation" case_art_input_validation
 run_case "ART conditional GET and HEAD" case_art_conditional_get_head
 optin_case "ART anonymous write (none)" MEGA2_SMOKE_AUTH_NONE case_art_anonymous_write_none
 optin_case "ART GC removes unreferenced object" MEGA2_SMOKE_ARTIFACTS_GC case_art_gc_unreferenced
+optin_case "ART proxied download range (local)" MEGA2_SMOKE_LOCAL_STORAGE case_art_proxied_range_local
 
 finish
