@@ -424,3 +424,16 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profil
 已登记 case：`ART discovery`、`ART presigned upload and commit`、`ART server PUT upload and commit`、`ART presigned download`、`ART reject unauthenticated write`、`ART commit with missing objects`、`ART commit replay and conflict`、`ART list sets pagination`、`ART metadata filters`、`ART resolve file`、`ART set detail`、`ART repo isolation`、`ART input validation`、`ART conditional GET and HEAD`、`ART anonymous write (none)`、`ART GC removes unreferenced object`、`ART proxied download range (local)`。
 
 不设 `MEGA2_SMOKE_CASE` 时整跑全部默认栈 case；opt-in case（auth-none、GC、本地存储）只经 `scripts/bb_optin_run.sh <none|gc|local> artifacts_smoke_storage_only.sh '<case>' <log>` 运行。GC 模式使用 `config/compose.env.storage-only.artifacts-gc`（每 5 秒回收一次、宽限 1 秒，仅限实验室栈）；默认栈经 compose 透传的 `MEGA_ARTIFACTS_GC__*` 取代码默认值（关闭）。
+
+## 12. storage-only Libra 客户端黑盒
+
+[plan-20261001](plan/plan-20261001.md) 的 `scripts/libra_smoke_storage_only.sh` 在 `interop-smoke` 容器内运行。脚本以隔离 HOME 调用镜像内的 Libra 客户端，先检查版本不低于 0.30.8，并用只读 `git ls-remote` 检查 mega2 HTTP 端点。客户端经容器内环回中继访问 `http://127.0.0.1:9000/`；先按 §8 启动默认栈与 `interop-smoke`。
+
+```bash
+mkdir -p target/tmp; set -o pipefail
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T interop-smoke bash /repo/scripts/libra_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-libra-all.log
+CASE='<case>'
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profile interop exec -T -e MEGA2_SMOKE_CASE="$CASE" interop-smoke bash /repo/scripts/libra_smoke_storage_only.sh 2>&1 | tee target/tmp/bb-libra-case.log
+```
+
+BB-50 只建立零 case 框架：整跑输出 `libra smoke storage_only summary: 0 passed, 0 failed (0 skipped)`；点名尚未登记的 case 退出 2。后续 BB-51..BB-64 逐卡登记互通场景。
