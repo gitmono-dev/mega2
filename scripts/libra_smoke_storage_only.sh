@@ -16,7 +16,8 @@ source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "libra"
 require_tools git mkdir rm date timeout curl jq sha256sum cat grep
-if [ -z "$SMOKE_CASE_FILTER" ] || [ "$SMOKE_CASE_FILTER" = "LIBRA clone SSH" ]; then
+if [ -z "$SMOKE_CASE_FILTER" ] || [ "$SMOKE_CASE_FILTER" = "LIBRA clone SSH" ] \
+    || [ "$SMOKE_CASE_FILTER" = "LIBRA reject SSH push" ]; then
     require_tools ssh-keyscan ssh
 fi
 
@@ -440,7 +441,7 @@ case_libra_reject_non_main_branch_push() {
 
 case_libra_clone_ssh() {
     local WORK="$WORK/ssh-clone" ssh_url="ssh://git@127.0.0.1:2222//project"
-    local url="$MEGA2_BASE_URL/project" name="bb59-$RUN_ID.txt"
+    local url="$MEGA2_BASE_URL/project" name="${1:-bb59}-$RUN_ID.txt"
     local token="${MEGA2_IT_SEED_TOKEN:-}"
     local kh code left seed_hash git_hash libra_hash git_oid ssh_ref ssh_oid clone_oid
     local deadline=$((SECONDS + 55))
@@ -464,7 +465,7 @@ EOF
     chmod 700 "$WORK/ssh-client"
     export MEGA2_SMOKE_KNOWN_HOSTS="$kh" LIBRA_SSH_COMMAND="$WORK/ssh-client"
 
-    printf 'bb59 SSH clone seed %s' "$RUN_ID" > "$WORK/seed.txt"
+    printf '%s SSH clone seed %s' "${1:-bb59}" "$RUN_ID" > "$WORK/seed.txt"
     jq -n --arg name "$name" --arg content "$(cat "$WORK/seed.txt")" \
         '{is_directory: false, name: $name, path: "/project", content: $content, skip_build: true}' \
         > "$WORK/create.json"
@@ -524,6 +525,58 @@ EOF
     printf 'SSH clone seed sha256: %s\n' "$libra_hash"
 }
 
+case_libra_reject_ssh_push() {
+    local WORK="$WORK/ssh-push" url="$MEGA2_BASE_URL/project" name="bb60-$RUN_ID.txt"
+    local before_ref after_ref before_oid after_oid left push_rc=0
+    local deadline=$((SECONDS + 55))
+    mkdir "$WORK"
+    case_libra_clone_ssh bb60-clone
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    before_ref=$(timeout "$left" git ls-remote "$url" refs/heads/main) || return 1
+    [[ "$before_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "git observer is missing main before SSH push" >&2; return 1; }
+    before_oid=${before_ref%%$'\t'*}
+    printf 'bb60 SSH push %s\n' "$RUN_ID" > "$WORK/ssh-clone/libra-clone/$name"
+    (
+        run_remaining() {
+            local remaining=$((deadline - SECONDS))
+            [ "$remaining" -gt 0 ] || return 124
+            timeout "$remaining" "$@"
+        }
+        cd "$WORK/ssh-clone/libra-clone" || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.name 'Mega2 Smoke' || exit 1
+        run_remaining "$LIBRA_BIN" config set --local user.email 'mega2-smoke@example.invalid' || exit 1
+        run_remaining "$LIBRA_BIN" add "$name" || exit 1
+        run_remaining "$LIBRA_BIN" commit -m 'BB-60 SSH push rejection smoke' --no-gpg-sign || exit 1
+    ) > "$WORK/commit.out" 2>&1 \
+        || { echo "libra commit for SSH push failed" >&2; return 1; }
+    export MEGA2_SMOKE_SSH_BASE="$LIBRA_SSH_COMMAND"
+    export MEGA2_SMOKE_SSH_ERROR_LOG="$WORK/ssh-push.err"
+    cat > "$WORK/ssh-push-client" <<'EOF'
+#!/usr/bin/env bash
+exec "$MEGA2_SMOKE_SSH_BASE" "$@" 2> "$MEGA2_SMOKE_SSH_ERROR_LOG"
+EOF
+    chmod 700 "$WORK/ssh-push-client"
+    export LIBRA_SSH_COMMAND="$WORK/ssh-push-client"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    (cd "$WORK/ssh-clone/libra-clone" && timeout "$left" "$LIBRA_BIN" push origin main < /dev/null) \
+        > "$WORK/push.out" 2>&1 || push_rc=$?
+    if [ "$push_rc" -eq 0 ] || [ "$push_rc" -eq 124 ]; then
+        echo "SSH push did not fail promptly" >&2
+        return 1
+    fi
+    grep -Fq 'SSH receive-pack is disabled' "$WORK/ssh-push.err" \
+        || { echo "SSH push failed without the server's receive-pack rejection" >&2; cat "$WORK/push.out" "$WORK/ssh-push.err" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    after_ref=$(timeout "$left" git ls-remote "$url" refs/heads/main) || return 1
+    [[ "$after_ref" == *$'\t'refs/heads/main ]] \
+        || { echo "git observer is missing main after SSH push" >&2; return 1; }
+    after_oid=${after_ref%%$'\t'*}
+    [ "$after_oid" = "$before_oid" ] \
+        || { echo "git observer tip advanced after rejected SSH push" >&2; return 1; }
+    printf 'main unchanged: %s (SSH receive-pack disabled)\n' "$after_oid"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -533,5 +586,6 @@ run_case "LIBRA reject unauthenticated push" case_libra_reject_unauthenticated_p
 run_case "LIBRA reject tag push" case_libra_reject_tag_push
 run_case "LIBRA reject non-main branch push" case_libra_reject_non_main_branch_push
 run_case "LIBRA clone SSH" case_libra_clone_ssh
+run_case "LIBRA reject SSH push" case_libra_reject_ssh_push
 
 finish
