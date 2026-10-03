@@ -333,11 +333,57 @@ case_libra_reject_unauthenticated_push() {
     printf 'main unchanged: %s (push rejected with authentication required)\n' "$after_oid"
 }
 
+case_libra_reject_tag_push() {
+    local WORK="$WORK/tag-push" url="$MEGA2_BASE_URL/project" tag="bb57-$RUN_ID"
+    local token="${MEGA2_IT_SEED_TOKEN:-}"
+    local before_refs after_refs left push_rc=0 scan_rc=0
+    local deadline=$((SECONDS + 55))
+    [[ "$MEGA2_BASE_URL" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] \
+        || { echo "tag push requires a loopback HTTP endpoint" >&2; return 1; }
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK" "$WORK/home" "$WORK/home/config"
+    export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/config"
+    export LIBRA_CONFIG_GLOBAL_DB="$WORK/home/config/config.db"
+    before_refs=$(timeout 10 git ls-remote --tags "$url" "refs/tags/$tag") || return 1
+    [ -z "$before_refs" ] \
+        || { echo "git observer found the tag before push" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" clone "$url" "$WORK/push-clone" > "$WORK/clone.out" 2>&1 \
+        || { echo "libra HTTP clone for tag push failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    (cd "$WORK/push-clone" && timeout "$left" "$LIBRA_BIN" tag -m 'BB-57 tag push smoke' "$tag") \
+        > "$WORK/tag.out" 2>&1 || { echo "libra local tag creation failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" "$LIBRA_BIN" auth login \
+        --host "${MEGA2_BASE_URL#http://}" --with-token \
+        > "$WORK/auth.out" 2>&1 || { echo "libra loopback auth login failed" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    (cd "$WORK/push-clone" && timeout "$left" "$LIBRA_BIN" push origin "$tag") \
+        > "$WORK/push.out" 2>&1 || push_rc=$?
+    [ "$push_rc" -ne 0 ] && [ "$push_rc" -ne 124 ] \
+        || { echo "tag push did not fail promptly" >&2; return 1; }
+    grep -Fq 'tag pushes are not supported' "$WORK/push.out" \
+        || { echo "tag push failed without the server's tag rejection" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || scan_rc=$?
+    if [ "$scan_rc" -eq 0 ]; then
+        echo "tag push token was persisted in the case work directory" >&2
+        return 1
+    fi
+    [ "$scan_rc" -eq 1 ] || { echo "cannot scan the tag-push work directory" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    after_refs=$(timeout "$left" git ls-remote --tags "$url" "refs/tags/$tag") || return 1
+    [ -z "$after_refs" ] \
+        || { echo "git observer found the rejected tag on the remote" >&2; return 1; }
+    printf 'remote tag absent: refs/tags/%s\n' "$tag"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
 run_case "LIBRA trunk push HTTP" case_libra_trunk_push_http
 run_case "LIBRA multi-commit push HTTP" case_libra_multi_commit_push_http
 run_case "LIBRA reject unauthenticated push" case_libra_reject_unauthenticated_push
+run_case "LIBRA reject tag push" case_libra_reject_tag_push
 
 finish
