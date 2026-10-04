@@ -196,7 +196,7 @@ git-smoke runner git-lfs 固定版本: `git-lfs/3.8.0`
 
 `docker/docker-compose-storage-only.yml`（项目 `mega2-trunk`）里的互通黑盒 runner，供 [`plan-20261001`](../plan/plan-20261001.md) 的 OCI / Artifacts / Libra 三个 smoke 脚本使用。与 `git-smoke` 并存、互不替代：`git-smoke` 只用 `git` 观察 Git 协议面，`interop-smoke` 用 `oras` / `curl` / `jq` / `libra` 观察其余公开面。
 
-interop-smoke libra 版本: 构建时 libra.tools 最新 stable（镜像内 `/etc/interop-smoke/libra-version` 记录实际版本，下限 `0.30.8`）
+interop-smoke libra 版本: 构建时 libra.tools 最新 stable（镜像内 `/etc/interop-smoke/libra-version` 记录实际版本，下限 `0.30.26`）
 
 | 项 | 值 |
 |---|---|
