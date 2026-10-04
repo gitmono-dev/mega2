@@ -1092,6 +1092,117 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_accepts_mst2_file_source_and_checks_identity() {
+        use futures::FutureExt;
+
+        let lock = env_lock();
+        // The repository test environment still carries this removed setting.
+        // Keep the file-source regression isolated for both load and validate.
+        let _mail = crate::config::testing::EnvVarGuard::remove(&lock, "MEGA_MAIL__ENABLED");
+        let _enabled = crate::config::testing::EnvVarGuard::remove(&lock, "MEGA_MST2__ENABLED");
+        let _identity =
+            crate::config::testing::EnvVarGuard::remove(&lock, "MEGA_MST2__INSTANCE_UUID");
+        let _publication =
+            crate::config::testing::EnvVarGuard::remove(&lock, "MEGA_MST2__PUBLICATION_ENABLED");
+        let _token = crate::config::testing::EnvVarGuard::remove(&lock, "MEGA_MST2__AUTH_TOKEN");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = dir.path().join("config.toml");
+        let content = format!(
+            "{}\n[mst2]\nenabled = true\ninstance_uuid = \"12345678-1234-4234-9234-123456789abc\"\npublication_enabled = false\nauth_token = \"mst2-cli-test-token\"\n",
+            crate::config::template::config_init_template(dir.path()),
+        );
+        fs::write(&config_path, &content).expect("write MST/2 config");
+        let selected =
+            crate::config::loader::ConfigLoader::new(crate::config::loader::ConfigInput {
+                cli_path: Some(config_path.clone()),
+                ..Default::default()
+            })
+            .load_readonly()
+            .expect("select explicit existing config");
+        assert_eq!(selected.path, config_path);
+        let config =
+            load_config_for_validate(&selected.path, None).expect("CLI loader accepts MST/2 file");
+        assert!(config.mst2.enabled);
+        assert_eq!(
+            config.mst2.auth_token.as_deref(),
+            Some("mst2-cli-test-token")
+        );
+        let invalid_path = dir.path().join("invalid.toml");
+        fs::write(
+            &invalid_path,
+            content.replace(
+                "12345678-1234-4234-9234-123456789abc",
+                "00000000-0000-0000-0000-000000000000",
+            ),
+        )
+        .expect("write nil UUID config");
+        let invalid_config = load_config_for_validate(&invalid_path, None)
+            .expect("syntactically valid MST/2 file loads before semantic validation");
+        validate_config(
+            &config,
+            Some(&config_path),
+            None,
+            false,
+            false,
+            false,
+            "human",
+        )
+        .now_or_never()
+        .expect("validation without secret resolution must complete synchronously")
+        .expect("ordinary CLI validation accepts MST/2");
+        let message = validate_config(
+            &invalid_config,
+            Some(&invalid_path),
+            None,
+            false,
+            false,
+            false,
+            "human",
+        )
+        .now_or_never()
+        .expect("validation without secret resolution must complete synchronously")
+        .expect_err("ordinary CLI validation must reject nil UUID")
+        .to_string();
+        assert!(message.contains("mst2.instance_uuid"), "{message}");
+        assert!(!message.contains("mst2-cli-test-token"), "{message}");
+    }
+
+    #[test]
+    fn config_validate_rejects_unknown_mst2_profile_field() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = dir.path().join("config.toml");
+        let profile_path = dir.path().join("config.test.toml");
+        fs::write(
+            &config_path,
+            crate::config::template::config_init_template(dir.path()),
+        )
+        .expect("write base config");
+        fs::write(
+            &profile_path,
+            "[mst2]\nenabled = false\npublication_enabeld = true\n",
+        )
+        .expect("write typo profile");
+        let selected =
+            crate::config::loader::ConfigLoader::new(crate::config::loader::ConfigInput {
+                cli_path: Some(config_path),
+                cli_profile: Some("test".to_string()),
+                ..Default::default()
+            })
+            .load_readonly()
+            .expect("select explicit existing profile");
+        let message = load_config_for_validate(
+            &selected.path,
+            selected
+                .profile
+                .as_ref()
+                .map(|profile| profile.path.as_path()),
+        )
+        .expect_err("MST/2 nested typo must fail in the CLI profile loader")
+        .to_string();
+        assert!(message.contains("mst2.publication_enabeld"), "{message}");
+    }
+
+    #[test]
     fn config_validate_accepts_deny_warnings_flag() {
         let matches = cli()
             .try_get_matches_from(["config", "validate", "--deny-warnings", "--show-sources"])
