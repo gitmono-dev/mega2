@@ -689,6 +689,89 @@ case_libra_browser_list_root() {
     printf 'root entries matched: %s\n' "$(jq -r '.data.items | length' "$WORK/browser.json")"
 }
 
+case_libra_browser_list_at_ref() {
+    local WORK="$WORK/browser-ref" tag="bb63-$RUN_ID" name="bb63-$RUN_ID.txt"
+    local path="/project" token="${MEGA2_IT_SEED_TOKEN:-}" left code
+    local baseline_names tag_names
+    local tag_attempted=false
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    printf 'Authorization: Bearer %s\n' "$token" > "$WORK/auth.header"
+    # Invoked indirectly by the RETURN trap below.
+    # shellcheck disable=SC2329
+    cleanup_bb63_tag() {
+        trap - RETURN
+        local cleanup_code=000 cleanup_left cleanup_timeout
+        if [ "$tag_attempted" = true ]; then
+            cleanup_left=$((deadline - SECONDS))
+            if [ "$cleanup_left" -gt 0 ]; then
+                cleanup_timeout=$cleanup_left
+                [ "$cleanup_timeout" -le 5 ] || cleanup_timeout=5
+                cleanup_code=$(curl -sS --connect-timeout 5 --max-time "$cleanup_timeout" -X DELETE \
+                    -H @"$WORK/auth.header" -o "$WORK/delete-tag.out" -w '%{http_code}' \
+                    "$MEGA2_BASE_URL/api/v1/tags/$tag") || cleanup_code=000
+            fi
+            if [ "$cleanup_code" = 200 ] && jq -e --arg name "$tag" \
+                '.req_result == true and .data.deleted_tag == $name' "$WORK/delete-tag.out" > /dev/null; then
+                printf 'cleaned root tag: %s\n' "$tag"
+            elif [ "$cleanup_code" != 404 ]; then
+                printf 'warning: root tag cleanup failed (HTTP %s): %s\n' "$cleanup_code" "$tag" >&2
+            fi
+        fi
+        rm -f "$WORK/auth.header"
+        return 0
+    }
+    trap cleanup_bb63_tag RETURN
+    jq -n --arg name "$tag" '{name: $name}' > "$WORK/tag.json"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    tag_attempted=true
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/tag.json" \
+        -o "$WORK/tag.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tags") || return 1
+    [ "$code" = 200 ] && jq -e --arg name "$tag" \
+        '.req_result == true and .data.name == $name' "$WORK/tag.out" > /dev/null \
+        || { echo "root tag creation failed (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" --ref "$tag" "$path" \
+        > "$WORK/tag-baseline.json" 2> "$WORK/tag-baseline.err" \
+        || { echo "libra browser tag baseline listing failed" >&2; return 1; }
+    jq -e --arg tag "$tag" --arg path "$path" --arg name "$name" \
+        '.ok == true and .data.path == $path and .data.ref == $tag and (.data.items | type) == "array" and all(.data.items[]; .name != $name)' \
+        "$WORK/tag-baseline.json" > /dev/null \
+        || { echo "libra browser tag baseline JSON is invalid" >&2; return 1; }
+    baseline_names=$(jq -c '[.data.items[].name] | sort' "$WORK/tag-baseline.json") || return 1
+    jq -n --arg name "$name" --arg path "$path" --arg content "bb63 after tag $RUN_ID" \
+        '{is_directory: false, name: $name, path: $path, content: $content, skip_build: true}' \
+        > "$WORK/create.json" || return 1
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/create.json" \
+        -o "$WORK/create.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/create-entry") || return 1
+    [ "$code" = 200 ] && jq -e '.req_result == true' "$WORK/create.out" > /dev/null \
+        || { echo "post-tag file creation failed (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" --ref "$tag" "$path" \
+        > "$WORK/tag-list.json" 2> "$WORK/tag-list.err" \
+        || { echo "libra browser tag listing failed" >&2; return 1; }
+    jq -e --arg tag "$tag" --arg path "$path" --arg name "$name" \
+        '.ok == true and .data.path == $path and .data.ref == $tag and all(.data.items[]; .name != $name)' \
+        "$WORK/tag-list.json" > /dev/null \
+        || { echo "tag listing contains the post-tag file" >&2; return 1; }
+    tag_names=$(jq -c '[.data.items[].name] | sort' "$WORK/tag-list.json") || return 1
+    [ "$tag_names" = "$baseline_names" ] \
+        || { echo "tag listing changed after the main write" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" "$path" \
+        > "$WORK/current-list.json" 2> "$WORK/current-list.err" \
+        || { echo "libra browser current listing failed" >&2; return 1; }
+    jq -e --arg path "$path" --arg name "$name" \
+        '.ok == true and .data.path == $path and .data.ref == null and any(.data.items[]; .name == $name)' \
+        "$WORK/current-list.json" > /dev/null \
+        || { echo "current listing is missing the post-tag file" >&2; return 1; }
+    printf 'ref isolated post-tag file: %s\n' "$name"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -701,5 +784,6 @@ run_case "LIBRA clone SSH" case_libra_clone_ssh
 run_case "LIBRA reject SSH push" case_libra_reject_ssh_push
 run_case "LIBRA LFS push and clone" case_libra_lfs_push_and_clone
 run_case "LIBRA browser list root" case_libra_browser_list_root
+run_case "LIBRA browser list at ref" case_libra_browser_list_at_ref
 
 finish
