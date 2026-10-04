@@ -806,6 +806,50 @@ case_libra_browser_unknown_path() {
     printf 'unknown path error_code: LBR-NET-002\n'
 }
 
+case_libra_browser_list_text() {
+    local WORK="$WORK/browser-list-text" path="/project" name="bb66-$RUN_ID"
+    local token="${MEGA2_IT_SEED_TOKEN:-}" left code leak_rc=0
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    jq -n --arg name "$name" --arg path "$path" \
+        '{is_directory: true, name: $name, path: $path, content: null, skip_build: true}' \
+        > "$WORK/create.json" || return 1
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf 'Authorization: Bearer %s\n' "$token" > "$WORK/auth.header"
+    if ! code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/create.json" \
+        -o "$WORK/create.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/create-entry"); then
+        rm -f "$WORK/auth.header"
+        return 1
+    fi
+    rm -f "$WORK/auth.header"
+    [ "$code" = 200 ] && jq -e '.req_result == true' "$WORK/create.out" > /dev/null \
+        || { echo "browser list fixture creation failed (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" mega2 browser --server "$MEGA2_BASE_URL" --list "$path" \
+        > "$WORK/browser.out" 2> "$WORK/browser.err" \
+        || { echo "libra browser text listing failed" >&2; return 1; }
+    grep -Fxq -- "dir  $name" "$WORK/browser.out" \
+        || { echo "libra browser text listing is missing the fixture directory line" >&2; return 1; }
+    ! jq -e . "$WORK/browser.out" > /dev/null 2>&1 \
+        || { echo "libra browser text listing unexpectedly emitted JSON" >&2; return 1; }
+    [ ! -s "$WORK/browser.err" ] \
+        || { echo "libra browser text listing wrote unexpected stderr" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$path" \
+        -o "$WORK/tree.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg name "$name" \
+        '.req_result == true and any(.data.tree_items[]; .name == $name and .content_type == "directory")' \
+        "$WORK/tree.json" > /dev/null \
+        || { echo "mega2 project tree is missing the fixture directory (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || leak_rc=$?
+    [ "$leak_rc" -eq 1 ] \
+        || { echo "browser list token was persisted or the work directory scan failed" >&2; return 1; }
+    printf 'browser text entry matched: %s\n' "$name"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -820,5 +864,6 @@ run_case "LIBRA LFS push and clone" case_libra_lfs_push_and_clone
 run_case "LIBRA browser list root" case_libra_browser_list_root
 run_case "LIBRA browser list at ref" case_libra_browser_list_at_ref
 run_case "LIBRA browser unknown path" case_libra_browser_unknown_path
+run_case "LIBRA browser list text" case_libra_browser_list_text
 
 finish
