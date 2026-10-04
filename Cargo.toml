@@ -1,6 +1,6 @@
 [package]
 name = "mega2"
-version = "0.41.59"
+version = "0.41.60"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Monorepo engine and Git hosting server for AI agents: trunk-based storage, Git Smart HTTP, Git LFS, OCI registry, and Agent Session Capture"

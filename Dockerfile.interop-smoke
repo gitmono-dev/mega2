@@ -92,7 +92,9 @@ CMD ["sleep", "infinity"]
 # installer verifies its Ed25519-signed stable manifest and the binary's
 # sha256 (LIBRA_REQUIRE_CHECKSUM=1); fallback installs are never enabled.
 # LIBRA_VERSION empty = latest stable; LIBRA_CACHE_BUST forces a fresh layer
-# so a rebuild picks up a newer stable release.
+# so a rebuild picks up a newer stable release. The official installer's two
+# bounded asset downloads are raised from 300s to 600s for this deployment;
+# the signed origin, manifest, size, and sha256 checks remain unchanged.
 FROM base AS final
 
 ARG LIBRA_VERSION=""
@@ -102,6 +104,10 @@ RUN set -eu; \
     echo "libra cache bust: ${LIBRA_CACHE_BUST:-none}"; \
     curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh -o /tmp/libra-install.sh; \
     sha256sum /tmp/libra-install.sh; \
+    test "$(grep -oF -- '--max-time 300 "$1"' /tmp/libra-install.sh | wc -l)" -eq 2; \
+    sed -i 's/--max-time 300 "$1"/--max-time 600 "$1"/g' /tmp/libra-install.sh; \
+    test "$(grep -oF -- '--max-time 600 "$1"' /tmp/libra-install.sh | wc -l)" -eq 2; \
+    if grep -qF -- '--max-time 300 "$1"' /tmp/libra-install.sh; then exit 1; fi; \
     LIBRA_REQUIRE_CHECKSUM=1 LIBRA_NO_TUI=1 LIBRA_HOME=/tmp/libra-home \
         sh /tmp/libra-install.sh -d /usr/local/bin --no-modify-path --no-alias ${LIBRA_VERSION:+-v "$LIBRA_VERSION"}; \
     rm -rf /tmp/libra-install.sh /tmp/libra-home; \

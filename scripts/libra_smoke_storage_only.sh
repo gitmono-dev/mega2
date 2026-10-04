@@ -34,8 +34,8 @@ if [[ "$version" =~ ^libra[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
 else
     smoke_die "unrecognized libra version"
 fi
-if (( major == 0 && (minor < 30 || (minor == 30 && patch < 8)) )); then
-    smoke_die "libra 0.30.8 or newer is required"
+if (( major == 0 && (minor < 30 || (minor == 30 && patch < 26)) )); then
+    smoke_die "libra 0.30.26 or newer is required"
 fi
 
 MEGA2_BASE_URL="${MEGA2_BASE_URL:-http://127.0.0.1:9000}"

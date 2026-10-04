@@ -427,7 +427,7 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profil
 
 ## 12. storage-only Libra 客户端黑盒
 
-[plan-20261001](plan/plan-20261001.md) 的 `scripts/libra_smoke_storage_only.sh` 在 `interop-smoke` 容器内运行。脚本以隔离 HOME 调用镜像内的 Libra 客户端，先检查版本不低于 0.30.8，并用只读 `git ls-remote` 检查 mega2 HTTP 端点。客户端经容器内环回中继访问 `http://127.0.0.1:9000/`；先按 §8 启动默认栈与 `interop-smoke`。
+[plan-20261001](plan/plan-20261001.md) 的 `scripts/libra_smoke_storage_only.sh` 在 `interop-smoke` 容器内运行。脚本以隔离 HOME 调用镜像内的 Libra 客户端，先检查版本不低于 0.30.26，并用只读 `git ls-remote` 检查 mega2 HTTP 端点。客户端经容器内环回中继访问 `http://127.0.0.1:9000/`；先按 §8 启动默认栈与 `interop-smoke`。
 
 ```bash
 mkdir -p target/tmp; set -o pipefail
