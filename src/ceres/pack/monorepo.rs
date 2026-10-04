@@ -282,17 +282,21 @@ impl RepoHandler for Monorepo {
         for level in 0..depth {
             let mut next_level: Vec<Commit> = Vec::new();
             for commit in &current_level {
+                // Depth counts the wanted commit. Cut its parent edges at
+                // the last included level, without packing the next level.
+                if level + 1 == depth {
+                    if !commit.parent_commit_ids.is_empty() {
+                        shallow_commits.push(commit.id.to_string());
+                    }
+                    continue;
+                }
                 for p_commit_id in &commit.parent_commit_ids {
                     let p_id = p_commit_id.to_string();
                     if visited.insert(p_id.clone())
                         && let Some(model) = storage.get_commit_by_hash(&p_id).await.unwrap()
                     {
                         let parent = Commit::from_mega_model(model);
-                        if level + 1 == depth {
-                            shallow_commits.push(p_id);
-                        } else {
-                            next_level.push(parent.clone());
-                        }
+                        next_level.push(parent.clone());
                         all_commits.push(parent);
                     }
                 }
@@ -3714,6 +3718,156 @@ mod tests {
             err.to_string().contains("pack decode failed"),
             "unpack_stream must convert the decoder failure into a typed error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn shallow_pack_respects_depth_and_excludes_parent_only_objects() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        let mono_storage = storage.mono_storage();
+        let conn = mono_storage.get_connection();
+        let sig = Signature::new(
+            SignatureType::Author,
+            "Shallow Test".into(),
+            "shallow@example.invalid".into(),
+        );
+        let mut commits: Vec<Commit> = Vec::new();
+        let mut objects = Vec::new();
+        for index in 0..3 {
+            let blob = Blob::from_content_bytes(format!("unique depth {index}").into_bytes());
+            storage
+                .git_service
+                .put_objects(vec![blob.clone()])
+                .await
+                .unwrap();
+            let tree = Tree::from_tree_items(vec![TreeItem::new(
+                TreeItemMode::Blob,
+                blob.id,
+                format!("file-{index}.txt"),
+            )])
+            .unwrap();
+            mega_tree::Entity::insert(
+                tree.clone()
+                    .into_mega_model(EntryMeta::default())
+                    .into_active_model(),
+            )
+            .exec(conn)
+            .await
+            .unwrap();
+            let parents = commits.last().map(|c| vec![c.id]).unwrap_or_default();
+            let commit = Commit::new(sig.clone(), sig.clone(), tree.id, parents, "depth fixture");
+            let model: mega_commit::Model = commit.clone().into_mega_model(EntryMeta::default());
+            mega_commit::Entity::insert(model.into_active_model())
+                .exec(conn)
+                .await
+                .unwrap();
+            objects.push([
+                blob.id.to_string(),
+                tree.id.to_string(),
+                commit.id.to_string(),
+            ]);
+            commits.push(commit);
+        }
+        let repo =
+            trunk_monorepo(&storage, "/", vec![], HashSet::new(), HashSet::new(), None).await;
+        for depth in [1, 2, 3, 5] {
+            let (stream, boundaries) = repo
+                .shallow_pack(vec![commits[2].id.to_string()], depth, false)
+                .await
+                .unwrap();
+            let included = (depth as usize).min(commits.len());
+            let expected_boundaries = if included < commits.len() {
+                vec![commits[commits.len() - included].id.to_string()]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                boundaries, expected_boundaries,
+                "depth {depth}: cut at the included boundary commit"
+            );
+            let pack: Vec<u8> = stream.concat().await;
+            let declared = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
+            let mut decoder = Pack::new_with_hash_kind(
+                repo.object_hash_kind().unwrap(),
+                Some(1),
+                Some(64 * 1024 * 1024),
+                Some(temp.path().to_path_buf()),
+                true,
+            );
+            let ids = Arc::new(Mutex::new(Vec::new()));
+            let sink = ids.clone();
+            decoder
+                .decode(
+                    &mut std::io::Cursor::new(pack),
+                    move |entry| sink.lock().unwrap().push(entry.inner.hash.to_string()),
+                    None::<fn(ObjectHash)>,
+                )
+                .unwrap();
+            let expected: HashSet<_> = objects[objects.len() - included..]
+                .iter()
+                .flatten()
+                .cloned()
+                .collect();
+            let ids = ids.lock().unwrap();
+            assert_eq!(
+                declared,
+                expected.len(),
+                "depth {depth}: exact pack header count"
+            );
+            assert_eq!(ids.len(), expected.len(), "depth {depth}: no duplicates");
+            assert_eq!(
+                ids.iter().cloned().collect::<HashSet<_>>(),
+                expected,
+                "depth {depth}: no parent-only objects"
+            );
+        }
+
+        let state = crate::ceres::api_service::state::ProtocolApiState {
+            storage: storage.clone(),
+            git_object_cache: repo.git_object_cache.clone(),
+            entity_store: storage.entity_store(),
+        };
+        for depth in [1, 3] {
+            for done in [false, true] {
+                use crate::ceres::protocol::{ServiceType, SmartSession, TransportProtocol, smart};
+                let mut session = SmartSession::from_state(
+                    PathBuf::from("/"),
+                    ServiceType::UploadPack,
+                    TransportProtocol::Http,
+                    &state,
+                )
+                .unwrap();
+                let mut request = bytes::BytesMut::new();
+                smart::add_pkt_line_string(&mut request, format!("want {}\n", commits[2].id));
+                smart::add_pkt_line_string(&mut request, format!("deepen {depth}\n"));
+                request.extend_from_slice(smart::PKT_LINE_END_MARKER);
+                if done {
+                    smart::add_pkt_line_string(&mut request, "done\n".to_string());
+                }
+                let (stream, response) = session
+                    .git_upload_pack(&state, &mut request.freeze())
+                    .await
+                    .unwrap();
+                let mut expected = bytes::BytesMut::new();
+                if depth == 1 {
+                    smart::add_pkt_line_string(
+                        &mut expected,
+                        format!("shallow {}\n", commits[2].id),
+                    );
+                }
+                expected.extend_from_slice(smart::PKT_LINE_END_MARKER);
+                if done {
+                    smart::add_pkt_line_string(&mut expected, "NAK\n".to_string());
+                }
+                assert_eq!(
+                    response, expected,
+                    "depth {depth}, done {done}: v0 negotiation"
+                );
+                let pack: Vec<u8> = stream.concat().await;
+                assert_eq!(pack.starts_with(b"PACK"), done);
+                assert_eq!(pack.is_empty(), !done);
+            }
+        }
     }
 
     /// Regression (fetch duplicate/count defect): two want commits sharing

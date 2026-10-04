@@ -250,6 +250,9 @@ pub async fn git_upload_pack(
     let body_stream = async_stream::stream! {
         tracing::info!("send ack/nak message buf: --------> {:?}", &protocol_buf);
         yield Ok::<_, Infallible>(Bytes::copy_from_slice(&protocol_buf));
+        if protocol_buf.ends_with(smart::PKT_LINE_END_MARKER) {
+            return;
+        }
         while let Some(chunk) = send_pack_data.next().await {
             let mut reader = chunk.as_slice();
             loop {
