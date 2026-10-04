@@ -241,8 +241,9 @@ impl PushQueueStorage {
                     });
                 }
                 // operation_states race: winner already committed — classify by read.
+                let replay_txn = self.get_connection().begin().await?;
                 if let Some(existing) = push_queue::Entity::find()
-                    .filter(push_queue::Column::Kind.eq(kind))
+                    .filter(push_queue::Column::Kind.eq(kind.clone()))
                     .filter(push_queue::Column::Path.eq(path))
                     .filter(push_queue::Column::OperationId.eq(operation_id))
                     .filter(push_queue::Column::Status.is_in([
@@ -250,9 +251,23 @@ impl PushQueueStorage {
                         PushQueueStatusEnum::Running,
                         PushQueueStatusEnum::Done,
                     ]))
-                    .one(self.get_connection())
+                    .one(&replay_txn)
                     .await?
                 {
+                    if matches!(&kind, PushQueueKindEnum::Push | PushQueueKindEnum::Merge) {
+                        let mut candidate = existing.clone();
+                        candidate.old_id = old_id.to_owned();
+                        candidate.new_id = new_id.to_owned();
+                        candidate.requester = requester.map(str::to_owned);
+                        candidate.payload = payload.clone();
+                        crate::jupiter::storage::mono_storage::MonoStorage {
+                            base: self.base.clone(),
+                        }
+                        .validate_queue_publication_replay_in_txn(&replay_txn, &candidate)
+                        .await
+                        .map_err(|error| MegaError::Other(error.to_string()))?;
+                    }
+                    replay_txn.commit().await?;
                     return match existing.status {
                         PushQueueStatusEnum::Done => Ok(EnqueueOutcome::Replay {
                             id: existing.id,
@@ -264,6 +279,7 @@ impl PushQueueStorage {
                         _ => unreachable!("filter restricts status"),
                     };
                 }
+                replay_txn.rollback().await?;
                 return Err(MegaError::Other(format!(
                     "unique conflict without classifiable row: {msg}"
                 )));
@@ -283,6 +299,29 @@ impl PushQueueStorage {
                 Some(outcome) => {
                     match &outcome {
                         EnqueueOutcome::Adopted { .. } | EnqueueOutcome::Replay { .. } => {
+                            if matches!(&kind, PushQueueKindEnum::Push | PushQueueKindEnum::Merge) {
+                                let id = match &outcome {
+                                    EnqueueOutcome::Adopted { id }
+                                    | EnqueueOutcome::Replay { id, .. } => *id,
+                                    _ => unreachable!("adopt or replay"),
+                                };
+                                let mut candidate = push_queue::Entity::find_by_id(id)
+                                    .one(&txn)
+                                    .await?
+                                    .ok_or_else(|| {
+                                        MegaError::Other("queue replay row missing".into())
+                                    })?;
+                                candidate.old_id = old_id.to_owned();
+                                candidate.new_id = new_id.to_owned();
+                                candidate.requester = requester.map(str::to_owned);
+                                candidate.payload = payload.clone();
+                                crate::jupiter::storage::mono_storage::MonoStorage {
+                                    base: self.base.clone(),
+                                }
+                                .validate_queue_publication_replay_in_txn(&txn, &candidate)
+                                .await
+                                .map_err(|error| MegaError::Other(error.to_string()))?;
+                            }
                             txn.commit().await?;
                         }
                         EnqueueOutcome::Rejected { .. } => {
