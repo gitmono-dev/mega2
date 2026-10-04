@@ -889,6 +889,67 @@ case_libra_browser_create_dir() {
     printf 'browser directory created: %s\n' "$name"
 }
 
+case_libra_browser_delete_dir() {
+    local WORK="$WORK/browser-delete-dir" path="/project" name="bb68-$RUN_ID"
+    local token="${MEGA2_IT_SEED_TOKEN:-}" left code leak_rc=0 rc=0
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    jq -n --arg name "$name" --arg path "$path" \
+        '{is_directory: true, name: $name, path: $path, content: null, skip_build: true}' \
+        > "$WORK/fixture.json" || return 1
+    printf 'Authorization: Bearer %s\n' "$token" > "$WORK/auth.header"
+    chmod 600 "$WORK/auth.header"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    if ! code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/fixture.json" \
+        -o "$WORK/fixture.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/create-entry"); then
+        rm -f "$WORK/auth.header"
+        return 1
+    fi
+    rm -f "$WORK/auth.header"
+    [ "$code" = 200 ] && jq -e '.req_result == true' "$WORK/fixture.out" > /dev/null \
+        || { echo "browser delete fixture creation failed (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$path" \
+        -o "$WORK/tree-before.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg name "$name" \
+        '.req_result == true and any(.data.tree_items[]; .name == $name and .content_type == "directory")' \
+        "$WORK/tree-before.json" > /dev/null \
+        || { echo "mega2 project tree is missing the delete fixture (HTTP $code)" >&2; return 1; }
+    printf '%s\n' "$token" > "$WORK/token"
+    chmod 600 "$WORK/token"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    if timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" \
+        --token-file "$WORK/token" --delete-dir "$name" "$path" \
+        > "$WORK/delete.json" 2> "$WORK/delete.err"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "$WORK/token"
+    [ "$rc" -eq 0 ] \
+        || { echo "libra browser directory deletion failed (exit $rc)" >&2; return 1; }
+    [ ! -s "$WORK/delete.err" ] \
+        || { echo "libra browser directory deletion wrote unexpected stderr" >&2; return 1; }
+    jq -e --arg server "$MEGA2_BASE_URL" --arg path "$path" --arg name "$name" \
+        '.ok == true and .command == "mega2 browser" and .data.operation == "delete-dir" and .data.server == $server and .data.target == {parent: $path, name: $name, path: ($path + "/" + $name)} and (.data.receipt.commit_id | type) == "string" and (.data.receipt.commit_id | length) > 0' \
+        "$WORK/delete.json" > /dev/null \
+        || { echo "libra browser delete-dir JSON is invalid" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$path" \
+        -o "$WORK/tree-after.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg name "$name" \
+        '.req_result == true and (.data.tree_items | type) == "array" and all(.data.tree_items[]; .name != $name)' \
+        "$WORK/tree-after.json" > /dev/null \
+        || { echo "mega2 project tree still contains the deleted directory (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || leak_rc=$?
+    [ "$leak_rc" -eq 1 ] \
+        || { echo "browser delete-dir token was persisted or the work directory scan failed" >&2; return 1; }
+    printf 'browser directory deleted: %s\n' "$name"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -905,5 +966,6 @@ run_case "LIBRA browser list at ref" case_libra_browser_list_at_ref
 run_case "LIBRA browser unknown path" case_libra_browser_unknown_path
 run_case "LIBRA browser list text" case_libra_browser_list_text
 run_case "LIBRA browser create dir" case_libra_browser_create_dir
+run_case "LIBRA browser delete dir" case_libra_browser_delete_dir
 
 finish
