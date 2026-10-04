@@ -396,7 +396,9 @@ async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Respo
         scope_page.page_id,
     )
     .map_err(mst2_error_response)?;
-    let ctx = runtime().insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds);
+    let ctx = runtime()
+        .insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds)
+        .map_err(mst2_error_response)?;
     // Publication identity: with T05 enabled the sequence is the durable
     // per-namespace counter written atomically with the ref CAS; a read
     // failure there is surfaced rather than silently falling back, because

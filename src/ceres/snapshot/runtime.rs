@@ -11,7 +11,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, MutexGuard, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -101,16 +101,16 @@ impl Mst2Runtime {
         st.1
     }
 
-    /// Insert a context and create its first lease. The lease also becomes
-    /// a retention root covering the snapshot's derived metadata root
-    /// (spec 10 §5: active leases pin what a fixed view needs).
+    /// Acquire the complete in-memory retention group before exposing a
+    /// context or lease. These placeholder anchors do not yet represent
+    /// the complete durable page/chunk graph required by T06.
     pub fn insert_context(
         &self,
         built: BuiltDescriptor,
         commit_oid: &str,
         root_tree_oid: &str,
         lease_seconds: u64,
-    ) -> SnapshotContext {
+    ) -> Result<SnapshotContext, SnapshotError> {
         let lease_id = Uuid::new_v4().to_string();
         let expires = now_unix() + lease_seconds.clamp(1, 3600);
         let snapshot_id = built.snapshot_id.clone();
@@ -122,23 +122,9 @@ impl Mst2Runtime {
             lease_expires_at_unix: expires,
             authorization_epoch: 1,
         };
-        self.contexts.lock().unwrap().insert(
-            snapshot_id.clone(),
-            ContextData {
-                built: built.clone(),
-                commit_oid: commit_oid.to_string(),
-                root_tree_oid: root_tree_oid.to_string(),
-            },
-        );
-        self.leases.lock().unwrap().insert(
-            lease_id.clone(),
-            LeaseRec {
-                snapshot_id: snapshot_id.clone(),
-                expires_at_unix: expires,
-            },
-        );
-        // Retention root for the lease: the metadata-root page node and the
-        // snapshot's chunk projections stay reachable while it is active.
+        // Serialize registration with release/expiry/renewal. No path holds
+        // contexts while acquiring leases, so this lock order cannot cycle.
+        let mut leases = self.leases.lock().unwrap();
         let root = crate::ceres::snapshot::retention::RetentionRoot::Lease(lease_id.clone());
         let page_node = crate::ceres::snapshot::retention::RetentionNode {
             id: format!("page:{}", built.metadata_root),
@@ -152,15 +138,24 @@ impl Mst2Runtime {
             state: crate::ceres::snapshot::retention::NodeState::Live,
             bytes: 0,
         };
-        if let Err(e) = self
-            .retention
-            .pin_root(&root, &[page_node, projection_node])
-        {
-            // Coverage failure is surfaced, not swallowed: a lease that
-            // cannot pin its view must not pretend to.
-            tracing::warn!(error = %e, "retention pin for new lease failed");
-        }
-        ctx
+        self.retention
+            .pin_root(&root, &[page_node, projection_node])?;
+        self.contexts.lock().unwrap().insert(
+            snapshot_id.clone(),
+            ContextData {
+                built,
+                commit_oid: commit_oid.to_string(),
+                root_tree_oid: root_tree_oid.to_string(),
+            },
+        );
+        leases.insert(
+            lease_id,
+            LeaseRec {
+                snapshot_id,
+                expires_at_unix: expires,
+            },
+        );
+        Ok(ctx)
     }
 
     /// Look up a snapshot context by snapshot_id. It is servable while at
@@ -194,7 +189,7 @@ impl Mst2Runtime {
     /// as it goes.
     fn active_lease(&self, snapshot_id: &str) -> Result<(String, u64), SnapshotError> {
         let mut leases = self.leases.lock().unwrap();
-        leases.retain(|_, r| r.expires_at_unix >= now_unix());
+        self.prune_expired_leases(&mut leases, now_unix());
         leases
             .iter()
             .find(|(_, r)| r.snapshot_id == snapshot_id)
@@ -207,6 +202,22 @@ impl Mst2Runtime {
             })
     }
 
+    /// The leases lock serializes expiry with renewal and registration;
+    /// releasing one expired lease never removes another lease's coverage.
+    /// The current in-memory store's release operation is infallible.
+    fn prune_expired_leases(&self, leases: &mut HashMap<String, LeaseRec>, now: u64) {
+        leases.retain(|lease_id, rec| {
+            if rec.expires_at_unix >= now {
+                return true;
+            }
+            self.retention
+                .release(&crate::ceres::snapshot::retention::RetentionRoot::Lease(
+                    lease_id.clone(),
+                ));
+            false
+        });
+    }
+
     /// Validate the lease a request presented (spec 04 §1: identity lives in
     /// the `X-Mega-Snapshot-Lease` header, and a read path must check it —
     /// knowing the snapshot id alone is not a capability). Any lease that is
@@ -216,8 +227,8 @@ impl Mst2Runtime {
     /// existed is answered identically: probing with lease ids must not
     /// distinguish released from forged.
     ///
-    /// Expired-row pruning happens in `active_lease`, not here: this runs on
-    /// every authenticated read and must stay a single key lookup.
+    /// Expired-row pruning happens in `active_lease` and collection: this
+    /// runs on every authenticated read and stays a single key lookup.
     pub fn validate_lease(&self, snapshot_id: &str, lease_id: &str) -> Result<(), SnapshotError> {
         let leases = self.leases.lock().unwrap();
         match leases.get(lease_id) {
@@ -237,8 +248,24 @@ impl Mst2Runtime {
         lease_id: &str,
         lease_seconds: u64,
     ) -> Result<LeaseRenewed, SnapshotError> {
-        let now = now_unix();
-        let mut leases = self.leases.lock().unwrap();
+        Self::renew_lease_with_clock(
+            lease_id,
+            lease_seconds,
+            || self.leases.lock().unwrap(),
+            now_unix,
+        )
+    }
+
+    /// Sample the clock only after acquiring the lease lock. Separate
+    /// sources let tests force a deadline crossing during lock contention.
+    fn renew_lease_with_clock<'a>(
+        lease_id: &str,
+        lease_seconds: u64,
+        acquire_leases: impl FnOnce() -> MutexGuard<'a, HashMap<String, LeaseRec>>,
+        clock: impl FnOnce() -> u64,
+    ) -> Result<LeaseRenewed, SnapshotError> {
+        let mut leases = acquire_leases();
+        let now = clock();
         let Some(rec) = leases.get_mut(lease_id) else {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LeaseUnknown,
@@ -268,7 +295,8 @@ impl Mst2Runtime {
     /// only drops the retention root so a later collection pass may
     /// reclaim derived pages no other lease/pin covers.
     pub fn release_lease(&self, lease_id: &str) -> bool {
-        let removed = self.leases.lock().unwrap().remove(lease_id).is_some();
+        let mut leases = self.leases.lock().unwrap();
+        let removed = leases.remove(lease_id).is_some();
         self.retention
             .release(&crate::ceres::snapshot::retention::RetentionRoot::Lease(
                 lease_id.to_string(),
@@ -282,6 +310,7 @@ impl Mst2Runtime {
     pub fn collect_retention(
         &self,
     ) -> Result<crate::ceres::snapshot::retention::CollectionReport, SnapshotError> {
+        self.prune_expired_leases(&mut self.leases.lock().unwrap(), now_unix());
         self.retention
             .collect(&crate::ceres::snapshot::retention::NoopReaper)
     }
@@ -336,20 +365,24 @@ pub fn rfc3339(unix: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc, TryLockError,
+            atomic::{AtomicU64, Ordering},
+            mpsc::sync_channel,
+        },
+        thread,
+    };
+
+    use mst2_codec::descriptor::ServingDescriptor;
+
     use super::*;
+    use crate::ceres::snapshot::retention::{
+        NodeState, RetainedKind, RetentionRoot, RetentionStore as _,
+    };
 
-    #[test]
-    fn rfc3339_known_values() {
-        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339(1_789_525_722), "2026-09-16T02:28:42Z");
-    }
-
-    #[tokio::test]
-    async fn lease_lifecycle_drives_retention() {
-        use crate::ceres::snapshot::retention::{
-            NodeState, RetainedKind, RetentionRoot, RetentionStore as _,
-        };
-        let r = Mst2Runtime {
+    fn isolated_runtime() -> Mst2Runtime {
+        Mst2Runtime {
             hmac_key: blake3_key(),
             contexts: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
@@ -357,9 +390,324 @@ mod tests {
                 crate::ceres::snapshot::retention::mem::InMemoryRetentionStore::default(),
             ),
             tip_state: Mutex::new((String::new(), 0u64)),
+        }
+    }
+
+    fn descriptor(root_byte: u8) -> BuiltDescriptor {
+        let descriptor = ServingDescriptor {
+            instance_uuid: [0x11; 16],
+            namespace_view_id: [0x22; 32],
+            scope: "/".into(),
+            metadata_root: [root_byte; 32],
         };
-        // Retain the snapshot's derived nodes directly, covered by the lease
-        // root that insert_context created.
+        BuiltDescriptor {
+            instance_id: Uuid::from_bytes(descriptor.instance_uuid).to_string(),
+            snapshot_id: format!(
+                "sha256:{}",
+                crate::ceres::snapshot::view::hex(&descriptor.snapshot_id().unwrap())
+            ),
+            metadata_root: format!(
+                "sha256:{}",
+                crate::ceres::snapshot::view::hex(&descriptor.metadata_root)
+            ),
+            descriptor,
+        }
+    }
+
+    #[test]
+    fn pin_failure_exposes_no_context_lease_or_partial_graph_and_can_retry() {
+        let r = isolated_runtime();
+        let built = descriptor(3);
+        r.retention.store().fail_next_retain_for_test();
+        assert_eq!(
+            r.insert_context(built.clone(), "commit", "tree", 60)
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::Internal
+        );
+        assert!(r.contexts.lock().unwrap().is_empty());
+        assert!(r.leases.lock().unwrap().is_empty());
+        assert!(r.retention.store().all_live().is_empty());
+        assert_eq!(
+            r.context(&built.snapshot_id).unwrap_err().code,
+            SnapshotErrorCode::SnapshotGone
+        );
+
+        let ctx = r
+            .insert_context(built.clone(), "commit", "tree", 60)
+            .unwrap();
+        r.validate_lease(&built.snapshot_id, &ctx.lease_id).unwrap();
+        assert!(
+            r.retention
+                .is_retained(&format!("page:{}", built.metadata_root))
+        );
+        assert!(r.retention.is_retained("projection:commit"));
+    }
+
+    #[test]
+    fn failed_resolve_preserves_an_existing_active_snapshot() {
+        let r = isolated_runtime();
+        let old = descriptor(3);
+        let active = r
+            .insert_context(old.clone(), "old-commit", "old-tree", 60)
+            .unwrap();
+        let new = descriptor(4);
+        r.retention.store().fail_next_retain_for_test();
+        assert!(
+            r.insert_context(new.clone(), "new-commit", "new-tree", 60)
+                .is_err()
+        );
+        assert_eq!(r.contexts.lock().unwrap().len(), 1);
+        assert_eq!(r.leases.lock().unwrap().len(), 1);
+        assert_eq!(
+            r.context(&old.snapshot_id).unwrap().lease_id,
+            active.lease_id
+        );
+        assert_eq!(
+            r.context(&new.snapshot_id).unwrap_err().code,
+            SnapshotErrorCode::SnapshotGone
+        );
+        assert!(
+            r.retention
+                .store()
+                .node(&format!("page:{}", new.metadata_root))
+                .is_none()
+        );
+        assert!(r.retention.store().node("projection:new-commit").is_none());
+    }
+
+    #[test]
+    fn resolve_cannot_create_a_lease_for_a_deleting_group() {
+        let r = isolated_runtime();
+        let built = descriptor(3);
+        let ctx = r
+            .insert_context(built.clone(), "commit", "tree", 60)
+            .unwrap();
+        assert!(r.release_lease(&ctx.lease_id));
+        assert!(r.collect_retention().unwrap().reaped.is_empty());
+        assert_eq!(
+            r.insert_context(built.clone(), "commit", "tree", 60)
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::ObjectUnavailable
+        );
+        assert!(r.leases.lock().unwrap().is_empty());
+        assert!(
+            r.retention.store().all_live().is_empty(),
+            "no new lease anchor leaked"
+        );
+        assert_eq!(
+            r.context(&built.snapshot_id).unwrap_err().code,
+            SnapshotErrorCode::LeaseExpired
+        );
+        assert_eq!(
+            r.retention
+                .store()
+                .node(&format!("page:{}", built.metadata_root))
+                .unwrap()
+                .state,
+            NodeState::Deleting
+        );
+    }
+
+    #[test]
+    fn context_expiry_releases_only_the_expired_lease_on_a_shared_snapshot() {
+        let r = isolated_runtime();
+        let built = descriptor(3);
+        let expired = r
+            .insert_context(built.clone(), "commit", "tree", 60)
+            .unwrap();
+        let active = r
+            .insert_context(built.clone(), "commit", "tree", 60)
+            .unwrap();
+        r.leases
+            .lock()
+            .unwrap()
+            .get_mut(&expired.lease_id)
+            .unwrap()
+            .expires_at_unix = 0;
+
+        assert_eq!(
+            r.context(&built.snapshot_id).unwrap().lease_id,
+            active.lease_id
+        );
+        assert!(!r.leases.lock().unwrap().contains_key(&expired.lease_id));
+        assert!(
+            !r.retention
+                .store()
+                .root_covers(&format!("lease:{}", expired.lease_id))
+        );
+        assert!(
+            r.retention
+                .store()
+                .root_covers(&format!("lease:{}", active.lease_id))
+        );
+        assert!(
+            r.retention
+                .is_retained(&format!("page:{}", built.metadata_root))
+        );
+        r.validate_lease(&built.snapshot_id, &active.lease_id)
+            .unwrap();
+        assert_eq!(
+            r.validate_lease(&built.snapshot_id, &expired.lease_id)
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::LeaseExpired
+        );
+        assert_eq!(
+            r.collect_retention().unwrap().unreachable,
+            vec![format!("lease:{}", expired.lease_id)]
+        );
+        assert_eq!(
+            r.context(&built.snapshot_id).unwrap().lease_id,
+            active.lease_id
+        );
+
+        assert!(r.release_lease(&active.lease_id));
+        assert!(
+            !r.retention
+                .store()
+                .root_covers(&format!("page:{}", built.metadata_root))
+        );
+        assert!(!r.retention.store().root_covers("projection:commit"));
+    }
+
+    #[test]
+    fn collection_prunes_expired_roots_without_a_context_read() {
+        let r = isolated_runtime();
+        let built = descriptor(3);
+        let ctx = r
+            .insert_context(built.clone(), "commit", "tree", 60)
+            .unwrap();
+        r.leases
+            .lock()
+            .unwrap()
+            .get_mut(&ctx.lease_id)
+            .unwrap()
+            .expires_at_unix = 0;
+        let report = r.collect_retention().unwrap();
+        assert_eq!(report.unreachable.len(), 3, "anchor, page and projection");
+        assert!(report.reaped.is_empty(), "NoopReaper stays fail-closed");
+        assert!(r.leases.lock().unwrap().is_empty());
+        for id in [
+            format!("lease:{}", ctx.lease_id),
+            format!("page:{}", built.metadata_root),
+            "projection:commit".into(),
+        ] {
+            assert!(report.unreachable.contains(&id));
+            assert!(!r.retention.store().root_covers(&id));
+            assert_eq!(
+                r.retention.store().node(&id).unwrap().state,
+                NodeState::Deleting
+            );
+        }
+    }
+
+    #[test]
+    fn renewal_winning_before_expiry_keeps_its_root_and_expiry_winning_prevents_renewal() {
+        let r = isolated_runtime();
+        let built = descriptor(3);
+        let ctx = r
+            .insert_context(built.clone(), "commit", "tree", 60)
+            .unwrap();
+        let renewed = r.renew_lease(&ctx.lease_id, 60).unwrap();
+        {
+            let mut leases = r.leases.lock().unwrap();
+            // Advance past the old deadline, before the renewed deadline.
+            r.prune_expired_leases(&mut leases, ctx.lease_expires_at_unix + 1);
+        }
+        r.validate_lease(&built.snapshot_id, &ctx.lease_id).unwrap();
+        assert!(
+            r.retention
+                .store()
+                .root_covers(&format!("lease:{}", ctx.lease_id))
+        );
+        {
+            let mut leases = r.leases.lock().unwrap();
+            r.prune_expired_leases(&mut leases, renewed.expires_at_unix + 1);
+        }
+        assert!(
+            !r.retention
+                .store()
+                .root_covers(&format!("lease:{}", ctx.lease_id))
+        );
+        assert_eq!(
+            r.renew_lease(&ctx.lease_id, 60).unwrap_err().code,
+            SnapshotErrorCode::LeaseUnknown
+        );
+        assert_eq!(
+            r.context(&built.snapshot_id).unwrap_err().code,
+            SnapshotErrorCode::LeaseExpired
+        );
+    }
+
+    #[test]
+    fn renewal_waiting_for_the_lease_lock_cannot_use_a_pre_expiry_clock_sample() {
+        let r = Arc::new(isolated_runtime());
+        let ctx = r
+            .insert_context(descriptor(3), "commit", "tree", 60)
+            .unwrap();
+        let clock = Arc::new(AtomicU64::new(9));
+        let (blocked_tx, blocked_rx) = sync_channel(1);
+        let mut leases = r.leases.lock().unwrap();
+        leases.get_mut(&ctx.lease_id).unwrap().expires_at_unix = 10;
+        let renewal = {
+            let r = Arc::clone(&r);
+            let clock = Arc::clone(&clock);
+            let lease_id = ctx.lease_id.clone();
+            thread::spawn(move || {
+                Mst2Runtime::renew_lease_with_clock(
+                    &lease_id,
+                    60,
+                    || {
+                        // Prove contention before allowing the clock to cross
+                        // the deadline. A pre-lock sample would observe 9.
+                        assert!(matches!(r.leases.try_lock(), Err(TryLockError::WouldBlock)));
+                        blocked_tx.send(()).unwrap();
+                        r.leases.lock().unwrap()
+                    },
+                    || clock.load(Ordering::SeqCst),
+                )
+            })
+        };
+        blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("renewal did not contend for the lease lock");
+        clock.store(11, Ordering::SeqCst);
+        drop(leases);
+
+        assert_eq!(
+            renewal.join().unwrap().unwrap_err().code,
+            SnapshotErrorCode::LeaseExpired
+        );
+        assert_eq!(
+            r.leases
+                .lock()
+                .unwrap()
+                .get(&ctx.lease_id)
+                .unwrap()
+                .expires_at_unix,
+            10
+        );
+        assert_eq!(r.leases.lock().unwrap().len(), 1, "no replacement lease");
+        assert!(r.collect_retention().unwrap().reaped.is_empty());
+        assert!(
+            !r.retention
+                .store()
+                .root_covers(&format!("lease:{}", ctx.lease_id))
+        );
+    }
+
+    #[test]
+    fn rfc3339_known_values() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_789_525_722), "2026-09-16T02:28:42Z");
+    }
+
+    #[test]
+    fn lease_lifecycle_drives_retention() {
+        let r = isolated_runtime();
+        // Cover a derived node directly with a manual test lease root.
         let lease_root = RetentionRoot::Lease("gc-lease-1".to_string());
         let page = crate::ceres::snapshot::retention::RetentionNode {
             id: "page:sha256:test".to_string(),
@@ -382,7 +730,7 @@ mod tests {
         assert_eq!(report.unreachable, vec!["page:sha256:test".to_string()]);
         assert_eq!(report.reclaimed_bytes, 100);
         assert!(report.reaped.is_empty(), "fail-closed reaper");
-        // The node is DELETING, not gone: a re-resolve re-lifts it.
+        // The node stays DELETING; a new acquire must not resurrect it.
         assert_eq!(
             r.retention.store().node("page:sha256:test").unwrap().state,
             NodeState::Deleting

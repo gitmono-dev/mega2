@@ -105,7 +105,7 @@ pub enum ReapDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CollectionReport {
-    /// Node ids that became unreachable this run.
+    /// Node ids atomically marked DELETING this run.
     pub unreachable: Vec<String>,
     /// Bytes that would be / were reclaimed.
     pub reclaimed_bytes: u64,
@@ -140,16 +140,30 @@ impl Reaper for NoopReaper {
 pub trait RetentionStore {
     fn node(&self, id: &str) -> Option<RetentionNode>;
     fn root_covers(&self, node_id: &str) -> bool;
+    /// Count incoming edges from parents not yet removed, including
+    /// DELETING parents whose physical reclaim has not succeeded.
     fn live_incoming(&self, node_id: &str) -> usize;
-    /// Idempotent: create the node if absent, upsert edges and roots in
-    /// one atomic step (spec §6 "no empty window").
+    /// Idempotent: retain one LIVE node with its edges and root coverage.
     fn retain(
         &self,
         node: RetentionNode,
         edges: &[RetentionEdge],
         roots: &[RetentionRoot],
+    ) -> Result<(), SnapshotError> {
+        self.retain_group(std::slice::from_ref(&node), edges, roots)
+    }
+    /// Atomically retain the entire group, covering every supplied node
+    /// with `roots`. All nodes and edge endpoints must be LIVE; acquiring
+    /// a DELETING node is forbidden. Any error leaves the graph unchanged.
+    fn retain_group(
+        &self,
+        nodes: &[RetentionNode],
+        edges: &[RetentionEdge],
+        roots: &[RetentionRoot],
     ) -> Result<(), SnapshotError>;
-    /// Atomically CAS a node LIVE→DELETING; false if it is no longer LIVE.
+    /// Atomically check zero roots/incoming references and CAS LIVE→DELETING.
+    /// A parent still protects its children until the parent is removed,
+    /// including while the parent is DELETING and physical reclaim is pending.
     fn mark_deleting(&self, id: &str) -> bool;
     /// Remove a DELETING node after the reaper succeeds.
     fn remove(&self, id: &str);
@@ -182,14 +196,6 @@ impl<S: RetentionStore> RetentionCoordinator<S> {
         parents: &[String],
         roots: &[RetentionRoot],
     ) -> Result<(), SnapshotError> {
-        for p in parents {
-            if self.store.node(p).is_none() {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::Internal,
-                    format!("retention edge to unknown parent {p}"),
-                ));
-            }
-        }
         let edges: Vec<RetentionEdge> = parents
             .iter()
             .map(|p| RetentionEdge {
@@ -200,38 +206,24 @@ impl<S: RetentionStore> RetentionCoordinator<S> {
         self.store.retain(node, &edges, roots)
     }
 
-    /// Add coverage from a root to a node, atomically re-lifting it out of
-    /// a DELETING state (spec §10). The root is also materialized as a live
-    /// anchor node so reachability can start from it. The store's `retain`
-    /// is the upsert, so both the fresh and the already-known cases take
-    /// the same path.
+    /// Acquire root coverage for the complete group in one store operation.
+    /// The root is also materialized as a LIVE anchor. If any covered node
+    /// is DELETING, neither the anchor nor any partial coverage is retained.
     pub fn pin_root(
         &self,
         root: &RetentionRoot,
         covered: &[RetentionNode],
     ) -> Result<(), SnapshotError> {
-        let roots = std::slice::from_ref(root);
-        self.store.retain(
-            RetentionNode {
-                id: root.key(),
-                kind: RetainedKind::Frame,
-                state: NodeState::Live,
-                bytes: 0,
-            },
-            &[],
-            roots,
-        )?;
-        for n in covered {
-            self.store.retain(
-                RetentionNode {
-                    state: NodeState::Live,
-                    ..n.clone()
-                },
-                &[],
-                roots,
-            )?;
-        }
-        Ok(())
+        let mut nodes = Vec::with_capacity(covered.len() + 1);
+        nodes.push(RetentionNode {
+            id: root.key(),
+            kind: RetainedKind::Frame,
+            state: NodeState::Live,
+            bytes: 0,
+        });
+        nodes.extend_from_slice(covered);
+        self.store
+            .retain_group(&nodes, &[], std::slice::from_ref(root))
     }
 
     pub fn release(&self, root: &RetentionRoot) {
@@ -239,11 +231,10 @@ impl<S: RetentionStore> RetentionCoordinator<S> {
     }
 
     /// One collection pass (spec 10 §6 steps 1–7):
-    /// mark unreachable LIVE nodes DELETING, then reap. Nodes marked
-    /// DELETING are skipped entirely on later passes if a new root/edge
-    /// raced in only after the CAS — here reachability is recomputed under
-    /// the store lock, so a retain concurrent with a pass either observes
-    /// the node (keeping it LIVE) or lands before the next pass.
+    /// mark unreachable LIVE nodes DELETING, then reap. The reachability
+    /// scan selects candidates; the store rechecks roots and incoming
+    /// references atomically with the CAS. Acquisition either wins before
+    /// that CAS or fails because the node is already DELETING.
     pub fn collect<R: Reaper>(&self, reaper: &R) -> Result<CollectionReport, SnapshotError> {
         let live = self.store.all_live();
         let reachable = self.reachable_set();
@@ -254,18 +245,11 @@ impl<S: RetentionStore> RetentionCoordinator<S> {
                 continue;
             }
             if !self.store.mark_deleting(&node.id) {
-                // Lost the CAS: a new reference made it LIVE again.
+                // Another collector or a newly acquired reference won.
                 continue;
             }
             report.unreachable.push(node.id.clone());
             report.reclaimed_bytes += node.bytes;
-            // Re-verify after the CAS: the store serializes retain against
-            // mark, so a zero incoming count here is stable for this pass.
-            if self.store.root_covers(&node.id) || self.store.live_incoming(&node.id) > 0 {
-                // A concurrent retain resurrected it; the CAS semantics of
-                // the store keep it LIVE, so do not reap.
-                continue;
-            }
             if reaper.physical() {
                 reaper.reap(&node)?;
                 self.store.remove(&node.id);
@@ -311,6 +295,8 @@ pub mod mem {
         edges: HashSet<RetentionEdge>,
         /// node id -> set of root keys covering it.
         roots: HashMap<String, HashSet<String>>,
+        #[cfg(test)]
+        fail_next_retain: bool,
     }
 
     /// Single-Mutex store; the lock is the serialization point that makes
@@ -324,6 +310,14 @@ pub mod mem {
             InMemoryRetentionStore {
                 inner: Mutex::new(Inner::default()),
             }
+        }
+    }
+
+    #[cfg(test)]
+    impl InMemoryRetentionStore {
+        /// Inject a backend failure after validation and before committing.
+        pub(crate) fn fail_next_retain_for_test(&self) {
+            self.inner.lock().unwrap().fail_next_retain = true;
         }
     }
 
@@ -350,41 +344,82 @@ pub mod mem {
                 .count()
         }
 
-        fn retain(
+        fn retain_group(
             &self,
-            node: RetentionNode,
+            nodes: &[RetentionNode],
             edges: &[RetentionEdge],
             roots: &[RetentionRoot],
         ) -> Result<(), SnapshotError> {
             let mut g = self.inner.lock().unwrap();
-            // Atomic re-lift: never downgrade a LIVE node to DELETING.
-            g.nodes
-                .entry(node.id.clone())
-                .and_modify(|existing| {
-                    existing.bytes = node.bytes;
-                    existing.kind = node.kind;
-                    existing.state = NodeState::Live;
-                })
-                .or_insert_with(|| node.clone());
-            // Defensive: do not insert an edge to a missing child node.
-            for e in edges {
-                if !g.nodes.contains_key(&e.child) || !g.nodes.contains_key(&e.parent) {
+            // Validate the entire transaction before mutating any graph data.
+            let mut staged = HashMap::new();
+            for node in nodes {
+                if node.state != NodeState::Live
+                    || g.nodes
+                        .get(&node.id)
+                        .is_some_and(|existing| existing.state != NodeState::Live)
+                {
                     return Err(SnapshotError::new(
-                        SnapshotErrorCode::Internal,
-                        "retention edge references missing node",
+                        SnapshotErrorCode::ObjectUnavailable,
+                        format!("retention acquire requires LIVE node {}", node.id),
                     ));
                 }
-                g.edges.insert(e.clone());
+                if staged
+                    .insert(node.id.as_str(), node)
+                    .is_some_and(|previous| previous != node)
+                {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        "retention group has conflicting node definitions",
+                    ));
+                }
             }
-            let entry = g.roots.entry(node.id.clone()).or_default();
-            for r in roots {
-                entry.insert(r.key());
+            for e in edges {
+                for id in [&e.parent, &e.child] {
+                    match staged.get(id.as_str()).copied().or_else(|| g.nodes.get(id)) {
+                        Some(node) if node.state == NodeState::Live => {}
+                        Some(_) => {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::ObjectUnavailable,
+                                format!("retention edge requires LIVE endpoint {id}"),
+                            ));
+                        }
+                        None => {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::Internal,
+                                format!("retention edge references missing node {id}"),
+                            ));
+                        }
+                    }
+                }
             }
+            #[cfg(test)]
+            if std::mem::take(&mut g.fail_next_retain) {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::Internal,
+                    "injected retention commit failure",
+                ));
+            }
+            for node in nodes {
+                g.nodes.insert(node.id.clone(), node.clone());
+                let entry = g.roots.entry(node.id.clone()).or_default();
+                for root in roots {
+                    entry.insert(root.key());
+                }
+            }
+            g.edges.extend(edges.iter().cloned());
             Ok(())
         }
 
         fn mark_deleting(&self, id: &str) -> bool {
             let mut g = self.inner.lock().unwrap();
+            if g.roots.get(id).is_some_and(|roots| !roots.is_empty())
+                || g.edges
+                    .iter()
+                    .any(|edge| edge.child == id && g.nodes.contains_key(&edge.parent))
+            {
+                return false;
+            }
             match g.nodes.get_mut(id) {
                 Some(n) if n.state == NodeState::Live => {
                     n.state = NodeState::Deleting;
@@ -396,6 +431,13 @@ pub mod mem {
 
         fn remove(&self, id: &str) {
             let mut g = self.inner.lock().unwrap();
+            if !g
+                .nodes
+                .get(id)
+                .is_some_and(|node| node.state == NodeState::Deleting)
+            {
+                return;
+            }
             g.nodes.remove(id);
             g.edges.retain(|e| e.parent != id && e.child != id);
             g.roots.remove(id);
@@ -435,6 +477,15 @@ pub mod mem {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            mpsc::{Receiver, SyncSender, sync_channel},
+        },
+        thread,
+        time::Duration,
+    };
+
     use super::{mem::InMemoryRetentionStore, *};
 
     fn node(id: &str, bytes: u64) -> RetentionNode {
@@ -448,6 +499,243 @@ mod tests {
 
     fn coord() -> RetentionCoordinator<InMemoryRetentionStore> {
         RetentionCoordinator::new(InMemoryRetentionStore::default())
+    }
+
+    /// Pause a collection after its scan, immediately before the store CAS.
+    /// Timeouts make both sides of the forced interleaving bounded.
+    struct PausedMarkStore {
+        inner: InMemoryRetentionStore,
+        ready: SyncSender<()>,
+        resume: Mutex<Receiver<()>>,
+    }
+
+    impl RetentionStore for PausedMarkStore {
+        fn node(&self, id: &str) -> Option<RetentionNode> {
+            self.inner.node(id)
+        }
+
+        fn root_covers(&self, node_id: &str) -> bool {
+            self.inner.root_covers(node_id)
+        }
+
+        fn live_incoming(&self, node_id: &str) -> usize {
+            self.inner.live_incoming(node_id)
+        }
+
+        fn retain_group(
+            &self,
+            nodes: &[RetentionNode],
+            edges: &[RetentionEdge],
+            roots: &[RetentionRoot],
+        ) -> Result<(), SnapshotError> {
+            self.inner.retain_group(nodes, edges, roots)
+        }
+
+        fn mark_deleting(&self, id: &str) -> bool {
+            self.ready.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test did not resume deletion");
+            self.inner.mark_deleting(id)
+        }
+
+        fn remove(&self, id: &str) {
+            self.inner.remove(id);
+        }
+
+        fn release_root(&self, root: &RetentionRoot) {
+            self.inner.release_root(root);
+        }
+
+        fn all_live(&self) -> Vec<RetentionNode> {
+            self.inner.all_live()
+        }
+
+        fn children(&self, parent: &str) -> Vec<String> {
+            self.inner.children(parent)
+        }
+    }
+
+    #[test]
+    fn failed_pin_group_leaves_no_anchor_or_partial_coverage() {
+        let c = coord();
+        let original = node("existing", 10);
+        c.store().retain(original.clone(), &[], &[]).unwrap();
+        c.store().retain(node("deleting", 7), &[], &[]).unwrap();
+        assert!(c.store().mark_deleting("deleting"));
+        let root = RetentionRoot::Lease("new".into());
+
+        // The last node fails after earlier entries would have been written
+        // by the old per-node pin loop, including an update to existing.
+        let err = c
+            .pin_root(
+                &root,
+                &[node("fresh", 1), node("existing", 99), node("deleting", 7)],
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SnapshotErrorCode::ObjectUnavailable);
+        assert!(c.store().node(&root.key()).is_none());
+        assert!(c.store().node("fresh").is_none());
+        assert_eq!(c.store().node("existing"), Some(original));
+        assert!(!c.store().root_covers("existing"));
+        assert!(!c.store().root_covers("deleting"));
+        assert_eq!(
+            c.store().node("deleting").unwrap().state,
+            NodeState::Deleting
+        );
+    }
+
+    #[test]
+    fn supplied_deleting_node_cannot_be_created_or_pinned() {
+        let c = coord();
+        let root = RetentionRoot::Pin("invalid".into());
+        let mut deleting = node("absent", 1);
+        deleting.state = NodeState::Deleting;
+        assert_eq!(
+            c.pin_root(&root, &[deleting]).unwrap_err().code,
+            SnapshotErrorCode::ObjectUnavailable
+        );
+        assert!(c.store().all_live().is_empty());
+        assert!(c.store().node("absent").is_none());
+        assert!(c.store().node(&root.key()).is_none());
+    }
+
+    #[test]
+    fn late_invalid_edge_rolls_back_nodes_edges_and_roots() {
+        let c = coord();
+        c.store().retain(node("parent", 0), &[], &[]).unwrap();
+        let root = RetentionRoot::Lease("new".into());
+        let edges = [
+            RetentionEdge {
+                parent: "parent".into(),
+                child: "fresh".into(),
+            },
+            RetentionEdge {
+                parent: "missing".into(),
+                child: "fresh".into(),
+            },
+        ];
+        let err = c
+            .store()
+            .retain(node("fresh", 2), &edges, &[root])
+            .unwrap_err();
+        assert_eq!(err.code, SnapshotErrorCode::Internal);
+        assert!(c.store().node("fresh").is_none());
+        assert!(c.store().children("parent").is_empty());
+        assert!(!c.store().root_covers("fresh"));
+        assert_eq!(c.store().live_incoming("fresh"), 0);
+    }
+
+    #[test]
+    fn injected_commit_failure_preserves_existing_root_and_can_retry() {
+        let c = coord();
+        let old = RetentionRoot::Pin("old".into());
+        let new = RetentionRoot::Lease("new".into());
+        c.store()
+            .retain(node("existing", 1), &[], std::slice::from_ref(&old))
+            .unwrap();
+        c.store().fail_next_retain_for_test();
+        assert_eq!(
+            c.pin_root(&new, &[node("existing", 1), node("fresh", 2)])
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::Internal
+        );
+        assert!(c.store().node(&new.key()).is_none());
+        assert!(c.store().node("fresh").is_none());
+        assert!(c.store().root_covers("existing"));
+        c.release(&old);
+        assert!(
+            !c.store().root_covers("existing"),
+            "failed pin added no new root"
+        );
+
+        c.pin_root(&new, &[node("existing", 1), node("fresh", 2)])
+            .unwrap();
+        assert!(c.is_retained("existing"));
+        assert!(c.is_retained("fresh"));
+    }
+
+    #[test]
+    fn collection_rechecks_roots_and_edges_acquired_after_its_scan() {
+        for via_edge in [false, true] {
+            let (ready_tx, ready_rx) = sync_channel(1);
+            let (resume_tx, resume_rx) = sync_channel(1);
+            let c = Arc::new(RetentionCoordinator::new(PausedMarkStore {
+                inner: InMemoryRetentionStore::default(),
+                ready: ready_tx,
+                resume: Mutex::new(resume_rx),
+            }));
+            c.store().retain(node("candidate", 1), &[], &[]).unwrap();
+            let root = RetentionRoot::Lease("late".into());
+            if via_edge {
+                c.store()
+                    .retain(node("parent", 0), &[], std::slice::from_ref(&root))
+                    .unwrap();
+            }
+            let collector = {
+                let c = Arc::clone(&c);
+                thread::spawn(move || c.collect(&NoopReaper))
+            };
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("collector did not reach its deletion CAS");
+            // Both references land after candidate selection, before CAS.
+            if via_edge {
+                c.retain(node("candidate", 1), &["parent".into()], &[])
+                    .unwrap();
+            } else {
+                c.pin_root(&root, &[node("candidate", 1)]).unwrap();
+            }
+            resume_tx.send(()).unwrap();
+            let report = collector.join().unwrap().unwrap();
+            assert!(report.unreachable.is_empty());
+            assert_eq!(c.store().node("candidate").unwrap().state, NodeState::Live);
+            assert!(c.is_retained("candidate"));
+        }
+    }
+
+    #[test]
+    fn deleting_parent_rejects_new_edges_and_protects_existing_children_until_removed() {
+        let c = coord();
+        c.store().retain(node("parent", 0), &[], &[]).unwrap();
+        c.retain(node("child", 1), &["parent".into()], &[]).unwrap();
+        assert!(c.store().mark_deleting("parent"));
+        assert!(!c.store().mark_deleting("child"));
+        assert_eq!(c.store().live_incoming("child"), 1);
+        assert_eq!(
+            c.retain(node("new-child", 2), &["parent".into()], &[])
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::ObjectUnavailable
+        );
+        assert!(c.store().node("new-child").is_none());
+        c.store().remove("parent");
+        assert_eq!(c.store().live_incoming("child"), 0);
+        assert!(c.store().mark_deleting("child"));
+    }
+
+    #[test]
+    fn retain_cannot_add_an_edge_to_a_deleting_child() {
+        let c = coord();
+        c.store().retain(node("child", 1), &[], &[]).unwrap();
+        assert!(c.store().mark_deleting("child"));
+        let edge = RetentionEdge {
+            parent: "new-parent".into(),
+            child: "child".into(),
+        };
+        assert_eq!(
+            c.store()
+                .retain(node("new-parent", 0), &[edge], &[])
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::ObjectUnavailable
+        );
+        assert!(c.store().node("new-parent").is_none());
+        assert_eq!(c.store().node("child").unwrap().state, NodeState::Deleting);
+        assert_eq!(c.store().live_incoming("child"), 0);
     }
 
     #[test]
@@ -486,8 +774,8 @@ mod tests {
         let r = c.collect(&NoopReaper).unwrap();
         assert_eq!(r.unreachable, vec!["orphan".to_string()]);
         assert_eq!(r.reclaimed_bytes, 9);
-        // Releasing the root cascades unreachability to a and b only after
-        // the anchor itself is collected (the anchor node is root-covered).
+        // Releasing the root makes the chain unreachable, but children stay
+        // LIVE while their parents await physical removal under NoopReaper.
         c.release(&root);
         let _ = c.collect(&NoopReaper).unwrap();
         assert!(!c.is_retained("b"));
@@ -521,7 +809,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.store().live_incoming("shared"), 2);
-        // Remove p1's coverage and p1 itself; shared still has p2.
+        // Drop p1's coverage; its pending deletion must not affect p2's view.
         c.release(&RetentionRoot::Pin("r1".into()));
         c.collect(&NoopReaper).unwrap();
         assert!(c.store().node("shared").is_some());
@@ -562,12 +850,12 @@ mod tests {
         let c = coord();
         c.store().retain(node("x", 3), &[], &[]).unwrap();
         assert!(c.collect(&Fail).is_err());
-        // Node remains (DELETING) so a retry can replay; it is not lost.
-        assert!(c.store().node("x").is_some());
+        // Node remains DELETING; physical retry/recovery is a later slice.
+        assert_eq!(c.store().node("x").unwrap().state, NodeState::Deleting);
     }
 
     #[test]
-    fn new_root_revives_a_node_before_it_is_collected() {
+    fn new_root_protects_a_live_node_before_it_is_collected() {
         let c = coord();
         c.store().retain(node("x", 4), &[], &[]).unwrap();
         // Before any collect, a lease covers it.
@@ -644,7 +932,12 @@ mod tests {
         c.retain(node("ch", 2), &["p".to_string()], &[]).unwrap();
         c.release(&RetentionRoot::Lease("l".into()));
         c.collect(&Delete).unwrap();
+        // A child selected before its parent was removed waits for the
+        // next pass; iteration order must not affect the final result.
+        c.collect(&Delete).unwrap();
         // Both nodes and their edge are gone; no stale incoming edge.
+        assert!(c.store().node("p").is_none());
+        assert!(c.store().node("ch").is_none());
         assert_eq!(c.store().live_incoming("ch"), 0);
     }
 }
