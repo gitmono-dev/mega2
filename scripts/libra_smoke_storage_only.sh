@@ -950,6 +950,89 @@ case_libra_browser_delete_dir() {
     printf 'browser directory deleted: %s\n' "$name"
 }
 
+case_libra_browser_move_dir() {
+    local WORK="$WORK/browser-move-dir" path="/project"
+    local source="bb69-source-$RUN_ID" target="bb69-target-$RUN_ID"
+    local dest="$path/$target" token="${MEGA2_IT_SEED_TOKEN:-}"
+    local left code fixture leak_rc=0 rc=0
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    jq -n --arg name "$source" --arg path "$path" \
+        '{is_directory: true, name: $name, path: $path, content: null, skip_build: true}' \
+        > "$WORK/source.json" || return 1
+    jq -n --arg name "$target" --arg path "$path" \
+        '{is_directory: true, name: $name, path: $path, content: null, skip_build: true}' \
+        > "$WORK/target.json" || return 1
+    printf 'Authorization: Bearer %s\n' "$token" > "$WORK/auth.header"
+    chmod 600 "$WORK/auth.header"
+    for fixture in source target; do
+        left=$((deadline - SECONDS))
+        if [ "$left" -le 0 ]; then
+            rm -f "$WORK/auth.header"
+            return 124
+        fi
+        if ! code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+            -H 'Content-Type: application/json' --data @"$WORK/$fixture.json" \
+            -o "$WORK/$fixture.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/create-entry"); then
+            rm -f "$WORK/auth.header"
+            return 1
+        fi
+        if [ "$code" != 200 ] || ! jq -e '.req_result == true' "$WORK/$fixture.out" > /dev/null; then
+            rm -f "$WORK/auth.header"
+            echo "browser move $fixture fixture creation failed (HTTP $code)" >&2
+            return 1
+        fi
+    done
+    rm -f "$WORK/auth.header"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$path" \
+        -o "$WORK/tree-before.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg source "$source" --arg target "$target" \
+        '.req_result == true and any(.data.tree_items[]; .name == $source and .content_type == "directory") and any(.data.tree_items[]; .name == $target and .content_type == "directory")' \
+        "$WORK/tree-before.json" > /dev/null \
+        || { echo "mega2 project tree is missing a move fixture (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" > "$WORK/token"
+    chmod 600 "$WORK/token"
+    if timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" \
+        --token-file "$WORK/token" --move-dir "$source" "$dest" "$path" \
+        > "$WORK/move.json" 2> "$WORK/move.err"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "$WORK/token"
+    [ "$rc" -eq 0 ] \
+        || { echo "libra browser directory move failed (exit $rc)" >&2; return 1; }
+    [ ! -s "$WORK/move.err" ] \
+        || { echo "libra browser directory move wrote unexpected stderr" >&2; return 1; }
+    jq -e --arg server "$MEGA2_BASE_URL" --arg path "$path" \
+        --arg source "$source" --arg dest "$dest" \
+        '.ok == true and .command == "mega2 browser" and .data.operation == "move-dir" and .data.server == $server and .data.target.from == {parent: $path, name: $source, path: ($path + "/" + $source)} and .data.target.to == {parent: $dest, name: $source, path: ($dest + "/" + $source)} and (.data.receipt.commit_id | type) == "string" and (.data.receipt.commit_id | length) > 0' \
+        "$WORK/move.json" > /dev/null \
+        || { echo "libra browser move-dir JSON is invalid" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$path" \
+        -o "$WORK/tree-root-after.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg source "$source" --arg target "$target" \
+        '.req_result == true and all(.data.tree_items[]; .name != $source) and any(.data.tree_items[]; .name == $target and .content_type == "directory")' \
+        "$WORK/tree-root-after.json" > /dev/null \
+        || { echo "mega2 project tree still contains the moved source (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$dest" \
+        -o "$WORK/tree-target-after.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg source "$source" \
+        '.req_result == true and any(.data.tree_items[]; .name == $source and .content_type == "directory")' \
+        "$WORK/tree-target-after.json" > /dev/null \
+        || { echo "mega2 target tree is missing the moved directory (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || leak_rc=$?
+    [ "$leak_rc" -eq 1 ] \
+        || { echo "browser move-dir token was persisted or the work directory scan failed" >&2; return 1; }
+    printf 'browser directory moved: %s -> %s\n' "$source" "$dest/$source"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -967,5 +1050,6 @@ run_case "LIBRA browser unknown path" case_libra_browser_unknown_path
 run_case "LIBRA browser list text" case_libra_browser_list_text
 run_case "LIBRA browser create dir" case_libra_browser_create_dir
 run_case "LIBRA browser delete dir" case_libra_browser_delete_dir
+run_case "LIBRA browser move dir" case_libra_browser_move_dir
 
 finish
