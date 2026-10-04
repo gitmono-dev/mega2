@@ -5,12 +5,13 @@
 // so vault and other bin test targets do not compile these symbols.
 
 use std::{
+    collections::HashSet,
     env, fs,
     io::Read,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
     thread::{self, sleep},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -113,17 +114,82 @@ pub fn record_service_pid(pid: u32) {
     append_evidence_line("MEGA2_IT_PIDS_FILE", &pid.to_string());
 }
 
-/// Bind `127.0.0.1:0`, capture the OS-assigned port, then drop the listener.
+/// Allocate a port that no other service in this test process has claimed.
 #[allow(
     dead_code,
-    reason = "SSH lifecycle helper; path-included into HTTP targets that do not call it yet"
+    reason = "HTTP/SSH lifecycle helper; some path-included targets do not call it"
 )]
 pub fn reserve_ephemeral_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
+    bind_ephemeral_listener()
         .local_addr()
         .expect("local addr")
         .port()
+}
+
+pub fn bind_ephemeral_listener() -> TcpListener {
+    static CLAIMED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    bind_unique_listener(CLAIMED_PORTS.get_or_init(Default::default), || {
+        TcpListener::bind("0.0.0.0:0")
+    })
+}
+
+fn bind_unique_listener(
+    claimed: &Mutex<HashSet<u16>>,
+    mut bind: impl FnMut() -> std::io::Result<TcpListener>,
+) -> TcpListener {
+    for _ in 0..1024 {
+        let listener = bind().expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        // Keep the listener until the claim is recorded, and never recycle
+        // a port during this target's lifetime: services bind after DB setup.
+        if claimed.lock().expect("port allocator lock").insert(port) {
+            return listener;
+        }
+    }
+    panic!("could not allocate a new service port after 1024 attempts")
+}
+
+#[test]
+fn service_port_allocator_rejects_an_os_reused_port() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
+    let first = listener.local_addr().unwrap().port();
+    let claimed = Mutex::new(HashSet::from([first]));
+    let mut reused = Some(listener);
+    let mut attempts = 0;
+    let second = bind_unique_listener(&claimed, || {
+        attempts += 1;
+        if attempts == 1 {
+            Ok(reused.take().unwrap())
+        } else {
+            TcpListener::bind("127.0.0.1:0")
+        }
+    })
+    .local_addr()
+    .unwrap()
+    .port();
+    assert_ne!(first, second);
+    assert!(attempts >= 2);
+}
+
+#[test]
+fn concurrent_service_port_claims_are_unique() {
+    let ports = thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    (0..16)
+                        .map(|_| reserve_ephemeral_port())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("port worker"))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ports.len(), 128);
+    assert_eq!(ports.iter().copied().collect::<HashSet<_>>().len(), 128);
 }
 
 #[allow(

@@ -119,6 +119,19 @@ impl SmartSession {
         state: &ProtocolApiState,
         upload_request: &mut Bytes,
     ) -> Result<(ReceiverStream<Vec<u8>>, BytesMut), ProtocolError> {
+        self.git_upload_pack_with_shallow_info(state, upload_request, false)
+            .await
+    }
+
+    /// Stateful SSH clients send their wants once, read shallow-info, then
+    /// send `done`. The channel replays the wants for pack generation, but
+    /// must not send the already consumed shallow-info section again.
+    pub(crate) async fn git_upload_pack_with_shallow_info(
+        &mut self,
+        state: &ProtocolApiState,
+        upload_request: &mut Bytes,
+        shallow_info_sent: bool,
+    ) -> Result<(ReceiverStream<Vec<u8>>, BytesMut), ProtocolError> {
         let repo_handler = self.repo_handler_with_commands(state, Vec::new()).await?;
 
         let mut want: HashSet<String> = HashSet::new();
@@ -265,12 +278,14 @@ impl SmartSession {
                         ProtocolError::InvalidInput(format!("shallow pack generation failed: {e}"))
                     })?;
                 pack_data = stream;
-                for shallow in &shallow_commits {
-                    add_pkt_line_string(&mut protocol_buf, format!("shallow {shallow}\n"));
+                if !shallow_info_sent {
+                    for shallow in &shallow_commits {
+                        add_pkt_line_string(&mut protocol_buf, format!("shallow {shallow}\n"));
+                    }
+                    // The shallow-info section ends before the ACK/NAK section,
+                    // even when the requested depth reaches the root commit.
+                    protocol_buf.extend_from_slice(PKT_LINE_END_MARKER);
                 }
-                // The shallow-info section ends before the ACK/NAK section,
-                // even when the requested depth reaches the root commit.
-                protocol_buf.extend_from_slice(PKT_LINE_END_MARKER);
                 // Stateless clients first request shallow boundaries, then
                 // repeat the wants with `done` to request the pack.
                 if !done {

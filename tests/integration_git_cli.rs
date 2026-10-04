@@ -20,7 +20,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -367,7 +367,7 @@ fn spawn_website_session_stub(username: &str) -> u16 {
 /// subjects. UN-19 needs that: the same CL has to be offered to an admin and to
 /// a non-admin, and only one of them may merge it.
 fn spawn_website_session_stub_for(sessions: &[(&str, &str)]) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind session stub");
+    let listener = git_cli::bind_ephemeral_listener();
     let port = listener.local_addr().expect("stub addr").port();
     let sessions: Vec<(String, String)> = sessions
         .iter()
@@ -5092,11 +5092,7 @@ fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
 }
 
 fn reserve_free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    git_cli::reserve_ephemeral_port()
 }
 
 fn create_log_file(path: &Path) -> fs::File {

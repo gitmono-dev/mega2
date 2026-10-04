@@ -14,10 +14,10 @@ mod common;
 mod git_cli;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::Read,
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -450,6 +450,175 @@ fn integration_git_ssh_authenticated_clone() {
     git_cli::wait_until_port_closed(port, Duration::from_secs(5));
     drop(service);
     drop(env);
+}
+
+#[test]
+fn integration_git_ssh_v0_shallow_fetch_resumes_after_shallow_info() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let env = GitSshEnv::new();
+    let (mut service, port, _stdout_path, stderr_path, git_ssh, remote) =
+        prepare_authenticated_ssh(&env);
+    let git_stdout = |args: &[&str]| {
+        let output = git_cli::git_cli_ssh(&env.case_dir, &git_ssh, args);
+        git_cli::assert_git_success(&output, "SSH shallow fetch fixture/verification");
+        String::from_utf8(output.stdout).expect("Git output UTF-8")
+    };
+
+    // Publish one child of the initial monorepo commit as a CL. Removing a
+    // parent-only file makes an over-deep pack observable in the object set.
+    let seed_name = "ssh-shallow-seed";
+    git_stdout(&["clone", &remote, seed_name]);
+    git_stdout(&["-C", seed_name, "config", "user.name", "SSH Shallow Test"]);
+    git_stdout(&[
+        "-C",
+        seed_name,
+        "config",
+        "user.email",
+        "ssh-shallow@example.invalid",
+    ]);
+    fs::remove_file(env.case_dir.join(seed_name).join("project/.gitkeep"))
+        .expect("remove parent-only fixture file");
+    fs::write(
+        env.case_dir.join(seed_name).join("ssh-shallow-tip.txt"),
+        b"only the shallow tip contains this file\n",
+    )
+    .expect("write shallow tip fixture");
+    git_stdout(&["-C", seed_name, "add", "-A"]);
+    git_stdout(&["-C", seed_name, "commit", "-m", "SSH shallow tip"]);
+    let before = ls_remote_cl_refs_ssh(&env.case_dir, &git_ssh, &remote);
+    git_stdout(&[
+        "-C",
+        seed_name,
+        "-c",
+        "pack.window=0",
+        "-c",
+        "pack.depth=0",
+        "push",
+        "origin",
+        "HEAD:refs/heads/ssh-shallow-test",
+    ]);
+    let cl_ref = ls_remote_cl_refs_ssh(&env.case_dir, &git_ssh, &remote)
+        .into_iter()
+        .find(|reference| !before.contains(reference))
+        .expect("new SSH shallow CL ref");
+
+    // Freeze the actual server history as the oracle; server CL publication
+    // may assign commit identities independently of the client's seed.
+    let reference = "ssh-shallow-reference";
+    git_stdout(&["init", reference]);
+    git_stdout(&["-C", reference, "fetch", &remote, &cl_ref]);
+    git_stdout(&["-C", reference, "checkout", "--detach", "FETCH_HEAD"]);
+    let history: Vec<String> = git_stdout(&["-C", reference, "rev-list", "HEAD"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(history.len(), 2, "fixture must have a tip and its parent");
+    let expected_worktree = snapshot_workdir(&env.case_dir.join(reference));
+    assert_eq!(
+        expected_worktree,
+        snapshot_workdir(&env.case_dir.join(seed_name)),
+        "server must preserve the fixture tree"
+    );
+
+    for depth in [1, 2, 5] {
+        let repo = format!("ssh-shallow-depth-{depth}");
+        let depth_arg = depth.to_string();
+        git_stdout(&["init", &repo]);
+        // v0 SSH sends want/deepen/flush, consumes shallow-info, and sends
+        // only `done` next. Fresh repositories exercise the clone handshake.
+        git_stdout(&[
+            "-C",
+            &repo,
+            "-c",
+            "protocol.version=0",
+            "fetch",
+            "--depth",
+            &depth_arg,
+            &remote,
+            &cl_ref,
+        ]);
+        git_stdout(&["-C", &repo, "checkout", "--detach", "FETCH_HEAD"]);
+        let included = (depth as usize).min(history.len());
+        let actual_history: Vec<String> = git_stdout(&["-C", &repo, "rev-list", "HEAD"])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            actual_history,
+            history[..included],
+            "depth {depth}: commits"
+        );
+        let shallow_path = env.case_dir.join(&repo).join(".git/shallow");
+        let boundaries: Vec<String> = fs::read_to_string(shallow_path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        if included < history.len() {
+            assert_eq!(
+                boundaries,
+                vec![history[included - 1].clone()],
+                "depth {depth}: boundary"
+            );
+        } else {
+            // Git may retain a shallow marker at the root even when every
+            // commit fits within the requested depth. It cuts no real edge.
+            assert!(
+                boundaries.is_empty() || boundaries == vec![history.last().unwrap().clone()],
+                "depth {depth}: only a root marker is valid for complete history: {boundaries:?}"
+            );
+        }
+
+        let mut expected_objects = HashSet::new();
+        for commit in &history[..included] {
+            expected_objects.insert(commit.clone());
+            let tree = git_stdout(&["-C", reference, "rev-parse", &format!("{commit}^{{tree}}")])
+                .trim()
+                .to_owned();
+            expected_objects.insert(tree.clone());
+            let entries = git_stdout(&["-C", reference, "ls-tree", "-r", "-t", &tree]);
+            for entry in entries.lines() {
+                expected_objects.insert(
+                    entry
+                        .split_whitespace()
+                        .nth(2)
+                        .expect("tree object id")
+                        .to_owned(),
+                );
+            }
+        }
+        let actual_objects: HashSet<String> = git_stdout(&[
+            "-C",
+            &repo,
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(
+            actual_objects, expected_objects,
+            "depth {depth}: exact objects"
+        );
+        assert_eq!(
+            snapshot_workdir(&env.case_dir.join(&repo)),
+            expected_worktree,
+            "depth {depth}: worktree"
+        );
+        git_stdout(&["-C", &repo, "fsck", "--full", "--strict"]);
+    }
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "SSH service shutdown failed: {status}\n{}",
+        read_log(&stderr_path)
+    );
+    git_cli::wait_until_port_closed(port, Duration::from_secs(5));
 }
 
 fn git_ssh_command_loopback_password(case_dir: &Path, port: u16) -> String {
@@ -2434,7 +2603,7 @@ const SESSION_COOKIE: &str = "better-auth.session_token=it-un16-ssh-session";
 /// this stub answers with the admin whose ACL change is being merged. Returns
 /// the port it listens on.
 fn spawn_website_session_stub(username: &str) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind session stub");
+    let listener = git_cli::bind_ephemeral_listener();
     let port = listener.local_addr().expect("stub addr").port();
     let body = format!(
         r#"{{"session":{{"id":"it-session","userId":"{username}"}},"user":{{"id":"{username}","name":"{username}","email":"{username}@example.invalid"}}}}"#
