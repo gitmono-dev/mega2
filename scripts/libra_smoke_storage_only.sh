@@ -1033,6 +1033,69 @@ case_libra_browser_move_dir() {
     printf 'browser directory moved: %s -> %s\n' "$source" "$dest/$source"
 }
 
+case_libra_browser_rename_dir() {
+    local WORK="$WORK/browser-rename-dir" path="/project"
+    local old="bb70-old-$RUN_ID" new="bb70-new-$RUN_ID"
+    local token="${MEGA2_IT_SEED_TOKEN:-}" left code leak_rc=0 rc=0
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    jq -n --arg name "$old" --arg path "$path" \
+        '{is_directory: true, name: $name, path: $path, content: null, skip_build: true}' \
+        > "$WORK/fixture.json" || return 1
+    printf 'Authorization: Bearer %s\n' "$token" > "$WORK/auth.header"
+    chmod 600 "$WORK/auth.header"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || { rm -f "$WORK/auth.header"; return 124; }
+    if ! code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/fixture.json" \
+        -o "$WORK/fixture.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/create-entry"); then
+        rm -f "$WORK/auth.header"
+        return 1
+    fi
+    rm -f "$WORK/auth.header"
+    [ "$code" = 200 ] && jq -e '.req_result == true' "$WORK/fixture.out" > /dev/null \
+        || { echo "browser rename fixture creation failed (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$path" \
+        -o "$WORK/tree-before.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg old "$old" --arg new "$new" \
+        '.req_result == true and any(.data.tree_items[]; .name == $old and .content_type == "directory") and all(.data.tree_items[]; .name != $new)' \
+        "$WORK/tree-before.json" > /dev/null \
+        || { echo "mega2 project tree does not have the expected rename fixture state (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" > "$WORK/token"
+    chmod 600 "$WORK/token"
+    if timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" \
+        --token-file "$WORK/token" --rename-dir "$old" "$new" "$path" \
+        > "$WORK/rename.json" 2> "$WORK/rename.err"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "$WORK/token"
+    [ "$rc" -eq 0 ] \
+        || { echo "libra browser directory rename failed (exit $rc)" >&2; return 1; }
+    [ ! -s "$WORK/rename.err" ] \
+        || { echo "libra browser directory rename wrote unexpected stderr" >&2; return 1; }
+    jq -e --arg server "$MEGA2_BASE_URL" --arg path "$path" \
+        --arg old "$old" --arg new "$new" \
+        '.ok == true and .command == "mega2 browser" and .data.operation == "rename-dir" and .data.server == $server and .data.target.from == {parent: $path, name: $old, path: ($path + "/" + $old)} and .data.target.to == {parent: $path, name: $new, path: ($path + "/" + $new)} and (.data.receipt.commit_id | type) == "string" and (.data.receipt.commit_id | length) > 0' \
+        "$WORK/rename.json" > /dev/null \
+        || { echo "libra browser rename-dir JSON is invalid" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$path" \
+        -o "$WORK/tree-after.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg old "$old" --arg new "$new" \
+        '.req_result == true and all(.data.tree_items[]; .name != $old) and any(.data.tree_items[]; .name == $new and .content_type == "directory")' \
+        "$WORK/tree-after.json" > /dev/null \
+        || { echo "mega2 project tree does not show the renamed directory (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || leak_rc=$?
+    [ "$leak_rc" -eq 1 ] \
+        || { echo "browser rename-dir token was persisted or the work directory scan failed" >&2; return 1; }
+    printf 'browser directory renamed: %s -> %s\n' "$old" "$new"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -1051,5 +1114,6 @@ run_case "LIBRA browser list text" case_libra_browser_list_text
 run_case "LIBRA browser create dir" case_libra_browser_create_dir
 run_case "LIBRA browser delete dir" case_libra_browser_delete_dir
 run_case "LIBRA browser move dir" case_libra_browser_move_dir
+run_case "LIBRA browser rename dir" case_libra_browser_rename_dir
 
 finish
