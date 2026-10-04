@@ -1177,6 +1177,10 @@ impl ApiHandler for MonoApiService {
         self.storage.clone()
     }
 
+    fn native_snapshot_projection(&self) -> bool {
+        true
+    }
+
     fn object_cache(&self) -> &GitObjectCache {
         &self.git_object_cache
     }
