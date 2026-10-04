@@ -41,13 +41,14 @@
 
 ## 范围
 
-- **只 pin 不改语义：** `GET /tree`、`POST /create-entry`。
+- **只 pin 不改语义：** `POST /create-entry`。
+- **错误语义修正（FIX-BB-10）：** GET /tree：路径不存在或指向非目录时返回 **404**；已有目录的请求字段与成功响应不变。
 - **新增产品写：** `POST /delete-entry`、`POST /move-entry`（改名 = 同 parent 的 move）。plan-20260918 用同一路径扩文件（`is_directory=false`）。
 - **挂载 + 鉴权 + 文档对齐：** 四条 `/tags*`。plan-20260918 把 list 改 GET，并为 get/delete 加 `?path=`。
 - **ImportRepo 叶子清理（plan-20260923 FU-20）：** `POST /import-repo/remove`，见「ImportRepo 叶子清理」。
 - 目录/文件变更是**父目录 tree 改写**后写新 commit，经 `land_api_tip_push`（trunk）或既有 CL 分支（Review）前进 tip；**不是** Git delete command，也不走 CL `apply_changes`（ADR-LB-02 / ADR-FT-01）。
 
-## 已有 API（本计划不改语义）
+## 已有 API 与错误语义修正
 
 ### `GET /api/v1/tree` — `implemented`
 
@@ -56,6 +57,7 @@
 | 鉴权 | 无（不送 Authorization） |
 | Query | `path`（可选，`#[serde(default = "default_path")]` → `/`）、`refs`（可选，`#[serde(default)]` → 空串 = 当前 tip） |
 | 成功 | `200` + `CommonResult<TreeResponse>` |
+| 路径不存在或指向非目录 | `404` + 失败 `CommonResult`（`req_result=false`、`data=null`、`err_message` 点名请求路径或首个缺失前缀） |
 
 `data.tree_items[]` 每项为 `{ name, path, content_type }`（`TreeBriefItem`）。
 
@@ -216,7 +218,7 @@
 | create-entry / edit-save：`import_dir` 命名空间内、无存活 ImportRepo 的路径 | **400** `MONO_PATH_NOT_ALLOWED: …`（ADR-FU-06，两种形态均适用；存活 ImportRepo 内部的写由 `ImportApiService` 处理；处理期间该仓库被清理见下一行） |
 | ImportRepo 产品写遇清理（`edit/save`、`POST /tags`、`DELETE /tags/{name}`；请求已分派给存活 ImportRepo 的 `ImportApiService`，处理期间该仓库被 detach，[plan-20260923](../plan/plan-20260923.md) ADR-FU-09 第 5 条，FU-19） | **409**，wire `err_message` = `IMPORT_REPO_REMOVED: "<path>" was removed; push again to import it anew`（码与含义见 [错误码](../errors.md) 的 ImportRepoError 小节）。本次写不落行：`edit/save` 的对象行经 `save_entry` 栅栏，默认分支 ref 在自己的带锁事务里写（二者之间遇 detach 时，已提交的对象行由清扫删除）；annotated tag 的 `git_tag` 行与 ref 同一事务（ref 写失败时两者皆无），lightweight tag 只写 ref；tag 删除的 ref 与 `git_tag` 行同一事务，被拒的删除不改任何行（含不存在的名字）。预读因行已被删除而失败时同样答 409，存活仓库的 404 / 400 不受影响（存活仓库缺默认分支 / commit / tree 为 404）。detach 在分派之前已提交的请求不再到达 `ImportApiService`：`edit/save` 为上一行的 **400** `MONO_PATH_NOT_ALLOWED`，tag 路由按 Monorepo 语义处理（计划 `DEFER-FU-38`）。事务的锁序与 detach 等待时长见 [trunk-push.md](trunk-push.md) 的「receive-pack 写路径存活栅栏」 |
 | trunk 全新栈：写路径无非根 tip | 合法路径落在惰性物化的一级根上；首组件不在 `root_dirs` 中（含在 `/` 下新建顶层）→ **400** `MONO_PATH_NOT_ALLOWED`，点名用户写的路径；跨顶层 move 与删除顶层目录（落点只能是 `/`）→ **400** `MONO_PATH_NOT_ALLOWED`，点名 `/`；嵌套 `import_dir` 的严格祖先根 → **409** `MONO_PATH_UNINITIALIZED`，点名写入所在目录（新建目录时为该目录本身）（ADR-FU-06） |
-| 缺目录（delete / move 均已按此落地） | `404`（ADR-LB-03）。注意这**不是** `GET /tree` / create-entry 的今日行为：今日 `GET /tree` 对不存在的 path 返回 **200 + `tree_items: []`**（`search_tree_by_path` 取不到时返回 `Ok(None)`，`get_tree_info` 再把它映射成 `Ok(vec![])`——`tree_ops.rs:93`/`:98`/`:256`），而 `create-entry` 会**自动补建**缺失的父层级而不是 404 |
+| 缺目录 | delete / move 与 `GET /tree` 均返回 `404`（ADR-LB-03、FIX-BB-10）；`GET /tree` 的路径穿过或指向文件也返回 404。`create-entry` 会**自动补建**缺失的父层级而不是 404 |
 | 鉴权失败 | 见「鉴权」 |
 
 > `[code:NNN]` 前缀是本仓真正的 4xx 约定（`mono_api_service.rs:1097`/`:1677`/`:1690`/`:1846` 都在用）。缺前缀的 `CustomError` 会静默变成 500 并丢失原文。
@@ -453,7 +455,7 @@ tag create/delete 之后，`GET /tags/{name}` 与 `GET /tags/list` 必须在同�
 
 | # | 方法与路径 | 成功 HTTP | 鉴权（trunk / storage-only） | 请求字段 | 成功 `data` 字段 | 本仓 `file:line` |
 |---|---|---|---|---|---|---|
-| 1 | `GET /api/v1/tree?path=<dir>` | 200 | 不要求 Authorization | query `CodePreviewQuery`：`path`（可选，缺省 `/`）、`refs`（可选，缺省空串 = 当前 tip；可为 40 位完整 commit SHA 或 tag 名）；**没有** `oid` 键（`oid` 属于另一条路由 `GET /api/v1/file/tree` 的 `TreeQuery`——`api_router.rs` 以 `.route()` 直挂、不进 OpenAPI，与 `/tree` 无关） | `TreeResponse`：`tree_items[]`（`TreeBriefItem`：`name`、`path`、`content_type`）与 `file_tree`（map：祖先路径 → `FileTreeItem { tree_items, total_count }`，仅辅助结构，见上文 `GET /tree` 节）；**没有**顶层 `total_count` | `preview_router.rs:226`（path）/ `:233` `get_tree_info`；`git.rs:53` `CodePreviewQuery`、`:155` `TreeBriefItem`、`:514` `TreeResponse` |
+| 1 | `GET /api/v1/tree?path=<dir>` | 200；路径不存在或指向非目录 404 | 不要求 Authorization | query `CodePreviewQuery`：`path`（可选，缺省 `/`）、`refs`（可选，缺省空串 = 当前 tip；可为 40 位完整 commit SHA 或 tag 名）；**没有** `oid` 键（`oid` 属于另一条路由 `GET /api/v1/file/tree` 的 `TreeQuery`——`api_router.rs` 以 `.route()` 直挂、不进 OpenAPI，与 `/tree` 无关） | `TreeResponse`：`tree_items[]`（`TreeBriefItem`：`name`、`path`、`content_type`）与 `file_tree`（map：祖先路径 → `FileTreeItem { tree_items, total_count }`，仅辅助结构，见上文 `GET /tree` 节）；**没有**顶层 `total_count` | `preview_router.rs:266`（path）/ `:276` `get_tree_info`；`git.rs:53` `CodePreviewQuery`、`:155` `TreeBriefItem`、`:514` `TreeResponse` |
 | 2 | `POST /api/v1/create-entry` | 200 | `push_auth`（token：Bearer / Basic 密码栏；none：无 header） | `CreateEntryInfo`：`is_directory`、`name`、`path`；可选 `content`、`author_username`、`author_email`、`skip_build`（默认 false）、`mode`（`EditCLMode`，serde `snake_case` 外部标签枚举：`"force_create"` 或 `{"try_reuse": <cl_link 或 null>}`，缺省 `try_reuse(null)`；只影响 Review 形态的 CL 复用，trunk 忽略） | `CreateEntryResult`：`commit_id`、`new_oid`、`path`、`cl_link`（trunk 必为 `null`） | `preview_router.rs:112`；`git.rs:13` / `:239` |
 | 3 | `POST /api/v1/delete-entry` | 200 | 同上；鉴权 path = `path`（父目录） | `DeleteEntryInfo`：`path`、`name`；可选 `is_directory`（`bool`，`default_is_directory` → **`true`**；`false` 删文件）、`author_username`、`skip_build`（默认 false；Libra 送 true） | `DeleteEntryResult`：`commit_id`、`path`、`cl_link`（trunk `null`）；**无** `new_oid` | `preview_router.rs:138`；`git.rs:253` / `:280` |
 | 4 | `POST /api/v1/move-entry` | 200 | 同上；`from_path` 与 `to_path` 各鉴权一次 | `MoveEntryInfo`：`from_path`、`from_name`、`to_path`、`to_name`；可选 `is_directory`（同 delete：缺省 **`true`**；`false` 移文件并保留同一 blob oid）、`author_username`、`skip_build`（默认 false；Libra 送 true） | `MoveEntryResult`：`commit_id`、`from_path`、`to_path`、`cl_link`（trunk `null`）；**无** `new_oid` | `preview_router.rs:166`；`git.rs:293` / `:339` |

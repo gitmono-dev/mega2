@@ -772,6 +772,40 @@ case_libra_browser_list_at_ref() {
     printf 'ref isolated post-tag file: %s\n' "$name"
 }
 
+case_libra_browser_unknown_path() {
+    local WORK="$WORK/browser-unknown" path="/bb-$RUN_ID/missing"
+    local sentinel="bb64-$RUN_ID-secret" left rc leak_rc
+    local deadline=$((SECONDS + 55))
+    mkdir "$WORK"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    if LIBRA_MEGA2_TOKEN="$sentinel" timeout "$left" \
+        "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" "$path" \
+        > "$WORK/browser.json" 2> "$WORK/browser.err"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    [ "$rc" -ne 0 ] \
+        || { echo "libra browser unknown path unexpectedly succeeded" >&2; return 1; }
+    [ "$rc" -ne 124 ] \
+        || { echo "libra browser unknown path timed out" >&2; return 1; }
+    jq -e \
+        '.ok == false and .category == "network" and .error_code == "LBR-NET-002" and (.message | contains("HTTP 404"))' \
+        "$WORK/browser.err" > /dev/null \
+        || { echo "libra browser unknown path JSON is invalid" >&2; return 1; }
+    [ ! -s "$WORK/browser.json" ] \
+        || { echo "libra browser unknown path wrote unexpected stdout" >&2; return 1; }
+    if grep -Fq -- "$sentinel" "$WORK/browser.json" "$WORK/browser.err"; then
+        echo "libra browser unknown path exposed the sentinel token" >&2
+        return 1
+    else
+        leak_rc=$?
+    fi
+    [ "$leak_rc" -eq 1 ] \
+        || { echo "could not scan libra browser output for the sentinel token" >&2; return 1; }
+    printf 'unknown path error_code: LBR-NET-002\n'
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -785,5 +819,6 @@ run_case "LIBRA reject SSH push" case_libra_reject_ssh_push
 run_case "LIBRA LFS push and clone" case_libra_lfs_push_and_clone
 run_case "LIBRA browser list root" case_libra_browser_list_root
 run_case "LIBRA browser list at ref" case_libra_browser_list_at_ref
+run_case "LIBRA browser unknown path" case_libra_browser_unknown_path
 
 finish

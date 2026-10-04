@@ -268,7 +268,8 @@ async fn get_latest_commit(
         CodePreviewQuery
     ),
     responses(
-        (status = 200, body = CommonResult<TreeResponse>, content_type = "application/json")
+        (status = 200, body = CommonResult<TreeResponse>, content_type = "application/json"),
+        (status = 404, description = "Tree path not found", body = CommonResult<TreeResponse>, content_type = "application/json")
     ),
     tag = CODE_PREVIEW
 )]
@@ -563,6 +564,23 @@ mod tests {
                 "readonly preview must not include {needle}: {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn tree_openapi_documents_not_found() {
+        let api = OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(readonly_routers())
+            .split_for_parts()
+            .1;
+        let get = api
+            .paths
+            .paths
+            .get("/tree")
+            .and_then(|item| item.get.as_ref())
+            .expect("GET /tree");
+        let codes: Vec<&String> = get.responses.responses.keys().collect();
+        assert!(codes.iter().any(|code| code.as_str() == "200"), "{codes:?}");
+        assert!(codes.iter().any(|code| code.as_str() == "404"), "{codes:?}");
     }
 
     #[test]
