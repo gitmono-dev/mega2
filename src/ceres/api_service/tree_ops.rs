@@ -313,7 +313,7 @@ pub async fn get_tree_info<T: ApiHandler + ?Sized>(
                 .collect();
             Ok(items)
         }
-        None => Ok(vec![]),
+        None => Err(MegaError::NotFound(format!("tree path not found: {}", path.display())).into()),
     }
 }
 

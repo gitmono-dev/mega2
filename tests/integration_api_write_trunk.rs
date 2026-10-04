@@ -998,6 +998,51 @@ impl EntryCase {
     }
 }
 
+#[test]
+fn tree_unknown_path_returns_404() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&EntryCase::bearer()), "fix-bb-10-file.txt", false);
+
+    let (known_status, known) = case.get("tree?path=/project", None);
+    assert_eq!(known_status, 200, "known directory must remain readable");
+    assert_eq!(known["req_result"], true);
+    assert!(
+        known["data"]["tree_items"]
+            .as_array()
+            .expect("tree_items")
+            .iter()
+            .any(|item| { item["name"] == "fix-bb-10-file.txt" && item["content_type"] == "file" }),
+        "created file must be visible in its parent tree: {known}"
+    );
+
+    for (path, reported_path) in [
+        ("/project/fix-bb-10-missing", "/project/fix-bb-10-missing"),
+        (
+            "/project/fix-bb-10-parent/child",
+            "/project/fix-bb-10-parent",
+        ),
+        ("/project/fix-bb-10-file.txt", "/project/fix-bb-10-file.txt"),
+    ] {
+        let (status, json) = case.get(&format!("tree?path={path}"), None);
+        assert_eq!(status, 404, "GET /tree must reject {path}: {json}");
+        assert_eq!(json["req_result"], false);
+        assert!(json["data"].is_null());
+        assert_eq!(
+            json["err_message"],
+            format!("tree path not found: {reported_path}")
+        );
+        assert!(
+            !json["err_message"]
+                .as_str()
+                .expect("err_message string")
+                .contains(PUSH_TOKEN)
+        );
+    }
+
+    case.finish();
+}
+
 /// Create `/project/lb02-gone` through the API, delete it with the token, and
 /// return the delete response (asserted 200) plus the tip before the delete.
 fn delete_success_flow(case: &EntryCase) -> (Value, String) {
