@@ -1561,13 +1561,14 @@ fn integration_git_lfs_storage_events_presigned_gap() {
     let payload = wh05_unique_payload();
     let oid = hex::encode(sha2::Sha256::digest(&payload));
 
+    let rustfs_endpoint = common::rustfs_endpoint();
     let s3_env: [(&str, &str); 6] = [
         ("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible"),
         ("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1"),
         ("MEGA_OBJECT_STORAGE__S3__BUCKET", "mega2"),
         (
             "MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL",
-            "http://127.0.0.1:19000",
+            rustfs_endpoint.as_str(),
         ),
         ("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "rustfs"),
         (
@@ -1633,7 +1634,7 @@ fn integration_git_lfs_storage_events_presigned_gap() {
         .expect("batch must carry an upload action for the fresh OID")
         .to_owned();
     assert!(
-        upload_href.contains("127.0.0.1:19000"),
+        upload_href.starts_with(&format!("{rustfs_endpoint}/")),
         "upload action must be a presigned RustFS URL, got {upload_href}"
     );
     let probe_status = probe.shutdown_via_sigint(Duration::from_secs(60));
