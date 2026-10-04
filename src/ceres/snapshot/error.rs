@@ -34,6 +34,8 @@ pub enum SnapshotErrorCode {
     DigestMismatch,
     RangeNotSupported,
     SymlinkTraversal,
+    ObjectUnavailable,
+    IntegrityError,
     Internal,
 }
 
@@ -60,6 +62,8 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::DigestMismatch => "EXPECTED_DIGEST_MISMATCH",
             SnapshotErrorCode::RangeNotSupported => "RANGE_NOT_SUPPORTED",
             SnapshotErrorCode::SymlinkTraversal => "SYMLINK_TRAVERSAL",
+            SnapshotErrorCode::ObjectUnavailable => "OBJECT_UNAVAILABLE",
+            SnapshotErrorCode::IntegrityError => "INTEGRITY_ERROR",
             SnapshotErrorCode::Internal => "INTERNAL",
         }
     }
@@ -79,6 +83,7 @@ impl SnapshotErrorCode {
             | SnapshotErrorCode::PathNotFound
             | SnapshotErrorCode::LeaseUnknown => 404,
             SnapshotErrorCode::SnapshotNotReady => 503,
+            SnapshotErrorCode::ObjectUnavailable => 503,
             SnapshotErrorCode::NotDirectory
             | SnapshotErrorCode::Conflict
             | SnapshotErrorCode::CursorStale
@@ -87,6 +92,7 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::UnsupportedEntry => 422,
             SnapshotErrorCode::LimitExceeded | SnapshotErrorCode::ProofBudgetExceeded => 413,
             SnapshotErrorCode::LeaseExpired | SnapshotErrorCode::SnapshotGone => 410,
+            SnapshotErrorCode::IntegrityError => 502,
             SnapshotErrorCode::Internal => 500,
         }
     }
