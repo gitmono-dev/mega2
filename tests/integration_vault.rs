@@ -927,8 +927,8 @@ fn integration_object_storage_s3_compatible_smoke() {
     // 启动真实 RustFS 服务后，通过 `debug storage-smoke` 对 S3-compatible 后端
     // 执行 put/get/delete  round-trip，验证对象存储后端在 post-vault 启动路径
     // 正确解析 endpoint、bucket、credential 并完成真实 I/O。
-    let rustfs_endpoint = "http://127.0.0.1:19000";
-    let rustfs_available = std::net::TcpStream::connect("127.0.0.1:19000").is_ok();
+    let rustfs_endpoint = common::rustfs_endpoint();
+    let rustfs_available = common::rustfs_available(&rustfs_endpoint);
     if !rustfs_available {
         eprintln!(
             "integration_object_storage_s3_compatible_smoke requires RustFS at {}; \

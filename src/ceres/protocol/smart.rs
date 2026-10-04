@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt, stream};
 use git_internal::hash::HashKind;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -119,6 +119,19 @@ impl SmartSession {
         state: &ProtocolApiState,
         upload_request: &mut Bytes,
     ) -> Result<(ReceiverStream<Vec<u8>>, BytesMut), ProtocolError> {
+        self.git_upload_pack_with_shallow_info(state, upload_request, false)
+            .await
+    }
+
+    /// Stateful SSH clients send their wants once, read shallow-info, then
+    /// send `done`. The channel replays the wants for pack generation, but
+    /// must not send the already consumed shallow-info section again.
+    pub(crate) async fn git_upload_pack_with_shallow_info(
+        &mut self,
+        state: &ProtocolApiState,
+        upload_request: &mut Bytes,
+        shallow_info_sent: bool,
+    ) -> Result<(ReceiverStream<Vec<u8>>, BytesMut), ProtocolError> {
         let repo_handler = self.repo_handler_with_commands(state, Vec::new()).await?;
 
         let mut want: HashSet<String> = HashSet::new();
@@ -126,7 +139,7 @@ impl SmartSession {
         let mut last_common_commit = String::new();
         let mut deepen_depth: Option<u32> = None;
         let mut deepen_relative = false;
-        let mut shallow_commits: Vec<String> = Vec::new();
+        let mut done = false;
 
         let mut read_first_line = false;
         loop {
@@ -162,7 +175,10 @@ impl SmartSession {
                     let oid = self.parse_pkt_object_id(&dst, 5, "have")?;
                     have.insert(oid);
                 }
-                b"done" => break,
+                b"done" => {
+                    done = true;
+                    break;
+                }
                 b"deep" => {
                     let payload = &dst[4..];
                     if payload.starts_with(b"en ") {
@@ -255,14 +271,28 @@ impl SmartSession {
 
         if have.is_empty() {
             if let Some(depth) = deepen_depth {
-                let (stream, shallows) = repo_handler
+                let (stream, shallow_commits) = repo_handler
                     .shallow_pack(want, depth, deepen_relative)
                     .await
                     .map_err(|e| {
                         ProtocolError::InvalidInput(format!("shallow pack generation failed: {e}"))
                     })?;
                 pack_data = stream;
-                shallow_commits = shallows;
+                if !shallow_info_sent {
+                    for shallow in &shallow_commits {
+                        add_pkt_line_string(&mut protocol_buf, format!("shallow {shallow}\n"));
+                    }
+                    // The shallow-info section ends before the ACK/NAK section,
+                    // even when the requested depth reaches the root commit.
+                    protocol_buf.extend_from_slice(PKT_LINE_END_MARKER);
+                }
+                // Stateless clients first request shallow boundaries, then
+                // repeat the wants with `done` to request the pack.
+                if !done {
+                    pack_data.for_each(|_| async {}).await;
+                    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                    return Ok((ReceiverStream::new(rx), protocol_buf));
+                }
             } else {
                 pack_data = repo_handler.full_pack(want).await.map_err(|e| {
                     ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
@@ -302,10 +332,6 @@ impl SmartSession {
                 pack_data = ReceiverStream::new(rx);
             }
             add_pkt_line_string(&mut protocol_buf, format!("ACK {last_common_commit} \n"));
-        }
-
-        for shallow in &shallow_commits {
-            add_pkt_line_string(&mut protocol_buf, format!("shallow {shallow}\n"));
         }
 
         Ok((pack_data, protocol_buf))

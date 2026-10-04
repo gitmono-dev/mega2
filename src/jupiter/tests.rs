@@ -412,6 +412,18 @@ pub async fn with_test_vault(storage: Storage, dir: impl AsRef<Path>) -> Storage
     storage.with_vault(vault)
 }
 
+/// Start a standalone Redis instance on an OS-assigned test port.
+pub fn test_redis_server() -> redis_test::server::RedisServer {
+    use redis_test::server::RedisServer;
+
+    // RedisServer::new reserves room for a cluster bus port and rejects
+    // ports >= 55535. These standalone servers need no cluster bus port.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("free Redis test port");
+    let port = listener.local_addr().expect("Redis test address").port();
+    drop(listener);
+    RedisServer::new_with_addr_and_modules(RedisServer::get_addr(port), &[], false)
+}
+
 /// Redis manager for RedLock-backed server-signing key init.
 pub async fn test_redis_manager() -> crate::jupiter::redis::ConnectionManager {
     let url =

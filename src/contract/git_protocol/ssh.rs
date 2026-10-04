@@ -58,6 +58,8 @@ pub struct SshServer {
 pub struct GitSshChannelState {
     pub smart_protocol: SmartSession,
     pub data_combined: BytesMut,
+    /// Wants/depth from a v0 shallow-info round; SSH sends only `done` next.
+    pub pending_shallow_request: Option<Bytes>,
 }
 
 impl server::Server for SshServer {
@@ -185,6 +187,7 @@ impl server::Handler for SshServer {
                         GitSshChannelState {
                             smart_protocol,
                             data_combined: BytesMut::new(),
+                            pending_shallow_request: None,
                         },
                     );
                     session.data(channel, v2_adv.to_vec())?;
@@ -196,6 +199,7 @@ impl server::Handler for SshServer {
                         GitSshChannelState {
                             smart_protocol,
                             data_combined: BytesMut::new(),
+                            pending_shallow_request: None,
                         },
                     );
                     session.data(channel, res.to_vec())?;
@@ -363,13 +367,16 @@ impl server::Handler for SshServer {
         match service_type {
             ServiceType::UploadPack => {
                 // Git may deliver the upload-pack request across multiple SSH
-                // data packets. Process only once the buffer ends in a flush
-                // pkt-line (`0000`), matching HTTP's full-body collection.
+                // data packets. Process only a complete round, terminated
+                // by a flush pkt-line (`0000`) or a complete `done` packet.
                 // Handling a partial/flush-only chunk as a complete request
                 // previously ran pack generation with want=[] and returned
                 // `error: …` (`bad line length character: erro` on the client).
                 state.data_combined.extend_from_slice(data);
-                while upload_pack_buffer_complete(&state.data_combined) {
+                while upload_pack_buffer_complete(
+                    &state.data_combined,
+                    state.pending_shallow_request.is_some(),
+                ) {
                     let request = take_complete_upload_pack_request(&mut state.data_combined);
                     handle_upload_pack(state, &self.state, channel, &request, session).await;
                 }
@@ -575,8 +582,19 @@ async fn handle_upload_pack(
         return;
     }
 
+    let previous = state.pending_shallow_request.take();
+    let shallow_info_sent = previous.is_some();
+    let mut request = BytesMut::new();
+    if let Some(previous) = previous {
+        request.extend_from_slice(&previous);
+    }
+    request.extend_from_slice(data);
+    let request = request.freeze();
+    body = request.clone();
     let smart_protocol = &mut state.smart_protocol;
-    let (mut send_pack_data, buf) = match smart_protocol.git_upload_pack(api_state, &mut body).await
+    let (mut send_pack_data, buf) = match smart_protocol
+        .git_upload_pack_with_shallow_info(api_state, &mut body, shallow_info_sent)
+        .await
     {
         Ok(result) => result,
         Err(e) => {
@@ -588,6 +606,10 @@ async fn handle_upload_pack(
 
     tracing::info!("buf is {:?}", buf);
     let _ = session.data(channel, buf.to_vec());
+    if buf.ends_with(smart::PKT_LINE_END_MARKER) {
+        state.pending_shallow_request = Some(request);
+        return;
+    }
 
     while let Some(chunk) = send_pack_data.next().await {
         let mut reader = chunk.as_slice();
@@ -613,15 +635,19 @@ async fn handle_upload_pack(
 
 /// True when `buf` holds at least one terminated upload-pack/v2 command.
 ///
-/// A flush-only (`0000`) or empty buffer is *not* complete — processing those
-/// as a full request yields `want=[]` and a protocol error to the client.
-fn upload_pack_buffer_complete(buf: &[u8]) -> bool {
+/// A flush-only (`0000`) or empty buffer is *not* complete. A done-only
+/// continuation is complete when the channel already holds the wants/depth.
+fn upload_pack_buffer_complete(buf: &[u8], shallow_negotiation_pending: bool) -> bool {
     if buf.len() < 8 {
         return false;
     }
     let text = String::from_utf8_lossy(buf);
-    let has_payload = text.contains("want ") || text.contains("command=") || text.contains("have ");
-    let terminated = buf.ends_with(smart::PKT_LINE_END_MARKER) || text.contains("0009done");
+    let has_done = text.contains("0009done\n");
+    let has_payload = text.contains("want ")
+        || text.contains("command=")
+        || text.contains("have ")
+        || (shallow_negotiation_pending && has_done);
+    let terminated = buf.ends_with(smart::PKT_LINE_END_MARKER) || has_done;
     has_payload && terminated
 }
 
@@ -1078,6 +1104,7 @@ mod tests {
                 TransportProtocol::Ssh,
             ),
             data_combined: BytesMut::new(),
+            pending_shallow_request: None,
         };
         let mut channel_b = GitSshChannelState {
             smart_protocol: SmartSession::new(
@@ -1086,6 +1113,7 @@ mod tests {
                 TransportProtocol::Ssh,
             ),
             data_combined: BytesMut::new(),
+            pending_shallow_request: None,
         };
 
         channel_a.data_combined.extend_from_slice(b"payload-a");
@@ -1093,5 +1121,14 @@ mod tests {
 
         assert_eq!(&channel_a.data_combined[..], b"payload-a");
         assert_eq!(&channel_b.data_combined[..], b"payload-b");
+    }
+
+    #[test]
+    fn upload_pack_accepts_done_only_after_shallow_info() {
+        assert!(!upload_pack_buffer_complete(b"0009done\n", false));
+        assert!(upload_pack_buffer_complete(b"0009done\n", true));
+        assert!(!upload_pack_buffer_complete(b"0009don", true));
+        assert!(!upload_pack_buffer_complete(b"0009done", true));
+        assert!(!upload_pack_buffer_complete(b"0000", true));
     }
 }

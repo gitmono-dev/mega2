@@ -126,7 +126,7 @@ mod tests {
             eprintln!("redis-server not found; skipping snowflake worker tests");
             return None;
         }
-        let server = RedisServer::new();
+        let server = crate::jupiter::tests::test_redis_server();
         let url = server.client_addr().to_owned();
         let client = redis::Client::open(url).unwrap();
         let conn = ConnectionManager::new(client).await.unwrap();

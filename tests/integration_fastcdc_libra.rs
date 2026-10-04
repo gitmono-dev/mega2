@@ -173,20 +173,18 @@ impl FastcdcEnv {
                     .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root);
             }
             StorageBackend::S3 => {
+                let endpoint = common::rustfs_endpoint();
                 // Fail closed if RustFS is missing — no skip (MF-07).
                 assert!(
-                    TcpStream::connect(("127.0.0.1", 19000)).is_ok(),
-                    "media_publication_s3 requires RustFS at http://127.0.0.1:19000; \
+                    common::rustfs_available(&endpoint),
+                    "media_publication_s3 requires RustFS at {endpoint}; \
                      run `docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --wait postgres redis rustfs rustfs-init`"
                 );
                 command
                     .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible")
                     .env("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1")
                     .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "mega2")
-                    .env(
-                        "MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL",
-                        "http://127.0.0.1:19000",
-                    )
+                    .env("MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL", endpoint)
                     .env("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "rustfs")
                     .env(
                         "MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY",
@@ -1240,7 +1238,7 @@ async fn build_publication_store(
             s3: S3Config {
                 region: "us-east-1".into(),
                 bucket: "mega2".into(),
-                endpoint_url: "http://127.0.0.1:19000".into(),
+                endpoint_url: common::rustfs_endpoint(),
                 public_endpoint_url: String::new(),
                 access_key_id: "rustfs".into(),
                 secret_access_key: "rustfs_secret".into(),

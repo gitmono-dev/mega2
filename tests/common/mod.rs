@@ -11,6 +11,30 @@
 
 use std::{fs, path::Path};
 
+#[allow(
+    dead_code,
+    reason = "RustFS endpoint is used by S3 integration targets only"
+)]
+pub fn rustfs_endpoint() -> String {
+    std::env::var("MEGA2_IT_RUSTFS_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:19000".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+#[allow(
+    dead_code,
+    reason = "RustFS probe is used by S3 integration targets only"
+)]
+pub fn rustfs_available(endpoint: &str) -> bool {
+    let url = url::Url::parse(endpoint).expect("valid RustFS test endpoint");
+    std::net::TcpStream::connect((
+        url.host_str().expect("RustFS test host"),
+        url.port_or_known_default().expect("RustFS test port"),
+    ))
+    .is_ok()
+}
+
 pub fn write_full_config(path: &Path) {
     // Product sample defaults to `admin = ["mega2"]` (local convenience), but
     // the git/SSH/LFS IT harness and seeded cedar fixtures still use the

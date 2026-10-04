@@ -15,7 +15,7 @@ mod git_cli;
 use std::{
     fs,
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -1219,11 +1219,7 @@ fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
 }
 
 fn reserve_free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    git_cli::reserve_ephemeral_port()
 }
 
 fn create_log_file(path: &Path) -> fs::File {
@@ -1561,13 +1557,14 @@ fn integration_git_lfs_storage_events_presigned_gap() {
     let payload = wh05_unique_payload();
     let oid = hex::encode(sha2::Sha256::digest(&payload));
 
+    let rustfs_endpoint = common::rustfs_endpoint();
     let s3_env: [(&str, &str); 6] = [
         ("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible"),
         ("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1"),
         ("MEGA_OBJECT_STORAGE__S3__BUCKET", "mega2"),
         (
             "MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL",
-            "http://127.0.0.1:19000",
+            rustfs_endpoint.as_str(),
         ),
         ("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "rustfs"),
         (
@@ -1633,7 +1630,7 @@ fn integration_git_lfs_storage_events_presigned_gap() {
         .expect("batch must carry an upload action for the fresh OID")
         .to_owned();
     assert!(
-        upload_href.contains("127.0.0.1:19000"),
+        upload_href.starts_with(&format!("{rustfs_endpoint}/")),
         "upload action must be a presigned RustFS URL, got {upload_href}"
     );
     let probe_status = probe.shutdown_via_sigint(Duration::from_secs(60));

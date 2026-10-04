@@ -406,7 +406,7 @@ mod tests {
             eprintln!("redis-server not found; skipping redis lock tests");
             return None;
         }
-        let server = RedisServer::new();
+        let server = crate::jupiter::tests::test_redis_server();
         let url = server.client_addr().to_owned();
         println!("starting redis mock server at: {}", url);
         let client = redis::Client::open(url).unwrap();
