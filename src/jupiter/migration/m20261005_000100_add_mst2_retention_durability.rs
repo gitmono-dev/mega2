@@ -5,7 +5,7 @@
 //! LIVE→DELETING CAS and an idempotent operation log for crash recovery. The
 //! runtime is not switched to this schema by this migration alone.
 
-use sea_orm_migration::prelude::*;
+use sea_orm_migration::{prelude::*, schema::*};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;

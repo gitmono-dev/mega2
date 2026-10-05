@@ -140,6 +140,7 @@ mod m20260923_000100_import_repo_cleanups;
 mod m20260923_000200_canonicalize_import_repo_paths;
 mod m20260925_000100_media_paging;
 mod m20261005_000100_add_mst2_retention_durability;
+mod m20261005_000200_harden_mst2_retention_graph;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -268,6 +269,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260923_000200_canonicalize_import_repo_paths::Migration),
             Box::new(m20260925_000100_media_paging::Migration),
             Box::new(m20261005_000100_add_mst2_retention_durability::Migration),
+            Box::new(m20261005_000200_harden_mst2_retention_graph::Migration),
         ]
     }
 }
@@ -477,12 +479,13 @@ mod tests {
     async fn import_repo_alias_rows_canonicalized() {
         let names = migration_names();
         assert_eq!(
-            &names[names.len() - 4..],
+            &names[names.len() - 5..],
             &[
                 "m20260923_000100_import_repo_cleanups".to_string(),
                 "m20260923_000200_canonicalize_import_repo_paths".to_string(),
                 "m20260925_000100_media_paging".to_string(),
                 "m20261005_000100_add_mst2_retention_durability".to_string(),
+                "m20261005_000200_harden_mst2_retention_graph".to_string(),
             ],
             "retention durability registered last, after media paging"
         );
