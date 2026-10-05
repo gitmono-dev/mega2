@@ -31,6 +31,9 @@ docs/
 它复用 `trunk-push.md` 的根写入路径，验收场景在 `integration.md` 登记；执行依赖与优先级见 README 的 5b 条目。
 当前为用户明确要求的文档编写与 review，不执行本文「执行时的共同需求」中的代码实现／版本发布步骤。
 
+补充登记（2026-10-05）：[`history-projection.md`](history-projection.md) 定义 trunk 根历史只读视图的过滤、派生状态与 Git 协议契约。
+其实施与验收见 [`../plan/plan-20261002.md`](../plan/plan-20261002.md)，长期剩余范围见 [`../plan/plan-long.md`](../plan/plan-long.md) PT-14；与 `trunk-push.md`、`protocol.md` 协同，集成场景由 `integration.md` 登记。
+
 ### 文档角色定义
 
 | 文档 | 角色 | 职责 |

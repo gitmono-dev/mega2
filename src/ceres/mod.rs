@@ -10,3 +10,4 @@ pub mod oci;
 pub mod pack;
 pub mod protocol;
 pub mod snapshot;
+pub mod view;
