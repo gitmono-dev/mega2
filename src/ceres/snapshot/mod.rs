@@ -11,5 +11,6 @@ pub mod pages;
 pub mod publication;
 pub mod resolver;
 pub mod retention;
+pub mod retention_dag;
 pub mod runtime;
 pub mod view;
