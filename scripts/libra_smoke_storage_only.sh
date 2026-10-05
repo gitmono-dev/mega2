@@ -15,7 +15,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 source "$SCRIPT_DIR/lib/smoke-runner.sh"
 
 smoke_init "libra"
-require_tools git mkdir rm date timeout curl jq sha256sum cat grep
+require_tools git mkdir rm date timeout curl jq sha256sum cat grep awk
 if [ -z "$SMOKE_CASE_FILTER" ] || [ "$SMOKE_CASE_FILTER" = "LIBRA clone SSH" ] \
     || [ "$SMOKE_CASE_FILTER" = "LIBRA reject SSH push" ]; then
     require_tools ssh-keyscan ssh
@@ -1298,6 +1298,74 @@ case_libra_browser_tags_page_two() {
     printf 'root tag second page matched: %s of %s\n' "$browser_name" "$browser_total"
 }
 
+case_libra_browser_create_lightweight_tag() {
+    local WORK="$WORK/browser-create-lightweight-tag" path="/" name="bb73-$RUN_ID"
+    local token="${MEGA2_IT_SEED_TOKEN:-}" head code left rc=0 leak_rc=0
+    local attempted=false cleanup_ok=false deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    # shellcheck disable=SC2329
+    cleanup_bb73_tag() {
+        trap - RETURN
+        local cleanup_code=000 cleanup_left cleanup_timeout
+        rm -f "$WORK/token"
+        if [ "$attempted" = true ]; then
+            printf 'Authorization: Bearer %s\n' "$token" > "$WORK/cleanup.header"
+            chmod 600 "$WORK/cleanup.header"
+            cleanup_left=$((deadline - SECONDS))
+            if [ "$cleanup_left" -gt 0 ]; then
+                cleanup_timeout=$cleanup_left
+                [ "$cleanup_timeout" -le 5 ] || cleanup_timeout=5
+                cleanup_code=$(curl -sS --connect-timeout 5 --max-time "$cleanup_timeout" -X DELETE \
+                    -H @"$WORK/cleanup.header" -o "$WORK/delete.out" -w '%{http_code}' \
+                    "$MEGA2_BASE_URL/api/v1/tags/$name") || cleanup_code=000
+            fi
+            rm -f "$WORK/cleanup.header"
+            if [ "$cleanup_code" = 200 ] && jq -e --arg name "$name" \
+                '.req_result == true and .data.deleted_tag == $name' "$WORK/delete.out" > /dev/null; then
+                cleanup_ok=true
+                printf 'cleaned root tag: %s\n' "$name"
+            elif [ "$cleanup_code" != 404 ]; then
+                printf 'warning: root tag cleanup failed (HTTP %s): %s\n' "$cleanup_code" "$name" >&2
+            fi
+        fi
+        return 0
+    }
+    trap cleanup_bb73_tag RETURN
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    head=$(timeout "$left" git ls-remote "$MEGA2_BASE_URL/" HEAD | awk '$2 == "HEAD" { print $1 }') || return 1
+    [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "root HEAD is not a SHA-1 OID" >&2; return 1; }
+    printf '%s\n' "$token" > "$WORK/token"
+    chmod 600 "$WORK/token"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    attempted=true
+    if timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" \
+        --token-file "$WORK/token" --create-tag "$name" "$path" \
+        > "$WORK/create.json" 2> "$WORK/create.err"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "$WORK/token"
+    [ "$rc" -eq 0 ] || { echo "libra browser lightweight tag creation failed (exit $rc)" >&2; return 1; }
+    [ ! -s "$WORK/create.err" ] || { echo "libra browser create-tag wrote unexpected stderr" >&2; return 1; }
+    jq -e --arg server "$MEGA2_BASE_URL" --arg name "$name" --arg head "$head" \
+        '.ok == true and .command == "mega2 browser" and .data.operation == "create-tag" and .data.server == $server and .data.target == {name: $name, kind: "lightweight", path: "/"} and .data.receipt.name == $name and .data.receipt.tag_id == $head and .data.receipt.object_id == $head' \
+        "$WORK/create.json" > /dev/null || { echo "libra browser lightweight tag receipt is invalid" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -o "$WORK/tag.json" -w '%{http_code}' \
+        "$MEGA2_BASE_URL/api/v1/tags/$name") || return 1
+    [ "$code" = 200 ] && jq -e --arg name "$name" --arg head "$head" \
+        '.req_result == true and .data.name == $name and .data.tag_id == $head and .data.object_id == $head' \
+        "$WORK/tag.json" > /dev/null || { echo "anonymous tag GET differs from root HEAD (HTTP $code)" >&2; return 1; }
+    cleanup_bb73_tag
+    [ "$cleanup_ok" = true ] || return 1
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || leak_rc=$?
+    [ "$leak_rc" -eq 1 ] || { echo "browser lightweight tag token persisted or scan failed" >&2; return 1; }
+    printf 'lightweight root tag matched HEAD: %s\n' "$name"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -1319,5 +1387,6 @@ run_case "LIBRA browser move dir" case_libra_browser_move_dir
 run_case "LIBRA browser rename dir" case_libra_browser_rename_dir
 run_case "LIBRA browser list tags" case_libra_browser_list_tags
 run_case "LIBRA browser tags page two" case_libra_browser_tags_page_two
+run_case "LIBRA browser create lightweight tag" case_libra_browser_create_lightweight_tag
 
 finish
