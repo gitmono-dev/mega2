@@ -7,6 +7,7 @@ pub mod chunks;
 pub mod descriptor;
 pub mod error;
 pub mod frame_stream;
+pub(crate) mod metadata_install;
 pub mod pages;
 pub mod publication;
 pub mod resolver;
