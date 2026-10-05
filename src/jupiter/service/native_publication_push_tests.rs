@@ -18,18 +18,29 @@ async fn native_fixture() -> (tempfile::TempDir, crate::jupiter::storage::Storag
     let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
     let storage = crate::jupiter::tests::with_test_vault(storage, temp.path()).await;
     let name = format!("native-{}", uuid::Uuid::new_v4().simple());
-    let (tip, path) = wh03_path_fixture(&storage, &name).await;
-    // Persist the literal file bytes expected by the tree fixture for actual HTTP projection.
-    for (oid, raw) in [("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", b"keep".as_slice()),
-        ("dddddddddddddddddddddddddddddddddddddddd", b"old".as_slice())] {
-        storage.git_service.save_object_from_raw(Bytes::copy_from_slice(raw)).await.unwrap();
-        storage.mono_storage().get_connection().execute_raw(Statement::from_sql_and_values(
-            storage.mono_storage().get_connection().get_database_backend(),
-            "INSERT INTO mst2_verified_object(storage_domain,git_oid,object_kind,raw_sha256,size,verification_version,state,created_at) \
-             VALUES ('git',$1,'blob',$2,$3,2,'VERIFIED',now()) ON CONFLICT DO NOTHING",
-            [oid.into(), Sha256::digest(raw).to_vec().into(), (raw.len() as i64).into()],
-        )).await.unwrap();
-    }
+    use git_internal::internal::object::{
+        commit::Commit,
+        tree::{Tree, TreeItem, TreeItemMode},
+    };
+    let keep_oid = storage.git_service.save_object_from_raw(Bytes::from_static(b"keep")).await.unwrap();
+    let old_oid = storage.git_service.save_object_from_raw(Bytes::from_static(b"old")).await.unwrap();
+    let child = Tree::from_tree_items(vec![wh03_blob_item("x.txt", &old_oid)]).unwrap();
+    let root_tree = Tree::from_tree_items(vec![
+        wh03_blob_item(".gitkeep", &keep_oid),
+        TreeItem::new(TreeItemMode::Tree, child.id, name.clone()),
+    ]).unwrap();
+    let root_commit = Commit::from_tree_id(root_tree.id, vec![], "root");
+    let tip = Commit::from_tree_id(child.id, vec![], "path tip");
+    let mono = storage.mono_storage();
+    mono.save_mega_trees(vec![child.clone(), root_tree.clone()], root_commit.id, None).await.unwrap();
+    mono.save_mega_commits(vec![root_commit.clone(), tip.clone()], None).await.unwrap();
+    mono.save_refs(mega_refs::Model::new(
+        "/", MEGA_BRANCH_NAME.to_owned(), root_commit.id.to_string(), root_tree.id.to_string(), false,
+    ), None).await.unwrap();
+    let path = format!("/{name}");
+    mono.save_refs(mega_refs::Model::new(
+        path.clone(), MEGA_BRANCH_NAME.to_owned(), tip.id.to_string(), child.id.to_string(), false,
+    ), None).await.unwrap();
     storage.mono_storage().initialize_native_publication(NATIVE_INSTANCE).await.unwrap();
     (temp, storage, tip, path)
 }
@@ -219,8 +230,9 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
     assert!(matches!(wh03_exec(&storage,id).await,ExecuteOutcome::Done{..}));
     let state=api_state(storage.clone()).await;
     let (status,v1)=http_resolve(state.clone(),"/").await;
-    assert_eq!(status,200);
-    let (_,subscope)=http_resolve(state.clone(),&path).await;
+    assert_eq!(status,200,"{v1}");
+    let (status,subscope)=http_resolve(state.clone(),&path).await;
+    assert_eq!(status,200,"{subscope}");
     assert_eq!(v1["publication_sequence"],subscope["publication_sequence"]);
     assert_eq!(v1["writer_epoch"],subscope["writer_epoch"]);
     let root_v1=storage.mono_storage().get_main_ref("/").await.unwrap().unwrap();
@@ -234,14 +246,15 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
     tokio::time::timeout(Duration::from_secs(5),captured.wait()).await.unwrap();
     let first_commit=storage.mono_storage().get_commit_by_hash(&first).await.unwrap().unwrap();
     let first_commit=git_internal::internal::object::commit::Commit::from_mega_model(first_commit);
-    let (next,next_payload)=wh03_save_n1_commit(&storage,first_commit.id,"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","next projection").await;
+    let next_blob = storage.git_service.save_object_from_raw(Bytes::from_static(b"next projection")).await.unwrap();
+    let (next,next_payload)=wh03_save_n1_commit(&storage,first_commit.id,&next_blob,"next projection").await;
     let id=wh03_enqueue_push(&storage,&path,&first,&next,&next_payload).await;
     assert!(matches!(wh03_exec(&storage,id).await,ExecuteOutcome::Done{..}));
     tokio::time::timeout(Duration::from_secs(5),release.wait()).await.unwrap();
     let (status,delayed)=tokio::time::timeout(Duration::from_secs(10),&mut reader).await.unwrap().unwrap();
-    assert_eq!(status,200);assert_eq!(delayed["descriptor"],v1["descriptor"]);
+    assert_eq!(status,200,"{delayed}");assert_eq!(delayed["descriptor"],v1["descriptor"]);
     assert_eq!(delayed["publication_sequence"],v1["publication_sequence"]);
     let (status,v2)=http_resolve(state,"/").await;
-    assert_eq!(status,200);assert_eq!(v2["publication_sequence"],"2");
+    assert_eq!(status,200,"{v2}");assert_eq!(v2["publication_sequence"],"2");
     assert_ne!(v2["descriptor"]["snapshot_id"],v1["descriptor"]["snapshot_id"]);
 }
