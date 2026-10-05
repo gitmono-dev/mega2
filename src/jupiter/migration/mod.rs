@@ -479,13 +479,15 @@ mod tests {
     async fn import_repo_alias_rows_canonicalized() {
         let names = migration_names();
         assert_eq!(
-            &names[names.len() - 3..],
+            &names[names.len() - 5..],
             &[
                 "m20260923_000100_import_repo_cleanups".to_string(),
                 "m20260923_000200_canonicalize_import_repo_paths".to_string(),
                 "m20260925_000100_media_paging".to_string(),
+                "m20261005_000100_add_mst2_publication_request_digest".to_string(),
+                "m20261005_000200_add_mst2_native_head".to_string(),
             ],
-            "media paging registered last, after the FU-14/16 migrations"
+            "native publication registered after media paging and request receipts"
         );
 
         let db = alias_db().await;
