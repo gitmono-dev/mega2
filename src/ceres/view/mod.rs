@@ -1,3 +1,4 @@
+pub mod commit;
 pub mod filter;
 pub mod tree;
 pub mod tree_source;
