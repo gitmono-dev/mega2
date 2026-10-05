@@ -94,9 +94,9 @@ pub enum MetadataPrepareObservation {
     Committed(PreparedMetadataReceipt),
 }
 
-struct StoredPlan {
-    record: mst2_metadata_prepare::Model,
-    plan: MetadataInstallPlan,
+pub(super) struct StoredPlan {
+    pub(super) record: mst2_metadata_prepare::Model,
+    pub(super) plan: MetadataInstallPlan,
 }
 
 impl StoredPlan {
@@ -162,6 +162,7 @@ impl PostgresMetadataInstallRepository {
         let result = async {
             self.barrier(&txn).await?;
             if let Some(stored) = load_plan(&txn, operation_id, &digest).await? {
+                reject_consumed(&stored)?;
                 return stored.intent();
             }
             let id = uuid::Uuid::new_v4().to_string();
@@ -378,7 +379,10 @@ impl PostgresMetadataInstallRepository {
                     verify_graph(&txn, &stored).await?;
                     Ok(MetadataPrepareObservation::Committed(stored.receipt()?))
                 }
-                Some(stored) => Ok(MetadataPrepareObservation::Preparing(stored.intent()?)),
+                Some(stored) => {
+                    reject_consumed(&stored)?;
+                    Ok(MetadataPrepareObservation::Preparing(stored.intent()?))
+                }
             }
         }
         .await;
@@ -394,7 +398,15 @@ impl PostgresMetadataInstallRepository {
         })
     }
 
-    async fn transaction(&self) -> Result<DatabaseTransaction, SnapshotError> {
+    pub(super) fn storage_uuid(&self) -> &str {
+        &self.storage_scope.storage_uuid
+    }
+
+    pub(super) fn connection(&self) -> &DatabaseConnection {
+        &self.connection
+    }
+
+    pub(super) async fn transaction(&self) -> Result<DatabaseTransaction, SnapshotError> {
         if self.connection.get_database_backend() != DbBackend::Postgres {
             return Err(internal("metadata installation requires PostgreSQL"));
         }
@@ -404,7 +416,7 @@ impl PostgresMetadataInstallRepository {
             .map_err(internal)
     }
 
-    async fn barrier(&self, txn: &DatabaseTransaction) -> Result<(), SnapshotError> {
+    pub(super) async fn barrier(&self, txn: &DatabaseTransaction) -> Result<(), SnapshotError> {
         if txn.get_database_backend() != DbBackend::Postgres {
             return Err(internal("metadata installation requires PostgreSQL"));
         }
@@ -491,7 +503,7 @@ async fn read_storage_scope<C: ConnectionTrait>(
     })
 }
 
-async fn load_plan<C: ConnectionTrait>(
+pub(super) async fn load_plan<C: ConnectionTrait>(
     connection: &C,
     operation_id: &str,
     digest: &[u8; 32],
@@ -526,8 +538,8 @@ async fn load_plan<C: ConnectionTrait>(
         || record.node_count as usize != plan.pages.len()
         || record.edge_count as usize != plan.edges.len()
         || record.total_bytes as u64 != plan.total_bytes
-        || !["PREPARING", "COMMITTED"].contains(&record.state.as_str())
-        || (record.state == "COMMITTED") != record.committed_at.is_some()
+        || !["PREPARING", "COMMITTED", "CONSUMED"].contains(&record.state.as_str())
+        || (record.state != "PREPARING") != record.committed_at.is_some()
     {
         return Err(integrity(
             "stored metadata preparation fields disagree with their canonical plan",
@@ -572,10 +584,21 @@ async fn require_plan<C: ConnectionTrait>(
     if stored.record.prepare_id != intent.prepare_id {
         return Err(integrity("metadata intent identity mismatch"));
     }
+    reject_consumed(&stored)?;
     Ok(stored)
 }
 
-async fn load_installed_dag<C: ConnectionTrait>(
+fn reject_consumed(stored: &StoredPlan) -> Result<(), SnapshotError> {
+    if stored.record.state == "CONSUMED" {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::Conflict,
+            "metadata preparation has been consumed into a lease binding",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn load_installed_dag<C: ConnectionTrait>(
     connection: &C,
     stored: &StoredPlan,
 ) -> Result<ValidatedMetadataDag, SnapshotError> {
@@ -625,7 +648,7 @@ async fn load_installed_dag<C: ConnectionTrait>(
     )
 }
 
-async fn check_payload_coverage<C: ConnectionTrait>(
+pub(super) async fn check_payload_coverage<C: ConnectionTrait>(
     connection: &C,
     stored: &StoredPlan,
 ) -> Result<(), SnapshotError> {
@@ -646,6 +669,21 @@ async fn check_payload_coverage<C: ConnectionTrait>(
 async fn verify_graph<C: ConnectionTrait>(
     connection: &C,
     stored: &StoredPlan,
+) -> Result<(), SnapshotError> {
+    verify_graph_root(
+        connection,
+        stored,
+        &format!("prepare:{}", stored.record.prepare_id),
+        "prepare",
+    )
+    .await
+}
+
+pub(super) async fn verify_graph_root<C: ConnectionTrait>(
+    connection: &C,
+    stored: &StoredPlan,
+    root_key: &str,
+    root_kind: &str,
 ) -> Result<(), SnapshotError> {
     let sizes: BTreeMap<_, _> = stored
         .plan
@@ -694,15 +732,12 @@ async fn verify_graph<C: ConnectionTrait>(
         ));
     }
     let roots = mst2_retention_root::Entity::find()
-        .filter(
-            mst2_retention_root::Column::RootKey
-                .eq(format!("prepare:{}", stored.record.prepare_id)),
-        )
+        .filter(mst2_retention_root::Column::RootKey.eq(root_key))
         .limit((MetadataDagLimits::default().nodes + 1) as u64)
         .all(connection)
         .await
         .map_err(internal)?;
-    if roots.iter().any(|root| root.root_kind != "prepare")
+    if roots.iter().any(|root| root.root_kind != root_kind)
         || roots
             .into_iter()
             .map(|root| root.node_id)
@@ -799,4 +834,4 @@ fn unavailable(message: &str) -> SnapshotError {
 
 #[cfg(test)]
 #[path = "native_metadata_install_tests.rs"]
-mod tests;
+pub(super) mod tests;
