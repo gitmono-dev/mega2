@@ -295,6 +295,22 @@ impl AppContext {
             }
         };
 
+        let mut storage = storage;
+        if config.mst2.projection_observation_enabled {
+            match crate::ceres::snapshot::projection_writer::ProjectionObservationSink::start(
+                &crate::config::mega_cache(),
+            ) {
+                Ok(sink) => storage.projection_observation_sink = Some(sink),
+                Err(_) => {
+                    notification_shutdown.cancel();
+                    storage.storage_event_emitter.shutdown().await;
+                    return Err(MegaError::Other(
+                        "typed projection writer failed startup".into(),
+                    ));
+                }
+            }
+        }
+
         Ok(Self {
             storage,
             vault,

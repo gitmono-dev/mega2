@@ -561,8 +561,18 @@ async fn resolve(
             projection_work,
             projection_elapsed,
         ) {
-            Ok(observation) => observation.emit(),
-            Err(_) => tracing::warn!("native resolve observation context rejected"),
+            Ok(observation) => {
+                if let Some(sink) = &state.storage.projection_observation_sink {
+                    let _ = sink.enqueue(&observation);
+                }
+                observation.emit();
+            }
+            Err(_) => {
+                if let Some(sink) = &state.storage.projection_observation_sink {
+                    sink.reject_binding();
+                }
+                tracing::warn!("native resolve observation context rejected");
+            }
         }
     }
 

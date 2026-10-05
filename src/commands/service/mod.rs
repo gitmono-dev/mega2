@@ -96,7 +96,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         .await
     };
 
-    match setup.await {
+    let result = match setup.await {
         Err(error) => cleanup_tail(Err(error), emitter, None, signal_forwarder).await,
         Ok(reload_watcher) => {
             let service = context.clone();
@@ -117,7 +117,16 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             )
             .await
         }
+    };
+    if let Some(sink) = &context.storage.projection_observation_sink {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        if sink.shutdown(deadline).await.is_err() && result.is_ok() {
+            return Err(MegaError::Other(
+                "typed projection writer did not drain successfully".into(),
+            ));
+        }
     }
+    result
 }
 
 /// Runs the service body under the unified cleanup tail (WH-13).
