@@ -11,6 +11,8 @@ use mst2_codec::treeframe::{ChunkPayload, EndPayload, MetaPayload, ObjectPayload
 
 use crate::ceres::snapshot::error::{SnapshotError, SnapshotErrorCode};
 
+pub const HTTP_FRAME_ENCODINGS: [&str; 1] = ["identity"];
+
 /// Negotiated per-request encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
@@ -19,6 +21,13 @@ pub enum Encoding {
 }
 
 impl Encoding {
+    /// Legacy clients may retain a zstd capability whose digest contract
+    /// differs. HTTP uses identity until raw-digest negotiation is explicit.
+    pub fn parse_http(s: &str) -> Result<Self, SnapshotError> {
+        Self::parse(s)?;
+        Ok(Self::Identity)
+    }
+
     pub fn parse(s: &str) -> Result<Self, SnapshotError> {
         match s {
             "identity" | "" => Ok(Encoding::Identity),
@@ -164,6 +173,44 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[test]
+    fn cached_legacy_zstd_requests_emit_byte_compatible_frames() {
+        let encoding = Encoding::parse_http("zstd").unwrap();
+        let mut stream = FrameStream::new(13, encoding);
+        let raw = vec![b'x'; 4096];
+        let content_id: [u8; 32] = Sha256::digest(&raw).into();
+        let page = mst2_codec::metapage::Page::build(&[]).unwrap();
+        let page_id = mst2_codec::metapage::page_id(&page);
+        let frames = [
+            stream.object(vec![(content_id, raw.clone())]).unwrap(),
+            stream.meta(vec![(page_id, page)]).unwrap(),
+            stream.chunk([6; 32], content_id, 0, raw).unwrap(),
+            stream.end(1, 1, 4096, [4; 32]),
+        ];
+        for (sequence, frame) in frames.iter().enumerate() {
+            assert_eq!(frame[7], 0, "legacy decoders require identity fallback");
+            assert_eq!(frame[32..64], Sha256::digest(&frame[HEADER_LEN..])[..]);
+            assert_eq!(
+                u64::from_le_bytes(frame[24..32].try_into().unwrap()),
+                sequence as u64
+            );
+        }
+        assert_eq!(
+            mst2_codec::treeframe::parse_stream(&frames.concat())
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            Encoding::parse_http("identity").unwrap(),
+            Encoding::Identity
+        );
+        assert_eq!(
+            Encoding::parse_http("gzip").unwrap_err().code,
+            SnapshotErrorCode::ScopeInvalid
+        );
+    }
 
     #[test]
     fn compressed_service_frames_commit_to_the_raw_payload() {

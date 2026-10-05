@@ -1,7 +1,7 @@
 //! Content transport handlers (spec 04 §9, spec 06, spec 07):
 //! HEAD blob, batched OBJECT frames, chunk-map descriptors/pages and CHUNK
-//! frames. Identity encoding only in this slice; zstd negotiation is a later
-//! WP and `frame_encodings` advertises identity alone.
+//! frames. HTTP emits identity during the raw-digest codec rollout, including
+//! fallback for older clients retaining a zstd capability.
 
 use axum::{
     Json,
@@ -190,7 +190,7 @@ pub(super) async fn objects(
     let encoding = req
         .encoding
         .as_deref()
-        .map(crate::ceres::snapshot::frame_stream::Encoding::parse)
+        .map(crate::ceres::snapshot::frame_stream::Encoding::parse_http)
         .transpose()
         .map_err(mst2_error_response)?
         .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
@@ -485,7 +485,7 @@ pub(super) async fn chunks(
     let encoding = req
         .encoding
         .as_deref()
-        .map(crate::ceres::snapshot::frame_stream::Encoding::parse)
+        .map(crate::ceres::snapshot::frame_stream::Encoding::parse_http)
         .transpose()
         .map_err(mst2_error_response)?
         .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
