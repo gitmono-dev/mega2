@@ -14,7 +14,7 @@ use futures::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{abs_view_path, internal, mst2_error_response};
+use super::{abs_view_path, internal, mst2_error_response, treeframe_response};
 use crate::ceres::snapshot::{
     chunks::{ChunkProjection, get_or_project},
     error::{SnapshotError, SnapshotErrorCode},
@@ -290,11 +290,7 @@ pub(super) async fn objects(
     );
     out.extend_from_slice(&end);
 
-    axum::response::Response::builder()
-        .header("content-type", "application/octet-stream")
-        .header("cache-control", "private, no-cache, no-transform")
-        .body(axum::body::Body::from(Bytes::from(out)))
-        .map_err(|e| mst2_error_response(internal(format!("body build failed: {e}"))))
+    treeframe_response(&snapshot_id, &body, out).map_err(mst2_error_response)
 }
 
 #[derive(Deserialize, Debug)]
@@ -589,11 +585,7 @@ pub(super) async fn chunks(
     );
     out.extend_from_slice(&end);
 
-    axum::response::Response::builder()
-        .header("content-type", "application/octet-stream")
-        .header("cache-control", "private, no-cache, no-transform")
-        .body(axum::body::Body::from(Bytes::from(out)))
-        .map_err(|e| mst2_error_response(internal(format!("body build failed: {e}"))))
+    treeframe_response(&snapshot_id, &body, out).map_err(mst2_error_response)
 }
 
 /// Strict decimal-string parse for unsigned counts (spec 04 §1: no leading

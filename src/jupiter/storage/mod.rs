@@ -125,6 +125,9 @@ impl AppService {
 #[derive(Clone)]
 pub struct Storage {
     pub(crate) app_service: Arc<AppService>,
+    /// Derived native projection memoization, scoped to this storage assembly.
+    /// Clones share it; independent databases/backends never share entries.
+    pub(crate) native_projection_cache: Arc<crate::ceres::snapshot::pages::NativeProjectionCache>,
     pub cl_service: CLService,
     pub push_queue_service: PushQueueService,
     pub artifact_service: ArtifactService,
@@ -280,6 +283,7 @@ impl Storage {
 
         Ok(Storage {
             app_service: app_service.into(),
+            native_projection_cache: Arc::default(),
             config_handle,
             config,
             cl_service: CLService::new(base.clone()),
@@ -562,6 +566,7 @@ impl Storage {
 
         Storage {
             app_service,
+            native_projection_cache: Arc::default(),
             // app_service: AppService::mock(),
             cl_service: CLService::mock(),
             push_queue_service: PushQueueService::new(
