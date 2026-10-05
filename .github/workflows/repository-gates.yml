@@ -1,0 +1,77 @@
+name: Repository gates
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository-gates-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux repository gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "1"
+      NO_PROXY: localhost,127.0.0.1,::1,host.docker.internal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo +nightly fmt --all --check
+
+      - name: Check all targets and features
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      - name: Build tests
+        run: cargo build --tests
+
+      - name: Start isolated test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/lib/mega2-it.sh
+          mega2_it_ensure_env_test
+          mega2_it_prepare_git_workdir
+          docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git \
+            up -d --build --wait postgres redis rustfs rustfs-init git-cli
+
+      - name: Run repository tests with test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .env.test
+          export no_proxy="$NO_PROXY"
+          cargo test --all
+
+      - name: Stop isolated test dependencies
+        if: always()
+        run: docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git down -v
