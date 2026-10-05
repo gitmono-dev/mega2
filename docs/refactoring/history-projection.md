@@ -715,7 +715,7 @@ fn filter_tree(F, T) -> Result<TreeId, MissingObject>:
         Chain(fs)  => try_fold(fs, T, filter_tree)?
     return Ok(r)
 ```
-**空树规范（冻结进 v1）【决策】**，与 Josh 一致【代码】：Josh `tree.rs::replace_child_inner` 中有 `remove = oid == null || oid == empty_id()`，`subtract_inner` 在结果为空时删除整个条目。规则如下：
+**空树规范（冻结进 v1）【决策】**，与 Josh 一致（被重写层的兄弟空树条目除外，见 §7.3 R8）【代码】：Josh `tree.rs::replace_child_inner` 中有 `remove = oid == null || oid == empty_id()`，`subtract_inner` 在结果为空时删除整个条目。规则如下：
 - 任何新建的 tree 都不写入指向 EMPTY_TREE 的条目。某一层在删除或替换之后没有条目了，该层的结果就是 EMPTY_TREE，同时在父层删掉对应条目，逐级向上传递。
 - `Prefix(p)` 作用于 EMPTY_TREE 时，结果是 EMPTY_TREE。
 - `Exclude(S)` 删掉命中的条目后，按上一条剪掉被删空的祖先目录；根被删空时返回 EMPTY_TREE。
@@ -1377,7 +1377,7 @@ P1 的清扫周期，以及闲置阈值 `idle_recycle_secs`（下界为 2T = 720
 | R5 投影滞后 | 只读视图是最终一致的 | 未就绪返回 503；有界同步追赶；补偿任务；指标 `view_projection_lag_commits` |
 | R6 表膨胀与 GC | 见 7.2 | 游程映射；注册上限；按 `last_access_at` 加引用不变式回收，带宽限期；可选不持久化提交字节 |
 | R7 根提交作者可读性差 | 产品写 API、review 合并、attach 的作者仍是 mega 身份 | 为 L0 写入者另立 ADR，不阻塞本设计 |
-| R8 与 Josh 的语义差异 | Compose 不相交判定偏保守；规范化不完备；签名默认删除，且同时删除 gpgsig-sha256；不移植 nop 恒等；L0 含空子树条目时，中间级空根规则无法复现 | 在文档中写明；对应的 Josh 用例改成负向测试，或者不移植 |
+| R8 与 Josh 的语义差异 | Compose 不相交判定偏保守；规范化不完备；签名默认删除，且同时删除 gpgsig-sha256；不移植 nop 恒等；L0 含空子树条目时，中间级空根规则无法复现；被重写的祖先 tree 不保留指向 EMPTY_TREE 的兄弟条目，Josh（`tree.rs::seed_entries`）原样保留 | 在文档中写明；对应的 Josh 用例改成负向测试，或者不移植 |
 | R9 越权写入（P2） | Exclude 逆运算、同名覆盖、值域外内容、import 命名空间、根级文件、root_dirs 白名单、源路径删除 | 2.5 的更正；可推送视图的约束；2.7 的三项校验；按每个源路径授权；默认不允许匿名推送 |
 | R10 推送后客户端分叉（P2） | 视图推送不能往返恒等 | sideband 对齐提示（ADR-TP-18）；可推送视图的 advertise 读到自己的写入；Libra 侧提示 reset |
 | R11 根链非线性或不连续 | 遗留数据、review 形态的根路径 CL 合并、根 ref 被人工回滚 | 只支持 trunk；建链和扩展时都校验，一旦发现就停下、返回 503 并告警；附录 E 留到 P2。合法的长滞后不算不连续：回走预算用尽只返回"未追上"，由暂存表续扫（3.3） |
