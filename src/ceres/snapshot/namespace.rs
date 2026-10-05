@@ -399,3 +399,7 @@ fn validate_entry_name(name: &str) -> Result<(), NamespaceError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "namespace/tests.rs"]
+mod tests;

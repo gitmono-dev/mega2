@@ -5,7 +5,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use mega2_core::ceres::snapshot::{
+use tempfile::TempDir;
+
+use crate::ceres::snapshot::{
     error::{SnapshotError, SnapshotErrorCode},
     namespace::{
         BindingPolicy, FixedBinding, FixedNamespaceIndex, FixedSourceReader, NamespaceError,
@@ -13,7 +15,6 @@ use mega2_core::ceres::snapshot::{
     },
     resolver::FsKind,
 };
-use tempfile::TempDir;
 
 #[derive(Default)]
 struct MemoryReader {
