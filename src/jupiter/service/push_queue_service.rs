@@ -1381,7 +1381,8 @@ impl PushQueueService {
             let ctx = push_ctx.ok_or_else(|| {
                 MegaError::Other("native publication requires the real push writer".into())
             })?;
-            let Some(instance) = ctx.storage.config().mst2.instance_uuid.as_deref() else {
+            let config = ctx.storage.config();
+            let Some(instance) = config.mst2.instance_uuid.as_deref() else {
                 return self
                     .b3_fail_merge(
                         txn,

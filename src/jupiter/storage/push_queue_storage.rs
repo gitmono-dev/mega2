@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     callisto::{
-        authz_notify_outbox, mega_refs, push_queue, queue_control,
+        authz_notify_outbox, push_queue, queue_control,
         sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
     },
     common::{errors::MegaError, utils::MEGA_BRANCH_NAME},
@@ -1414,9 +1414,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::jupiter::{
-        migration::apply_migrations, storage::base_storage::StorageConnector,
-        tests::test_db_connection,
+    use crate::{
+        callisto::mega_refs,
+        jupiter::{
+            migration::apply_migrations, storage::base_storage::StorageConnector,
+            tests::test_db_connection,
+        },
     };
 
     async fn storage() -> (tempfile::TempDir, PushQueueStorage) {

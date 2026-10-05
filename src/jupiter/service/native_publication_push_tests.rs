@@ -1,11 +1,10 @@
-use super::*;
-
 use bytes::Bytes;
 
 use crate::callisto::{
     mst2_native_head, mst2_native_publication, mst2_publication, mst2_publication_outbox,
 };
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Statement};
+use crate::jupiter::utils::converter::FromMegaModel;
 
 const NATIVE_INSTANCE: &str = "6ab219b0-4275-45ba-9d7b-7b0b633018cd";
 
