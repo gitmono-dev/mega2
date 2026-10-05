@@ -17,12 +17,19 @@ use crate::{
 pub mod http;
 pub mod init;
 pub mod multi;
+pub mod native_publication_init;
 pub mod ssh;
 
 const CONFIG_RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn cli() -> Command {
-    let subcommands = vec![init::cli(), http::cli(), ssh::cli(), multi::cli()];
+    let subcommands = vec![
+        init::cli(),
+        native_publication_init::cli(),
+        http::cli(),
+        ssh::cli(),
+        multi::cli(),
+    ];
     Command::new("service")
         .about("Start different kinds of server: for example https or ssh")
         .subcommands(subcommands)
@@ -30,6 +37,9 @@ pub fn cli() -> Command {
 
 #[tokio::main]
 pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    if let Some(("native-publication-init", subcommand_args)) = args.subcommand() {
+        return native_publication_init::exec(ctx, subcommand_args).await;
+    }
     let config_path = ctx.config_path.clone();
     let config_profile_path = ctx.config_profile_path.clone();
     let config = require_config(ctx, "service")?;
@@ -256,7 +266,10 @@ mod tests {
             .map(|cmd| cmd.get_name().to_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["init", "http", "ssh", "multi"]);
+        assert_eq!(
+            names,
+            vec!["init", "native-publication-init", "http", "ssh", "multi"]
+        );
     }
 
     #[test]

@@ -376,3 +376,363 @@ pub(super) fn crash_checkpoint(phase: &str) {
         panic!("SIGKILL did not terminate the native worker");
     }
 }
+
+async fn maintenance_fixture() -> (tempfile::TempDir, MonoStorage, PushQueueStorage, NativeRoot) {
+    let (temp, mono, queue) = fixture().await;
+    mono.get_connection()
+        .execute_unprepared("DELETE FROM mst2_native_head")
+        .await
+        .unwrap();
+    queue
+        .set_control_flags(Some(true), None, None)
+        .await
+        .unwrap();
+    let tree = git_internal::internal::object::tree::Tree::from_tree_items(vec![]).unwrap();
+    let commit = git_internal::internal::object::commit::Commit::from_tree_id(
+        tree.id,
+        vec![],
+        "maintenance root",
+    );
+    mono.save_mega_trees(vec![tree.clone()], commit.id, None)
+        .await
+        .unwrap();
+    mono.save_mega_commits(vec![commit.clone()], None)
+        .await
+        .unwrap();
+    let root = NativeRoot {
+        commit: commit.id.to_string(),
+        tree: tree.id.to_string(),
+    };
+    mono.get_connection().execute_raw(Statement::from_sql_and_values(
+        mono.get_connection().get_database_backend(),
+        "UPDATE mega_refs SET ref_commit_hash=$1,ref_tree_hash=$2 WHERE path='/' AND ref_name=$3 AND is_cl=false",
+        [root.commit.clone().into(), root.tree.clone().into(), MEGA_BRANCH_NAME.into()],
+    )).await.unwrap();
+    (temp, mono, queue, root)
+}
+
+async fn assert_no_maintenance_head(mono: &MonoStorage) {
+    assert_eq!(
+        mst2_native_head::Entity::find()
+            .count(mono.get_connection())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        mst2_native_publication::Entity::find()
+            .count(mono.get_connection())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        mst2_publication_outbox::Entity::find()
+            .count(mono.get_connection())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn maintenance_initializes_only_a_floor_and_preserves_the_paused_gate() {
+    let (_temp, mono, queue, root) = maintenance_fixture().await;
+    mono.get_connection()
+        .execute_unprepared(
+            "INSERT INTO mst2_namespace_seq(namespace,sequence,epoch) VALUES('/older',23,1)",
+        )
+        .await
+        .unwrap();
+    mono.initialize_native_publication_for_maintenance(INSTANCE, &root)
+        .await
+        .unwrap();
+    let before = mst2_native_head::Entity::find()
+        .one(mono.get_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.instance_id, INSTANCE);
+    assert_eq!(before.sequence, 23);
+    assert_eq!(before.writer_epoch, 1);
+    assert_eq!(
+        (&before.root_commit, &before.root_tree),
+        (&root.commit, &root.tree)
+    );
+    assert_eq!(before.state, "INITIALIZING");
+    assert_eq!(before.certificate_receipt_id, None);
+    assert!(queue.get_control().await.unwrap().paused);
+    assert!(mono.read_native_publication_head(INSTANCE).await.is_err());
+    assert!(
+        mono.initialize_native_publication_for_maintenance(INSTANCE, &root)
+            .await
+            .is_err()
+    );
+    assert!(
+        mono.initialize_native_publication_for_maintenance(
+            "11111111-2222-4333-8444-555555555555",
+            &root
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        mst2_native_head::Entity::find()
+            .one(mono.get_connection())
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        selected_ref(mono.get_connection(), "/").await.unwrap(),
+        Some(root)
+    );
+    assert_eq!(
+        mst2_native_publication::Entity::find()
+            .count(mono.get_connection())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        mst2_publication_outbox::Entity::find()
+            .count(mono.get_connection())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn maintenance_rejects_unpaused_missing_or_hard_stopped_control_without_writes() {
+    for state in ["unpaused", "missing", "hard-stopped"] {
+        let (_temp, mono, queue, root) = maintenance_fixture().await;
+        match state {
+            "unpaused" => queue
+                .set_control_flags(Some(false), None, None)
+                .await
+                .unwrap(),
+            "hard-stopped" => queue
+                .set_control_flags(None, Some(true), None)
+                .await
+                .unwrap(),
+            "missing" => {
+                mono.get_connection()
+                    .execute_unprepared("DELETE FROM queue_control")
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            mono.initialize_native_publication_for_maintenance(INSTANCE, &root)
+                .await
+                .is_err(),
+            "{state}"
+        );
+        assert_no_maintenance_head(&mono).await;
+        let control = crate::callisto::queue_control::Entity::find()
+            .one(mono.get_connection())
+            .await
+            .unwrap();
+        match state {
+            "missing" => assert!(control.is_none()),
+            "hard-stopped" => assert!(control.unwrap().hard_stopped),
+            _ => assert!(!control.unwrap().paused),
+        }
+    }
+}
+
+#[tokio::test]
+async fn maintenance_refuses_queued_and_running_work_until_drained() {
+    for status in ["Queued", "Running"] {
+        let (_temp, mono, queue, root) = maintenance_fixture().await;
+        queue
+            .set_control_flags(Some(false), None, None)
+            .await
+            .unwrap();
+        let EnqueueOutcome::Inserted { id } = queue
+            .enqueue_atomic(EnqueueParams {
+                kind: PushQueueKindEnum::Push,
+                operation_id: "maintenance-pending",
+                path: "/project",
+                old_id: &"c".repeat(40),
+                new_id: &"e".repeat(40),
+                requester: None,
+                payload: serde_json::json!({"n":1,"commits":["e".repeat(40)]}),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("fresh pending operation");
+        };
+        mono.get_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                mono.get_connection().get_database_backend(),
+                "UPDATE push_queue SET status=$1::push_queue_status_enum WHERE id=$2",
+                [status.into(), id.into()],
+            ))
+            .await
+            .unwrap();
+        queue
+            .set_control_flags(Some(true), None, None)
+            .await
+            .unwrap();
+        assert!(
+            mono.initialize_native_publication_for_maintenance(INSTANCE, &root)
+                .await
+                .is_err(),
+            "{status}"
+        );
+        assert_no_maintenance_head(&mono).await;
+        assert!(queue.get_control().await.unwrap().paused);
+    }
+}
+
+#[tokio::test]
+async fn maintenance_refuses_busy_writer_or_admission_locks_and_can_retry() {
+    for lock in ["writer", "admission"] {
+        let (_temp, mono, _queue, root) = maintenance_fixture().await;
+        let other = mono.get_connection().begin().await.unwrap();
+        if lock == "writer" {
+            PushQueueStorage::acquire_mono_write_lock(&other)
+                .await
+                .unwrap();
+        } else {
+            other
+                .execute_unprepared("SELECT id FROM queue_control WHERE id=1 FOR UPDATE")
+                .await
+                .unwrap();
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mono.initialize_native_publication_for_maintenance(INSTANCE, &root),
+        )
+        .await;
+        assert!(
+            result
+                .expect("maintenance lock refusal must be bounded")
+                .is_err(),
+            "{lock}"
+        );
+        assert_no_maintenance_head(&mono).await;
+        other.rollback().await.unwrap();
+        mono.initialize_native_publication_for_maintenance(INSTANCE, &root)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn maintenance_rejects_wrong_or_ambiguous_root_and_invalid_counters() {
+    for damage in [
+        "commit",
+        "tree",
+        "missing",
+        "ambiguous",
+        "negative",
+        "exhausted",
+    ] {
+        let (_temp, mono, _queue, mut root) = maintenance_fixture().await;
+        match damage {
+            "commit" => root.commit = "e".repeat(40),
+            "tree" => root.tree = "e".repeat(40),
+            "missing" => {
+                mono.get_connection()
+                    .execute_unprepared("DELETE FROM mega_refs WHERE path='/'")
+                    .await
+                    .unwrap();
+            }
+            "ambiguous" => {
+                // Simulate a corrupted/old schema, independently of the normal
+                // uniqueness protection on selected refs.
+                mono.get_connection()
+                    .execute_unprepared("DROP INDEX uniq_mref_path")
+                    .await
+                    .unwrap();
+                mono.get_connection().execute_unprepared("INSERT INTO mega_refs(id,path,ref_name,ref_commit_hash,ref_tree_hash,created_at,updated_at,is_cl) SELECT 3,path,ref_name,ref_commit_hash,ref_tree_hash,created_at,updated_at,is_cl FROM mega_refs WHERE path='/'").await.unwrap();
+            }
+            "negative" | "exhausted" => {
+                let floor = if damage == "negative" {
+                    -1_i64
+                } else {
+                    i64::MAX
+                };
+                mono.get_connection().execute_raw(Statement::from_sql_and_values(
+                    mono.get_connection().get_database_backend(),
+                    "INSERT INTO mst2_namespace_seq(namespace,sequence,epoch) VALUES('/older',$1,1)", [floor.into()],
+                )).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            mono.initialize_native_publication_for_maintenance(INSTANCE, &root)
+                .await
+                .is_err(),
+            "{damage}"
+        );
+        assert_no_maintenance_head(&mono).await;
+    }
+}
+
+#[tokio::test]
+async fn maintenance_rejects_nil_instance_and_non_sha1_expected_roots() {
+    let (_temp, mono, _queue, root) = maintenance_fixture().await;
+    for instance in ["invalid", "00000000-0000-0000-0000-000000000000"] {
+        assert!(
+            mono.initialize_native_publication_for_maintenance(instance, &root)
+                .await
+                .is_err()
+        );
+    }
+    for commit in ["a".repeat(64), "A".repeat(40)] {
+        let wrong = NativeRoot {
+            commit,
+            tree: root.tree.clone(),
+        };
+        assert!(
+            mono.initialize_native_publication_for_maintenance(INSTANCE, &wrong)
+                .await
+                .is_err()
+        );
+    }
+    assert_no_maintenance_head(&mono).await;
+}
+
+#[tokio::test]
+async fn maintenance_refuses_missing_commit_tree_or_a_mismatched_commit_tree() {
+    for damage in ["commit", "tree", "wrong-tree"] {
+        let (_temp, mono, _queue, root) = maintenance_fixture().await;
+        let sql = match damage {
+            "commit" => "DELETE FROM mega_commit WHERE commit_id=$1",
+            "tree" => "DELETE FROM mega_tree WHERE tree_id=$1",
+            "wrong-tree" => "UPDATE mega_commit SET tree=repeat('e',40) WHERE commit_id=$1",
+            _ => unreachable!(),
+        };
+        let id = if damage == "tree" {
+            &root.tree
+        } else {
+            &root.commit
+        };
+        mono.get_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                mono.get_connection().get_database_backend(),
+                sql,
+                [id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            mono.initialize_native_publication_for_maintenance(INSTANCE, &root)
+                .await
+                .is_err(),
+            "{damage}"
+        );
+        assert_no_maintenance_head(&mono).await;
+        assert_eq!(
+            selected_ref(mono.get_connection(), "/").await.unwrap(),
+            Some(root)
+        );
+    }
+}
