@@ -762,18 +762,26 @@ async fn noop_reservation_cannot_move_to_another_transaction() {
 async fn migration_preserves_legacy_receipts_and_validates_digest_columns() {
     let temp = tempfile::tempdir().unwrap();
     let db = test_db_connection(temp.path()).await;
-    let old_count = u32::try_from(Migrator::migrations().len() - 1).unwrap();
+    let migrations = Migrator::migrations();
+    let receipt_at = migrations
+        .iter()
+        .position(|migration| {
+            migration.name() == "m20261005_000100_add_mst2_publication_request_digest"
+        })
+        .expect("publication receipt migration registered");
+    let old_count = u32::try_from(receipt_at).unwrap();
     Migrator::up(&db, Some(old_count)).await.unwrap();
     db.execute_unprepared(
         "INSERT INTO mst2_publication (operation_id, namespace, sequence, old_oid, new_oid, writer_epoch, writer_kind, created_at) \
          VALUES ('legacy', '/', 1, 'a', 'b', 1, 'test', now())"
     ).await.unwrap();
     apply_migrations(&db, false).await.unwrap();
-    let latest = Migrator::migrations().pop().unwrap();
-    latest
-        .up(&sea_orm_migration::SchemaManager::new(&db))
+    let txn = db.begin().await.unwrap();
+    migrations[receipt_at]
+        .up(&sea_orm_migration::SchemaManager::new(&txn))
         .await
         .unwrap();
+    txn.commit().await.unwrap();
     let legacy = mst2_publication::Entity::find()
         .one(&db)
         .await
