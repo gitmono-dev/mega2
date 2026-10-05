@@ -268,7 +268,25 @@ impl MonoStorage {
         &self,
         instance: &str,
     ) -> Result<NativePublicationHead, PublicationReceiptError> {
-        let observation = observe(self.get_connection()).await?;
+        self.read_native_publication_head_on(self.get_connection(), instance)
+            .await
+    }
+
+    pub(super) async fn read_native_publication_head_in_txn(
+        &self,
+        transaction: &DatabaseTransaction,
+        instance: &str,
+    ) -> Result<NativePublicationHead, PublicationReceiptError> {
+        self.read_native_publication_head_on(transaction, instance)
+            .await
+    }
+
+    async fn read_native_publication_head_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        instance: &str,
+    ) -> Result<NativePublicationHead, PublicationReceiptError> {
+        let observation = observe(connection).await?;
         let head = observation
             .head
             .ok_or_else(|| integrity("native publication is not initialized"))?;
