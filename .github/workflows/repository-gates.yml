@@ -24,7 +24,6 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       RUST_BACKTRACE: "1"
       NO_PROXY: localhost,127.0.0.1,::1,host.docker.internal
-      no_proxy: localhost,127.0.0.1,::1,host.docker.internal
     steps:
       - uses: actions/checkout@v4
 
@@ -70,6 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           source .env.test
+          export no_proxy="$NO_PROXY"
           cargo test --all
 
       - name: Stop isolated test dependencies
