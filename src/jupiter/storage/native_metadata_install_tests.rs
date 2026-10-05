@@ -827,23 +827,23 @@ async fn native_metadata_stored_identity_and_plan_tampering_fail_closed_on_resta
 }
 
 #[derive(Clone, Copy)]
-enum Fault {
+pub(in crate::jupiter::storage) enum Fault {
     BeforeCommit,
     AfterCommit,
     PrepareRead,
 }
 
-struct PgCommitFaultProxy {
-    url: String,
-    armed: Arc<AtomicBool>,
+pub(in crate::jupiter::storage) struct PgCommitFaultProxy {
+    pub(in crate::jupiter::storage) url: String,
+    pub(in crate::jupiter::storage) armed: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
-    commit_observed: Arc<AtomicBool>,
+    pub(in crate::jupiter::storage) commit_observed: Arc<AtomicBool>,
     changed: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
 impl PgCommitFaultProxy {
-    async fn start(original: &str, fault: Fault) -> Self {
+    pub(in crate::jupiter::storage) async fn start(original: &str, fault: Fault) -> Self {
         let mut url = url::Url::parse(original).unwrap();
         let host = url.host_str().unwrap().to_owned();
         let port = url.port().unwrap_or(5432);
@@ -893,7 +893,7 @@ impl PgCommitFaultProxy {
             task,
         }
     }
-    async fn wait_for_fault(&self) {
+    pub(in crate::jupiter::storage) async fn wait_for_fault(&self) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let changed = self.changed.notified();

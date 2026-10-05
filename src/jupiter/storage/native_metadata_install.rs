@@ -834,4 +834,4 @@ fn unavailable(message: &str) -> SnapshotError {
 
 #[cfg(test)]
 #[path = "native_metadata_install_tests.rs"]
-mod tests;
+pub(super) mod tests;

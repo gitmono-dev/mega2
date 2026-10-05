@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
 use mst2_codec::metapage::{Entry, EntryKind, Page, page_id};
 use sea_orm::Database;
@@ -12,6 +15,7 @@ use crate::{
     },
     jupiter::{
         migration::Migrator,
+        storage::native_metadata_install::tests::{Fault, PgCommitFaultProxy},
         tests::{TestSchemaGuard, test_db_config},
     },
 };
@@ -23,6 +27,199 @@ async fn fixture() -> (DatabaseConnection, DatabaseConnection, TestSchemaGuard) 
     Migrator::up(&first, None).await.unwrap();
     let second = Database::connect(config.db_url).await.unwrap();
     (first, second, schema)
+}
+
+async fn actual_commit_fault(fault: Fault) {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (config, _schema) = test_db_config(temp.path()).await;
+    let direct = Database::connect(config.db_url.clone()).await.unwrap();
+    Migrator::up(&direct, None).await.unwrap();
+    let (_direct_ledger, handoff, _receipt) = handoff(&direct, "fault-prepare", 1).await;
+    let access = access(&direct).await;
+    let proxy = PgCommitFaultProxy::start(&config.db_url, fault).await;
+    let mut options = sea_orm::ConnectOptions::new(proxy.url.clone());
+    options.max_connections(1).min_connections(1);
+    let connection = Database::connect(options).await.unwrap();
+    let ledger = PostgresMetadataLeaseRepository::new(connection)
+        .await
+        .unwrap();
+    let digest = operation_digest("fault-consume", &handoff, &access, 60_000).unwrap();
+    proxy.armed.store(true, Ordering::SeqCst);
+    assert!(
+        matches!(ledger.consume("fault-consume",&handoff,&access,60_000).await.unwrap_err(),
+        MetadataLeaseError::CommitUncertain { operation_id,operation_digest } if operation_id=="fault-consume" && operation_digest==digest)
+    );
+    proxy.wait_for_fault().await;
+    let observed = ledger
+        .inspect_operation(&direct, "fault-consume", digest)
+        .await
+        .unwrap();
+    let restarted = PostgresMetadataLeaseRepository::new(direct.clone())
+        .await
+        .unwrap();
+    match fault {
+        Fault::BeforeCommit => {
+            assert!(!proxy.commit_observed.load(Ordering::SeqCst));
+            assert_eq!(observed, MetadataLeaseObservation::Absent);
+            assert_eq!(count(&direct, "mst2_metadata_lease").await, 0);
+            let state: String = direct
+                .query_one_raw(statement("SELECT state FROM mst2_metadata_prepare", []))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get_by_index(0)
+                .unwrap();
+            assert_eq!(state, "COMMITTED");
+            assert_eq!(count(&direct, "mst2_retention_root").await, 2);
+            restarted
+                .consume("fault-consume", &handoff, &access, 60_000)
+                .await
+                .unwrap();
+        }
+        Fault::AfterCommit => {
+            assert!(proxy.commit_observed.load(Ordering::SeqCst));
+            let original = match observed {
+                MetadataLeaseObservation::Committed { event, state, .. } => {
+                    assert_eq!(state, "ACTIVE");
+                    *event
+                }
+                _ => panic!("actual COMMIT response loss must recover its event"),
+            };
+            let replay = restarted
+                .consume("fault-consume", &handoff, &access, 60_000)
+                .await
+                .unwrap();
+            assert_eq!(replay, original);
+            assert_eq!(count(&direct, "mst2_metadata_prepare_consumption").await, 1);
+            assert_eq!(count(&direct, "mst2_metadata_lease_operation").await, 1);
+        }
+        Fault::PrepareRead => panic!("query failure is not a COMMIT fault"),
+    }
+    assert_eq!(count(&direct, "mst2_metadata_lease").await, 1);
+    assert_eq!(count(&direct, "mst2_retention_root").await, 2);
+    assert_eq!(count(&direct, "mst2_retention_edge").await, 1);
+}
+
+#[tokio::test]
+async fn metadata_lease_actual_disconnect_before_commit_keeps_prepare_until_recovery() {
+    actual_commit_fault(Fault::BeforeCommit).await;
+}
+
+#[tokio::test]
+async fn metadata_lease_actual_commit_reply_loss_recovers_one_consumed_event_without_recount() {
+    actual_commit_fault(Fault::AfterCommit).await;
+}
+
+#[tokio::test]
+async fn metadata_lease_clock_is_sampled_after_actual_retention_barrier_wait() {
+    let (first, second, _schema) = fixture().await;
+    let (ledger, handoff, _receipt) = handoff(&first, "clock-prepare", 1).await;
+    let access = access(&first).await;
+    let blocked_ledger = PostgresMetadataLeaseRepository::new(second.clone())
+        .await
+        .unwrap();
+    let blocker = ledger.install.transaction().await.unwrap();
+    ledger.install.barrier(&blocker).await.unwrap();
+    let worker = tokio::spawn(async move {
+        blocked_ledger
+            .consume("clock-consume", &handoff, &access, 1000)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3),async {
+        loop {
+            let waiting:bool=first.query_one_raw(statement(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid
+                 WHERE l.locktype='advisory' AND NOT l.granted AND a.datname=current_database()
+                 AND l.classid::bigint=$1 AND l.objid::bigint=(hashtext(current_schema())::bigint & 4294967295)
+                 AND a.query LIKE '%pg_advisory_xact_lock%')",[super::super::mst2_retention::RETENTION_LOCK_KEY.into()]
+            )).await.unwrap().unwrap().try_get_by_index(0).unwrap();
+            if waiting {break;}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    // Real lock wait exceeds the requested lease lifetime; transaction-start
+    // now() would issue an already-expired lease in this exact schedule.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let released_at = clock_after_lock(&blocker).await.unwrap();
+    blocker.rollback().await.unwrap();
+    let receipt = worker.await.unwrap().unwrap();
+    assert!(receipt.expires_at_ms() >= released_at + 1000);
+    assert_eq!(count(&first, "mst2_metadata_lease").await, 1);
+}
+
+#[tokio::test]
+async fn metadata_lease_corrupted_catalog_and_consumption_fail_closed_without_repair() {
+    let (first, second, _schema) = fixture().await;
+    let (ledger, handoff, _receipt) = handoff(&first, "corruption-prepare", 1).await;
+    let access = access(&first).await;
+    let receipt = ledger
+        .consume("corruption-consume", &handoff, &access, 60_000)
+        .await
+        .unwrap();
+    // Actual SQL bypass is confined to this isolated schema; production
+    // immutable triggers are restored before recovery observes corruption.
+    first.execute_unprepared("ALTER TABLE mst2_metadata_catalog DISABLE TRIGGER mst2_metadata_catalog_immutable;
+        UPDATE mst2_metadata_catalog SET tagged_root_commit_oid='sha1:cccccccccccccccccccccccccccccccccccccccc';
+        ALTER TABLE mst2_metadata_catalog ENABLE TRIGGER mst2_metadata_catalog_immutable;").await.unwrap();
+    assert_eq!(
+        rejection(
+            ledger
+                .inspect_operation(&second, receipt.operation_id(), receipt.operation_digest())
+                .await
+                .unwrap_err()
+        ),
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(
+        rejection(
+            ledger
+                .consume("corruption-consume", &handoff, &access, 60_000)
+                .await
+                .unwrap_err()
+        ),
+        SnapshotErrorCode::IntegrityError
+    );
+    first
+        .execute_raw(statement(
+            "ALTER TABLE mst2_metadata_catalog DISABLE TRIGGER mst2_metadata_catalog_immutable",
+            [],
+        ))
+        .await
+        .unwrap();
+    first
+        .execute_raw(statement(
+            "UPDATE mst2_metadata_catalog SET tagged_root_commit_oid=$1",
+            [handoff.binding.tagged_root_commit_oid.clone().into()],
+        ))
+        .await
+        .unwrap();
+    first.execute_unprepared("ALTER TABLE mst2_metadata_catalog ENABLE TRIGGER mst2_metadata_catalog_immutable;
+        ALTER TABLE mst2_metadata_prepare_consumption DISABLE TRIGGER mst2_metadata_consumption_immutable;
+        UPDATE mst2_metadata_prepare_consumption SET install_digest=decode(repeat('00',32),'hex');
+        ALTER TABLE mst2_metadata_prepare_consumption ENABLE TRIGGER mst2_metadata_consumption_immutable;").await.unwrap();
+    assert_eq!(
+        rejection(
+            ledger
+                .inspect_operation(&second, receipt.operation_id(), receipt.operation_digest())
+                .await
+                .unwrap_err()
+        ),
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(count(&second, "mst2_retention_root").await, 2);
+    assert_eq!(count(&second, "mst2_retention_edge").await, 1);
+    assert_eq!(count(&second, "mst2_metadata_lease").await, 1);
+    let still_bad: Vec<u8> = second
+        .query_one_raw(statement(
+            "SELECT install_digest FROM mst2_metadata_prepare_consumption",
+            [],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(still_bad, [0; 32]);
 }
 
 fn prepared() -> PreparedNativeMetadataRetention {
