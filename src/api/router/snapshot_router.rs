@@ -15,6 +15,7 @@ use axum::{
 };
 use base64::Engine;
 use bytes::Bytes;
+use git_internal::hash::{ObjectHash, get_hash_kind};
 use mst2_codec::descriptor;
 use request::Mst2Bytes;
 use serde::Deserialize;
@@ -26,7 +27,11 @@ use crate::{
     ceres::snapshot::{
         descriptor::build as build_descriptor,
         error::{SnapshotError, SnapshotErrorCode},
-        pages::{WalkOutcome, base64_of, build_directory_page, hex_of, proof_pages, resolve_abs},
+        pages::{
+            WalkOutcome, base64_of, build_directory_page, build_directory_page_with_work, hex_of,
+            proof_pages, resolve_abs,
+        },
+        projection_observation::{NativeResolveSource, ResolvedProjection},
         runtime::{now_unix, runtime},
         view::{SnapshotView, validate_scope_relative_path},
     },
@@ -423,6 +428,7 @@ async fn resolve(
     })?;
 
     let config = state.storage.config();
+    let mut native_source = None;
     let (commit_oid, tree_oid, sequence, writer_epoch) = if config.mst2.publication_enabled {
         let Some(instance) = config.mst2.instance_uuid.as_deref() else {
             return Err(mst2_error_response(SnapshotError::new(
@@ -442,6 +448,34 @@ async fn resolve(
                     "native publication is not ready",
                 ))
             })?;
+        let observation_source = ObjectHash::from_hex_for_kind(get_hash_kind(), &head.root.commit)
+            .and_then(|commit| {
+                ObjectHash::from_hex_for_kind(get_hash_kind(), &head.root.tree)
+                    .map(|tree| (commit, tree))
+            })
+            .map_err(|_| {
+                SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "invalid fixed native source identity",
+                )
+            })
+            .and_then(|(commit, tree)| {
+                NativeResolveSource::capture(
+                    &head.instance_id,
+                    commit,
+                    tree,
+                    head.token.certificate,
+                    head.token.epoch,
+                    head.token.sequence,
+                )
+            });
+        native_source = match observation_source {
+            Ok(source) => Some(source),
+            Err(_) => {
+                tracing::warn!("native resolve observation source rejected");
+                None
+            }
+        };
         (
             head.root.commit,
             head.root.tree,
@@ -498,15 +532,39 @@ async fn resolve(
         .map_err(internal)?;
     // The scope root doubles as metadata_root; building it also validates
     // that the scope exists and is a directory in this view.
-    let scope_page = build_directory_page(handler.as_ref(), &root_tree, &req.scope)
-        .await
-        .map_err(mst2_error_response)?;
+    let projection_started = std::time::Instant::now();
+    let (scope_page, projection_work) =
+        build_directory_page_with_work(handler.as_ref(), &root_tree, &req.scope)
+            .await
+            .map_err(mst2_error_response)?;
+    let projection_elapsed = projection_started.elapsed();
 
     let built = build_descriptor(&config.mst2, &view, &req.scope, scope_page.page_id)
         .map_err(mst2_error_response)?;
     let ctx = runtime()
         .insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds)
         .map_err(mst2_error_response)?;
+
+    if let Some(source) = native_source {
+        let request_id = current_request_id();
+        match source.observe(
+            ResolvedProjection {
+                descriptor: &ctx.built.descriptor,
+                snapshot_id: &ctx.built.snapshot_id,
+                metadata_root: &ctx.built.metadata_root,
+                context_commit: &ctx.commit_oid,
+                context_root_tree: &ctx.root_tree_oid,
+                fixed_root_tree: root_tree.id,
+                requested_scope: &req.scope,
+                request_id: &request_id,
+            },
+            projection_work,
+            projection_elapsed,
+        ) {
+            Ok(observation) => observation.emit(),
+            Err(_) => tracing::warn!("native resolve observation context rejected"),
+        }
+    }
 
     let body = json!({
         "descriptor": descriptor_json(&built),

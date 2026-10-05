@@ -8,6 +8,7 @@ pub mod descriptor;
 pub mod error;
 pub mod frame_stream;
 pub mod pages;
+pub(crate) mod projection_observation;
 pub mod publication;
 pub mod resolver;
 pub mod retention;

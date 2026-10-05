@@ -23,11 +23,13 @@ use mst2_codec::{
 use sea_orm::ActiveValue::Set;
 use sha2::{Digest, Sha256};
 
+pub use crate::ceres::snapshot::projection_observation::ProjectionWork;
 use crate::{
     ceres::{
         api_service::ApiHandler,
         snapshot::{
             error::{SnapshotError, SnapshotErrorCode},
+            projection_observation::NATIVE_PROJECTION_REVISION,
             resolver::FsKind,
             retention_dag::{MetadataDagBuilder, MetadataDagLimits, ValidatedMetadataDag},
             view::hex,
@@ -82,28 +84,6 @@ impl DescendantPathBudget {
     }
 }
 
-/// Actual work in one on-demand native projection. These are memoization
-/// counters, not durable publication or retention accounting. Page counters
-/// cover returned directory-root pages only: the codec does not expose the
-/// radix pages it internally encodes while building a root.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProjectionWork {
-    pub directories_rebuilt: u64,
-    pub reused_subtree_roots: u64,
-    pub directory_root_pages_built: u64,
-    pub directory_root_page_bytes_built: u64,
-    pub directory_root_pages_reused: u64,
-    pub directory_root_page_bytes_reused: u64,
-    pub directory_entries_scanned: u64,
-    pub scope_path_entries_examined: u64,
-    /// Backend tree requests, excluding the caller-supplied fixed root tree.
-    pub tree_fetches: u64,
-    pub verified_blob_hits: u64,
-    pub verified_blob_misses: u64,
-    pub raw_bytes_fetched: u64,
-    pub raw_bytes_hashed: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NativeProjectionKey {
     source_domain: &'static str,
@@ -129,7 +109,7 @@ impl NativeProjectionKey {
             fs_semantics: FS_SEMANTICS_LINUX_CODE_V1,
             access_projection: ACCESS_PROJECTION_EXACT_FULL,
             verification_revision: MST2_VERIFICATION_VERSION,
-            projection_revision: 1,
+            projection_revision: NATIVE_PROJECTION_REVISION,
         }
     }
 }
