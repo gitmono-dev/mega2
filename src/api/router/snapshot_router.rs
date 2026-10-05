@@ -422,55 +422,55 @@ async fn resolve(
         ))
     })?;
 
-    let (commit_oid, tree_oid, sequence, writer_epoch) =
-        if state.storage.config().mst2.publication_enabled {
-            let Some(instance) = state.storage.config().mst2.instance_uuid.as_deref() else {
-                return Err(mst2_error_response(SnapshotError::new(
-                    SnapshotErrorCode::SnapshotNotReady,
-                    "native publication instance missing",
-                )));
-            };
-            let head = state
-                .storage
-                .mono_storage()
-                .read_native_publication_head(instance)
-                .await
-                .map_err(|error| {
-                    tracing::error!(error = %error, "native publication observation failed");
-                    mst2_error_response(SnapshotError::new(
-                        SnapshotErrorCode::SnapshotNotReady,
-                        "native publication is not ready",
-                    ))
-                })?;
-            (
-                head.root.commit,
-                head.root.tree,
-                head.token.sequence.to_string(),
-                head.token.epoch.to_string(),
-            )
-        } else {
-            let main = state
-                .storage
-                .mono_storage()
-                .get_main_ref("/")
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| {
-                    mst2_error_response(SnapshotError::new(
-                        SnapshotErrorCode::SnapshotNotReady,
-                        "monorepo main ref missing",
-                    ))
-                })?;
-            let sequence = runtime()
-                .publication_sequence(&main.ref_commit_hash)
-                .to_string();
-            (
-                main.ref_commit_hash,
-                main.ref_tree_hash,
-                sequence,
-                "1".to_owned(),
-            )
+    let config = state.storage.config();
+    let (commit_oid, tree_oid, sequence, writer_epoch) = if config.mst2.publication_enabled {
+        let Some(instance) = config.mst2.instance_uuid.as_deref() else {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "native publication instance missing",
+            )));
         };
+        let head = state
+            .storage
+            .mono_storage()
+            .read_native_publication_head(instance)
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "native publication observation failed");
+                mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "native publication is not ready",
+                ))
+            })?;
+        (
+            head.root.commit,
+            head.root.tree,
+            head.token.sequence.to_string(),
+            head.token.epoch.to_string(),
+        )
+    } else {
+        let main = state
+            .storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "monorepo main ref missing",
+                ))
+            })?;
+        let sequence = runtime()
+            .publication_sequence(&main.ref_commit_hash)
+            .to_string();
+        (
+            main.ref_commit_hash,
+            main.ref_tree_hash,
+            sequence,
+            "1".to_owned(),
+        )
+    };
 
     #[cfg(test)]
     if let Ok((captured, release)) = NATIVE_RESOLVE_BARRIERS.try_with(|value| value.clone()) {
@@ -502,13 +502,8 @@ async fn resolve(
         .await
         .map_err(mst2_error_response)?;
 
-    let built = build_descriptor(
-        &state.storage.config().mst2,
-        &view,
-        &req.scope,
-        scope_page.page_id,
-    )
-    .map_err(mst2_error_response)?;
+    let built = build_descriptor(&config.mst2, &view, &req.scope, scope_page.page_id)
+        .map_err(mst2_error_response)?;
     let ctx = runtime()
         .insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds)
         .map_err(mst2_error_response)?;
