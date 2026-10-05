@@ -82,6 +82,22 @@ tokio::task_local! {
     static REQUEST_ID: String;
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static NATIVE_RESOLVE_BARRIERS: (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+}
+
+#[cfg(test)]
+pub(crate) async fn with_native_resolve_barriers<F: std::future::Future>(
+    captured: std::sync::Arc<tokio::sync::Barrier>,
+    release: std::sync::Arc<tokio::sync::Barrier>,
+    future: F,
+) -> F::Output {
+    NATIVE_RESOLVE_BARRIERS
+        .scope((captured, release), future)
+        .await
+}
+
 /// The request id of the in-flight request, for error envelopes.
 pub(crate) fn current_request_id() -> String {
     REQUEST_ID.try_with(|id| id.clone()).unwrap_or_default()
@@ -349,21 +365,61 @@ async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Respo
         ))
     })?;
 
-    // Fix the view on exactly one commit read; nothing below may re-read refs.
-    let main = state
-        .storage
-        .mono_storage()
-        .get_main_ref("/")
-        .await
-        .map_err(internal)?
-        .ok_or_else(|| {
-            mst2_error_response(SnapshotError::new(
-                SnapshotErrorCode::SnapshotNotReady,
-                "monorepo main ref missing; run service init",
-            ))
-        })?;
-    let commit_oid = main.ref_commit_hash.clone();
-    let tree_oid = main.ref_tree_hash.clone();
+    let (commit_oid, tree_oid, sequence, writer_epoch) =
+        if state.storage.config().mst2.publication_enabled {
+            let Some(instance) = state.storage.config().mst2.instance_uuid.as_deref() else {
+                return Err(mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "native publication instance missing",
+                )));
+            };
+            let head = state
+                .storage
+                .mono_storage()
+                .read_native_publication_head(instance)
+                .await
+                .map_err(|error| {
+                    tracing::error!(error = %error, "native publication observation failed");
+                    mst2_error_response(SnapshotError::new(
+                        SnapshotErrorCode::SnapshotNotReady,
+                        "native publication is not ready",
+                    ))
+                })?;
+            (
+                head.root.commit,
+                head.root.tree,
+                head.token.sequence.to_string(),
+                head.token.epoch.to_string(),
+            )
+        } else {
+            let main = state
+                .storage
+                .mono_storage()
+                .get_main_ref("/")
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    mst2_error_response(SnapshotError::new(
+                        SnapshotErrorCode::SnapshotNotReady,
+                        "monorepo main ref missing",
+                    ))
+                })?;
+            let sequence = runtime()
+                .publication_sequence(&main.ref_commit_hash)
+                .to_string();
+            (
+                main.ref_commit_hash,
+                main.ref_tree_hash,
+                sequence,
+                "1".to_owned(),
+            )
+        };
+
+    #[cfg(test)]
+    if let Ok((captured, release)) = NATIVE_RESOLVE_BARRIERS.try_with(|value| value.clone()) {
+        captured.wait().await;
+        release.wait().await;
+    }
     let view = SnapshotView::from_commit(&commit_oid, &tree_oid);
     if let Some(want) = &req.target.view_id {
         let kind_matches = req.target.kind == "view";
@@ -396,36 +452,14 @@ async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Respo
         scope_page.page_id,
     )
     .map_err(mst2_error_response)?;
-    let ctx = runtime().insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds);
-    // Publication identity: with T05 enabled the sequence is the durable
-    // per-namespace counter written atomically with the ref CAS; a read
-    // failure there is surfaced rather than silently falling back, because
-    // the sequence is what binds a client to a version. When publication is
-    // disabled the provisional per-tip counter is the honest answer.
-    //
-    // Namespace note: the counter is keyed on the writer's repo path, and
-    // resolve maps the request scope onto it. That mapping is the identity
-    // only while a scope names one native namespace (true for the default
-    // scope and for deployments without composite bindings); the general
-    // scope→namespace map arrives with the T04 binding layer (see
-    // ISSUES.md ISS-01/ISS-06).
-    let seq = if state.storage.config().mst2.publication_enabled {
-        let namespace = state.storage.mono_storage().normalize_namespace(&req.scope);
-        let durable = state
-            .storage
-            .mono_storage()
-            .publication_sequence(&namespace)
-            .await
-            .map_err(internal)?;
-        durable.to_string()
-    } else {
-        runtime().publication_sequence(&commit_oid).to_string()
-    };
+    let ctx = runtime()
+        .insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds)
+        .map_err(mst2_error_response)?;
 
     let body = json!({
         "descriptor": descriptor_json(&built),
-        "publication_sequence": seq.to_string(),
-        "writer_epoch": "1",
+        "publication_sequence": sequence,
+        "writer_epoch": writer_epoch,
         "lease_id": ctx.lease_id,
         "lease_expires_at": crate::ceres::snapshot::runtime::rfc3339(ctx.lease_expires_at_unix),
         "authorization_epoch": "1",

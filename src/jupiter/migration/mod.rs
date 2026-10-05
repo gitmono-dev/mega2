@@ -139,6 +139,8 @@ mod m20260921_000100_fix_git_tag_unique;
 mod m20260923_000100_import_repo_cleanups;
 mod m20260923_000200_canonicalize_import_repo_paths;
 mod m20260925_000100_media_paging;
+mod m20261005_000100_add_mst2_publication_request_digest;
+mod m20261005_000200_add_mst2_native_head;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -266,6 +268,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260923_000100_import_repo_cleanups::Migration),
             Box::new(m20260923_000200_canonicalize_import_repo_paths::Migration),
             Box::new(m20260925_000100_media_paging::Migration),
+            Box::new(m20261005_000100_add_mst2_publication_request_digest::Migration),
+            Box::new(m20261005_000200_add_mst2_native_head::Migration),
         ]
     }
 }
