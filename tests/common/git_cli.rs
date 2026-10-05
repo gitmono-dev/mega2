@@ -1283,12 +1283,7 @@ pub fn ensure_git_cli_passwd_for_runtime_uid() {
         "unexpected git-cli id output: {id_pair}"
     );
 
-    let script = format!(
-        "if getent passwd {uid} >/dev/null 2>&1; then exit 0; fi; \
-         if ! getent group {gid} >/dev/null 2>&1; then addgroup -g {gid} gitcliruntime || true; fi; \
-         group_name=\"$(getent group {gid} | cut -d: -f1)\"; \
-         adduser -D -u {uid} -G \"$group_name\" -h /home/gitcli -s /bin/sh gitcliruntime"
-    );
+    let script = git_cli_runtime_passwd_script(&uid, &gid);
     let mut command = docker_exec_base();
     command
         .arg("-u")
@@ -1301,6 +1296,81 @@ pub fn ensure_git_cli_passwd_for_runtime_uid() {
         "failed to ensure passwd for git-cli uid {uid}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_cli_runtime_passwd_script(uid: &str, gid: &str) -> String {
+    assert!(
+        !uid.is_empty()
+            && !gid.is_empty()
+            && uid.bytes().all(|byte| byte.is_ascii_digit())
+            && gid.bytes().all(|byte| byte.is_ascii_digit()),
+        "git-cli runtime uid/gid must be numeric"
+    );
+    format!(
+        r#"passwd_matches() {{
+            getent passwd {uid} | awk -F: -v uid={uid} -v gid={gid} \
+                '$3 == uid && $4 == gid {{ matched++ }} END {{ exit matched != 1 }}'
+        }}
+        if getent passwd {uid} >/dev/null 2>&1; then passwd_matches; exit $?; fi
+        if ! getent group {gid} >/dev/null 2>&1; then addgroup -g {gid} gitcliruntime || true; fi
+        group_name="$(getent group {gid} | cut -d: -f1)"
+        test -n "$group_name" || exit 1
+        if adduser -D -u {uid} -G "$group_name" -h /home/gitcli -s /bin/sh gitcliruntime; then
+            passwd_matches
+        else
+            status=$?
+            # Another SSH test can win the check/create race. Accept only the
+            # exact runtime identity, never an unrelated name or primary GID.
+            if passwd_matches; then exit 0; fi
+            exit "$status"
+        fi"#
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn git_cli_passwd_creation_race_requires_exact_runtime_identity() {
+    let fixture = r#"
+        getent() {
+            if [ "$1" = group ]; then printf 'gitcliruntime:x:1001:\n'; return 0; fi
+            if [ "$SCENARIO" = existing ]; then printf 'gitcliruntime:x:1001:1001::/home/gitcli:/bin/sh\n'; return 0; fi
+            if [ "$SCENARIO" = existing_wrong_gid ]; then printf 'gitcliruntime:x:1001:1000::/home/gitcli:/bin/sh\n'; return 0; fi
+            if [ ! -f "$MOCK_STATE" ]; then return 2; fi
+            cat "$MOCK_STATE"
+        }
+        adduser() {
+            case "$SCENARIO" in
+                raced|created) printf 'gitcliruntime:x:1001:1001::/home/gitcli:/bin/sh\n' > "$MOCK_STATE" ;;
+                wrong_uid) printf 'gitcliruntime:x:1000:1001::/home/gitcli:/bin/sh\n' > "$MOCK_STATE" ;;
+                wrong_gid|created_wrong_gid) printf 'gitcliruntime:x:1001:1000::/home/gitcli:/bin/sh\n' > "$MOCK_STATE" ;;
+            esac
+            if [ "$SCENARIO" = created ] || [ "$SCENARIO" = created_wrong_gid ]; then return 0; fi
+            return 17
+        }
+    "#;
+    let temp = tempfile::tempdir().expect("passwd race fixture");
+    let script = format!(
+        "{fixture}\n{}",
+        git_cli_runtime_passwd_script("1001", "1001")
+    );
+    for (scenario, expected) in [
+        ("existing", 0),
+        ("existing_wrong_gid", 1),
+        ("raced", 0),
+        ("created", 0),
+        ("missing", 17),
+        ("wrong_uid", 17),
+        ("wrong_gid", 17),
+        ("created_wrong_gid", 1),
+    ] {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &script])
+            .env("SCENARIO", scenario)
+            .env("MOCK_STATE", temp.path().join(scenario));
+        let output = output_with_timeout(command, Duration::from_secs(5), "passwd race fixture");
+        assert_eq!(output.status.code(), Some(expected), "{scenario}");
+    }
 }
 
 /// Build ADR-GM-05 `GIT_SSH_COMMAND` for the selected runner (container paths under `/work`).
