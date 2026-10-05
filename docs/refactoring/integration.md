@@ -55,6 +55,20 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_storage_events_git` | storage-only 出站 `repo.push` 进程级门（plan-20260912 / WH-03）：enabled+已播种 secret 下真实 host-git trunk push 落地、真实运输记录一次有界投递尝试（类别日志）、SIGINT 经清理尾段退出；review 形态拒绝 enabled；review 分支 push 建 CL 回归。WH-15 追加：每条 emitter 投递/drop 行带播种的 `installation_id`、drop 行不命中投递过滤器、被静态过滤的 seed push 恰好产生一条 `dropped_filter` 行（API 写用例为零条） | PostgreSQL, Redis；host git；`--test-threads=1` |
 | `integration_github_sync` | outbound GitHub-sync SSH session（plan-20260916 / GS-07）：`ssh_connect_authenticates` 钉住回环主机钥并对本地 russh 服务端完成 Ed25519 公钥认证 | 回环 only；不连 GitHub；`--test-threads=1` |
 
+## Storage-only compose black-box coverage
+
+These scripts run in the `interop-smoke` service (`--profile interop`) against the
+published loopback endpoints of the default `mega2-trunk` stack. They complement,
+not replace, the process-level integration targets above. Run them as documented
+in [`deploy-trunk.md`](../deploy-trunk.md); each case and its task card are indexed
+in [`plan-20261001.md`](../plan/plan-20261001.md).
+
+| Script | Default-stack result | Opt-in coverage |
+| --- | --- | --- |
+| `scripts/oci_client_smoke_storage_only.sh` | 12 passed, 0 failed (1 skipped) | auth-none case through `scripts/bb_optin_run.sh` |
+| `scripts/artifacts_smoke_storage_only.sh` | 14 passed, 0 failed (3 skipped) | auth-none, GC, and local-storage cases through `scripts/bb_optin_run.sh` |
+| `scripts/libra_smoke_storage_only.sh` | 24 passed, 0 failed (0 skipped) | None; Libra is the client under test, with Git used only as a read-only observer |
+
 storage-only outbound events（plan-20260912）地址策略、HMAC 运输与有界 emitter 由 lib 测试（`jupiter::service::storage_event_transport` / `storage_event_emitter`）覆盖；WH-15 的 drop 记账与 `installation_id` 记录字段由 `storage_event_emitter::tests::drop_accounting_and_installation_id`（thread-local tracing 捕获，覆盖七类 disposition、per-target 行、`record_invalid_event` 与 disabled/`-` 情形）覆盖，投递行的 `installation_id` 与「drop 行不命中投递过滤器」由 `integration_storage_events_git` 的 `assert_emitter_lines_carry_installation_id` 在真实进程 stdout 上断言；WH-13 的 CLI/service 关停接线与 WH-11 的启动 secret 绑定由进程级 target `integration_storage_events_runtime` 覆盖（见上表）。生产运输没有 HTTP/私网逃逸开关。WH-03 已在 B3 真实 push 提交挂钩（`repo.push`），进程级证据见 `integration_storage_events_git`；WH-07 Agent `events.committed` 的进程级认证/OpenAPI 证据见 `integration_agent_capture` 的 `storage_events_batch`；WH-08 checkpoint 见同 target 的 `storage_events_checkpoint`。
 
 Run the normal project gate with the test environment loaded:
