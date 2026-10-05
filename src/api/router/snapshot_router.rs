@@ -16,6 +16,7 @@ use axum::{
 use base64::Engine;
 use bytes::Bytes;
 use mst2_codec::descriptor;
+use request::Mst2Bytes;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -72,6 +73,13 @@ pub fn routers(api_state: MonoApiServiceState) -> Router<MonoApiServiceState> {
 
 #[path = "snapshot_content.rs"]
 mod content;
+
+#[path = "snapshot_request.rs"]
+mod request;
+
+#[cfg(test)]
+#[path = "snapshot_request_tests.rs"]
+mod request_tests;
 
 /// Spec 14 §4: JSON request bytes hard limit.
 pub(crate) const JSON_REQUEST_LIMIT: usize = 131_072;
@@ -141,28 +149,36 @@ const LEASE_HEADER: &str = "x-mega-snapshot-lease";
 /// knowing the snapshot id alone is not a capability.
 async fn snapshot_auth_middleware(
     State(state): State<MonoApiServiceState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    // Same id the global trace layer echoes on responses and logs.
+    // Nested routes may be added after the server's trace layer. Reuse an
+    // existing context or establish one here, including rejection responses.
     let id = req
         .extensions()
         .get::<crate::server::trace_context::TraceContext>()
-        .map(|c| c.trace_id.to_string())
-        .unwrap_or_default();
-    REQUEST_ID
-        .scope(id, async {
+        .map(|c| c.trace_id.clone())
+        .unwrap_or_else(|| crate::server::trace_context::resolve_trace_id(req.headers()));
+    req.extensions_mut()
+        .insert(crate::server::trace_context::TraceContext {
+            trace_id: id.clone(),
+        });
+    let mut response = REQUEST_ID
+        .scope(id.to_string(), async {
             if let Some(res) = auth_error(&state, req.headers(), req.uri().path()) {
                 return res;
             }
             next.run(req).await
         })
-        .await
+        .await;
+    if let Ok(value) = HeaderValue::from_str(&id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
 }
 
-/// Spec 14 §4 enforcement with the MST/2 error envelope (DefaultBodyLimit's
-/// own rejection is plain-text). Content-Length is checked here; a lying
-/// chunked body still trips DefaultBodyLimit inside the extractor.
+/// Reject an oversized declared length before consuming any body. Actual
+/// bytes and the overall read deadline are checked by `Mst2Bytes`.
 async fn reject_oversize_body(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -186,12 +202,14 @@ async fn reject_oversize_body(
 /// (spec 14 §5 INVALID_REQUEST). Size is enforced by the router layers.
 #[allow(clippy::result_large_err)]
 pub(crate) fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
-    serde_json::from_slice(body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::InvalidRequest,
-            format!("malformed request body: {e}"),
-        ))
-    })
+    request::validate_json_keys(body)
+        .and_then(|()| serde_json::from_slice(body))
+        .map_err(|e| {
+            mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                format!("malformed request body: {e}"),
+            ))
+        })
 }
 
 /// Bearer-token check shared by the auth middleware; the parsing rule is the
@@ -260,7 +278,9 @@ fn mst2_error_response(err: SnapshotError) -> Response {
                 "request_id": current_request_id(),
                 "retryable": matches!(
                     err.code,
-                    SnapshotErrorCode::SnapshotNotReady | SnapshotErrorCode::Internal
+                    SnapshotErrorCode::SnapshotNotReady
+                        | SnapshotErrorCode::TemporaryUnavailable
+                        | SnapshotErrorCode::Internal
                 ),
             }
         })),
@@ -271,6 +291,12 @@ fn mst2_error_response(err: SnapshotError) -> Response {
 impl From<SnapshotError> for Response {
     fn from(err: SnapshotError) -> Self {
         mst2_error_response(err)
+    }
+}
+
+impl IntoResponse for SnapshotError {
+    fn into_response(self) -> Response {
+        mst2_error_response(self)
     }
 }
 
@@ -363,7 +389,10 @@ fn ensure_enabled(state: &MonoApiServiceState) -> Result<(), SnapshotError> {
 // `lfs_router::enforce_lfs_access` (where the error is the rare arm and is
 // boxed), there is nothing to gain here, so the lint is allowed outright.
 #[allow(clippy::result_large_err)]
-async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Response, Response> {
+async fn resolve(
+    state: State<MonoApiServiceState>,
+    Mst2Bytes(body): Mst2Bytes,
+) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: ResolveRequest = parse_json_body(&body)?;
     // Unknown target kinds are client errors, never a silent fallback to
@@ -540,18 +569,13 @@ struct RenewRequest {
 async fn lease_renew(
     state: State<MonoApiServiceState>,
     AxumPath(lease_id): AxumPath<String>,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: RenewRequest = if body.is_empty() {
         RenewRequest::default()
     } else {
-        serde_json::from_slice(&body).map_err(|e| {
-            mst2_error_response(SnapshotError::new(
-                SnapshotErrorCode::ScopeInvalid,
-                format!("malformed renew body: {e}"),
-            ))
-        })?
+        parse_json_body(&body)?
     };
     let renewed = runtime()
         .renew_lease(&lease_id, req.lease_seconds.unwrap_or(600))
@@ -911,7 +935,7 @@ async fn lookup(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     _headers: HeaderMap,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: LookupRequest = parse_json_body(&body)?;
@@ -1068,7 +1092,7 @@ async fn metadata_pages(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     _headers: HeaderMap,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: MetadataPagesRequest = parse_json_body(&body)?;
