@@ -157,3 +157,38 @@ fn codec_err(kind: &str, e: mst2_codec::CodecError) -> SnapshotError {
         format!("{kind} frame encode failed: {e}"),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use mst2_codec::treeframe::HEADER_LEN;
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+
+    #[test]
+    fn compressed_service_frames_commit_to_the_raw_payload() {
+        let object = vec![b'x'; 4096];
+        let content_id: [u8; 32] = Sha256::digest(&object).into();
+        let mut identity = FrameStream::new(13, Encoding::Identity);
+        let mut compressed = FrameStream::new(13, Encoding::Zstd);
+        let raw = identity.object(vec![(content_id, object.clone())]).unwrap();
+        let wire = compressed.object(vec![(content_id, object)]).unwrap();
+        let raw_digest: [u8; 32] = Sha256::digest(&raw[HEADER_LEN..]).into();
+        let wire_digest: [u8; 32] = Sha256::digest(&wire[HEADER_LEN..]).into();
+        assert_eq!(wire[7], 1);
+        assert_eq!(wire[32..64], raw_digest);
+        assert_ne!(wire[32..64], wire_digest);
+
+        let mut legacy = wire.clone();
+        legacy[32..64].copy_from_slice(&wire_digest);
+        assert!(mst2_codec::treeframe::parse_frame(&legacy).is_err());
+        let end = compressed.end(1, 1, 4096, [4; 32]);
+        assert_eq!(end[7], 0);
+        let mut stream = wire;
+        stream.extend(end);
+        assert_eq!(
+            mst2_codec::treeframe::parse_stream(&stream).unwrap().len(),
+            2
+        );
+    }
+}
