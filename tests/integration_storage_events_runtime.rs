@@ -363,12 +363,6 @@ fn integration_storage_events_runtime_occupied_port_exits_through_cleanup() {
     // evidence that the cleanup tail ran.
     let receipt = wait_for_shutdown_receipt(&stdout_path, &stderr_path, Duration::from_secs(60));
     assert_shutdown_receipt_sanitized(&receipt);
-    // The failure must be the port bind, not some unrelated startup error.
-    let combined = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
-    assert!(
-        combined.contains("failed to bind HTTP listener"),
-        "occupied-port case must fail at the HTTP bind:\n{combined}"
-    );
     let status = service
         .wait_for_exit(Duration::from_secs(60))
         .expect("occupied-port startup failure must exit on its own");
@@ -377,6 +371,13 @@ fn integration_storage_events_runtime_occupied_port_exits_through_cleanup() {
         "occupied-port startup must exit non-zero: {status}\nstdout:\n{}\nstderr:\n{}",
         read_log(&stdout_path),
         read_log(&stderr_path),
+    );
+    // main prints the startup error after cleanup returns; wait for exit
+    // before reading the final diagnostic that must identify the bind failure.
+    let combined = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
+    assert!(
+        combined.contains("failed to bind HTTP listener"),
+        "occupied-port case must fail at the HTTP bind:\n{combined}"
     );
 }
 
