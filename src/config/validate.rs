@@ -9,8 +9,8 @@ use url::Url;
 
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig,
-    GithubSyncConfig, LFSConfig, LogConfig, MonoConfig, NotificationConfig, OAuthConfig,
-    PackConfig, PushAuth, PushPolicy, RedisConfig, VAULT_AUDIT_SINKS, VaultConfig,
+    GithubSyncConfig, LFSConfig, LogConfig, MonoConfig, Mst2Config, NotificationConfig,
+    OAuthConfig, PackConfig, PushAuth, PushPolicy, RedisConfig, VAULT_AUDIT_SINKS, VaultConfig,
     normalize_token_path,
     secret::{SecretRef, SecretResolver, is_secret_ref_value},
 };
@@ -123,6 +123,7 @@ impl Config {
         validate_lfs_config(&self.lfs)?;
         validate_redis_config(&self.redis)?;
         validate_cedar_config(&self.cedar)?;
+        validate_mst2_config(&self.mst2)?;
         if let Some(buck_config) = &self.buck {
             validate_buck_config(buck_config)?;
         }
@@ -146,6 +147,34 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn validate_mst2_config(config: &Mst2Config) -> Result<(), MegaError> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let instance_uuid = config.instance_uuid.as_deref().ok_or_else(|| {
+        MegaError::Other("mst2.instance_uuid is required when mst2.enabled is true".to_string())
+    })?;
+    let instance_uuid = uuid::Uuid::parse_str(instance_uuid).map_err(|_| {
+        MegaError::Other("mst2.instance_uuid must be a valid non-nil UUID".to_string())
+    })?;
+    if instance_uuid.is_nil() {
+        return Err(MegaError::Other(
+            "mst2.instance_uuid must be a valid non-nil UUID".to_string(),
+        ));
+    }
+    if config
+        .auth_token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err(MegaError::Other(
+            "mst2.auth_token must not be empty when configured and mst2.enabled is true"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate `[oauth]` settings: website API base URL, session cookie names, and
@@ -2032,6 +2061,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "object_storage",
             "oauth",
             "blame",
+            "mst2",
             "redis",
             "buck",
             "artifacts_gc",
@@ -2095,6 +2125,12 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "enable_caching",
         ]),
         "redis" => Some(&["url"]),
+        "mst2" => Some(&[
+            "enabled",
+            "instance_uuid",
+            "publication_enabled",
+            "auth_token",
+        ]),
         "buck" => Some(&[
             "session_timeout",
             "max_file_size",
@@ -2190,13 +2226,130 @@ mod tests {
         StorageEventsTargetConfig,
         secret::{SecretRef, SecretResolver},
         template::config_init_template,
-        testing::isolated_config,
+        testing::{EnvVarGuard, env_lock, isolated_config},
     };
     #[rustfmt::skip]
     use crate::orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config};
 
     fn valid_config() -> Config {
         isolated_config(std::env::temp_dir().join("mega2-config-validate-tests"))
+    }
+
+    #[test]
+    fn config_validate_mst2_checks_enabled_identity_and_configured_token() {
+        let mut config = valid_config();
+        config.mst2.enabled = true;
+        for instance_uuid in [
+            None,
+            Some(""),
+            Some("invalid-uuid"),
+            Some("00000000-0000-0000-0000-000000000000"),
+        ] {
+            config.mst2.instance_uuid = instance_uuid.map(str::to_owned);
+            config.mst2.auth_token = Some("mst2-private-token-must-not-appear".to_string());
+            let message = config
+                .validate()
+                .expect_err("enabled MST/2 requires a non-nil UUID")
+                .to_string();
+            assert!(message.contains("mst2.instance_uuid"), "{message}");
+            assert!(
+                !message.contains("mst2-private-token-must-not-appear"),
+                "{message}"
+            );
+        }
+        config.mst2.instance_uuid = Some("12345678-1234-4234-9234-123456789abc".to_string());
+        for token in ["", " \t\n"] {
+            config.mst2.auth_token = Some(token.to_string());
+            let message = config
+                .validate()
+                .expect_err("configured MST/2 token must not be blank")
+                .to_string();
+            assert!(message.contains("mst2.auth_token"), "{message}");
+        }
+        config.mst2.auth_token = None;
+        config
+            .validate()
+            .expect("existing unauthenticated lab mode remains valid");
+        config.mst2.auth_token = Some("mst2-test-token".to_string());
+        config.mst2.publication_enabled = true;
+        config
+            .validate()
+            .expect("authenticated publication config is valid");
+        config.mst2.enabled = false;
+        config.mst2.publication_enabled = false;
+        config.mst2.instance_uuid = None;
+        config.mst2.auth_token = None;
+        config
+            .validate()
+            .expect("disabled MST/2 defaults remain valid");
+    }
+
+    #[test]
+    fn config_load_str_accepts_mst2_and_expands_file_token_without_reexpansion() {
+        let lock = env_lock();
+        let _enabled = EnvVarGuard::remove(&lock, "MEGA_MST2__ENABLED");
+        let _identity = EnvVarGuard::remove(&lock, "MEGA_MST2__INSTANCE_UUID");
+        let _publication = EnvVarGuard::remove(&lock, "MEGA_MST2__PUBLICATION_ENABLED");
+        let _token = EnvVarGuard::remove(&lock, "MEGA_MST2__AUTH_TOKEN");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let token_file = dir.path().join("mst2-token");
+        let token = "literal-${must_not_be_reexpanded}";
+        std::fs::write(&token_file, format!("{token}\n")).expect("write private test token");
+        let file_placeholder = format!("${{file:{}}}", token_file.display());
+        let content = format!(
+            "{}\n[mst2]\nenabled = true\ninstance_uuid = \"12345678-1234-4234-9234-123456789abc\"\npublication_enabled = false\nauth_token = {}\n",
+            config_init_template(dir.path()),
+            toml::Value::String(file_placeholder),
+        );
+        let loaded =
+            Config::load_str(&content).expect("ordinary config loader must recognize MST/2");
+        assert!(loaded.mst2.enabled);
+        assert!(!loaded.mst2.publication_enabled);
+        assert_eq!(loaded.mst2.auth_token.as_deref(), Some(token));
+        loaded
+            .validate()
+            .expect("expanded MST/2 config must validate");
+        assert!(
+            known_unconsumed_fields(&toml::from_str(&content).expect("parse source")).is_empty()
+        );
+        for field in [
+            "enabled",
+            "instance_uuid",
+            "publication_enabled",
+            "auth_token",
+        ] {
+            assert!(is_known_field_path(&format!("mst2.{field}")));
+        }
+        assert!(!is_known_field_path("mst2.auth_token.extra"));
+        assert!(!is_known_field_path("mst2.typo"));
+        std::fs::write(&token_file, "\n").expect("write empty private test token");
+        let empty_token =
+            Config::load_str(&content).expect("file token still uses ordinary expansion");
+        let message = empty_token
+            .validate()
+            .expect_err("expanded empty token must fail semantic validation")
+            .to_string();
+        assert!(message.contains("mst2.auth_token"), "{message}");
+    }
+
+    #[test]
+    fn config_load_str_rejects_mst2_typo_and_unknown_nested_table() {
+        let content = r#"
+            [mst2]
+            enabled = false
+            publication_enabeld = true
+            [mst2.credentials]
+            auth_token = "private-value-must-not-appear"
+        "#;
+        let message = Config::load_str(content)
+            .expect_err("MST/2 unknown fields must fail closed")
+            .to_string();
+        assert!(message.contains("mst2.publication_enabeld"), "{message}");
+        assert!(message.contains("mst2.credentials"), "{message}");
+        assert!(
+            !message.contains("private-value-must-not-appear"),
+            "{message}"
+        );
     }
 
     #[test]

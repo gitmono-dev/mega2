@@ -60,6 +60,13 @@ mod un25_freeze;
 pub trait ApiHandler: Send + Sync {
     fn get_context(&self) -> Storage;
 
+    /// Only native monorepo trees use the native snapshot memoization domain.
+    /// Import and custom handlers remain uncached unless they implement their
+    /// own source identity and verification contract.
+    fn native_snapshot_projection(&self) -> bool {
+        false
+    }
+
     fn object_cache(&self) -> &GitObjectCache;
 
     fn strip_relative(&self, path: &Path) -> Result<PathBuf, MegaError>;
