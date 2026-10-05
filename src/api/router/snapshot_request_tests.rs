@@ -62,7 +62,9 @@ impl Fixture {
         };
         let view = SnapshotView::from_commit(&"1".repeat(40), &"2".repeat(40));
         let built = build(&state.storage.config().mst2, &view, "/", [3; 32]).unwrap();
-        let ctx = runtime().insert_context(built, &view.commit_oid, &view.root_tree_oid, 60);
+        let ctx = runtime()
+            .insert_context(built, &view.commit_oid, &view.root_tree_oid, 60)
+            .unwrap();
         // Reproduce the server's nest-after-layer order: MST must establish
         // its own request context even when the earlier layer does not run.
         let app = Router::new()
