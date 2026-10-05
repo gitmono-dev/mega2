@@ -125,6 +125,13 @@
 - **计划**：[`../plan/plan-20260912.md`](../plan/plan-20260912.md)
 - **边界**：无 webhook CRUD、无 outbox/retry、不复用 review CL webhook 表
 
+### 5e. **refactoring/history-projection.md** — trunk 历史只读投影
+
+- **目标**：从根历史确定性生成 Prefix / Exclude / Compose 视图，并通过只读 Git URL 提供完整前史
+- **核心内容**：过滤器代数、八张派生表、根链与追赶、ViewRepo、注册准入、HTTP / SSH v0 / v2 读路径及故障恢复
+- **计划**：[`../plan/plan-20261002.md`](../plan/plan-20261002.md)
+- **边界**：P0 仅 trunk、sha1 与线性根链；视图不是读 ACL，不接受 push；P1–P3 留给 PT-14
+
 ### 6. **其他文档**
 - **[`../user-guide.zh.md`](../user-guide.zh.md)**：Monorepo 路径、公开分支、Tag 和推送规则；初始化布局见 [`../manual/monorepo-init.zh.md`](../manual/monorepo-init.zh.md)，trunk 不变式见 [`trunk-push.md`](trunk-push.md)
 - **[`../deploy-trunk.md`](../deploy-trunk.md)**：trunk / storage-only 部署（`push_auth`、LFS、SSH、形态切换）
