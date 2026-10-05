@@ -472,6 +472,9 @@ async fn resolve(
         native_source = match observation_source {
             Ok(source) => Some(source),
             Err(_) => {
+                if let Some(sink) = &state.storage.projection_observation_sink {
+                    sink.reject_binding();
+                }
                 tracing::warn!("native resolve observation source rejected");
                 None
             }

@@ -307,3 +307,23 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
         assert_eq!(status["first_error_code"],0);
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_source_without_positive_publication_receipt_is_a_sticky_writer_failure() {
+    let (temp,mut storage,_tip,_path)=native_fixture().await;
+    let writer=crate::ceres::snapshot::projection_writer::ProjectionObservationSink::start(temp.path()).unwrap();
+    storage.projection_observation_sink=Some(writer.clone());
+    let state=api_state(storage).await;
+    let ((status,response),observations)=crate::ceres::snapshot::projection_observation::with_observations(http_resolve(state,"/")).await;
+    assert_eq!(status,200,"{response}");
+    assert_eq!(response["publication_sequence"],"0");
+    assert!(observations.is_empty());
+    assert!(writer.shutdown(std::time::Instant::now()+Duration::from_secs(5)).await.is_err());
+    let directory=writer.test_directory(temp.path());
+    assert!(std::fs::read(directory.join("records.jsonl")).unwrap().is_empty());
+    let status:serde_json::Value=serde_json::from_slice(&std::fs::read(directory.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status["first_error_code"],crate::ceres::snapshot::projection_writer::WriterFailure::ObservationBindingRejected as u8);
+    assert_eq!(status["accepted_records"],0);
+    assert_eq!(status["closed"],true);
+}

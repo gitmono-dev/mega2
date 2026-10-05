@@ -411,31 +411,78 @@ fn create_private(path: &Path) -> io::Result<File> {
 }
 
 fn prepare_directory(cache: &Path, id: Uuid) -> io::Result<PathBuf> {
+    prepare_directory_with(cache, id, sync_directory)
+}
+
+fn real_directory(path: &Path) -> io::Result<()> {
+    if !fs::symlink_metadata(path)?.is_dir() {
+        return Err(io::Error::other(
+            "projection storage must be a real directory",
+        ));
+    }
+    Ok(())
+}
+
+fn create_directory(path: &Path, private: bool) -> io::Result<()> {
+    #[cfg(unix)]
+    let mut directory = fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let directory = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(if private { 0o700 } else { 0o755 });
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    directory.create(path)
+}
+
+fn private_directory(path: &Path) -> io::Result<()> {
+    real_directory(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::symlink_metadata(path)?;
+        // SAFETY: geteuid reads the process identity and has no pointer arguments.
+        let owner = unsafe { libc::geteuid() };
+        if metadata.uid() != owner || metadata.permissions().mode() & 0o7777 != 0o700 {
+            return Err(io::Error::other(
+                "projection directory must be privately owned",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_directory_with(
+    cache: &Path,
+    id: Uuid,
+    sync: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    // The actual configured cache is an existing anchor. No arbitrary output
+    // path or recursively created ancestor is accepted by this writer.
+    real_directory(cache)?;
     let logs = cache.join("logs");
-    fs::create_dir_all(&logs)?;
-    let parent = logs.join("mst2-native-projection");
-    match fs::create_dir(&parent) {
+    match create_directory(&logs, false) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    if fs::symlink_metadata(&logs)?.file_type().is_symlink()
-        || fs::symlink_metadata(&parent)?.file_type().is_symlink()
-        || !parent.is_dir()
-    {
-        return Err(io::Error::other(
-            "projection directory is not owned real storage",
-        ));
+    real_directory(&logs)?;
+    sync(cache)?;
+    let parent = logs.join("mst2-native-projection");
+    match create_directory(&parent, true) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
     }
+    private_directory(&parent)?;
+    sync(&logs)?;
     let root = parent.join(id.to_string());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(&root)?;
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(&root)?;
-    sync_directory(&parent)?;
+    create_directory(&root, true)?;
+    private_directory(&root)?;
+    sync(&parent)?;
     Ok(root)
 }
 

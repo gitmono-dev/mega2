@@ -193,6 +193,14 @@ async fn actual_writer_fsync_ack_tracks_exact_bytes_and_closed_drain() {
         fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700
     );
+    assert_eq!(
+        fs::metadata(root.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700
+    );
     for path in [root.join("records.jsonl"), root.join("status.json")] {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -278,4 +286,73 @@ fn actual_writer_rejects_a_symlinked_output_directory_before_creating_records() 
     .unwrap();
     assert!(ProjectionObservationSink::start(temp.path()).is_err());
     assert_eq!(target.path().read_dir().unwrap().count(), 0);
+    let temp = tempfile::tempdir().unwrap();
+    symlink(target.path(), temp.path().join("logs")).unwrap();
+    assert!(ProjectionObservationSink::start(temp.path()).is_err());
+    assert_eq!(target.path().read_dir().unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_chain_is_synced_from_existing_anchor_before_any_record_can_be_created() {
+    use std::cell::RefCell;
+    let temp = tempfile::tempdir().unwrap();
+    let calls = RefCell::new(Vec::new());
+    let root = prepare_directory_with(temp.path(), Uuid::new_v4(), |path| {
+        sync_directory(path)?;
+        calls.borrow_mut().push(path.to_path_buf());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        *calls.borrow(),
+        [
+            temp.path().to_path_buf(),
+            temp.path().join("logs"),
+            temp.path().join("logs/mst2-native-projection")
+        ]
+    );
+    assert_eq!(root.read_dir().unwrap().count(), 0);
+    for fail_at in 0..3 {
+        let temp = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let calls = RefCell::new(0);
+        assert!(
+            prepare_directory_with(temp.path(), id, |path| {
+                let current = *calls.borrow();
+                *calls.borrow_mut() += 1;
+                if current == fail_at {
+                    Err(io::Error::other("injected directory durability failure"))
+                } else {
+                    sync_directory(path)
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(*calls.borrow(), fail_at + 1);
+        let root = temp
+            .path()
+            .join("logs/mst2-native-projection")
+            .join(id.to_string());
+        assert!(!root.join("records.jsonl").exists());
+        assert!(!root.join("status.json").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_or_symlink_anchor_and_nonprivate_existing_parent_fail_before_records() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let temp = tempfile::tempdir().unwrap();
+    assert!(ProjectionObservationSink::start(&temp.path().join("missing")).is_err());
+    assert!(!temp.path().join("missing").exists());
+    let alias = temp.path().join("alias");
+    symlink(temp.path(), &alias).unwrap();
+    assert!(ProjectionObservationSink::start(&alias).is_err());
+    assert!(!temp.path().join("logs").exists());
+    let parent = temp.path().join("logs/mst2-native-projection");
+    fs::create_dir_all(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(ProjectionObservationSink::start(temp.path()).is_err());
+    assert_eq!(parent.read_dir().unwrap().count(), 0);
 }
