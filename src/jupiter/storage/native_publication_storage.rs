@@ -281,7 +281,104 @@ impl MonoStorage {
         Ok(head)
     }
 
-    /// Maintenance-only, with stopped old writers and a drained queue; never invoked by resolve.
+    /// The command confirms stopped writers; this transaction checks the
+    /// paused admission gate, drained queue and exact native root.
+    pub(crate) async fn initialize_native_publication_for_maintenance(
+        &self,
+        instance: &str,
+        expected_root: &NativeRoot,
+    ) -> Result<(), PublicationReceiptError> {
+        let instance = canonical_instance(instance)?;
+        if uuid::Uuid::parse_str(&instance).is_ok_and(|id| id.is_nil()) {
+            return Err(integrity("native deployment instance must not be nil"));
+        }
+        for oid in [&expected_root.commit, &expected_root.tree] {
+            if oid.len() != 40
+                || !oid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(integrity(
+                    "maintenance requires canonical SHA-1 root identities",
+                ));
+            }
+        }
+        let txn = self.get_connection().begin().await?;
+        if !PushQueueStorage::try_mono_write_lock(&txn)
+            .await
+            .map_err(|error| integrity(&error.to_string()))?
+        {
+            return Err(PublicationReceiptError::Conflict(
+                "native initialization refused while a writer holds the mono write lock".into(),
+            ));
+        }
+        let control = txn
+            .query_one_raw(Statement::from_string(
+                txn.get_database_backend(),
+                "SELECT paused, hard_stopped FROM queue_control WHERE id=1 FOR UPDATE NOWAIT"
+                    .to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| {
+                integrity(
+                    "queue_control row missing; maintenance cannot establish admission exclusion",
+                )
+            })?;
+        if !control.try_get::<bool>("", "paused")? {
+            return Err(integrity(
+                "queue admission must be paused before native initialization",
+            ));
+        }
+        if control.try_get::<bool>("", "hard_stopped")? {
+            return Err(integrity(
+                "hard-stopped queue must be investigated before native initialization",
+            ));
+        }
+        let history = txn
+            .query_one_raw(Statement::from_string(
+                txn.get_database_backend(),
+                "SELECT EXISTS(SELECT 1 FROM mst2_native_publication) OR \
+                 EXISTS(SELECT 1 FROM mst2_publication WHERE native_certificate_version IS NOT NULL) AS present"
+                    .to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| integrity("native history observation missing"))?;
+        if history.try_get::<bool>("", "present")? {
+            return Err(integrity(
+                "native publication history exists; initialization cannot repair or replace it",
+            ));
+        }
+        let objects = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "SELECT (SELECT count(*) FROM mega_commit WHERE commit_id=$1) AS commits, \
+                 (SELECT max(tree) FROM mega_commit WHERE commit_id=$1) AS commit_tree, \
+                 (SELECT count(*) FROM mega_tree WHERE tree_id=$2) AS trees",
+                [
+                    expected_root.commit.clone().into(),
+                    expected_root.tree.clone().into(),
+                ],
+            ))
+            .await?
+            .ok_or_else(|| integrity("native object observation missing"))?;
+        if objects.try_get::<i64>("", "commits")? != 1
+            || objects
+                .try_get::<Option<String>>("", "commit_tree")?
+                .as_deref()
+                != Some(expected_root.tree.as_str())
+            || objects.try_get::<i64>("", "trees")? != 1
+        {
+            return Err(integrity(
+                "native root requires a unique stored commit with the expected tree and a unique stored tree",
+            ));
+        }
+        self.initialize_native_publication_in_txn(&txn, &instance, Some(expected_root))
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn initialize_native_publication(
         &self,
         instance: &str,
@@ -293,13 +390,30 @@ impl MonoStorage {
             .map_err(|error| integrity(&error.to_string()))?;
         txn.execute_unprepared("SELECT id FROM queue_control WHERE id=1 FOR UPDATE")
             .await?;
-        let observation = observe(&txn).await?;
+        self.initialize_native_publication_in_txn(&txn, &instance, None)
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn initialize_native_publication_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        instance: &str,
+        expected_root: Option<&NativeRoot>,
+    ) -> Result<(), PublicationReceiptError> {
+        let observation = observe(txn).await?;
         if observation.head.is_some() {
             return Err(integrity("native head already initialized"));
         }
         let root = observation
             .root
             .ok_or_else(|| integrity("native root missing"))?;
+        if expected_root.is_some_and(|expected| *expected != root) {
+            return Err(PublicationReceiptError::Conflict(
+                "native root differs from the maintenance command's expected commit/tree".into(),
+            ));
+        }
         let row = txn.query_one_raw(Statement::from_string(txn.get_database_backend(),
             "SELECT count(*)::bigint AS active FROM push_queue WHERE status IN ('Queued', 'Running')".to_owned())).await?
             .ok_or_else(|| integrity("queue observation missing"))?;
@@ -331,7 +445,6 @@ impl MonoStorage {
              VALUES ('/', $1, $2, $3, $4, $5, 'INITIALIZING')",
             [instance.into(), floor.into(), NATIVE_EPOCH.into(), root.commit.into(), root.tree.into()],
         )).await?;
-        txn.commit().await?;
         Ok(())
     }
 

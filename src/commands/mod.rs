@@ -119,7 +119,7 @@ pub(crate) fn builtin_exec(cmd: &str) -> Option<CommandExec> {
 pub(crate) fn load_mode(cmd: &str, args: &ArgMatches) -> Option<LoadMode> {
     match cmd {
         "service" => match args.subcommand_name() {
-            Some("init") => Some(LoadMode::ParsedExistingConfig),
+            Some("init" | "native-publication-init") => Some(LoadMode::ParsedExistingConfig),
             _ => Some(LoadMode::FullAppContext),
         },
         "debug" => Some(LoadMode::FullAppContext),
