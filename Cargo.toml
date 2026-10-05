@@ -48,9 +48,9 @@ ed25519-dalek = { version = "3.0.0", features = ["pkcs8"] }
 envsubst = "0.2.1"
 futures = "0.3.34"
 git-internal = "0.10.2"
-# Shared MST/2 wire codec (specs 03/05/06/07). Registry crate 0.3.1
-# (spec-conformance wire fixes + zstd CHUNK cap).
-mst2-codec = { version = "0.3.1", features = ["zstd"] }
+# Shared MST/2 wire codec (specs 03/05/06/07). Pin the reviewed raw-payload
+# digest fix until the corresponding registry release is available.
+mst2-codec = { git = "https://github.com/gitmono-dev/mst2-codec", rev = "dc5ec7650a221ec07a62f4dea4be9ddf17ad924e", version = "=0.4.0", features = ["zstd"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"

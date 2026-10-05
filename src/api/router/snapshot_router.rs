@@ -296,7 +296,7 @@ async fn capabilities() -> Json<serde_json::Value> {
     Json(json!({
         "protocol_versions": [2],
         "metadata_codecs": [1],
-        "frame_encodings": ["identity", "zstd"],
+        "frame_encodings": crate::ceres::snapshot::frame_stream::HTTP_FRAME_ENCODINGS,
         "features": {
             "resolve": true,
             "directory": true,
@@ -1141,11 +1141,11 @@ async fn metadata_pages(
 
     // Frames hold at most 64 pages and at most 1 MiB of raw payload (spec 06),
     // so a wide route set becomes several META frames rather than one
-    // oversized one. Encoding (identity/zstd) is negotiated per request.
+    // oversized one. HTTP uses identity during the mixed-codec rollout.
     let encoding = req
         .encoding
         .as_deref()
-        .map(crate::ceres::snapshot::frame_stream::Encoding::parse)
+        .map(crate::ceres::snapshot::frame_stream::Encoding::parse_http)
         .transpose()
         .map_err(mst2_error_response)?
         .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
@@ -1196,6 +1196,12 @@ async fn metadata_pages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capabilities_do_not_advertise_ambiguous_zstd_digests() {
+        let Json(caps) = capabilities().await;
+        assert_eq!(caps["frame_encodings"], json!(["identity"]));
+    }
 
     #[test]
     fn treeframe_response_emits_protocol_identity_headers() {

@@ -18,7 +18,6 @@ mod git_cli;
 use std::{
     fs,
     io::Read,
-    net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -242,7 +241,7 @@ impl ServiceProcess {
         }
     }
 
-    fn wait_until_listening(
+    fn wait_until_http_ready(
         &mut self,
         port: u16,
         timeout: Duration,
@@ -250,10 +249,15 @@ impl ServiceProcess {
         stderr_path: &Path,
     ) {
         let deadline = Instant::now() + timeout;
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("readiness client");
+        let url = format!("http://127.0.0.1:{port}/api/openapi.json");
         loop {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return;
-            }
             if let Some(status) = self.child.try_wait().expect("poll service") {
                 self.reaped = true;
                 panic!(
@@ -262,9 +266,19 @@ impl ServiceProcess {
                     read_log(stderr_path),
                 );
             }
+            // A successful TCP connect alone can self-connect to its source
+            // port on Linux before this child starts accepting HTTP requests.
+            if let Ok(response) = client.get(&url).send()
+                && response.status().is_success()
+                && let Ok(document) = response.json::<Value>()
+                && document["openapi"].is_string()
+                && document["paths"].is_object()
+            {
+                return;
+            }
             if Instant::now() >= deadline {
                 panic!(
-                    "service did not bind port {port} within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+                    "service HTTP was not ready on port {port} within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
                     read_log(stdout_path),
                     read_log(stderr_path),
                 );
@@ -568,7 +582,7 @@ fn boot_service_http(env: &ApiWriteEnv) -> (ServiceProcess, u16, PathBuf, PathBu
         .stderr(Stdio::from(create_log_file(&stderr_path)));
 
     let mut service = ServiceProcess::spawn(command);
-    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_http_ready(port, Duration::from_secs(90), &stdout_path, &stderr_path);
     (service, port, stdout_path, stderr_path)
 }
 
@@ -746,18 +760,20 @@ struct EntryCase {
     port: u16,
     api: String,
     client: reqwest::blocking::Client,
+    stdout: PathBuf,
     stderr: PathBuf,
 }
 
 impl EntryCase {
     fn boot(env: ApiWriteEnv) -> Self {
-        let (service, port, _stdout, stderr) = boot_service_http(&env);
+        let (service, port, stdout, stderr) = boot_service_http(&env);
         Self {
             env,
             service,
             port,
             api: format!("http://127.0.0.1:{port}/api/v1"),
             client: http_client(),
+            stdout,
             stderr,
         }
     }
@@ -779,9 +795,13 @@ impl EntryCase {
         if let Some(auth) = auth {
             request = request.header("Authorization", auth);
         }
-        let response = request
-            .send()
-            .unwrap_or_else(|err| panic!("POST {route}: {err}"));
+        let response = request.send().unwrap_or_else(|err| {
+            panic!(
+                "POST {route}: {err:?}\nstdout:\n{}\nstderr:\n{}",
+                read_log(&self.stdout),
+                read_log(&self.stderr),
+            )
+        });
         let status = response.status().as_u16();
         let text = response.text().expect("response body");
         let json = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
