@@ -1435,6 +1435,80 @@ case_libra_browser_create_annotated_tag() {
     printf 'annotated root tag matched HEAD: %s\n' "$name"
 }
 
+case_libra_browser_delete_tag() {
+    local WORK="$WORK/browser-delete-tag" path="/" name="bb75-$RUN_ID"
+    local message="bb75 delete fixture $RUN_ID" token="${MEGA2_IT_SEED_TOKEN:-}"
+    local code left rc=0 leak_rc=0 attempted=false
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    # shellcheck disable=SC2329
+    cleanup_bb75_tag() {
+        trap - RETURN
+        local cleanup_left cleanup_timeout
+        rm -f "$WORK/token"
+        if [ "$attempted" = true ]; then
+            printf 'Authorization: Bearer %s\n' "$token" > "$WORK/cleanup.header"
+            chmod 600 "$WORK/cleanup.header"
+            cleanup_left=$((deadline - SECONDS))
+            if [ "$cleanup_left" -gt 0 ]; then
+                cleanup_timeout=$cleanup_left
+                [ "$cleanup_timeout" -le 5 ] || cleanup_timeout=5
+                curl -sS --connect-timeout 5 --max-time "$cleanup_timeout" -X DELETE \
+                    -H @"$WORK/cleanup.header" -o "$WORK/cleanup.out" \
+                    "$MEGA2_BASE_URL/api/v1/tags/$name" || true
+            fi
+        fi
+        rm -f "$WORK/auth.header" "$WORK/cleanup.header"
+        return 0
+    }
+    trap cleanup_bb75_tag RETURN
+    jq -n --arg name "$name" --arg message "$message" \
+        '{name: $name, message: $message}' > "$WORK/fixture.json" || return 1
+    printf 'Authorization: Bearer %s\n' "$token" > "$WORK/auth.header"
+    chmod 600 "$WORK/auth.header"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    attempted=true
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/fixture.json" \
+        -o "$WORK/fixture.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tags") || return 1
+    rm -f "$WORK/auth.header"
+    [ "$code" = 200 ] && jq -e --arg name "$name" --arg message "$message" \
+        '.req_result == true and .data.name == $name and .data.message == $message and .data.tag_id != .data.object_id' \
+        "$WORK/fixture.out" > /dev/null || { echo "annotated delete fixture failed (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -o "$WORK/before.json" -w '%{http_code}' \
+        "$MEGA2_BASE_URL/api/v1/tags/$name") || return 1
+    [ "$code" = 200 ] && jq -e --arg name "$name" \
+        '.req_result == true and .data.name == $name' "$WORK/before.json" > /dev/null \
+        || { echo "anonymous tag GET did not find the fixture (HTTP $code)" >&2; return 1; }
+    printf '%s\n' "$token" > "$WORK/token"
+    chmod 600 "$WORK/token"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    if timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" \
+        --token-file "$WORK/token" --delete-tag "$name" "$path" \
+        > "$WORK/delete.json" 2> "$WORK/delete.err"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "$WORK/token"
+    [ "$rc" -eq 0 ] || { echo "libra browser root tag deletion failed (exit $rc)" >&2; return 1; }
+    [ ! -s "$WORK/delete.err" ] || { echo "libra browser delete-tag wrote unexpected stderr" >&2; return 1; }
+    jq -e --arg server "$MEGA2_BASE_URL" --arg name "$name" \
+        '.ok == true and .command == "mega2 browser" and .data.operation == "delete-tag" and .data.server == $server and .data.target == {name: $name, path: "/"} and .data.receipt.deleted_tag == $name' \
+        "$WORK/delete.json" > /dev/null || { echo "libra browser delete-tag JSON is invalid" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -o "$WORK/after.json" -w '%{http_code}' \
+        "$MEGA2_BASE_URL/api/v1/tags/$name") || return 1
+    [ "$code" = 404 ] || { echo "anonymous tag GET still found deleted tag (HTTP $code)" >&2; return 1; }
+    attempted=false
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || leak_rc=$?
+    [ "$leak_rc" -eq 1 ] || { echo "browser delete-tag token persisted or scan failed" >&2; return 1; }
+    printf 'root tag deleted: %s\n' "$name"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -1458,5 +1532,6 @@ run_case "LIBRA browser list tags" case_libra_browser_list_tags
 run_case "LIBRA browser tags page two" case_libra_browser_tags_page_two
 run_case "LIBRA browser create lightweight tag" case_libra_browser_create_lightweight_tag
 run_case "LIBRA browser create annotated tag" case_libra_browser_create_annotated_tag
+run_case "LIBRA browser delete tag" case_libra_browser_delete_tag
 
 finish
