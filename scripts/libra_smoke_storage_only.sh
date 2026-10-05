@@ -1033,6 +1033,154 @@ case_libra_browser_move_dir() {
     printf 'browser directory moved: %s -> %s\n' "$source" "$dest/$source"
 }
 
+case_libra_browser_rename_dir() {
+    local WORK="$WORK/browser-rename-dir" path="/project"
+    local old="bb70-old-$RUN_ID" new="bb70-new-$RUN_ID"
+    local token="${MEGA2_IT_SEED_TOKEN:-}" left code leak_rc=0 rc=0
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    jq -n --arg name "$old" --arg path "$path" \
+        '{is_directory: true, name: $name, path: $path, content: null, skip_build: true}' \
+        > "$WORK/fixture.json" || return 1
+    printf 'Authorization: Bearer %s\n' "$token" > "$WORK/auth.header"
+    chmod 600 "$WORK/auth.header"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || { rm -f "$WORK/auth.header"; return 124; }
+    if ! code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/fixture.json" \
+        -o "$WORK/fixture.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/create-entry"); then
+        rm -f "$WORK/auth.header"
+        return 1
+    fi
+    rm -f "$WORK/auth.header"
+    [ "$code" = 200 ] && jq -e '.req_result == true' "$WORK/fixture.out" > /dev/null \
+        || { echo "browser rename fixture creation failed (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$path" \
+        -o "$WORK/tree-before.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg old "$old" --arg new "$new" \
+        '.req_result == true and any(.data.tree_items[]; .name == $old and .content_type == "directory") and all(.data.tree_items[]; .name != $new)' \
+        "$WORK/tree-before.json" > /dev/null \
+        || { echo "mega2 project tree does not have the expected rename fixture state (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" > "$WORK/token"
+    chmod 600 "$WORK/token"
+    if timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" \
+        --token-file "$WORK/token" --rename-dir "$old" "$new" "$path" \
+        > "$WORK/rename.json" 2> "$WORK/rename.err"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "$WORK/token"
+    [ "$rc" -eq 0 ] \
+        || { echo "libra browser directory rename failed (exit $rc)" >&2; return 1; }
+    [ ! -s "$WORK/rename.err" ] \
+        || { echo "libra browser directory rename wrote unexpected stderr" >&2; return 1; }
+    jq -e --arg server "$MEGA2_BASE_URL" --arg path "$path" \
+        --arg old "$old" --arg new "$new" \
+        '.ok == true and .command == "mega2 browser" and .data.operation == "rename-dir" and .data.server == $server and .data.target.from == {parent: $path, name: $old, path: ($path + "/" + $old)} and .data.target.to == {parent: $path, name: $new, path: ($path + "/" + $new)} and (.data.receipt.commit_id | type) == "string" and (.data.receipt.commit_id | length) > 0' \
+        "$WORK/rename.json" > /dev/null \
+        || { echo "libra browser rename-dir JSON is invalid" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get --data-urlencode "path=$path" \
+        -o "$WORK/tree-after.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tree") || return 1
+    [ "$code" = 200 ] && jq -e --arg old "$old" --arg new "$new" \
+        '.req_result == true and all(.data.tree_items[]; .name != $old) and any(.data.tree_items[]; .name == $new and .content_type == "directory")' \
+        "$WORK/tree-after.json" > /dev/null \
+        || { echo "mega2 project tree does not show the renamed directory (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || leak_rc=$?
+    [ "$leak_rc" -eq 1 ] \
+        || { echo "browser rename-dir token was persisted or the work directory scan failed" >&2; return 1; }
+    printf 'browser directory renamed: %s -> %s\n' "$old" "$new"
+}
+
+case_libra_browser_list_tags() {
+    local WORK="$WORK/browser-list-tags" path="/" tag="bb71-$RUN_ID"
+    local message="bb71 annotated fixture $RUN_ID" token="${MEGA2_IT_SEED_TOKEN:-}"
+    local left code leak_rc=0 browser_names api_names browser_total api_total
+    local tag_attempted=false cleanup_ok=false
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    # Invoked indirectly by the RETURN trap below.
+    # shellcheck disable=SC2329
+    cleanup_bb71_tag() {
+        trap - RETURN
+        local cleanup_code=000 cleanup_left cleanup_timeout
+        if [ "$tag_attempted" = true ]; then
+            printf 'Authorization: Bearer %s\n' "$token" > "$WORK/cleanup.header"
+            chmod 600 "$WORK/cleanup.header"
+            cleanup_left=$((deadline - SECONDS))
+            if [ "$cleanup_left" -gt 0 ]; then
+                cleanup_timeout=$cleanup_left
+                [ "$cleanup_timeout" -le 5 ] || cleanup_timeout=5
+                cleanup_code=$(curl -sS --connect-timeout 5 --max-time "$cleanup_timeout" -X DELETE \
+                    -H @"$WORK/cleanup.header" -o "$WORK/delete-tag.out" -w '%{http_code}' \
+                    "$MEGA2_BASE_URL/api/v1/tags/$tag") || cleanup_code=000
+            fi
+            rm -f "$WORK/cleanup.header"
+            if [ "$cleanup_code" = 200 ] && jq -e --arg name "$tag" \
+                '.req_result == true and .data.deleted_tag == $name' "$WORK/delete-tag.out" > /dev/null; then
+                cleanup_ok=true
+                printf 'cleaned root tag: %s\n' "$tag"
+            elif [ "$cleanup_code" != 404 ]; then
+                printf 'warning: root tag cleanup failed (HTTP %s): %s\n' "$cleanup_code" "$tag" >&2
+            fi
+        fi
+        rm -f "$WORK/auth.header"
+        return 0
+    }
+    trap cleanup_bb71_tag RETURN
+    jq -n --arg name "$tag" --arg message "$message" \
+        '{name: $name, message: $message}' > "$WORK/tag.json" || return 1
+    printf 'Authorization: Bearer %s\n' "$token" > "$WORK/auth.header"
+    chmod 600 "$WORK/auth.header"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    tag_attempted=true
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -H @"$WORK/auth.header" \
+        -H 'Content-Type: application/json' --data @"$WORK/tag.json" \
+        -o "$WORK/tag.out" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tags") || return 1
+    rm -f "$WORK/auth.header"
+    [ "$code" = 200 ] && jq -e --arg name "$tag" --arg message "$message" \
+        '.req_result == true and .data.name == $name and .data.object_type == "commit" and .data.message == $message and .data.tag_id != .data.object_id' \
+        "$WORK/tag.out" > /dev/null \
+        || { echo "annotated root tag creation failed (HTTP $code)" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" \
+        --list-tags --page 1 --per-page 2 "$path" \
+        > "$WORK/browser.json" 2> "$WORK/browser.err" \
+        || { echo "libra browser root tag listing failed" >&2; return 1; }
+    [ ! -s "$WORK/browser.err" ] \
+        || { echo "libra browser root tag listing wrote unexpected stderr" >&2; return 1; }
+    jq -e --arg server "$MEGA2_BASE_URL" --arg path "$path" \
+        '.ok == true and .command == "mega2 browser" and .data.operation == "list-tags" and .data.server == $server and .data.path == $path and .data.page == 1 and .data.per_page == 2 and (.data.total | type) == "number" and .data.total >= 1 and (.data.items | type) == "array"' \
+        "$WORK/browser.json" > /dev/null \
+        || { echo "libra browser list-tags JSON is invalid" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" --get \
+        --data-urlencode 'page=1' --data-urlencode 'per_page=2' --data-urlencode 'path=/' \
+        -o "$WORK/tags.json" -w '%{http_code}' "$MEGA2_BASE_URL/api/v1/tags/list") || return 1
+    [ "$code" = 200 ] && jq -e \
+        '.req_result == true and (.data.total | type) == "number" and (.data.items | type) == "array"' \
+        "$WORK/tags.json" > /dev/null \
+        || { echo "mega2 root tag list response is invalid (HTTP $code)" >&2; return 1; }
+    browser_names=$(jq -c '[.data.items[].name]' "$WORK/browser.json") || return 1
+    api_names=$(jq -c '[.data.items[].name]' "$WORK/tags.json") || return 1
+    browser_total=$(jq -r '.data.total' "$WORK/browser.json") || return 1
+    api_total=$(jq -r '.data.total' "$WORK/tags.json") || return 1
+    [ "$browser_names" = "$api_names" ] && [ "$browser_total" = "$api_total" ] \
+        || { echo "libra browser root tag page differs from the API" >&2; return 1; }
+    cleanup_bb71_tag
+    [ "$cleanup_ok" = true ] || return 1
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || leak_rc=$?
+    [ "$leak_rc" -eq 1 ] \
+        || { echo "browser list-tags token was persisted or the work directory scan failed" >&2; return 1; }
+    printf 'root tag page matched: %s of %s\n' "$(jq -r '.data.items | length' "$WORK/browser.json")" "$browser_total"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -1051,5 +1199,7 @@ run_case "LIBRA browser list text" case_libra_browser_list_text
 run_case "LIBRA browser create dir" case_libra_browser_create_dir
 run_case "LIBRA browser delete dir" case_libra_browser_delete_dir
 run_case "LIBRA browser move dir" case_libra_browser_move_dir
+run_case "LIBRA browser rename dir" case_libra_browser_rename_dir
+run_case "LIBRA browser list tags" case_libra_browser_list_tags
 
 finish
