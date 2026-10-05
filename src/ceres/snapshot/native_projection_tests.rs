@@ -27,6 +27,161 @@ use crate::{
 
 type Files = BTreeMap<String, Vec<u8>>;
 
+#[tokio::test]
+async fn mst2_native_retention_prepares_full_shared_radix_closure_once() {
+    use crate::ceres::snapshot::retention_dag::MetadataDagLimits;
+
+    let temp = tempfile::tempdir().unwrap();
+    let handler = handler(temp.path()).await;
+    let mut files = Files::new();
+    for prefix in ["/project/alpha", "/project/beta"] {
+        for index in 0..129 {
+            files.insert(
+                format!("{prefix}/f{index:03}"),
+                format!("raw-{index}").into_bytes(),
+            );
+        }
+        files.insert(format!("{prefix}/nested/file"), b"shared nested".to_vec());
+    }
+    let (_, root) = persist_commit(&handler, &files, vec![], "retention closure").await;
+    let scope = build_directory_page(&handler, &root, "/project")
+        .await
+        .unwrap();
+    let prepared = super::prepare_native_metadata_retention(
+        &handler,
+        &root,
+        "/project",
+        MetadataDagLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.fixed_root_tree_oid(), root.id.to_tagged_string());
+    assert_eq!(prepared.scope(), "/project");
+    assert_eq!(prepared.metadata_codec(), 1);
+    assert_eq!(prepared.schema_version(), 2);
+    assert_eq!(prepared.dag().root(), scope.page_id);
+    assert!(prepared.dag().payloads().iter().any(|payload| {
+        matches!(
+            mst2_codec::metapage::Page::decode(&payload.bytes)
+                .unwrap()
+                .0,
+            mst2_codec::metapage::Page::Branch { .. }
+        )
+    }));
+    assert!(prepared.dag().payloads().len() > 3);
+    let root_node = format!("page:sha256:{}", super::hex(&scope.page_id));
+    assert_eq!(
+        prepared
+            .dag()
+            .edges()
+            .iter()
+            .filter(|edge| edge.parent == root_node)
+            .count(),
+        1
+    );
+
+    // Remove all directory memo entries: the prepared hit must return its Arc
+    // without rebuilding or walking even this fixed view's child Git trees.
+    {
+        let mut state = handler
+            .storage
+            .native_projection_cache
+            .state
+            .lock()
+            .unwrap();
+        state.pages.clear();
+        state.retained_payload_bytes = 0;
+    }
+    let again = super::prepare_native_metadata_retention(
+        &handler,
+        &root,
+        "/project",
+        MetadataDagLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert!(Arc::ptr_eq(prepared.dag(), again.dag()));
+    {
+        let state = handler
+            .storage
+            .native_projection_cache
+            .state
+            .lock()
+            .unwrap();
+        assert!(
+            state.pages.is_empty(),
+            "prepare hit must not rebuild directory projections"
+        );
+    }
+    let tightened = super::prepare_native_metadata_retention(
+        &handler,
+        &root,
+        "/project",
+        MetadataDagLimits {
+            nodes: 1,
+            ..MetadataDagLimits::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        tightened.code,
+        crate::ceres::snapshot::error::SnapshotErrorCode::LimitExceeded
+    );
+}
+
+#[tokio::test]
+async fn mst2_native_retention_checks_source_budgets_before_unknown_child_fetch() {
+    use crate::ceres::snapshot::{error::SnapshotErrorCode, retention_dag::MetadataDagLimits};
+
+    let temp = tempfile::tempdir().unwrap();
+    let handler = handler(temp.path()).await;
+    let unknown = ObjectHash::from_hex_for_kind(HashKind::Sha1, &"a".repeat(40)).unwrap();
+    let root = Tree::from_tree_items_with_kind(
+        HashKind::Sha1,
+        vec![TreeItem::new(
+            TreeItemMode::Tree,
+            unknown,
+            "unknown-child".into(),
+        )],
+    )
+    .unwrap();
+    for limits in [
+        MetadataDagLimits {
+            nodes: 1,
+            ..MetadataDagLimits::default()
+        },
+        MetadataDagLimits {
+            edges: 0,
+            ..MetadataDagLimits::default()
+        },
+        MetadataDagLimits {
+            entries: 0,
+            ..MetadataDagLimits::default()
+        },
+        MetadataDagLimits {
+            payload_bytes: 19,
+            ..MetadataDagLimits::default()
+        },
+    ] {
+        let error = super::prepare_native_metadata_retention(&handler, &root, "/", limits)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            SnapshotErrorCode::LimitExceeded,
+            "budget must reject before querying the nonexistent tree: {error}"
+        );
+    }
+    let state = handler
+        .storage
+        .native_projection_cache
+        .state
+        .lock()
+        .unwrap();
+    assert!(state.retention_dags.is_empty());
+}
+
 async fn handler(temp: &std::path::Path) -> MonoApiService {
     let config = isolated_config(temp.join("config"));
     let object_storage = build_object_storage(&config.object_storage).await.unwrap();

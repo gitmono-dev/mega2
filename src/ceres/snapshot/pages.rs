@@ -7,7 +7,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -23,12 +23,15 @@ use mst2_codec::{
 use sea_orm::ActiveValue::Set;
 use sha2::{Digest, Sha256};
 
+pub use crate::ceres::snapshot::projection_observation::ProjectionWork;
 use crate::{
     ceres::{
         api_service::ApiHandler,
         snapshot::{
             error::{SnapshotError, SnapshotErrorCode},
+            projection_observation::NATIVE_PROJECTION_REVISION,
             resolver::FsKind,
+            retention_dag::{MetadataDagBuilder, MetadataDagLimits, ValidatedMetadataDag},
             view::hex,
         },
     },
@@ -81,28 +84,6 @@ impl DescendantPathBudget {
     }
 }
 
-/// Actual work in one on-demand native projection. These are memoization
-/// counters, not durable publication or retention accounting. Page counters
-/// cover returned directory-root pages only: the codec does not expose the
-/// radix pages it internally encodes while building a root.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProjectionWork {
-    pub directories_rebuilt: u64,
-    pub reused_subtree_roots: u64,
-    pub directory_root_pages_built: u64,
-    pub directory_root_page_bytes_built: u64,
-    pub directory_root_pages_reused: u64,
-    pub directory_root_page_bytes_reused: u64,
-    pub directory_entries_scanned: u64,
-    pub scope_path_entries_examined: u64,
-    /// Backend tree requests, excluding the caller-supplied fixed root tree.
-    pub tree_fetches: u64,
-    pub verified_blob_hits: u64,
-    pub verified_blob_misses: u64,
-    pub raw_bytes_fetched: u64,
-    pub raw_bytes_hashed: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NativeProjectionKey {
     source_domain: &'static str,
@@ -128,7 +109,7 @@ impl NativeProjectionKey {
             fs_semantics: FS_SEMANTICS_LINUX_CODE_V1,
             access_projection: ACCESS_PROJECTION_EXACT_FULL,
             verification_revision: MST2_VERIFICATION_VERSION,
-            projection_revision: 1,
+            projection_revision: NATIVE_PROJECTION_REVISION,
         }
     }
 }
@@ -144,9 +125,67 @@ pub(crate) struct NativeProjectionCache {
 struct NativeProjectionCacheState {
     pages: HashMap<NativeProjectionKey, Arc<BuiltDirectory>>,
     retained_payload_bytes: usize,
+    retention_dags: HashMap<NativeRetentionKey, Arc<ValidatedMetadataDag>>,
+    retained_dag_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NativeRetentionKey {
+    projection: NativeProjectionKey,
+    scope: String,
 }
 
 impl NativeProjectionCache {
+    fn retention_dag(&self, key: &NativeRetentionKey) -> Option<Arc<ValidatedMetadataDag>> {
+        self.state.lock().ok()?.retention_dags.get(key).cloned()
+    }
+
+    fn insert_retention_dag(&self, key: NativeRetentionKey, dag: Arc<ValidatedMetadataDag>) {
+        // The memo has one aggregate residency bound, independent of the page
+        // cache. Caller Arcs may outlive eviction; this is no request admission.
+        const MAX_DAG_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
+        const MAX_DAG_ENTRIES: usize = 16;
+        self.insert_retention_dag_with_budget(key, dag, MAX_DAG_RESIDENT_BYTES, MAX_DAG_ENTRIES);
+    }
+
+    fn insert_retention_dag_with_budget(
+        &self,
+        key: NativeRetentionKey,
+        dag: Arc<ValidatedMetadataDag>,
+        maximum_bytes: usize,
+        maximum_entries: usize,
+    ) {
+        let Some(bytes) = dag
+            .residency_bytes()
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    std::mem::size_of::<NativeRetentionKey>()
+                        + std::mem::size_of::<Arc<ValidatedMetadataDag>>(),
+                )
+            })
+            .and_then(|bytes| bytes.checked_add(key.scope.capacity()))
+            .and_then(|bytes| bytes.checked_add(key.projection.tree_oid.capacity()))
+        else {
+            return;
+        };
+        if bytes > maximum_bytes || maximum_entries == 0 {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            if state.retention_dags.contains_key(&key) {
+                return;
+            }
+            if state.retention_dags.len() >= maximum_entries
+                || state.retained_dag_bytes > maximum_bytes - bytes
+            {
+                state.retention_dags.clear();
+                state.retained_dag_bytes = 0;
+            }
+            state.retained_dag_bytes += bytes;
+            state.retention_dags.insert(key, dag);
+        }
+    }
+
     fn get(&self, oid: ObjectHash) -> Option<Arc<BuiltDirectory>> {
         // A poisoned optimization cache is a miss, not a serving failure.
         self.state
@@ -207,6 +246,195 @@ pub struct DirEntry {
     pub content_digest: Option<[u8; 32]>,
     /// Child directory page id (directories only).
     pub directory_root: Option<[u8; 32]>,
+    /// Preserve the source hash kind when preparing a cached child closure.
+    directory_tree_oid: Option<ObjectHash>,
+}
+
+/// Fixed source/profile identity for a prepared metadata closure. This grants
+/// no authorization, durable retention or coverage of file/chunk payloads.
+#[derive(Debug)]
+pub struct PreparedNativeMetadataRetention {
+    key: NativeRetentionKey,
+    dag: Arc<ValidatedMetadataDag>,
+}
+
+impl PreparedNativeMetadataRetention {
+    #[cfg(test)]
+    pub(crate) fn test_installation(dag: Arc<ValidatedMetadataDag>, scope: &str) -> Self {
+        let tree_oid =
+            ObjectHash::from_hex_for_kind(git_internal::hash::HashKind::Sha1, &"a".repeat(40))
+                .unwrap();
+        Self {
+            key: NativeRetentionKey {
+                projection: NativeProjectionKey::new(tree_oid),
+                scope: scope.to_owned(),
+            },
+            dag,
+        }
+    }
+    pub(crate) fn install_plan(
+        &self,
+    ) -> Result<super::metadata_install::MetadataInstallPlan, SnapshotError> {
+        use super::metadata_install::{MetadataInstallIdentity, MetadataInstallPlan};
+        let key = &self.key.projection;
+        MetadataInstallPlan::from_validated(
+            MetadataInstallIdentity {
+                source_domain: key.source_domain.to_owned(),
+                tagged_root_tree_oid: key.tree_oid.clone(),
+                scope: self.key.scope.clone(),
+                schema_version: key.schema_version,
+                metadata_codec: key.metadata_codec,
+                materialization_policy: key.materialization_policy,
+                fs_semantics: key.fs_semantics,
+                access_projection: key.access_projection,
+                verification_revision: key.verification_revision,
+                projection_revision: key.projection_revision,
+            },
+            &self.dag,
+        )
+    }
+    pub fn fixed_root_tree_oid(&self) -> &str {
+        &self.key.projection.tree_oid
+    }
+    pub fn scope(&self) -> &str {
+        &self.key.scope
+    }
+    pub fn metadata_codec(&self) -> u16 {
+        self.key.projection.metadata_codec
+    }
+    pub fn schema_version(&self) -> u16 {
+        self.key.projection.schema_version
+    }
+    pub fn dag(&self) -> &Arc<ValidatedMetadataDag> {
+        &self.dag
+    }
+}
+
+/// Explicit preparation, separate from resolve/lease success. A hit returns
+/// the immutable Arc before traversing any child Git tree. A miss collects
+/// from existing native codec entries, rebuilding an evicted child as needed.
+pub async fn prepare_native_metadata_retention<T: ApiHandler + ?Sized>(
+    handler: &T,
+    root_tree: &Tree,
+    scope: &str,
+    limits: MetadataDagLimits,
+) -> Result<PreparedNativeMetadataRetention, SnapshotError> {
+    crate::ceres::snapshot::view::validate_scope_relative_path(scope)?;
+    if !handler.native_snapshot_projection() {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            "retention preparation requires native Git projection",
+        ));
+    }
+    let storage = handler.get_context();
+    let limits = limits.effective();
+    let key = NativeRetentionKey {
+        projection: NativeProjectionKey::new(root_tree.id),
+        scope: scope.to_owned(),
+    };
+    if let Some(dag) = storage.native_projection_cache.retention_dag(&key) {
+        dag.check_limits(limits)?;
+        return Ok(PreparedNativeMetadataRetention { key, dag });
+    }
+    let mut projection_budget = MetadataProjectionBudget::new(limits);
+    let mut work = ProjectionWork::default();
+    let root = if scope == "/" {
+        build_subtree_inner(
+            handler,
+            &storage,
+            root_tree,
+            scope,
+            true,
+            &mut work,
+            Some(&mut projection_budget),
+        )
+        .await?
+    } else {
+        let tree = fetch_tree_with_work(handler, root_tree, scope, &mut work).await?;
+        build_subtree_inner(
+            handler,
+            &storage,
+            &tree,
+            scope,
+            true,
+            &mut work,
+            Some(&mut projection_budget),
+        )
+        .await?
+    };
+    let root_id = root.page_id;
+    let mut builder = MetadataDagBuilder::new(limits);
+    let mut scheduled = HashSet::from([root_id]);
+    let mut pending = vec![(root, scope.to_owned())];
+    while let Some((directory, path)) = pending.pop() {
+        builder.add_directory(&directory.page_bytes, &directory.codec_entries)?;
+        for entry in directory
+            .entries
+            .iter()
+            .filter(|entry| entry.fs_kind == FsKind::Directory)
+        {
+            let child_id = entry.directory_root.ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "directory lacks its metadata root",
+                )
+            })?;
+            if !scheduled.insert(child_id) {
+                continue;
+            }
+            let child_oid = entry.directory_tree_oid.ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "directory lacks its tagged source identity",
+                )
+            })?;
+            let child_path = if path == "/" {
+                format!("/{}", entry.name)
+            } else {
+                format!("{path}/{}", entry.name)
+            };
+            let child = if let Some(hit) =
+                cached_subtree(&storage, child_oid, &child_path, true, &mut work)?
+            {
+                hit
+            } else {
+                let tree = handler
+                    .get_tree_by_hash(&entry.oid)
+                    .await
+                    .map_err(|error| {
+                        SnapshotError::new(SnapshotErrorCode::Internal, error.to_string())
+                    })?;
+                if tree.id != child_oid {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::IntegrityError,
+                        "retention child tree identity mismatch",
+                    ));
+                }
+                build_subtree_inner(
+                    handler,
+                    &storage,
+                    &tree,
+                    &child_path,
+                    true,
+                    &mut work,
+                    Some(&mut projection_budget),
+                )
+                .await?
+            };
+            if child.page_id != child_id {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "retention child page disagrees with fixed parent",
+                ));
+            }
+            pending.push((child, child_path));
+        }
+    }
+    let dag = Arc::new(builder.finish(root_id)?);
+    storage
+        .native_projection_cache
+        .insert_retention_dag(key.clone(), Arc::clone(&dag));
+    Ok(PreparedNativeMetadataRetention { key, dag })
 }
 
 /// Build the MTP2 page for one directory of the fixed view. `rel_path` is
@@ -279,7 +507,108 @@ async fn build_subtree<T: ApiHandler + ?Sized>(
     native: bool,
     work: &mut ProjectionWork,
 ) -> Result<Arc<BuiltDirectory>, SnapshotError> {
+    build_subtree_inner(handler, storage, tree, rel_path, native, work, None).await
+}
+
+struct MetadataProjectionBudget {
+    limits: MetadataDagLimits,
+    seen: HashSet<ObjectHash>,
+    required: HashSet<ObjectHash>,
+    edges: HashSet<(ObjectHash, ObjectHash)>,
+    entries: usize,
+    encoded_entry_bytes: u64,
+}
+
+impl MetadataProjectionBudget {
+    fn new(limits: MetadataDagLimits) -> Self {
+        Self {
+            limits,
+            seen: HashSet::new(),
+            required: HashSet::new(),
+            edges: HashSet::new(),
+            entries: 0,
+            encoded_entry_bytes: 0,
+        }
+    }
+
+    fn tree(&mut self, tree: &Tree) -> Result<(), SnapshotError> {
+        let failed = || {
+            SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "native metadata source projection budget exceeded",
+            )
+        };
+        if self.seen.contains(&tree.id) {
+            return Ok(());
+        }
+        self.require_node(tree.id)?;
+        self.entries = self
+            .entries
+            .checked_add(tree.tree_items.len())
+            .filter(|count| *count <= self.limits.entries)
+            .ok_or_else(failed)?;
+        self.encoded_entry_bytes = self
+            .encoded_entry_bytes
+            .checked_add(mst2_codec::metapage::HEADER_LEN as u64)
+            .filter(|bytes| *bytes <= self.limits.payload_bytes)
+            .ok_or_else(failed)?;
+        for item in &tree.tree_items {
+            let kind = FsKind::from_git_mode(item.mode).ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::UnsupportedEntry,
+                    "unsupported entry in native retention projection",
+                )
+            })?;
+            let value_bytes = if kind == FsKind::Directory { 32 } else { 40 };
+            self.encoded_entry_bytes = self
+                .encoded_entry_bytes
+                .checked_add((3 + item.name.len() + value_bytes) as u64)
+                .filter(|bytes| *bytes <= self.limits.payload_bytes)
+                .ok_or_else(failed)?;
+            if kind == FsKind::Directory {
+                self.require_node(item.id)?;
+                if !self.edges.contains(&(tree.id, item.id)) {
+                    if self.edges.len() >= self.limits.edges {
+                        return Err(failed());
+                    }
+                    self.edges.insert((tree.id, item.id));
+                }
+            }
+        }
+        if self.required.len() > self.limits.nodes {
+            return Err(failed());
+        }
+        self.seen.insert(tree.id);
+        Ok(())
+    }
+
+    fn require_node(&mut self, id: ObjectHash) -> Result<(), SnapshotError> {
+        if !self.required.contains(&id) {
+            if self.required.len() >= self.limits.nodes {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::LimitExceeded,
+                    "native metadata source node budget exceeded",
+                ));
+            }
+            self.required.insert(id);
+        }
+        Ok(())
+    }
+}
+
+async fn build_subtree_inner<T: ApiHandler + ?Sized>(
+    handler: &T,
+    storage: &Storage,
+    tree: &Tree,
+    rel_path: &str,
+    native: bool,
+    work: &mut ProjectionWork,
+    mut budget: Option<&mut MetadataProjectionBudget>,
+) -> Result<Arc<BuiltDirectory>, SnapshotError> {
     crate::ceres::snapshot::view::validate_scope_relative_path(rel_path)?;
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.tree(tree)?;
+    }
     if let Some(hit) = cached_subtree(storage, tree.id, rel_path, native, work)? {
         return Ok(hit);
     }
@@ -344,13 +673,14 @@ async fn build_subtree<T: ApiHandler + ?Sized>(
                             "fetched child tree identity mismatch",
                         ));
                     }
-                    Box::pin(build_subtree(
+                    Box::pin(build_subtree_inner(
                         handler,
                         storage,
                         &child_tree,
                         &child_rel,
                         native,
                         work,
+                        budget.as_deref_mut(),
                     ))
                     .await?
                 };
@@ -363,6 +693,7 @@ async fn build_subtree<T: ApiHandler + ?Sized>(
                     size: None,
                     content_digest: None,
                     directory_root: Some(child_page.page_id),
+                    directory_tree_oid: Some(child_oid),
                 });
             }
             FsKind::Regular | FsKind::Executable | FsKind::Symlink => {
@@ -420,6 +751,7 @@ async fn build_subtree<T: ApiHandler + ?Sized>(
                     size: Some(size),
                     content_digest: Some(digest),
                     directory_root: None,
+                    directory_tree_oid: None,
                 });
             }
         }
@@ -669,6 +1001,10 @@ pub fn hex_of(id: &[u8; 32]) -> String {
 #[cfg(test)]
 #[path = "native_projection_tests.rs"]
 mod native_projection_tests;
+
+#[cfg(test)]
+#[path = "retention_prepare_tests.rs"]
+mod retention_prepare_tests;
 
 #[cfg(test)]
 mod tests {

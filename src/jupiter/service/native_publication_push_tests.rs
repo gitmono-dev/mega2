@@ -274,19 +274,32 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
     let id=wh03_enqueue_push(&storage,&path,&tip.id.to_string(),&first,&payload).await;
     assert!(matches!(wh03_exec(&storage,id).await,ExecuteOutcome::Done{..}));
     let state=api_state(storage.clone()).await;
-    let (status,v1)=http_resolve(state.clone(),"/").await;
+    let ((status,v1),first_observations)=crate::ceres::snapshot::projection_observation::with_observations(http_resolve(state.clone(),"/")).await;
     assert_eq!(status,200,"{v1}");
+    assert_eq!(first_observations.len(),1);
+    let first_identity=first_observations[0].test_identity();
+    assert_eq!(first_identity["snapshot_id"],v1["descriptor"]["snapshot_id"]);
+    assert_eq!(first_identity["metadata_root"],v1["descriptor"]["metadata_root"]);
+    assert_eq!(first_identity["namespace_view_id"],v1["descriptor"]["namespace_view_id"]);
+    assert_eq!(first_identity["instance_id"],v1["descriptor"]["instance_id"]);
+    assert_eq!(first_identity["native_publication_sequence"],v1["publication_sequence"]);
+    assert_eq!(first_identity["native_writer_epoch"],v1["writer_epoch"]);
+    assert!(first_identity["native_certificate_receipt_id"].as_u64().unwrap()>0);
+    assert!(!first_identity["request_id"].as_str().unwrap().is_empty());
     let (status,subscope)=http_resolve(state.clone(),&path).await;
     assert_eq!(status,200,"{subscope}");
     assert_eq!(v1["publication_sequence"],subscope["publication_sequence"]);
     assert_eq!(v1["writer_epoch"],subscope["writer_epoch"]);
     let root_v1=storage.mono_storage().get_main_ref("/").await.unwrap().unwrap();
-    let _ = root_v1;
+    assert_eq!(first_identity["root_commit_oid"],git_internal::hash::ObjectHash::from_hex_for_kind(git_internal::hash::get_hash_kind(),&root_v1.ref_commit_hash).unwrap().to_tagged_string());
+    assert_eq!(first_identity["root_tree_oid"],git_internal::hash::ObjectHash::from_hex_for_kind(git_internal::hash::get_hash_kind(),&root_v1.ref_tree_hash).unwrap().to_tagged_string());
+    let native_v1=storage.mono_storage().read_native_publication_head(storage.config().mst2.instance_uuid.as_deref().unwrap()).await.unwrap();
+    assert_eq!(first_identity["native_certificate_receipt_id"].as_u64(),Some(native_v1.token.certificate.unwrap() as u64));
     let captured=Arc::new(tokio::sync::Barrier::new(2));
     let release=Arc::new(tokio::sync::Barrier::new(2));
     let task_state=state.clone();let task_captured=captured.clone();let task_release=release.clone();
     let mut reader=tokio::spawn(async move {
-        crate::api::router::snapshot_router::with_native_resolve_barriers(task_captured,task_release,http_resolve(task_state,"/")).await
+        crate::ceres::snapshot::projection_observation::with_observations(crate::api::router::snapshot_router::with_native_resolve_barriers(task_captured,task_release,http_resolve(task_state,"/"))).await
     });
     tokio::time::timeout(Duration::from_secs(5),captured.wait()).await.unwrap();
     let first_commit=storage.mono_storage().get_commit_by_hash(&first).await.unwrap().unwrap();
@@ -296,10 +309,23 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
     let id=wh03_enqueue_push(&storage,&path,&first,&next,&next_payload).await;
     assert!(matches!(wh03_exec(&storage,id).await,ExecuteOutcome::Done{..}));
     tokio::time::timeout(Duration::from_secs(5),release.wait()).await.unwrap();
-    let (status,delayed)=tokio::time::timeout(Duration::from_secs(10),&mut reader).await.unwrap().unwrap();
+    let ((status,delayed),delayed_observations)=tokio::time::timeout(Duration::from_secs(10),&mut reader).await.unwrap().unwrap();
     assert_eq!(status,200,"{delayed}");assert_eq!(delayed["descriptor"],v1["descriptor"]);
     assert_eq!(delayed["publication_sequence"],v1["publication_sequence"]);
-    let (status,v2)=http_resolve(state,"/").await;
+    assert_eq!(delayed_observations.len(),1);
+    let delayed_identity=delayed_observations[0].test_identity();
+    for field in ["root_commit_oid","root_tree_oid","native_certificate_receipt_id","native_writer_epoch","native_publication_sequence","snapshot_id","metadata_root"] {
+        assert_eq!(delayed_identity[field],first_identity[field],"{field} mixed with a later publication");
+    }
+    let ((status,v2),next_observations)=crate::ceres::snapshot::projection_observation::with_observations(http_resolve(state.clone(),"/")).await;
     assert_eq!(status,200,"{v2}");assert_eq!(v2["publication_sequence"],"2");
     assert_ne!(v2["descriptor"]["snapshot_id"],v1["descriptor"]["snapshot_id"]);
+    assert_eq!(next_observations.len(),1);
+    let next_identity=next_observations[0].test_identity();
+    assert_eq!(next_identity["native_publication_sequence"],v2["publication_sequence"]);
+    assert_eq!(next_identity["snapshot_id"],v2["descriptor"]["snapshot_id"]);
+    assert_ne!(next_identity["native_certificate_receipt_id"],first_identity["native_certificate_receipt_id"]);
+    let ((status,_),failed_observations)=crate::ceres::snapshot::projection_observation::with_observations(http_resolve(state,"/absent-observation-scope")).await;
+    assert_eq!(status,404);
+    assert!(failed_observations.is_empty(),"failed projection emitted success observation");
 }
