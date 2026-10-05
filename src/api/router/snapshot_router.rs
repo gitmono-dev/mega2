@@ -186,12 +186,14 @@ async fn reject_oversize_body(
 /// (spec 14 §5 INVALID_REQUEST). Size is enforced by the router layers.
 #[allow(clippy::result_large_err)]
 pub(crate) fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
-    serde_json::from_slice(body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::InvalidRequest,
-            format!("malformed request body: {e}"),
-        ))
-    })
+    request::validate_json_keys(body)
+        .and_then(|()| serde_json::from_slice(body))
+        .map_err(|e| {
+            mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                format!("malformed request body: {e}"),
+            ))
+        })
 }
 
 /// Bearer-token check shared by the auth middleware; the parsing rule is the

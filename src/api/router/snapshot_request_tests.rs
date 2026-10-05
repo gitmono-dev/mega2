@@ -200,6 +200,8 @@ async fn mst2_json_closed_dtos_duplicates_and_malformed_input_do_not_renew() {
         (&renew, br#"{"lease_seconds":3600,"lease_seconds":120}"#),
         (&renew, br#"{"lease_seconds":3600,"\u006cease_seconds":120}"#),
         (&renew, br#"{"lease_seconds":null,"lease_seconds":120}"#),
+        (&renew, br#"{"lease_seconds":null,"\u006cease_seconds":120}"#),
+        (&renew, br#"{"lease_seconds":null,"lease_seconds":null}"#),
         (&renew, br#"{"lease_seconds":3600,"extra":true}"#),
         (&renew, br#"{"lease_seconds":"120"}"#),
         (&renew, br#"{"lease_seconds":1.5}"#),
