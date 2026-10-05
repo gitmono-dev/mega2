@@ -126,6 +126,14 @@ tokio::task_local! {
 #[cfg(test)]
 tokio::task_local! {
     static NATIVE_RESOLVE_BARRIERS: (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+    static REJECT_NATIVE_OBSERVATION_SOURCE: bool;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_rejected_native_observation_source<F: std::future::Future>(
+    future: F,
+) -> F::Output {
+    REJECT_NATIVE_OBSERVATION_SOURCE.scope(true, future).await
 }
 
 #[cfg(test)]
@@ -460,11 +468,21 @@ async fn resolve(
                 )
             })
             .and_then(|(commit, tree)| {
+                let certificate = head.token.certificate;
+                #[cfg(test)]
+                let certificate = if REJECT_NATIVE_OBSERVATION_SOURCE
+                    .try_with(|reject| *reject)
+                    .unwrap_or(false)
+                {
+                    None
+                } else {
+                    certificate
+                };
                 NativeResolveSource::capture(
                     &head.instance_id,
                     commit,
                     tree,
-                    head.token.certificate,
+                    certificate,
                     head.token.epoch,
                     head.token.sequence,
                 )
@@ -472,6 +490,9 @@ async fn resolve(
         native_source = match observation_source {
             Ok(source) => Some(source),
             Err(_) => {
+                if let Some(sink) = &state.storage.projection_observation_sink {
+                    sink.reject_binding();
+                }
                 tracing::warn!("native resolve observation source rejected");
                 None
             }
@@ -561,8 +582,18 @@ async fn resolve(
             projection_work,
             projection_elapsed,
         ) {
-            Ok(observation) => observation.emit(),
-            Err(_) => tracing::warn!("native resolve observation context rejected"),
+            Ok(observation) => {
+                if let Some(sink) = &state.storage.projection_observation_sink {
+                    let _ = sink.enqueue(&observation);
+                }
+                observation.emit();
+            }
+            Err(_) => {
+                if let Some(sink) = &state.storage.projection_observation_sink {
+                    sink.reject_binding();
+                }
+                tracing::warn!("native resolve observation context rejected");
+            }
         }
     }
 

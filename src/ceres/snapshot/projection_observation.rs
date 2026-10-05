@@ -7,6 +7,7 @@ use mst2_codec::descriptor::{
     ACCESS_PROJECTION_EXACT_FULL, FS_SEMANTICS_LINUX_CODE_V1, MATERIALIZATION_POLICY_GIT_RAW_V1,
     METADATA_CODEC, SCHEMA_VERSION, ServingDescriptor,
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ pub(crate) const NATIVE_PROJECTION_REVISION: u16 = 1;
 
 /// Work in one directory projection. Page counters cover returned directory
 /// roots, excluding codec-internal radix encoding and later route traversal.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ProjectionWork {
     pub directories_rebuilt: u64,
     /// Cache-hit boundary visits, not all descendants or unique source OIDs.
@@ -73,6 +74,44 @@ pub(crate) struct NativeProjectionObservation {
     request_id: String,
     projection_elapsed_micros: u64,
     work: ProjectionWork,
+}
+
+/// Closed wire fields, borrowed only from the already validated observation.
+#[derive(Serialize)]
+pub(crate) struct ProjectionWireRecord<'a> {
+    observation_revision: u16,
+    phase: &'static str,
+    source_domain: &'static str,
+    request_id: &'a str,
+    instance_id: String,
+    #[serde(serialize_with = "tagged_oid")]
+    root_commit_oid: ObjectHash,
+    #[serde(serialize_with = "tagged_oid")]
+    root_tree_oid: ObjectHash,
+    native_certificate_receipt_id: u64,
+    native_writer_epoch: u64,
+    native_publication_sequence: u64,
+    scope: &'a str,
+    schema_version: u16,
+    metadata_codec: u16,
+    materialization_policy: u16,
+    fs_semantics: u16,
+    access_projection: u16,
+    verification_revision: i32,
+    projection_revision: u16,
+    namespace_view_id: &'a str,
+    snapshot_id: &'a str,
+    metadata_root: &'a str,
+    projection_elapsed_micros: u64,
+    page_counter_scope: &'static str,
+    codec_radix_work: &'static str,
+    #[serde(flatten)]
+    work: &'a ProjectionWork,
+    message: &'static str,
+}
+
+fn tagged_oid<S: serde::Serializer>(oid: &ObjectHash, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&oid.to_tagged_string())
 }
 
 fn invalid() -> SnapshotError {
@@ -156,6 +195,37 @@ impl NativeResolveSource {
 }
 
 impl NativeProjectionObservation {
+    pub(crate) fn wire_record(&self) -> ProjectionWireRecord<'_> {
+        ProjectionWireRecord {
+            observation_revision: 1,
+            phase: "resolve_directory_projection",
+            source_domain: "native-git",
+            request_id: &self.request_id,
+            instance_id: self.source.instance.to_string(),
+            root_commit_oid: self.source.commit,
+            root_tree_oid: self.source.tree,
+            native_certificate_receipt_id: self.source.certificate_receipt_id,
+            native_writer_epoch: self.source.writer_epoch,
+            native_publication_sequence: self.source.publication_sequence,
+            scope: &self.scope,
+            schema_version: SCHEMA_VERSION,
+            metadata_codec: METADATA_CODEC,
+            materialization_policy: MATERIALIZATION_POLICY_GIT_RAW_V1,
+            fs_semantics: FS_SEMANTICS_LINUX_CODE_V1,
+            access_projection: ACCESS_PROJECTION_EXACT_FULL,
+            verification_revision: MST2_VERIFICATION_VERSION,
+            projection_revision: NATIVE_PROJECTION_REVISION,
+            namespace_view_id: &self.namespace_view_id,
+            snapshot_id: &self.snapshot_id,
+            metadata_root: &self.metadata_root,
+            projection_elapsed_micros: self.projection_elapsed_micros,
+            page_counter_scope: "returned-directory-root-pages",
+            codec_radix_work: "NOT_EXPOSED",
+            work: &self.work,
+            message: "native resolve directory projection succeeded",
+        }
+    }
+
     pub(crate) fn emit(self) {
         tracing::debug!(
             target: "mst2::native_projection_observation",
@@ -459,6 +529,7 @@ mod tests {
                 Duration::from_micros(4),
             )
             .unwrap();
+        let wire = serde_json::to_value(observation.wire_record()).unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         tracing::subscriber::with_default(TraceCapture(events.clone()), || observation.emit());
         let events = events.lock().unwrap();
@@ -506,6 +577,19 @@ mod tests {
         ];
         assert_eq!(fields.len(), expected.len());
         assert!(expected.iter().all(|field| fields.contains_key(*field)));
+        let wire = wire.as_object().unwrap();
+        assert_eq!(wire.len(), expected.len());
+        for key in expected {
+            let typed = &wire[key];
+            let expected = if key == "scope" {
+                typed.to_string()
+            } else if let Some(text) = typed.as_str() {
+                text.into()
+            } else {
+                typed.to_string()
+            };
+            assert_eq!(fields[key], expected, "typed observation diverged at {key}");
+        }
         assert_eq!(fields["phase"], "resolve_directory_projection");
         assert_eq!(
             fields["page_counter_scope"],

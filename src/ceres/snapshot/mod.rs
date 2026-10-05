@@ -9,6 +9,7 @@ pub mod error;
 pub mod frame_stream;
 pub mod pages;
 pub(crate) mod projection_observation;
+pub(crate) mod projection_writer;
 pub mod publication;
 pub mod resolver;
 pub mod retention;

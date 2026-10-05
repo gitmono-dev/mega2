@@ -225,6 +225,10 @@ async fn http_resolve(state: crate::api::MonoApiServiceState,scope:&str) -> (u16
 #[tokio::test]
 async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_descriptor() {
     let (_temp,storage,tip,path)=native_fixture().await;
+    #[cfg(unix)]
+    let writer=crate::ceres::snapshot::projection_writer::ProjectionObservationSink::start(_temp.path()).unwrap();
+    #[cfg(unix)]
+    let storage={ let mut storage=storage; storage.projection_observation_sink=Some(writer.clone()); storage };
     let (first,payload)=save_same_tree_commit(&storage,&tip).await;
     let id=wh03_enqueue_push(&storage,&path,&tip.id.to_string(),&first,&payload).await;
     assert!(matches!(wh03_exec(&storage,id).await,ExecuteOutcome::Done{..}));
@@ -283,4 +287,53 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
     let ((status,_),failed_observations)=crate::ceres::snapshot::projection_observation::with_observations(http_resolve(state,"/absent-observation-scope")).await;
     assert_eq!(status,404);
     assert!(failed_observations.is_empty(),"failed projection emitted success observation");
+    #[cfg(unix)]
+    {
+        writer.shutdown(std::time::Instant::now()+Duration::from_secs(5)).await.unwrap();
+        let directory=writer.test_directory(_temp.path());
+        let records=std::fs::read_to_string(directory.join("records.jsonl")).unwrap();
+        let records:Vec<serde_json::Value>=records.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(records.len(),4,"failed resolve must not be a successful observation");
+        for (record,observation) in [(&records[0],&first_observations[0]),(&records[2],&delayed_observations[0]),(&records[3],&next_observations[0])] {
+            let typed=serde_json::to_value(observation.wire_record()).unwrap();
+            assert_eq!(record["payload"],typed,"writer must preserve the full validated operation tuple");
+            assert_eq!(record["payload"].as_object().unwrap().len(),38);
+        }
+        assert_ne!(records[0]["payload"]["request_id"],records[2]["payload"]["request_id"]);
+        let status:serde_json::Value=serde_json::from_slice(&std::fs::read(directory.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status["closed"],true);
+        assert_eq!(status["accepted_records"],4);
+        assert_eq!(status["written_records"],4);
+        assert_eq!(status["first_error_code"],0);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejected_native_observation_source_does_not_change_ready_resolve_and_is_a_sticky_writer_failure() {
+    let (temp,mut storage,tip,path)=native_fixture().await;
+    let (first,payload)=save_same_tree_commit(&storage,&tip).await;
+    let id=wh03_enqueue_push(&storage,&path,&tip.id.to_string(),&first,&payload).await;
+    assert!(matches!(wh03_exec(&storage,id).await,ExecuteOutcome::Done{..}));
+    let head=storage.mono_storage().read_native_publication_head(NATIVE_INSTANCE).await.unwrap();
+    assert_eq!(head.token.sequence,1);
+    assert!(head.token.certificate.unwrap()>0);
+    let writer=crate::ceres::snapshot::projection_writer::ProjectionObservationSink::start(temp.path()).unwrap();
+    storage.projection_observation_sink=Some(writer.clone());
+    let state=api_state(storage).await;
+    // Corrupt only the observation's captured certificate. The actual native
+    // head is READY; INITIALIZING heads remain correctly rejected with 503.
+    let ((status,response),observations)=crate::ceres::snapshot::projection_observation::with_observations(
+        crate::api::router::snapshot_router::with_rejected_native_observation_source(http_resolve(state,"/"))
+    ).await;
+    assert_eq!(status,200,"{response}");
+    assert_eq!(response["publication_sequence"],"1");
+    assert!(observations.is_empty());
+    assert!(writer.shutdown(std::time::Instant::now()+Duration::from_secs(5)).await.is_err());
+    let directory=writer.test_directory(temp.path());
+    assert!(std::fs::read(directory.join("records.jsonl")).unwrap().is_empty());
+    let status:serde_json::Value=serde_json::from_slice(&std::fs::read(directory.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status["first_error_code"],crate::ceres::snapshot::projection_writer::WriterFailure::ObservationBindingRejected as u8);
+    assert_eq!(status["accepted_records"],0);
+    assert_eq!(status["closed"],true);
 }

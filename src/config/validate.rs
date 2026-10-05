@@ -150,6 +150,11 @@ impl Config {
 }
 
 fn validate_mst2_config(config: &Mst2Config) -> Result<(), MegaError> {
+    if config.projection_observation_enabled && (!config.enabled || !config.publication_enabled) {
+        return Err(MegaError::Other(
+            "mst2.projection_observation_enabled requires mst2.enabled and mst2.publication_enabled".into(),
+        ));
+    }
     if !config.enabled {
         return Ok(());
     }
@@ -2129,6 +2134,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "enabled",
             "instance_uuid",
             "publication_enabled",
+            "projection_observation_enabled",
             "auth_token",
         ]),
         "buck" => Some(&[
@@ -2233,6 +2239,31 @@ mod tests {
 
     fn valid_config() -> Config {
         isolated_config(std::env::temp_dir().join("mega2-config-validate-tests"))
+    }
+
+    #[test]
+    fn typed_projection_writer_is_default_off_and_requires_native_publication() {
+        assert!(!Mst2Config::default().projection_observation_enabled);
+        let loaded: Mst2Config = toml::from_str("enabled = false").unwrap();
+        assert!(!loaded.projection_observation_enabled);
+        let mut config = valid_config();
+        config.mst2.projection_observation_enabled = true;
+        config.mst2.instance_uuid = Some("12345678-1234-4234-9234-123456789abc".into());
+        for (enabled, publication) in [(false, false), (false, true), (true, false)] {
+            config.mst2.enabled = enabled;
+            config.mst2.publication_enabled = publication;
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("projection_observation_enabled")
+            );
+        }
+        config.mst2.enabled = true;
+        config.mst2.publication_enabled = true;
+        config.validate().unwrap();
+        assert!(is_known_field_path("mst2.projection_observation_enabled"));
     }
 
     #[test]
