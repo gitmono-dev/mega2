@@ -20,7 +20,6 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
-    net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -203,34 +202,51 @@ impl ServiceProcess {
         service
     }
 
-    fn wait_until_listening(
+    fn wait_until_openapi_ready(
         &mut self,
         port: u16,
         timeout: Duration,
         stdout_path: &Path,
         stderr_path: &Path,
     ) {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build HTTP readiness client");
+        let url = format!("http://127.0.0.1:{port}/api/openapi.json");
         let deadline = Instant::now() + timeout;
         loop {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return;
-            }
             if let Some(status) = self.child.try_wait().expect("poll service") {
                 self.reaped = true;
                 panic!(
-                    "service exited before binding port {port} (status {status})\nstdout:\n{}\nstderr:\n{}",
+                    "service exited before OpenAPI was ready on port {port} (status {status})\nstdout:\n{}\nstderr:\n{}",
                     read_log(stdout_path),
                     read_log(stderr_path),
                 );
             }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 panic!(
-                    "service did not bind port {port} within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+                    "service OpenAPI not ready on port {port} within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
                     read_log(stdout_path),
                     read_log(stderr_path),
                 );
             }
-            sleep(Duration::from_millis(200));
+            if let Ok(response) = client
+                .get(&url)
+                .timeout(remaining.min(Duration::from_secs(5)))
+                .send()
+                && response.status() == reqwest::StatusCode::OK
+                && Instant::now() <= deadline
+            {
+                return;
+            }
+            sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(200)),
+            );
         }
     }
 
@@ -344,7 +360,7 @@ fn boot_service_http_with_env(
         .stderr(Stdio::from(create_log_file(&stderr_path)));
 
     let mut service = ServiceProcess::spawn(command);
-    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_openapi_ready(port, Duration::from_secs(90), &stdout_path, &stderr_path);
     (service, port, stdout_path, stderr_path)
 }
 
