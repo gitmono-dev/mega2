@@ -232,6 +232,63 @@ struct ServiceProcess {
     reaped: bool,
 }
 
+#[cfg(target_os = "linux")]
+fn process_owns_tcp_listener(pid: u32, port: u16) -> std::io::Result<bool> {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let sockets: std::collections::HashSet<_> = fs::read_dir(proc.join("fd"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_link(entry.path()).ok())
+        .filter_map(|target| {
+            target
+                .to_str()?
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')
+                .map(str::to_owned)
+        })
+        .collect();
+    for table in ["tcp", "tcp6"] {
+        let rows = fs::read_to_string(proc.join("net").join(table))?;
+        for row in rows.lines().skip(1) {
+            let fields: Vec<_> = row.split_whitespace().collect();
+            if fields.len() < 10 || fields[3] != "0A" || !sockets.contains(fields[9]) {
+                continue;
+            }
+            let Some((address, encoded_port)) = fields[1].split_once(':') else {
+                continue;
+            };
+            if u16::from_str_radix(encoded_port, 16).ok() == Some(port)
+                && matches!(
+                    address,
+                    "00000000" | "0100007F" | "00000000000000000000000000000000"
+                )
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn service_readiness_accepts_its_own_kernel_listener() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    assert!(process_owns_tcp_listener(std::process::id(), port).unwrap());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn service_readiness_rejects_a_connectable_foreign_listener() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut command = Command::new("sh");
+    command.args(["-c", "exec sleep 60"]);
+    let service = ServiceProcess::spawn(command);
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+    assert!(!process_owns_tcp_listener(service.child.id(), port).unwrap());
+}
+
 impl ServiceProcess {
     fn spawn(mut command: Command) -> Self {
         let child = command.spawn().expect("spawn mega2 service");
@@ -251,9 +308,6 @@ impl ServiceProcess {
     ) {
         let deadline = Instant::now() + timeout;
         loop {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return;
-            }
             if let Some(status) = self.child.try_wait().expect("poll service") {
                 self.reaped = true;
                 panic!(
@@ -261,6 +315,14 @@ impl ServiceProcess {
                     read_log(stdout_path),
                     read_log(stderr_path),
                 );
+            }
+            // Another test's short-lived socket cannot establish this child's readiness.
+            #[cfg(target_os = "linux")]
+            let owns_listener = process_owns_tcp_listener(self.child.id(), port).unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            let owns_listener = true;
+            if owns_listener && TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return;
             }
             if Instant::now() >= deadline {
                 panic!(
