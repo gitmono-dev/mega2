@@ -191,9 +191,8 @@ mod tests {
             .unwrap();
         let error = exec(CommandContext::default(), &args).await.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .starts_with("MST2_NATIVE_INIT_CONFIG_REQUIRED")
+            matches!(&error, MegaError::Other(message) if message.starts_with("MST2_NATIVE_INIT_CONFIG_REQUIRED")),
+            "unexpected error: {error}"
         );
     }
 }

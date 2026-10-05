@@ -378,6 +378,15 @@ pub(super) fn crash_checkpoint(phase: &str) {
 }
 
 async fn maintenance_fixture() -> (tempfile::TempDir, MonoStorage, PushQueueStorage, NativeRoot) {
+    use git_internal::{
+        hash::HashKind,
+        internal::object::{
+            blob::Blob,
+            commit::Commit,
+            tree::{Tree, TreeItem, TreeItemMode},
+        },
+    };
+
     let (temp, mono, queue) = fixture().await;
     mono.get_connection()
         .execute_unprepared("DELETE FROM mst2_native_head")
@@ -387,12 +396,20 @@ async fn maintenance_fixture() -> (tempfile::TempDir, MonoStorage, PushQueueStor
         .set_control_flags(Some(true), None, None)
         .await
         .unwrap();
-    let tree = git_internal::internal::object::tree::Tree::from_tree_items(vec![]).unwrap();
-    let commit = git_internal::internal::object::commit::Commit::from_tree_id(
-        tree.id,
-        vec![],
-        "maintenance root",
-    );
+    let blob =
+        Blob::from_content_bytes_with_kind(HashKind::Sha1, b"maintenance root".to_vec()).unwrap();
+    let tree = Tree::from_tree_items_with_kind(
+        HashKind::Sha1,
+        vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            ".gitkeep".to_owned(),
+        )],
+    )
+    .unwrap();
+    let commit =
+        Commit::from_tree_id_with_kind(HashKind::Sha1, tree.id, vec![], "maintenance root")
+            .unwrap();
     mono.save_mega_trees(vec![tree.clone()], commit.id, None)
         .await
         .unwrap();
