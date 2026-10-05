@@ -62,15 +62,20 @@ pub fn validate_scope_relative_path(path: &str) -> Result<(), SnapshotError> {
     if path == "/" {
         return Ok(());
     }
+    let mut component_count = 0;
     for comp in path[1..].split('/') {
+        component_count += 1;
+        if component_count > 256 {
+            return Err(invalid("path has more than 256 components"));
+        }
         if comp.is_empty() {
             return Err(invalid("empty path component"));
         }
         if comp == "." || comp == ".." {
             return Err(invalid("dot component"));
         }
-        if comp.len() > 256 {
-            return Err(invalid("path component over 256 bytes"));
+        if comp.len() > 255 {
+            return Err(invalid("path component over 255 bytes"));
         }
     }
     Ok(())
@@ -98,5 +103,15 @@ mod tests {
         assert!(validate_scope_relative_path("/a//b").is_err());
         assert!(validate_scope_relative_path("/a/").is_err());
         assert!(validate_scope_relative_path("/a\0").is_err());
+    }
+
+    #[test]
+    fn scope_relative_path_enforces_byte_and_component_boundaries() {
+        assert!(validate_scope_relative_path(&format!("/{}", "a".repeat(255))).is_ok());
+        assert!(validate_scope_relative_path(&format!("/{}", "a".repeat(256))).is_err());
+        assert!(validate_scope_relative_path(&format!("/{}a", "é".repeat(127))).is_ok());
+        assert!(validate_scope_relative_path(&format!("/{}", "é".repeat(128))).is_err());
+        assert!(validate_scope_relative_path(&format!("/{}", vec!["a"; 256].join("/"))).is_ok());
+        assert!(validate_scope_relative_path(&format!("/{}", vec!["a"; 257].join("/"))).is_err());
     }
 }

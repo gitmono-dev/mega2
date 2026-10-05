@@ -2,9 +2,9 @@
 //!
 //! One row per verified object: Git identity + raw content digest + 64-bit
 //! size + verification state. The natural key is
-//! `(storage_domain, git_oid, object_kind)`; rows are insert-only with
-//! ON CONFLICT DO NOTHING — a row only ever appears after the content was
-//! fetched and hashed by this service (write-through verification).
+//! `(storage_domain, git_oid, object_kind)`. Current-generation facts retain
+//! first-write-wins semantics; valid legacy facts can be atomically upgraded
+//! only after this service fetches and hashes the raw body again.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

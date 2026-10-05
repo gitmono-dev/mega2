@@ -349,7 +349,15 @@ mod tests {
         use crate::ceres::snapshot::retention::{
             NodeState, RetainedKind, RetentionRoot, RetentionStore as _,
         };
-        let r = runtime();
+        let r = Mst2Runtime {
+            hmac_key: blake3_key(),
+            contexts: Mutex::new(HashMap::new()),
+            leases: Mutex::new(HashMap::new()),
+            retention: crate::ceres::snapshot::retention::RetentionCoordinator::new(
+                crate::ceres::snapshot::retention::mem::InMemoryRetentionStore::default(),
+            ),
+            tip_state: Mutex::new((String::new(), 0u64)),
+        };
         // Retain the snapshot's derived nodes directly, covered by the lease
         // root that insert_context created.
         let lease_root = RetentionRoot::Lease("gc-lease-1".to_string());

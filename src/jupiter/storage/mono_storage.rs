@@ -47,6 +47,10 @@ pub struct MonoStorage {
     pub base: BaseStorage,
 }
 
+/// Generation 2 hashes the raw file body without guessing a Git envelope.
+pub const MST2_VERIFICATION_VERSION: i32 = 2;
+const MST2_MAX_FILE_SIZE: i64 = 8_796_093_022_208;
+
 impl Deref for MonoStorage {
     type Target = BaseStorage;
     fn deref(&self) -> &Self::Target {
@@ -1730,18 +1734,52 @@ impl MonoStorage {
             .filter(mst2_verified_object::Column::GitOid.is_in(oids))
             .all(self.get_connection())
             .await?;
-        Ok(rows.into_iter().map(|m| (m.git_oid.clone(), m)).collect())
+        for row in &rows {
+            if row.state != "VERIFIED"
+                || ![1, MST2_VERIFICATION_VERSION].contains(&row.verification_version)
+                || !(0..=MST2_MAX_FILE_SIZE).contains(&row.size)
+                || row.raw_sha256.len() != 32
+            {
+                return Err(MegaError::ObjStorageInconsistent(
+                    "invalid MST/2 verified blob record".to_string(),
+                ));
+            }
+        }
+        // Generation 1 may have stripped header-like file bytes. Reverify
+        // valid legacy rows from object storage before trusting their facts.
+        Ok(rows
+            .into_iter()
+            .filter(|m| m.verification_version == MST2_VERIFICATION_VERSION)
+            .map(|m| (m.git_oid.clone(), m))
+            .collect())
     }
 
     /// Write-through verification: rows are only written after the content
     /// was fetched and hashed. Conflicts (concurrent verification of the same
-    /// oid) resolve to the existing row.
+    /// oid) keep current facts. Only valid generation-1 facts may be upgraded.
     pub async fn insert_verified_blobs(
         &self,
         rows: Vec<mst2_verified_object::ActiveModel>,
     ) -> Result<(), MegaError> {
         if rows.is_empty() {
             return Ok(());
+        }
+        for row in &rows {
+            if row.state.try_as_ref().map(String::as_str) != Some("VERIFIED")
+                || row.verification_version.try_as_ref() != Some(&MST2_VERIFICATION_VERSION)
+                || !row
+                    .size
+                    .try_as_ref()
+                    .is_some_and(|size| (0..=MST2_MAX_FILE_SIZE).contains(size))
+                || !row
+                    .raw_sha256
+                    .try_as_ref()
+                    .is_some_and(|digest| digest.len() == 32)
+            {
+                return Err(MegaError::ObjStorageInconsistent(
+                    "invalid MST/2 verified blob write".to_string(),
+                ));
+            }
         }
         match mst2_verified_object::Entity::insert_many(rows)
             .on_conflict(
@@ -1750,15 +1788,43 @@ impl MonoStorage {
                     mst2_verified_object::Column::GitOid,
                     mst2_verified_object::Column::ObjectKind,
                 ])
-                .do_nothing()
+                .update_columns([
+                    mst2_verified_object::Column::RawSha256,
+                    mst2_verified_object::Column::Size,
+                    mst2_verified_object::Column::VerificationVersion,
+                    mst2_verified_object::Column::CreatedAt,
+                ])
+                .action_and_where(
+                    Expr::col((
+                        mst2_verified_object::Entity,
+                        mst2_verified_object::Column::VerificationVersion,
+                    ))
+                    .eq(1),
+                )
+                .action_and_where(
+                    Expr::col((
+                        mst2_verified_object::Entity,
+                        mst2_verified_object::Column::State,
+                    ))
+                    .eq("VERIFIED"),
+                )
+                .action_and_where(
+                    Expr::col((
+                        mst2_verified_object::Entity,
+                        mst2_verified_object::Column::Size,
+                    ))
+                    .between(0, MST2_MAX_FILE_SIZE),
+                )
+                .action_and_where(Expr::cust(
+                    "length(\"mst2_verified_object\".\"raw_sha256\") = 32",
+                ))
                 .to_owned(),
             )
             .exec(self.get_connection())
             .await
         {
-            // ON CONFLICT DO NOTHING returns RecordNotInserted when every
-            // row was a duplicate; that is the intended first-write-wins
-            // outcome (same convention as next_insert_retry).
+            // A skipped conditional conflict returns RecordNotInserted;
+            // current-generation facts retain first-write-wins semantics.
             Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -3339,7 +3405,7 @@ mod tests {
             object_kind: Set("blob".to_string()),
             raw_sha256: Set(digest.clone()),
             size: Set(4_294_967_296), // > i32::MAX: the size64 gap this table closes
-            verification_version: Set(1),
+            verification_version: Set(MST2_VERIFICATION_VERSION),
             state: Set("VERIFIED".to_string()),
             created_at: Set(chrono::Utc::now().fixed_offset()),
         }])
@@ -3364,7 +3430,7 @@ mod tests {
             object_kind: Set("blob".to_string()),
             raw_sha256: Set(vec![9u8; 32]),
             size: Set(1),
-            verification_version: Set(1),
+            verification_version: Set(MST2_VERIFICATION_VERSION),
             state: Set("VERIFIED".to_string()),
             created_at: Set(chrono::Utc::now().fixed_offset()),
         }])
@@ -3381,8 +3447,7 @@ mod tests {
 
     #[tokio::test]
     async fn mst2_verified_blob_insert_real_error_is_not_swallowed() {
-        // The ON CONFLICT DO NOTHING sentinel (RecordNotInserted on an
-        // all-duplicate batch) is treated as idempotent success; a genuine
+        // A skipped conditional conflict is idempotent success; a genuine
         // database error must still surface, never be masked as Ok.
         let temp = tempfile::TempDir::new().unwrap();
         let storage = test_storage(temp.path()).await;
@@ -3402,7 +3467,7 @@ mod tests {
                 object_kind: Set("blob".to_string()),
                 raw_sha256: Set(vec![2u8; 32]),
                 size: Set(2),
-                verification_version: Set(1),
+                verification_version: Set(MST2_VERIFICATION_VERSION),
                 state: Set("VERIFIED".to_string()),
                 created_at: Set(chrono::Utc::now().fixed_offset()),
             }])
@@ -3411,5 +3476,170 @@ mod tests {
             res.is_err(),
             "a real DB error must propagate, not be swallowed by the ON CONFLICT sentinel match"
         );
+    }
+
+    #[tokio::test]
+    async fn mst2_verified_blob_invalid_records_reject_the_entire_lookup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let valid_oid = "f".repeat(40);
+        let row = |oid: String, state: &str, version, size, digest: Vec<u8>| {
+            mst2_verified_object::ActiveModel {
+                id: sea_orm::ActiveValue::NotSet,
+                storage_domain: Set("git".to_string()),
+                git_oid: Set(oid),
+                object_kind: Set("blob".to_string()),
+                raw_sha256: Set(digest),
+                size: Set(size),
+                verification_version: Set(version),
+                state: Set(state.to_string()),
+                created_at: Set(chrono::Utc::now().fixed_offset()),
+            }
+        };
+        mono.insert_verified_blobs(vec![row(
+            valid_oid.clone(),
+            "VERIFIED",
+            MST2_VERIFICATION_VERSION,
+            0,
+            vec![7; 32],
+        )])
+        .await
+        .unwrap();
+        for (index, (state, version, size, digest_len)) in [
+            ("PENDING", 1, 1, 32),
+            ("VERIFIED", 0, 1, 32),
+            ("VERIFIED", 3, 1, 32),
+            ("VERIFIED", 1, -1, 32),
+            ("VERIFIED", 1, 8_796_093_022_209, 32),
+            ("VERIFIED", 1, 1, 31),
+            ("VERIFIED", 1, 1, 33),
+            ("VERIFIED", MST2_VERIFICATION_VERSION, -1, 32),
+            ("VERIFIED", MST2_VERIFICATION_VERSION, 8_796_093_022_209, 32),
+            ("VERIFIED", MST2_VERIFICATION_VERSION, 1, 31),
+            ("VERIFIED", MST2_VERIFICATION_VERSION, 1, 33),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bad_oid = format!("{index:040x}");
+            mst2_verified_object::Entity::insert(row(
+                bad_oid.clone(),
+                state,
+                version,
+                size,
+                vec![8; digest_len],
+            ))
+            .exec(mono.get_connection())
+            .await
+            .unwrap();
+            assert!(matches!(
+                mono.get_verified_blobs(vec![valid_oid.clone(), bad_oid])
+                    .await,
+                Err(MegaError::ObjStorageInconsistent(_))
+            ));
+            assert_eq!(
+                mono.get_verified_blobs(vec![valid_oid.clone()])
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mst2_verified_blob_accepts_the_eight_tib_boundary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let oid = "e".repeat(40);
+        mono.insert_verified_blobs(vec![mst2_verified_object::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            storage_domain: Set("git".to_string()),
+            git_oid: Set(oid.clone()),
+            object_kind: Set("blob".to_string()),
+            raw_sha256: Set(vec![9; 32]),
+            size: Set(8_796_093_022_208),
+            verification_version: Set(MST2_VERIFICATION_VERSION),
+            state: Set("VERIFIED".to_string()),
+            created_at: Set(chrono::Utc::now().fixed_offset()),
+        }])
+        .await
+        .unwrap();
+        let rows = mono.get_verified_blobs(vec![oid.clone()]).await.unwrap();
+        assert_eq!(rows[&oid].size, 8_796_093_022_208);
+    }
+
+    #[tokio::test]
+    async fn mst2_verified_blob_upgrade_only_replaces_valid_legacy_facts() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        for (index, (version, state, size, digest_len)) in [
+            (1, "VERIFIED", 3, 32),
+            (1, "PENDING", 3, 32),
+            (1, "VERIFIED", -1, 32),
+            (1, "VERIFIED", MST2_MAX_FILE_SIZE + 1, 32),
+            (1, "VERIFIED", 3, 31),
+            (MST2_VERIFICATION_VERSION, "VERIFIED", 3, 32),
+            (3, "VERIFIED", 3, 32),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let oid = format!("{index:040x}");
+            let legacy = mst2_verified_object::ActiveModel {
+                id: sea_orm::ActiveValue::NotSet,
+                storage_domain: Set("git".to_string()),
+                git_oid: Set(oid.clone()),
+                object_kind: Set("blob".to_string()),
+                raw_sha256: Set(vec![7; digest_len]),
+                size: Set(size),
+                verification_version: Set(version),
+                state: Set(state.to_string()),
+                created_at: Set(chrono::Utc::now().fixed_offset()),
+            };
+            let old = mst2_verified_object::Entity::insert(legacy)
+                .exec_with_returning(mono.get_connection())
+                .await
+                .unwrap();
+            if index == 0 {
+                assert!(
+                    mono.get_verified_blobs(vec![oid.clone()])
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            mono.insert_verified_blobs(vec![mst2_verified_object::ActiveModel {
+                id: sea_orm::ActiveValue::NotSet,
+                storage_domain: Set("git".to_string()),
+                git_oid: Set(oid),
+                object_kind: Set("blob".to_string()),
+                raw_sha256: Set(vec![9; 32]),
+                size: Set(10),
+                verification_version: Set(MST2_VERIFICATION_VERSION),
+                state: Set("VERIFIED".to_string()),
+                created_at: Set(chrono::Utc::now().fixed_offset()),
+            }])
+            .await
+            .unwrap();
+            let saved = mst2_verified_object::Entity::find_by_id(old.id)
+                .one(mono.get_connection())
+                .await
+                .unwrap()
+                .unwrap();
+            if index == 0 {
+                assert_eq!(saved.verification_version, MST2_VERIFICATION_VERSION);
+                assert_eq!(saved.size, 10);
+                assert_eq!(saved.raw_sha256, vec![9; 32]);
+            } else {
+                assert_eq!(
+                    saved, old,
+                    "invalid, unknown and current rows are never replaced"
+                );
+            }
+        }
     }
 }

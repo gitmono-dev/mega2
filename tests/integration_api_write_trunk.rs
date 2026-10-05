@@ -18,7 +18,7 @@ mod git_cli;
 use std::{
     fs,
     io::Read,
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -235,6 +235,7 @@ struct ServiceProcess {
 impl ServiceProcess {
     fn spawn(mut command: Command) -> Self {
         let child = command.spawn().expect("spawn mega2 service");
+        git_cli::record_service_pid(child.id());
         Self {
             child,
             reaped: false,
@@ -711,11 +712,9 @@ fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
 }
 
 fn reserve_free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    let port = git_cli::reserve_ephemeral_port();
+    git_cli::record_allocated_port(port);
+    port
 }
 
 fn create_log_file(path: &Path) -> fs::File {
