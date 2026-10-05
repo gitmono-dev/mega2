@@ -126,6 +126,14 @@ tokio::task_local! {
 #[cfg(test)]
 tokio::task_local! {
     static NATIVE_RESOLVE_BARRIERS: (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+    static REJECT_NATIVE_OBSERVATION_SOURCE: bool;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_rejected_native_observation_source<F: std::future::Future>(
+    future: F,
+) -> F::Output {
+    REJECT_NATIVE_OBSERVATION_SOURCE.scope(true, future).await
 }
 
 #[cfg(test)]
@@ -460,11 +468,21 @@ async fn resolve(
                 )
             })
             .and_then(|(commit, tree)| {
+                let certificate = head.token.certificate;
+                #[cfg(test)]
+                let certificate = if REJECT_NATIVE_OBSERVATION_SOURCE
+                    .try_with(|reject| *reject)
+                    .unwrap_or(false)
+                {
+                    None
+                } else {
+                    certificate
+                };
                 NativeResolveSource::capture(
                     &head.instance_id,
                     commit,
                     tree,
-                    head.token.certificate,
+                    certificate,
                     head.token.epoch,
                     head.token.sequence,
                 )

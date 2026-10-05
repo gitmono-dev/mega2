@@ -310,14 +310,24 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
 
 #[cfg(unix)]
 #[tokio::test]
-async fn native_source_without_positive_publication_receipt_is_a_sticky_writer_failure() {
-    let (temp,mut storage,_tip,_path)=native_fixture().await;
+async fn rejected_native_observation_source_does_not_change_ready_resolve_and_is_a_sticky_writer_failure() {
+    let (temp,mut storage,tip,path)=native_fixture().await;
+    let (first,payload)=save_same_tree_commit(&storage,&tip).await;
+    let id=wh03_enqueue_push(&storage,&path,&tip.id.to_string(),&first,&payload).await;
+    assert!(matches!(wh03_exec(&storage,id).await,ExecuteOutcome::Done{..}));
+    let head=storage.mono_storage().read_native_publication_head(NATIVE_INSTANCE).await.unwrap();
+    assert_eq!(head.token.sequence,1);
+    assert!(head.token.certificate.unwrap()>0);
     let writer=crate::ceres::snapshot::projection_writer::ProjectionObservationSink::start(temp.path()).unwrap();
     storage.projection_observation_sink=Some(writer.clone());
     let state=api_state(storage).await;
-    let ((status,response),observations)=crate::ceres::snapshot::projection_observation::with_observations(http_resolve(state,"/")).await;
+    // Corrupt only the observation's captured certificate. The actual native
+    // head is READY; INITIALIZING heads remain correctly rejected with 503.
+    let ((status,response),observations)=crate::ceres::snapshot::projection_observation::with_observations(
+        crate::api::router::snapshot_router::with_rejected_native_observation_source(http_resolve(state,"/"))
+    ).await;
     assert_eq!(status,200,"{response}");
-    assert_eq!(response["publication_sequence"],"0");
+    assert_eq!(response["publication_sequence"],"1");
     assert!(observations.is_empty());
     assert!(writer.shutdown(std::time::Instant::now()+Duration::from_secs(5)).await.is_err());
     let directory=writer.test_directory(temp.path());
