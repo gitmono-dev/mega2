@@ -554,8 +554,8 @@ async fn t06b_forward_migration_backfills_old_graph_and_enforces_constraints() {
         .await
         .unwrap();
     db.execute_unprepared(
-        "INSERT INTO mst2_retention_node (node_id, kind, state, bytes) \
-         VALUES ('parent', 'page', 'LIVE', 7), ('child', 'page', 'LIVE', 7); \
+        "INSERT INTO mst2_retention_node (node_id, kind, state, bytes, created_at) \
+         VALUES ('parent', 'page', 'LIVE', 7, now()), ('child', 'page', 'LIVE', 7, now()); \
          INSERT INTO mst2_retention_edge (parent_id, child_id) VALUES ('parent', 'child')",
     )
     .await
@@ -600,8 +600,8 @@ async fn t06b_forward_migration_refuses_existing_cycles() {
         .await
         .unwrap();
     db.execute_unprepared(
-        "INSERT INTO mst2_retention_node (node_id, kind, state, bytes) \
-         VALUES ('a', 'page', 'LIVE', 7), ('b', 'page', 'LIVE', 7); \
+        "INSERT INTO mst2_retention_node (node_id, kind, state, bytes, created_at) \
+         VALUES ('a', 'page', 'LIVE', 7, now()), ('b', 'page', 'LIVE', 7, now()); \
          INSERT INTO mst2_retention_edge (parent_id, child_id) VALUES ('a', 'b'), ('b', 'a')",
     )
     .await
