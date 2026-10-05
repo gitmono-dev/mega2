@@ -463,6 +463,11 @@ async fn native_identity_actual_commit_corruption_and_malformed_fields_fail_clos
         .bootstrap_native_source_identity(INSTANCE)
         .await
         .unwrap();
+    fixture
+        .mono
+        .attest_native_source_identity(INSTANCE)
+        .await
+        .unwrap();
     for modification in [
         "content=content || 'corruption'",
         "author=NULL",
@@ -528,9 +533,49 @@ async fn native_identity_actual_root_tree_missing_corrupt_or_mismatched_is_rejec
         .bootstrap_native_source_identity(INSTANCE)
         .await
         .unwrap();
+    let stored = mega_tree::Entity::find()
+        .filter(mega_tree::Column::TreeId.eq(fixture.root.tree_id.to_string()))
+        .one(fixture.mono.get_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.size, 0);
+    assert!(!stored.sub_trees.is_empty());
+    let baseline = fixture
+        .mono
+        .attest_native_source_identity(INSTANCE)
+        .await
+        .unwrap();
+    // Tree::into_mega_model intentionally leaves this metadata at zero.
+    // Changing it cannot serve as evidence for different Git object bytes.
+    for size in [1, stored.sub_trees.len() as i32, i32::MAX] {
+        let txn = fixture.mono.get_connection().begin().await.unwrap();
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE mega_tree SET size=$1 WHERE tree_id=$2",
+            [size.into(), fixture.root.tree_id.to_string().into()],
+        ))
+        .await
+        .unwrap();
+        let actual = fixture
+            .mono
+            .attest_native_source_in_snapshot(&txn, INSTANCE)
+            .await
+            .unwrap();
+        assert_eq!(actual.source(), baseline.source());
+        assert_eq!(actual.namespace(), baseline.namespace());
+        assert_eq!(
+            actual.publication_sequence(),
+            baseline.publication_sequence()
+        );
+        assert_eq!(actual.publication_epoch(), baseline.publication_epoch());
+        assert_eq!(
+            actual.publication_certificate(),
+            baseline.publication_certificate()
+        );
+        txn.rollback().await.unwrap();
+    }
     for modification in [
-        "size=-1",
-        "size=size+1",
         "sub_trees=set_byte(sub_trees,0,49)",
         "sub_trees=decode(repeat('41',16777217),'hex')",
     ] {

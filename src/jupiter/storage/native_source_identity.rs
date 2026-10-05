@@ -174,9 +174,8 @@ impl MonoStorage {
             .ok_or_else(|| {
                 integrity("captured native root tree is missing or exceeds the validation budget")
             })?;
-        if tree.size < 0 || tree.size as usize != tree.sub_trees.len() {
-            return Err(integrity("persisted native root tree size is inconsistent"));
-        }
+        // IntoMegaModel stores tree.size as zero; it is not an object-byte
+        // length witness. Bound and verify the actual sub_trees bytes instead.
         let actual = ObjectHash::from_type_and_data_for_kind(
             HashKind::Sha1,
             ObjectType::Tree,
