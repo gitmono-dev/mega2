@@ -10,7 +10,7 @@ use crate::{
     jupiter::{
         migration::Migrator,
         storage::{
-            base_storage::BaseStorage,
+            base_storage::{BaseStorage, StorageConnector},
             init::{postgres_connection, read_only_database_connection},
             mono_storage::MonoStorage,
             native_publication_storage::NativeRoot,
