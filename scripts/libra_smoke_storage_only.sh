@@ -1366,6 +1366,75 @@ case_libra_browser_create_lightweight_tag() {
     printf 'lightweight root tag matched HEAD: %s\n' "$name"
 }
 
+case_libra_browser_create_annotated_tag() {
+    local WORK="$WORK/browser-create-annotated-tag" path="/" name="bb74-$RUN_ID"
+    local message="bb74 annotated root tag $RUN_ID" token="${MEGA2_IT_SEED_TOKEN:-}"
+    local head code left rc=0 leak_rc=0 attempted=false cleanup_ok=false
+    local deadline=$((SECONDS + 55))
+    [ -n "$token" ] || { echo "MEGA2_IT_SEED_TOKEN is empty" >&2; return 1; }
+    mkdir "$WORK"
+    # shellcheck disable=SC2329
+    cleanup_bb74_tag() {
+        trap - RETURN
+        local cleanup_code=000 cleanup_left cleanup_timeout
+        rm -f "$WORK/token"
+        if [ "$attempted" = true ]; then
+            printf 'Authorization: Bearer %s\n' "$token" > "$WORK/cleanup.header"
+            chmod 600 "$WORK/cleanup.header"
+            cleanup_left=$((deadline - SECONDS))
+            if [ "$cleanup_left" -gt 0 ]; then
+                cleanup_timeout=$cleanup_left
+                [ "$cleanup_timeout" -le 5 ] || cleanup_timeout=5
+                cleanup_code=$(curl -sS --connect-timeout 5 --max-time "$cleanup_timeout" -X DELETE \
+                    -H @"$WORK/cleanup.header" -o "$WORK/delete.out" -w '%{http_code}' \
+                    "$MEGA2_BASE_URL/api/v1/tags/$name") || cleanup_code=000
+            fi
+            rm -f "$WORK/cleanup.header"
+            if [ "$cleanup_code" = 200 ] && jq -e --arg name "$name" \
+                '.req_result == true and .data.deleted_tag == $name' "$WORK/delete.out" > /dev/null; then
+                cleanup_ok=true
+                printf 'cleaned root tag: %s\n' "$name"
+            elif [ "$cleanup_code" != 404 ]; then
+                printf 'warning: root tag cleanup failed (HTTP %s): %s\n' "$cleanup_code" "$name" >&2
+            fi
+        fi
+        return 0
+    }
+    trap cleanup_bb74_tag RETURN
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    head=$(timeout "$left" git ls-remote "$MEGA2_BASE_URL/" HEAD | awk '$2 == "HEAD" { print $1 }') || return 1
+    [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "root HEAD is not a SHA-1 OID" >&2; return 1; }
+    printf '%s\n' "$token" > "$WORK/token"
+    chmod 600 "$WORK/token"
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    attempted=true
+    if timeout "$left" "$LIBRA_BIN" --json mega2 browser --server "$MEGA2_BASE_URL" \
+        --token-file "$WORK/token" --create-tag "$name" --message "$message" "$path" \
+        > "$WORK/create.json" 2> "$WORK/create.err"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "$WORK/token"
+    [ "$rc" -eq 0 ] || { echo "libra browser annotated tag creation failed (exit $rc)" >&2; return 1; }
+    [ ! -s "$WORK/create.err" ] || { echo "libra browser create-tag wrote unexpected stderr" >&2; return 1; }
+    jq -e --arg server "$MEGA2_BASE_URL" --arg name "$name" --arg message "$message" --arg head "$head" \
+        '.ok == true and .command == "mega2 browser" and .data.operation == "create-tag" and .data.server == $server and .data.target == {name: $name, kind: "annotated", path: "/"} and .data.receipt.name == $name and .data.receipt.message == $message and .data.receipt.object_id == $head and .data.receipt.tag_id != .data.receipt.object_id' \
+        "$WORK/create.json" > /dev/null || { echo "libra browser annotated tag receipt is invalid" >&2; return 1; }
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    code=$(curl -sS --connect-timeout 5 --max-time "$left" -o "$WORK/tag.json" -w '%{http_code}' \
+        "$MEGA2_BASE_URL/api/v1/tags/$name") || return 1
+    [ "$code" = 200 ] && jq -e --arg name "$name" --arg message "$message" --arg head "$head" \
+        '.req_result == true and .data.name == $name and .data.message == $message and .data.object_id == $head and .data.tag_id != .data.object_id' \
+        "$WORK/tag.json" > /dev/null || { echo "anonymous annotated tag GET is invalid (HTTP $code)" >&2; return 1; }
+    cleanup_bb74_tag
+    [ "$cleanup_ok" = true ] || return 1
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || return 124
+    printf '%s\n' "$token" | timeout "$left" grep -R -F -q -f /dev/stdin -- "$WORK" || leak_rc=$?
+    [ "$leak_rc" -eq 1 ] || { echo "browser annotated tag token persisted or scan failed" >&2; return 1; }
+    printf 'annotated root tag matched HEAD: %s\n' "$name"
+}
+
 run_case "LIBRA clone HTTP" case_libra_clone_http
 run_case "LIBRA fetch HTTP" case_libra_fetch_http
 run_case "LIBRA ls-remote HTTP" case_libra_ls_remote_http
@@ -1388,5 +1457,6 @@ run_case "LIBRA browser rename dir" case_libra_browser_rename_dir
 run_case "LIBRA browser list tags" case_libra_browser_list_tags
 run_case "LIBRA browser tags page two" case_libra_browser_tags_page_two
 run_case "LIBRA browser create lightweight tag" case_libra_browser_create_lightweight_tag
+run_case "LIBRA browser create annotated tag" case_libra_browser_create_annotated_tag
 
 finish
