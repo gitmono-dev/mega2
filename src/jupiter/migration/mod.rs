@@ -145,6 +145,7 @@ mod m20261005_000200_add_mst2_native_head;
 mod m20261005_000200_harden_mst2_retention_graph;
 mod m20261005_000300_add_mst2_metadata_install;
 mod m20261005_000400_add_mst2_metadata_lease_ledger;
+mod m20261005_000500_add_mst2_metadata_prepare_expiry;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -278,6 +279,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000200_harden_mst2_retention_graph::Migration),
             Box::new(m20261005_000300_add_mst2_metadata_install::Migration),
             Box::new(m20261005_000400_add_mst2_metadata_lease_ledger::Migration),
+            Box::new(m20261005_000500_add_mst2_metadata_prepare_expiry::Migration),
         ]
     }
 }
@@ -496,6 +498,7 @@ mod tests {
             "m20261005_000200_harden_mst2_retention_graph".to_string(),
             "m20261005_000300_add_mst2_metadata_install".to_string(),
             "m20261005_000400_add_mst2_metadata_lease_ledger".to_string(),
+            "m20261005_000500_add_mst2_metadata_prepare_expiry".to_string(),
         ];
         assert_eq!(
             &names[names.len() - expected.len()..],

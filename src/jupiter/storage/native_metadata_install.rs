@@ -13,7 +13,13 @@ use sea_orm::{
 };
 use serde_json::json;
 
-use super::mst2_retention::{PostgresRetentionRepository, RETENTION_LOCK_KEY};
+use super::{
+    mst2_retention::{PostgresRetentionRepository, RETENTION_LOCK_KEY},
+    native_metadata_prepare_expiry::{
+        DEFAULT_PREPARE_DURATION_MS, PrepareDeadline, clock, load_deadline, load_expiry,
+        request_digest,
+    },
+};
 use crate::{
     callisto::{
         mst2_metadata_payload, mst2_metadata_prepare, mst2_metadata_prepare_page,
@@ -46,6 +52,7 @@ pub enum MetadataInstallError {
         operation_id: String,
         manifest_digest: [u8; 32],
         phase: MetadataCommitPhase,
+        recovery: Box<MetadataPrepareRecovery>,
     },
 }
 
@@ -54,6 +61,7 @@ pub struct MetadataPrepareIntent {
     prepare_id: String,
     operation_id: String,
     manifest_digest: [u8; 32],
+    deadline_digest: Option<[u8; 32]>,
 }
 
 impl MetadataPrepareIntent {
@@ -66,6 +74,31 @@ impl MetadataPrepareIntent {
     pub fn manifest_digest(&self) -> [u8; 32] {
         self.manifest_digest
     }
+    pub fn deadline_digest(&self) -> Option<[u8; 32]> {
+        self.deadline_digest
+    }
+    pub fn recovery(&self, phase: MetadataCommitPhase) -> MetadataPrepareRecovery {
+        MetadataPrepareRecovery {
+            operation_id: self.operation_id.clone(),
+            manifest_digest: self.manifest_digest,
+            phase,
+            binding: PrepareRecoveryBinding::Exact(self.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataPrepareRecovery {
+    operation_id: String,
+    manifest_digest: [u8; 32],
+    phase: MetadataCommitPhase,
+    binding: PrepareRecoveryBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrepareRecoveryBinding {
+    Exact(MetadataPrepareIntent),
+    Request([u8; 32]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,15 +125,20 @@ pub enum MetadataPrepareObservation {
     Absent,
     Preparing(MetadataPrepareIntent),
     Committed(PreparedMetadataReceipt),
+    DeadlinePassed {
+        intent: MetadataPrepareIntent,
+        expires_at_ms: i64,
+    },
 }
 
 pub(super) struct StoredPlan {
     pub(super) record: mst2_metadata_prepare::Model,
     pub(super) plan: MetadataInstallPlan,
+    pub(super) deadline: Option<PrepareDeadline>,
 }
 
 impl StoredPlan {
-    fn intent(&self) -> Result<MetadataPrepareIntent, SnapshotError> {
+    pub(super) fn intent(&self) -> Result<MetadataPrepareIntent, SnapshotError> {
         Ok(MetadataPrepareIntent {
             prepare_id: self.record.prepare_id.clone(),
             operation_id: self.record.operation_id.clone(),
@@ -110,6 +148,7 @@ impl StoredPlan {
                 .as_slice()
                 .try_into()
                 .map_err(|_| integrity("invalid stored metadata manifest digest"))?,
+            deadline_digest: self.deadline.as_ref().map(|grant| grant.grant_digest),
         })
     }
     fn receipt(&self) -> Result<PreparedMetadataReceipt, SnapshotError> {
@@ -155,14 +194,31 @@ impl PostgresMetadataInstallRepository {
         operation_id: &str,
         prepared: &PreparedNativeMetadataRetention,
     ) -> Result<MetadataPrepareIntent, MetadataInstallError> {
+        self.begin_intent_with_duration(operation_id, prepared, DEFAULT_PREPARE_DURATION_MS)
+            .await
+    }
+
+    pub(crate) async fn begin_intent_with_duration(
+        &self,
+        operation_id: &str,
+        prepared: &PreparedNativeMetadataRetention,
+        duration_ms: i64,
+    ) -> Result<MetadataPrepareIntent, MetadataInstallError> {
         validate_operation_id(operation_id)?;
         let plan = prepared.install_plan()?;
         let digest = plan.digest()?;
+        let expected_request =
+            request_digest(self.storage_uuid(), operation_id, &digest, duration_ms)?;
         let txn = self.transaction().await?;
         let result = async {
             self.barrier(&txn).await?;
+            lock_prepare_operation(&txn, operation_id).await?;
             if let Some(stored) = load_plan(&txn, operation_id, &digest).await? {
-                reject_consumed(&stored)?;
+                reject_terminal(&stored)?;
+                if stored.deadline.as_ref().map(|grant| grant.request_digest) != Some(expected_request) {
+                    return Err(conflict("metadata operation does not bind this preparation duration"));
+                }
+                require_unelapsed(&txn, &stored).await?;
                 return stored.intent();
             }
             let id = uuid::Uuid::new_v4().to_string();
@@ -171,8 +227,8 @@ impl PostgresMetadataInstallRepository {
                 "INSERT INTO mst2_metadata_prepare (prepare_id, operation_id, manifest_digest, canonical_plan,
                  source_domain, tagged_root_tree_oid, scope, schema_version, metadata_codec, materialization_policy,
                  fs_semantics, access_projection, verification_revision, projection_revision, metadata_root,
-                 node_count, edge_count, total_bytes, state)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'PREPARING')",
+                 node_count, edge_count, total_bytes, state, deadline_managed)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'PREPARING',true)",
                 [id.clone().into(), operation_id.into(), digest.to_vec().into(), plan.encode()?.into(),
                  identity.source_domain.clone().into(), identity.tagged_root_tree_oid.clone().into(), identity.scope.clone().into(),
                  (identity.schema_version as i16).into(), (identity.metadata_codec as i16).into(),
@@ -187,15 +243,16 @@ impl PostgresMetadataInstallRepository {
                  SELECT $1,decode(p.page_id,'hex'),p.size FROM jsonb_to_recordset($2::jsonb) AS p(page_id text,size integer)",
                 [id.clone().into(), serde_json::to_string(&pages).map_err(internal)?.into()],
             )).await.map_err(internal)?;
-            Ok(MetadataPrepareIntent { prepare_id:id, operation_id:operation_id.into(), manifest_digest:digest })
+            let deadline = PrepareDeadline::new(
+                self.storage_uuid(), &id, operation_id, digest, duration_ms, clock(&txn).await?,
+            )?;
+            deadline.insert(&txn).await?;
+            Ok(MetadataPrepareIntent { prepare_id:id, operation_id:operation_id.into(), manifest_digest:digest,
+                deadline_digest:Some(deadline.grant_digest) })
         }.await;
-        commit(
-            txn,
-            result,
-            operation_id,
-            digest,
-            MetadataCommitPhase::Intent,
-        )
+        commit(txn, result, |intent| {
+            intent.recovery(MetadataCommitPhase::Intent)
+        })
         .await
     }
 
@@ -208,6 +265,7 @@ impl PostgresMetadataInstallRepository {
         let txn = self.transaction().await?;
         let result = async {
             self.barrier(&txn).await?;
+            lock_prepare_operation(&txn, &intent.operation_id).await?;
             let stored = require_plan(&txn, intent).await?;
             if stored.plan.pages.get(&payload.id) != Some(&payload.size) {
                 return Err(integrity(
@@ -242,13 +300,9 @@ impl PostgresMetadataInstallRepository {
             Ok(())
         }
         .await;
-        commit(
-            txn,
-            result,
-            &intent.operation_id,
-            intent.manifest_digest,
-            MetadataCommitPhase::Payload,
-        )
+        commit(txn, result, |_| {
+            intent.recovery(MetadataCommitPhase::Payload)
+        })
         .await
     }
 
@@ -269,13 +323,9 @@ impl PostgresMetadataInstallRepository {
         let dag = self.load_installed_dag(intent).await?;
         let txn = self.transaction().await?;
         let result = self.finalize_in_txn(&txn, intent, &dag).await;
-        commit(
-            txn,
-            result,
-            &intent.operation_id,
-            intent.manifest_digest,
-            MetadataCommitPhase::Finalize,
-        )
+        commit(txn, result, |_| {
+            intent.recovery(MetadataCommitPhase::Finalize)
+        })
         .await
     }
 
@@ -288,6 +338,7 @@ impl PostgresMetadataInstallRepository {
         dag: &ValidatedMetadataDag,
     ) -> Result<PreparedMetadataReceipt, SnapshotError> {
         self.barrier(txn).await?;
+        lock_prepare_operation(txn, &intent.operation_id).await?;
         let stored = require_plan(txn, intent).await?;
         let expected: BTreeSet<_> = dag
             .payloads()
@@ -353,48 +404,97 @@ impl PostgresMetadataInstallRepository {
     pub async fn inspect_prepare(
         &self,
         fresh_primary: &DatabaseConnection,
-        operation_id: &str,
-        digest: [u8; 32],
-        phase: MetadataCommitPhase,
+        recovery: &MetadataPrepareRecovery,
     ) -> Result<MetadataPrepareObservation, MetadataInstallError> {
+        let operation_id = &recovery.operation_id;
+        let digest = recovery.manifest_digest;
         validate_operation_id(operation_id)?;
         let txn = fresh_primary
             .begin_with_config(Some(IsolationLevel::ReadCommitted), None)
             .await
-            .map_err(|_| uncertain(operation_id, digest, phase))?;
+            .map_err(|_| uncertain(recovery))?;
         if self.barrier(&txn).await.is_err() {
             let _ = txn.rollback().await;
-            return Err(uncertain(operation_id, digest, phase));
+            return Err(uncertain(recovery));
         }
         let result = async {
+            lock_prepare_operation(&txn, operation_id).await?;
             match load_plan(&txn, operation_id, &digest).await? {
                 None => Ok(MetadataPrepareObservation::Absent),
-                Some(stored) if stored.record.state == "COMMITTED" => {
-                    // Recovery rechecks the bounded bytes/DAG under the barrier,
-                    // so corruption cannot turn a stored state into a receipt.
-                    // This may read 64 MiB; normal finalization verifies outside
-                    // its short graph transaction instead.
-                    load_installed_dag(&txn, &stored).await?;
-                    check_payload_coverage(&txn, &stored).await?;
-                    verify_graph(&txn, &stored).await?;
-                    Ok(MetadataPrepareObservation::Committed(stored.receipt()?))
-                }
                 Some(stored) => {
-                    reject_consumed(&stored)?;
-                    Ok(MetadataPrepareObservation::Preparing(stored.intent()?))
+                    let matches = match &recovery.binding {
+                        PrepareRecoveryBinding::Exact(intent) => &stored.intent()? == intent,
+                        PrepareRecoveryBinding::Request(digest) => {
+                            stored.deadline.as_ref().map(|grant| grant.request_digest)
+                                == Some(*digest)
+                        }
+                    };
+                    if !matches {
+                        return Err(conflict(
+                            "metadata recovery does not bind this fixed preparation grant",
+                        ));
+                    }
+                    reject_terminal(&stored)?;
+                    if let Some(grant) = &stored.deadline
+                        && clock(&txn).await? >= grant.expires_at_ms
+                    {
+                        return Ok(MetadataPrepareObservation::DeadlinePassed {
+                            intent: stored.intent()?,
+                            expires_at_ms: grant.expires_at_ms,
+                        });
+                    }
+                    if stored.record.state == "COMMITTED" {
+                        // Recovery rechecks bounded bytes/DAG under the barrier;
+                        // corruption cannot turn a stored state into a receipt.
+                        load_installed_dag(&txn, &stored).await?;
+                        check_payload_coverage(&txn, &stored).await?;
+                        verify_graph(&txn, &stored).await?;
+                        Ok(MetadataPrepareObservation::Committed(stored.receipt()?))
+                    } else {
+                        Ok(MetadataPrepareObservation::Preparing(stored.intent()?))
+                    }
                 }
             }
         }
         .await;
-        txn.rollback()
-            .await
-            .map_err(|_| uncertain(operation_id, digest, phase))?;
+        txn.rollback().await.map_err(|_| uncertain(recovery))?;
         result.map_err(|error: SnapshotError| {
             if error.code == SnapshotErrorCode::Internal {
-                uncertain(operation_id, digest, phase)
+                uncertain(recovery)
             } else {
                 MetadataInstallError::Rejected(error)
             }
+        })
+    }
+
+    /// A process restart may retain the original operation and requested duration
+    /// without a server-issued intent. Recovery must still match that fixed request.
+    pub fn recovery_request(
+        &self,
+        operation: &str,
+        digest: [u8; 32],
+        phase: MetadataCommitPhase,
+    ) -> Result<MetadataPrepareRecovery, SnapshotError> {
+        self.recovery_request_with_duration(operation, digest, phase, DEFAULT_PREPARE_DURATION_MS)
+    }
+
+    pub(crate) fn recovery_request_with_duration(
+        &self,
+        operation: &str,
+        digest: [u8; 32],
+        phase: MetadataCommitPhase,
+        duration_ms: i64,
+    ) -> Result<MetadataPrepareRecovery, SnapshotError> {
+        Ok(MetadataPrepareRecovery {
+            operation_id: operation.into(),
+            manifest_digest: digest,
+            phase,
+            binding: PrepareRecoveryBinding::Request(request_digest(
+                self.storage_uuid(),
+                operation,
+                &digest,
+                duration_ms,
+            )?),
         })
     }
 
@@ -538,8 +638,13 @@ pub(super) async fn load_plan<C: ConnectionTrait>(
         || record.node_count as usize != plan.pages.len()
         || record.edge_count as usize != plan.edges.len()
         || record.total_bytes as u64 != plan.total_bytes
-        || !["PREPARING", "COMMITTED", "CONSUMED"].contains(&record.state.as_str())
-        || (record.state != "PREPARING") != record.committed_at.is_some()
+        || !["PREPARING", "COMMITTED", "CONSUMED", "EXPIRED"].contains(&record.state.as_str())
+        || match record.state.as_str() {
+            "PREPARING" => record.committed_at.is_some(),
+            "COMMITTED" | "CONSUMED" => record.committed_at.is_none(),
+            "EXPIRED" => !record.deadline_managed,
+            _ => true,
+        }
     {
         return Err(integrity(
             "stored metadata preparation fields disagree with their canonical plan",
@@ -570,7 +675,14 @@ pub(super) async fn load_plan<C: ConnectionTrait>(
             "stored metadata preparation coverage differs from its canonical plan",
         ));
     }
-    Ok(Some(StoredPlan { record, plan }))
+    let deadline = load_deadline(connection, &record, digest).await?;
+    let stored = StoredPlan {
+        record,
+        plan,
+        deadline,
+    };
+    load_expiry(connection, &stored).await?;
+    Ok(Some(stored))
 }
 
 async fn require_plan<C: ConnectionTrait>(
@@ -581,20 +693,45 @@ async fn require_plan<C: ConnectionTrait>(
     let stored = load_plan(connection, &intent.operation_id, &intent.manifest_digest)
         .await?
         .ok_or_else(|| unavailable("metadata preparation intent is not durable"))?;
-    if stored.record.prepare_id != intent.prepare_id {
+    if stored.record.prepare_id != intent.prepare_id
+        || stored.deadline.as_ref().map(|grant| grant.grant_digest) != intent.deadline_digest
+    {
         return Err(integrity("metadata intent identity mismatch"));
     }
-    reject_consumed(&stored)?;
+    reject_terminal(&stored)?;
+    require_unelapsed(connection, &stored).await?;
     Ok(stored)
 }
 
-fn reject_consumed(stored: &StoredPlan) -> Result<(), SnapshotError> {
-    if stored.record.state == "CONSUMED" {
-        return Err(SnapshotError::new(
-            SnapshotErrorCode::Conflict,
-            "metadata preparation has been consumed into a lease binding",
-        ));
+fn reject_terminal(stored: &StoredPlan) -> Result<(), SnapshotError> {
+    if ["CONSUMED", "EXPIRED"].contains(&stored.record.state.as_str()) {
+        return Err(conflict("metadata preparation is terminal"));
     }
+    Ok(())
+}
+
+pub(super) async fn require_unelapsed<C: ConnectionTrait>(
+    connection: &C,
+    stored: &StoredPlan,
+) -> Result<(), SnapshotError> {
+    if let Some(grant) = &stored.deadline
+        && clock(connection).await? >= grant.expires_at_ms
+    {
+        return Err(conflict("metadata preparation deadline has passed"));
+    }
+    Ok(())
+}
+
+pub(super) async fn lock_prepare_operation(
+    txn: &DatabaseTransaction,
+    operation: &str,
+) -> Result<(), SnapshotError> {
+    txn.query_one_raw(statement(
+        "SELECT prepare_id FROM mst2_metadata_prepare WHERE operation_id=$1 FOR UPDATE",
+        [operation.into()],
+    ))
+    .await
+    .map_err(internal)?;
     Ok(())
 }
 
@@ -775,7 +912,7 @@ fn validate_payload(payload: &MetadataPagePayload) -> Result<(), SnapshotError> 
     Ok(())
 }
 
-fn validate_operation_id(operation: &str) -> Result<(), SnapshotError> {
+pub(super) fn validate_operation_id(operation: &str) -> Result<(), SnapshotError> {
     if operation.is_empty() || operation.len() > 255 || operation.contains('\0') {
         return Err(SnapshotError::new(
             SnapshotErrorCode::InvalidRequest,
@@ -788,15 +925,12 @@ fn validate_operation_id(operation: &str) -> Result<(), SnapshotError> {
 async fn commit<T>(
     txn: DatabaseTransaction,
     result: Result<T, SnapshotError>,
-    operation: &str,
-    digest: [u8; 32],
-    phase: MetadataCommitPhase,
+    recovery: impl FnOnce(&T) -> MetadataPrepareRecovery,
 ) -> Result<T, MetadataInstallError> {
     match result {
         Ok(value) => {
-            txn.commit()
-                .await
-                .map_err(|_| uncertain(operation, digest, phase))?;
+            let recovery = recovery(&value);
+            txn.commit().await.map_err(|_| uncertain(&recovery))?;
             Ok(value)
         }
         Err(error) => {
@@ -805,15 +939,12 @@ async fn commit<T>(
         }
     }
 }
-fn uncertain(
-    operation: &str,
-    digest: [u8; 32],
-    phase: MetadataCommitPhase,
-) -> MetadataInstallError {
+fn uncertain(recovery: &MetadataPrepareRecovery) -> MetadataInstallError {
     MetadataInstallError::CommitUncertain {
-        operation_id: operation.into(),
-        manifest_digest: digest,
-        phase,
+        operation_id: recovery.operation_id.clone(),
+        manifest_digest: recovery.manifest_digest,
+        phase: recovery.phase,
+        recovery: Box::new(recovery.clone()),
     }
 }
 fn node_id(id: &[u8; 32]) -> String {
@@ -830,6 +961,9 @@ fn integrity(message: &str) -> SnapshotError {
 }
 fn unavailable(message: &str) -> SnapshotError {
     SnapshotError::new(SnapshotErrorCode::ObjectUnavailable, message)
+}
+fn conflict(message: &str) -> SnapshotError {
+    SnapshotError::new(SnapshotErrorCode::Conflict, message)
 }
 
 #[cfg(test)]

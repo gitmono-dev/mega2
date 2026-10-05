@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-fn prepared(scope: &str) -> PreparedNativeMetadataRetention {
+pub(in crate::jupiter::storage) fn prepared(scope: &str) -> PreparedNativeMetadataRetention {
     let child_entries = [Entry::file(EntryKind::Regular, b"file", 3, [42; 32])];
     let child = Page::build(&child_entries).unwrap();
     let entries = [
@@ -39,7 +39,7 @@ fn prepared(scope: &str) -> PreparedNativeMetadataRetention {
     )
 }
 
-async fn fixture() -> (
+pub(in crate::jupiter::storage) async fn fixture() -> (
     DatabaseConnection,
     DatabaseConnection,
     TestSchemaGuard,
@@ -53,7 +53,7 @@ async fn fixture() -> (
     (first, second, schema, config.db_url)
 }
 
-async fn install(
+pub(in crate::jupiter::storage) async fn install(
     repository: &PostgresMetadataInstallRepository,
     intent: &MetadataPrepareIntent,
     prepared: &PreparedNativeMetadataRetention,
@@ -61,6 +61,44 @@ async fn install(
     for page in prepared.dag().payloads() {
         repository.install_page(intent, page).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn native_metadata_recovery_requires_the_original_preparation_and_deadline_grant() {
+    let (first, second, _schema, _url) = fixture().await;
+    let repo = PostgresMetadataInstallRepository::new(first.clone())
+        .await
+        .unwrap();
+    let pages = prepared("/");
+    let original = repo.begin_intent("original-witness", &pages).await.unwrap();
+    let other = repo.begin_intent("other-witness", &pages).await.unwrap();
+    assert_eq!(original.manifest_digest(), other.manifest_digest());
+    let mut wrong = original.clone();
+    wrong.prepare_id = other.prepare_id.clone();
+    assert_eq!(
+        rejected(
+            repo.inspect_prepare(&second, &wrong.recovery(MetadataCommitPhase::Intent))
+                .await
+                .unwrap_err()
+        ),
+        SnapshotErrorCode::Conflict
+    );
+    wrong = original.clone();
+    wrong.deadline_digest = other.deadline_digest;
+    assert_eq!(
+        rejected(
+            repo.inspect_prepare(&second, &wrong.recovery(MetadataCommitPhase::Intent))
+                .await
+                .unwrap_err()
+        ),
+        SnapshotErrorCode::Conflict
+    );
+    assert_eq!(
+        repo.inspect_prepare(&second, &original.recovery(MetadataCommitPhase::Intent))
+            .await
+            .unwrap(),
+        MetadataPrepareObservation::Preparing(original)
+    );
 }
 
 fn rejected(error: MetadataInstallError) -> SnapshotErrorCode {
@@ -285,12 +323,7 @@ async fn native_metadata_partial_installation_survives_repository_and_connection
         .unwrap();
     assert!(matches!(
         restarted
-            .inspect_prepare(
-                &second,
-                intent.operation_id(),
-                intent.manifest_digest(),
-                MetadataCommitPhase::Payload
-            )
+            .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Payload))
             .await
             .unwrap(),
         MetadataPrepareObservation::Preparing(_)
@@ -386,7 +419,12 @@ async fn native_metadata_half_installation_survives_real_process_kill() {
     let prepared = prepared("/");
     let digest = prepared.install_plan().unwrap().digest().unwrap();
     let original = match restarted
-        .inspect_prepare(&second, OPERATION, digest, MetadataCommitPhase::Payload)
+        .inspect_prepare(
+            &second,
+            &restarted
+                .recovery_request(OPERATION, digest, MetadataCommitPhase::Payload)
+                .unwrap(),
+        )
         .await
         .unwrap()
     {
@@ -505,12 +543,7 @@ async fn native_metadata_committed_recovery_rejects_same_length_corruption_and_p
     assert_eq!(
         rejected(
             repository
-                .inspect_prepare(
-                    &second,
-                    intent.operation_id(),
-                    intent.manifest_digest(),
-                    MetadataCommitPhase::Finalize
-                )
+                .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Finalize))
                 .await
                 .unwrap_err()
         ),
@@ -549,12 +582,7 @@ async fn native_metadata_committed_recovery_rejects_same_length_corruption_and_p
     overwrite_installed_payload_for_test(&first, page, page.bytes.clone()).await;
     assert_eq!(
         repository
-            .inspect_prepare(
-                &second,
-                intent.operation_id(),
-                intent.manifest_digest(),
-                MetadataCommitPhase::Finalize
-            )
+            .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Finalize))
             .await
             .unwrap(),
         MetadataPrepareObservation::Committed(receipt)
@@ -598,12 +626,7 @@ async fn native_metadata_outer_rollback_preserves_intent_but_exposes_no_graph_or
     txn.rollback().await.unwrap();
     assert!(matches!(
         repository
-            .inspect_prepare(
-                &second,
-                intent.operation_id(),
-                intent.manifest_digest(),
-                MetadataCommitPhase::Finalize
-            )
+            .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Finalize))
             .await
             .unwrap(),
         MetadataPrepareObservation::Preparing(_)
@@ -690,12 +713,7 @@ async fn native_metadata_receipt_replay_rejects_lost_pin_without_recreating_it()
     assert_eq!(
         rejected(
             repository
-                .inspect_prepare(
-                    &second,
-                    intent.operation_id(),
-                    intent.manifest_digest(),
-                    MetadataCommitPhase::Finalize
-                )
+                .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Finalize))
                 .await
                 .unwrap_err()
         ),
@@ -739,12 +757,7 @@ async fn native_metadata_recovery_lock_timeout_is_unknown_and_never_releases_pin
     recovery.barrier_timeout = Duration::from_millis(25);
     assert!(matches!(
         recovery
-            .inspect_prepare(
-                &second,
-                intent.operation_id(),
-                intent.manifest_digest(),
-                MetadataCommitPhase::Finalize
-            )
+            .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Finalize))
             .await
             .unwrap_err(),
         MetadataInstallError::CommitUncertain {
@@ -762,12 +775,7 @@ async fn native_metadata_recovery_lock_timeout_is_unknown_and_never_releases_pin
     blocker.rollback().await.unwrap();
     assert!(matches!(
         recovery
-            .inspect_prepare(
-                &second,
-                intent.operation_id(),
-                intent.manifest_digest(),
-                MetadataCommitPhase::Finalize
-            )
+            .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Finalize))
             .await
             .unwrap(),
         MetadataPrepareObservation::Committed(_)
@@ -791,12 +799,7 @@ async fn native_metadata_stored_identity_and_plan_tampering_fail_closed_on_resta
     assert_eq!(
         rejected(
             repository
-                .inspect_prepare(
-                    &second,
-                    intent.operation_id(),
-                    intent.manifest_digest(),
-                    MetadataCommitPhase::Intent
-                )
+                .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Intent))
                 .await
                 .unwrap_err()
         ),
@@ -806,12 +809,7 @@ async fn native_metadata_stored_identity_and_plan_tampering_fail_closed_on_resta
     assert_eq!(
         rejected(
             repository
-                .inspect_prepare(
-                    &second,
-                    intent.operation_id(),
-                    intent.manifest_digest(),
-                    MetadataCommitPhase::Intent
-                )
+                .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Intent))
                 .await
                 .unwrap_err()
         ),
@@ -1043,12 +1041,7 @@ async fn commit_fault_case(fault: Fault) {
     ));
     proxy.wait_for_fault().await;
     let observed = repository
-        .inspect_prepare(
-            &recovery,
-            intent.operation_id(),
-            intent.manifest_digest(),
-            MetadataCommitPhase::Finalize,
-        )
+        .inspect_prepare(&recovery, &intent.recovery(MetadataCommitPhase::Finalize))
         .await
         .unwrap();
     match fault {
@@ -1136,9 +1129,7 @@ async fn native_metadata_wrong_schema_primary_cannot_report_absent_for_another_c
         repository
             .inspect_prepare(
                 &wrong_primary,
-                intent.operation_id(),
-                intent.manifest_digest(),
-                MetadataCommitPhase::Finalize
+                &intent.recovery(MetadataCommitPhase::Finalize)
             )
             .await
             .unwrap_err(),
@@ -1160,12 +1151,7 @@ async fn native_metadata_wrong_schema_primary_cannot_report_absent_for_another_c
     );
     assert!(matches!(
         repository
-            .inspect_prepare(
-                &second,
-                intent.operation_id(),
-                intent.manifest_digest(),
-                MetadataCommitPhase::Finalize
-            )
+            .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Finalize))
             .await
             .unwrap(),
         MetadataPrepareObservation::Committed(_)
@@ -1192,12 +1178,7 @@ async fn native_metadata_query_loss_after_recovery_barrier_preserves_typed_unkno
     proxy.armed.store(true, Ordering::SeqCst);
     assert!(matches!(
         repository
-            .inspect_prepare(
-                &fresh,
-                intent.operation_id(),
-                intent.manifest_digest(),
-                MetadataCommitPhase::Finalize
-            )
+            .inspect_prepare(&fresh, &intent.recovery(MetadataCommitPhase::Finalize))
             .await
             .unwrap_err(),
         MetadataInstallError::CommitUncertain { .. }
@@ -1213,12 +1194,7 @@ async fn native_metadata_query_loss_after_recovery_barrier_preserves_typed_unkno
     );
     assert!(matches!(
         repository
-            .inspect_prepare(
-                &second,
-                intent.operation_id(),
-                intent.manifest_digest(),
-                MetadataCommitPhase::Finalize
-            )
+            .inspect_prepare(&second, &intent.recovery(MetadataCommitPhase::Finalize))
             .await
             .unwrap(),
         MetadataPrepareObservation::Committed(_)

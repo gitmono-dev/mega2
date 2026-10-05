@@ -316,6 +316,88 @@ fn rejection(error: MetadataLeaseError) -> SnapshotErrorCode {
     }
 }
 
+#[tokio::test]
+async fn metadata_lease_consumed_prepare_deadline_cannot_expire_or_break_operation_replay() {
+    let (first, second, _schema) = fixture().await;
+    let install = PostgresMetadataInstallRepository::new(first.clone())
+        .await
+        .unwrap();
+    let pages = prepared();
+    let intent = install
+        .begin_intent_with_duration("consumed-deadline", &pages, 3000)
+        .await
+        .unwrap();
+    for page in pages.dag().payloads() {
+        install.install_page(&intent, page).await.unwrap();
+    }
+    let prepared_receipt = install.finalize(&intent).await.unwrap();
+    let ledger = PostgresMetadataLeaseRepository::new(first.clone())
+        .await
+        .unwrap();
+    let handoff = ledger
+        .verify_handoff(
+            binding(prepared_receipt.metadata_root(), 1),
+            &prepared_receipt,
+        )
+        .await
+        .unwrap();
+    let access = access(&first).await;
+    let lease = ledger
+        .consume("consume-before-deadline", &handoff, &access, 60_000)
+        .await
+        .unwrap();
+    let grant = load_plan(&first, intent.operation_id(), &intent.manifest_digest())
+        .await
+        .unwrap()
+        .unwrap()
+        .deadline
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while super::super::native_metadata_prepare_expiry::clock(&first)
+            .await
+            .unwrap()
+            < grant.expires_at_ms
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(install.expire_prepare("expire-consumed", &intent).await.unwrap_err(),
+        super::super::native_metadata_prepare_expiry::PrepareExpiryError::Rejected(error)
+        if error.code==SnapshotErrorCode::Conflict)
+    );
+    assert_eq!(
+        ledger
+            .consume("consume-before-deadline", &handoff, &access, 60_000)
+            .await
+            .unwrap(),
+        lease
+    );
+    assert!(
+        matches!(ledger.inspect_operation(&second, lease.operation_id(), lease.operation_digest()).await.unwrap(),
+        MetadataLeaseObservation::Committed { event, state, .. } if *event==lease && state=="ACTIVE")
+    );
+    assert_eq!(count(&first, "mst2_metadata_prepare_expiry").await, 0);
+    assert_eq!(count(&first, "mst2_metadata_prepare_consumption").await, 1);
+    assert_eq!(count(&first, "mst2_metadata_lease_operation").await, 1);
+    assert_eq!(count(&first, "mst2_retention_root").await, 2);
+    let stored = load_plan(&first, intent.operation_id(), &intent.manifest_digest())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.record.state, "CONSUMED");
+    verify_graph_root(
+        &second,
+        &stored,
+        &format!("lease:{}", lease.lease_id()),
+        "lease",
+    )
+    .await
+    .unwrap();
+}
+
 #[test]
 fn metadata_lease_descriptor_fixture_requires_exact_plan_sid_profile_and_tagged_source() {
     let prepared = prepared();
@@ -391,8 +473,7 @@ async fn metadata_lease_two_real_primary_connections_consume_once_and_recover_ex
         super::super::native_metadata_install::MetadataInstallError::Rejected(error) if error.code==SnapshotErrorCode::Conflict)
     );
     assert!(
-        matches!(install.inspect_prepare(&second,prepared_receipt.intent().operation_id(),prepared_receipt.intent().manifest_digest(),
-        super::super::native_metadata_install::MetadataCommitPhase::Finalize).await.unwrap_err(),
+        matches!(install.inspect_prepare(&second, &prepared_receipt.intent().recovery(super::super::native_metadata_install::MetadataCommitPhase::Finalize)).await.unwrap_err(),
         super::super::native_metadata_install::MetadataInstallError::Rejected(error) if error.code==SnapshotErrorCode::Conflict)
     );
 }
