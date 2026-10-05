@@ -17,6 +17,7 @@ pub mod lfs_db_storage;
 pub mod media_paging_storage;
 pub mod mono_storage;
 pub(crate) mod mst2_publication_storage;
+pub mod mst2_retention;
 pub mod notification_storage;
 pub mod object_storage;
 pub mod oci_db_storage;
