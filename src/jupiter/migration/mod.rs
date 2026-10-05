@@ -486,20 +486,21 @@ mod tests {
     #[tokio::test]
     async fn import_repo_alias_rows_canonicalized() {
         let names = migration_names();
+        let expected = [
+            "m20260923_000100_import_repo_cleanups".to_string(),
+            "m20260923_000200_canonicalize_import_repo_paths".to_string(),
+            "m20260925_000100_media_paging".to_string(),
+            "m20261005_000100_add_mst2_publication_request_digest".to_string(),
+            "m20261005_000200_add_mst2_native_head".to_string(),
+            "m20261005_000100_add_mst2_retention_durability".to_string(),
+            "m20261005_000200_harden_mst2_retention_graph".to_string(),
+            "m20261005_000300_add_mst2_metadata_install".to_string(),
+            "m20261005_000400_add_mst2_metadata_lease_ledger".to_string(),
+        ];
         assert_eq!(
-            &names[names.len() - 8..],
-            &[
-                "m20260923_000100_import_repo_cleanups".to_string(),
-                "m20260923_000200_canonicalize_import_repo_paths".to_string(),
-                "m20260925_000100_media_paging".to_string(),
-                "m20261005_000100_add_mst2_publication_request_digest".to_string(),
-                "m20261005_000200_add_mst2_native_head".to_string(),
-                "m20261005_000100_add_mst2_retention_durability".to_string(),
-                "m20261005_000200_harden_mst2_retention_graph".to_string(),
-                "m20261005_000300_add_mst2_metadata_install".to_string(),
-                "m20261005_000400_add_mst2_metadata_lease_ledger".to_string(),
-            ],
-            "metadata installation follows retention graph hardening"
+            &names[names.len() - expected.len()..],
+            &expected,
+            "metadata installation and lease ledger follow retention graph hardening"
         );
 
         let db = alias_db().await;
