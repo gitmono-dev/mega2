@@ -452,6 +452,10 @@ impl RepoHandler for ImportRepo {
     }
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_recursion adds must_use to the generated boxed Future"
+)]
 #[async_recursion]
 pub(crate) async fn collect_git_blob_filepaths(
     storage: GitDbStorage,

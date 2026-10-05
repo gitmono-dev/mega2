@@ -374,6 +374,7 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
 
     Storage {
         app_service: Arc::new(svc),
+        native_projection_cache: Arc::default(),
         cl_service: CLService::mock(),
         push_queue_service: PushQueueService::new(
             base.clone(),
