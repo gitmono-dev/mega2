@@ -207,7 +207,7 @@ pub(crate) enum PrepareExpiryError {
     #[error(transparent)]
     Rejected(#[from] SnapshotError),
     #[error("preparation expiry commit outcome is unknown")]
-    CommitUncertain { recovery: PrepareExpiryRequest },
+    CommitUncertain { recovery: Box<PrepareExpiryRequest> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,7 +544,7 @@ async fn require_no_consumption<C: ConnectionTrait>(
 
 fn expiry_uncertain(request: &PrepareExpiryRequest) -> PrepareExpiryError {
     PrepareExpiryError::CommitUncertain {
-        recovery: request.clone(),
+        recovery: Box::new(request.clone()),
     }
 }
 

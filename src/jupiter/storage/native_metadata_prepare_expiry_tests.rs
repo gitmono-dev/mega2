@@ -524,7 +524,7 @@ async fn prepare_expiry_recovery_query_failure_and_wrong_primary_stay_unknown() 
     let fresh = Database::connect(proxy.url.clone()).await.unwrap();
     proxy.armed.store(true, Ordering::SeqCst);
     assert!(
-        matches!(repo.inspect_prepare_expiry(&fresh, &event.request).await.unwrap_err(), PrepareExpiryError::CommitUncertain { recovery } if recovery==event.request)
+        matches!(repo.inspect_prepare_expiry(&fresh, &event.request).await.unwrap_err(), PrepareExpiryError::CommitUncertain { recovery } if *recovery==event.request)
     );
     proxy.wait_for_fault().await;
     let (wrong, _wrong_second, _wrong_schema, _wrong_url) = fixture().await;
