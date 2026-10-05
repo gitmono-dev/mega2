@@ -585,7 +585,19 @@ async fn t06b_forward_migration_backfills_old_graph_and_enforces_constraints() {
         .await
         .is_err()
     );
-    assert!(db.execute_unprepared("INSERT INTO mst2_retention_gc_op (operation_id, node_id, operation, state) VALUES ('bad', 'child', 'REMOVE', 'APPLIED')").await.is_err());
+    let completion_error = db
+        .execute_unprepared(
+            "INSERT INTO mst2_retention_gc_op (operation_id, node_id, operation, state, attempts, created_at) \
+             VALUES ('bad', 'child', 'REMOVE', 'APPLIED', 0, now())",
+        )
+        .await
+        .expect_err("APPLIED receipt without completed_at must violate its completion constraint");
+    assert!(
+        completion_error
+            .to_string()
+            .contains("mst2_retention_gc_op_completion_check"),
+        "unexpected constraint failure: {completion_error}"
+    );
 }
 
 #[tokio::test]
