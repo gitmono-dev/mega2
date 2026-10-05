@@ -969,7 +969,7 @@ async fn forward_connection(
             let is_commit = frame.0 == b'Q' && frame.1.as_slice() == b"COMMIT\0";
             let fault_target = match fault {
                 Fault::PrepareRead => {
-                    [b'P', b'Q'].contains(&frame.0)
+                    b"PQ".contains(&frame.0)
                         && frame
                             .1
                             .windows(b"mst2_metadata_prepare".len())
