@@ -1,0 +1,310 @@
+use std::sync::Arc;
+
+use mst2_codec::metapage::{Entry, EntryKind, Page, page_id};
+use sea_orm::Database;
+use sea_orm_migration::MigratorTrait;
+
+use super::*;
+use crate::{
+    ceres::snapshot::{
+        pages::PreparedNativeMetadataRetention,
+        retention_dag::{MetadataDagBuilder, MetadataDagLimits},
+    },
+    jupiter::{
+        migration::Migrator,
+        tests::{TestSchemaGuard, test_db_config},
+    },
+};
+
+async fn fixture() -> (DatabaseConnection, DatabaseConnection, TestSchemaGuard) {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (config, schema) = test_db_config(temp.path()).await;
+    let first = Database::connect(config.db_url.clone()).await.unwrap();
+    Migrator::up(&first, None).await.unwrap();
+    let second = Database::connect(config.db_url).await.unwrap();
+    (first, second, schema)
+}
+
+fn prepared() -> PreparedNativeMetadataRetention {
+    let child_entries = [Entry::file(EntryKind::Regular, b"file", 3, [42; 32])];
+    let child = Page::build(&child_entries).unwrap();
+    let root_entries = [
+        Entry::dir(b"one", page_id(&child)),
+        Entry::dir(b"two", page_id(&child)),
+    ];
+    let root = Page::build(&root_entries).unwrap();
+    let mut builder = MetadataDagBuilder::new(MetadataDagLimits::default());
+    builder.add_directory(&child, &child_entries).unwrap();
+    builder.add_directory(&root, &root_entries).unwrap();
+    PreparedNativeMetadataRetention::test_installation(
+        Arc::new(builder.finish(page_id(&root)).unwrap()),
+        "/",
+    )
+}
+
+// Synthetic fixture identities are confined to cfg(test). This is not an
+// adopted native namespace identity factory or a production authorizer.
+fn binding(root: [u8; 32], publication: u8) -> MetadataOnlyBinding {
+    MetadataOnlyBinding {
+        canonical_descriptor: ServingDescriptor {
+            instance_uuid: *uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555556")
+                .unwrap()
+                .as_bytes(),
+            namespace_view_id: [22; 32],
+            scope: "/".into(),
+            metadata_root: root,
+        }
+        .encode()
+        .unwrap(),
+        tagged_root_commit_oid: format!("sha1:{}", "b".repeat(40)),
+        publication_binding: [publication; 32],
+    }
+}
+
+async fn handoff(
+    db: &DatabaseConnection,
+    operation: &str,
+    publication: u8,
+) -> (
+    PostgresMetadataLeaseRepository,
+    VerifiedMetadataHandoff,
+    PreparedMetadataReceipt,
+) {
+    let install = PostgresMetadataInstallRepository::new(db.clone())
+        .await
+        .unwrap();
+    let prepared = prepared();
+    let intent = install.begin_intent(operation, &prepared).await.unwrap();
+    for page in prepared.dag().payloads() {
+        install.install_page(&intent, page).await.unwrap();
+    }
+    let receipt = install.finalize(&intent).await.unwrap();
+    let ledger = PostgresMetadataLeaseRepository::new(db.clone())
+        .await
+        .unwrap();
+    let handoff = ledger
+        .verify_handoff(binding(receipt.metadata_root(), publication), &receipt)
+        .await
+        .unwrap();
+    (ledger, handoff, receipt)
+}
+
+async fn access(db: &DatabaseConnection) -> MetadataAccess {
+    let access = MetadataAccess {
+        subject_id: [7; 32],
+        generation: 1,
+        scope: "/".into(),
+    };
+    db.execute_raw(statement(
+        "INSERT INTO mst2_metadata_access_generation(subject_id,generation,scope,enabled) VALUES($1,1,'/',true) ON CONFLICT(subject_id) DO NOTHING",
+        [access.subject_id.to_vec().into()],
+    )).await.unwrap();
+    access
+}
+
+async fn count<C: ConnectionTrait>(db: &C, table: &str) -> i64 {
+    let sql = format!("SELECT count(*) FROM {table}");
+    db.query_one_raw(statement(&sql, []))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap()
+}
+
+fn rejection(error: MetadataLeaseError) -> SnapshotErrorCode {
+    match error {
+        MetadataLeaseError::Rejected(error) => error.code,
+        _ => panic!("expected definite rejection"),
+    }
+}
+
+#[test]
+fn metadata_lease_descriptor_fixture_requires_exact_plan_sid_profile_and_tagged_source() {
+    let prepared = prepared();
+    let plan = prepared.install_plan().unwrap();
+    let valid = binding(plan.root, 1);
+    checked_descriptor(&valid, &plan).unwrap();
+    let mut wrong = valid.clone();
+    wrong.canonical_descriptor = binding([0; 32], 1).canonical_descriptor;
+    assert_eq!(
+        checked_descriptor(&wrong, &plan).unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    let mut wrong = valid.clone();
+    wrong.tagged_root_commit_oid = format!("sha256:{}", "a".repeat(64));
+    assert_eq!(
+        checked_descriptor(&wrong, &plan).unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    let mut wrong = valid;
+    wrong.canonical_descriptor.push(0);
+    assert!(checked_descriptor(&wrong, &plan).is_err());
+}
+
+#[tokio::test]
+async fn metadata_lease_two_real_primary_connections_consume_once_and_recover_exact_binding() {
+    let (first, second, _schema) = fixture().await;
+    let (a, handoff, prepared_receipt) = handoff(&first, "prepare-once", 1).await;
+    let b = PostgresMetadataLeaseRepository::new(second.clone())
+        .await
+        .unwrap();
+    let access = access(&first).await;
+    let (left, right) = tokio::join!(
+        a.consume("consume-once", &handoff, &access, 60_000),
+        b.consume("consume-once", &handoff, &access, 60_000)
+    );
+    let receipt = left.unwrap();
+    assert_eq!(receipt, right.unwrap());
+    for table in [
+        "mst2_metadata_catalog",
+        "mst2_metadata_lease",
+        "mst2_metadata_prepare_consumption",
+        "mst2_metadata_lease_operation",
+    ] {
+        assert_eq!(count(&second, table).await, 1, "{table}");
+    }
+    assert_eq!(count(&second, "mst2_retention_root").await, 2);
+    assert_eq!(count(&second, "mst2_retention_edge").await, 1);
+    assert_eq!(count(&second, "mst2_metadata_payload").await, 2);
+    let state: String = second
+        .query_one_raw(statement("SELECT state FROM mst2_metadata_prepare", []))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(state, "CONSUMED");
+    assert!(
+        matches!(a.inspect_operation(&second,receipt.operation_id(),receipt.operation_digest()).await.unwrap(),
+        MetadataLeaseObservation::Committed { event, state,version:1,.. } if *event==receipt && state=="ACTIVE")
+    );
+    assert_eq!(
+        rejection(
+            a.consume("consume-once", &handoff, &access, 60_001)
+                .await
+                .unwrap_err()
+        ),
+        SnapshotErrorCode::Conflict
+    );
+    assert_eq!(count(&second, "mst2_metadata_lease").await, 1);
+    let install = PostgresMetadataInstallRepository::new(first).await.unwrap();
+    assert!(
+        matches!(install.finalize(prepared_receipt.intent()).await.unwrap_err(),
+        super::super::native_metadata_install::MetadataInstallError::Rejected(error) if error.code==SnapshotErrorCode::Conflict)
+    );
+    assert!(
+        matches!(install.inspect_prepare(&second,prepared_receipt.intent().operation_id(),prepared_receipt.intent().manifest_digest(),
+        super::super::native_metadata_install::MetadataCommitPhase::Finalize).await.unwrap_err(),
+        super::super::native_metadata_install::MetadataInstallError::Rejected(error) if error.code==SnapshotErrorCode::Conflict)
+    );
+}
+
+#[tokio::test]
+async fn metadata_lease_outer_rollback_restores_prepare_and_exposes_no_provisional_catalog_or_lease()
+ {
+    let (first, second, _schema) = fixture().await;
+    let (ledger, handoff, _receipt) = handoff(&first, "rollback-prepare", 1).await;
+    let access = access(&first).await;
+    let digest = operation_digest("rollback-consume", &handoff, &access, 60_000).unwrap();
+    let txn = ledger.install.transaction().await.unwrap();
+    let provisional = ledger
+        .consume_in_txn(&txn, "rollback-consume", digest, &handoff, &access, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(count(&txn, "mst2_metadata_lease").await, 1);
+    for table in [
+        "mst2_metadata_catalog",
+        "mst2_metadata_lease",
+        "mst2_metadata_prepare_consumption",
+        "mst2_metadata_lease_operation",
+    ] {
+        assert_eq!(
+            count(&second, table).await,
+            0,
+            "uncommitted {table} escaped"
+        );
+    }
+    txn.rollback().await.unwrap();
+    let state: String = second
+        .query_one_raw(statement("SELECT state FROM mst2_metadata_prepare", []))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(state, "COMMITTED");
+    assert_eq!(count(&second, "mst2_retention_root").await, 2);
+    assert_eq!(
+        ledger
+            .inspect_operation(&second, "rollback-consume", digest)
+            .await
+            .unwrap(),
+        MetadataLeaseObservation::Absent
+    );
+    let committed = ledger
+        .consume("rollback-consume", &handoff, &access, 60_000)
+        .await
+        .unwrap();
+    assert_ne!(committed.lease_id(), provisional.lease_id());
+    assert_eq!(count(&second, "mst2_retention_root").await, 2);
+}
+
+#[tokio::test]
+async fn metadata_lease_current_policy_and_live_pins_fail_closed_without_repair() {
+    let (first, second, _schema) = fixture().await;
+    let (ledger, handoff, _receipt) = handoff(&first, "policy-prepare", 1).await;
+    let mut access = access(&first).await;
+    access.generation = 2;
+    assert_eq!(
+        rejection(
+            ledger
+                .consume("policy-consume", &handoff, &access, 60_000)
+                .await
+                .unwrap_err()
+        ),
+        SnapshotErrorCode::ScopeForbidden
+    );
+    assert_eq!(count(&second, "mst2_metadata_lease").await, 0);
+    access.generation = 1;
+    let receipt = ledger
+        .consume("policy-consume", &handoff, &access, 60_000)
+        .await
+        .unwrap();
+    first
+        .execute_unprepared("UPDATE mst2_metadata_access_generation SET enabled=false,generation=2")
+        .await
+        .unwrap();
+    assert_eq!(
+        rejection(
+            ledger
+                .consume("policy-consume", &handoff, &access, 60_000)
+                .await
+                .unwrap_err()
+        ),
+        SnapshotErrorCode::ScopeForbidden
+    );
+    PostgresRetentionRepository::new(first.clone())
+        .release_root(&RetentionRoot::Lease(receipt.lease_id().into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        rejection(
+            ledger
+                .inspect_operation(&second, receipt.operation_id(), receipt.operation_digest())
+                .await
+                .unwrap_err()
+        ),
+        SnapshotErrorCode::ObjectUnavailable
+    );
+    assert_eq!(count(&second, "mst2_retention_root").await, 0);
+    assert_eq!(count(&second, "mst2_metadata_lease_operation").await, 1);
+    let (other, _other_connection, _other_schema) = fixture().await;
+    assert!(matches!(
+        ledger
+            .inspect_operation(&other, receipt.operation_id(), receipt.operation_digest())
+            .await
+            .unwrap_err(),
+        MetadataLeaseError::CommitUncertain { .. }
+    ));
+}
