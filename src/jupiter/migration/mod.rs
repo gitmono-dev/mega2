@@ -143,6 +143,7 @@ mod m20261005_000100_add_mst2_publication_request_digest;
 mod m20261005_000100_add_mst2_retention_durability;
 mod m20261005_000200_add_mst2_native_head;
 mod m20261005_000200_harden_mst2_retention_graph;
+mod m20261005_000300_add_mst2_metadata_install;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -274,6 +275,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000200_add_mst2_native_head::Migration),
             Box::new(m20261005_000100_add_mst2_retention_durability::Migration),
             Box::new(m20261005_000200_harden_mst2_retention_graph::Migration),
+            Box::new(m20261005_000300_add_mst2_metadata_install::Migration),
         ]
     }
 }
@@ -483,7 +485,7 @@ mod tests {
     async fn import_repo_alias_rows_canonicalized() {
         let names = migration_names();
         assert_eq!(
-            &names[names.len() - 7..],
+            &names[names.len() - 8..],
             &[
                 "m20260923_000100_import_repo_cleanups".to_string(),
                 "m20260923_000200_canonicalize_import_repo_paths".to_string(),
@@ -492,8 +494,9 @@ mod tests {
                 "m20261005_000200_add_mst2_native_head".to_string(),
                 "m20261005_000100_add_mst2_retention_durability".to_string(),
                 "m20261005_000200_harden_mst2_retention_graph".to_string(),
+                "m20261005_000300_add_mst2_metadata_install".to_string(),
             ],
-            "retention durability registered last, after media paging"
+            "metadata installation follows retention graph hardening"
         );
 
         let db = alias_db().await;

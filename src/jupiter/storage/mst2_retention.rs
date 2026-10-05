@@ -37,7 +37,7 @@ const MAX_NODES: usize = 4096;
 const MAX_EDGES: usize = 16_384;
 const MAX_ROOTS: usize = 16;
 const MAX_PENDING_BATCH: u64 = 1000;
-const RETENTION_LOCK_KEY: i32 = 1_296_717_362;
+pub(crate) const RETENTION_LOCK_KEY: i32 = 1_296_717_362;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcClaim {
