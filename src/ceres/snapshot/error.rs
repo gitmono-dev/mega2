@@ -18,6 +18,8 @@ pub enum SnapshotErrorCode {
     ScopeForbidden,
     ViewNotFound,
     SnapshotNotReady,
+    /// A bounded operation could not complete in time (spec 14 §5).
+    TemporaryUnavailable,
     /// The fixed view no longer exists: spec 14 §5 SNAPSHOT_GONE (410).
     SnapshotGone,
     PathNotFound,
@@ -49,6 +51,7 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::ScopeForbidden => "SCOPE_FORBIDDEN",
             SnapshotErrorCode::ViewNotFound => "VIEW_NOT_FOUND",
             SnapshotErrorCode::SnapshotNotReady => "SNAPSHOT_NOT_READY",
+            SnapshotErrorCode::TemporaryUnavailable => "TEMPORARY_UNAVAILABLE",
             SnapshotErrorCode::SnapshotGone => "SNAPSHOT_GONE",
             SnapshotErrorCode::PathNotFound => "PATH_NOT_FOUND",
             SnapshotErrorCode::NotDirectory => "NOT_DIRECTORY",
@@ -82,7 +85,7 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::ViewNotFound
             | SnapshotErrorCode::PathNotFound
             | SnapshotErrorCode::LeaseUnknown => 404,
-            SnapshotErrorCode::SnapshotNotReady => 503,
+            SnapshotErrorCode::SnapshotNotReady | SnapshotErrorCode::TemporaryUnavailable => 503,
             SnapshotErrorCode::ObjectUnavailable => 503,
             SnapshotErrorCode::NotDirectory
             | SnapshotErrorCode::Conflict

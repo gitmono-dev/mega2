@@ -14,7 +14,7 @@ use futures::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{abs_view_path, internal, mst2_error_response, treeframe_response};
+use super::{abs_view_path, internal, mst2_error_response, request::Mst2Bytes, treeframe_response};
 use crate::ceres::snapshot::{
     chunks::{ChunkProjection, get_or_project},
     error::{SnapshotError, SnapshotErrorCode},
@@ -174,7 +174,7 @@ const OBJECT_TOTAL_MAX: usize = 8 * 1024 * 1024;
 pub(super) async fn objects(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure(&state)?;
     let ctx = runtime()
@@ -469,7 +469,7 @@ struct Planned {
 pub(super) async fn chunks(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure(&state)?;
     let ctx = runtime()
