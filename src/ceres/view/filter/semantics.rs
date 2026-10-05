@@ -26,6 +26,14 @@ pub fn src_paths(filter: &Filter) -> Vec<String> {
     paths
 }
 
+/// Computes exact destination paths for a filter already accepted for registration.
+///
+/// Callers handling request-supplied filters must validate them before calling this
+/// function, because the exact result itself can be large for an unvalidated AST.
+pub fn dst_paths(filter: &Filter) -> Vec<String> {
+    src_paths(&invert(filter))
+}
+
 pub(crate) fn src_paths_limited(
     filter: &Filter,
     max_paths: usize,
@@ -257,6 +265,17 @@ mod tests {
             (":[:/a/b:prefix=x,:/a.c:prefix=y]", vec!["/a.c", "/a/b"]),
         ] {
             assert_eq!(src_paths(&filter(input)), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn dst_paths_examples() {
+        for (input, expected) in [
+            (":/a:prefix=x", vec!["/x"]),
+            (":[:/a:prefix=x,:/b:prefix=y]", vec!["/x", "/y"]),
+            (":exclude[::secret]", vec!["/"]),
+        ] {
+            assert_eq!(dst_paths(&filter(input)), expected, "{input}");
         }
     }
 }

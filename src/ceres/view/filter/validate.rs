@@ -1,7 +1,8 @@
 use super::{
     Filter, canonicalize,
     semantics::{
-        all_compose_source_paths_limited, display_path, is_prefix, path_segments, src_paths_limited,
+        all_compose_source_paths_limited, display_path, invert, is_prefix, path_segments,
+        src_paths_limited,
     },
 };
 use crate::{
@@ -91,9 +92,16 @@ fn validate_with_limits(
 
     let src_paths = src_paths_limited(&filter, limits.k)
         .map_err(|_| scale_limit(ScaleLimitKind::K, limits.k))?;
-    for group in all_compose_source_paths_limited(&filter, limits.k)
-        .map_err(|_| scale_limit(ScaleLimitKind::K, limits.k))?
-    {
+    let source_groups = all_compose_source_paths_limited(&filter, limits.k)
+        .map_err(|_| scale_limit(ScaleLimitKind::K, limits.k))?;
+    let destination_groups = all_compose_source_paths_limited(&invert(&filter), limits.k)
+        .map_err(|_| scale_limit(ScaleLimitKind::K, limits.k))?;
+    for group in destination_groups {
+        if let Some((first, second)) = first_overlap(&group) {
+            return Err(RegistrationRejection::ComposeOverlap { first, second });
+        }
+    }
+    for group in source_groups {
         if let Some((first, second)) = first_overlap(&group) {
             return Err(RegistrationRejection::ComposeOverlap { first, second });
         }
@@ -182,7 +190,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{super::parse_for_registration, *};
-    use crate::ceres::view::filter::semantics::src_paths;
+    use crate::ceres::view::filter::semantics::{
+        all_compose_source_paths_limited, src_paths, src_paths_limited,
+    };
 
     fn check(text: &str, config: &MonoConfig) -> Result<RegistrationCheck, RegistrationRejection> {
         let parsed =
@@ -215,6 +225,74 @@ mod tests {
         ] {
             assert!(check(input, &config).is_ok(), "{input}");
         }
+    }
+
+    #[test]
+    fn output_path_overlap_rejected() {
+        let config = MonoConfig::default();
+        for input in [
+            ":[:/x:prefix=a,:/y:prefix=a/b]",
+            ":[:/sub1,:/xx]",
+            ":[:/xx,:/sub1]",
+            ":[:/sub1,:/xx,:/sub/xx]",
+            ":/r:[:/a:prefix=x,:/b:prefix=x/y]",
+            ":[:[:/a:prefix=x,:/b:prefix=x/y]:prefix=q,:/c:prefix=z]",
+        ] {
+            assert!(
+                matches!(
+                    check(input, &config),
+                    Err(RegistrationRejection::ComposeOverlap { .. })
+                ),
+                "{input}"
+            );
+        }
+        assert!(check(":[:/a:prefix=x,:/b:prefix=y]", &config).is_ok());
+        assert_eq!(
+            check(":[:/a:prefix=x,:/a/b:prefix=x/y]", &config),
+            Err(RegistrationRejection::ComposeOverlap {
+                first: "/x".to_owned(),
+                second: "/x/y".to_owned(),
+            })
+        );
+        let limits = ScaleLimits {
+            members: 64,
+            selectors: 256,
+            k: 2,
+        };
+        let filter = parse_for_registration(
+            ":[:prefix=p:[:/p:prefix=a,:/q:prefix=b,:/r:prefix=c],:/s:prefix=t,:/u:prefix=t/v]:/t",
+        )
+        .unwrap()
+        .filter;
+        assert!(src_paths_limited(&filter, limits.k).is_ok());
+        assert!(all_compose_source_paths_limited(&filter, limits.k).is_err());
+        assert!(matches!(
+            validate_with_limits(&filter, &config, limits),
+            Err(RegistrationRejection::ScaleLimit {
+                which: ScaleLimitKind::K,
+                limit: 2,
+                actual: 3,
+            })
+        ));
+        let destination_groups =
+            all_compose_source_paths_limited(&invert(&filter), limits.k).unwrap();
+        assert!(
+            destination_groups.iter().any(|group| {
+                first_overlap(group) == Some(("/t".to_owned(), "/t/v".to_owned()))
+            })
+        );
+        let output_k_filter = invert(&filter);
+        assert!(src_paths_limited(&output_k_filter, limits.k).is_ok());
+        assert!(all_compose_source_paths_limited(&output_k_filter, limits.k).is_ok());
+        assert!(all_compose_source_paths_limited(&invert(&output_k_filter), limits.k).is_err());
+        assert!(matches!(
+            validate_with_limits(&output_k_filter, &config, limits),
+            Err(RegistrationRejection::ScaleLimit {
+                which: ScaleLimitKind::K,
+                limit: 2,
+                actual: 3,
+            })
+        ));
     }
 
     #[test]
