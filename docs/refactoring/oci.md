@@ -178,8 +178,9 @@ DELETE /uploads/{uuid}        → 按 seq 删分片 + 删行 → 204
 - S3 multipart / copy 加速 complete（DEFER-DR-03）
 - referrers API（DEFER-DR-04）
 - manifest list 平台重写（老 docker 客户端）（DEFER-DR-05）
-- compose smoke profile 集成（DEFER-DR-06）
 - 独立 OCI token 颁发、pull-through / P2P、review 形态挂载 `/v2`、sha256 以外的 digest 算法
+
+DEFER-DR-06（compose smoke profile 集成）已由 [plan-20261001](../plan/plan-20261001.md) 的 `interop-smoke` 与 OCI 黑盒验收关闭；默认栈 12/12，auth-none opt-in 1/1，见 [`deploy-trunk.md`](../deploy-trunk.md) §10.4。
 
 ## 相关入口
 
