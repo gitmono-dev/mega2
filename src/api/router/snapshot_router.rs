@@ -18,6 +18,7 @@ use bytes::Bytes;
 use mst2_codec::descriptor;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{
     api::MonoApiServiceState,
@@ -74,6 +75,33 @@ mod content;
 
 /// Spec 14 §4: JSON request bytes hard limit.
 pub(crate) const JSON_REQUEST_LIMIT: usize = 131_072;
+
+/// The media type is part of the MST/2 TreeFrame wire contract (spec 06
+/// §1). Keep it in one place so every frame-producing endpoint has the same
+/// response representation.
+pub(crate) const TREEFRAME_MEDIA_TYPE: &str = "application/vnd.mega.treeframe;version=2";
+
+/// Build a TreeFrame response with the protocol identity headers. The request
+/// digest covers the exact bytes that were parsed, including JSON whitespace
+/// and key ordering, so callers must pass the original body.
+pub(crate) fn treeframe_response(
+    snapshot_id: &str,
+    request_body: &[u8],
+    body: Vec<u8>,
+) -> Result<Response, SnapshotError> {
+    let request_digest: [u8; 32] = Sha256::digest(request_body).into();
+    Response::builder()
+        .header("content-type", TREEFRAME_MEDIA_TYPE)
+        .header("x-mega-snapshot-id", snapshot_id)
+        .header(
+            "x-mega-request-digest",
+            format!("sha256:{}", hex_of(&request_digest)),
+        )
+        .header("cache-control", "private, no-cache, no-transform")
+        .header("vary", "Authorization, Accept")
+        .body(axum::body::Body::from(Bytes::from(body)))
+        .map_err(|e| internal(format!("TreeFrame response build failed: {e}")))
+}
 
 tokio::task_local! {
     /// Per-request id for the error envelope (spec 14 §5). Sourced from the
@@ -1136,9 +1164,30 @@ async fn metadata_pages(
     );
     out.extend_from_slice(&end);
 
-    Response::builder()
-        .header("content-type", "application/octet-stream")
-        .header("cache-control", "private, no-cache, no-transform")
-        .body(axum::body::Body::from(Bytes::from(out)))
-        .map_err(|e| mst2_error_response(internal(format!("body build failed: {e}"))))
+    treeframe_response(&snapshot_id, &body, out).map_err(mst2_error_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn treeframe_response_emits_protocol_identity_headers() {
+        let snapshot_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let request_body = br#"{"items":[], "encoding":"identity"}"#;
+        let response = treeframe_response(snapshot_id, request_body, vec![1, 2, 3]).unwrap();
+
+        assert_eq!(response.headers()["content-type"], TREEFRAME_MEDIA_TYPE);
+        assert_eq!(response.headers()["x-mega-snapshot-id"], snapshot_id);
+        let digest: [u8; 32] = Sha256::digest(request_body).into();
+        assert_eq!(
+            response.headers()["x-mega-request-digest"],
+            format!("sha256:{}", hex_of(&digest))
+        );
+        assert_eq!(
+            response.headers()["cache-control"],
+            "private, no-cache, no-transform"
+        );
+        assert_eq!(response.headers()["vary"], "Authorization, Accept");
+    }
 }
