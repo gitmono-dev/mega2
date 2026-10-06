@@ -25,7 +25,7 @@ use crate::{
             buck_service::BuckService, cl_service::CLService, git_service::GitService,
             import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
             oci_service::OciService, push_queue_service::PushQueueService,
-            webhook_service::WebhookService,
+            view_worker::ViewRuntime, webhook_service::WebhookService,
         },
         storage::{
             AppService, Storage,
@@ -396,6 +396,7 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         storage_event_emitter:
             crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         notification_storage: NotificationStorage::new(connection.clone()),
+        view_runtime: Arc::new(ViewRuntime::new()),
         entity_store: Arc::new(SharedEntityStore::default()),
         vault: None,
     }

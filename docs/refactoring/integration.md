@@ -399,6 +399,43 @@ author 时间戳的原始字节经 `Commit::from_bytes` 和 `into_mega_model` �
 `metrics_snapshot()` 另以一条 `warming_since IS NOT NULL` 计数查询填入
 `view_cold_start_slots_in_use`，并在每个快照步骤与同一原生 SELECT 的结果比较。
 
+## DB 模块覆盖：视图 worker（HP-14）
+
+六个 lib 用例是 `view_worker_spawned_only_when_enabled`、`worker_hot_reload`、
+`round_selection`、`compensation_liveness`、`round_errors_do_not_stop_worker` 与
+`view_runtime_wiring`。它们覆盖启动时 `[views].enabled` 门控、正在执行的轮被取消、
+热加载、候选选择、周期补偿、候选与整轮错误隔离，以及共享运行时的作用域。视图 trunk
+配置使用 `push_policy = "trunk"`、`push_auth = "none"`、`ssh_receive_pack = false` 与
+`cedar.enforcement = "off"`，并显式启用 views。
+
+`spawn_view_worker_with_round` 是测试替换轮函数的接缝，`production_round` 是取得生产轮的
+唯一入口。每轮先读配置快照、试锁扩展根链、查询候选，再按主键顺序调用共享服务的
+`catch_up`；每批的 `batch_size` 仍由 `catch_up` 自行读取，所以热改在下一批生效。候选
+失败只记录错误并继续其余候选；根链或候选查询失败只记录该轮错误，下一 tick 继续。测试
+通过 `compensation_round` 的逐候选函数注入错误或记录候选集合。
+
+`ViewRuntime` 随一个 `Storage` 及其克隆共享 `ViewMetrics`、`ViewSignal` 和一次性的
+`OnceLock` 服务槽。`view_projection_service()` 传给服务的内部 Storage 使用空槽，避免
+服务反向持有同一槽产生 Arc 环；因此服务、memo 和计数器在同一进程 Storage 内共享，而
+测试 schema 的连接仍可释放。`notify_worker()` 用 `notify_one` 保留许可；HP-32、HP-19、
+HP-33 和 HP-21 分别消费该信号接口。
+
+worker 只在启动时 enabled 才注册热加载订阅者。订阅者只持有 watch 控制结构，不捕获
+Storage；收到 `views.` 应用字段后转发新的 `ViewsConfig`，`worker_interval_secs` 改变时以
+`.max(1)` 重建 ticker。循环把进行中的轮与 `token.cancelled()` 放在同一个 `tokio::select!`
+中，取消时丢弃本轮而不等待无上界的冷启动；短事务、根链段和投影批会各自回滚或保留已
+提交状态。后台根链扩展传入 `budget = None`，不受 `max_append_walk` 限制，保证超过前台
+上限的根链仍在后台追平。
+
+`worker_hot_reload` 与 `compensation_liveness` 的双连接池情形使用 `test_db_config` 和
+`database_connection` 建 worker、持锁两个连接池，持锁事务不占 worker 的池连接。
+`worker_hot_reload` 以 `mega_view_filter` 的表锁让首轮已取旧配置快照、但还未开始第一批，
+再热改 `batch_size`；根链缺口使新批大小 1 的第一批推进到 seq 3，区别于缓存旧值的结果。
+`compensation_liveness` 覆盖冷启动在 seq 1 中断后由另一个 worker 继续、链尾水位但尚未就绪的
+过滤器、持有视图锁后释放且不发送信号，以及超过 `max_append_walk` 的根链在后台无预算追平。
+故障注入只改列名，不改表名，避免 `search_path` 回退到 public 表。`start_http` 以
+`ctx.storage.clone()` 启动 worker，并在关闭时以 30 秒上限等待任务结束。
+
 ## 迁移覆盖：`merge_queue.requester` nullable 列（UN-18）
 
 **历史表。** [`plan-20260910.md`](../plan/plan-20260910.md) MW-05 已 `DROP TABLE merge_queue`；下列描述 UN-18 当时的加列迁移，不再是现行 schema。

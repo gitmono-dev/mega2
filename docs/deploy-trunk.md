@@ -501,3 +501,16 @@ DELETE FROM mega_view_root_chain_scan;
 根链首次判为不连续时会发出带 `reason` 与 `commit_id` 的 ERROR 事件，没有 metric 字段。证据是 `mega_view_root_chain_scan` 中 pos 最大的一行：若 `main@/` 已恢复为链尾后代，使用 clear-root-chain-scan；否则使用 rebuild-all，并公告视图历史可能改变。
 
 P0 不提供设计 §4.2 的根链审计 SQL：审计需要逐项复算 SHA-1，Postgres 没有内置 sha1，本仓没有 pgcrypto 迁移。带 review 形态历史的部署在启用视图前需要这项审计；P0 只能依靠停止告警发现首个失败点。完整审计由 `DEFER-HP-04` 的 `mega2 view status` 承接。
+
+### 13.1 视图投影 worker
+
+投影 worker 只随 HTTP 服务启动：使用 `service http`，或 `service multi` 中包含 HTTP 的副本。
+只运行 `service ssh` 的进程不启动投影 worker，也不执行周期补偿；部署中至少一个副本必须运行
+HTTP 服务。
+
+`worker_interval_secs` 是可热加载的周期，也是缺少进程内信号时推送后视图额外滞后的上界，另加
+一轮执行所需的时间。根链被判为不连续时 worker 跳过整轮补偿；按本节停服步骤恢复根链后，重启
+HTTP 服务即可从已提交水位继续。
+
+停服时 worker 丢弃正在执行的轮。已提交的根链段与投影批会保留，未提交的当前事务会回滚；服务
+重启后从这些已提交水位继续追赶。

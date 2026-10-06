@@ -15,4 +15,5 @@ pub mod storage_event_emitter;
 pub mod storage_event_transport;
 pub mod view_metrics;
 pub mod view_projection_service;
+pub mod view_worker;
 pub mod webhook_service;

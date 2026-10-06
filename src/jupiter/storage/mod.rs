@@ -51,10 +51,19 @@ use crate::{
     contract::{policy::entitystore::SharedEntityStore, vault::integration::vault_core::VaultCore},
     jupiter::{
         service::{
-            agent_capture_service::AgentCaptureService, artifact_service::ArtifactService,
-            buck_service::BuckService, cl_service::CLService, git_service::GitService,
-            import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
-            oci_service::OciService, push_queue_service::PushQueueService,
+            agent_capture_service::AgentCaptureService,
+            artifact_service::ArtifactService,
+            buck_service::BuckService,
+            cl_service::CLService,
+            git_service::GitService,
+            import_service::ImportService,
+            lfs_service::LfsService,
+            mono_service::MonoService,
+            oci_service::OciService,
+            push_queue_service::PushQueueService,
+            view_metrics::ViewMetrics,
+            view_projection_service::ViewProjectionService,
+            view_worker::{ViewRuntime, ViewSignal},
             webhook_service::WebhookService,
         },
         storage::{
@@ -157,6 +166,7 @@ pub struct Storage {
     pub webhook_service: WebhookService,
     pub storage_event_emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     pub notification_storage: notification_storage::NotificationStorage,
+    pub(crate) view_runtime: Arc<ViewRuntime>,
     /// Shared authorization snapshot holder (ADR-UN-02). Injected by
     /// `AppContext`; the same `Arc` is shared with the HTTP state so the write
     /// path (notify) and read path (guard/push) observe the same instance.
@@ -313,6 +323,7 @@ impl Storage {
             webhook_service,
             storage_event_emitter,
             notification_storage,
+            view_runtime: Arc::new(ViewRuntime::new()),
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
         })
@@ -375,6 +386,25 @@ impl Storage {
         self.config_handle
             .snapshot()
             .unwrap_or_else(|_| Arc::clone(&self.config))
+    }
+
+    pub(crate) fn view_metrics(&self) -> ViewMetrics {
+        self.view_runtime.metrics()
+    }
+
+    pub(crate) fn view_signal(&self) -> ViewSignal {
+        self.view_runtime.signal()
+    }
+
+    pub(crate) fn view_projection_service(&self) -> ViewProjectionService {
+        self.view_runtime
+            .service_slot()
+            .get_or_init(|| {
+                let mut inner = self.clone();
+                inner.view_runtime = Arc::new(self.view_runtime.without_service_slot());
+                ViewProjectionService::new(inner, self.view_metrics())
+            })
+            .clone()
     }
 
     /// Refuse view-enabled startup when existing repository state occupies a
@@ -672,6 +702,7 @@ impl Storage {
             storage_event_emitter:
                 crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
+            view_runtime: Arc::new(ViewRuntime::new()),
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
         }
