@@ -27,7 +27,7 @@ use crate::{
     common::errors::MegaError,
     config::Config,
     jupiter::{
-        service::view_metrics::ViewMetrics,
+        service::view_metrics::{ViewMetrics, ViewMetricsSnapshot},
         storage::{
             Storage,
             base_storage::StorageConnector,
@@ -45,6 +45,23 @@ pub(crate) enum CatchUpOutcome {
     MainNotCovered,
     NotRun,
     BatchPremiseFailed,
+    Stopped(ViewProjectionStop),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ViewProjectionStop {
+    pub(crate) filter_id: String,
+    pub(crate) seq: i64,
+    pub(crate) commit_id: String,
+    pub(crate) reason: ViewProjectionStopReason,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ViewProjectionStopReason {
+    PremiseCheckFailed,
+    RowAbsent { tree_id: String },
+    Unparsable { tree_id: String },
+    CommitRowMissing,
 }
 
 #[derive(Clone)]
@@ -147,7 +164,12 @@ impl ViewProjectionService {
             .await;
         match result {
             Ok(outcome) => match txn.commit().await {
-                Ok(()) => Ok(outcome),
+                Ok(()) => {
+                    if let CatchUpOutcome::Stopped(stop) = &outcome {
+                        self.record_projection_stop(stop);
+                    }
+                    Ok(outcome)
+                }
                 Err(error) => {
                     let error = MegaError::from(error);
                     let context = error_context
@@ -262,6 +284,7 @@ impl ViewProjectionService {
 
         let mut segments = Vec::new();
         let mut written_outputs = BTreeMap::new();
+        let mut stop = None;
         for (index, row) in rows.iter().enumerate() {
             if row.seq <= filter.projected_seq {
                 continue;
@@ -290,6 +313,26 @@ impl ViewProjectionService {
                     },
                 )
                 .await?;
+            let segment = match segment {
+                Ok(segment) => segment,
+                Err(ProjectFailure::Internal) => {
+                    return Err(project_error(ProjectFailure::Internal));
+                }
+                Err(ProjectFailure::Data(error)) => match stop_dispatch(&error) {
+                    StopDispatch::Stop(reason) => {
+                        stop = Some(ViewProjectionStop {
+                            filter_id: filter.filter_id.clone(),
+                            seq: row.seq,
+                            commit_id: row.commit_id.clone(),
+                            reason,
+                        });
+                        break;
+                    }
+                    StopDispatch::Internal => {
+                        return Err(project_error(ProjectFailure::Data(error)));
+                    }
+                },
+            };
             if let Some(segment) = segment {
                 if segment.view_commit.is_some()
                     && let Some(output) = outputs.get(&row.seq)
@@ -307,17 +350,18 @@ impl ViewProjectionService {
             }
         }
 
+        let projected_seq = stop.as_ref().map_or(last, |stop| stop.seq - 1);
         view_storage
-            .write_projection_batch(txn, filter_pk, &segments, &written_outputs, last)
+            .write_projection_batch(txn, filter_pk, &segments, &written_outputs, projected_seq)
             .await?;
-        if last == tip {
+        if stop.is_none() && last == tip {
             view_storage
                 .mark_ready_if_covered(txn, filter_pk, tip)
                 .await?;
         }
         #[cfg(test)]
-        self.test_hooks.record_advanced_projected_seq(last);
-        Ok(CatchUpOutcome::Advanced)
+        self.test_hooks.record_advanced_projected_seq(projected_seq);
+        Ok(stop.map_or(CatchUpOutcome::Advanced, CatchUpOutcome::Stopped))
     }
 
     async fn prefetch_filter_outputs<C: ConnectionTrait>(
@@ -364,7 +408,7 @@ impl ViewProjectionService {
         &self,
         source: &mut ViewTreeSource<'_, C>,
         work: ProjectionWork<'_, '_>,
-    ) -> Result<Option<Segment>, MegaError> {
+    ) -> Result<Result<Option<Segment>, ProjectFailure>, MegaError> {
         let mut prefetched = BTreeSet::new();
         loop {
             let tracking = self.tracking_tree_source(source);
@@ -405,7 +449,7 @@ impl ViewProjectionService {
                 prefetched.extend(needed);
                 continue;
             }
-            return result.map_err(project_error);
+            return Ok(result);
         }
     }
 
@@ -467,6 +511,49 @@ impl ViewProjectionService {
             "view projection batch premise failed"
         );
         Ok(CatchUpOutcome::BatchPremiseFailed)
+    }
+
+    pub(crate) async fn metrics_snapshot(&self) -> Result<ViewMetricsSnapshot, MegaError> {
+        Ok(ViewMetricsSnapshot {
+            counters: self.metrics.counters(),
+            view_cold_start_slots_in_use: self
+                .storage
+                .view_storage()
+                .warming_filter_count()
+                .await?,
+        })
+    }
+
+    fn record_projection_stop(&self, stop: &ViewProjectionStop) {
+        self.metrics.increment_projection_stops();
+        match &stop.reason {
+            ViewProjectionStopReason::PremiseCheckFailed => error!(
+                metric = %"view_projection_stops_total",
+                filter_id = %stop.filter_id,
+                s = stop.seq,
+                commit_id = %stop.commit_id,
+                reason = %stop.reason.as_str(),
+                "view projection stopped"
+            ),
+            ViewProjectionStopReason::RowAbsent { tree_id }
+            | ViewProjectionStopReason::Unparsable { tree_id } => error!(
+                metric = %"view_projection_stops_total",
+                filter_id = %stop.filter_id,
+                s = stop.seq,
+                commit_id = %stop.commit_id,
+                reason = %stop.reason.as_str(),
+                tree_id = %tree_id,
+                "view projection stopped"
+            ),
+            ViewProjectionStopReason::CommitRowMissing => error!(
+                metric = %"view_projection_stops_total",
+                filter_id = %stop.filter_id,
+                s = stop.seq,
+                commit_id = %stop.commit_id,
+                reason = %stop.reason.as_str(),
+                "view projection stopped"
+            ),
+        }
     }
 
     fn with_memo<T>(&self, f: impl FnOnce(&mut FilterMemo) -> T) -> T {
@@ -679,6 +766,50 @@ fn project_error(error: ProjectFailure) -> MegaError {
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StopDispatch {
+    Stop(ViewProjectionStopReason),
+    Internal,
+}
+
+fn stop_dispatch(error: &ProjectError) -> StopDispatch {
+    match error {
+        ProjectError::Premise(_) => {
+            StopDispatch::Stop(ViewProjectionStopReason::PremiseCheckFailed)
+        }
+        ProjectError::MissingObject(MissingObject {
+            tree_id,
+            reason: MissingObjectReason::Absent,
+        }) => StopDispatch::Stop(ViewProjectionStopReason::RowAbsent {
+            tree_id: tree_id.clone(),
+        }),
+        ProjectError::MissingObject(MissingObject {
+            tree_id,
+            reason: MissingObjectReason::Malformed,
+        }) => StopDispatch::Stop(ViewProjectionStopReason::Unparsable {
+            tree_id: tree_id.clone(),
+        }),
+        ProjectError::MissingObject(MissingObject {
+            reason: MissingObjectReason::Unprefetched,
+            ..
+        }) => StopDispatch::Internal,
+        ProjectError::MissingCommit { .. } => {
+            StopDispatch::Stop(ViewProjectionStopReason::CommitRowMissing)
+        }
+    }
+}
+
+impl ViewProjectionStopReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::PremiseCheckFailed => "premise_check_failed",
+            Self::RowAbsent { .. } => "row_absent",
+            Self::Unparsable { .. } => "unparsable",
+            Self::CommitRowMissing => "commit_row_missing",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -692,29 +823,37 @@ mod tests {
     use chrono::Utc;
     use git_internal::{
         hash::{HashKind, ObjectHash},
-        internal::object::{
-            ObjectTrait,
-            commit::Commit,
-            signature::Signature,
-            tree::{Tree, TreeItem, TreeItemMode},
+        internal::{
+            metadata::EntryMeta,
+            object::{
+                ObjectTrait,
+                commit::Commit,
+                signature::Signature,
+                tree::{Tree, TreeItem, TreeItemMode},
+                types::ObjectType,
+            },
         },
     };
     use sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait,
-        PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait,
+        IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, Statement, TransactionTrait,
     };
 
-    use super::{CatchUpOutcome, ViewProjectionService};
+    use super::{
+        CatchUpOutcome, StopDispatch, ViewProjectionService, ViewProjectionStop,
+        ViewProjectionStopReason, stop_dispatch,
+    };
     use crate::{
         callisto::{
-            mega_commit, mega_refs, mega_view_commit_map, mega_view_filter, mega_view_object,
-            mega_view_object_ref,
+            mega_commit, mega_refs, mega_tree, mega_view_commit_map, mega_view_filter,
+            mega_view_object, mega_view_object_ref,
         },
         ceres::view::{
+            commit::RewriteError,
             filter::{RecheckFailure, parse_for_registration, recheck_definition},
-            project::{PreviousProjection, ProjectionInput, project_commit},
+            project::{PreviousProjection, ProjectError, ProjectionInput, project_commit},
             tree::{FILTER_TREE_MEMO_CAPACITY_BYTES, FilterMemo, filter_tree},
-            tree_source::{InMemoryTreeSource, empty_tree_id},
+            tree_source::{InMemoryTreeSource, MissingObject, MissingObjectReason, empty_tree_id},
         },
         common::utils::{MEGA_BRANCH_NAME, generate_id},
         jupiter::{
@@ -725,8 +864,10 @@ mod tests {
                 object_storage::mock_object_storage,
                 view_storage::{ViewLock, ViewLockMode, acquire_view_lock},
                 view_test_fixtures::{RootCommitFixture, RootTreeFixture, root_tree_from_paths},
+                view_tree_source::ViewTreeSource,
             },
             tests::{TestSchemaGuard, test_db_config, test_storage_with_config},
+            utils::converter::IntoMegaModel,
         },
     };
 
@@ -763,6 +904,95 @@ mod tests {
             mono.save_mega_commits(vec![commit.clone()], None)
                 .await
                 .unwrap();
+            parent = Some(commit.id);
+            fixtures.push(RootCommitFixture {
+                commit,
+                trees: tree.trees,
+                blobs: tree.blobs,
+            });
+        }
+        let tip = fixtures.last().unwrap();
+        mega_refs::ActiveModel {
+            id: Set(generate_id()),
+            path: Set("/".to_owned()),
+            ref_name: Set(MEGA_BRANCH_NAME.to_owned()),
+            ref_commit_hash: Set(tip.commit.id.to_string()),
+            ref_tree_hash: Set(tip.commit.tree_id.to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+            updated_at: Set(Utc::now().naive_utc()),
+            is_cl: Set(false),
+        }
+        .insert(storage.view_storage().get_connection())
+        .await
+        .unwrap();
+        fixtures
+    }
+
+    const HP12_SENTINEL_AUTHOR: &str =
+        "author hp12-sentinel-author <author@hp12.invalid> 01700000000 +0000";
+    const HP12_SENTINEL_COMMITTER: &str =
+        "committer hp12-sentinel-author <author@hp12.invalid> 1700000001 +0000";
+    const HP12_SENTINEL_MESSAGE: &str = "hp12-sentinel-message";
+
+    async fn seed_hp12_linear_history(
+        storage: &crate::jupiter::storage::Storage,
+        trees: Vec<RootTreeFixture>,
+        raw_premise_at_seven: bool,
+    ) -> Vec<RootCommitFixture> {
+        let kind = HashKind::Sha1;
+        let mono = storage.mono_storage();
+        let mut parent = None;
+        let mut fixtures = Vec::with_capacity(trees.len());
+        for (index, tree) in trees.into_iter().enumerate() {
+            let parents = parent.into_iter().collect::<Vec<ObjectHash>>();
+            let raw_premise = raw_premise_at_seven && index == 6;
+            let commit = if raw_premise {
+                let parent = parents.first().unwrap();
+                let bytes = format!(
+                    "tree {}\nparent {parent}\n{HP12_SENTINEL_AUTHOR}\n{HP12_SENTINEL_COMMITTER}\n\n{HP12_SENTINEL_MESSAGE} {}",
+                    tree.root.id,
+                    index + 1,
+                )
+                .into_bytes();
+                let id = ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Commit, &bytes)
+                    .unwrap();
+                Commit::from_bytes(&bytes, id).unwrap()
+            } else {
+                let author = Signature::from_data(
+                    b"author hp12-sentinel-author <author@hp12.invalid> 1700000000 +0000".to_vec(),
+                )
+                .unwrap();
+                let committer = Signature::from_data(
+                    b"committer hp12-sentinel-author <author@hp12.invalid> 1700000001 +0000"
+                        .to_vec(),
+                )
+                .unwrap();
+                Commit::new_with_kind(
+                    kind,
+                    author,
+                    committer,
+                    tree.root.id,
+                    parents,
+                    &format!("{HP12_SENTINEL_MESSAGE} {}", index + 1),
+                )
+                .unwrap()
+            };
+            mono.save_mega_trees(tree.trees.clone(), commit.id, None)
+                .await
+                .unwrap();
+            if raw_premise {
+                let model: mega_commit::Model =
+                    commit.clone().into_mega_model(EntryMeta::default());
+                model
+                    .into_active_model()
+                    .insert(storage.view_storage().get_connection())
+                    .await
+                    .unwrap();
+            } else {
+                mono.save_mega_commits(vec![commit.clone()], None)
+                    .await
+                    .unwrap();
+            }
             parent = Some(commit.id);
             fixtures.push(RootCommitFixture {
                 commit,
@@ -881,6 +1111,388 @@ mod tests {
         let filter_pk = insert_warming_filter(&storage, 1, spec).await;
         let metrics = ViewMetrics::default();
         (temp, storage, metrics, filter_pk)
+    }
+
+    fn hp12_roots() -> Vec<Vec<(String, Vec<u8>)>> {
+        (1..=12)
+            .map(|number| {
+                let c_number = if number == 7 { 6 } else { number };
+                vec![
+                    ("README".to_owned(), format!("readme-{number}").into_bytes()),
+                    ("a/b/f".to_owned(), format!("a-b-{number}").into_bytes()),
+                    ("c/f".to_owned(), format!("c-{c_number}").into_bytes()),
+                ]
+            })
+            .collect()
+    }
+
+    async fn hp12_storage_with_history(
+        batch_size: u64,
+    ) -> (
+        tempfile::TempDir,
+        crate::jupiter::storage::Storage,
+        Vec<RootCommitFixture>,
+        String,
+    ) {
+        hp12_storage_with_raw_premise(batch_size, false).await
+    }
+
+    async fn hp12_storage_for_defect(
+        batch_size: u64,
+        defect: Hp12Defect,
+    ) -> (
+        tempfile::TempDir,
+        crate::jupiter::storage::Storage,
+        Vec<RootCommitFixture>,
+        String,
+    ) {
+        hp12_storage_with_raw_premise(batch_size, matches!(defect, Hp12Defect::Premise)).await
+    }
+
+    async fn hp12_storage_with_raw_premise(
+        batch_size: u64,
+        raw_premise_at_seven: bool,
+    ) -> (
+        tempfile::TempDir,
+        crate::jupiter::storage::Storage,
+        Vec<RootCommitFixture>,
+        String,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.views.batch_size = batch_size;
+        config.views.sync_catch_up_commits = if batch_size < 64 { batch_size } else { 64 };
+        let storage = test_storage_with_config(&temp, config).await;
+        let trees = hp12_roots()
+            .iter()
+            .map(|paths| root_tree_from_paths(HashKind::Sha1, paths))
+            .collect();
+        let fixtures = seed_hp12_linear_history(&storage, trees, raw_premise_at_seven).await;
+        storage
+            .view_storage()
+            .extend_root_chain(None, 1000, ViewLockMode::Try)
+            .await
+            .unwrap();
+        let seventh_root = fixtures[6]
+            .trees
+            .iter()
+            .find(|tree| tree.id == fixtures[6].commit.tree_id)
+            .unwrap();
+        let a_tree_id = seventh_root
+            .tree_items
+            .iter()
+            .find(|item| item.name == "a")
+            .unwrap()
+            .id
+            .to_string();
+        (temp, storage, fixtures, a_tree_id)
+    }
+
+    async fn hp12_counted_storage_for_defect(
+        batch_size: u64,
+        defect: Hp12Defect,
+    ) -> (
+        tempfile::TempDir,
+        TestSchemaGuard,
+        crate::jupiter::storage::Storage,
+        Arc<AtomicUsize>,
+        Vec<RootCommitFixture>,
+        String,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let (db_config, schema) = test_db_config(temp.path()).await;
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.database = db_config.clone();
+        config.views.batch_size = batch_size;
+        config.views.sync_catch_up_commits = if batch_size < 64 { batch_size } else { 64 };
+        let mega_commit_selects = Arc::new(AtomicUsize::new(0));
+        let callback_count = mega_commit_selects.clone();
+        let mut db = database_connection(&db_config).await.unwrap();
+        db.set_metric_callback(move |info| {
+            let statement = info.statement.to_string();
+            if statement.starts_with("SELECT") && statement.contains("mega_commit") {
+                callback_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let storage = crate::jupiter::storage::Storage::new_with_connection(
+            Arc::new(config),
+            Arc::new(db),
+            mock_object_storage(),
+        )
+        .await
+        .unwrap();
+        let trees = hp12_roots()
+            .iter()
+            .map(|paths| root_tree_from_paths(HashKind::Sha1, paths))
+            .collect();
+        let fixtures =
+            seed_hp12_linear_history(&storage, trees, matches!(defect, Hp12Defect::Premise)).await;
+        storage
+            .view_storage()
+            .extend_root_chain(None, 1000, ViewLockMode::Try)
+            .await
+            .unwrap();
+        let seventh_root = fixtures[6]
+            .trees
+            .iter()
+            .find(|tree| tree.id == fixtures[6].commit.tree_id)
+            .unwrap();
+        let a_tree_id = seventh_root
+            .tree_items
+            .iter()
+            .find(|item| item.name == "a")
+            .unwrap()
+            .id
+            .to_string();
+        (
+            temp,
+            schema,
+            storage,
+            mega_commit_selects,
+            fixtures,
+            a_tree_id,
+        )
+    }
+
+    async fn hp12_prefix_storage() -> (tempfile::TempDir, crate::jupiter::storage::Storage) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.views.batch_size = 1000;
+        config.views.sync_catch_up_commits = 64;
+        let storage = test_storage_with_config(&temp, config).await;
+        let trees = hp12_roots()[..6]
+            .iter()
+            .map(|paths| root_tree_from_paths(HashKind::Sha1, paths))
+            .collect();
+        seed_hp12_linear_history(&storage, trees, false).await;
+        storage
+            .view_storage()
+            .extend_root_chain(None, 1000, ViewLockMode::Try)
+            .await
+            .unwrap();
+        (temp, storage)
+    }
+
+    async fn hp12_prefix_spine_tree(
+        storage: &crate::jupiter::storage::Storage,
+        fixture: &RootCommitFixture,
+    ) -> String {
+        let mono = storage.mono_storage();
+        let view_storage = storage.view_storage();
+        let root_id = fixture.commit.tree_id.to_string();
+        let mut source =
+            ViewTreeSource::new(&mono, view_storage.get_connection(), HashKind::Sha1).unwrap();
+        source
+            .prefetch(std::slice::from_ref(&root_id))
+            .await
+            .unwrap();
+        let canonical = parse_for_registration(":/a:prefix=x").unwrap();
+        filter_tree(
+            HashKind::Sha1,
+            &source,
+            &mut FilterMemo::with_capacity(FILTER_TREE_MEMO_CAPACITY_BYTES),
+            &canonical.filter,
+            &root_id,
+        )
+        .unwrap()
+        .tree_id
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Hp12Defect {
+        Premise,
+        RowAbsent,
+        Unparsable,
+        CommitRowMissing,
+    }
+
+    enum Hp12Repair {
+        Author {
+            commit_id: String,
+            author: Option<String>,
+        },
+        Tree(mega_tree::Model),
+        Commit(mega_commit::Model),
+    }
+
+    impl Hp12Defect {
+        fn reason(self, tree_id: &str) -> ViewProjectionStopReason {
+            match self {
+                Self::Premise => ViewProjectionStopReason::PremiseCheckFailed,
+                Self::RowAbsent => ViewProjectionStopReason::RowAbsent {
+                    tree_id: tree_id.to_owned(),
+                },
+                Self::Unparsable => ViewProjectionStopReason::Unparsable {
+                    tree_id: tree_id.to_owned(),
+                },
+                Self::CommitRowMissing => ViewProjectionStopReason::CommitRowMissing,
+            }
+        }
+
+        fn alert_reason(self) -> &'static str {
+            match self {
+                Self::Premise => "premise_check_failed",
+                Self::RowAbsent => "row_absent",
+                Self::Unparsable => "unparsable",
+                Self::CommitRowMissing => "commit_row_missing",
+            }
+        }
+    }
+
+    async fn introduce_hp12_defect(
+        storage: &crate::jupiter::storage::Storage,
+        fixtures: &[RootCommitFixture],
+        a_tree_id: &str,
+        defect: Hp12Defect,
+    ) -> Hp12Repair {
+        let view_storage = storage.view_storage();
+        let db = view_storage.get_connection();
+        let commit_id = fixtures[6].commit.id.to_string();
+        match defect {
+            Hp12Defect::Premise => {
+                let row = mega_commit::Entity::find()
+                    .filter(mega_commit::Column::CommitId.eq(commit_id.clone()))
+                    .one(db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(row.author.as_deref(), Some(HP12_SENTINEL_AUTHOR));
+                Hp12Repair::Author {
+                    commit_id,
+                    author: Some(HP12_SENTINEL_AUTHOR.to_owned()),
+                }
+            }
+            Hp12Defect::RowAbsent | Hp12Defect::Unparsable => {
+                let tree = mega_tree::Entity::find()
+                    .filter(mega_tree::Column::TreeId.eq(a_tree_id))
+                    .one(db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if matches!(defect, Hp12Defect::RowAbsent) {
+                    mega_tree::Entity::delete_by_id(tree.id)
+                        .exec(db)
+                        .await
+                        .unwrap();
+                } else {
+                    let malformed = tree.sub_trees[..tree.sub_trees.len() - 1].to_vec();
+                    assert!(
+                        crate::ceres::view::tree_source::parse_tree_bytes(
+                            HashKind::Sha1,
+                            a_tree_id,
+                            &malformed,
+                        )
+                        .is_err()
+                    );
+                    mega_tree::Entity::update_many()
+                        .col_expr(
+                            mega_tree::Column::SubTrees,
+                            sea_orm::sea_query::Expr::value(malformed),
+                        )
+                        .filter(mega_tree::Column::Id.eq(tree.id))
+                        .exec(db)
+                        .await
+                        .unwrap();
+                }
+                Hp12Repair::Tree(tree)
+            }
+            Hp12Defect::CommitRowMissing => {
+                let commit = mega_commit::Entity::find()
+                    .filter(mega_commit::Column::CommitId.eq(commit_id))
+                    .one(db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                mega_commit::Entity::delete_by_id(commit.id)
+                    .exec(db)
+                    .await
+                    .unwrap();
+                Hp12Repair::Commit(commit)
+            }
+        }
+    }
+
+    async fn repair_hp12_defect(storage: &crate::jupiter::storage::Storage, repair: Hp12Repair) {
+        let view_storage = storage.view_storage();
+        let db = view_storage.get_connection();
+        match repair {
+            Hp12Repair::Author { commit_id, author } => {
+                mega_commit::Entity::update_many()
+                    .col_expr(
+                        mega_commit::Column::Author,
+                        sea_orm::sea_query::Expr::value(author),
+                    )
+                    .filter(mega_commit::Column::CommitId.eq(commit_id))
+                    .exec(db)
+                    .await
+                    .unwrap();
+            }
+            Hp12Repair::Tree(tree) => {
+                if mega_tree::Entity::find_by_id(tree.id)
+                    .one(db)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    mega_tree::Entity::update_many()
+                        .col_expr(
+                            mega_tree::Column::SubTrees,
+                            sea_orm::sea_query::Expr::value(tree.sub_trees),
+                        )
+                        .filter(mega_tree::Column::Id.eq(tree.id))
+                        .exec(db)
+                        .await
+                        .unwrap();
+                } else {
+                    tree.into_active_model().insert(db).await.unwrap();
+                }
+            }
+            Hp12Repair::Commit(commit) => {
+                commit.into_active_model().insert(db).await.unwrap();
+            }
+        }
+    }
+
+    fn assert_hp12_stop(
+        outcome: CatchUpOutcome,
+        defect: Hp12Defect,
+        a_tree_id: &str,
+        commit_id: &str,
+    ) -> ViewProjectionStop {
+        match outcome {
+            CatchUpOutcome::Stopped(stop) => {
+                assert_eq!(stop.seq, 7);
+                assert_eq!(stop.commit_id, commit_id);
+                assert_eq!(stop.reason, defect.reason(a_tree_id));
+                stop
+            }
+            other => panic!("expected projection stop, got {other:?}"),
+        }
+    }
+
+    async fn hp12_catch_up(service: &ViewProjectionService, filter_pk: i64) -> CatchUpOutcome {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            service.catch_up(filter_pk),
+        )
+        .await
+        .expect("HP-12 catch-up timeout")
+        .unwrap()
+    }
+
+    async fn hp12_catch_up_one_batch(
+        service: &ViewProjectionService,
+        filter_pk: i64,
+        snapshot: &crate::config::Config,
+        batch_size: usize,
+    ) -> CatchUpOutcome {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            service.catch_up_one_batch(filter_pk, snapshot, batch_size),
+        )
+        .await
+        .expect("HP-12 single-batch catch-up timeout")
+        .unwrap()
     }
 
     async fn storage_with_history(
@@ -1089,6 +1701,65 @@ mod tests {
         (maps, objects, refs)
     }
 
+    async fn reset_projection_state(storage: &crate::jupiter::storage::Storage) {
+        let view_storage = storage.view_storage();
+        let db = view_storage.get_connection();
+        for sql in [
+            "DELETE FROM mega_view_object_ref",
+            "DELETE FROM mega_view_commit_map",
+            "DELETE FROM mega_view_object",
+            "UPDATE mega_view_filter SET projected_seq = 0, ready_seq = NULL, warming_since = now()",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+    }
+
+    async fn assert_snapshot_warming_count(
+        service: &ViewProjectionService,
+        storage: &crate::jupiter::storage::Storage,
+        expected: u64,
+    ) -> crate::jupiter::service::view_metrics::ViewMetricsSnapshot {
+        let snapshot = service.metrics_snapshot().await.unwrap();
+        let view_storage = storage.view_storage();
+        let statement = Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT count(*) AS count FROM mega_view_filter WHERE warming_since IS NOT NULL",
+        );
+        let row = view_storage
+            .get_connection()
+            .query_one_raw(statement)
+            .await
+            .unwrap()
+            .unwrap();
+        let count: i64 = row.try_get("", "count").unwrap();
+        assert_eq!(snapshot.view_cold_start_slots_in_use, expected);
+        assert_eq!(snapshot.view_cold_start_slots_in_use, count as u64);
+        snapshot
+    }
+
+    async fn assert_hp12_prefix_state(
+        storage: &crate::jupiter::storage::Storage,
+        filter_pks: &[i64],
+        reference: &ProjectionSnapshot,
+    ) {
+        assert_eq!(projection_snapshot(storage).await, *reference);
+        for filter_pk in filter_pks {
+            assert!(
+                persisted_commit_map(storage, *filter_pk)
+                    .await
+                    .iter()
+                    .all(|(seq, _, _)| *seq < 7)
+            );
+            let filter = mega_view_filter::Entity::find_by_id(*filter_pk)
+                .one(storage.view_storage().get_connection())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(filter.projected_seq, 6);
+            assert!(filter.ready_seq.is_none());
+        }
+    }
+
     async fn reference_commit_map(
         storage: &crate::jupiter::storage::Storage,
         fixtures: &[RootCommitFixture],
@@ -1291,6 +1962,17 @@ mod tests {
     type CapturedLog = Arc<Mutex<Vec<u8>>>;
 
     fn capture_tracing<F: FnOnce(&CapturedLog)>(f: F) -> String {
+        capture_tracing_with_max_level(tracing::Level::ERROR, f)
+    }
+
+    fn capture_tracing_with_reader<F: FnOnce(&CapturedLog)>(f: F) -> String {
+        capture_tracing_with_max_level(tracing::Level::DEBUG, f)
+    }
+
+    fn capture_tracing_with_max_level<F: FnOnce(&CapturedLog)>(
+        max_level: tracing::Level,
+        f: F,
+    ) -> String {
         use std::io::Write;
 
         use tracing_subscriber::fmt::MakeWriter;
@@ -1320,14 +2002,14 @@ mod tests {
         let _pin_registry = tracing::Dispatch::new(
             tracing_subscriber::fmt()
                 .with_writer(std::io::sink)
-                .with_max_level(tracing::Level::ERROR)
+                .with_max_level(max_level)
                 .finish(),
         );
         let buffer: CapturedLog = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(TestWriter(buffer.clone()))
             .with_ansi(false)
-            .with_max_level(tracing::Level::ERROR)
+            .with_max_level(max_level)
             .finish();
         tracing::subscriber::with_default(subscriber, || f(&buffer));
         String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
@@ -2888,5 +3570,655 @@ mod tests {
         let cleared_ten = run_after_clearing_memo(10).await;
         let cleared_five_hundred = run_after_clearing_memo(500).await;
         assert_eq!(cleared_ten, cleared_five_hundred);
+    }
+
+    #[tokio::test]
+    async fn stop_state_equals_prefix_reference() {
+        for batch_size in [1, 1000] {
+            for defect in [
+                Hp12Defect::Premise,
+                Hp12Defect::RowAbsent,
+                Hp12Defect::Unparsable,
+                Hp12Defect::CommitRowMissing,
+            ] {
+                let specs = if matches!(defect, Hp12Defect::Premise | Hp12Defect::CommitRowMissing)
+                {
+                    vec![":/a/b", ":/a:prefix=x"]
+                } else {
+                    vec![":/a/b"]
+                };
+                let (_reference_temp, reference_storage) = hp12_prefix_storage().await;
+                let mut reference_filters = Vec::new();
+                for (index, spec) in specs.iter().enumerate() {
+                    let filter_pk =
+                        insert_warming_filter(&reference_storage, index as i64 + 1, spec).await;
+                    let service = ViewProjectionService::new(
+                        reference_storage.clone(),
+                        ViewMetrics::default(),
+                    );
+                    assert_eq!(
+                        hp12_catch_up(&service, filter_pk).await,
+                        CatchUpOutcome::Ready
+                    );
+                    reference_filters.push(filter_pk);
+                }
+                let reference = projection_snapshot(&reference_storage).await;
+
+                let (_temp, _schema, storage, mega_commit_selects, fixtures, a_tree_id) =
+                    hp12_counted_storage_for_defect(batch_size, defect).await;
+                let mut filter_pks = Vec::new();
+                for (index, spec) in specs.iter().enumerate() {
+                    filter_pks.push(insert_warming_filter(&storage, index as i64 + 1, spec).await);
+                }
+                let commit_id = fixtures[6].commit.id.to_string();
+                let _repair = introduce_hp12_defect(&storage, &fixtures, &a_tree_id, defect).await;
+                let metrics = ViewMetrics::default();
+                let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+
+                for filter_pk in &filter_pks {
+                    assert_hp12_stop(
+                        hp12_catch_up(&service, *filter_pk).await,
+                        defect,
+                        &a_tree_id,
+                        &commit_id,
+                    );
+                }
+                assert_hp12_prefix_state(&storage, &filter_pks, &reference).await;
+                if specs.len() == 2 {
+                    let spine_tree = hp12_prefix_spine_tree(&storage, &fixtures[6]).await;
+                    let reference_view_storage = reference_storage.view_storage();
+                    assert!(
+                        mega_view_object::Entity::find()
+                            .filter(mega_view_object::Column::ObjectId.eq(&spine_tree))
+                            .one(reference_view_storage.get_connection())
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    let view_storage = storage.view_storage();
+                    assert!(
+                        mega_view_object::Entity::find()
+                            .filter(mega_view_object::Column::ObjectId.eq(&spine_tree))
+                            .one(view_storage.get_connection())
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                for filter_pk in &filter_pks {
+                    assert!(
+                        persisted_commit_map(&storage, *filter_pk)
+                            .await
+                            .iter()
+                            .all(|(seq, _, _)| *seq < 7)
+                    );
+                    let filter = mega_view_filter::Entity::find_by_id(*filter_pk)
+                        .one(storage.view_storage().get_connection())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(filter.projected_seq, 6);
+                    assert!(filter.ready_seq.is_none());
+
+                    mega_commit_selects.store(0, Ordering::Relaxed);
+                    assert_hp12_stop(
+                        hp12_catch_up(&service, *filter_pk).await,
+                        defect,
+                        &a_tree_id,
+                        &commit_id,
+                    );
+                    assert_eq!(mega_commit_selects.load(Ordering::Relaxed), 1);
+                    assert_hp12_stop(
+                        hp12_catch_up_one_batch(&service, *filter_pk, &storage.config(), 1).await,
+                        defect,
+                        &a_tree_id,
+                        &commit_id,
+                    );
+                }
+                assert_hp12_prefix_state(&storage, &filter_pks, &reference).await;
+
+                reset_projection_state(&storage).await;
+                for filter_pk in &filter_pks {
+                    assert_hp12_stop(
+                        hp12_catch_up(&service, *filter_pk).await,
+                        defect,
+                        &a_tree_id,
+                        &commit_id,
+                    );
+                }
+                assert_hp12_prefix_state(&storage, &filter_pks, &reference).await;
+
+                reset_projection_state(&storage).await;
+                for filter_pk in &filter_pks {
+                    assert_hp12_stop(
+                        hp12_catch_up_one_batch(&service, *filter_pk, &storage.config(), 1000)
+                            .await,
+                        defect,
+                        &a_tree_id,
+                        &commit_id,
+                    );
+                }
+                assert_hp12_prefix_state(&storage, &filter_pks, &reference).await;
+                assert_eq!(filter_pks.len(), reference_filters.len());
+            }
+        }
+    }
+
+    #[test]
+    fn stop_alert_and_counter() {
+        let captured = capture_tracing_with_reader(|logs| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let metrics = ViewMetrics::default();
+                    for defect in [
+                        Hp12Defect::Premise,
+                        Hp12Defect::RowAbsent,
+                        Hp12Defect::Unparsable,
+                        Hp12Defect::CommitRowMissing,
+                    ] {
+                        let (_temp, storage, fixtures, a_tree_id) =
+                            hp12_storage_for_defect(1000, defect).await;
+                        let filter_pk = insert_warming_filter(&storage, 1, ":/a/b").await;
+                        let filter_id = mega_view_filter::Entity::find_by_id(filter_pk)
+                            .one(storage.view_storage().get_connection())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .filter_id;
+                        let commit_id = fixtures[6].commit.id.to_string();
+                        let _repair =
+                            introduce_hp12_defect(&storage, &fixtures, &a_tree_id, defect).await;
+                        let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+
+                        for _ in 0..2 {
+                            let offset = captured_log_offset(logs);
+                            assert_hp12_stop(
+                                hp12_catch_up(&service, filter_pk).await,
+                                defect,
+                                &a_tree_id,
+                                &commit_id,
+                            );
+                            let new_logs = captured_log_since(logs, offset);
+                            let events = new_logs
+                                .lines()
+                                .filter(|line| line.contains("view projection stopped"))
+                                .collect::<Vec<_>>();
+                            assert_eq!(events.len(), 1, "{new_logs}");
+                            let event = events[0];
+                            assert!(event.contains("ERROR"), "{event}");
+                            assert!(!new_logs.contains("hp12-sentinel-author"), "{new_logs}");
+                            assert!(!new_logs.contains("hp12-sentinel-message"), "{new_logs}");
+                            let fields = event
+                                .split("mega2_core::jupiter::service::view_projection_service: ")
+                                .nth(1)
+                                .expect("stop event target");
+                            let mut expected =
+                                BTreeSet::from(["commit_id", "filter_id", "metric", "reason", "s"]);
+                            if matches!(defect, Hp12Defect::RowAbsent | Hp12Defect::Unparsable) {
+                                expected.insert("tree_id");
+                                assert!(fields.contains(&format!("tree_id={a_tree_id}")));
+                            }
+                            assert_eq!(event_field_keys(fields), expected, "{event}");
+                            assert!(
+                                fields.contains("metric=view_projection_stops_total"),
+                                "event={event}; fields={fields}"
+                            );
+                            assert!(fields.contains(&format!("filter_id={filter_id}")));
+                            assert!(fields.contains("s=7"));
+                            assert!(fields.contains(&format!("commit_id={commit_id}")));
+                            assert!(fields.contains(&format!("reason={}", defect.alert_reason())));
+                        }
+                    }
+                    assert_eq!(metrics.counters().view_projection_stops_total, 8);
+
+                    let (_temp, storage, fixtures, a_tree_id) =
+                        hp12_storage_with_history(1000).await;
+                    let filter_pk = insert_warming_filter(&storage, 1, ":/a/b").await;
+                    let commit_id = fixtures[6].commit.id.to_string();
+                    let _repair = introduce_hp12_defect(
+                        &storage,
+                        &fixtures,
+                        &a_tree_id,
+                        Hp12Defect::RowAbsent,
+                    )
+                    .await;
+                    let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+                    let offset = captured_log_offset(logs);
+                    assert_hp12_stop(
+                        hp12_catch_up_one_batch(&service, filter_pk, &storage.config(), 64).await,
+                        Hp12Defect::RowAbsent,
+                        &a_tree_id,
+                        &commit_id,
+                    );
+                    assert_eq!(metrics.counters().view_projection_stops_total, 9);
+                    assert_eq!(
+                        captured_log_since(logs, offset)
+                            .lines()
+                            .filter(|line| line.contains("view projection stopped"))
+                            .count(),
+                        1
+                    );
+
+                    let (_temp, storage, _fixtures, _a_tree_id) =
+                        hp12_storage_with_history(1000).await;
+                    let filter_pk = insert_warming_filter(&storage, 1, ":/c").await;
+                    let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+                    let offset = captured_log_offset(logs);
+                    assert_eq!(
+                        hp12_catch_up(&service, filter_pk).await,
+                        CatchUpOutcome::Ready
+                    );
+                    assert_eq!(metrics.counters().view_projection_stops_total, 9);
+                    assert!(!captured_log_since(logs, offset).contains("view projection stopped"));
+
+                    let (_temp, storage, _fixtures, _a_tree_id) =
+                        hp12_storage_with_history(1000).await;
+                    let filter_pk = insert_warming_filter(&storage, 1, ":/c").await;
+                    storage
+                        .view_storage()
+                        .get_connection()
+                        .execute_unprepared("DELETE FROM mega_view_root_chain WHERE seq = 1")
+                        .await
+                        .unwrap();
+                    let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+                    let offset = captured_log_offset(logs);
+                    assert_eq!(
+                        hp12_catch_up(&service, filter_pk).await,
+                        CatchUpOutcome::BatchPremiseFailed
+                    );
+                    assert_eq!(metrics.counters().view_projection_stops_total, 9);
+                    assert!(!captured_log_since(logs, offset).contains("view projection stopped"));
+
+                    let (_temp, storage, _fixtures, _a_tree_id) =
+                        hp12_storage_with_history(1000).await;
+                    let filter_pk = insert_warming_filter(&storage, 1, ":/c").await;
+                    let view_storage = storage.view_storage();
+                    let db = view_storage.get_connection();
+                    db.execute_unprepared(
+                        "ALTER TABLE mega_view_object_ref RENAME COLUMN object_id TO hp12_gone",
+                    )
+                    .await
+                    .unwrap();
+                    let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+                    let offset = captured_log_offset(logs);
+                    assert!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            service.catch_up(filter_pk),
+                        )
+                        .await
+                        .expect("HP-12 query failure timeout")
+                        .is_err()
+                    );
+                    assert_eq!(metrics.counters().view_projection_stops_total, 9);
+                    assert!(!captured_log_since(logs, offset).contains("view projection stopped"));
+                    assert_eq!(
+                        mega_view_filter::Entity::find_by_id(filter_pk)
+                            .one(db)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .projected_seq,
+                        0
+                    );
+                    db.execute_unprepared(
+                        "ALTER TABLE mega_view_object_ref RENAME COLUMN hp12_gone TO object_id",
+                    )
+                    .await
+                    .unwrap();
+                });
+        });
+        assert!(!captured.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_stop_inputs_reach_ready() {
+        let metrics = ViewMetrics::default();
+        for defect in [
+            Hp12Defect::Premise,
+            Hp12Defect::RowAbsent,
+            Hp12Defect::Unparsable,
+            Hp12Defect::CommitRowMissing,
+        ] {
+            let (_temp, storage, fixtures, a_tree_id) = hp12_storage_for_defect(1000, defect).await;
+            let filter_pk = insert_warming_filter(&storage, 1, ":/c").await;
+            let _repair = introduce_hp12_defect(&storage, &fixtures, &a_tree_id, defect).await;
+            let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+            assert_eq!(
+                hp12_catch_up(&service, filter_pk).await,
+                CatchUpOutcome::Ready
+            );
+            assert_eq!(
+                mega_view_filter::Entity::find_by_id(filter_pk)
+                    .one(storage.view_storage().get_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ready_seq,
+                Some(12)
+            );
+        }
+        for defect in [Hp12Defect::RowAbsent, Hp12Defect::Unparsable] {
+            let (_temp, storage, fixtures, a_tree_id) = hp12_storage_for_defect(1000, defect).await;
+            let filter_pk = insert_warming_filter(&storage, 1, ":/a:prefix=x").await;
+            let _repair = introduce_hp12_defect(&storage, &fixtures, &a_tree_id, defect).await;
+            let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+            assert_eq!(
+                hp12_catch_up(&service, filter_pk).await,
+                CatchUpOutcome::Ready
+            );
+            assert_eq!(
+                mega_view_filter::Entity::find_by_id(filter_pk)
+                    .one(storage.view_storage().get_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ready_seq,
+                Some(12)
+            );
+        }
+        for roots in [
+            vec![
+                ("README".to_owned(), b"readme".to_vec()),
+                ("c/f".to_owned(), b"c".to_vec()),
+            ],
+            vec![
+                ("README".to_owned(), b"readme".to_vec()),
+                ("a".to_owned(), b"not-a-tree".to_vec()),
+                ("c/f".to_owned(), b"c".to_vec()),
+            ],
+        ] {
+            let roots = vec![roots.clone(), roots.clone(), roots];
+            let (_temp, storage, _fixture_metrics, filter_pk) =
+                service_with_history(":/a/b", roots, 1000).await;
+            let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+            assert_eq!(
+                hp12_catch_up(&service, filter_pk).await,
+                CatchUpOutcome::Ready
+            );
+            assert_eq!(
+                mega_view_filter::Entity::find_by_id(filter_pk)
+                    .one(storage.view_storage().get_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ready_seq,
+                Some(3)
+            );
+            assert_eq!(
+                persisted_commit_map(&storage, filter_pk)
+                    .await
+                    .last()
+                    .unwrap()
+                    .2,
+                empty_tree_id(HashKind::Sha1).unwrap().to_string()
+            );
+        }
+        assert_eq!(metrics.counters().view_projection_stops_total, 0);
+    }
+
+    #[test]
+    fn stop_dispatch_excludes_not_prefetched() {
+        let stop_cases = [
+            (
+                ProjectError::Premise(RewriteError::PremiseMismatch {
+                    commit_id: "p".to_owned(),
+                }),
+                ViewProjectionStopReason::PremiseCheckFailed,
+            ),
+            (
+                ProjectError::MissingObject(MissingObject {
+                    tree_id: "absent".to_owned(),
+                    reason: MissingObjectReason::Absent,
+                }),
+                ViewProjectionStopReason::RowAbsent {
+                    tree_id: "absent".to_owned(),
+                },
+            ),
+            (
+                ProjectError::MissingObject(MissingObject {
+                    tree_id: "malformed".to_owned(),
+                    reason: MissingObjectReason::Malformed,
+                }),
+                ViewProjectionStopReason::Unparsable {
+                    tree_id: "malformed".to_owned(),
+                },
+            ),
+            (
+                ProjectError::MissingCommit {
+                    commit_id: "missing".to_owned(),
+                },
+                ViewProjectionStopReason::CommitRowMissing,
+            ),
+        ];
+        for (error, expected) in stop_cases {
+            assert_eq!(stop_dispatch(&error), StopDispatch::Stop(expected));
+        }
+        assert_eq!(
+            stop_dispatch(&ProjectError::MissingObject(MissingObject {
+                tree_id: "unprefetched".to_owned(),
+                reason: MissingObjectReason::Unprefetched,
+            })),
+            StopDispatch::Internal
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_resumes_after_repair() {
+        for defect in [
+            Hp12Defect::Premise,
+            Hp12Defect::RowAbsent,
+            Hp12Defect::Unparsable,
+            Hp12Defect::CommitRowMissing,
+        ] {
+            let (_reference_temp, reference_storage, reference_fixtures, reference_a_tree_id) =
+                hp12_storage_for_defect(1000, defect).await;
+            if matches!(defect, Hp12Defect::Premise) {
+                let repair = introduce_hp12_defect(
+                    &reference_storage,
+                    &reference_fixtures,
+                    &reference_a_tree_id,
+                    defect,
+                )
+                .await;
+                repair_hp12_defect(&reference_storage, repair).await;
+            }
+            let reference_filter = insert_warming_filter(&reference_storage, 1, ":/a/b").await;
+            let reference_service =
+                ViewProjectionService::new(reference_storage.clone(), ViewMetrics::default());
+            assert_eq!(
+                hp12_catch_up(&reference_service, reference_filter).await,
+                CatchUpOutcome::Ready
+            );
+            let reference = projection_snapshot(&reference_storage).await;
+
+            let (_temp, storage, fixtures, a_tree_id) = hp12_storage_for_defect(1000, defect).await;
+            let filter_pk = insert_warming_filter(&storage, 1, ":/a/b").await;
+            let commit_id = fixtures[6].commit.id.to_string();
+            let repair = introduce_hp12_defect(&storage, &fixtures, &a_tree_id, defect).await;
+            let service = ViewProjectionService::new(storage.clone(), ViewMetrics::default());
+            assert_hp12_stop(
+                hp12_catch_up(&service, filter_pk).await,
+                defect,
+                &a_tree_id,
+                &commit_id,
+            );
+            repair_hp12_defect(&storage, repair).await;
+            assert_eq!(
+                hp12_catch_up(&service, filter_pk).await,
+                CatchUpOutcome::Ready
+            );
+            assert_eq!(
+                mega_view_filter::Entity::find_by_id(filter_pk)
+                    .one(storage.view_storage().get_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ready_seq,
+                Some(12)
+            );
+            assert_eq!(projection_snapshot(&storage).await, reference);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_changes_only_projected_seq() {
+        for defect in [
+            Hp12Defect::Premise,
+            Hp12Defect::RowAbsent,
+            Hp12Defect::Unparsable,
+            Hp12Defect::CommitRowMissing,
+        ] {
+            for ready_before_stop in [false, true] {
+                let (_temp, storage, fixtures, a_tree_id) =
+                    hp12_storage_for_defect(1000, defect).await;
+                let filter_pk = insert_warming_filter(&storage, 1, ":/a/b").await;
+                let service = ViewProjectionService::new(storage.clone(), ViewMetrics::default());
+                if ready_before_stop {
+                    let view_storage = storage.view_storage();
+                    let db = view_storage.get_connection();
+                    db.execute_unprepared("DELETE FROM mega_view_root_chain WHERE seq > 6")
+                        .await
+                        .unwrap();
+                    mega_refs::Entity::update_many()
+                        .col_expr(
+                            mega_refs::Column::RefCommitHash,
+                            sea_orm::sea_query::Expr::value(fixtures[5].commit.id.to_string()),
+                        )
+                        .col_expr(
+                            mega_refs::Column::RefTreeHash,
+                            sea_orm::sea_query::Expr::value(fixtures[5].commit.tree_id.to_string()),
+                        )
+                        .filter(mega_refs::Column::Path.eq("/"))
+                        .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME))
+                        .exec(db)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        hp12_catch_up(&service, filter_pk).await,
+                        CatchUpOutcome::Ready
+                    );
+                    mega_refs::Entity::update_many()
+                        .col_expr(
+                            mega_refs::Column::RefCommitHash,
+                            sea_orm::sea_query::Expr::value(fixtures[11].commit.id.to_string()),
+                        )
+                        .col_expr(
+                            mega_refs::Column::RefTreeHash,
+                            sea_orm::sea_query::Expr::value(
+                                fixtures[11].commit.tree_id.to_string(),
+                            ),
+                        )
+                        .filter(mega_refs::Column::Path.eq("/"))
+                        .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME))
+                        .exec(db)
+                        .await
+                        .unwrap();
+                    view_storage
+                        .extend_root_chain(None, 1000, ViewLockMode::Try)
+                        .await
+                        .unwrap();
+                }
+                let commit_id = fixtures[6].commit.id.to_string();
+                let _repair = introduce_hp12_defect(&storage, &fixtures, &a_tree_id, defect).await;
+                let before = mega_view_filter::Entity::find_by_id(filter_pk)
+                    .one(storage.view_storage().get_connection())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_hp12_stop(
+                    hp12_catch_up(&service, filter_pk).await,
+                    defect,
+                    &a_tree_id,
+                    &commit_id,
+                );
+                let after = mega_view_filter::Entity::find_by_id(filter_pk)
+                    .one(storage.view_storage().get_connection())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut comparable = before;
+                comparable.projected_seq = after.projected_seq;
+                assert_eq!(comparable, after);
+                assert_eq!(after.projected_seq, 6);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_start_slots_gauge() {
+        let (_temp, storage, fixtures, a_tree_id) = hp12_storage_with_history(1000).await;
+        let metrics = ViewMetrics::default();
+        let service = ViewProjectionService::new(storage.clone(), metrics.clone());
+        let snapshot = assert_snapshot_warming_count(&service, &storage, 0).await;
+        let json = serde_json::to_value(&snapshot).unwrap();
+        for key in [
+            "view_batch_premise_failures_total",
+            "view_projection_stops_total",
+            "view_cold_start_slots_in_use",
+        ] {
+            assert!(
+                json.get(key).is_some_and(serde_json::Value::is_u64),
+                "{json}"
+            );
+        }
+
+        let stopped_filter = insert_warming_filter(&storage, 1, ":/a/b").await;
+        let ready_filter = insert_warming_filter(&storage, 2, ":/c").await;
+        assert_snapshot_warming_count(&service, &storage, 2).await;
+        let commit_id = fixtures[6].commit.id.to_string();
+        let _repair =
+            introduce_hp12_defect(&storage, &fixtures, &a_tree_id, Hp12Defect::RowAbsent).await;
+        assert_hp12_stop(
+            hp12_catch_up(&service, stopped_filter).await,
+            Hp12Defect::RowAbsent,
+            &a_tree_id,
+            &commit_id,
+        );
+        assert_snapshot_warming_count(&service, &storage, 2).await;
+        assert_eq!(
+            hp12_catch_up(&service, ready_filter).await,
+            CatchUpOutcome::Ready
+        );
+        let snapshot = assert_snapshot_warming_count(&service, &storage, 1).await;
+        assert_eq!(snapshot.counters.view_projection_stops_total, 1);
+        assert_eq!(snapshot.counters.view_batch_premise_failures_total, 0);
+        assert_eq!(snapshot.view_cold_start_slots_in_use, 1);
+
+        let complete_filter = insert_warming_filter(&storage, 3, ":/c:prefix=x").await;
+        mega_view_filter::Entity::update_many()
+            .col_expr(
+                mega_view_filter::Column::ReadySeq,
+                sea_orm::sea_query::Expr::value(Some(12_i64)),
+            )
+            .col_expr(
+                mega_view_filter::Column::WarmingSince,
+                sea_orm::sea_query::Expr::value(sea_orm::Value::ChronoDateTime(None)),
+            )
+            .filter(mega_view_filter::Column::Id.eq(complete_filter))
+            .exec(storage.view_storage().get_connection())
+            .await
+            .unwrap();
+        assert_snapshot_warming_count(&service, &storage, 1).await;
+
+        let (_temp, storage, fixtures, a_tree_id) =
+            hp12_storage_for_defect(1000, Hp12Defect::Premise).await;
+        let metrics = ViewMetrics::default();
+        let service = ViewProjectionService::new(storage.clone(), metrics);
+        let filter_pk = insert_warming_filter(&storage, 1, ":/a/b").await;
+        assert_snapshot_warming_count(&service, &storage, 1).await;
+        let commit_id = fixtures[6].commit.id.to_string();
+        let _repair =
+            introduce_hp12_defect(&storage, &fixtures, &a_tree_id, Hp12Defect::Premise).await;
+        assert_hp12_stop(
+            hp12_catch_up(&service, filter_pk).await,
+            Hp12Defect::Premise,
+            &a_tree_id,
+            &commit_id,
+        );
+        assert_snapshot_warming_count(&service, &storage, 1).await;
     }
 }

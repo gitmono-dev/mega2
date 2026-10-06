@@ -303,6 +303,41 @@ ERROR 事件、状态回滚、指标与脱敏字段；列名恢复后，同一�
 逐字节比较，证明失败事务不污染水位或映射；`ON CONFLICT DO NOTHING` 的整批冲突也通过无返回值插入
 执行，不会把合法对象复用变成失败。
 
+## DB 模块覆盖：视图投影停止（HP-12）
+
+`ViewProjectionService` 在单批事务中把 `ProjectFailure::Data` 交给纯停止分派：
+前提校验失败、缺失 tree 行、无法解析 tree 字节和缺失 commit 行分别以
+`premise_check_failed`、`row_absent`、`unparsable`、`commit_row_missing` 停止；
+`MissingObjectReason::Unprefetched` 仍按内部错误回滚。停止点为 `s` 时仅写入
+`seq < s` 的段、对象和引用，将 `projected_seq` 推至 `s - 1`，不标记 ready。提交成功后才
+递增 `view_projection_stops_total` 并发出一条 ERROR 事件。事件字段为 `metric`、`filter_id`、
+`s`、`commit_id` 和 `reason`；缺对象时另有 `tree_id`。字符串字段以 Display 记录。字段断言
+只分析事件 target 之后的文本；任何 span 上下文都不算事件字段，且事件不回显作者、提交者或消息。
+
+`jupiter::service::view_projection_service::tests::stop_state_equals_prefix_reference` 覆盖四种
+故障在 B=1 与 B=1000 时的前缀状态、重复追赶和显式单批入口；
+`jupiter::service::view_projection_service::tests::stop_alert_and_counter` 覆盖逐次 ERROR 告警、
+脱敏和共享计数器；
+`jupiter::service::view_projection_service::tests::non_stop_inputs_reach_ready` 覆盖被 J4 丢弃、
+未读取缺失 tree 和真实不存在路径；
+`jupiter::service::view_projection_service::tests::stop_dispatch_excludes_not_prefetched` 覆盖
+分派表；`jupiter::service::view_projection_service::tests::stop_resumes_after_repair` 覆盖补回 L0
+行或字节后的续追；`jupiter::service::view_projection_service::tests::stop_changes_only_projected_seq`
+覆盖冷启动及已就绪状态只修改水位；
+`jupiter::service::view_projection_service::tests::cold_start_slots_gauge` 覆盖快照和冷启动名额。
+
+夹具先建立 12 个固定哨兵签名与 message 的根提交和根链，在第 7 个提交制造四类故障；P 组以带前导零
+author 时间戳的原始字节经 `Commit::from_bytes` 和 `into_mega_model` 写入，所有组的作者与 message
+哨兵为 `hp12-sentinel-author` 和 `hp12-sentinel-message`。独立 schema 的前六个根提交提供前缀参照；
+缺行和缺提交修复时恢复原模型，损坏 tree 恢复原字节。语句计数通过 `test_db_config` 和
+`database_connection` 自建连接，并以 `Storage::new_with_connection` 复用该连接；metric callback
+只记录 `mega_commit` 的 SELECT。多个 schema 可以共享同一份 `ViewMetrics`，因其计数由 `Arc` 维护。
+告警捕获使用带 `_pin_registry` 的、闭包内可读取缓冲的 DEBUG helper，按每次调用前后的差值断言；
+查询失败在测试 schema 中把 `mega_view_object_ref.object_id` 改名而非改表名。
+`ViewMetrics::counters()` 只读取原子总数；`ViewMetricsSnapshot` 以 `#[serde(flatten)]` 展平它们，
+`metrics_snapshot()` 另以一条 `warming_since IS NOT NULL` 计数查询填入
+`view_cold_start_slots_in_use`，并在每个快照步骤与同一原生 SELECT 的结果比较。
+
 ## 迁移覆盖：`merge_queue.requester` nullable 列（UN-18）
 
 **历史表。** [`plan-20260910.md`](../plan/plan-20260910.md) MW-05 已 `DROP TABLE merge_queue`；下列描述 UN-18 当时的加列迁移，不再是现行 schema。

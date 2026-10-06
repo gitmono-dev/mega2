@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter,
-    QueryOrder, Statement, Value, sea_query::OnConflict,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, Statement, Value, sea_query::OnConflict,
 };
 
 use crate::{
@@ -43,6 +43,13 @@ impl From<mega_view_filter::Model> for ProjectionFilter {
 }
 
 impl ViewStorage {
+    pub(crate) async fn warming_filter_count(&self) -> Result<u64, MegaError> {
+        Ok(mega_view_filter::Entity::find()
+            .filter(mega_view_filter::Column::WarmingSince.is_not_null())
+            .count(self.get_connection())
+            .await?)
+    }
+
     pub(crate) async fn projection_filter(
         &self,
         txn: &DatabaseTransaction,
