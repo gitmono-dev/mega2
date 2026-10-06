@@ -1,0 +1,46 @@
+EXCLUDE-SUB2:
+git log --graph:
+* seq=3 9e1a88620745de65ebc8b8d810a7ae4b2667c9ec
+* seq=1 9e677168fe5e216d1bbc6d7e88ef16ff90dbb129
+tree list:
+root-seq=1
+seq=1
+commit=9e677168fe5e216d1bbc6d7e88ef16ff90dbb129
+tree=2e5911fc727609e8ebfb29474d3d21caff5490e7
+bytes=tree 2e5911fc727609e8ebfb29474d3d21caff5490e7
+author Alice <alice@example.com> 1 +0000
+committer Bob <bob@example.com> 2 +0000
+
+message
+root-seq=2
+segment=none
+root-seq=3
+seq=3
+commit=9e1a88620745de65ebc8b8d810a7ae4b2667c9ec
+tree=cf401c4ed73c64b8577c2383a4cc5302b8fef805
+bytes=tree cf401c4ed73c64b8577c2383a4cc5302b8fef805
+parent 9e677168fe5e216d1bbc6d7e88ef16ff90dbb129
+author Alice <alice@example.com> 1 +0000
+committer Bob <bob@example.com> 2 +0000
+
+message
+EXCLUDE-SUB1-SUB2:
+git log --graph:
+* seq=3 a64a113b9f2d0172e1a8e7d4db336bff89ece305
+* seq=1 NULL
+tree list:
+root-seq=1
+seq=1
+commit=null
+tree=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+root-seq=2
+segment=none
+root-seq=3
+seq=3
+commit=a64a113b9f2d0172e1a8e7d4db336bff89ece305
+tree=956a7dad0e337bf59a0f890821b60e2ed8c77943
+bytes=tree 956a7dad0e337bf59a0f890821b60e2ed8c77943
+author Alice <alice@example.com> 1 +0000
+committer Bob <bob@example.com> 2 +0000
+
+message

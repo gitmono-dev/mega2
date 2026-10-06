@@ -801,6 +801,7 @@ fn project_commit(F, c /* seq = s */, parent_tree, prev) -> Result<Option<Segmen
     return Some(Segment(s, rewrite_commit(F, c, t, [vp]), t))  # 含 t == EMPTY_TREE（视图被清空）
 ```
 - `is_empty_root(T)` 的定义：T == EMPTY_TREE，或者 T 的全部条目都是 tree，且每个条目都递归满足 `is_empty_root`（Josh `history.rs::is_empty_root`）。递归读取经由 4.1 的 `read_tree`，缺对象时返回错误，不按非空或空处理。`project_commit` 返回 `Result<Option<Segment>, ProjectError>`，ProjectError 是以下三者之一：4.2 前提校验失败；4.1 `MissingObject`；根链行的 `mega_commit` 行缺失。最后一种只在 `rewrite_commit` 需要读该行时触发，在该处被 J4 丢弃的视图不受影响。
+- **线性投影的实现细化（HP-06）。** `project_commit` 返回 `Result<Option<Segment>, ProjectFailure>`，其中 `ProjectFailure::Data(ProjectError)` 承载前提校验失败、`MissingObject` 与根链提交行缺失，`ProjectError` 保持这三个变体不变；`ProjectFailure::Internal` 只承载调用方违反前提时的过滤器不变式违例，不对应数据状态，并由调用方整批回滚、水位不变；`MissingObject` 原样保留含未预取在内的读取原因，由调用方按原因分派；`Segment` 带视图提交的字节，供批末写对象；R8 检测在视图尚无提交且复合结果不写提交时逐级读取，超出按层预取范围的读取由调用方补预取后重算；中间级只含目录、子 tree 逐提交变化、复合结果为 EMPTY_TREE（如 `:/a:exclude[::b]` 且 `a/` 只含 `b/`）的罕见形态构成 §4.4「往返次数」的明示例外，可能使往返次数随批内提交增加，由 HP-24 计量。
 - 在单父情形下，以上规则与 Josh 的 `create_filtered_commit2` / `select_parent_commits` 一致【代码：`history.rs` 约 L697–721、L899–911】。
 - 【推断】在 mega2 中，trunk 根提交的 tree 总是与父提交不同（ADR-TP-16：净零推送不推进根），所以 `all_diffs_empty` 分支实际上不会触发；mega2 的初始化提交也不是空树。这两条规则仍然保留，用于与 Josh 对齐，并由测试覆盖。
 - **顶层 Chain。** Josh 按 `flatten_chain` 逐级做历史过滤（`filter/mod.rs::apply_to_commit2`）。在线性历史上，这与"先求复合 tree 函数，再套一次上述规则"等价，所以 P0 用复合 tree 函数。例外：L0 tree 中含有指向空树的条目时，逐级过滤的中间级可能触发空根规则，复合函数复现不了这种情形。这一点列入 R8，投影时检测到就告警。非线性情形见附录 E。
