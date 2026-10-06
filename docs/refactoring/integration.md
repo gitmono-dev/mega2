@@ -212,6 +212,44 @@ Try/Blocking/取消等锁；以及全部锁键与同 schema 的两两隔离。
 用持锁事务之外的自动提交查询在一秒内轮询 `pg_stat_activity`；事务快照不会看到之后
 才出现的等待者。代码审查点是根链只按 `seq` 递增插入，绝不以 `max(seq)+1` 追加单行。
 
+## DB 模块覆盖：视图注册准入（HP-13）
+
+`ViewStorage::admit(req, limits)` 在一个短事务中实现注册准入。`Register` 按
+`filter_id` 查找定义，`Rewarm` 按主键查找；不存在的 Rewarm 返回
+`MegaError::NotFound`。两种模式都在定义新建或处于回收态时判定冷启动，依次检查
+活跃过滤器总数和冷启动名额。命名 Register 只读取该 name 的最新
+`(version, filter_pk)`：同一活跃定义且不需新版本时返回 `Idempotent`，其余成功
+请求返回 `Admitted`；`version` 是请求 name 的最终最新版本（无 name 时为
+`None`），`ready` 是第 2 步读到的 `ready_seq` 是否非空。第 3 步的速率窗口和
+`mega_view_register_log` 读写由 HP-31 接入，本卡不读写该表。
+
+`AdmitRequest`、`AdmitMode`、`FilterDefinition`、`AdmitLimits`、
+`AdmitOutcome` 与 `RejectReason` 都限定在 storage crate 内。限额仅来自调用方传入的
+`AdmitLimits`，其 `From<&ViewsConfig>` 实现读取 `max_filters` 与
+`max_concurrent_cold_starts`；准入自身不读取 `Storage` 的配置快照。拒绝返回
+`Rejected { reason, retry_after: 30 秒 }` 并回滚；幂等命中没有写入。新过滤器以
+`ON CONFLICT (filter_id) DO NOTHING RETURNING` 写入，若 L_R 以外的写入方在查询后
+抢先提交，SeaORM 的零返回行会规范为
+`MegaError::Db(DbErr::RecordNotInserted)`，事务回滚，绝不会用未插入的 id 创建
+`mega_view`。
+
+第 1 步直接执行 `admit_lock_stmt(cfg!(test))` 返回的 HP-10
+`view_lock_stmt_prod` 或 `view_lock_stmt_test` 的 `ViewLock::Register`、`Blocking`
+语句。该纯函数只负责委托拼装；准入不调用 `acquire_view_lock`，因为后者会设置两秒
+`lock_timeout`，而设计 §6.5 要求 L_R 不限时等待。事务不取得其他视图锁，也不重写
+§4.4 的锁键方案。
+
+七个 lib 用例覆盖 `concurrent_last_slot`、`same_filter_concurrent`、
+`rejection_and_idempotent_hit`、`checks_follow_design`、`cold_start_marks_warming`、
+`named_register_versions` 与 `limits_follow_reload`。并发用例用 `test_db_config` 和
+`database_connection` 建同一 schema 的多个连接池，由第三个连接的未提交事务持有
+L_R，并轮询确认两个准入正在等待再释放；轮询失败分支会显式回滚 H，每轮的
+`tokio::join!` 外包 30 秒超时，延时轮分别确认两个请求都在释放 L_R 后才返回，因而等待
+超过通常锁超时仍可成功。其余用例直接构造就绪、预热、部分投影和回收态行，以三表 JSON
+快照验证拒绝、幂等、Rewarm 与错误都不写行；改名列注入第 6 步写失败，并让 L_R 外部
+未提交的同键插入与准入经 `tokio::join!` 在 30 秒内运行，在观测到 transactionid 等待后
+提交；观测失败先显式回滚写入事务，验证零行冲突回滚。
+
 ## DB 模块覆盖：根链停追与恢复（HP-28）
 
 `ROOT_CHAIN_HALTED_SQL` 是不带绑定参数、不引用外层别名的完整布尔表达式。读者可把它
