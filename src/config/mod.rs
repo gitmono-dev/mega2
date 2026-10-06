@@ -137,6 +137,7 @@ impl Config {
                 ..Default::default()
             },
             artifacts_gc: ArtifactGcConfig::default(),
+            views: ViewsConfig::default(),
             notification: None,
             vault: None,
             oauth: None,

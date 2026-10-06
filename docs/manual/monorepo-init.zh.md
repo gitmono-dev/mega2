@@ -124,6 +124,7 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 
 - `root_dirs = ["a/b"]`、含 `\`、NUL、首尾空格，或为 `.`、`..`、空串的条目**在校验阶段即被拒绝**，不会生成含非法条目名的根树；
 - 与 `init_trees` 自带根条目同名（`.cedar`、`.mega_cedar.json`、`.buckroot`、`.buckconfig`）或为 `.git`（不区分大小写）的条目同样被拒绝，避免根树重复条目或客户端拒绝 checkout；
+- `.view`、`.filter` 是按大小写精确匹配的视图 URL 保留名（不同于 `.git` 的不区分大小写），同样被拒绝；迁移与启动检查见[配置指南的「视图保留名」](../configuration.zh.md)。
 - `toolchains` 的 BUCK 注入按条目名 `toolchains` 精确匹配。
 
 **多级目录的正确做法**：初始化只铺设一级骨架；更深层级由客户端正常提交产生——clone 后 `mkdir -p a/b && git add && git commit && git push`（非 `main` 推送进入 CL 管线，合并后落地 `main`）。

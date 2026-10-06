@@ -9,12 +9,13 @@ use url::Url;
 
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig,
-    GithubSyncConfig, LFSConfig, LogConfig, MonoConfig, Mst2Config, NotificationConfig,
-    OAuthConfig, PackConfig, PushAuth, PushPolicy, RedisConfig, VAULT_AUDIT_SINKS, VaultConfig,
-    normalize_token_path,
+    GithubSyncConfig, LFSConfig, LogConfig, MonoConfig, MonoObjectFormat, Mst2Config,
+    NotificationConfig, OAuthConfig, PackConfig, PushAuth, PushPolicy, RedisConfig,
+    VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
     secret::{SecretRef, SecretResolver, is_secret_ref_value},
 };
 use crate::{
+    ceres::view::VIEW_URL_RESERVED_NAMES,
     common::{
         errors::MegaError, oci_name::valid_repository_name, utils::canonicalize_mono_ref_path,
     },
@@ -129,6 +130,7 @@ impl Config {
         }
         validate_object_storage_config(&self.object_storage)?;
         validate_artifact_gc_config(&self.artifacts_gc)?;
+        validate_views_config(self)?;
         if let Some(notification_config) = &self.notification {
             validate_notification_config(notification_config)?;
         }
@@ -545,7 +547,10 @@ fn validate_monorepo_path_shape(root_dirs: &[String], import_dir: &Path) -> Resu
                 "{field} must not have leading or trailing whitespace; got {name:?}"
             )));
         }
-        if INIT_ROOT_RESERVED_NAMES.contains(&name.as_str()) || name.eq_ignore_ascii_case(".git") {
+        if INIT_ROOT_RESERVED_NAMES.contains(&name.as_str())
+            || VIEW_URL_RESERVED_NAMES.contains(&name.as_str())
+            || name.eq_ignore_ascii_case(".git")
+        {
             return Err(MegaError::Other(format!(
                 "{field} {name:?} is reserved for the root tree"
             )));
@@ -571,6 +576,11 @@ fn validate_monorepo_path_shape(root_dirs: &[String], import_dir: &Path) -> Resu
         )));
     }
     let first = import_dir[1..].split('/').next().unwrap_or_default();
+    if VIEW_URL_RESERVED_NAMES.contains(&first) {
+        return Err(MegaError::Other(format!(
+            "{field} first component {first:?} is reserved for view URLs"
+        )));
+    }
     if !root_dirs.iter().any(|name| name == first) {
         return Err(MegaError::Other(format!(
             "{field} first component {first:?} must be listed in monorepo.root_dirs"
@@ -1382,6 +1392,57 @@ pub(crate) fn validate_artifact_gc_config(
     Ok(())
 }
 
+pub(crate) fn validate_views_config(config: &Config) -> Result<(), MegaError> {
+    let views = &config.views;
+
+    if views.worker_interval_secs == 0 {
+        return Err(MegaError::Other(
+            "views.worker_interval_secs must be greater than 0".to_string(),
+        ));
+    }
+    if !(1..=10_000).contains(&views.batch_size) {
+        return Err(MegaError::Other(
+            "views.batch_size must be between 1 and 10000".to_string(),
+        ));
+    }
+    if !(1..=100_000).contains(&views.max_append_walk) {
+        return Err(MegaError::Other(
+            "views.max_append_walk must be between 1 and 100000".to_string(),
+        ));
+    }
+    if views.sync_catch_up_commits > views.batch_size {
+        return Err(MegaError::Other(
+            "views.sync_catch_up_commits must not exceed views.batch_size".to_string(),
+        ));
+    }
+    if views.max_filters == 0 {
+        return Err(MegaError::Other(
+            "views.max_filters must be greater than 0".to_string(),
+        ));
+    }
+    if views.max_concurrent_cold_starts == 0 {
+        return Err(MegaError::Other(
+            "views.max_concurrent_cold_starts must be greater than 0".to_string(),
+        ));
+    }
+    if views.register_rate_per_token == 0 {
+        return Err(MegaError::Other(
+            "views.register_rate_per_token must be greater than 0".to_string(),
+        ));
+    }
+    if views.enabled
+        && (config.monorepo.push_policy != PushPolicy::Trunk
+            || config.monorepo.object_format != MonoObjectFormat::Sha1)
+    {
+        return Err(MegaError::Other(
+            "[views] enabled=true requires monorepo.push_policy = \"trunk\" and monorepo.object_format = \"sha1\""
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_size_string(field_path: &str, value: &str) -> Result<(), MegaError> {
     let bytes = PackConfig::get_size_from_str(value, || Ok(8 * 1024 * 1024 * 1024))
         .map_err(|e| MegaError::Other(format!("{field_path} must be a valid size: {e}")))?;
@@ -2070,6 +2131,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "redis",
             "buck",
             "artifacts_gc",
+            "views",
             "notification",
             "vault",
             "oauth",
@@ -2150,6 +2212,17 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "completed_retention_days",
         ]),
         "artifacts_gc" => Some(&["enable", "interval_secs", "grace_secs", "batch_limit"]),
+        "views" => Some(&[
+            "enabled",
+            "worker_interval_secs",
+            "batch_size",
+            "max_append_walk",
+            "sync_catch_up_commits",
+            "max_filters",
+            "max_concurrent_cold_starts",
+            "register_rate_per_token",
+            "allow_anonymous_register",
+        ]),
         "notification" => Some(&["enabled", "webhook"]),
         "notification.webhook" => Some(&["enabled", "url", "token_ref"]),
         "vault" => Some(&["audit"]),
@@ -2229,7 +2302,7 @@ mod tests {
     use super::*;
     use crate::config::{
         GithubSyncBinding, MonoObjectFormat, PushAuth, PushPolicy, PushTokenConfig,
-        StorageEventsTargetConfig,
+        StorageEventsTargetConfig, ViewsConfig,
         secret::{SecretRef, SecretResolver},
         template::config_init_template,
         testing::{EnvVarGuard, env_lock, isolated_config},
@@ -2239,6 +2312,13 @@ mod tests {
 
     fn valid_config() -> Config {
         isolated_config(std::env::temp_dir().join("mega2-config-validate-tests"))
+    }
+
+    fn assert_views_validation_error(config: Config, field: &str) {
+        let err = config
+            .validate()
+            .expect_err("views config should be rejected");
+        assert!(err.to_string().contains(field), "{err}");
     }
 
     #[test]
@@ -2388,6 +2468,194 @@ mod tests {
         valid_config()
             .validate()
             .expect("isolated test config should validate");
+    }
+
+    #[test]
+    fn views_defaults_match_design() {
+        let _lock = env_lock();
+        let defaults = ViewsConfig::default();
+        assert_eq!(
+            defaults,
+            ViewsConfig {
+                enabled: false,
+                worker_interval_secs: 10,
+                batch_size: 1_000,
+                max_append_walk: 1_000,
+                sync_catch_up_commits: 64,
+                max_filters: 100,
+                max_concurrent_cold_starts: 2,
+                register_rate_per_token: 10,
+                allow_anonymous_register: false,
+            }
+        );
+
+        let source = include_str!("../../config/config-review.toml");
+        assert_eq!(
+            Config::load_str(source)
+                .expect("review config without views")
+                .views,
+            defaults
+        );
+
+        for (field, value) in [
+            ("enabled", "true"),
+            ("worker_interval_secs", "11"),
+            ("batch_size", "1001"),
+            ("max_append_walk", "1001"),
+            ("sync_catch_up_commits", "65"),
+            ("max_filters", "101"),
+            ("max_concurrent_cold_starts", "3"),
+            ("register_rate_per_token", "11"),
+            ("allow_anonymous_register", "true"),
+        ] {
+            let config = Config::load_str(&format!("{source}\n[views]\n{field} = {value}\n"))
+                .unwrap_or_else(|err| panic!("{field}: {err}"));
+            let mut expected = defaults.clone();
+            match field {
+                "enabled" => expected.enabled = true,
+                "worker_interval_secs" => expected.worker_interval_secs = 11,
+                "batch_size" => expected.batch_size = 1_001,
+                "max_append_walk" => expected.max_append_walk = 1_001,
+                "sync_catch_up_commits" => expected.sync_catch_up_commits = 65,
+                "max_filters" => expected.max_filters = 101,
+                "max_concurrent_cold_starts" => expected.max_concurrent_cold_starts = 3,
+                "register_rate_per_token" => expected.register_rate_per_token = 11,
+                "allow_anonymous_register" => expected.allow_anonymous_register = true,
+                _ => unreachable!("declared views field"),
+            }
+            assert_eq!(config.views, expected, "{field}");
+        }
+    }
+
+    #[test]
+    fn views_rejects_input_outside_design_table() {
+        let _lock = env_lock();
+        let source = include_str!("../../config/config-review.toml");
+        for (field, value) in [
+            ("foo", "1"),
+            ("gc_grace_secs", "86400"),
+            ("gc_batch_limit", "1000"),
+            ("idle_recycle_secs", "7200"),
+            ("max_in_lock_catch_up", "256"),
+            ("allow_anonymous_push", "true"),
+        ] {
+            let err = Config::load_str(&format!("{source}\n[views]\n{field} = {value}\n"))
+                .expect_err("field outside the P0 table must fail");
+            assert!(err.to_string().contains(&format!("views.{field}")), "{err}");
+        }
+
+        let mut config = valid_config();
+        config.views.worker_interval_secs = 0;
+        assert_views_validation_error(config, "views.worker_interval_secs");
+
+        let mut config = valid_config();
+        config.views.batch_size = 0;
+        config.views.sync_catch_up_commits = 0;
+        assert_views_validation_error(config, "views.batch_size");
+
+        let mut config = valid_config();
+        config.views.batch_size = 10_001;
+        assert_views_validation_error(config, "views.batch_size");
+
+        for max_append_walk in [0, 100_001] {
+            let mut config = valid_config();
+            config.views.max_append_walk = max_append_walk;
+            assert_views_validation_error(config, "views.max_append_walk");
+        }
+        for batch_size in [1_000, 10] {
+            let mut config = valid_config();
+            config.views.batch_size = batch_size;
+            config.views.sync_catch_up_commits = batch_size + 1;
+            assert_views_validation_error(config, "views.sync_catch_up_commits");
+        }
+        for field in [
+            "max_filters",
+            "max_concurrent_cold_starts",
+            "register_rate_per_token",
+        ] {
+            let mut config = valid_config();
+            match field {
+                "max_filters" => config.views.max_filters = 0,
+                "max_concurrent_cold_starts" => config.views.max_concurrent_cold_starts = 0,
+                "register_rate_per_token" => config.views.register_rate_per_token = 0,
+                _ => unreachable!("declared views field"),
+            }
+            assert_views_validation_error(config, &format!("views.{field}"));
+        }
+
+        let mut configs = Vec::new();
+        let mut config = valid_config();
+        config.views.worker_interval_secs = 1;
+        configs.push(config);
+        let mut config = valid_config();
+        config.views.batch_size = 1;
+        config.views.sync_catch_up_commits = 1;
+        configs.push(config);
+        let mut config = valid_config();
+        config.views.batch_size = 10_000;
+        configs.push(config);
+        for max_append_walk in [1, 100_000] {
+            let mut config = valid_config();
+            config.views.max_append_walk = max_append_walk;
+            configs.push(config);
+        }
+        for sync_catch_up_commits in [0, 1_000] {
+            let mut config = valid_config();
+            config.views.sync_catch_up_commits = sync_catch_up_commits;
+            configs.push(config);
+        }
+        for field in [
+            "max_filters",
+            "max_concurrent_cold_starts",
+            "register_rate_per_token",
+        ] {
+            let mut config = valid_config();
+            match field {
+                "max_filters" => config.views.max_filters = 1,
+                "max_concurrent_cold_starts" => config.views.max_concurrent_cold_starts = 1,
+                "register_rate_per_token" => config.views.register_rate_per_token = 1,
+                _ => unreachable!("declared views field"),
+            }
+            configs.push(config);
+        }
+        for config in configs {
+            config
+                .validate()
+                .expect("views range boundary should validate");
+        }
+    }
+
+    #[test]
+    fn views_enabled_requires_trunk_sha1() {
+        let mut config = valid_config();
+        config.views.enabled = true;
+        assert_views_validation_error(config, "[views] enabled=true requires");
+
+        for object_format in [MonoObjectFormat::Sha256, MonoObjectFormat::Blake3] {
+            let mut config = storage_only_none();
+            config.views.enabled = true;
+            config.monorepo.object_format = object_format;
+            assert_views_validation_error(config, "[views] enabled=true requires");
+        }
+
+        let mut config = storage_only_none();
+        config.views.enabled = true;
+        config
+            .validate()
+            .expect("enabled views must allow trunk sha1");
+
+        let mut config = valid_config();
+        config.views.enabled = false;
+        config.validate().expect("disabled views must allow review");
+
+        for object_format in [MonoObjectFormat::Sha256, MonoObjectFormat::Blake3] {
+            let mut config = storage_only_none();
+            config.views.enabled = false;
+            config.monorepo.object_format = object_format;
+            config
+                .validate()
+                .expect("disabled views must allow non-sha1 formats");
+        }
     }
 
     #[test]
@@ -3029,6 +3297,45 @@ mod tests {
             config.monorepo.import_dir = PathBuf::from(import_dir);
             validate_monorepo_config(&config.monorepo)
                 .unwrap_or_else(|err| panic!("{import_dir:?} must validate: {err}"));
+        }
+    }
+
+    #[test]
+    fn view_reserved_names_rejected() {
+        for enabled in [false, true] {
+            for reserved in crate::ceres::view::VIEW_URL_RESERVED_NAMES {
+                let mut config = storage_only_none();
+                config.views.enabled = enabled;
+                config.monorepo.root_dirs = vec!["third-party".to_string(), reserved.to_string()];
+                config.monorepo.import_dir = PathBuf::from("/third-party");
+                let err = config
+                    .validate()
+                    .expect_err("reserved root directory must be rejected")
+                    .to_string();
+                assert!(err.contains("monorepo.root_dirs[1]"), "{reserved}: {err}");
+                assert!(err.contains("reserved"), "{reserved}: {err}");
+
+                let mut config = storage_only_none();
+                config.views.enabled = enabled;
+                config.monorepo.root_dirs = vec!["third-party".to_string()];
+                config.monorepo.import_dir = PathBuf::from(format!("/{reserved}/vendor"));
+                let err = config
+                    .validate()
+                    .expect_err("reserved import-directory first component must be rejected")
+                    .to_string();
+                assert!(err.contains("monorepo.import_dir"), "{reserved}: {err}");
+                assert!(err.contains("reserved"), "{reserved}: {err}");
+            }
+
+            let mut config = storage_only_none();
+            config.views.enabled = enabled;
+            config.monorepo.root_dirs = ["third-party", ".viewer", ".filters", ".View"]
+                .map(str::to_string)
+                .to_vec();
+            config.monorepo.import_dir = PathBuf::from("/third-party/.view");
+            config
+                .validate()
+                .expect("near-match names and a non-leading segment must remain valid");
         }
     }
 

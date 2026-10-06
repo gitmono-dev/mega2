@@ -715,7 +715,7 @@ fn filter_tree(F, T) -> Result<TreeId, MissingObject>:
         Chain(fs)  => try_fold(fs, T, filter_tree)?
     return Ok(r)
 ```
-**空树规范（冻结进 v1）【决策】**，与 Josh 一致【代码】：Josh `tree.rs::replace_child_inner` 中有 `remove = oid == null || oid == empty_id()`，`subtract_inner` 在结果为空时删除整个条目。规则如下：
+**空树规范（冻结进 v1）【决策】**，与 Josh 一致（被重写层的兄弟空树条目除外，见 §7.3 R8）【代码】：Josh `tree.rs::replace_child_inner` 中有 `remove = oid == null || oid == empty_id()`，`subtract_inner` 在结果为空时删除整个条目。规则如下：
 - 任何新建的 tree 都不写入指向 EMPTY_TREE 的条目。某一层在删除或替换之后没有条目了，该层的结果就是 EMPTY_TREE，同时在父层删掉对应条目，逐级向上传递。
 - `Prefix(p)` 作用于 EMPTY_TREE 时，结果是 EMPTY_TREE。
 - `Exclude(S)` 删掉命中的条目后，按上一条剪掉被删空的祖先目录；根被删空时返回 EMPTY_TREE。
@@ -724,6 +724,7 @@ fn filter_tree(F, T) -> Result<TreeId, MissingObject>:
 
 **缺对象不等于路径不存在【决策】。**
 - **读取原语。** `filter_tree`、`lookup_path`、`subtract_paths`、`overlay_disjoint` 与 4.3 的 `is_empty_root`，都只经由 `read_tree(id) -> Result<Tree, MissingObject>` 读 tree：先查 `mega_view_object`，其余查 `mega_tree`。行不存在、字节无法解析，都返回 `MissingObject { tree_id }`，告警中注明属于哪一种。解析用 `ObjectHash::from_hex_for_kind(kind, tree_id)?` 加 `<Tree as ObjectTrait>::from_bytes`：它出错时返回 Err，按 id 的 kind 切分条目（git-internal `tree.rs` 约 L408–411）。不用 `Tree::from_mega_model`，它会 panic，且依赖 thread-local kind（`converter.rs` 约 L857–863）。
+- **读取原语的细化（HP-04）。** 「未预取」是除「行不存在」「字节无法解析」外的第三种 `MissingObject` 原因，表示 TreeSource 没有加载该 id；读取同步且不访问数据库（ADR-HP-02），它不表示库中没有该行，不属于本节所说的缺对象，不进入缺失集合，调用方不得据此按 §4.4 把水位停在 s − 1。`read_tree(EMPTY_TREE)` 不经 TreeSource，直接返回空条目的 tree，即使没有对应行也不返回 `MissingObject`。本批缺失集合中的 id 是「行不存在」；id 长度与 kind 不符、`from_bytes` 失败或解析出的 tree 含同名条目（只按名字判定，不论 mode）都是「字节无法解析」，所有读取共用该解析函数，所以 `lookup_path` 与各算子对同名条目的结论相同。
 - **只有两种情形算路径不存在**，按 EMPTY_TREE 处理：路径上某一层的 tree 中确实没有该名字的条目；条目存在，但不是 tree（blob、symlink、gitlink）。条目存在且 mode 为 tree、它指向的 tree 却读不到时，返回 `MissingObject`，不得返回 EMPTY_TREE。根树 T 本身读不到，或者 Exclude、Compose 需要重写的祖先 tree 读不到，同样返回 `MissingObject`。`lookup_path` 因此返回 `Result<Tree(id) | Absent | NotTree, MissingObject>`。
 - **只检查计算需要读取的 tree。** 原样复用、不需要读取的子树在投影时不检查，与下文“原样复用的 L0 tree”一致。这类子树包括 Subdir 的结果 tree、Prefix 包住的 T，以及 Exclude/Compose 没有触及的子树；它们缺失时，由 6.3 在打包时报错。视图提交的哈希只依赖这些子树的 id，所以确定性不受影响。memo 不缓存 `MissingObject`。
 - **批量读取。** 本节要求新增的可失败批量读取，只在查询本身失败时返回 `Err`。查不到的 id 由调用方按“请求集减返回集”得出，存储层不判错。4.4 的按层预取把这些 id 记入本批的缺失集合，不让整批失败；`read_tree` 命中缺失集合时返回 `MissingObject`。6.3 的 ViewRepo 读取发现缺失集合非空即报错。
@@ -800,6 +801,7 @@ fn project_commit(F, c /* seq = s */, parent_tree, prev) -> Result<Option<Segmen
     return Some(Segment(s, rewrite_commit(F, c, t, [vp]), t))  # 含 t == EMPTY_TREE（视图被清空）
 ```
 - `is_empty_root(T)` 的定义：T == EMPTY_TREE，或者 T 的全部条目都是 tree，且每个条目都递归满足 `is_empty_root`（Josh `history.rs::is_empty_root`）。递归读取经由 4.1 的 `read_tree`，缺对象时返回错误，不按非空或空处理。`project_commit` 返回 `Result<Option<Segment>, ProjectError>`，ProjectError 是以下三者之一：4.2 前提校验失败；4.1 `MissingObject`；根链行的 `mega_commit` 行缺失。最后一种只在 `rewrite_commit` 需要读该行时触发，在该处被 J4 丢弃的视图不受影响。
+- **线性投影的实现细化（HP-06）。** `project_commit` 返回 `Result<Option<Segment>, ProjectFailure>`，其中 `ProjectFailure::Data(ProjectError)` 承载前提校验失败、`MissingObject` 与根链提交行缺失，`ProjectError` 保持这三个变体不变；`ProjectFailure::Internal` 只承载调用方违反前提时的过滤器不变式违例，不对应数据状态，并由调用方整批回滚、水位不变；`MissingObject` 原样保留含未预取在内的读取原因，由调用方按原因分派；`Segment` 带视图提交的字节，供批末写对象；R8 检测在视图尚无提交且复合结果不写提交时逐级读取，超出按层预取范围的读取由调用方补预取后重算；中间级只含目录、子 tree 逐提交变化、复合结果为 EMPTY_TREE（如 `:/a:exclude[::b]` 且 `a/` 只含 `b/`）的罕见形态构成 §4.4「往返次数」的明示例外，可能使往返次数随批内提交增加，由 HP-24 计量。
 - 在单父情形下，以上规则与 Josh 的 `create_filtered_commit2` / `select_parent_commits` 一致【代码：`history.rs` 约 L697–721、L899–911】。
 - 【推断】在 mega2 中，trunk 根提交的 tree 总是与父提交不同（ADR-TP-16：净零推送不推进根），所以 `all_diffs_empty` 分支实际上不会触发；mega2 的初始化提交也不是空树。这两条规则仍然保留，用于与 Josh 对齐，并由测试覆盖。
 - **顶层 Chain。** Josh 按 `flatten_chain` 逐级做历史过滤（`filter/mod.rs::apply_to_commit2`）。在线性历史上，这与"先求复合 tree 函数，再套一次上述规则"等价，所以 P0 用复合 tree 函数。例外：L0 tree 中含有指向空树的条目时，逐级过滤的中间级可能触发空根规则，复合函数复现不了这种情形。这一点列入 R8，投影时检测到就告警。非线性情形见附录 E。
@@ -843,6 +845,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
     return true
 ```
 - **往返次数。** 每批 O(1) 条提交查询，再加 O(深度) 条按层的 tree 查询；不存在"每个提交一次往返"。
+- **可失败批量读取的语句数（HP-29）。** 一层有 k 个待查 tree id、其中 r 个不在 `mega_view_object` 中时，先查询 `mega_view_object`、再查询剩余 `mega_tree`，至多执行 ⌈k/1000⌉ + ⌈r/1000⌉ 条语句；每条最多 1000 个 id。伪代码的「每层 1 条 SQL」和 4.1 的「同一层只发一次查询」按此分块规则理解：一层 id 不超过 1000 时至多两条。每层语句数只取决于该层 id 数，与批内提交数无关，因此 O(深度) 不变。提交的 `get_commits_by_hashes_fallible` 也按 1000 分块：请求 m 个不同提交 id 时执行 ⌈m/1000⌉ 条；若按伪代码传入完整 rows，m 至多 B + 1，默认 B = 1000 且 s0 ≥ 1 的满批为 1001 个 id、两条查询，B ≤ 10 000 时至多 11 条。第 s0 行只提供父 tree 时可从 `mega_view_root_chain.tree_id` 取得它，不读取该提交则 m ≤ B；提交读取的「1 条 SQL」按此理解，仍为每批 O(1)。
 - **批的前提【决策】。** `s0 < tip` 时，本批必须恰好取到 seq 从 `max(s0,1)` 到 `min(s0+B, tip)` 的连续行，因此至少包含 `seq = s0+1` 这一行，水位每批至少前进 1。
   - 取不到这些行，说明派生状态或配置已经损坏，原因可能是根链表出现空洞，或者 B < 1 绕过了 6.9 的校验。
   - 此时本批不写任何行、不推进水位，记错误、告警并退出循环，不得原地重试。
@@ -853,7 +856,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
 - **就绪与水位同事务【决策】。** 首次就绪在把水位推进到 tip 的那个批事务内写入，与 3.1、6.5 所说的‘视图首次就绪的那个 catch_up 批事务’一致，只有该批读到的 `main@/` 已经超出根链时，才留给之后 s0 ≥ tip 分支的事务置就绪；6.9 的候选谓词保证它在一个周期内被选中。如果放在不同的事务里，最后一批提交之后、置就绪之前，只要发生以下任一情形，视图就会停在‘水位已到链尾、`ready_seq` 仍为 NULL’的状态：进程退出，该事务遇到瞬时数据库错误，或者后台 worker 对 L_G 试锁失败后返回（4.6）。此后入口要到下一个补偿周期才不再返回 503，名额也多占一个周期。判定是否覆盖 `main@/` 时，与根链中 seq = tip 那一行的 `commit_id` 比较，不重读链尾。【推断】READ COMMITTED 下，`max_seq()` 与链尾是两条语句，各取一次快照；其间 `extend_root_chain` 可能接入新行，重读链尾会把落后的水位误判为已覆盖 `main@/`。
 - **锁【决策】。** 视图锁和根链锁都用两个整数作键：
   - `VIEW_LOCK_NS` 与 `VIEW_FILTER_LOCK_NS` 互不相同，也与 `MONO_WRITE_LOCK` 及初始化锁的 key1 都不同；
-  - 单例锁（根链锁、L_G、L_R）用 `key1 = VIEW_LOCK_NS`，`key2` 分别取 `ROOT_CHAIN_KEY`、`OBJECT_GC_KEY`、`REGISTER_KEY`。视图锁改用独立的 `key1 = VIEW_FILTER_LOCK_NS`，`key2 = hash32(filter_pk)`，与单例锁不会撞键；
+  - 单例锁（根链锁、L_G、L_R）用 `key1 = VIEW_LOCK_NS`，`key2` 分别取 `ROOT_CHAIN_KEY`、`OBJECT_GC_KEY`、`REGISTER_KEY`。视图锁改用独立的 `key1 = VIEW_FILTER_LOCK_NS`，`key2 = hash32(filter_pk)`（`hash32(x) = ((x as u64) ^ ((x as u64) >> 32)) as u32 as i32`，即 64 位 id 的高低 32 位异或折叠），与单例锁不会撞键；
   - `cfg(test)` 下，key2 改为 `hashtext(current_schema() || ':' || d)`，其中 d 是 filter_pk 的十进制文本，或者 `'root_chain'`、`'object_gc'`、`'register'` 之一。这样并行的测试 schema 之间互不争锁，同一 schema 内根链锁与各视图锁也仍然互不相同。`mono_write_lock_sql` 只有一把锁，可以整体替换 key2；这里有多把锁，不能照搬。
 
   投影写入只发生在同时持有视图锁和 L_G 共享锁的 worker 事务中；回收、清扫与 rebuild 的删除按 4.6 执行；B3 等写入判定路径对这些表只读（5.2）。对象维护锁 L_G、各类事务的取锁方式和全局锁顺序，见 4.6。投影是确定的，重复计算无害：写入都是 `ON CONFLICT DO NOTHING`，水位只增不减。抢锁失败时直接返回，不设进程内标记。【推断】这样做不影响正确性：B3 的写入判定只用锁内算出的 `tip_at_R`（4.5）；advertise 与 B0 的同步路径或者带 `lock_timeout` 阻塞等锁，或者在追不上时按 3.3、4.4 广告已投影的 tip、返回可重试错误，都不依赖 worker 何时被唤醒。活性只由周期补偿保证，前提是周期任务的候选谓词覆盖所有未完成的活跃视图（6.9 `worker_interval_secs`）。代价是：持锁者最后一次读取链尾之后落地的提交，在本副本上最多多等一个 `worker_interval_secs`。原来的 dirty 握手也给不出更强的保证：持锁者检查标记之后、提交并释放锁之前，竞争者仍可能置位后离开；而且标记只在进程内可见，跨副本无效。如果实测需要更低的延迟，再加回在释放锁之后复查的版本。
@@ -897,7 +900,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
 |---|---|---|
 | L_M：`MONO_WRITE_LOCK` | 现有 | B3、物化插入、ADR-TP-20 的对账与巡检批次、reaper（试锁） |
 | L_C：根链锁 | `(VIEW_LOCK_NS, ROOT_CHAIN_KEY)` | `extend_root_chain`、全局 rebuild |
-| L_V(F)：视图锁 | `(VIEW_LOCK_NS, view_key(F.pk))` | catch_up(F)、回收与单视图 rebuild |
+| L_V(F)：视图锁 | `(VIEW_FILTER_LOCK_NS, hash32(F.pk))` | catch_up(F)、回收与单视图 rebuild |
 | L_G：对象维护锁（新增，分共享与排他） | `(VIEW_LOCK_NS, OBJECT_GC_KEY)`；`cfg(test)` 下 d 取 `'object_gc'`（4.4） | 共享：catch_up 批事务、回收；排他：清扫、全局 rebuild |
 | L_R：注册准入锁 | `(VIEW_LOCK_NS, REGISTER_KEY)`；`cfg(test)` 下 d 取 `'register'`（4.4） | 6.5 的注册准入事务与重新预热准入事务 |
 
@@ -1251,7 +1254,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
 - **过滤器规模上限【决策】。** 以下上限都是代码常量，不进配置；超限返回 400，并指明超了哪一项。它们只约束注册：worker 与 6.1 第 3 层加载已有定义时不复查，所以日后调低常量不会让已注册的视图失效。
   - `filter_spec` 经 JSON 解码后不超过 16 KiB（UTF-8 字节）；该路由另设 `DefaultBodyLimit::max(64 KiB)`。【代码】storage-only 的 `/api/v1` 没有单独的请求体上限，沿用 axum 默认的 2 MiB；`snapshot_router.rs` 约 L62、L76 以 `JSON_REQUEST_LIMIT = 131_072` 收紧，是先例。
   - `:[` 的嵌套层数不超过 16。解析器在递归下降时计数，超限立即报错，早于规范化与 pull 计算。【推断】不设此限时，2 MiB 的 `:[:[:[…` 会让递归实现在 tokio 工作线程上栈溢出，进程直接中止。
-  - 规范化后，全部 Compose 的成员总数不超过 64，Exclude 选择器总数不超过 256，`k = |src_paths(F)|` 不超过 64。k 决定三处开销：逐源路径授权的次数（本节与 5.2 B0）、2.7 授权面复核的选择器数、P2 锁内的 1 + k 次候选查询（5.2 第 7 步）。成员数决定每个提交 O(深度 × 成员数) 的脊柱 tree（3.5）。
+  - 规范化后，全部 Compose 的成员总数不超过 64，Exclude 选择器总数不超过 256。注册期以 `k = 64` 有界物化全过滤器与每个 Compose 成员的最小源路径集：活动集合超过 k 时立即以 K 超限拒绝（`actual = 65` 是下界），不为求最终 `|src_paths(F)|` 而继续展开。完成这一步后，对每个 Compose 节点的逆过滤器成员以同一 k 有界物化输出路径；任一活动集合超限同样以 K 拒绝。两个坐标的受限物化都早于相交检查，先检查输出路径相交，再检查源路径相交。于是每个获准过滤器都满足 `|src_paths(F)| ≤ k`，但某些最终会归约到 k 以内的输入也会被保守拒绝。k 决定三处开销：逐源路径授权的次数（本节与 5.2 B0）、2.7 授权面复核的选择器数、P2 锁内的 1 + k 次候选查询（5.2 第 7 步）。成员数决定每个提交 O(深度 × 成员数) 的脊柱 tree（3.5）。
   - 这组数值在 P0 基准中复核：用顶到上限的过滤器测单提交投影耗时与脊柱 tree 数，结果写入 7.2；超出预算就下调常量。
 - **解析栈安全上限（HP-02）。** `parse` 与 §2.1「往返要求」第 3 项的加载复核受栈安全上限 `PARSE_MAX_NESTING = 64` 约束：`:[` 嵌套超过它的定义行复核为 `DefinitionCorrupt { failed: RoundTrip }`，不会让 worker 或协议处理线程栈溢出；它不是本节规模上限，不在注册时施加，经注册写入的定义嵌套不超过当时的 `REGISTER_MAX_NESTING`（当前 16），复核不会因它失败；它只能调高，且不得低于历次发布的 `REGISTER_MAX_NESTING` 最大值（当前 16），调低会让已注册的定义失效，与本节「日后调低常量不会让已注册的视图失效」相悖，只能按 §2.4 升到 `v2` 或强制重建受影响的视图。
 - **注册准入【决策】。** 跨副本的计数与预留放在同一个 Postgres 短事务中，用 L_R（4.6）串行化。处理顺序为：规范化与 2.2 校验 → 逐源路径鉴权 → 准入事务。鉴权在准入之前，因此未通过鉴权的请求不会消耗任何 token 的配额。
@@ -1263,7 +1266,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
     5. **名额。** 需要冷启动时，统计 `warming_since IS NOT NULL` 的行数，达到 `max_concurrent_cold_starts` 即拒绝。
     6. **写入。** 插入新过滤器行（`warming_since = now()`，`ON CONFLICT (filter_id) DO NOTHING`），或者对已回收的行置 `warming_since = now()`（P1 起，在同一语句中置 `last_access_at = now()`，见 4.6）；需要时插入 `mega_view` 新 version；计入速率时，插入一行 `mega_view_register_log`，并删除本 requester 窗口外的旧行。提交后发 4.4 的进程内信号。
     由读者访问触发的重新预热（4.6）只执行第 1、2、4、5、6 步，不计速率。
-  - **拒绝应答。** 第 3、4、5 步任一项不满足时，事务回滚，不写任何行，返回 429 加 `Retry-After`。速率超限时，取窗口内最早一行还要多久离开窗口；其余情形固定为 30 秒。【代码】`ApiError` 不携带响应头，注册接口要自行构造响应，参照 `lfs_media.rs::map_media_error`（约 L79–85）。
+  - **拒绝应答。** 第 3、4、5 步任一项不满足时，事务回滚，不写任何行，返回 429 加 `Retry-After`。速率超限时，取窗口内最早一行还要多久离开窗口，向上取整到秒，上限 3600 秒；其余情形固定为 30 秒。【代码】`ApiError` 不携带响应头，注册接口要自行构造响应，参照 `lfs_media.rs::map_media_error`（约 L79–85）。
   - **名额的释放与崩溃回收。** 名额记在数据库状态中，不是进程持有的租约，所以不需要心跳或 TTL。
     - 释放只有两处：视图首次就绪的那个 catch_up 批事务内清空 `warming_since`（4.4）；回收与 rebuild 时清空（4.6）。
     - 处理冷启动的副本崩溃时，名额与 `projected_seq` 都已持久化。任一副本的补偿任务都把 `warming_since` 非空的过滤器视为活跃视图，从已提交的水位接着做（4.4 触发方式第 2 条）。水位已到链尾、尚未就绪的过滤器同样是补偿候选（6.9），由下一次 catch_up 置就绪并释放名额。
@@ -1376,7 +1379,7 @@ P1 的清扫周期，以及闲置阈值 `idle_recycle_secs`（下界为 2T = 720
 | R5 投影滞后 | 只读视图是最终一致的 | 未就绪返回 503；有界同步追赶；补偿任务；指标 `view_projection_lag_commits` |
 | R6 表膨胀与 GC | 见 7.2 | 游程映射；注册上限；按 `last_access_at` 加引用不变式回收，带宽限期；可选不持久化提交字节 |
 | R7 根提交作者可读性差 | 产品写 API、review 合并、attach 的作者仍是 mega 身份 | 为 L0 写入者另立 ADR，不阻塞本设计 |
-| R8 与 Josh 的语义差异 | Compose 不相交判定偏保守；规范化不完备；签名默认删除，且同时删除 gpgsig-sha256；不移植 nop 恒等；L0 含空子树条目时，中间级空根规则无法复现 | 在文档中写明；对应的 Josh 用例改成负向测试，或者不移植 |
+| R8 与 Josh 的语义差异 | Compose 不相交判定偏保守；规范化不完备；签名默认删除，且同时删除 gpgsig-sha256；不移植 nop 恒等；L0 含空子树条目时，中间级空根规则无法复现；被重写的祖先 tree 不保留指向 EMPTY_TREE 的兄弟条目，Josh（`tree.rs::seed_entries`）原样保留 | 在文档中写明；对应的 Josh 用例改成负向测试，或者不移植 |
 | R9 越权写入（P2） | Exclude 逆运算、同名覆盖、值域外内容、import 命名空间、根级文件、root_dirs 白名单、源路径删除 | 2.5 的更正；可推送视图的约束；2.7 的三项校验；按每个源路径授权；默认不允许匿名推送 |
 | R10 推送后客户端分叉（P2） | 视图推送不能往返恒等 | sideband 对齐提示（ADR-TP-18）；可推送视图的 advertise 读到自己的写入；Libra 侧提示 reset |
 | R11 根链非线性或不连续 | 遗留数据、review 形态的根路径 CL 合并、根 ref 被人工回滚 | 只支持 trunk；建链和扩展时都校验，一旦发现就停下、返回 503 并告警；附录 E 留到 P2。合法的长滞后不算不连续：回走预算用尽只返回"未追上"，由暂存表续扫（3.3） |
@@ -1465,7 +1468,7 @@ P1 的清扫周期，以及闲置阈值 `idle_recycle_secs`（下界为 2T = 720
 
 **注册准入（P0）：**
   - 用两个连接模拟两个副本。在活跃过滤器数为 `max_filters − 1`、且名额只剩一个时，并发注册两个不同的新过滤器：恰好一个成功，另一个得到 429，且没有留下过滤器行、视图行或速率行。同一个新过滤器并发注册两次：只建一行，只占一个名额；
-  - 同一 token 在窗口内第 `register_rate_per_token + 1` 次产生新定义的注册得到 429，`Retry-After` 不超过窗口的剩余时间；幂等的重复注册不计数；不同 token 互不影响；
+  - 同一 token 在窗口内第 `register_rate_per_token + 1` 次产生新定义的注册得到 429，`Retry-After` 等于最早一行离开窗口的剩余时间向上取整到秒，不超过 3600 秒；幂等的重复注册不计数；不同 token 互不影响；
   - 冷启动进行中丢弃处理它的 worker，当前批不提交；另一个 worker 实例在同一 schema 上续做到就绪，名额在就绪的同一事务内释放；
   - 冷启动的最后一批：如果根链已覆盖 `main@/`，`projected_seq`、`ready_seq` 与 `warming_since` 在同一事务内更新，提交后不存在‘水位到链尾、`ready_seq` 为 NULL’的中间状态。如果最后一批时 `main@/` 已前进到根链之外，则不置就绪；根链扩展后，视图续追到就绪。另在测试中直接写出以下状态：`projected_seq` 等于链尾、`ready_seq` 为 NULL、`warming_since` 非空、`main@/` 等于链尾，此后不再推进根。只运行另一个 worker 实例的补偿任务，断言视图在一个周期内就绪并释放名额。
   - 4.2 前提校验失败的冷启动仍占用名额，并能由指标观测到；

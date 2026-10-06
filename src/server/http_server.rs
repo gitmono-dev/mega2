@@ -49,7 +49,12 @@ use crate::{
         },
     },
     jupiter::{
-        service::{artifact_service::ArtifactService, oci_service::DEFAULT_MAX_UPLOAD_CHUNK},
+        service::{
+            artifact_service::ArtifactService,
+            oci_service::DEFAULT_MAX_UPLOAD_CHUNK,
+            view_worker::{production_round, spawn_view_worker_with_round},
+        },
+        storage::Storage,
         utils::converter::FromMegaModel,
     },
     server::{CommonHttpOptions, trace_context},
@@ -365,6 +370,13 @@ fn spawn_artifact_gc_task(
     })))
 }
 
+fn spawn_view_worker_task(
+    storage: Storage,
+    token: CancellationToken,
+) -> Result<Option<JoinHandle<()>>, MegaError> {
+    spawn_view_worker_with_round(storage, token, production_round())
+}
+
 /// Returns a future that completes when the cancellation token is triggered.
 async fn shutdown_signal(token: CancellationToken) {
     token.cancelled().await;
@@ -434,6 +446,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
 
     // TP-15 / 4.1 ②③⑥: open CLs, last_policy vs non-terminal rows, watermark reset.
     ctx.storage.prepare_push_policy_startup().await?;
+    ctx.storage.check_view_reserved_startup().await?;
 
     // First-build the shared authorization snapshot before the listener binds
     // (UN-02). `off` is a no-op; a failed first build fails startup.
@@ -453,16 +466,18 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     })?;
 
     let middleware = tower::util::MapRequestLayer::new(rewrite_lfs_request_uri::<Body>);
-
-    let shutdown_token = CancellationToken::new();
-    let cleanup_handle = spawn_cleanup_task(ctx.clone(), shutdown_token.clone())?;
-    let artifact_gc_handle = spawn_artifact_gc_task(ctx.clone(), shutdown_token.clone())?;
-    let notification_shutdown = ctx.notification_shutdown.clone();
-    let server_token = shutdown_token.clone();
-
     let shutdown_context = ctx.clone();
     let app = app(ctx, host.clone(), port).await?;
     let app_with_middleware = middleware.layer(app);
+
+    let shutdown_token = CancellationToken::new();
+    let cleanup_handle = spawn_cleanup_task(shutdown_context.clone(), shutdown_token.clone())?;
+    let artifact_gc_handle =
+        spawn_artifact_gc_task(shutdown_context.clone(), shutdown_token.clone())?;
+    let view_worker_handle =
+        spawn_view_worker_task(shutdown_context.storage.clone(), shutdown_token.clone())?;
+    let notification_shutdown = shutdown_context.notification_shutdown.clone();
+    let server_token = shutdown_token.clone();
 
     tracing::info!(address = %addr, "HTTP server started up");
 
@@ -523,7 +538,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
         },
     };
 
-    let (cleanup_result, artifact_gc_result) = tokio::join!(
+    let (cleanup_result, artifact_gc_result, view_worker_result) = tokio::join!(
         async {
             if let Some(handle) = cleanup_handle {
                 match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
@@ -572,10 +587,33 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
             } else {
                 Ok(())
             }
+        },
+        async {
+            if let Some(handle) = view_worker_handle {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+                    Ok(Ok(_)) => {
+                        tracing::info!("view projection worker stopped successfully");
+                        Ok(())
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("view projection worker panicked: {}", e);
+                        Err(())
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "view projection worker did not stop within 30s timeout. The task will be detached."
+                        );
+                        Err(())
+                    }
+                }
+            } else {
+                Ok(())
+            }
         }
     );
 
-    let shutdown_failed = cleanup_result.is_err() || artifact_gc_result.is_err();
+    let shutdown_failed =
+        cleanup_result.is_err() || artifact_gc_result.is_err() || view_worker_result.is_err();
     match (shutdown_failed, &server_result) {
         (false, Ok(())) => {
             tracing::info!("Graceful shutdown completed successfully");
@@ -990,7 +1028,13 @@ async fn handle_smart_protocol(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -999,9 +1043,22 @@ mod tests {
     use crate::{
         api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
         ceres::api_service::cache::GitObjectCache,
+        config::{PushAuth, PushPolicy},
         contract::policy::entitystore::SharedEntityStore,
-        jupiter::storage::Storage,
+        jupiter::{
+            service::view_worker::{ViewWorkerRound, spawn_view_worker_with_round},
+            storage::Storage,
+            tests::test_storage_with_config,
+        },
     };
+
+    struct RoundDropFlag(Arc<AtomicBool>);
+
+    impl Drop for RoundDropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     fn dummy_api_state() -> MonoApiServiceState {
         MonoApiServiceState {
@@ -1088,6 +1145,68 @@ mod tests {
             origins,
             vec![HeaderValue::from_static("https://ok.example.com")]
         );
+    }
+
+    #[tokio::test]
+    async fn view_worker_spawned_only_when_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let disabled =
+            test_storage_with_config(temp.path(), isolated_config(temp.path().join("disabled")))
+                .await;
+        assert!(
+            spawn_view_worker_task(disabled, CancellationToken::new())
+                .unwrap()
+                .is_none()
+        );
+
+        let mut config = isolated_config(temp.path().join("enabled"));
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        config.git.push_auth = Some(PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        config.cedar.enforcement = "off".to_owned();
+        config.views.enabled = true;
+        assert!(config.validate().is_ok());
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let token = CancellationToken::new();
+        let worker = spawn_view_worker_task(storage.clone(), token.clone())
+            .unwrap()
+            .unwrap();
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started_round = started.clone();
+        let dropped_round = dropped.clone();
+        let round: ViewWorkerRound = Arc::new(move |_| {
+            let started = started_round.clone();
+            let dropped = dropped_round.clone();
+            Box::pin(async move {
+                let _flag = RoundDropFlag(dropped);
+                started.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<(), MegaError>>().await
+            })
+        });
+        let token = CancellationToken::new();
+        let worker = spawn_view_worker_with_round(storage, token.clone(), round)
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while started.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
     }
     use crate::config::{
         ArtifactGcConfig, BuckConfig, reload::ConfigHandle, testing::isolated_config,

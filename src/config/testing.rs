@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use super::{
     AgentCaptureConfig, ArtifactGcConfig, BlameConfig, CedarConfig, Config, DbConfig, GitConfig,
     LFSConfig, LFSLocalConfig, LFSSshConfig, LogConfig, MonoConfig, OciConfig, PackConfig,
-    PushPolicy, RedisConfig, StorageEventsConfig,
+    PushPolicy, RedisConfig, StorageEventsConfig, ViewsConfig,
     secret::{SecretRef, SecretResolver},
 };
 use crate::common::errors::MegaError;
@@ -203,6 +203,7 @@ impl TestConfigBuilder {
                 ..Default::default()
             },
             artifacts_gc: ArtifactGcConfig::default(),
+            views: ViewsConfig::default(),
             notification: None,
             vault: None,
             oauth: None,

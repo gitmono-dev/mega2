@@ -2,6 +2,7 @@
 //! classifier shared by path provisioning, product writes and receive-pack.
 
 use crate::{
+    ceres::view::VIEW_URL_RESERVED_NAMES,
     common::{
         errors::{ImportRepoError, PathPolicyError},
         utils::canonicalize_mono_ref_path,
@@ -33,6 +34,12 @@ pub fn classify_creation_path(
         return Err(invalid(
             canonical_path,
             "the monorepo root cannot be created",
+        ));
+    }
+    if has_view_reserved_first_component(canonical_path) {
+        return Err(invalid(
+            canonical_path,
+            "first path component is reserved for view URLs",
         ));
     }
     let first = canonical_path[1..].split('/').next().unwrap_or_default();
@@ -167,6 +174,12 @@ pub fn check_write_operands(
         let Some(path) = operand_path(operand) else {
             return Err(invalid(operand, "path must not contain '..' segments"));
         };
+        if has_view_reserved_first_component(&path) {
+            return Err(invalid(
+                &path,
+                "first path component is reserved for view URLs",
+            ));
+        }
         let blocked = in_import_namespace(config, &path)
             || (removal && path != "/" && is_import_dir_ancestor(config, &path));
         if blocked {
@@ -188,6 +201,15 @@ pub fn operand_path(operand: &str) -> Option<String> {
         }
     }
     Some(format!("/{}", components.join("/")))
+}
+
+fn has_view_reserved_first_component(path: &str) -> bool {
+    let first = path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    VIEW_URL_RESERVED_NAMES.contains(&first)
 }
 
 /// Component-level prefix match: `/a/b` is under `/a`, `/ab` is not.
@@ -345,6 +367,46 @@ mod tests {
         assert_eq!(operand_path("a//b/./c/"), Some("/a/b/c".to_owned()));
         assert_eq!(operand_path(""), Some("/".to_owned()));
         assert_eq!(operand_path("/a/../b"), None);
+    }
+
+    #[test]
+    fn view_reserved_creation_rejected() {
+        let declared = config(
+            &[
+                ".view", ".filter", ".viewer", ".filters", ".View", "project",
+            ],
+            "/project/vendor",
+        );
+        let undeclared = config(&["project"], "/project/vendor");
+        for path in ["/.view", "/.view/a", "/.filter", "/.filter/x/y"] {
+            assert_invalid(classify_creation_path(&declared, path), path);
+            assert_invalid(classify_creation_path(&undeclared, path), path);
+        }
+        for path in ["/.viewer/a", "/.filters/x", "/.View/a", "/project/.view"] {
+            classify_creation_path(&declared, path)
+                .unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+    }
+
+    #[test]
+    fn view_reserved_write_rejected() {
+        let config = config(&["project"], "/project/vendor");
+        for (written, removed) in [
+            (vec!["/.view/a"], vec![]),
+            (vec![".filter/x"], vec![]),
+            (vec![], vec!["/.view"]),
+        ] {
+            assert_invalid(
+                check_write_operands(&config, &written, &removed),
+                "reserved operand",
+            );
+        }
+        check_write_operands(
+            &config,
+            &["/project/.view/a", "/.viewer", "/.filters/x", "/.View/a"],
+            &[],
+        )
+        .expect("near-match and non-leading segments must remain valid");
     }
 
     #[test]

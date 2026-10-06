@@ -29,6 +29,10 @@ pub struct Config {
     /// (`docs/artifacts-protocol.md` §10.6).
     #[serde(default)]
     pub artifacts_gc: ArtifactGcConfig,
+    /// View projection configuration. The P0 surface remains disabled until an
+    /// operator explicitly enables it on a trunk, sha1 deployment.
+    #[serde(default)]
+    pub views: ViewsConfig,
     /// Global notification subsystem settings (kill switch, defaults). Per-user
     /// preferences still live in the DB; this is the global layer
     /// (docs/notification.md phase 5).
@@ -516,6 +520,81 @@ impl Default for ArtifactGcConfig {
             interval_secs: default_artifacts_gc_interval_secs(),
             grace_secs: default_artifacts_gc_grace_secs(),
             batch_limit: default_artifacts_gc_batch_limit(),
+        }
+    }
+}
+
+/// P0 configuration for deterministic history projections.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ViewsConfig {
+    #[serde(default = "default_views_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_views_worker_interval_secs")]
+    pub worker_interval_secs: u64,
+    #[serde(default = "default_views_batch_size")]
+    pub batch_size: u64,
+    #[serde(default = "default_views_max_append_walk")]
+    pub max_append_walk: u64,
+    #[serde(default = "default_views_sync_catch_up_commits")]
+    pub sync_catch_up_commits: u64,
+    #[serde(default = "default_views_max_filters")]
+    pub max_filters: u64,
+    #[serde(default = "default_views_max_concurrent_cold_starts")]
+    pub max_concurrent_cold_starts: u64,
+    #[serde(default = "default_views_register_rate_per_token")]
+    pub register_rate_per_token: u64,
+    #[serde(default = "default_views_allow_anonymous_register")]
+    pub allow_anonymous_register: bool,
+}
+
+fn default_views_enabled() -> bool {
+    false
+}
+
+fn default_views_worker_interval_secs() -> u64 {
+    10
+}
+
+fn default_views_batch_size() -> u64 {
+    1_000
+}
+
+fn default_views_max_append_walk() -> u64 {
+    1_000
+}
+
+fn default_views_sync_catch_up_commits() -> u64 {
+    64
+}
+
+fn default_views_max_filters() -> u64 {
+    100
+}
+
+fn default_views_max_concurrent_cold_starts() -> u64 {
+    2
+}
+
+fn default_views_register_rate_per_token() -> u64 {
+    10
+}
+
+fn default_views_allow_anonymous_register() -> bool {
+    false
+}
+
+impl Default for ViewsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_views_enabled(),
+            worker_interval_secs: default_views_worker_interval_secs(),
+            batch_size: default_views_batch_size(),
+            max_append_walk: default_views_max_append_walk(),
+            sync_catch_up_commits: default_views_sync_catch_up_commits(),
+            max_filters: default_views_max_filters(),
+            max_concurrent_cold_starts: default_views_max_concurrent_cold_starts(),
+            register_rate_per_token: default_views_register_rate_per_token(),
+            allow_anonymous_register: default_views_allow_anonymous_register(),
         }
     }
 }
