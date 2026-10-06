@@ -148,6 +148,29 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 
 迁移模块内 `#[cfg(test)]` 覆盖四条：`up` 建唯一索引且 `down` 删除、重复数据使 `up` 带完整冲突清单失败且行数不变、并发插入在迁移事务提交前被锁阻塞（提交后被唯一索引拒绝）、`SET LOCAL enable_seqscan = off` 下 `EXPLAIN` 的计划命中新索引名。`get_cl` 的按 link 回归在 `src/jupiter/storage/cl_storage.rs` 内。
 
+## 迁移覆盖：视图表（HP-09）
+
+`m20261006_000100_add_view_tables` 按顺序创建八张无外键的表：
+`mega_view_filter`、`mega_view`、`mega_view_root_chain`、
+`mega_view_root_chain_scan`、`mega_view_commit_map`、`mega_view_object`、
+`mega_view_object_ref` 与 `mega_view_register_log`。最后一张表及其
+`(requester, created_at)` 索引位于迁移的最后一组语句，确保故障注入能
+验证整个迁移的事务边界。
+
+恢复是 forward-only。运行期只有 `up` 与开发用的 `refresh`，`down` 是空实现；
+已发布的 DDL 问题必须用后续迁移前滚修复。升级时服务启动会自动执行待处理
+迁移；未启用视图的部署会保留这八张空表。
+
+`jupiter::migration::tests` 中的
+`view_tables_match_design_schema`、`view_tables_have_no_foreign_keys`、
+`view_tables_migration_up_replays_over_existing_schema`、
+`view_tables_leave_existing_schema_unchanged`、`view_entities_round_trip` 和
+`view_tables_migration_rolls_back_and_recovers` 覆盖完整列、可空性、默认值与
+索引集合；没有外键；对已有 schema 重放 `up` 的空操作；新迁移不改变既有
+schema；八个 SeaORM 实体各写入后按主键读回；以及预建同名
+`mega_view_register_log` view 使最终索引失败时，八张表和迁移记录全部回滚，
+移除冲突对象后可直接重跑。
+
 ## 迁移覆盖：`merge_queue.requester` nullable 列（UN-18）
 
 **历史表。** [`plan-20260910.md`](../plan/plan-20260910.md) MW-05 已 `DROP TABLE merge_queue`；下列描述 UN-18 当时的加列迁移，不再是现行 schema。
