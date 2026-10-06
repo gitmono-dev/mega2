@@ -300,6 +300,12 @@ pub(super) struct ChunkMapQuery {
     pub(super) expected_digest: Option<String>,
     #[serde(default)]
     pub(super) page: Option<String>,
+    /// Canonical v3 page requests bind the page to the already verified map
+    /// instead of repeating the file digest.
+    #[serde(default)]
+    pub(super) map_id: Option<String>,
+    #[serde(default)]
+    pub(super) page_index: Option<String>,
 }
 
 /// Project a fixed-path file into its range-readable representation.
@@ -358,17 +364,23 @@ pub(super) async fn chunk_map(
         q.expected_digest.as_deref(),
     )
     .await?;
+    // Canonical v3 uses a closed top-level envelope and a nested map
+    // descriptor.  Keeping the map under `map` is part of profile selection;
+    // the client rejects the legacy flat shape once canonical capabilities
+    // have been advertised.
     let body = json!({
         "snapshot_id": snapshot_id,
         "path": q.path,
-        "schema_version": 2,
-        "file_content_id": format!("sha256:{}", hex_of(&proj.map.file_content_id)),
-        "file_size": proj.map.file_size.to_string(),
-        "chunk_size": mst2_codec::chunkmap::CHUNK_SIZE,
-        "chunk_count": proj.map.chunk_count.to_string(),
-        "page_count": proj.map.page_count.to_string(),
-        "pages_root": format!("sha256:{}", hex_of(&proj.map.pages_root)),
-        "map_id": format!("sha256:{}", hex_of(&proj.map_id)),
+        "map": {
+            "schema_version": 2,
+            "file_content_id": format!("sha256:{}", hex_of(&proj.map.file_content_id)),
+            "file_size": proj.map.file_size.to_string(),
+            "chunk_size": mst2_codec::chunkmap::CHUNK_SIZE,
+            "chunk_count": proj.map.chunk_count.to_string(),
+            "page_count": proj.map.page_count.to_string(),
+            "pages_root": format!("sha256:{}", hex_of(&proj.map.pages_root)),
+            "map_id": format!("sha256:{}", hex_of(&proj.map_id)),
+        },
     });
     Ok(Json(body).into_response())
 }
@@ -384,10 +396,25 @@ pub(super) async fn chunk_map_pages(
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
     validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
-    let page_index: u64 = match q.page.as_deref() {
-        Some(s) => parse_decimal_count(s, "page").map_err(mst2_error_response)?,
-        None => 0,
+    // Canonical v3 uses `map_id` + `page_index`; retain parsing of the old
+    // names only while the legacy client is still present in this checkout.
+    let page_index: u64 = match (q.page_index.as_deref(), q.page.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                "page_index and page are mutually exclusive",
+            )));
+        }
+        (Some(s), None) => parse_decimal_count(s, "page_index").map_err(mst2_error_response)?,
+        (None, Some(s)) => parse_decimal_count(s, "page").map_err(mst2_error_response)?,
+        (None, None) => 0,
     };
+    if q.page_index.is_some() != q.map_id.is_some() {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            "canonical page requests require map_id and page_index together",
+        )));
+    }
     let handler = state
         .api_handler(std::path::Path::new("/"))
         .await
@@ -405,6 +432,15 @@ pub(super) async fn chunk_map_pages(
         q.expected_digest.as_deref(),
     )
     .await?;
+    if let Some(expected_map) = q.map_id.as_deref() {
+        let actual_map = format!("sha256:{}", hex_of(&proj.map_id));
+        if expected_map != actual_map {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "chunk-map page map_id does not bind to the fixed file",
+            )));
+        }
+    }
     let (leaf, proof) = proj
         .leaf_and_proof(page_index)
         .map_err(mst2_error_response)?;
@@ -424,16 +460,13 @@ pub(super) async fn chunk_map_pages(
             })
         })
         .collect();
+    // Canonical v3 page responses are closed and carry the encoded leaf
+    // directly.  The map descriptor already authenticated page_count and the
+    // client verifies this page_index against that fixed descriptor.
     let body = json!({
-        "snapshot_id": snapshot_id,
-        "path": q.path,
         "map_id": format!("sha256:{}", hex_of(&proj.map_id)),
-        "page_count": proj.map.page_count.to_string(),
-        "leaf": {
-            "page_index": leaf.page_index.to_string(),
-            "count": leaf.chunk_sha256.len().to_string(),
-            "data_base64": base64_of(&leaf_bytes),
-        },
+        "page_index": leaf.page_index.to_string(),
+        "leaf_base64": base64_of(&leaf_bytes),
         "proof": proof_json,
     });
     Ok(Json(body).into_response())
