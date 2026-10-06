@@ -437,3 +437,67 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profil
 ```
 
 已登记 case：`LIBRA clone HTTP`、`LIBRA fetch HTTP`、`LIBRA ls-remote HTTP`、`LIBRA trunk push HTTP`、`LIBRA multi-commit push HTTP`、`LIBRA reject unauthenticated push`、`LIBRA reject tag push`、`LIBRA reject non-main branch push`、`LIBRA clone SSH`、`LIBRA reject SSH push`、`LIBRA LFS push and clone`、`LIBRA browser list root`、`LIBRA browser list at ref`、`LIBRA browser unknown path`、`LIBRA browser list text`、`LIBRA browser create dir`、`LIBRA browser delete dir`、`LIBRA browser move dir`、`LIBRA browser rename dir`、`LIBRA browser list tags`、`LIBRA browser tags page two`、`LIBRA browser create lightweight tag`、`LIBRA browser create annotated tag`、`LIBRA browser delete tag`。HTTP clone case 在 `/project` 写入带 `RUN_ID` 的种子文件，并用只读 Git clone 对照 Libra 克隆的文件 SHA-256；fetch case 在克隆后新增服务端文件，以只读 Git `ls-remote` 对照 Libra 的 `origin/main`；ls-remote case 对照两个客户端读取的 `refs/heads/main` OID；trunk push case 通过 stdin 在隔离 HOME 中配置加密存储的环回 HTTP token，再用不含凭据的 `origin` 推送一个 Libra commit，由只读 Git 观察者验证 tip 与文件内容；multi-commit push case 一次推送三个连续 Libra commit，并由 Git 观察者核对三个文件内容；无凭据推送 case 使用全新 HOME 和 Libra 配置库，确认认证拒绝且 Git 观察者所见的远端 tip 不变；tag push case 使用隔离凭据推送唯一标注 tag，检查服务端明确拒绝且 Git 观察者未见远端 tag；非 main 推送 case 用本地 `main` 作为来源尝试写入唯一远端分支，检查服务端 trunk 拒绝且 Git 观察者未见远端分支；SSH clone case 用隔离 known_hosts 严格校验环回 SSH 主机，比较 Libra SSH clone 与只读 Git HTTP 观察者的 `/project` tip 和种子文件 SHA-256。当前 Libra SSH 客户端从 URL 路径去掉首个斜杠，因此 SSH URL 使用 `ssh://git@127.0.0.1:2222//project`，使服务端收到绝对路径 `/project`。为兼容已有 LFS 指针的仓库，该 case 先通过 SSH `--no-checkout` 拉取 Git 对象，再临时把 origin 指向同一 `/project` 的 HTTP LFS 端点检出工作区，核对后恢复 SSH origin。SSH push case 在已验证的 SSH 克隆中提交新文件，要求 Libra 推送非零退出、隔离 SSH stderr 含服务端关闭 receive-pack 的明确拒绝，且只读 Git 观察者看到的远端 tip 不变。LFS case 跟踪 `*.bin`，在隔离 clone 中经 `commit -a` 生成 1 MiB 对象并推送，以只读 Git 观察者确认远端 LFS pointer 的 OID 与大小，再用全新 Libra clone 核对 SHA-256；默认栈的 upload action 给出 `Content-Length`，RustFS presigned PUT 可直接使用。browser root case 在非 TTY 中比较 Libra JSON 的 `items[].name` 与 HTTP `/api/v1/tree?path=/` 的名称集合。browser ref case 先创建根标签并记录 `/project` 历史列表，再在 main 写入唯一文件，确认 `--ref <tag>` 的列表保持不变而当前列表包含该文件；完成后尽力删除临时根标签。browser unknown-path case 注入仅供泄漏检测的哨兵环境 token，要求命令非零退出、stderr 为含 HTTP 404 的 `LBR-NET-002` JSON、stdout 为空，并确认 stdout 与 stderr 都不含该 token。browser list-text case 先用 0600 header 文件在 `/project` 创建唯一目录，再在非 TTY 中要求 stdout 含精确 `dir  <NAME>` 行、不是 JSON 且 stderr 为空，并以匿名 tree API 的 `content_type=directory` 核对同名目录。browser create-dir case 用 0600 token 文件执行一次 JSON 写操作，核对完整 target 与非空 receipt，再以不带 token 的匿名 tree API 确认同名目录及其类型。browser delete-dir case 用 curl 创建并匿名确认唯一目录，再用 0600 token 文件执行 JSON 删除操作，核对完整 target 与非空 receipt，并以匿名 tree API 确认同名条目消失。browser move-dir case 用 curl 创建并匿名确认唯一源目录与目标父目录，再用 0600 token 文件执行 JSON 移动操作，核对完整 from/to target 与非空 receipt，并从源、目标两侧匿名确认移动结果。browser rename-dir case 用 curl 创建并匿名确认旧名目录且新名不存在，再用 0600 token 文件执行 JSON 改名操作，核对共享父目录的完整 from/to target 与非空 receipt，并匿名确认旧名消失、新名目录出现。browser list-tags case 用 curl 创建唯一 annotated root tag，再分别通过无凭据 Libra JSON 与匿名 HTTP API 查询第一页两个 tag，逐序比较名称与总数，最后删除夹具 tag。browser tags-page-two case 用 curl 创建两个唯一 annotated root tag，再比较 Libra 与匿名 HTTP API 的第二页单条结果和总数，同时确认 HTTP 第一、二页名称不同，最后删除两个夹具 tag。browser create-lightweight-tag case 以只读 Git 记录 root HEAD，用 0600 token-file 经 Libra 创建轻量 root tag，再以匿名 tag GET 确认 tag_id 和 object_id 均为该 HEAD，随后删除夹具并扫描 token。browser create-annotated-tag case 以只读 Git 记录 root HEAD，用 0600 token-file 经 Libra 创建带 message 的 annotated root tag，再以匿名 tag GET 确认 message、object_id 与 HEAD 一致且 tag_id 不同，随后删除夹具并扫描 token。browser delete-tag case 经 curl 创建并匿名确认唯一 annotated root tag，再用 0600 token-file 经 Libra 删除，核对删除 receipt 和匿名 GET 404；失败时清理夹具。客户端工作目录运行后清理。点名尚未登记的 case 退出 2。
+
+## 13. 视图运维（P0）
+
+本节的三段 SQL 只用于停服窗口。执行前先停掉全部 mega2 进程，包括 HTTP 与 SSH 服务。这些 SQL 不获取视图锁或根链锁，在线执行会与 worker 的批事务交错；不停服的在线回收与 rebuild 仍由 `DEFER-HP-04` 承接。SQL 使用的连接串必须与 mega2 的 `[database].db_url` 相同，或者使用覆盖它的 `MEGA_DATABASE__DB_URL`，并保留其中的 `search_path`。表名没有 schema 限定，连接到其他 `search_path` 不会操作 mega2 实际使用的表。
+
+把每段代码块保存到文件后，用下面的方式执行；必须带 `ON_ERROR_STOP=1`：
+
+```bash
+psql "<数据库连接串>" -v ON_ERROR_STOP=1 -f <文件>
+```
+
+三个标记行是稳定接口，本节的用例和 HP-25 的 `scripts/libra_view_smoke_setup.sh` 都按标记提取 SQL。回收单个过滤器时，填写停止告警中 `filter_id` 字段的值。
+
+```sql
+-- view-ops: recycle-filter
+BEGIN;
+DELETE FROM mega_view_commit_map
+WHERE filter_pk = (SELECT id FROM mega_view_filter WHERE filter_id = '<filter_id>');
+DELETE FROM mega_view_object_ref
+WHERE filter_pk = (SELECT id FROM mega_view_filter WHERE filter_id = '<filter_id>');
+UPDATE mega_view_filter
+SET projected_seq = 0,
+    ready_seq = NULL,
+    warming_since = NULL
+WHERE filter_id = '<filter_id>';
+COMMIT;
+```
+
+```sql
+-- view-ops: rebuild-all
+BEGIN;
+DELETE FROM mega_view_root_chain;
+DELETE FROM mega_view_root_chain_scan;
+DELETE FROM mega_view_commit_map;
+DELETE FROM mega_view_object;
+DELETE FROM mega_view_object_ref;
+UPDATE mega_view_filter
+SET projected_seq = 0,
+    ready_seq = NULL,
+    warming_since = NULL;
+COMMIT;
+```
+
+```sql
+-- view-ops: clear-root-chain-scan
+DELETE FROM mega_view_root_chain_scan;
+```
+
+`recycle-filter` 与 `rebuild-all` 都有显式事务。`COMMIT` 之前的语句失败时，psql 会停止并断开连接，事务不会提交。recycle-filter 只回收目标过滤器的派生提交映射与对象引用，保留对象以供后续清扫；rebuild-all 清掉全部派生状态。两者把过滤器置为回收态：`projected_seq = 0`，且 `ready_seq`、`warming_since` 为 NULL。worker 只为活跃视图（`ready_seq` 或 `warming_since` 非空）执行 catch_up，因此回收态视图会等待重新预热。clear-root-chain-scan 只清暂存表，不改视图状态；下一次根链扩展会按当前的 `main@/` 重新判定。
+
+三段 SQL 都不用 `TRUNCATE`，不删除 `mega_view_filter`、`mega_view` 或 `mega_view_register_log`，也不改 `last_access_at` 与过滤器定义列。rebuild-all 是全表 `DELETE`，停服窗口随派生行数增长。恢复出口的具体操作由 HP-21 补写，本节不表示任何视图 URL 已可用。
+
+投影停止时，首个失败点会以 ERROR 事件给出。除 message 外，停止告警字段为 `metric=view_projection_stops_total`、`filter_id`、`s`、`commit_id`、`reason`；当 reason 是 `row_absent` 或 `unparsable` 时还带 `tree_id`。例如：`metric=view_projection_stops_total s=7 reason=row_absent`。按 reason 处理：
+
+- `premise_check_failed`：等待 L0 修复（`DEP-HP-05`）。在修复前重新预热仍会停在同一位置；若需释放冷启动名额，可用告警的 filter_id 执行 recycle-filter。
+- `row_absent`：补回 tree_id 指向的 `mega_tree` 行；之后自动从 s 续追。
+- `unparsable`：把 tree_id 指向的行恢复为原字节；之后自动续追。
+- `commit_row_missing`：补回 commit_id 指向的 `mega_commit` 行；之后自动续追。
+
+批前提不成立的信号是 `metric=view_batch_premise_failures_total` 的 ERROR 事件，字段为 `filter_id`、`s0`、`tip`、`batch_size`。它计入 `view_batch_premise_failures_total`，不计入 `view_projection_stops_total`，也不发停止告警。`batch_size` 受配置校验限制为 1..=10000；按根链表出现空洞处理，使用 rebuild-all。
+
+根链首次判为不连续时会发出带 `reason` 与 `commit_id` 的 ERROR 事件，没有 metric 字段。证据是 `mega_view_root_chain_scan` 中 pos 最大的一行：若 `main@/` 已恢复为链尾后代，使用 clear-root-chain-scan；否则使用 rebuild-all，并公告视图历史可能改变。
+
+P0 不提供设计 §4.2 的根链审计 SQL：审计需要逐项复算 SHA-1，Postgres 没有内置 sha1，本仓没有 pgcrypto 迁移。带 review 形态历史的部署在启用视图前需要这项审计；P0 只能依靠停止告警发现首个失败点。完整审计由 `DEFER-HP-04` 的 `mega2 view status` 承接。
