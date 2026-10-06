@@ -55,7 +55,7 @@ See the [Deployment Guide](./deployment.md) for token setup, credential injectio
 
 This section is the single authoritative description of creating a new path in the monorepo; the Quick Start, the README and the initialization manual link here.
 
-**Allowed roots.** The first-level directories listed in `[monorepo].root_dirs` (values in [`config/config.toml`](../config/config.toml), shape rules in the [Configuration Guide](./configuration.md)) are the allow-list for creating paths: a new path can only be created under one of them. Paths under `import_dir` (default `/third-party`) are ImportRepos (see §1); a Git push creates them directly and this section does not apply; §2.6 covers their updates and removal. Adding a first-level root requires a config change and a restart; the new root is then still missing from the root tree, and only a push that adds commits on top of existing history can create it, because provisioning and product writes never land at `/`.
+**Allowed roots.** The first-level directories listed in `[monorepo].root_dirs` (values in [`config/config.toml`](../config/config.toml), shape rules in the [Configuration Guide](./configuration.md)) are the allow-list for creating paths: a new path can only be created under one of them; `.view` and `.filter` are exact-case reserved names and cannot be first-level directories. Paths under `import_dir` (default `/third-party`) are ImportRepos (see §1); a Git push creates them directly and this section does not apply; §2.6 covers their updates and removal. Adding a first-level root requires a config change and a restart; the new root is then still missing from the root tree, and only a push that adds commits on top of existing history can create it, because provisioning and product writes never land at `/`.
 
 **First push to a new path.** If the path already exists (it was pushed, provisioned or written through the API), push as described in §2.1. If it does not exist yet, trunk mode handles the push as follows; both path-policy rejections in the table stay the same on a verbatim retry:
 
@@ -78,7 +78,7 @@ After provisioning, `git clone <URL><PATH>`, commit on top and push. Product wri
 
 - `MONO_PATH_NOT_ALLOWED`: use a path under an allowed root (provisioning, and product writes where no ImportRepo is live, also return it for paths under `import_dir`).
 - `MONO_PATH_UNINITIALIZED`: provision the path first.
-- `MONO_PATH_INVALID`: use a canonical path (absolute, no `.` / `..`, repeated or trailing `/`).
+- `MONO_PATH_INVALID`: use a canonical path (absolute, no `.` / `..`, repeated or trailing `/`); a path beginning with `.view` or `.filter` also receives this code from provisioning, product writes, and trunk pushes that create the path.
 - `MONO_PATH_CONFLICT`: a component of the path is a file; choose another path (returned only by provisioning, through the API or the CLI).
 
 ### 2.6 ImportRepo lifecycle

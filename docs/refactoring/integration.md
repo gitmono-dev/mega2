@@ -148,6 +148,294 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 
 迁移模块内 `#[cfg(test)]` 覆盖四条：`up` 建唯一索引且 `down` 删除、重复数据使 `up` 带完整冲突清单失败且行数不变、并发插入在迁移事务提交前被锁阻塞（提交后被唯一索引拒绝）、`SET LOCAL enable_seqscan = off` 下 `EXPLAIN` 的计划命中新索引名。`get_cl` 的按 link 回归在 `src/jupiter/storage/cl_storage.rs` 内。
 
+## 迁移覆盖：视图表（HP-09）
+
+`m20261006_000100_add_view_tables` 按顺序创建八张无外键的表：
+`mega_view_filter`、`mega_view`、`mega_view_root_chain`、
+`mega_view_root_chain_scan`、`mega_view_commit_map`、`mega_view_object`、
+`mega_view_object_ref` 与 `mega_view_register_log`。最后一张表及其
+`(requester, created_at)` 索引位于迁移的最后一组语句，确保故障注入能
+验证整个迁移的事务边界。
+
+恢复是 forward-only。运行期只有 `up` 与开发用的 `refresh`，`down` 是空实现；
+已发布的 DDL 问题必须用后续迁移前滚修复。升级时服务启动会自动执行待处理
+迁移；未启用视图的部署会保留这八张空表。
+
+`jupiter::migration::tests` 中的
+`view_tables_match_design_schema`、`view_tables_have_no_foreign_keys`、
+`view_tables_migration_up_replays_over_existing_schema`、
+`view_tables_leave_existing_schema_unchanged`、`view_entities_round_trip` 和
+`view_tables_migration_rolls_back_and_recovers` 覆盖完整列、可空性、默认值与
+索引集合；没有外键；对已有 schema 重放 `up` 的空操作；新迁移不改变既有
+schema；八个 SeaORM 实体各写入后按主键读回；以及预建同名
+`mega_view_register_log` view 使最终索引失败时，八张表和迁移记录全部回滚，
+移除冲突对象后可直接重跑。
+
+## DB 模块覆盖：视图根链（HP-10）
+
+`ViewStorage::extend_root_chain(budget, batch_size, lock_mode)` 在短事务中持有
+根链锁 L_C，返回 `CaughtUp`、`NotCaughtUp` 或 `RolledBack`、`Forked`、
+`UnrelatedHistory`、`MultiParent`、`MissingFirstParent`、`RowConflict` 六种不连续原因。扫描提交的首父链
+先落入 `mega_view_root_chain_scan`，再按 `seq` 递增分段写入
+`mega_view_root_chain`；每段把插入和锚点切换放在同一个事务中。预算同时计算暂存
+写入与根链插入，每批回走和每段接入都按剩余预算截断；锚点判定不写行，也不耗
+预算。耗尽时保留锚点供下次继续。`insert_segment` 在调用方的段事务内
+执行；主键冲突核对失败时，调用方回滚整个段，因此不会留下该段已先插入的部分行。
+不连续事务不改根链表，同一调用先前已经提交的段保持有效。
+
+锁键使用 `VIEW_LOCK_NS`、`VIEW_FILTER_LOCK_NS`、`ROOT_CHAIN_KEY`、
+`OBJECT_GC_KEY` 与 `REGISTER_KEY`；段上限是
+`ROOT_CHAIN_SEGMENT_ROWS = 10_000`。`hash32(x) = ((x as u64) ^ ((x as u64) >> 32)) as u32 as i32`
+折叠 64 位 id 的高低两半。
+测试 schema 把第二键映射为 `hashtext(current_schema() || ':' || d)`，使并行 schema
+不相互阻塞。`Blocking` 模式以绑定的 `set_config('lock_timeout', $1, true)` 设置
+`VIEW_LOCK_TIMEOUT`（两秒）等待上限；超时按 SQLSTATE `55P03` 返回未追上，取消等
+其他数据库错误原样上抛。返回 `Ok(false)` 的事务已经 aborted，调用方只能回滚；
+成功设置的 `lock_timeout` 一直持续到事务结束。取锁语句由 `view_lock_stmt_prod` 与
+`view_lock_stmt_test` 单独拼装，语句本身不带 `lock_timeout`；需要不限时等待的调用方
+可直接执行 `Blocking` 语句。
+
+`ViewStorage` 聚合在 `AppService` 中，访问器返回克隆而不新建实例，以便同一进程
+共享告警记录。它的 `base` 字段保持私有；同级实现经 `Deref<Target = BaseStorage>`
+取得连接。`view_test_fixtures` 以 `pub(crate)` 提供参数绑定的路径到 blob 字节和
+预构造 tree 列表、线性/多父/首父缺失/无关根历史，以及可回退的 root `main` CAS
+夹具；它写入 tree 层、返回 blobs，但不写 blob。
+
+六个 lib 用例分别覆盖：线性冷启动和增量；预算耗尽后的续接及回走中途重启；分段
+锚点、每段后的重启、两个连接池按 Try/Blocking 换手，以及扫描期间 `main@/` 前进；
+五类根历史不连续、三种 `insert_segment` 既有行输入和第二段冲突；不成功的
+Try/Blocking/取消等锁；以及全部锁键与同 schema 的两两隔离。
+不连续事件仅从 `view_root_chain` 发出，带 `reason` 与 `commit_id`，按进程中的
+`(reason, commit_id)` 去重，并在 `CaughtUp` 后清除记录。带数据库的事件捕获在
+单线程 Tokio 测试中安装按该模块 target 过滤的线程局部 subscriber，同时持有第二个
+`tracing::Dispatch`，避免并行测试首次命中 callsite 时缓存 no-op interest。取消等锁
+用持锁事务之外的自动提交查询在一秒内轮询 `pg_stat_activity`；事务快照不会看到之后
+才出现的等待者。代码审查点是根链只按 `seq` 递增插入，绝不以 `max(seq)+1` 追加单行。
+
+## DB 模块覆盖：视图注册准入（HP-13）
+
+`ViewStorage::admit(req, limits)` 在一个短事务中实现注册准入。`Register` 按
+`filter_id` 查找定义，`Rewarm` 按主键查找；不存在的 Rewarm 返回
+`MegaError::NotFound`。两种模式都在定义新建或处于回收态时判定冷启动，依次检查
+活跃过滤器总数和冷启动名额。命名 Register 只读取该 name 的最新
+`(version, filter_pk)`：同一活跃定义且不需新版本时返回 `Idempotent`，其余成功
+请求返回 `Admitted`；`version` 是请求 name 的最终最新版本（无 name 时为
+`None`），`ready` 是第 2 步读到的 `ready_seq` 是否非空。第 3 步的速率窗口和
+`mega_view_register_log` 读写由 HP-31 接入，本卡不读写该表。
+
+`AdmitRequest`、`AdmitMode`、`FilterDefinition`、`AdmitLimits`、
+`AdmitOutcome` 与 `RejectReason` 都限定在 storage crate 内。限额仅来自调用方传入的
+`AdmitLimits`：HP-13 的 `max_filters` 与 `max_concurrent_cold_starts`，以及 HP-31
+追加的 `register_rate_per_token` 都由 `From<&ViewsConfig>` 读取；准入自身不读取
+`Storage` 的配置快照。总数与名额拒绝返回
+`Rejected { reason, retry_after: 30 秒 }` 并回滚；幂等命中没有写入。新过滤器以
+`ON CONFLICT (filter_id) DO NOTHING RETURNING` 写入，若 L_R 以外的写入方在查询后
+抢先提交，SeaORM 的零返回行会规范为
+`MegaError::Db(DbErr::RecordNotInserted)`，事务回滚，绝不会用未插入的 id 创建
+`mega_view`。
+
+第 1 步直接执行 `admit_lock_stmt(cfg!(test))` 返回的 HP-10
+`view_lock_stmt_prod` 或 `view_lock_stmt_test` 的 `ViewLock::Register`、`Blocking`
+语句。该纯函数只负责委托拼装；准入不调用 `acquire_view_lock`，因为后者会设置两秒
+`lock_timeout`，而设计 §6.5 要求 L_R 不限时等待。事务不取得其他视图锁，也不重写
+§4.4 的锁键方案。
+
+七个 lib 用例覆盖 `concurrent_last_slot`、`same_filter_concurrent`、
+`rejection_and_idempotent_hit`、`checks_follow_design`、`cold_start_marks_warming`、
+`named_register_versions` 与 `limits_follow_reload`。并发用例用 `test_db_config` 和
+`database_connection` 建同一 schema 的多个连接池，由第三个连接的未提交事务持有
+L_R，并轮询确认两个准入正在等待再释放；轮询失败分支会显式回滚 H，每轮的
+`tokio::join!` 外包 30 秒超时，延时轮分别确认两个请求都在释放 L_R 后才返回，因而等待
+超过通常锁超时仍可成功。其余用例直接构造就绪、预热、部分投影和回收态行，以三表 JSON
+快照验证拒绝、幂等、Rewarm 与错误都不写行；改名列注入第 6 步写失败，并让 L_R 外部
+未提交的同键插入与准入经 `tokio::join!` 在 30 秒内运行，在观测到 transactionid 等待后
+提交；观测失败先显式回滚写入事务，验证零行冲突回滚。
+
+## DB 模块覆盖：视图注册速率窗口（HP-31）
+
+`AdmitLimits` 从调用方的配置快照额外携带
+`register_rate_per_token`，`RejectReason::Rate` 表示按 requester 的速率拒绝。
+`ViewStorage::admit` 在 Register 的幂等判定之后、总数和冷启动名额之前，以同一短事务
+读取 requester 在 `REGISTER_RATE_WINDOW_SECS`（3600 秒）内的注册行数和最早一行的
+离窗秒数。达到阈值时显式回滚并返回向上取整、最多 3600 秒的 `retry_after`；成功的
+计速率 Register 在提交前插入一条默认时间戳的日志，并仅删除该 requester 的过期行。
+`Idempotent` 与 `Rewarm` 不读写 `mega_view_register_log`。
+
+六个 lib 用例覆盖：`rate_rejects_iff_requester_window_full` 的三类计速率 Register、
+过期行、requester 隔离和热加载阈值；`rate_rejection_writes_nothing` 的速率、总数和
+名额拒绝逐行三表快照；`rate_retry_after_from_oldest_row` 的 SQL 时间边界和 3600 秒上限；
+`rate_admitted_appends_and_trims` 的插入与 requester 范围内清理；
+`rate_idempotent_and_rewarm_not_counted` 的不计数路径；以及
+`rate_concurrent_last_quota` 的跨副本最后一个速率配额。窗口状态由直接插入的
+`created_at = localtimestamp - k 秒` 行构造，并在各状态之间清空运行态表；重试秒数由
+调用前后的 SQL 值夹定，Rust 不直接比较时间。并发用例用 `test_db_config` 和
+`database_connection` 共享 schema，先预热三个连接池，再由第三个连接以
+`ViewLockMode::Blocking` 持有 L_R；只有观察到两个等待者才释放锁，10 秒内未观察到则
+显式回滚，整个 `tokio::join!` 另有 30 秒上限。
+
+## DB 模块覆盖：根链停追与恢复（HP-28）
+
+`ROOT_CHAIN_HALTED_SQL` 是不带绑定参数、不引用外层别名的完整布尔表达式。读者可把它
+原样嵌入自己的单条快照查询；`ViewStorage::root_chain_halted()` 只执行一条
+`SELECT`，从不取得根链 advisory lock。它依[事实校准第 7 项](history-projection.md#事实校准2026-10-05)的顺序先判断暂存表顶行是否已在
+根链中：该行只有不再是链尾时才停追；不在根链中时才依次判定无父而链表非空、多父、和
+首父缺失。因此，暂存表为空、已追平，以及无父的 bootstrap 仍是链尾或冷启动尚未接入时
+都不会误报停追。
+
+暂存表顶行持久化了五种根历史不连续的判定。后续 `extend_root_chain` 在锁内只复核该顶行，
+不改根链表或暂存表；语句数与历史长度无关。把 `main@/` 恢复到旧链尾的单父后代后，删除
+暂存表即可重新追赶；若不恢复 `main@/`，相同操作会重新得出原来的不连续原因。
+
+`view_root_chain` 的七个 lib 用例覆盖：五类不连续经同 schema 的新连接池重启后复现；8 行
+与 256 行历史的停追调用等语句数和单语句谓词；停追后 `main@/` 前进仍不写两张表；另一个
+连接池在根链锁被持有时仍读取停追；从未扫描、追平、预算扫描、段间锚点、bootstrap 与冷
+启动等正常状态均为假。分段接入期间再在同一条快照 SQL 中读取谓词和两张表的行数，
+并断言谓词为假；恢复后清空暂存表会重新追赶；未恢复时清空暂存表会再次停追。需要第二个
+连接池或重启的用例通过 `test_db_config` 保持同一 schema，并用
+`database_connection` 创建新的连接池。
+
+## DB 模块覆盖：视图 tree 读取（HP-29）
+
+`MonoStorage::get_commits_by_hashes_fallible` 与
+`MonoStorage::get_trees_by_hashes_fallible` 先对请求 id 去重，再以 1000 条为一组在给定
+连接或事务上读取；查询错误以 `MegaError` 返回，数据库中没有的 id 不会被误报为查询错误。
+`ViewTreeSource` 只在异步 `prefetch` 中访问数据库：它先读 `mega_view_object(kind = 2)`，
+再用剩余 id 读 `mega_tree`，并且只在两个阶段都成功后写入本实例的已预取与缺失集合。同步的
+`TreeSource::read_tree` 不发 SQL；已确认缺行、坏字节和未预取 id 分别给出 `Absent`、
+`Malformed` 与 `Unprefetched`。EMPTY_TREE 不进入预取集合，由 HP-04 的 `read_tree` 直接处理。
+
+六个 lib 用例是 `fallible_batch_reads_rows_then_query_error`、
+`fallible_batch_reads_chunk_statement_count`、`lookup_order_view_object_first`、
+`read_tree_outcomes_over_db_source`、`prefetch_statement_count` 和
+`prefetch_query_error_keeps_state`：它们分别覆盖连接和事务上的去重、缺行、分块和查询错误；
+视图对象优先于 L0 tree、kind = 1 回退、显式 SHA-1/SHA-256 解析及事务构造；三种
+`MissingObject` 原因和补行后的新实例读取；`prefetch` 的 1000 条分块、缓存命中与同步读取
+零查询；以及在测试 schema 内改列名后，预取失败不污染既有缓存或把新 id 误记为缺失。
+语句计数用 `test_db_config` 自建连接并安装 metric callback，避免替换
+`test_db_connection` 持有 schema 守卫的回调。失败注入只改列名，不改表名，也不用
+`DatabaseConnection::default()`。每个批量查询的语句数为 ⌈n / 1000⌉；HP-11 的语句数断言
+按同一公式计算。调用方收到 `Unprefetched` 说明漏做预取，它不表示对象缺失。
+
+## DB 模块覆盖：视图投影追赶（HP-11）
+
+`ViewProjectionService` 在单个事务中按 `filter_pk` 读取过滤器、复核规范定义，取得连续
+根链批次，并经 `ViewTreeSource` 按层预取 tree。它依次尝试过滤器锁与对象 GC 共享锁；未准入
+或试锁失败不写入。批中 `seq = s0` 只提供父 tree，不重复投影；每个后续根链行直接使用前一行
+的 `tree_id`，不会为每个提交另查父链。成功批仅为实际写出视图提交的段写提交对象、生成 tree
+与引用，以 `GREATEST` 推进水位；最后一批在同一事务内检查 `main@/` 覆盖并标记就绪。预取后
+同一 tree id 仍报告未加载会作为内部错误终止，避免循环重试。
+
+`jupiter::service::view_projection_service::tests::determinism`、
+`jupiter::service::view_projection_service::tests::commit_map_matches_design`、
+`jupiter::service::view_projection_service::tests::object_refs_match_design`、
+`jupiter::service::view_projection_service::tests::ready_same_txn`、
+`jupiter::service::view_projection_service::tests::noop_returns`、
+`jupiter::service::view_projection_service::tests::failed_batch_no_effect` 和
+`jupiter::service::view_projection_service::tests::statement_count_independent_of_batch`
+覆盖批次收敛、映射游程、对象与引用、同事务就绪、无操作返回、前提失败与内部错误，以及批量
+路径。映射用例用内存 `TreeSource` 加逐提交 `project_commit` 形成独立参照，覆盖起始空段、未预取
+重算和父提交为空的首段；对象用例先单批持久化起始空段，确认该段没有对象或引用。夹具根提交以固定
+author/committer 签名和时间戳构造，因而可跨 schema 比较投影字节。
+`determinism` 覆盖 Subdir、Prefix、Exclude 与 Compose：以一个 B=1000 基准结果比较两个独立
+schema 的冷启动、清表重建、同一过滤器上共享服务实例克隆的并发追赶（遇 `NotRun` 重试）、B=1/B=1000，
+以及批间钩子调用 `ConfigHandle::reload` 将 `views.batch_size` 从 3 改为 2；钩子记录实际水位 3、5
+与应用字段 `views.batch_size`，防止热改用例退化为单一批大小。
+
+服务实例持有同一份 memo 与计数器；测试构建下的钩子记录 memo 命中、补预取次数、每批预取的
+id 集合、已提交批的水位和终态 `s0 >= tip` 检查，并能在试算和段计算之间清空 memo、在批间触发
+回调。对象引用用例会删去仅由 Exclude 视图引用的对象并复位该视图，再以同一服务重跑，核对 memo
+命中后补写的对象字节、类型和引用行；共享的 EMPTY_TREE 则保留并核对 `gc_marked_at` 被清空。
+TreeSource 钩子可模拟漏记未加载与持续未加载，分别覆盖未经过包装层的读取和补预取后仍报告未加载的
+fail-closed 路径。补预取的生产来源是 seq=1 的 `is_empty_root` 递归与 HP-06 登记的 R8 例外；
+试算产出的 `FilterOutput` 直接交给 `project_with_output`，因此 memo 在两阶段之间被清空也不会使
+段计算重新执行 `filter_tree`。语句数用 `test_db_config` 取得独立 schema，并以
+`Storage::new_with_connection` 在自建连接上安装 metric callback；B=10 与 B=500 的常规档各断言一
+个推进事务和一个终态事务，预热 memo 后强制清空的两档各在新 schema 比较，后两档不与前两档比较。
+`ready_same_txn` 还让尚未 ready 的过滤器追到链尾时发现 `main@/` 在链外、再回退到链尾，验证
+`s0 >= tip` 分支首次写入 `ready_seq`；另以新过滤器验证扩展根链后的批内写入路径。
+
+批事务每次重新调用 `recheck_definition`；不存在的过滤器行和 `DefinitionCorrupt` 都按内部错误
+回滚。`failed_batch_no_effect` 是同步测试，`capture_tracing` 在 current-thread runtime 内驱动异步
+调用，保持 `_pin_registry` 存活并使用 `with_ansi(false)` 捕获 ERROR 事件。它以 H=6 的 Prefix 夹具
+逐一验证 B=0（s0=0、s0=2）和根链空洞三种前提失败；内部错误的七个子例为：过滤器缺失、定义往返
+损坏、定义哈希损坏、Compose 冲突导致的 `ProjectFailure::Internal`、不记录未预取、持续未预取，及在
+测试 schema 内把 `mega_view_object_ref.object_id` 改名造成的查询失败。每次调用都单独核对新增的一条
+ERROR 事件、状态回滚、指标与脱敏字段；列名恢复后，同一服务可重新追平并与独立 schema 的参照快照
+逐字节比较，证明失败事务不污染水位或映射；`ON CONFLICT DO NOTHING` 的整批冲突也通过无返回值插入
+执行，不会把合法对象复用变成失败。
+
+## DB 模块覆盖：视图投影停止（HP-12）
+
+`ViewProjectionService` 在单批事务中把 `ProjectFailure::Data` 交给纯停止分派：
+前提校验失败、缺失 tree 行、无法解析 tree 字节和缺失 commit 行分别以
+`premise_check_failed`、`row_absent`、`unparsable`、`commit_row_missing` 停止；
+`MissingObjectReason::Unprefetched` 仍按内部错误回滚。停止点为 `s` 时仅写入
+`seq < s` 的段、对象和引用，将 `projected_seq` 推至 `s - 1`，不标记 ready。提交成功后才
+递增 `view_projection_stops_total` 并发出一条 ERROR 事件。事件字段为 `metric`、`filter_id`、
+`s`、`commit_id` 和 `reason`；缺对象时另有 `tree_id`。字符串字段以 Display 记录。字段断言
+只分析事件 target 之后的文本；任何 span 上下文都不算事件字段，且事件不回显作者、提交者或消息。
+
+`jupiter::service::view_projection_service::tests::stop_state_equals_prefix_reference` 覆盖四种
+故障在 B=1 与 B=1000 时的前缀状态、重复追赶和显式单批入口；
+`jupiter::service::view_projection_service::tests::stop_alert_and_counter` 覆盖逐次 ERROR 告警、
+脱敏和共享计数器；
+`jupiter::service::view_projection_service::tests::non_stop_inputs_reach_ready` 覆盖被 J4 丢弃、
+未读取缺失 tree 和真实不存在路径；
+`jupiter::service::view_projection_service::tests::stop_dispatch_excludes_not_prefetched` 覆盖
+分派表；`jupiter::service::view_projection_service::tests::stop_resumes_after_repair` 覆盖补回 L0
+行或字节后的续追；`jupiter::service::view_projection_service::tests::stop_changes_only_projected_seq`
+覆盖冷启动及已就绪状态只修改水位；
+`jupiter::service::view_projection_service::tests::cold_start_slots_gauge` 覆盖快照和冷启动名额。
+
+夹具先建立 12 个固定哨兵签名与 message 的根提交和根链，在第 7 个提交制造四类故障；P 组以带前导零
+author 时间戳的原始字节经 `Commit::from_bytes` 和 `into_mega_model` 写入，所有组的作者与 message
+哨兵为 `hp12-sentinel-author` 和 `hp12-sentinel-message`。独立 schema 的前六个根提交提供前缀参照；
+缺行和缺提交修复时恢复原模型，损坏 tree 恢复原字节。语句计数通过 `test_db_config` 和
+`database_connection` 自建连接，并以 `Storage::new_with_connection` 复用该连接；metric callback
+只记录 `mega_commit` 的 SELECT。多个 schema 可以共享同一份 `ViewMetrics`，因其计数由 `Arc` 维护。
+告警捕获使用带 `_pin_registry` 的、闭包内可读取缓冲的 DEBUG helper，按每次调用前后的差值断言；
+查询失败在测试 schema 中把 `mega_view_object_ref.object_id` 改名而非改表名。
+`ViewMetrics::counters()` 只读取原子总数；`ViewMetricsSnapshot` 以 `#[serde(flatten)]` 展平它们，
+`metrics_snapshot()` 另以一条 `warming_since IS NOT NULL` 计数查询填入
+`view_cold_start_slots_in_use`，并在每个快照步骤与同一原生 SELECT 的结果比较。
+
+## DB 模块覆盖：视图 worker（HP-14）
+
+六个 lib 用例是 `view_worker_spawned_only_when_enabled`、`worker_hot_reload`、
+`round_selection`、`compensation_liveness`、`round_errors_do_not_stop_worker` 与
+`view_runtime_wiring`。它们覆盖启动时 `[views].enabled` 门控、正在执行的轮被取消、
+热加载、候选选择、周期补偿、候选与整轮错误隔离，以及共享运行时的作用域。视图 trunk
+配置使用 `push_policy = "trunk"`、`push_auth = "none"`、`ssh_receive_pack = false` 与
+`cedar.enforcement = "off"`，并显式启用 views。
+
+`spawn_view_worker_with_round` 是测试替换轮函数的接缝，`production_round` 是取得生产轮的
+唯一入口。每轮先读配置快照、试锁扩展根链、查询候选，再按主键顺序调用共享服务的
+`catch_up`；每批的 `batch_size` 仍由 `catch_up` 自行读取，所以热改在下一批生效。候选
+失败只记录错误并继续其余候选；根链或候选查询失败只记录该轮错误，下一 tick 继续。测试
+通过 `compensation_round` 的逐候选函数注入错误或记录候选集合。
+
+`ViewRuntime` 随一个 `Storage` 及其克隆共享 `ViewMetrics`、`ViewSignal` 和一次性的
+`OnceLock` 服务槽。`view_projection_service()` 传给服务的内部 Storage 使用空槽，避免
+服务反向持有同一槽产生 Arc 环；因此服务、memo 和计数器在同一进程 Storage 内共享，而
+测试 schema 的连接仍可释放。`notify_worker()` 用 `notify_one` 保留许可；HP-32、HP-19、
+HP-33 和 HP-21 分别消费该信号接口。
+
+worker 只在启动时 enabled 才注册热加载订阅者。订阅者只持有 watch 控制结构，不捕获
+Storage；收到 `views.` 应用字段后转发新的 `ViewsConfig`，`worker_interval_secs` 改变时以
+`.max(1)` 重建 ticker。循环把进行中的轮与 `token.cancelled()` 放在同一个 `tokio::select!`
+中，取消时丢弃本轮而不等待无上界的冷启动；短事务、根链段和投影批会各自回滚或保留已
+提交状态。后台根链扩展传入 `budget = None`，不受 `max_append_walk` 限制，保证超过前台
+上限的根链仍在后台追平。
+
+`worker_hot_reload` 与 `compensation_liveness` 的双连接池情形使用 `test_db_config` 和
+`database_connection` 建 worker、持锁两个连接池，持锁事务不占 worker 的池连接。
+`worker_hot_reload` 以 `mega_view_filter` 的表锁让首轮已取旧配置快照、但还未开始第一批，
+再热改 `batch_size`；根链缺口使新批大小 1 的第一批推进到 seq 3，区别于缓存旧值的结果。
+`compensation_liveness` 覆盖冷启动在 seq 1 中断后由另一个 worker 继续、链尾水位但尚未就绪的
+过滤器、持有视图锁后释放且不发送信号，以及超过 `max_append_walk` 的根链在后台无预算追平。
+故障注入只改列名，不改表名，避免 `search_path` 回退到 public 表。`start_http` 以
+`ctx.storage.clone()` 启动 worker，并在关闭时以 30 秒上限等待任务结束。
+
 ## 迁移覆盖：`merge_queue.requester` nullable 列（UN-18）
 
 **历史表。** [`plan-20260910.md`](../plan/plan-20260910.md) MW-05 已 `DROP TABLE merge_queue`；下列描述 UN-18 当时的加列迁移，不再是现行 schema。

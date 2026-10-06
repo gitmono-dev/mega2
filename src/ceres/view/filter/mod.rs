@@ -1,6 +1,9 @@
 mod canonical;
 mod parse;
 
+pub mod semantics;
+pub mod validate;
+
 pub use canonical::{canonicalize, print};
 use sha2::{Digest, Sha256};
 

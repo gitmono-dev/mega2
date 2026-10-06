@@ -14,7 +14,7 @@ use tokio::{
 
 use crate::{
     common::errors::MegaError,
-    config::{ArtifactGcConfig, BuckConfig, Config, LogConfig, NotificationConfig},
+    config::{ArtifactGcConfig, BuckConfig, Config, LogConfig, NotificationConfig, ViewsConfig},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -133,6 +133,12 @@ impl ConfigHandle {
             &current.artifacts_gc,
             &candidate.artifacts_gc,
             &mut next.artifacts_gc,
+            &mut report,
+        );
+        apply_views_changes(
+            &current.views,
+            &candidate.views,
+            &mut next.views,
             &mut report,
         );
         apply_buck_changes(&current.buck, &candidate.buck, &mut next.buck, &mut report);
@@ -417,6 +423,52 @@ fn apply_artifact_gc_changes(
     if current.batch_limit != candidate.batch_limit {
         next.batch_limit = candidate.batch_limit;
         report.applied_fields.push("artifacts_gc.batch_limit");
+    }
+}
+
+fn apply_views_changes(
+    current: &ViewsConfig,
+    candidate: &ViewsConfig,
+    next: &mut ViewsConfig,
+    report: &mut ConfigReloadReport,
+) {
+    if current.enabled != candidate.enabled {
+        report.restart_required_fields.push("views.enabled");
+    }
+    if current.worker_interval_secs != candidate.worker_interval_secs {
+        next.worker_interval_secs = candidate.worker_interval_secs;
+        report.applied_fields.push("views.worker_interval_secs");
+    }
+    if current.batch_size != candidate.batch_size {
+        next.batch_size = candidate.batch_size;
+        report.applied_fields.push("views.batch_size");
+    }
+    if current.max_append_walk != candidate.max_append_walk {
+        next.max_append_walk = candidate.max_append_walk;
+        report.applied_fields.push("views.max_append_walk");
+    }
+    if current.sync_catch_up_commits != candidate.sync_catch_up_commits {
+        next.sync_catch_up_commits = candidate.sync_catch_up_commits;
+        report.applied_fields.push("views.sync_catch_up_commits");
+    }
+    if current.max_filters != candidate.max_filters {
+        next.max_filters = candidate.max_filters;
+        report.applied_fields.push("views.max_filters");
+    }
+    if current.max_concurrent_cold_starts != candidate.max_concurrent_cold_starts {
+        next.max_concurrent_cold_starts = candidate.max_concurrent_cold_starts;
+        report
+            .applied_fields
+            .push("views.max_concurrent_cold_starts");
+    }
+    if current.register_rate_per_token != candidate.register_rate_per_token {
+        next.register_rate_per_token = candidate.register_rate_per_token;
+        report.applied_fields.push("views.register_rate_per_token");
+    }
+    if current.allow_anonymous_register != candidate.allow_anonymous_register {
+        report
+            .restart_required_fields
+            .push("views.allow_anonymous_register");
     }
 }
 
@@ -972,10 +1024,12 @@ fn collect_storage_events_restart_fields(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::{
         ArtifactGcConfig, BuckConfig, GithubSyncBinding, GithubSyncConfig, PushAuth, PushPolicy,
-        StorageEventsTargetConfig,
+        StorageEventsTargetConfig, ViewsConfig,
         template::config_init_template,
         testing::{EnvVarGuard, env_lock, isolated_config},
     };
@@ -985,6 +1039,180 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime")
+    }
+
+    fn trunk_views_config(base_dir: impl AsRef<Path>) -> Config {
+        let mut config = isolated_config(base_dir);
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        config.git.push_auth = Some(PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        config.cedar.enforcement = "off".to_string();
+        config
+    }
+
+    #[test]
+    fn views_reload_follows_design() {
+        for (field, value) in [
+            ("worker_interval_secs", 11),
+            ("batch_size", 1_001),
+            ("max_append_walk", 1_001),
+            ("sync_catch_up_commits", 65),
+            ("max_filters", 101),
+            ("max_concurrent_cold_starts", 3),
+            ("register_rate_per_token", 11),
+        ] {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let handle = ConfigHandle::new(trunk_views_config(temp_dir.path()));
+            let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+            match field {
+                "worker_interval_secs" => candidate.views.worker_interval_secs = value,
+                "batch_size" => candidate.views.batch_size = value,
+                "max_append_walk" => candidate.views.max_append_walk = value,
+                "sync_catch_up_commits" => candidate.views.sync_catch_up_commits = value,
+                "max_filters" => candidate.views.max_filters = value,
+                "max_concurrent_cold_starts" => {
+                    candidate.views.max_concurrent_cold_starts = value;
+                }
+                "register_rate_per_token" => candidate.views.register_rate_per_token = value,
+                _ => unreachable!("declared hot views field"),
+            }
+
+            let report = handle.reload(candidate).expect("reload");
+            let snapshot = handle.snapshot().expect("snapshot after reload");
+            let expected = format!("views.{field}");
+            assert_eq!(report.applied_fields, vec![expected.as_str()]);
+            assert!(report.restart_required_fields.is_empty());
+            match field {
+                "worker_interval_secs" => assert_eq!(snapshot.views.worker_interval_secs, value),
+                "batch_size" => assert_eq!(snapshot.views.batch_size, value),
+                "max_append_walk" => assert_eq!(snapshot.views.max_append_walk, value),
+                "sync_catch_up_commits" => {
+                    assert_eq!(snapshot.views.sync_catch_up_commits, value)
+                }
+                "max_filters" => assert_eq!(snapshot.views.max_filters, value),
+                "max_concurrent_cold_starts" => {
+                    assert_eq!(snapshot.views.max_concurrent_cold_starts, value)
+                }
+                "register_rate_per_token" => {
+                    assert_eq!(snapshot.views.register_rate_per_token, value)
+                }
+                _ => unreachable!("declared hot views field"),
+            }
+        }
+
+        for (field, current_true) in [
+            ("enabled", false),
+            ("enabled", true),
+            ("allow_anonymous_register", false),
+            ("allow_anonymous_register", true),
+        ] {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let mut current = trunk_views_config(temp_dir.path());
+            match field {
+                "enabled" => current.views.enabled = current_true,
+                "allow_anonymous_register" => {
+                    current.views.allow_anonymous_register = current_true;
+                }
+                _ => unreachable!("declared restart views field"),
+            }
+            let handle = ConfigHandle::new(current.clone());
+            let before = handle.snapshot().expect("snapshot before reload");
+            let mut candidate = before.as_ref().clone();
+            match field {
+                "enabled" => candidate.views.enabled = !current_true,
+                "allow_anonymous_register" => {
+                    candidate.views.allow_anonymous_register = !current_true;
+                }
+                _ => unreachable!("declared restart views field"),
+            }
+
+            let report = handle.reload(candidate).expect("reload");
+            let snapshot = handle.snapshot().expect("snapshot after reload");
+            assert!(report.applied_fields.is_empty());
+            assert_eq!(
+                report.restart_required_fields,
+                vec![match field {
+                    "enabled" => "views.enabled",
+                    "allow_anonymous_register" => "views.allow_anonymous_register",
+                    _ => unreachable!("declared restart views field"),
+                }]
+            );
+            assert!(Arc::ptr_eq(&before, &snapshot));
+            assert_eq!(snapshot.views, current.views);
+        }
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let handle = ConfigHandle::new(trunk_views_config(temp_dir.path()));
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.views.enabled = true;
+        candidate.views.batch_size = 1_001;
+        let report = handle.reload(candidate).expect("reload");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        assert_eq!(report.applied_fields, vec!["views.batch_size"]);
+        assert_eq!(report.restart_required_fields, vec!["views.enabled"]);
+        assert_eq!(snapshot.views.batch_size, 1_001);
+        assert!(!snapshot.views.enabled);
+
+        let values = toml::Value::try_from(ViewsConfig::default()).expect("serialize views");
+        let table = values.as_table().expect("views table");
+        assert_eq!(table.len(), 9);
+        for (field, value) in table {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let handle = ConfigHandle::new(trunk_views_config(temp_dir.path()));
+            let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+            let mut candidate_value =
+                toml::Value::try_from(candidate.views.clone()).expect("serialize candidate views");
+            let changed = match value {
+                toml::Value::Boolean(value) => toml::Value::Boolean(!*value),
+                toml::Value::Integer(value) => toml::Value::Integer(*value + 1),
+                _ => unreachable!("ViewsConfig only contains booleans and integers"),
+            };
+            candidate_value
+                .as_table_mut()
+                .expect("candidate views table")
+                .insert(field.clone(), changed);
+            candidate.views = candidate_value
+                .try_into()
+                .expect("deserialize candidate views");
+
+            let report = handle.reload(candidate).expect("reload");
+            let expected = format!("views.{field}");
+            let reported = report
+                .applied_fields
+                .iter()
+                .chain(&report.restart_required_fields)
+                .filter(|entry| **entry == expected.as_str())
+                .count();
+            assert_eq!(reported, 1, "{field}: {report:?}");
+            assert_eq!(
+                report.applied_fields.len() + report.restart_required_fields.len(),
+                1,
+                "{field}: {report:?}"
+            );
+        }
+
+        for (field, configure) in [
+            ("views.batch_size", 0_u64),
+            ("views.sync_catch_up_commits", 1_001_u64),
+        ] {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let handle = ConfigHandle::new(trunk_views_config(temp_dir.path()));
+            let before = handle.snapshot().expect("snapshot before reload");
+            let mut candidate = before.as_ref().clone();
+            if field == "views.batch_size" {
+                candidate.views.batch_size = configure;
+                candidate.views.sync_catch_up_commits = 0;
+            } else {
+                candidate.views.batch_size = 1_000;
+                candidate.views.sync_catch_up_commits = configure;
+            }
+            let error = handle
+                .reload(candidate)
+                .expect_err("invalid views candidate must be rejected");
+            assert!(error.to_string().contains(field), "{error}");
+            let snapshot = handle.snapshot().expect("snapshot after rejection");
+            assert!(Arc::ptr_eq(&before, &snapshot));
+        }
     }
 
     #[test]

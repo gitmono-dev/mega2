@@ -84,6 +84,8 @@ admin = ["mega2"]
 # 且不能是根树保留项(.cedar、.mega_cedar.json、.buckroot、.buckconfig、.git),否则校验失败.
 # 只有首次初始化(`service init` 或空库上的首次服务启动)会创建这些目录;事后修改需重启,且不会
 # 增删已初始化库的顶层目录.
+# .view and .filter are reserved view URL names; exact-case matches are rejected.
+# .view 和 .filter 是视图 URL 保留名，按大小写精确匹配时同样拒绝。
 root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
 
 # Object-ID format for the initial Monorepo graph and live Git service.
@@ -271,6 +273,28 @@ enable = false
 interval_secs = 3600
 grace_secs = 86400
 batch_limit = 100
+
+# Experimental history projections are default off. Enabling them requires
+# monorepo.push_policy = "trunk" and monorepo.object_format = "sha1".
+[views]
+# Restart-required: workers and route mounting are decided at startup.
+enabled = false
+# Hot-reloadable: background projection worker interval in seconds.
+worker_interval_secs = 10
+# Hot-reloadable: root commits projected in one batch.
+batch_size = 1000
+# Hot-reloadable: root-chain commits processed by an advertise or B0 walk.
+max_append_walk = 1000
+# Hot-reloadable: commits an advertise may synchronously project.
+sync_catch_up_commits = 64
+# Hot-reloadable: maximum filters that occupy derived state.
+max_filters = 100
+# Hot-reloadable: maximum concurrent cold-starting filters.
+max_concurrent_cold_starts = 2
+# Hot-reloadable: new registrations per requester in a 3600 second window.
+register_rate_per_token = 10
+# Restart-required: anonymous registration changes the write authorization surface.
+allow_anonymous_register = false
 
 [notification]
 # Global notification kill switch.

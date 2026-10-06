@@ -1,0 +1,36 @@
+git log --graph:
+* seq=3 4349678d71c600c87aa1a9e3f6ffe259312bf0af
+* seq=2 847cae4617ac58d986367874cfdfdbade70fb5d9
+* seq=1 7bdfa85566f46a15dae0f624bf71da0a6acfefef
+tree list:
+root-seq=1
+seq=1
+commit=7bdfa85566f46a15dae0f624bf71da0a6acfefef
+tree=3892777edda85b236e4d9aac3e6aaf6796bc0471
+bytes=tree 3892777edda85b236e4d9aac3e6aaf6796bc0471
+author Alice <alice@example.com> 1 +0000
+committer Bob <bob@example.com> 2 +0000
+
+message
+root-seq=2
+seq=2
+commit=847cae4617ac58d986367874cfdfdbade70fb5d9
+tree=4ec061c2c583420a59aba03fe538ddd783ed0db6
+bytes=tree 4ec061c2c583420a59aba03fe538ddd783ed0db6
+parent 7bdfa85566f46a15dae0f624bf71da0a6acfefef
+author Alice <alice@example.com> 1 +0000
+committer Bob <bob@example.com> 2 +0000
+
+message
+root-seq=3
+seq=3
+commit=4349678d71c600c87aa1a9e3f6ffe259312bf0af
+tree=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+bytes=tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+parent 847cae4617ac58d986367874cfdfdbade70fb5d9
+author Alice <alice@example.com> 1 +0000
+committer Bob <bob@example.com> 2 +0000
+
+message
+root-seq=4
+segment=none

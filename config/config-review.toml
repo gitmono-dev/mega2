@@ -86,6 +86,8 @@ admin = ["mega2"]
 # 且不能是根树保留项(.cedar、.mega_cedar.json、.buckroot、.buckconfig、.git),否则校验失败.
 # 只有首次初始化(`service init` 或空库上的首次服务启动)会创建这些目录;事后修改需重启,且不会
 # 增删已初始化库的顶层目录.
+# .view and .filter are reserved view URL names; exact-case matches are rejected.
+# .view 和 .filter 是视图 URL 保留名，按大小写精确匹配时同样拒绝。
 root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
 
 # Object-ID format for the initial Monorepo graph and live Git service.

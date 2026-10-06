@@ -26,23 +26,47 @@ pub mod push_queue_storage;
 pub mod stg_common;
 pub mod user_storage;
 pub mod vault_storage;
+pub mod view_admission;
+#[cfg(test)]
+mod view_ops_tests;
+pub mod view_projection_storage;
+pub mod view_root_chain;
+pub mod view_storage;
+#[cfg(test)]
+pub(crate) mod view_test_fixtures;
+pub mod view_tree_source;
 pub mod webhook_storage;
 
 use std::sync::Arc;
 
-use sea_orm::DatabaseConnection;
+use git_internal::{
+    hash::ObjectHash,
+    internal::object::{ObjectTrait, tree::Tree},
+};
+use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio::sync::Semaphore;
 
 use crate::{
+    callisto::mega_refs,
+    ceres::view::VIEW_URL_RESERVED_NAMES,
     common::errors::MegaError,
     config::{Config, PushPolicy, reload::ConfigHandle, validate::validate_buck_config},
     contract::{policy::entitystore::SharedEntityStore, vault::integration::vault_core::VaultCore},
     jupiter::{
         service::{
-            agent_capture_service::AgentCaptureService, artifact_service::ArtifactService,
-            buck_service::BuckService, cl_service::CLService, git_service::GitService,
-            import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
-            oci_service::OciService, push_queue_service::PushQueueService,
+            agent_capture_service::AgentCaptureService,
+            artifact_service::ArtifactService,
+            buck_service::BuckService,
+            cl_service::CLService,
+            git_service::GitService,
+            import_service::ImportService,
+            lfs_service::LfsService,
+            mono_service::MonoService,
+            oci_service::OciService,
+            push_queue_service::PushQueueService,
+            view_metrics::ViewMetrics,
+            view_projection_service::ViewProjectionService,
+            view_worker::{ViewRuntime, ViewSignal},
             webhook_service::WebhookService,
         },
         storage::{
@@ -68,6 +92,7 @@ use crate::{
             push_queue_storage::PushQueueStorage,
             user_storage::UserStorage,
             vault_storage::VaultStorage,
+            view_storage::ViewStorage,
             webhook_storage::WebhookStorage,
         },
     },
@@ -82,6 +107,7 @@ pub struct AppService {
     pub user_storage: UserStorage,
     pub group_storage: GroupStorage,
     pub vault_storage: VaultStorage,
+    pub view_storage: ViewStorage,
     pub cl_storage: ClStorage,
     pub issue_storage: IssueStorage,
     pub conversation_storage: ConversationStorage,
@@ -109,6 +135,7 @@ impl AppService {
             user_storage: UserStorage { base: mock.clone() },
             group_storage: GroupStorage { base: mock.clone() },
             vault_storage: VaultStorage { base: mock.clone() },
+            view_storage: ViewStorage::new(mock.clone()),
             cl_storage: ClStorage { base: mock.clone() },
             issue_storage: IssueStorage { base: mock.clone() },
             conversation_storage: ConversationStorage { base: mock.clone() },
@@ -147,6 +174,7 @@ pub struct Storage {
     pub webhook_service: WebhookService,
     pub storage_event_emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     pub notification_storage: notification_storage::NotificationStorage,
+    pub(crate) view_runtime: Arc<ViewRuntime>,
     /// Shared authorization snapshot holder (ADR-UN-02). Injected by
     /// `AppContext`; the same `Arc` is shared with the HTTP state so the write
     /// path (notify) and read path (guard/push) observe the same instance.
@@ -255,6 +283,7 @@ impl Storage {
             user_storage,
             group_storage,
             vault_storage,
+            view_storage: ViewStorage::new(base.clone()),
             cl_storage: cl_storage.clone(),
             issue_storage,
             conversation_storage,
@@ -306,6 +335,7 @@ impl Storage {
             webhook_service,
             storage_event_emitter,
             notification_storage,
+            view_runtime: Arc::new(ViewRuntime::new()),
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
         })
@@ -368,6 +398,93 @@ impl Storage {
         self.config_handle
             .snapshot()
             .unwrap_or_else(|_| Arc::clone(&self.config))
+    }
+
+    pub(crate) fn view_metrics(&self) -> ViewMetrics {
+        self.view_runtime.metrics()
+    }
+
+    pub(crate) fn view_signal(&self) -> ViewSignal {
+        self.view_runtime.signal()
+    }
+
+    pub(crate) fn view_projection_service(&self) -> ViewProjectionService {
+        self.view_runtime
+            .service_slot()
+            .get_or_init(|| {
+                let mut inner = self.clone();
+                inner.view_runtime = Arc::new(self.view_runtime.without_service_slot());
+                ViewProjectionService::new(inner, self.view_metrics())
+            })
+            .clone()
+    }
+
+    /// Refuse view-enabled startup when existing repository state occupies a
+    /// URL namespace reserved for deterministic projections.
+    pub async fn check_view_reserved_startup(&self) -> Result<(), MegaError> {
+        let config = self.config();
+        if !config.views.enabled {
+            return Ok(());
+        }
+
+        let mono_storage = self.mono_storage();
+        let mut conflicts = Vec::new();
+
+        if let Some(root_ref) = mono_storage.get_main_ref("/").await? {
+            let root_hash = ObjectHash::from_hex_for_kind(
+                config.monorepo.object_hash_kind()?,
+                &root_ref.ref_tree_hash,
+            )
+            .map_err(|_| {
+                MegaError::Other(
+                    "cannot validate View reserved names: root tree is unreadable".to_string(),
+                )
+            })?;
+            let root_tree_model = mono_storage
+                .get_tree_by_hash(&root_ref.ref_tree_hash)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other(
+                        "cannot validate View reserved names: root tree is unreadable".to_string(),
+                    )
+                })?;
+            let root_tree =
+                Tree::from_bytes(&root_tree_model.sub_trees, root_hash).map_err(|_| {
+                    MegaError::Other(
+                        "cannot validate View reserved names: root tree is unreadable".to_string(),
+                    )
+                })?;
+            for item in root_tree.tree_items {
+                if VIEW_URL_RESERVED_NAMES.contains(&item.name.as_str()) {
+                    conflicts.push(format!("root tree entry {:?}", item.name));
+                }
+            }
+        }
+
+        let reserved_prefixes = VIEW_URL_RESERVED_NAMES
+            .into_iter()
+            .flat_map(|name| [format!("/{name}"), name.to_string()]);
+        let reserved_path_filter = reserved_prefixes.fold(Condition::any(), |condition, prefix| {
+            condition.add(mega_refs::Column::Path.starts_with(prefix))
+        });
+        for reference in mega_refs::Entity::find()
+            .filter(reserved_path_filter)
+            .all(mono_storage.get_connection())
+            .await?
+        {
+            if has_view_reserved_first_component(&reference.path) {
+                conflicts.push(format!("mega_refs path {:?}", reference.path));
+            }
+        }
+
+        if conflicts.is_empty() {
+            return Ok(());
+        }
+
+        Err(MegaError::Other(format!(
+            "[views] reserved-name conflict: {}. Resolve these conflicts manually; no supported removal path exists. Set [views] enabled = false and restart; see docs/configuration.md \"View reserved names\".",
+            conflicts.join(", ")
+        )))
     }
 
     /// TP-15 / 4.1 ②③⑥: DB-backed fail-closed checks at HTTP start.
@@ -511,6 +628,10 @@ impl Storage {
         self.app_service.vault_storage.clone()
     }
 
+    pub fn view_storage(&self) -> ViewStorage {
+        self.app_service.view_storage.clone()
+    }
+
     pub fn cl_storage(&self) -> ClStorage {
         self.app_service.cl_storage.clone()
     }
@@ -595,6 +716,7 @@ impl Storage {
             storage_event_emitter:
                 crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
+            view_runtime: Arc::new(ViewRuntime::new()),
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
         }
@@ -612,9 +734,72 @@ fn calculate_db_concurrency_limit(
     calculated.max(min_limit).min(max_connections)
 }
 
+fn has_view_reserved_first_component(path: &str) -> bool {
+    let first_component = path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    VIEW_URL_RESERVED_NAMES.contains(&first_component)
+}
+
 #[cfg(test)]
 mod tests {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
     use super::*;
+    use crate::{
+        callisto::{mega_refs, mega_tree},
+        common::utils::MEGA_BRANCH_NAME,
+        config::{MonoConfig, testing::isolated_config},
+        jupiter::{
+            service::{git_service::GitService, mono_service::MonoService},
+            storage::object_storage::mock_object_storage,
+            tests::test_storage_with_config,
+        },
+    };
+
+    async fn storage_for_view_reserved_startup(
+        temp_dir: &tempfile::TempDir,
+        views_enabled: bool,
+    ) -> Storage {
+        let mut config = isolated_config(temp_dir.path().join("config"));
+        config.views.enabled = views_enabled;
+        config.database.db_url = "postgres://u:hp08-canary-secret@127.0.0.1:1/x".to_string();
+        let mut storage = test_storage_with_config(temp_dir.path(), config).await;
+        storage.mono_service = MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service: GitService {
+                obj_storage: mock_object_storage(),
+            },
+        };
+        storage
+    }
+
+    async fn initialize_view_reserved_storage(storage: &Storage, mono_config: &MonoConfig) {
+        storage
+            .mono_service
+            .init_monorepo(mono_config)
+            .await
+            .expect("initialize test monorepo");
+    }
+
+    async fn save_view_reserved_ref(storage: &Storage, path: &str, ref_name: &str, is_cl: bool) {
+        storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    path,
+                    ref_name.to_string(),
+                    "a".repeat(40),
+                    "b".repeat(40),
+                    is_cl,
+                ),
+                None,
+            )
+            .await
+            .expect("save view-reserved reference");
+    }
 
     #[test]
     fn test_calculate_db_concurrency_limit() {
@@ -666,6 +851,121 @@ mod tests {
         handle.reload(candidate).expect("reload should apply");
 
         assert_eq!(storage.config().log.level, "debug");
+    }
+
+    #[tokio::test]
+    async fn view_reserved_startup_rejects_conflicts() {
+        let root_tree_temp = tempfile::tempdir().expect("root tree tempdir");
+        let root_tree_storage = storage_for_view_reserved_startup(&root_tree_temp, true).await;
+        let root_tree_config = MonoConfig {
+            root_dirs: vec!["project".to_string(), ".view".to_string()],
+            ..Default::default()
+        };
+        initialize_view_reserved_storage(&root_tree_storage, &root_tree_config).await;
+
+        let error = root_tree_storage
+            .check_view_reserved_startup()
+            .await
+            .expect_err("reserved root tree entry must fail startup");
+        let error = error.to_string();
+        assert!(error.contains("root tree entry \".view\""), "{error}");
+        assert!(error.contains("[views] enabled = false"), "{error}");
+        assert!(error.contains("docs/configuration.md"), "{error}");
+        assert!(error.contains("View reserved names"), "{error}");
+        assert!(!error.contains("hp08-canary-secret"), "{error}");
+
+        let refs_temp = tempfile::tempdir().expect("refs tempdir");
+        let refs_storage = storage_for_view_reserved_startup(&refs_temp, true).await;
+        initialize_view_reserved_storage(&refs_storage, &MonoConfig::default()).await;
+        save_view_reserved_ref(&refs_storage, "/.view", MEGA_BRANCH_NAME, false).await;
+        save_view_reserved_ref(&refs_storage, "/.filter/x", "refs/cl/filter", true).await;
+        save_view_reserved_ref(&refs_storage, ".view/x", "refs/scp/raw", true).await;
+
+        let error = refs_storage
+            .check_view_reserved_startup()
+            .await
+            .expect_err("reserved refs must fail startup")
+            .to_string();
+        for path in ["/.view", "/.filter/x", ".view/x"] {
+            assert!(
+                error.contains(&format!("mega_refs path {path:?}")),
+                "{error}"
+            );
+        }
+        assert!(error.contains("[views] enabled = false"), "{error}");
+        assert!(error.contains("docs/configuration.md"), "{error}");
+        assert!(error.contains("View reserved names"), "{error}");
+        assert!(!error.contains("hp08-canary-secret"), "{error}");
+
+        let unreadable_temp = tempfile::tempdir().expect("unreadable tempdir");
+        let unreadable_storage = storage_for_view_reserved_startup(&unreadable_temp, true).await;
+        initialize_view_reserved_storage(&unreadable_storage, &MonoConfig::default()).await;
+        let root_ref = unreadable_storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .expect("find root ref")
+            .expect("root ref exists");
+        mega_tree::Entity::delete_many()
+            .filter(mega_tree::Column::TreeId.eq(root_ref.ref_tree_hash))
+            .exec(unreadable_storage.mono_storage().get_connection())
+            .await
+            .expect("delete root tree");
+        unreadable_storage
+            .check_view_reserved_startup()
+            .await
+            .expect_err("missing root tree must fail closed");
+
+        let no_root_temp = tempfile::tempdir().expect("no-root tempdir");
+        let no_root_storage = storage_for_view_reserved_startup(&no_root_temp, true).await;
+        save_view_reserved_ref(&no_root_storage, "/.filter/x", "refs/no-root", false).await;
+        let error = no_root_storage
+            .check_view_reserved_startup()
+            .await
+            .expect_err("reserved refs must be scanned without a root tree")
+            .to_string();
+        assert!(error.contains("mega_refs path \"/.filter/x\""), "{error}");
+        assert!(!error.contains("root tree entry"), "{error}");
+        assert!(error.contains("[views] enabled = false"), "{error}");
+        assert!(error.contains("docs/configuration.md"), "{error}");
+        assert!(error.contains("View reserved names"), "{error}");
+        assert!(!error.contains("hp08-canary-secret"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn view_reserved_startup_passes() {
+        let disabled_temp = tempfile::tempdir().expect("disabled tempdir");
+        let disabled_storage = storage_for_view_reserved_startup(&disabled_temp, false).await;
+        let disabled_config = MonoConfig {
+            root_dirs: vec!["project".to_string(), ".view".to_string()],
+            ..Default::default()
+        };
+        initialize_view_reserved_storage(&disabled_storage, &disabled_config).await;
+        save_view_reserved_ref(&disabled_storage, "/.filter/x", "refs/disabled", false).await;
+        disabled_storage
+            .check_view_reserved_startup()
+            .await
+            .expect("disabled views bypass reserved-name startup checks");
+
+        let enabled_temp = tempfile::tempdir().expect("enabled tempdir");
+        let enabled_storage = storage_for_view_reserved_startup(&enabled_temp, true).await;
+        let enabled_config = MonoConfig {
+            root_dirs: vec![
+                ".viewer".to_string(),
+                ".filters".to_string(),
+                ".View".to_string(),
+                "project".to_string(),
+            ],
+            ..Default::default()
+        };
+        initialize_view_reserved_storage(&enabled_storage, &enabled_config).await;
+        for path in ["/project/.view", "/.viewer/x", "/.filters/x", "/.View/x"] {
+            save_view_reserved_ref(&enabled_storage, path, "refs/allowed", false).await;
+        }
+        enabled_storage
+            .check_view_reserved_startup()
+            .await
+            .expect("non-reserved names must be allowed");
     }
 }
 

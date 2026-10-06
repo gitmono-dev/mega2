@@ -130,7 +130,7 @@ HTTP router 在 `server::http_server::app`（`src/server/http_server.rs:681`）�
 - **加载顺序**：`--config` → env `MEGA_CONFIG` → `./config/config.toml` → `$MEGA_BASE_DIR/etc/config.toml` → 生成默认。profile（`--profile` / `MEGA_PROFILE`）是主配置旁的兄弟文件 `config.<profile>.toml`，在 env 覆盖之前合并。
 - **覆盖与严格性**：env 覆盖模式 `MEGA_<SECTION>__<KEY>`；未知字段严格拒绝（残留键按错误处理，不静默忽略）。全部配置键的权威清单在带密集注释的样例 [`../config/config.toml`](../config/config.toml) 与 [`refactoring/config.md`](./refactoring/config.md)，本文不复制。
 - **校验时机**：`Config::validate` 在 `AppContext::new` 与 `config validate` 两条路径都执行，服务启动与 CLI 校验同一套规则。
-- **热加载**：service 命令启动 5s 轮询 watcher（`CONFIG_RELOAD_POLL_INTERVAL`，`src/commands/service/mod.rs:22`），变更经 `ConfigHandle::reload` 处理：白名单字段（`log`、`artifacts_gc`、`buck`、`notification`）即时生效并通知订阅者，其余字段记入 `restart_required_fields` 报告（`src/config/reload.rs:120`）。候选配置先过 `validate` 再应用，应用失败可回滚。
+- **热加载**：service 命令启动 5s 轮询 watcher（`CONFIG_RELOAD_POLL_INTERVAL`，`src/commands/service/mod.rs:22`），变更经 `ConfigHandle::reload` 处理：白名单字段（`log`、`artifacts_gc`、`buck`、`notification`、`views`，其中 `views.enabled` 与 `views.allow_anonymous_register` 需重启）即时生效并通知订阅者，其余字段记入 `restart_required_fields` 报告（`src/config/reload.rs:120`）。候选配置先过 `validate` 再应用，应用失败可回滚。
 
 深入阅读：[`refactoring/config.md`](./refactoring/config.md)（配置分层、SecretRef、热加载契约）。
 

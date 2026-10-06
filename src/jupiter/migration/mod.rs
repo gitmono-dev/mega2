@@ -143,6 +143,7 @@ mod m20261005_000100_add_mst2_publication_request_digest;
 mod m20261005_000100_add_mst2_retention_durability;
 mod m20261005_000200_add_mst2_native_head;
 mod m20261005_000200_harden_mst2_retention_graph;
+mod m20261006_000100_add_view_tables;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -274,13 +275,16 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000200_add_mst2_native_head::Migration),
             Box::new(m20261005_000100_add_mst2_retention_durability::Migration),
             Box::new(m20261005_000200_harden_mst2_retention_graph::Migration),
+            Box::new(m20261006_000100_add_view_tables::Migration),
         ]
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+    use sea_orm::{
+        ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, Set, Statement, TransactionTrait,
+    };
     use sea_orm_migration::prelude::*;
 
     use super::{
@@ -288,8 +292,28 @@ mod tests {
         m20260923_000200_canonicalize_import_repo_paths::{
             self, AliasRewrite, canonicalize_import_repo_paths,
         },
+        m20261006_000100_add_view_tables,
     };
-    use crate::jupiter::{migration::apply_migrations, tests::test_db_connection};
+    use crate::{
+        callisto::{
+            mega_view, mega_view_commit_map, mega_view_filter, mega_view_object,
+            mega_view_object_ref, mega_view_register_log, mega_view_root_chain,
+            mega_view_root_chain_scan,
+        },
+        jupiter::{migration::apply_migrations, tests::test_db_connection},
+    };
+
+    const VIEW_MIGRATION_NAME: &str = "m20261006_000100_add_view_tables";
+    const VIEW_TABLES: [&str; 8] = [
+        "mega_view_filter",
+        "mega_view",
+        "mega_view_root_chain",
+        "mega_view_root_chain_scan",
+        "mega_view_commit_map",
+        "mega_view_object",
+        "mega_view_object_ref",
+        "mega_view_register_log",
+    ];
 
     fn migration_names() -> Vec<String> {
         Migrator::migrations()
@@ -305,6 +329,685 @@ mod tests {
             .unwrap()
             .try_get("", "v")
             .unwrap()
+    }
+
+    async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
+        db.query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "v")
+            .unwrap()
+    }
+
+    async fn catalog_strings(db: &sea_orm::DatabaseConnection, sql: String) -> Vec<String> {
+        db.query_all_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get("", "v").unwrap())
+            .collect()
+    }
+
+    async fn view_db() -> sea_orm::DatabaseConnection {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        db
+    }
+
+    fn view_tables_sql_list() -> String {
+        VIEW_TABLES
+            .iter()
+            .map(|table| format!("'{table}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    async fn view_catalog_snapshot(db: &sea_orm::DatabaseConnection) -> Vec<String> {
+        let tables = view_tables_sql_list();
+        let mut rows = catalog_strings(
+            db,
+            format!(
+                "SELECT 'column|' || table_name || '|' || column_name || '|' || ordinal_position \
+                 || '|' || data_type || '|' || is_nullable || '|' || COALESCE(column_default, '') AS v \
+                 FROM information_schema.columns WHERE table_schema = current_schema() \
+                 AND table_name IN ({tables}) ORDER BY table_name, ordinal_position"
+            ),
+        )
+        .await;
+        rows.extend(
+            catalog_strings(
+                db,
+                format!(
+                    "SELECT 'index|' || tablename || '|' || indexname || '|' || indexdef AS v \
+                     FROM pg_indexes WHERE schemaname = current_schema() \
+                     AND tablename IN ({tables}) ORDER BY tablename, indexname"
+                ),
+            )
+            .await,
+        );
+        rows.extend(
+            catalog_strings(
+                db,
+                format!(
+                    "SELECT 'constraint|' || t.relname || '|' || c.conname || '|' \
+                     || pg_get_constraintdef(c.oid) AS v FROM pg_constraint c \
+                     JOIN pg_class t ON t.oid = c.conrelid \
+                     JOIN pg_namespace n ON n.oid = t.relnamespace \
+                     WHERE n.nspname = current_schema() AND t.relname IN ({tables}) \
+                     ORDER BY t.relname, c.conname"
+                ),
+            )
+            .await,
+        );
+        rows
+    }
+
+    async fn existing_catalog_snapshot(db: &sea_orm::DatabaseConnection) -> Vec<String> {
+        let tables = view_tables_sql_list();
+        let mut rows = catalog_strings(
+            db,
+            format!(
+                "SELECT 'column|' || table_name || '|' || column_name || '|' || ordinal_position \
+                 || '|' || data_type || '|' || is_nullable || '|' || COALESCE(column_default, '') AS v \
+                 FROM information_schema.columns WHERE table_schema = current_schema() \
+                 AND table_name NOT IN ({tables}, 'seaql_migrations') \
+                 ORDER BY table_name, ordinal_position"
+            ),
+        )
+        .await;
+        rows.extend(
+            catalog_strings(
+                db,
+                format!(
+                    "SELECT 'index|' || tablename || '|' || indexname || '|' || indexdef AS v \
+                     FROM pg_indexes WHERE schemaname = current_schema() \
+                     AND tablename NOT IN ({tables}, 'seaql_migrations') \
+                     ORDER BY tablename, indexname"
+                ),
+            )
+            .await,
+        );
+        rows.extend(
+            catalog_strings(
+                db,
+                format!(
+                    "SELECT 'constraint|' || t.relname || '|' || c.conname || '|' \
+                     || pg_get_constraintdef(c.oid) AS v FROM pg_constraint c \
+                     JOIN pg_class t ON t.oid = c.conrelid \
+                     JOIN pg_namespace n ON n.oid = t.relnamespace \
+                     WHERE n.nspname = current_schema() \
+                     AND t.relname NOT IN ({tables}, 'seaql_migrations') \
+                     ORDER BY t.relname, c.conname"
+                ),
+            )
+            .await,
+        );
+        rows
+    }
+
+    async fn view_row_counts(db: &sea_orm::DatabaseConnection) -> Vec<(String, i64)> {
+        let mut counts = Vec::new();
+        for table in VIEW_TABLES {
+            counts.push((
+                table.to_owned(),
+                scalar_i64(db, &format!("SELECT count(*)::bigint AS v FROM {table}")).await,
+            ));
+        }
+        counts
+    }
+
+    #[tokio::test]
+    async fn view_tables_match_design_schema() {
+        let db = view_db().await;
+        let tables = view_tables_sql_list();
+        let actual_columns = catalog_strings(
+            &db,
+            format!(
+                "SELECT table_name || '|' || column_name || '|' || data_type || '|' \
+                 || is_nullable || '|' || CASE WHEN column_default IS NULL THEN 'none' ELSE 'default' END AS v \
+                 FROM information_schema.columns WHERE table_schema = current_schema() \
+                 AND table_name IN ({tables}) ORDER BY table_name, ordinal_position"
+            ),
+        )
+        .await;
+        let mut expected_columns = vec![
+            ("mega_view_filter", "id", "bigint", "NO", "none"),
+            ("mega_view_filter", "filter_id", "text", "NO", "none"),
+            ("mega_view_filter", "canonical_spec", "text", "NO", "none"),
+            ("mega_view_filter", "algo_version", "smallint", "NO", "none"),
+            ("mega_view_filter", "object_format", "text", "NO", "none"),
+            ("mega_view_filter", "src_paths", "jsonb", "NO", "none"),
+            ("mega_view_filter", "push_enabled", "boolean", "NO", "none"),
+            (
+                "mega_view_filter",
+                "projected_seq",
+                "bigint",
+                "NO",
+                "default",
+            ),
+            ("mega_view_filter", "ready_seq", "bigint", "YES", "none"),
+            (
+                "mega_view_filter",
+                "warming_since",
+                "timestamp without time zone",
+                "YES",
+                "none",
+            ),
+            (
+                "mega_view_filter",
+                "last_access_at",
+                "timestamp without time zone",
+                "YES",
+                "none",
+            ),
+            (
+                "mega_view_filter",
+                "created_at",
+                "timestamp without time zone",
+                "NO",
+                "none",
+            ),
+            ("mega_view", "id", "bigint", "NO", "none"),
+            ("mega_view", "name", "text", "NO", "none"),
+            ("mega_view", "version", "integer", "NO", "none"),
+            ("mega_view", "filter_pk", "bigint", "NO", "none"),
+            ("mega_view", "created_by", "text", "NO", "none"),
+            (
+                "mega_view",
+                "created_at",
+                "timestamp without time zone",
+                "NO",
+                "none",
+            ),
+            ("mega_view_root_chain", "seq", "bigint", "NO", "none"),
+            ("mega_view_root_chain", "commit_id", "text", "NO", "none"),
+            ("mega_view_root_chain", "tree_id", "text", "NO", "none"),
+            ("mega_view_root_chain_scan", "pos", "bigint", "NO", "none"),
+            (
+                "mega_view_root_chain_scan",
+                "commit_id",
+                "text",
+                "NO",
+                "none",
+            ),
+            ("mega_view_root_chain_scan", "tree_id", "text", "NO", "none"),
+            (
+                "mega_view_root_chain_scan",
+                "parent_count",
+                "smallint",
+                "NO",
+                "none",
+            ),
+            (
+                "mega_view_root_chain_scan",
+                "first_parent",
+                "text",
+                "YES",
+                "none",
+            ),
+            ("mega_view_commit_map", "filter_pk", "bigint", "NO", "none"),
+            ("mega_view_commit_map", "seq_from", "bigint", "NO", "none"),
+            ("mega_view_commit_map", "view_commit", "text", "YES", "none"),
+            ("mega_view_commit_map", "view_tree", "text", "NO", "none"),
+            ("mega_view_object", "object_id", "text", "NO", "none"),
+            ("mega_view_object", "kind", "smallint", "NO", "none"),
+            ("mega_view_object", "data", "bytea", "NO", "none"),
+            (
+                "mega_view_object",
+                "created_at",
+                "timestamp without time zone",
+                "NO",
+                "none",
+            ),
+            (
+                "mega_view_object",
+                "gc_marked_at",
+                "timestamp without time zone",
+                "YES",
+                "none",
+            ),
+            ("mega_view_object_ref", "filter_pk", "bigint", "NO", "none"),
+            ("mega_view_object_ref", "object_id", "text", "NO", "none"),
+            ("mega_view_register_log", "id", "bigint", "NO", "default"),
+            ("mega_view_register_log", "requester", "text", "NO", "none"),
+            (
+                "mega_view_register_log",
+                "created_at",
+                "timestamp without time zone",
+                "NO",
+                "default",
+            ),
+        ]
+        .into_iter()
+        .map(|(table, column, ty, nullable, default)| {
+            format!("{table}|{column}|{ty}|{nullable}|{default}")
+        })
+        .collect::<Vec<_>>();
+        expected_columns.sort();
+        let mut actual_columns = actual_columns;
+        actual_columns.sort();
+        assert_eq!(actual_columns, expected_columns);
+
+        assert_eq!(
+            catalog_strings(
+                &db,
+                format!(
+                    "SELECT table_name || '|' || column_name || '|' || column_default AS v \
+                     FROM information_schema.columns WHERE table_schema = current_schema() \
+                     AND table_name IN ({tables}) AND column_default IS NOT NULL \
+                     AND NOT (table_name = 'mega_view_register_log' AND column_name = 'id') \
+                     ORDER BY table_name, column_name"
+                ),
+            )
+            .await,
+            vec![
+                "mega_view_filter|projected_seq|0".to_owned(),
+                "mega_view_register_log|created_at|now()".to_owned(),
+            ]
+        );
+        assert_eq!(
+            catalog_strings(
+                &db,
+                "SELECT c.column_default AS v FROM information_schema.columns c \
+                 WHERE c.table_schema = current_schema() \
+                 AND c.table_name = 'mega_view_register_log' AND c.column_name = 'id'"
+                    .to_owned(),
+            )
+            .await,
+            vec!["nextval('mega_view_register_log_id_seq'::regclass)".to_owned()]
+        );
+        assert!(
+            scalar_bool(
+                &db,
+                "SELECT pg_get_serial_sequence('mega_view_register_log', 'id') IS NOT NULL AS v",
+            )
+            .await,
+            "register-log id owns its BIGSERIAL sequence"
+        );
+
+        let mut actual_indexes = catalog_strings(
+            &db,
+            format!(
+                "SELECT t.relname || '|' || CASE WHEN i.indisprimary THEN 'P' \
+                 WHEN i.indisunique THEN 'U' ELSE 'I' END || '|' \
+                 || string_agg(a.attname, ',' ORDER BY key_column.ordinality) AS v \
+                 FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid \
+                 JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 JOIN unnest(i.indkey) WITH ORDINALITY AS key_column(attnum, ordinality) ON true \
+                 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = key_column.attnum \
+                 WHERE n.nspname = current_schema() AND t.relname IN ({tables}) \
+                 GROUP BY t.relname, i.indexrelid, i.indisprimary, i.indisunique \
+                 ORDER BY t.relname, i.indexrelid"
+            ),
+        )
+        .await;
+        actual_indexes.sort();
+        let mut expected_indexes = vec![
+            "mega_view_filter|P|id",
+            "mega_view_filter|U|filter_id",
+            "mega_view|P|id",
+            "mega_view|U|name,version",
+            "mega_view|I|filter_pk",
+            "mega_view_root_chain|P|seq",
+            "mega_view_root_chain|U|commit_id",
+            "mega_view_root_chain_scan|P|pos",
+            "mega_view_commit_map|P|filter_pk,seq_from",
+            "mega_view_commit_map|U|filter_pk,view_commit",
+            "mega_view_object|P|object_id",
+            "mega_view_object_ref|P|filter_pk,object_id",
+            "mega_view_object_ref|I|object_id",
+            "mega_view_register_log|P|id",
+            "mega_view_register_log|I|requester,created_at",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_indexes.sort();
+        assert_eq!(actual_indexes, expected_indexes);
+
+        db.execute_unprepared(
+            "INSERT INTO mega_view_commit_map (filter_pk, seq_from, view_commit, view_tree) \
+             VALUES (1, 1, NULL, 'tree-a'), (1, 2, NULL, 'tree-b')",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn view_tables_have_no_foreign_keys() {
+        let db = view_db().await;
+        assert_eq!(
+            scalar_i64(
+                &db,
+                &format!(
+                    "SELECT count(*)::bigint AS v FROM pg_constraint c \
+                     JOIN pg_class source ON source.oid = c.conrelid \
+                     JOIN pg_namespace source_ns ON source_ns.oid = source.relnamespace \
+                     JOIN pg_class target ON target.oid = c.confrelid \
+                     JOIN pg_namespace target_ns ON target_ns.oid = target.relnamespace \
+                     WHERE c.contype = 'f' AND ((source_ns.nspname = current_schema() \
+                     AND source.relname IN ({})) OR (target_ns.nspname = current_schema() \
+                     AND target.relname IN ({})))",
+                    view_tables_sql_list(),
+                    view_tables_sql_list()
+                ),
+            )
+            .await,
+            0,
+            "view tables do not use foreign keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_tables_migration_up_replays_over_existing_schema() {
+        let db = view_db().await;
+        db.execute_unprepared(
+            "INSERT INTO mega_view_filter \
+             (id, filter_id, canonical_spec, algo_version, object_format, src_paths, push_enabled, created_at) \
+             VALUES (1, 'filter', ':/src', 1, 'sha1', '[]'::jsonb, false, now())",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO mega_view (id, name, version, filter_pk, created_by, created_at) \
+             VALUES (1, 'named', 1, 1, 'token', now())",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO mega_view_root_chain (seq, commit_id, tree_id) VALUES (1, 'commit', 'tree')",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO mega_view_root_chain_scan (pos, commit_id, tree_id, parent_count) \
+             VALUES (1, 'scan-commit', 'scan-tree', 0)",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO mega_view_commit_map (filter_pk, seq_from, view_commit, view_tree) \
+             VALUES (1, 1, 'view-commit', 'view-tree')",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO mega_view_object (object_id, kind, data, created_at) \
+             VALUES ('object', 2, decode('00', 'hex'), now())",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO mega_view_object_ref (filter_pk, object_id) VALUES (1, 'object')",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared("INSERT INTO mega_view_register_log (requester) VALUES ('token')")
+            .await
+            .unwrap();
+
+        let before_catalog = view_catalog_snapshot(&db).await;
+        let before_counts = view_row_counts(&db).await;
+        m20261006_000100_add_view_tables::Migration
+            .up(&SchemaManager::new(&db))
+            .await
+            .unwrap();
+        assert_eq!(view_catalog_snapshot(&db).await, before_catalog);
+        assert_eq!(view_row_counts(&db).await, before_counts);
+    }
+
+    #[tokio::test]
+    async fn view_tables_leave_existing_schema_unchanged() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp.path()).await;
+        let migration_position = migration_names()
+            .iter()
+            .position(|name| name == VIEW_MIGRATION_NAME)
+            .expect("view migration is registered");
+        Migrator::up(&db, Some(migration_position.try_into().unwrap()))
+            .await
+            .unwrap();
+        let before = existing_catalog_snapshot(&db).await;
+
+        Migrator::up(&db, Some(1)).await.unwrap();
+
+        assert_eq!(existing_catalog_snapshot(&db).await, before);
+        assert_eq!(
+            scalar_i64(
+                &db,
+                &format!(
+                    "SELECT count(*)::bigint AS v FROM information_schema.tables \
+                     WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' \
+                     AND table_name IN ({})",
+                    view_tables_sql_list()
+                ),
+            )
+            .await,
+            VIEW_TABLES.len() as i64
+        );
+    }
+
+    fn view_fixture_time() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 6)
+            .unwrap()
+            .and_hms_micro_opt(1, 2, 3, 456_789)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn view_entities_round_trip() {
+        let db = view_db().await;
+        let timestamp = view_fixture_time();
+
+        let filter = mega_view_filter::ActiveModel {
+            id: Set(1),
+            filter_id: Set("filter-id".to_owned()),
+            canonical_spec: Set(":/src".to_owned()),
+            algo_version: Set(1),
+            object_format: Set("sha1".to_owned()),
+            src_paths: Set(serde_json::json!(["/src"])),
+            push_enabled: Set(false),
+            projected_seq: Set(0),
+            ready_seq: Set(None),
+            warming_since: Set(None),
+            last_access_at: Set(None),
+            created_at: Set(timestamp),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            mega_view_filter::Entity::find_by_id(1)
+                .one(&db)
+                .await
+                .unwrap(),
+            Some(filter)
+        );
+
+        let view = mega_view::ActiveModel {
+            id: Set(2),
+            name: Set("agent/task".to_owned()),
+            version: Set(1),
+            filter_pk: Set(1),
+            created_by: Set("token-name".to_owned()),
+            created_at: Set(timestamp),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            mega_view::Entity::find_by_id(2).one(&db).await.unwrap(),
+            Some(view)
+        );
+
+        let root_chain = mega_view_root_chain::ActiveModel {
+            seq: Set(1),
+            commit_id: Set("root-commit".to_owned()),
+            tree_id: Set("root-tree".to_owned()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            mega_view_root_chain::Entity::find_by_id(1)
+                .one(&db)
+                .await
+                .unwrap(),
+            Some(root_chain)
+        );
+
+        let scan = mega_view_root_chain_scan::ActiveModel {
+            pos: Set(1),
+            commit_id: Set("scan-commit".to_owned()),
+            tree_id: Set("scan-tree".to_owned()),
+            parent_count: Set(1),
+            first_parent: Set(Some("parent".to_owned())),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            mega_view_root_chain_scan::Entity::find_by_id(1)
+                .one(&db)
+                .await
+                .unwrap(),
+            Some(scan)
+        );
+
+        let commit_map = mega_view_commit_map::ActiveModel {
+            filter_pk: Set(1),
+            seq_from: Set(1),
+            view_commit: Set(Some("view-commit".to_owned())),
+            view_tree: Set("view-tree".to_owned()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            mega_view_commit_map::Entity::find_by_id((1, 1))
+                .one(&db)
+                .await
+                .unwrap(),
+            Some(commit_map)
+        );
+
+        let object = mega_view_object::ActiveModel {
+            object_id: Set("object-id".to_owned()),
+            kind: Set(2),
+            data: Set(vec![0, 1, 2]),
+            created_at: Set(timestamp),
+            gc_marked_at: Set(None),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            mega_view_object::Entity::find_by_id("object-id")
+                .one(&db)
+                .await
+                .unwrap(),
+            Some(object)
+        );
+
+        let object_ref = mega_view_object_ref::ActiveModel {
+            filter_pk: Set(1),
+            object_id: Set("object-id".to_owned()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            mega_view_object_ref::Entity::find_by_id((1, "object-id".to_owned()))
+                .one(&db)
+                .await
+                .unwrap(),
+            Some(object_ref)
+        );
+
+        let register_log = mega_view_register_log::ActiveModel {
+            id: Default::default(),
+            requester: Set("token-name".to_owned()),
+            created_at: Set(timestamp),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            mega_view_register_log::Entity::find_by_id(register_log.id)
+                .one(&db)
+                .await
+                .unwrap(),
+            Some(register_log)
+        );
+    }
+
+    #[tokio::test]
+    async fn view_tables_migration_rolls_back_and_recovers() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp.path()).await;
+        db.execute_unprepared("CREATE VIEW mega_view_register_log AS SELECT 1 AS id")
+            .await
+            .unwrap();
+
+        assert!(
+            apply_migrations(&db, false).await.is_err(),
+            "the final register-log index must reject a same-named view"
+        );
+        assert_eq!(
+            scalar_i64(
+                &db,
+                &format!(
+                    "SELECT count(*)::bigint AS v FROM information_schema.tables \
+                     WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' \
+                     AND table_name IN ({})",
+                    view_tables_sql_list()
+                ),
+            )
+            .await,
+            0,
+            "the failed migration leaves no partial view tables"
+        );
+        assert!(
+            scalar_bool(
+                &db,
+                &format!(
+                    "SELECT NOT EXISTS (SELECT 1 FROM seaql_migrations \
+                     WHERE version = '{VIEW_MIGRATION_NAME}') AS v"
+                ),
+            )
+            .await,
+            "the failed migration is not recorded"
+        );
+
+        db.execute_unprepared("DROP VIEW mega_view_register_log")
+            .await
+            .unwrap();
+        apply_migrations(&db, false).await.unwrap();
+        assert_eq!(
+            scalar_i64(
+                &db,
+                &format!(
+                    "SELECT count(*)::bigint AS v FROM information_schema.tables \
+                     WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' \
+                     AND table_name IN ({})",
+                    view_tables_sql_list()
+                ),
+            )
+            .await,
+            VIEW_TABLES.len() as i64
+        );
+        assert!(
+            scalar_bool(
+                &db,
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM seaql_migrations \
+                     WHERE version = '{VIEW_MIGRATION_NAME}') AS v"
+                ),
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -485,15 +1188,15 @@ mod tests {
         assert_eq!(
             &names[names.len() - 7..],
             &[
-                "m20260923_000100_import_repo_cleanups".to_string(),
                 "m20260923_000200_canonicalize_import_repo_paths".to_string(),
                 "m20260925_000100_media_paging".to_string(),
                 "m20261005_000100_add_mst2_publication_request_digest".to_string(),
                 "m20261005_000200_add_mst2_native_head".to_string(),
                 "m20261005_000100_add_mst2_retention_durability".to_string(),
                 "m20261005_000200_harden_mst2_retention_graph".to_string(),
+                VIEW_MIGRATION_NAME.to_string(),
             ],
-            "retention durability registered last, after media paging"
+            "native retention and view tables are registered after media paging"
         );
 
         let db = alias_db().await;

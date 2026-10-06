@@ -480,14 +480,11 @@ fn integration_git_ssh_v0_shallow_fetch_resumes_after_shallow_info() {
         "user.email",
         "ssh-shallow@example.invalid",
     ]);
-    fs::remove_file(env.case_dir.join(seed_name).join("project/.gitkeep"))
-        .expect("remove parent-only fixture file");
-    fs::write(
-        env.case_dir.join(seed_name).join("ssh-shallow-tip.txt"),
-        b"only the shallow tip contains this file\n",
-    )
-    .expect("write shallow tip fixture");
-    git_stdout(&["-C", seed_name, "add", "-A"]);
+    // Run both the removal and index update through the selected Git runner.
+    // With the container runner, changing the bind-mounted worktree from the
+    // host and immediately running `git add -A` can expose a stale directory
+    // entry to Git on macOS.
+    git_stdout(&["-C", seed_name, "rm", "project/.gitkeep"]);
     git_stdout(&["-C", seed_name, "commit", "-m", "SSH shallow tip"]);
     let before = ls_remote_cl_refs_ssh(&env.case_dir, &git_ssh, &remote);
     git_stdout(&[

@@ -72,8 +72,9 @@ mega2 --config /etc/mega2/config.toml config secret check redis.url \
 - `artifacts_gc.interval_secs` / `grace_secs` / `batch_limit`；`artifacts_gc.enable` 仅 **true → false** 热生效，false → true 需重启
 - `buck.cleanup_interval` / `completed_retention_days`；`buck.enable_session_cleanup` 仅 **true → false** 热生效，从 false 开启需重启
 - `notification.enabled`（notification 段快照整体热替换；enabled 翻转计入 applied）
+- `views.worker_interval_secs` / `batch_size` / `max_append_walk` / `sync_catch_up_commits` / `max_filters` / `max_concurrent_cold_starts` / `register_rate_per_token`
 
-**其余全部字段**（`database.*`、`redis.url`、`base_dir`、`monorepo.*`、`git.*`、`pack.*`、`lfs.*`、`blame.*`、`object_storage.*`、`oauth.*`、`storage_events.*`、`github_sync.*`、`buck` 上传限额、`vault.audit`、`cedar` 等）变更只记入 `restart_required_fields`，日志可见，快照不更新——需重启进程生效。热加载不会把新密值写回快照，报告里也不出现密值。
+**其余全部字段**（`database.*`、`redis.url`、`base_dir`、`monorepo.*`、`git.*`、`pack.*`、`lfs.*`、`blame.*`、`object_storage.*`、`oauth.*`、`storage_events.*`、`github_sync.*`、`views.enabled`、`views.allow_anonymous_register`、`buck` 上传限额、`vault.audit`、`cedar` 等）变更只记入 `restart_required_fields`，日志可见，快照不更新——需重启进程生效。热加载不会把新密值写回快照，报告里也不出现密值。
 
 ## 4. 分区指南
 
@@ -83,7 +84,8 @@ mega2 --config /etc/mega2/config.toml config secret check redis.url \
 - **`[log]`**：tracing 日志。`level`（trace..error）、`print_std`（生产关）、`with_ansi`（仅 stdout）。全部热加载。
 - **`[database]`**：仅支持 PostgreSQL（`db_type = "postgres"`）。`db_url`、连接池 `max_connection` / `min_connection`、`acquire_timeout` / `connect_timeout`、`sqlx_logging`。凭据用 `MEGA_DATABASE__DB_URL` 注入，不走 Vault SecretRef。
 - **`[monorepo]`**：`import_dir`（默认 `/third-party`，ImportRepo 多分支例外）、`admin`、`root_dirs`（初始化目录）、`object_format`（默认 `sha1`；`sha256` / `blake3` 为 Libra 扩展）、`push_policy`（默认 `trunk`，需显式设置 `git.push_auth`；review 形态示例见 [`config-review.toml`](../config/config-review.toml)）和 `max_push_commits`（trunk 推送链上限）。目录生成细节见 [`manual/monorepo-init.zh.md`](./manual/monorepo-init.zh.md)；完整配置项见 [`config/config.toml`](../config/config.toml)。
-  - **路径校验：**`config validate`、服务启动和热重载候选使用同一套校验，并在失败时指出字段。`root_dirs` 每项必须是唯一的单组件目录名：不得含 `/`、`\` 或 NUL；不得为空、`.` 或 `..`；不得有首尾空格；也不得与保留根条目重名（`.cedar`、`.mega_cedar.json`、`.buckroot`、`.buckconfig`、`.git`，大小写不敏感）。`import_dir` 必须是规范的绝对非根路径，不得有尾斜杠、`//`、`.` 或 `..` 路径段、NUL 或 `\`；其首组件必须列在 `root_dirs` 中。`import_dir` 下的路径始终按 ImportRepo 语义处理，即使 `root_dirs` 中有同名项。`root_dirs` 只在首次初始化时创建目录；之后修改需要重启，也不会增删已初始化仓库的目录。详情见[初始化手册](./manual/monorepo-init.zh.md)。
+  - **路径校验：**`config validate`、服务启动和热重载候选使用同一套校验，并在失败时指出字段。`root_dirs` 每项必须是唯一的单组件目录名：不得含 `/`、`\` 或 NUL；不得为空、`.` 或 `..`；不得有首尾空格；也不得与保留根条目重名（`.cedar`、`.mega_cedar.json`、`.buckroot`、`.buckconfig`、`.git`，大小写不敏感）。`.view`、`.filter` 同样不能作为 `root_dirs` 条目或 `import_dir` 首段，且按大小写精确匹配。`import_dir` 必须是规范的绝对非根路径，不得有尾斜杠、`//`、`.` 或 `..` 路径段、NUL 或 `\`；其首组件必须列在 `root_dirs` 中。`import_dir` 下的路径始终按 ImportRepo 语义处理，即使 `root_dirs` 中有同名项。`root_dirs` 只在首次初始化时创建目录；之后修改需要重启，也不会增删已初始化仓库的目录。详情见[初始化手册](./manual/monorepo-init.zh.md)。
+  - **视图保留名：**`.view`、`.filter` 是视图 URL 保留名，按完整首段与大小写精确匹配；`.viewer`、`.View` 不受影响，且此规则与 `[views].enabled` 无关。路径开通和产品写对首段为它们的路径返回 `MONO_PATH_INVALID`，trunk 形态下创建这类路径的 Git 推送同样被拒绝；review 形态推送不经过这一创建分类，这类路径上已有的 `mega_refs` 行由下述启动检查拦截。视图 URL 入口上线后，此类 Git URL 由视图入口应答，不再进入 Monorepo 分派。`enabled = true` 时，HTTP 与 SSH 在绑定监听前检查根树顶层条目和全部 `mega_refs`（不论 ref 名、是否 CL、path 是否带前导 `/`）；命中或读不到根树即拒绝启动，`enabled = false` 时不检查。冲突错误逐项以 Rust `{:?}` 引号转义列出 `root tree entry "<名字>"` 或 `mega_refs path "<path>"`，并含 `[views] enabled = false`、`docs/configuration.md` 与 `View reserved names`；错误不含任何从配置读取的值。根树或 `mega_refs` 已有冲突没有受支持的移除入口：这类部署只能保持 `enabled = false`，本计划不提供清理 SQL。升级后 `root_dirs` 含 `.view`、`.filter` 的配置会被拒绝，须先改名或移除；已初始化根树不会随配置变更。
 - **`[monorepo.rename]`**：diff 分类的移动 / 改名检测：`similarity_threshold`（0-100）、`rename_limit`（0 = 不限制）。
 - **`[pack]`**：receive-pack 解码资源。`pack_decode_mem_size` / `pack_decode_disk_size`（支持 K/M/G、KiB/MiB 与百分比）、`pack_decode_cache_path`、`clean_cache_after_decode`、`channel_message_size`、`save_entry_concurrency`。
 - **`[lfs]`**：`[lfs.ssh].http_url`（SSH 传输的 href 底座，LFS 文件仍走 HTTP）、`[lfs.local].lfs_file_path`。trunk 下 LFS 鉴权随 `git.push_auth`，见 [`deploy-trunk.md`](./deploy-trunk.md) §6。
@@ -93,6 +95,7 @@ mega2 --config /etc/mega2/config.toml config secret check redis.url \
 - **`[redis]`**：`url`。缓存 / 分布式锁 / snowflake worker 租约等；可作 Vault SecretRef 托管。
 - **`[buck]`**：Buck 上传 API：会话与文件限额（`session_timeout` / `max_file_size` / `max_files` / `max_concurrent_uploads`）、服务端并发限流（`upload_concurrency_limit` / `large_file_concurrency_limit` / `large_file_threshold`）、会话清理任务（`enable_session_cleanup` / `cleanup_interval` / `completed_retention_days`，部分热加载，见第 3 节）。
 - **`[artifacts_gc]`**：无引用 artifact blob 的 GC（`enable` / `interval_secs` / `grace_secs` / `batch_limit`），默认关；运行中调参热加载，从关闭到开启需重启。
+- **`[views]`**：实验功能，用于确定性历史投影，默认关闭。`enabled = true` 要求 `monorepo.push_policy = "trunk"` 与 `monorepo.object_format = "sha1"`；字段与缺省值见 [`config/config.toml`](../config/config.toml)。
 - **`[notification]`**：`enabled` 全局开关（热加载）；可选 `[notification.webhook]` 出站通道（`url` 非密，`token_ref` 为 SecretRef）。行为与边界见 [`refactoring/notification.md`](./refactoring/notification.md)。
 - **`[vault.audit]`**：见第 2 节。
 - **`[cedar]`**：`enforcement = "off" | "shadow" | "enforce"`（ADR-UN-01；默认 off）。trunk 形态必须为 `off`。语义与快照构建见 [`manual/authz.md`](./manual/authz.md)。
@@ -104,7 +107,7 @@ mega2 --config /etc/mega2/config.toml config secret check redis.url \
 
 ## 5. 启动期 fail-closed 校验
 
-`Config::validate` 和 `AppContext::new` 会在启动时拒绝不合规配置。trunk / storage-only 模式的 7 项不变式清单以 [`deploy-trunk.md`](./deploy-trunk.md) §1 为准，包括 `cedar.enforcement = off`、没有未关闭的 CL、`push_queue` 中没有非终态记录、显式设置且与模式匹配的 `push_auth`，以及 `ssh_receive_pack = false`。其他拒绝项包括未知或已移除字段、非法的 `cedar.enforcement` 值、`monorepo.admin` 中的保留匿名主体、在 storage-only 之外启用 `[oci]` / `[agent_capture]` / `[storage_events]`、越界的 `storage_events` 数值、非规范过滤器和不匹配的 SecretRef 命名空间。错误文本遵循 [`errors.md`](./errors.md) 的约定，不包含密钥值。
+`Config::validate` 和 `AppContext::new` 会在启动时拒绝不合规配置。trunk / storage-only 模式的 7 项不变式清单以 [`deploy-trunk.md`](./deploy-trunk.md) §1 为准，包括 `cedar.enforcement = off`、没有未关闭的 CL、`push_queue` 中没有非终态记录、显式设置且与模式匹配的 `push_auth`，以及 `ssh_receive_pack = false`。其他拒绝项包括未知或已移除字段、非法的 `cedar.enforcement` 值、`monorepo.admin` 中的保留匿名主体、在 storage-only 之外启用 `[oci]` / `[agent_capture]` / `[storage_events]`、越界的 `storage_events` 数值、非规范过滤器和不匹配的 SecretRef 命名空间。错误文本遵循 [`errors.md`](./errors.md) 的约定，不包含密钥值。`[views].enabled = true` 时，服务在绑定监听之前还检查保留名 `.view`、`.filter`；见第 4 节「视图保留名」。
 
 ## 6. `config validate`
 

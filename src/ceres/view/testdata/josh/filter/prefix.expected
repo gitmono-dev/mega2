@@ -1,0 +1,12 @@
+git log --graph:
+* seq=1 ac2305b93413de7b063ec3c7b2cb73e71bb50117
+tree list:
+root-seq=1
+seq=1
+commit=ac2305b93413de7b063ec3c7b2cb73e71bb50117
+tree=3896414667f29401d2840eabe83a21e1ec81603f
+bytes=tree 3896414667f29401d2840eabe83a21e1ec81603f
+author Alice <alice@example.com> 1 +0000
+committer Bob <bob@example.com> 2 +0000
+
+message
