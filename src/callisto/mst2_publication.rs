@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
     pub id: i64,
-    /// Deterministic writer-side operation id (e.g. push old→new).
+    /// Server-assigned writer identity (e.g. `mst2:trunk-queue:<row id>`).
     pub operation_id: String,
     /// Namespace path this publication advances (e.g. "/").
     pub namespace: String,
@@ -29,6 +29,12 @@ pub struct Model {
     pub writer_epoch: i64,
     /// `trunk_push` | `web_edit` | `import` | … (spec 09 §5 writer matrix).
     pub writer_kind: String,
+    /// Missing on legacy receipts; never reconstructed from current refs.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub request_digest: Option<String>,
+    pub request_digest_version: Option<i32>,
+    /// NULL preserves historical path-only receipts; version 1 requires its certificate.
+    pub native_certificate_version: Option<i32>,
     pub created_at: DateTimeWithTimeZone,
 }
 

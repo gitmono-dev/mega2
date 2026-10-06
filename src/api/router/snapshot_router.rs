@@ -16,6 +16,7 @@ use axum::{
 use base64::Engine;
 use bytes::Bytes;
 use mst2_codec::descriptor;
+use request::Mst2Bytes;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -73,6 +74,13 @@ pub fn routers(api_state: MonoApiServiceState) -> Router<MonoApiServiceState> {
 #[path = "snapshot_content.rs"]
 mod content;
 
+#[path = "snapshot_request.rs"]
+mod request;
+
+#[cfg(test)]
+#[path = "snapshot_request_tests.rs"]
+mod request_tests;
+
 /// Spec 14 §4: JSON request bytes hard limit.
 pub(crate) const JSON_REQUEST_LIMIT: usize = 131_072;
 
@@ -110,6 +118,22 @@ tokio::task_local! {
     static REQUEST_ID: String;
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static NATIVE_RESOLVE_BARRIERS: (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+}
+
+#[cfg(test)]
+pub(crate) async fn with_native_resolve_barriers<F: std::future::Future>(
+    captured: std::sync::Arc<tokio::sync::Barrier>,
+    release: std::sync::Arc<tokio::sync::Barrier>,
+    future: F,
+) -> F::Output {
+    NATIVE_RESOLVE_BARRIERS
+        .scope((captured, release), future)
+        .await
+}
+
 /// The request id of the in-flight request, for error envelopes.
 pub(crate) fn current_request_id() -> String {
     REQUEST_ID.try_with(|id| id.clone()).unwrap_or_default()
@@ -125,28 +149,36 @@ const LEASE_HEADER: &str = "x-mega-snapshot-lease";
 /// knowing the snapshot id alone is not a capability.
 async fn snapshot_auth_middleware(
     State(state): State<MonoApiServiceState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    // Same id the global trace layer echoes on responses and logs.
+    // Nested routes may be added after the server's trace layer. Reuse an
+    // existing context or establish one here, including rejection responses.
     let id = req
         .extensions()
         .get::<crate::server::trace_context::TraceContext>()
-        .map(|c| c.trace_id.to_string())
-        .unwrap_or_default();
-    REQUEST_ID
-        .scope(id, async {
+        .map(|c| c.trace_id.clone())
+        .unwrap_or_else(|| crate::server::trace_context::resolve_trace_id(req.headers()));
+    req.extensions_mut()
+        .insert(crate::server::trace_context::TraceContext {
+            trace_id: id.clone(),
+        });
+    let mut response = REQUEST_ID
+        .scope(id.to_string(), async {
             if let Some(res) = auth_error(&state, req.headers(), req.uri().path()) {
                 return res;
             }
             next.run(req).await
         })
-        .await
+        .await;
+    if let Ok(value) = HeaderValue::from_str(&id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
 }
 
-/// Spec 14 §4 enforcement with the MST/2 error envelope (DefaultBodyLimit's
-/// own rejection is plain-text). Content-Length is checked here; a lying
-/// chunked body still trips DefaultBodyLimit inside the extractor.
+/// Reject an oversized declared length before consuming any body. Actual
+/// bytes and the overall read deadline are checked by `Mst2Bytes`.
 async fn reject_oversize_body(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -170,12 +202,14 @@ async fn reject_oversize_body(
 /// (spec 14 §5 INVALID_REQUEST). Size is enforced by the router layers.
 #[allow(clippy::result_large_err)]
 pub(crate) fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
-    serde_json::from_slice(body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::InvalidRequest,
-            format!("malformed request body: {e}"),
-        ))
-    })
+    request::validate_json_keys(body)
+        .and_then(|()| serde_json::from_slice(body))
+        .map_err(|e| {
+            mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                format!("malformed request body: {e}"),
+            ))
+        })
 }
 
 /// Bearer-token check shared by the auth middleware; the parsing rule is the
@@ -244,7 +278,9 @@ fn mst2_error_response(err: SnapshotError) -> Response {
                 "request_id": current_request_id(),
                 "retryable": matches!(
                     err.code,
-                    SnapshotErrorCode::SnapshotNotReady | SnapshotErrorCode::Internal
+                    SnapshotErrorCode::SnapshotNotReady
+                        | SnapshotErrorCode::TemporaryUnavailable
+                        | SnapshotErrorCode::Internal
                 ),
             }
         })),
@@ -255,6 +291,12 @@ fn mst2_error_response(err: SnapshotError) -> Response {
 impl From<SnapshotError> for Response {
     fn from(err: SnapshotError) -> Self {
         mst2_error_response(err)
+    }
+}
+
+impl IntoResponse for SnapshotError {
+    fn into_response(self) -> Response {
+        mst2_error_response(self)
     }
 }
 
@@ -347,7 +389,10 @@ fn ensure_enabled(state: &MonoApiServiceState) -> Result<(), SnapshotError> {
 // `lfs_router::enforce_lfs_access` (where the error is the rare arm and is
 // boxed), there is nothing to gain here, so the lint is allowed outright.
 #[allow(clippy::result_large_err)]
-async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Response, Response> {
+async fn resolve(
+    state: State<MonoApiServiceState>,
+    Mst2Bytes(body): Mst2Bytes,
+) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: ResolveRequest = parse_json_body(&body)?;
     // Unknown target kinds are client errors, never a silent fallback to
@@ -377,21 +422,61 @@ async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Respo
         ))
     })?;
 
-    // Fix the view on exactly one commit read; nothing below may re-read refs.
-    let main = state
-        .storage
-        .mono_storage()
-        .get_main_ref("/")
-        .await
-        .map_err(internal)?
-        .ok_or_else(|| {
-            mst2_error_response(SnapshotError::new(
+    let config = state.storage.config();
+    let (commit_oid, tree_oid, sequence, writer_epoch) = if config.mst2.publication_enabled {
+        let Some(instance) = config.mst2.instance_uuid.as_deref() else {
+            return Err(mst2_error_response(SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
-                "monorepo main ref missing; run service init",
-            ))
-        })?;
-    let commit_oid = main.ref_commit_hash.clone();
-    let tree_oid = main.ref_tree_hash.clone();
+                "native publication instance missing",
+            )));
+        };
+        let head = state
+            .storage
+            .mono_storage()
+            .read_native_publication_head(instance)
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "native publication observation failed");
+                mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "native publication is not ready",
+                ))
+            })?;
+        (
+            head.root.commit,
+            head.root.tree,
+            head.token.sequence.to_string(),
+            head.token.epoch.to_string(),
+        )
+    } else {
+        let main = state
+            .storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "monorepo main ref missing",
+                ))
+            })?;
+        let sequence = runtime()
+            .publication_sequence(&main.ref_commit_hash)
+            .to_string();
+        (
+            main.ref_commit_hash,
+            main.ref_tree_hash,
+            sequence,
+            "1".to_owned(),
+        )
+    };
+
+    #[cfg(test)]
+    if let Ok((captured, release)) = NATIVE_RESOLVE_BARRIERS.try_with(|value| value.clone()) {
+        captured.wait().await;
+        release.wait().await;
+    }
     let view = SnapshotView::from_commit(&commit_oid, &tree_oid);
     if let Some(want) = &req.target.view_id {
         let kind_matches = req.target.kind == "view";
@@ -417,43 +502,16 @@ async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Respo
         .await
         .map_err(mst2_error_response)?;
 
-    let built = build_descriptor(
-        &state.storage.config().mst2,
-        &view,
-        &req.scope,
-        scope_page.page_id,
-    )
-    .map_err(mst2_error_response)?;
-    let ctx = runtime().insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds);
-    // Publication identity: with T05 enabled the sequence is the durable
-    // per-namespace counter written atomically with the ref CAS; a read
-    // failure there is surfaced rather than silently falling back, because
-    // the sequence is what binds a client to a version. When publication is
-    // disabled the provisional per-tip counter is the honest answer.
-    //
-    // Namespace note: the counter is keyed on the writer's repo path, and
-    // resolve maps the request scope onto it. That mapping is the identity
-    // only while a scope names one native namespace (true for the default
-    // scope and for deployments without composite bindings); the general
-    // scope→namespace map arrives with the T04 binding layer (see
-    // ISSUES.md ISS-01/ISS-06).
-    let seq = if state.storage.config().mst2.publication_enabled {
-        let namespace = state.storage.mono_storage().normalize_namespace(&req.scope);
-        let durable = state
-            .storage
-            .mono_storage()
-            .publication_sequence(&namespace)
-            .await
-            .map_err(internal)?;
-        durable.to_string()
-    } else {
-        runtime().publication_sequence(&commit_oid).to_string()
-    };
+    let built = build_descriptor(&config.mst2, &view, &req.scope, scope_page.page_id)
+        .map_err(mst2_error_response)?;
+    let ctx = runtime()
+        .insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds)
+        .map_err(mst2_error_response)?;
 
     let body = json!({
         "descriptor": descriptor_json(&built),
-        "publication_sequence": seq.to_string(),
-        "writer_epoch": "1",
+        "publication_sequence": sequence,
+        "writer_epoch": writer_epoch,
         "lease_id": ctx.lease_id,
         "lease_expires_at": crate::ceres::snapshot::runtime::rfc3339(ctx.lease_expires_at_unix),
         "authorization_epoch": "1",
@@ -511,18 +569,13 @@ struct RenewRequest {
 async fn lease_renew(
     state: State<MonoApiServiceState>,
     AxumPath(lease_id): AxumPath<String>,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: RenewRequest = if body.is_empty() {
         RenewRequest::default()
     } else {
-        serde_json::from_slice(&body).map_err(|e| {
-            mst2_error_response(SnapshotError::new(
-                SnapshotErrorCode::ScopeInvalid,
-                format!("malformed renew body: {e}"),
-            ))
-        })?
+        parse_json_body(&body)?
     };
     let renewed = runtime()
         .renew_lease(&lease_id, req.lease_seconds.unwrap_or(600))
@@ -882,7 +935,7 @@ async fn lookup(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     _headers: HeaderMap,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: LookupRequest = parse_json_body(&body)?;
@@ -1039,7 +1092,7 @@ async fn metadata_pages(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     _headers: HeaderMap,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: MetadataPagesRequest = parse_json_body(&body)?;
