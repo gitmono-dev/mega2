@@ -60,6 +60,7 @@ pub mod mega_webhook_delivery;
 pub mod mega_webhook_event_type;
 pub mod mst2_publication;
 pub mod mst2_publication_outbox;
+pub mod mst2_queue_noop_receipt;
 pub mod mst2_retention_edge;
 pub mod mst2_retention_gc_op;
 pub mod mst2_retention_node;
