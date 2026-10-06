@@ -15,6 +15,7 @@ use super::{
     secret::{SecretRef, SecretResolver, is_secret_ref_value},
 };
 use crate::{
+    ceres::view::VIEW_URL_RESERVED_NAMES,
     common::{
         errors::MegaError, oci_name::valid_repository_name, utils::canonicalize_mono_ref_path,
     },
@@ -512,7 +513,10 @@ fn validate_monorepo_path_shape(root_dirs: &[String], import_dir: &Path) -> Resu
                 "{field} must not have leading or trailing whitespace; got {name:?}"
             )));
         }
-        if INIT_ROOT_RESERVED_NAMES.contains(&name.as_str()) || name.eq_ignore_ascii_case(".git") {
+        if INIT_ROOT_RESERVED_NAMES.contains(&name.as_str())
+            || VIEW_URL_RESERVED_NAMES.contains(&name.as_str())
+            || name.eq_ignore_ascii_case(".git")
+        {
             return Err(MegaError::Other(format!(
                 "{field} {name:?} is reserved for the root tree"
             )));
@@ -538,6 +542,11 @@ fn validate_monorepo_path_shape(root_dirs: &[String], import_dir: &Path) -> Resu
         )));
     }
     let first = import_dir[1..].split('/').next().unwrap_or_default();
+    if VIEW_URL_RESERVED_NAMES.contains(&first) {
+        return Err(MegaError::Other(format!(
+            "{field} first component {first:?} is reserved for view URLs"
+        )));
+    }
     if !root_dirs.iter().any(|name| name == first) {
         return Err(MegaError::Other(format!(
             "{field} first component {first:?} must be listed in monorepo.root_dirs"
@@ -3104,6 +3113,45 @@ mod tests {
             config.monorepo.import_dir = PathBuf::from(import_dir);
             validate_monorepo_config(&config.monorepo)
                 .unwrap_or_else(|err| panic!("{import_dir:?} must validate: {err}"));
+        }
+    }
+
+    #[test]
+    fn view_reserved_names_rejected() {
+        for enabled in [false, true] {
+            for reserved in crate::ceres::view::VIEW_URL_RESERVED_NAMES {
+                let mut config = storage_only_none();
+                config.views.enabled = enabled;
+                config.monorepo.root_dirs = vec!["third-party".to_string(), reserved.to_string()];
+                config.monorepo.import_dir = PathBuf::from("/third-party");
+                let err = config
+                    .validate()
+                    .expect_err("reserved root directory must be rejected")
+                    .to_string();
+                assert!(err.contains("monorepo.root_dirs[1]"), "{reserved}: {err}");
+                assert!(err.contains("reserved"), "{reserved}: {err}");
+
+                let mut config = storage_only_none();
+                config.views.enabled = enabled;
+                config.monorepo.root_dirs = vec!["third-party".to_string()];
+                config.monorepo.import_dir = PathBuf::from(format!("/{reserved}/vendor"));
+                let err = config
+                    .validate()
+                    .expect_err("reserved import-directory first component must be rejected")
+                    .to_string();
+                assert!(err.contains("monorepo.import_dir"), "{reserved}: {err}");
+                assert!(err.contains("reserved"), "{reserved}: {err}");
+            }
+
+            let mut config = storage_only_none();
+            config.views.enabled = enabled;
+            config.monorepo.root_dirs = ["third-party", ".viewer", ".filters", ".View"]
+                .map(str::to_string)
+                .to_vec();
+            config.monorepo.import_dir = PathBuf::from("/third-party/.view");
+            config
+                .validate()
+                .expect("near-match names and a non-leading segment must remain valid");
         }
     }
 

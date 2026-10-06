@@ -152,6 +152,7 @@ not split entries on `/` to create nested directories. The validator rejects
 entries containing `/`, `\`, or NUL; empty entries, `.` and `..`; leading or
 trailing spaces; duplicates; and reserved root names (`.cedar`,
 `.mega_cedar.json`, `.buckroot`, `.buckconfig`, and `.git`, case-insensitive).
+`.view` and `.filter` are exact-case view URL reserved names (unlike case-insensitive `.git`) and are also rejected.
 It also requires `import_dir` to be a canonical absolute non-root path without
 a trailing slash, `//`, `.` or `..` segments, NUL, or `\`. Its first
 component must be in `root_dirs`; for example, `root_dirs = ["project"]` with

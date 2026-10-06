@@ -55,7 +55,7 @@ storage-only **不暴露 SSH receive-pack**(`git.ssh_receive_pack=false` 是强�
 
 本节是「在 Monorepo 中建一个新路径」的唯一权威说明；快速开始、README 与初始化手册都链接到这里。
 
-**允许的根。**`[monorepo].root_dirs` 列出的一级目录（取值见 [`config/config.toml`](../config/config.toml)，形状规则见[配置指南](./configuration.zh.md)）是「创建」白名单：新路径只能建在某个根之下。`import_dir`（默认 `/third-party`）之下的路径是 ImportRepo（见第 1 节），由 Git 推送直接创建，不适用本节，其更新与清理见第 2.6 节。新增一级根要改配置并重启服务；此后该根还不在根树中，只有在已有历史之上新增 commit 的推送能创建它——开通与产品写都不在 `/` 落地。
+**允许的根。**`[monorepo].root_dirs` 列出的一级目录（取值见 [`config/config.toml`](../config/config.toml)，形状规则见[配置指南](./configuration.zh.md)）是「创建」白名单：新路径只能建在某个根之下；`.view`、`.filter` 是按大小写精确匹配的保留名，不能用作一级目录。`import_dir`（默认 `/third-party`）之下的路径是 ImportRepo（见第 1 节），由 Git 推送直接创建，不适用本节，其更新与清理见第 2.6 节。新增一级根要改配置并重启服务；此后该根还不在根树中，只有在已有历史之上新增 commit 的推送能创建它——开通与产品写都不在 `/` 落地。
 
 **第一次推送到新路径。**目标路径已经存在时（已被推送、开通或 API 写入过），按第 2.1 节的规则推送即可。目标路径尚不存在时，trunk 模式按下表处理；表中两种路径策略拒绝在原样重试时保持不变：
 
@@ -78,7 +78,7 @@ storage-only **不暴露 SSH receive-pack**(`git.ssh_receive_pack=false` 是强�
 
 - `MONO_PATH_NOT_ALLOWED`：改用允许的根之下的路径（开通，以及没有存活 ImportRepo 处的产品写，对 `import_dir` 之下的路径也返回此码）。
 - `MONO_PATH_UNINITIALIZED`：先开通该路径。
-- `MONO_PATH_INVALID`：改用规范路径（绝对路径，不含 `.` / `..`、重复或末尾的 `/`）。
+- `MONO_PATH_INVALID`：改用规范路径（绝对路径，不含 `.` / `..`、重复或末尾的 `/`）；首段为 `.view` 或 `.filter` 的路径也得到此码，路径开通、产品写与 trunk 下创建该路径的推送均会拒绝。
 - `MONO_PATH_CONFLICT`：路径上的某一级已是文件，换一个路径（只由开通返回，API 与 CLI 均然）。
 
 ### 2.6 ImportRepo 生命周期

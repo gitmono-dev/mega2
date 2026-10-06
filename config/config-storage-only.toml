@@ -154,6 +154,8 @@ admin = ["mega2"]
 # 每项为唯一的单组件目录名:不含 '/'、'\' 或 NUL,不能是 '.'、'..' 或空串,无首尾
 # 空格,且不能是根树保留项(.cedar、.mega_cedar.json、.buckroot、.buckconfig、.git),
 # 否则校验失败.
+# .view and .filter are reserved view URL names; exact-case matches are rejected.
+# .view 和 .filter 是视图 URL 保留名，按大小写精确匹配时同样拒绝。
 root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
 
 # Object-ID hash for the repo graph / 仓库图的 Object-ID 哈希.

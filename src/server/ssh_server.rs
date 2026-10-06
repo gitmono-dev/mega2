@@ -77,6 +77,8 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
         ));
     }
 
+    ctx.storage.check_view_reserved_startup().await?;
+
     let state = ProtocolApiState {
         storage: ctx.storage.clone(),
         git_object_cache: Arc::new(GitObjectCache {
