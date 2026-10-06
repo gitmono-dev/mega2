@@ -13,6 +13,40 @@ use crate::{
 
 const ROOT_CHAIN_SEGMENT_ROWS: usize = 10_000;
 
+/// A self-contained expression readers can embed in their snapshot query.
+/// It preserves the ordered root-chain decision: an anchored scan row is
+/// halted only when it is no longer the chain tail; otherwise the three
+/// terminal scan shapes are checked in order.
+pub(crate) const ROOT_CHAIN_HALTED_SQL: &str = r#"(
+    COALESCE((
+        SELECT CASE
+            WHEN EXISTS (
+                SELECT 1 FROM mega_view_root_chain chain
+                WHERE chain.commit_id = scan.commit_id
+            ) THEN NOT EXISTS (
+                SELECT 1 FROM mega_view_root_chain tail
+                WHERE tail.commit_id = scan.commit_id
+                  AND tail.seq = (SELECT max(seq) FROM mega_view_root_chain)
+            )
+            WHEN scan.parent_count = 0 THEN EXISTS (
+                SELECT 1 FROM mega_view_root_chain
+            )
+            WHEN scan.parent_count > 1 THEN TRUE
+            WHEN NOT EXISTS (
+                SELECT 1 FROM mega_commit parent
+                WHERE parent.commit_id = scan.first_parent
+            ) THEN TRUE
+            ELSE FALSE
+        END
+        FROM (
+            SELECT commit_id, parent_count, first_parent
+            FROM mega_view_root_chain_scan
+            ORDER BY pos DESC
+            LIMIT 1
+        ) scan
+    ), FALSE)
+)"#;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiscontinuityReason {
     RolledBack,
@@ -66,6 +100,23 @@ enum ScanState {
 }
 
 impl ViewStorage {
+    /// Evaluates the persisted root-chain stop condition without taking the
+    /// root-chain advisory lock. Callers may embed [`ROOT_CHAIN_HALTED_SQL`]
+    /// in a larger read snapshot when they also need other state.
+    pub(crate) async fn root_chain_halted(&self) -> Result<bool, MegaError> {
+        let row = self
+            .get_connection()
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT {ROOT_CHAIN_HALTED_SQL} AS halted"),
+            ))
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other("root-chain halted query returned no row".to_owned())
+            })?;
+        Ok(row.try_get("", "halted")?)
+    }
+
     pub async fn extend_root_chain(
         &self,
         budget: Option<usize>,
@@ -546,7 +597,10 @@ async fn insert_segment(
 mod tests {
     use std::{
         io::Write,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -587,6 +641,25 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum RootDiscontinuityCase {
+        RolledBack,
+        Forked,
+        UnrelatedHistory,
+        MultiParent,
+        MissingFirstParent,
+    }
+
+    impl RootDiscontinuityCase {
+        const ALL: [Self; 5] = [
+            Self::RolledBack,
+            Self::Forked,
+            Self::UnrelatedHistory,
+            Self::MultiParent,
+            Self::MissingFirstParent,
+        ];
+    }
+
     async fn append_history(
         db: &DatabaseConnection,
         parent: &RootCommitFixture,
@@ -608,6 +681,106 @@ mod tests {
             commits.push(commit);
         }
         commits
+    }
+
+    async fn prepare_discontinuity(
+        db: &DatabaseConnection,
+        storage: &ViewStorage,
+        case: RootDiscontinuityCase,
+        history_len: usize,
+    ) -> (
+        Vec<RootCommitFixture>,
+        RootCommitFixture,
+        DiscontinuityReason,
+    ) {
+        assert!(
+            history_len >= 3,
+            "a discontinuity fixture needs three commits"
+        );
+        let history = seed_linear_root_history(db, history_len).await;
+        run_to_caught_up(storage, history_len.saturating_mul(3)).await;
+        let tail = history.last().unwrap().clone();
+        let (active, expected) = match case {
+            RootDiscontinuityCase::RolledBack => {
+                (history[2].clone(), DiscontinuityReason::RolledBack)
+            }
+            RootDiscontinuityCase::Forked => {
+                let fork = seed_single_parent_root_commit_with_tree(
+                    db,
+                    HashKind::Sha1,
+                    fixture_tree("hp28-fork"),
+                    &history[2],
+                    "HP-28 fork",
+                )
+                .await;
+                (fork, DiscontinuityReason::Forked)
+            }
+            RootDiscontinuityCase::UnrelatedHistory => {
+                let root = seed_unrelated_root_history_with_tree(
+                    db,
+                    HashKind::Sha1,
+                    fixture_tree("hp28-unrelated-root"),
+                )
+                .await;
+                let extension = append_history(db, &root, history_len - 1, "hp28-unrelated").await;
+                (
+                    extension.last().unwrap().clone(),
+                    DiscontinuityReason::UnrelatedHistory,
+                )
+            }
+            RootDiscontinuityCase::MultiParent => {
+                let merge = seed_multi_parent_root_commit_with_tree(
+                    db,
+                    HashKind::Sha1,
+                    fixture_tree("hp28-merge"),
+                    &tail,
+                    &history[history_len - 2],
+                )
+                .await;
+                (merge, DiscontinuityReason::MultiParent)
+            }
+            RootDiscontinuityCase::MissingFirstParent => {
+                let missing_parent = Blob::from_content_with_kind(HashKind::Sha1, "hp28-absent")
+                    .unwrap()
+                    .id;
+                let missing = seed_missing_first_parent_root_commit_with_tree(
+                    db,
+                    HashKind::Sha1,
+                    fixture_tree("hp28-missing"),
+                    missing_parent,
+                )
+                .await;
+                (missing, DiscontinuityReason::MissingFirstParent)
+            }
+        };
+        assert!(cas_fixture_main(db, &tail, &active).await);
+        assert_eq!(
+            storage
+                .extend_root_chain(None, 3, ViewLockMode::Try)
+                .await
+                .unwrap(),
+            RootChainOutcome::Discontinuous(expected),
+            "failed to prepare {case:?}"
+        );
+        (history, active, expected)
+    }
+
+    async fn clear_scan(db: &DatabaseConnection) {
+        db.execute_unprepared("DELETE FROM mega_view_root_chain_scan")
+            .await
+            .unwrap();
+    }
+
+    async fn halted_from_sql(db: &DatabaseConnection) -> bool {
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT {ROOT_CHAIN_HALTED_SQL} AS halted"),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        row.try_get("", "halted").unwrap()
     }
 
     fn new_view_storage(db: Arc<DatabaseConnection>) -> ViewStorage {
@@ -645,6 +818,23 @@ mod tests {
         let (config, schema) = test_db_config(temp.path()).await;
         let db = Arc::new(database_connection(&config).await.unwrap());
         (config, schema, db)
+    }
+
+    async fn counted_empty() -> (
+        DbConfig,
+        TestSchemaGuard,
+        Arc<DatabaseConnection>,
+        Arc<AtomicUsize>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, schema) = test_db_config(temp.path()).await;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let callback_counter = counter.clone();
+        let mut db = database_connection(&config).await.unwrap();
+        db.set_metric_callback(move |_| {
+            callback_counter.fetch_add(1, Ordering::Relaxed);
+        });
+        (config, schema, Arc::new(db), counter)
     }
 
     async fn open_view_storage(config: &DbConfig) -> (Arc<DatabaseConnection>, ViewStorage) {
@@ -1443,6 +1633,415 @@ mod tests {
             ),
         ]);
         assert_eq!(root_chain(&db).await, expected_after_first_segment);
+    }
+
+    #[tokio::test]
+    async fn discontinuity_persists_across_pools() {
+        for case in RootDiscontinuityCase::ALL {
+            let (config, _schema, first_db) = configured_empty().await;
+            let first_storage = new_view_storage(first_db.clone());
+            let (_, _, expected) =
+                prepare_discontinuity(first_db.as_ref(), &first_storage, case, 6).await;
+            close_view_storage(first_db, first_storage).await;
+
+            let (resumed_db, resumed_storage) = open_view_storage(&config).await;
+            assert_eq!(
+                resumed_storage
+                    .extend_root_chain(None, 3, ViewLockMode::Try)
+                    .await
+                    .unwrap(),
+                RootChainOutcome::Discontinuous(expected),
+                "restart must preserve {case:?}"
+            );
+            close_view_storage(resumed_db, resumed_storage).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn discontinuity_writes_nothing() {
+        for case in RootDiscontinuityCase::ALL {
+            let temp = tempfile::tempdir().unwrap();
+            let db = test_db_connection(temp.path()).await;
+            apply_migrations(&db, true).await.unwrap();
+            let storage = new_view_storage(Arc::new(db.clone()));
+            let (_, mut active, expected) = prepare_discontinuity(&db, &storage, case, 6).await;
+            let roots_before = root_chain(&db).await;
+            let scan_before = scan_chain(&db).await;
+
+            for call in 0..3 {
+                if call == 1 {
+                    let descendant = seed_single_parent_root_commit_with_tree(
+                        &db,
+                        HashKind::Sha1,
+                        fixture_tree("hp28-frozen-scan"),
+                        &active,
+                        "HP-28 main advancement after halt",
+                    )
+                    .await;
+                    assert!(cas_fixture_main(&db, &active, &descendant).await);
+                    active = descendant;
+                }
+                assert_eq!(
+                    storage
+                        .extend_root_chain(None, 3, ViewLockMode::Try)
+                        .await
+                        .unwrap(),
+                    RootChainOutcome::Discontinuous(expected),
+                    "halted state changed for {case:?}"
+                );
+                assert_eq!(root_chain(&db).await, roots_before);
+                assert_eq!(scan_chain(&db).await, scan_before);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn halted_true_after_discontinuity() {
+        for case in RootDiscontinuityCase::ALL {
+            let (config, _schema, holder_db) = configured_empty().await;
+            let holder_storage = new_view_storage(holder_db.clone());
+            prepare_discontinuity(holder_db.as_ref(), &holder_storage, case, 6).await;
+            let (observer_db, observer_storage) = open_view_storage(&config).await;
+
+            assert!(observer_storage.root_chain_halted().await.unwrap());
+            assert!(halted_from_sql(observer_db.as_ref()).await);
+
+            let holder = holder_db.begin().await.unwrap();
+            assert!(
+                acquire_view_lock(&holder, ViewLock::RootChain, ViewLockMode::Try)
+                    .await
+                    .unwrap()
+            );
+            let contender = observer_db.begin().await.unwrap();
+            assert!(
+                !acquire_view_lock(&contender, ViewLock::RootChain, ViewLockMode::Try)
+                    .await
+                    .unwrap()
+            );
+            contender.rollback().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), observer_storage.root_chain_halted())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "unlocked reader did not observe {case:?}"
+            );
+            holder.rollback().await.unwrap();
+            close_view_storage(observer_db, observer_storage).await;
+            close_view_storage(holder_db, holder_storage).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_scan_relinks_after_restore() {
+        for case in RootDiscontinuityCase::ALL {
+            let temp = tempfile::tempdir().unwrap();
+            let db = test_db_connection(temp.path()).await;
+            apply_migrations(&db, true).await.unwrap();
+            let storage = new_view_storage(Arc::new(db.clone()));
+            let (mut history, active, _) = prepare_discontinuity(&db, &storage, case, 6).await;
+            let recovered = append_history(&db, history.last().unwrap(), 2, "hp28-recovered").await;
+            assert!(cas_fixture_main(&db, &active, recovered.last().unwrap()).await);
+            clear_scan(&db).await;
+
+            assert_eq!(
+                storage
+                    .extend_root_chain(None, 3, ViewLockMode::Try)
+                    .await
+                    .unwrap(),
+                RootChainOutcome::CaughtUp,
+                "restored history did not relink for {case:?}"
+            );
+            history.extend(recovered);
+            assert_root_chain_matches(&db, &history).await;
+            assert!(!storage.root_chain_halted().await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_scan_without_restore_halts_again() {
+        for case in RootDiscontinuityCase::ALL {
+            let temp = tempfile::tempdir().unwrap();
+            let db = test_db_connection(temp.path()).await;
+            apply_migrations(&db, true).await.unwrap();
+            let storage = new_view_storage(Arc::new(db.clone()));
+            let (_, _, expected) = prepare_discontinuity(&db, &storage, case, 6).await;
+            clear_scan(&db).await;
+            assert_eq!(
+                storage
+                    .extend_root_chain(None, 3, ViewLockMode::Try)
+                    .await
+                    .unwrap(),
+                RootChainOutcome::Discontinuous(expected),
+                "clearing a scan silently repaired {case:?}"
+            );
+            assert!(storage.root_chain_halted().await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn halted_statement_counts() {
+        for case in RootDiscontinuityCase::ALL {
+            let mut resumed_counts = Vec::new();
+            for history_len in [8, 256] {
+                let (_config, _schema, db, counter) = counted_empty().await;
+                let storage = new_view_storage(db.clone());
+                let (_, _, expected) =
+                    prepare_discontinuity(db.as_ref(), &storage, case, history_len).await;
+
+                counter.store(0, Ordering::Relaxed);
+                assert_eq!(
+                    storage
+                        .extend_root_chain(None, 3, ViewLockMode::Try)
+                        .await
+                        .unwrap(),
+                    RootChainOutcome::Discontinuous(expected)
+                );
+                let resumed = counter.load(Ordering::Relaxed);
+                assert!(resumed > 0, "resuming {case:?} issued no SQL");
+                resumed_counts.push(resumed);
+
+                counter.store(0, Ordering::Relaxed);
+                assert!(storage.root_chain_halted().await.unwrap());
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    1,
+                    "root_chain_halted must use one statement"
+                );
+            }
+            assert_eq!(
+                resumed_counts[0], resumed_counts[1],
+                "resuming {case:?} must be independent of history length"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn halted_false_in_normal_states() {
+        {
+            let (db, storage, _) = view_storage_with_history(6).await;
+            assert!(root_chain(&db).await.is_empty());
+            assert!(scan_chain(&db).await.is_empty());
+            assert!(!storage.root_chain_halted().await.unwrap());
+            assert!(!halted_from_sql(&db).await);
+        }
+
+        {
+            let (db, storage, history) = view_storage_with_history(6).await;
+            run_to_caught_up(&storage, 20).await;
+            let extension = append_history(&db, history.last().unwrap(), 3, "hp28-caught-up").await;
+            assert!(
+                cas_fixture_main(&db, history.last().unwrap(), extension.last().unwrap()).await
+            );
+            assert_eq!(
+                storage
+                    .extend_root_chain(None, 3, ViewLockMode::Try)
+                    .await
+                    .unwrap(),
+                RootChainOutcome::CaughtUp
+            );
+            assert!(scan_chain(&db).await.is_empty());
+            assert!(!storage.root_chain_halted().await.unwrap());
+        }
+
+        {
+            let (db, storage, history) = view_storage_with_history(6).await;
+            run_to_caught_up(&storage, 20).await;
+            let extension = append_history(&db, history.last().unwrap(), 10, "hp28-budget").await;
+            assert!(
+                cas_fixture_main(&db, history.last().unwrap(), extension.last().unwrap()).await
+            );
+            assert_eq!(
+                storage
+                    .extend_root_chain(Some(3), 3, ViewLockMode::Try)
+                    .await
+                    .unwrap(),
+                RootChainOutcome::NotCaughtUp
+            );
+            let anchor = scan_chain(&db).await.pop().unwrap();
+            assert_eq!(anchor.3, 1);
+            assert!(
+                !root_chain(&db)
+                    .await
+                    .iter()
+                    .any(|(_, commit_id, _)| commit_id == &anchor.1)
+            );
+            let first_parent = anchor.4.as_ref().unwrap();
+            let parent_exists = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM mega_commit WHERE commit_id = $1) AS present",
+                    [Value::from(first_parent.clone())],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<bool>("", "present")
+                .unwrap();
+            assert!(parent_exists);
+            assert!(!storage.root_chain_halted().await.unwrap());
+        }
+
+        {
+            let (db, storage, history) = view_storage_with_history(6).await;
+            run_to_caught_up(&storage, 20).await;
+            let extension = append_history(&db, history.last().unwrap(), 3, "hp28-segment").await;
+            assert!(
+                cas_fixture_main(&db, history.last().unwrap(), extension.last().unwrap()).await
+            );
+            let mut saw_segment = false;
+            for _ in 0..20 {
+                let outcome = storage
+                    .extend_root_chain_with_segment_rows(Some(1), 3, ViewLockMode::Try, 1)
+                    .await
+                    .unwrap();
+                if root_chain(&db).await.len() > history.len() {
+                    assert_eq!(outcome, RootChainOutcome::NotCaughtUp);
+                    assert!(scan_chain(&db).await.len() > 1);
+                    assert_scan_anchor_is_tail(&db).await;
+                    saw_segment = true;
+                    break;
+                }
+            }
+            assert!(saw_segment, "incremental segment was not observed");
+            assert!(!storage.root_chain_halted().await.unwrap());
+        }
+
+        {
+            let (db, storage, history) = view_storage_with_history(1).await;
+            run_to_caught_up(&storage, 20).await;
+            let extension = append_history(&db, history.last().unwrap(), 2, "hp28-root-tail").await;
+            assert!(
+                cas_fixture_main(&db, history.last().unwrap(), extension.last().unwrap()).await
+            );
+            let root_id = history[0].commit.id.to_string();
+            let mut saw_root_anchor = false;
+            for _ in 0..20 {
+                assert_eq!(
+                    storage
+                        .extend_root_chain(Some(1), 3, ViewLockMode::Try)
+                        .await
+                        .unwrap(),
+                    RootChainOutcome::NotCaughtUp
+                );
+                if root_chain(&db).await.len() == 1
+                    && scan_chain(&db)
+                        .await
+                        .last()
+                        .is_some_and(|(_, commit_id, _, _, _)| commit_id == &root_id)
+                {
+                    saw_root_anchor = true;
+                    break;
+                }
+            }
+            assert!(saw_root_anchor, "root-tail scan anchor was not observed");
+            assert!(!storage.root_chain_halted().await.unwrap());
+        }
+
+        {
+            let (db, storage, history) = view_storage_with_history(3).await;
+            let root_id = history[0].commit.id.to_string();
+            let mut saw_first_segment = false;
+            for _ in 0..20 {
+                let outcome = storage
+                    .extend_root_chain_with_segment_rows(Some(1), 3, ViewLockMode::Try, 1)
+                    .await
+                    .unwrap();
+                if root_chain(&db).await.len() == 1 {
+                    assert_eq!(outcome, RootChainOutcome::NotCaughtUp);
+                    assert!(
+                        scan_chain(&db)
+                            .await
+                            .last()
+                            .is_some_and(|(_, commit_id, _, _, _)| commit_id == &root_id)
+                    );
+                    saw_first_segment = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_first_segment,
+                "cold-start first segment was not observed"
+            );
+            assert!(!storage.root_chain_halted().await.unwrap());
+        }
+
+        {
+            let (db, storage, history) = view_storage_with_history(3).await;
+            let root_id = history[0].commit.id.to_string();
+            let mut saw_unattached_root = false;
+            for _ in 0..20 {
+                assert_eq!(
+                    storage
+                        .extend_root_chain(Some(1), 3, ViewLockMode::Try)
+                        .await
+                        .unwrap(),
+                    RootChainOutcome::NotCaughtUp
+                );
+                if root_chain(&db).await.is_empty()
+                    && scan_chain(&db)
+                        .await
+                        .last()
+                        .is_some_and(|(_, commit_id, _, _, _)| commit_id == &root_id)
+                {
+                    saw_unattached_root = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_unattached_root,
+                "unattached root scan anchor was not observed"
+            );
+            assert!(!storage.root_chain_halted().await.unwrap());
+        }
+
+        {
+            let (config, _schema, worker_db) = configured_empty().await;
+            let history = seed_linear_root_history(worker_db.as_ref(), 31).await;
+            let worker_storage = new_view_storage(worker_db.clone());
+            let (observer_db, observer_storage) = open_view_storage(&config).await;
+            let worker = worker_storage.clone();
+            let task = tokio::spawn(async move {
+                worker
+                    .extend_root_chain_with_segment_rows(None, 3, ViewLockMode::Try, 1)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            let mut saw_in_progress = false;
+            let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+                while !task.is_finished() {
+                    let row = observer_db
+                        .query_one_raw(Statement::from_string(
+                            DbBackend::Postgres,
+                            format!(
+                                "SELECT {ROOT_CHAIN_HALTED_SQL} AS halted, \
+                             (SELECT count(*) FROM mega_view_root_chain) AS roots, \
+                             (SELECT count(*) FROM mega_view_root_chain_scan) AS scans"
+                            ),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let halted: bool = row.try_get("", "halted").unwrap();
+                    let roots: i64 = row.try_get("", "roots").unwrap();
+                    let scans: i64 = row.try_get("", "scans").unwrap();
+                    assert!(!halted);
+                    saw_in_progress |= (roots > 0 && roots < history.len() as i64) || scans > 0;
+                    tokio::task::yield_now().await;
+                }
+                task.await.unwrap().unwrap()
+            })
+            .await
+            .expect("segmented root-chain extension timed out");
+            assert_eq!(outcome, RootChainOutcome::CaughtUp);
+            assert!(
+                saw_in_progress,
+                "did not observe a committed segment or scan"
+            );
+            assert!(!observer_storage.root_chain_halted().await.unwrap());
+            close_view_storage(observer_db, observer_storage).await;
+            close_view_storage(worker_db, worker_storage).await;
+        }
     }
 
     #[tokio::test]
