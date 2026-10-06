@@ -22,6 +22,7 @@ pub mod native_metadata_install;
 pub(crate) mod native_metadata_lease;
 pub(crate) mod native_metadata_prepare_expiry;
 pub(crate) mod native_publication_storage;
+pub(crate) mod native_source_identity;
 pub mod notification_storage;
 pub mod object_storage;
 pub mod oci_db_storage;

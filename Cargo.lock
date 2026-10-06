@@ -4373,9 +4373,8 @@ dependencies = [
 
 [[package]]
 name = "mst2-codec"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a83966abccfebdbee64d702c76273aaf819ca24ad61c420e15208df6f8c4fdb"
+version = "0.4.0"
+source = "git+https://github.com/gitmono-dev/mst2-codec?rev=2589413984444f6a1c0064ccd85e2858647ec1e5#2589413984444f6a1c0064ccd85e2858647ec1e5"
 dependencies = [
  "sha2 0.10.9",
  "zstd",
