@@ -435,6 +435,14 @@ impl MonoStorage {
                 "operation did not change its selected native ref",
             ));
         }
+        let resolved_path_tree = self
+            .resolve_path_tree_hash_in_txn(&root.tree, &prepared.path, txn)
+            .await
+            .map_err(|_| integrity("native path tree lookup failed"))?
+            .ok_or_else(|| integrity("native path tree is not materialized"))?;
+        if resolved_path_tree != path.tree {
+            return Err(integrity("native path tree does not match selected ref"));
+        }
         let next = prepared
             .head
             .token

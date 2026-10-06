@@ -1,5 +1,9 @@
 use std::sync::Arc;
 
+use git_internal::{
+    hash::{ObjectHash, get_hash_kind},
+    internal::object::tree::{TreeItem, TreeItemMode},
+};
 use sea_orm::{DatabaseTransaction, PaginatorTrait};
 
 use super::*;
@@ -32,6 +36,24 @@ async fn fixture() -> (tempfile::TempDir, MonoStorage, PushQueueStorage) {
             "INSERT INTO mega_refs (id,path,ref_name,ref_commit_hash,ref_tree_hash,created_at,updated_at,is_cl) \
              VALUES ($1,$2,$3,$4,$5,now(),now(),false)",
             [id.into(), path.into(), MEGA_BRANCH_NAME.into(), commit.to_string().repeat(40).into(), tree.to_string().repeat(40).into()],
+        )).await.unwrap();
+    }
+    let child_tree = "d".repeat(40);
+    let root_tree = "b".repeat(40);
+    let project = TreeItem::new(
+        TreeItemMode::Tree,
+        ObjectHash::from_hex_for_kind(get_hash_kind(), &child_tree).unwrap(),
+        "project".to_owned(),
+    );
+    for (id, tree, sub_trees) in [
+        (1_i64, child_tree, Vec::new()),
+        (2_i64, root_tree, project.to_data()),
+    ] {
+        mono.get_connection().execute_raw(Statement::from_sql_and_values(
+            mono.get_connection().get_database_backend(),
+            "INSERT INTO mega_tree (id,tree_id,sub_trees,size,created_at,pack_id,pack_offset,commit_id) \
+             VALUES ($1,$2,$3,0,now(),$4,0,$5)",
+            [id.into(), tree.into(), sub_trees.into(), "".into(), "".into()],
         )).await.unwrap();
     }
     mono.initialize_native_publication(INSTANCE).await.unwrap();
@@ -347,6 +369,83 @@ async fn reservation_owner_and_unchanged_selected_ref_cannot_issue_a_certificate
             .is_err()
     );
     txn.rollback().await.unwrap();
+    assert_eq!(
+        mst2_native_publication::Entity::find()
+            .count(mono.get_connection())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        mst2_publication_outbox::Entity::find()
+            .count(mono.get_connection())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn missing_native_path_tree_keeps_head_initializing_and_rolls_back_receipt() {
+    let (_temp, mono, queue) = fixture().await;
+    let row = enqueue_claim(&queue, &"c".repeat(40), &"e".repeat(40), 1).await;
+    mono.get_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            mono.get_connection().get_database_backend(),
+            "DELETE FROM mega_tree WHERE tree_id = $1",
+            ["d".repeat(40).into()],
+        ))
+        .await
+        .unwrap();
+
+    let txn = mono.get_connection().begin().await.unwrap();
+    let request = PublicationRequest::from_trunk_queue(&row).unwrap();
+    let PublicationPreparation::Prepared(origin) =
+        mono.begin_publication_in_txn(&txn, request).await.unwrap()
+    else {
+        panic!("fresh publication");
+    };
+    let native = mono
+        .reserve_native_publication_in_txn(&txn, &row, INSTANCE)
+        .await
+        .unwrap();
+    assert!(
+        mono.cas_update_root_main_ref_in_txn(
+            &txn,
+            row.expected_commit_hash.as_deref(),
+            row.expected_tree_hash.as_deref(),
+            row.expected_commit_hash.as_deref().unwrap(),
+            row.expected_tree_hash.as_deref().unwrap(),
+        )
+        .await
+        .unwrap()
+    );
+    txn.execute_raw(Statement::from_sql_and_values(
+        txn.get_database_backend(),
+        "UPDATE mega_refs SET ref_commit_hash = $1 WHERE path='/project' AND ref_name=$2 AND is_cl=false",
+        [row.new_id.clone().into(), MEGA_BRANCH_NAME.into()],
+    ))
+    .await
+    .unwrap();
+    let committed = mono
+        .record_publication_in_txn(
+            &txn,
+            origin,
+            row.expected_commit_hash.as_deref().unwrap(),
+            &row.new_id,
+        )
+        .await
+        .unwrap();
+    let error = mono
+        .record_native_publication_in_txn(&txn, native, &committed)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, PublicationReceiptError::Integrity(message) if message.contains("path tree"))
+    );
+    txn.rollback().await.unwrap();
+
+    assert!(mono.read_native_publication_head(INSTANCE).await.is_err());
     assert_eq!(
         mst2_native_publication::Entity::find()
             .count(mono.get_connection())
