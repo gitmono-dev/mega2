@@ -233,6 +233,28 @@ Try/Blocking/取消等锁；以及全部锁键与同 schema 的两两隔离。
 连接池或重启的用例通过 `test_db_config` 保持同一 schema，并用
 `database_connection` 创建新的连接池。
 
+## DB 模块覆盖：视图 tree 读取（HP-29）
+
+`MonoStorage::get_commits_by_hashes_fallible` 与
+`MonoStorage::get_trees_by_hashes_fallible` 先对请求 id 去重，再以 1000 条为一组在给定
+连接或事务上读取；查询错误以 `MegaError` 返回，数据库中没有的 id 不会被误报为查询错误。
+`ViewTreeSource` 只在异步 `prefetch` 中访问数据库：它先读 `mega_view_object(kind = 2)`，
+再用剩余 id 读 `mega_tree`，并且只在两个阶段都成功后写入本实例的已预取与缺失集合。同步的
+`TreeSource::read_tree` 不发 SQL；已确认缺行、坏字节和未预取 id 分别给出 `Absent`、
+`Malformed` 与 `Unprefetched`。EMPTY_TREE 不进入预取集合，由 HP-04 的 `read_tree` 直接处理。
+
+六个 lib 用例是 `fallible_batch_reads_rows_then_query_error`、
+`fallible_batch_reads_chunk_statement_count`、`lookup_order_view_object_first`、
+`read_tree_outcomes_over_db_source`、`prefetch_statement_count` 和
+`prefetch_query_error_keeps_state`：它们分别覆盖连接和事务上的去重、缺行、分块和查询错误；
+视图对象优先于 L0 tree、kind = 1 回退、显式 SHA-1/SHA-256 解析及事务构造；三种
+`MissingObject` 原因和补行后的新实例读取；`prefetch` 的 1000 条分块、缓存命中与同步读取
+零查询；以及在测试 schema 内改列名后，预取失败不污染既有缓存或把新 id 误记为缺失。
+语句计数用 `test_db_config` 自建连接并安装 metric callback，避免替换
+`test_db_connection` 持有 schema 守卫的回调。失败注入只改列名，不改表名，也不用
+`DatabaseConnection::default()`。每个批量查询的语句数为 ⌈n / 1000⌉；HP-11 的语句数断言
+按同一公式计算。调用方收到 `Unprefetched` 说明漏做预取，它不表示对象缺失。
+
 ## 迁移覆盖：`merge_queue.requester` nullable 列（UN-18）
 
 **历史表。** [`plan-20260910.md`](../plan/plan-20260910.md) MW-05 已 `DROP TABLE merge_queue`；下列描述 UN-18 当时的加列迁移，不再是现行 schema。

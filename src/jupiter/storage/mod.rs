@@ -27,6 +27,7 @@ pub mod view_root_chain;
 pub mod view_storage;
 #[cfg(test)]
 pub(crate) mod view_test_fixtures;
+pub mod view_tree_source;
 pub mod webhook_storage;
 
 use std::sync::Arc;

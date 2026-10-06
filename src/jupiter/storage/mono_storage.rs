@@ -1638,6 +1638,27 @@ impl MonoStorage {
             .unwrap())
     }
 
+    /// Reads every stored commit in the requested set without converting a
+    /// database failure into a panic. Missing ids are deliberately omitted so
+    /// callers can distinguish them from a failed query.
+    pub async fn get_commits_by_hashes_fallible<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        hashes: &[String],
+    ) -> Result<Vec<mega_commit::Model>, MegaError> {
+        let hashes = deduplicated_ids(hashes);
+        let mut commits = Vec::new();
+        for chunk in hashes.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+            commits.extend(
+                mega_commit::Entity::find()
+                    .filter(mega_commit::Column::CommitId.is_in(chunk))
+                    .all(conn)
+                    .await?,
+            );
+        }
+        Ok(commits)
+    }
+
     pub async fn get_tree_by_hash(
         &self,
         hash: &str,
@@ -1707,6 +1728,27 @@ impl MonoStorage {
             .all(self.get_connection())
             .await
             .unwrap())
+    }
+
+    /// Reads every stored tree in the requested set without converting a
+    /// database failure into a panic. Missing ids are deliberately omitted so
+    /// callers can distinguish them from a failed query.
+    pub async fn get_trees_by_hashes_fallible<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        hashes: &[String],
+    ) -> Result<Vec<mega_tree::Model>, MegaError> {
+        let hashes = deduplicated_ids(hashes);
+        let mut trees = Vec::new();
+        for chunk in hashes.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+            trees.extend(
+                mega_tree::Entity::find()
+                    .filter(mega_tree::Column::TreeId.is_in(chunk))
+                    .all(conn)
+                    .await?,
+            );
+        }
+        Ok(trees)
     }
 
     pub async fn get_mega_blobs_by_hashes(
@@ -2049,17 +2091,205 @@ fn last_wins_mega_filepaths(pairs: Vec<(String, String)>) -> Vec<(String, String
     map.into_iter().collect()
 }
 
+fn deduplicated_ids(ids: &[String]) -> Vec<String> {
+    let mut unique = HashSet::with_capacity(ids.len());
+    ids.iter()
+        .filter(|id| unique.insert((*id).clone()))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        str::FromStr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
-    use sea_orm::TransactionTrait;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, TransactionTrait};
 
     use super::*;
     use crate::{
         common::utils::{MEGA_BRANCH_NAME, escape_like},
-        jupiter::tests::test_storage,
+        jupiter::{
+            migration::apply_migrations,
+            storage::init::database_connection,
+            tests::{test_db_config, test_db_connection, test_storage},
+        },
     };
+
+    async fn hp29_storage() -> (tempfile::TempDir, sea_orm::DatabaseConnection, MonoStorage) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        let storage = MonoStorage {
+            base: BaseStorage::new(Arc::new(db.clone())),
+        };
+        (temp, db, storage)
+    }
+
+    async fn hp29_insert_commit_and_tree(
+        db: &sea_orm::DatabaseConnection,
+        commit_id: &str,
+        tree_id: &str,
+    ) {
+        let now = chrono::Utc::now().naive_utc();
+        mega_commit::ActiveModel {
+            id: Set(1),
+            commit_id: Set(commit_id.to_owned()),
+            tree: Set(tree_id.to_owned()),
+            parents_id: Set(serde_json::json!([])),
+            author: Set(None),
+            committer: Set(None),
+            content: Set(None),
+            created_at: Set(now),
+            pack_id: Set(String::new()),
+            pack_offset: Set(0),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        mega_tree::ActiveModel {
+            id: Set(1),
+            tree_id: Set(tree_id.to_owned()),
+            sub_trees: Set(Vec::new()),
+            size: Set(0),
+            created_at: Set(now),
+            pack_id: Set(String::new()),
+            pack_offset: Set(0),
+            commit_id: Set(commit_id.to_owned()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    fn hp29_ids(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("{index:040x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn fallible_batch_reads_rows_then_query_error() {
+        let (_temp, db, mono) = hp29_storage().await;
+        let commit_id = "a".repeat(40);
+        let tree_id = "b".repeat(40);
+        hp29_insert_commit_and_tree(&db, &commit_id, &tree_id).await;
+
+        let mut commit_ids = hp29_ids(2500);
+        commit_ids.extend([commit_id.clone(), commit_id.clone(), "missing".to_owned()]);
+        let mut tree_ids = hp29_ids(2500);
+        tree_ids.extend([tree_id.clone(), tree_id.clone(), "missing".to_owned()]);
+        let commits = mono
+            .get_commits_by_hashes_fallible(&db, &commit_ids)
+            .await
+            .unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(
+            commits
+                .iter()
+                .map(|row| row.commit_id.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([commit_id.clone()])
+        );
+        let trees = mono
+            .get_trees_by_hashes_fallible(&db, &tree_ids)
+            .await
+            .unwrap();
+        assert_eq!(trees.len(), 1);
+        assert_eq!(
+            trees
+                .iter()
+                .map(|row| row.tree_id.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([tree_id.clone()])
+        );
+
+        let txn = db.begin().await.unwrap();
+        assert_eq!(
+            mono.get_commits_by_hashes_fallible(&txn, &commit_ids)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            mono.get_trees_by_hashes_fallible(&txn, &tree_ids)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        txn.rollback().await.unwrap();
+
+        db.execute_unprepared("ALTER TABLE mega_commit RENAME COLUMN tree TO hp29_gone")
+            .await
+            .unwrap();
+        db.execute_unprepared("ALTER TABLE mega_tree RENAME COLUMN sub_trees TO hp29_gone")
+            .await
+            .unwrap();
+        assert!(
+            mono.get_commits_by_hashes_fallible(&db, std::slice::from_ref(&commit_id))
+                .await
+                .is_err()
+        );
+        assert!(
+            mono.get_commits_by_hashes_fallible(&db, &commit_ids)
+                .await
+                .is_err()
+        );
+        assert!(
+            mono.get_trees_by_hashes_fallible(&db, std::slice::from_ref(&tree_id))
+                .await
+                .is_err()
+        );
+        assert!(
+            mono.get_trees_by_hashes_fallible(&db, &tree_ids)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fallible_batch_reads_chunk_statement_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, _schema) = test_db_config(temp.path()).await;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let callback_counter = counter.clone();
+        let mut db = database_connection(&config).await.unwrap();
+        db.set_metric_callback(move |_| {
+            callback_counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let mono = MonoStorage {
+            base: BaseStorage::new(Arc::new(db.clone())),
+        };
+
+        for count in [0, 1, 1000, 1001, 2500] {
+            let ids = hp29_ids(count);
+            let expected = count.div_ceil(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE);
+            counter.store(0, Ordering::Relaxed);
+            mono.get_commits_by_hashes_fallible(&db, &ids)
+                .await
+                .unwrap();
+            assert_eq!(counter.load(Ordering::Relaxed), expected);
+            counter.store(0, Ordering::Relaxed);
+            mono.get_trees_by_hashes_fallible(&db, &ids).await.unwrap();
+            assert_eq!(counter.load(Ordering::Relaxed), expected);
+        }
+
+        let mut ids = hp29_ids(1000);
+        ids.push(ids[0].clone());
+        counter.store(0, Ordering::Relaxed);
+        mono.get_commits_by_hashes_fallible(&db, &ids)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        counter.store(0, Ordering::Relaxed);
+        mono.get_trees_by_hashes_fallible(&db, &ids).await.unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn escape_like_covers_percent_underscore_backslash() {
