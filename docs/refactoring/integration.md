@@ -255,6 +255,54 @@ Try/Blocking/取消等锁；以及全部锁键与同 schema 的两两隔离。
 `DatabaseConnection::default()`。每个批量查询的语句数为 ⌈n / 1000⌉；HP-11 的语句数断言
 按同一公式计算。调用方收到 `Unprefetched` 说明漏做预取，它不表示对象缺失。
 
+## DB 模块覆盖：视图投影追赶（HP-11）
+
+`ViewProjectionService` 在单个事务中按 `filter_pk` 读取过滤器、复核规范定义，取得连续
+根链批次，并经 `ViewTreeSource` 按层预取 tree。它依次尝试过滤器锁与对象 GC 共享锁；未准入
+或试锁失败不写入。批中 `seq = s0` 只提供父 tree，不重复投影；每个后续根链行直接使用前一行
+的 `tree_id`，不会为每个提交另查父链。成功批仅为实际写出视图提交的段写提交对象、生成 tree
+与引用，以 `GREATEST` 推进水位；最后一批在同一事务内检查 `main@/` 覆盖并标记就绪。预取后
+同一 tree id 仍报告未加载会作为内部错误终止，避免循环重试。
+
+`jupiter::service::view_projection_service::tests::determinism`、
+`jupiter::service::view_projection_service::tests::commit_map_matches_design`、
+`jupiter::service::view_projection_service::tests::object_refs_match_design`、
+`jupiter::service::view_projection_service::tests::ready_same_txn`、
+`jupiter::service::view_projection_service::tests::noop_returns`、
+`jupiter::service::view_projection_service::tests::failed_batch_no_effect` 和
+`jupiter::service::view_projection_service::tests::statement_count_independent_of_batch`
+覆盖批次收敛、映射游程、对象与引用、同事务就绪、无操作返回、前提失败与内部错误，以及批量
+路径。映射用例用内存 `TreeSource` 加逐提交 `project_commit` 形成独立参照，覆盖起始空段、未预取
+重算和父提交为空的首段；对象用例先单批持久化起始空段，确认该段没有对象或引用。夹具根提交以固定
+author/committer 签名和时间戳构造，因而可跨 schema 比较投影字节。
+`determinism` 覆盖 Subdir、Prefix、Exclude 与 Compose：以一个 B=1000 基准结果比较两个独立
+schema 的冷启动、清表重建、同一过滤器上共享服务实例克隆的并发追赶（遇 `NotRun` 重试）、B=1/B=1000，
+以及批间钩子调用 `ConfigHandle::reload` 将 `views.batch_size` 从 3 改为 2；钩子记录实际水位 3、5
+与应用字段 `views.batch_size`，防止热改用例退化为单一批大小。
+
+服务实例持有同一份 memo 与计数器；测试构建下的钩子记录 memo 命中、补预取次数、每批预取的
+id 集合、已提交批的水位和终态 `s0 >= tip` 检查，并能在试算和段计算之间清空 memo、在批间触发
+回调。对象引用用例会删去仅由 Exclude 视图引用的对象并复位该视图，再以同一服务重跑，核对 memo
+命中后补写的对象字节、类型和引用行；共享的 EMPTY_TREE 则保留并核对 `gc_marked_at` 被清空。
+TreeSource 钩子可模拟漏记未加载与持续未加载，分别覆盖未经过包装层的读取和补预取后仍报告未加载的
+fail-closed 路径。补预取的生产来源是 seq=1 的 `is_empty_root` 递归与 HP-06 登记的 R8 例外；
+试算产出的 `FilterOutput` 直接交给 `project_with_output`，因此 memo 在两阶段之间被清空也不会使
+段计算重新执行 `filter_tree`。语句数用 `test_db_config` 取得独立 schema，并以
+`Storage::new_with_connection` 在自建连接上安装 metric callback；B=10 与 B=500 的常规档各断言一
+个推进事务和一个终态事务，预热 memo 后强制清空的两档各在新 schema 比较，后两档不与前两档比较。
+`ready_same_txn` 还让尚未 ready 的过滤器追到链尾时发现 `main@/` 在链外、再回退到链尾，验证
+`s0 >= tip` 分支首次写入 `ready_seq`；另以新过滤器验证扩展根链后的批内写入路径。
+
+批事务每次重新调用 `recheck_definition`；不存在的过滤器行和 `DefinitionCorrupt` 都按内部错误
+回滚。`failed_batch_no_effect` 是同步测试，`capture_tracing` 在 current-thread runtime 内驱动异步
+调用，保持 `_pin_registry` 存活并使用 `with_ansi(false)` 捕获 ERROR 事件。它以 H=6 的 Prefix 夹具
+逐一验证 B=0（s0=0、s0=2）和根链空洞三种前提失败；内部错误的七个子例为：过滤器缺失、定义往返
+损坏、定义哈希损坏、Compose 冲突导致的 `ProjectFailure::Internal`、不记录未预取、持续未预取，及在
+测试 schema 内把 `mega_view_object_ref.object_id` 改名造成的查询失败。每次调用都单独核对新增的一条
+ERROR 事件、状态回滚、指标与脱敏字段；列名恢复后，同一服务可重新追平并与独立 schema 的参照快照
+逐字节比较，证明失败事务不污染水位或映射；`ON CONFLICT DO NOTHING` 的整批冲突也通过无返回值插入
+执行，不会把合法对象复用变成失败。
+
 ## 迁移覆盖：`merge_queue.requester` nullable 列（UN-18）
 
 **历史表。** [`plan-20260910.md`](../plan/plan-20260910.md) MW-05 已 `DROP TABLE merge_queue`；下列描述 UN-18 当时的加列迁移，不再是现行 schema。

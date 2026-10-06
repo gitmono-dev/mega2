@@ -23,6 +23,7 @@ pub mod push_queue_storage;
 pub mod stg_common;
 pub mod user_storage;
 pub mod vault_storage;
+pub mod view_projection_storage;
 pub mod view_root_chain;
 pub mod view_storage;
 #[cfg(test)]
