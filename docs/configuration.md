@@ -72,8 +72,9 @@ While a service runs, `ConfigReloadWatcher` polls the base config and profile fi
 - `artifacts_gc.interval_secs` / `grace_secs` / `batch_limit`; `artifacts_gc.enable` applies live only **true → false** — enabling from false requires a restart
 - `buck.cleanup_interval` / `completed_retention_days`; `buck.enable_session_cleanup` applies live only **true → false** — enabling from false requires a restart
 - `notification.enabled` (the notification section snapshot is swapped live; an enabled flip counts as applied)
+- `views.worker_interval_secs` / `batch_size` / `max_append_walk` / `sync_catch_up_commits` / `max_filters` / `max_concurrent_cold_starts` / `register_rate_per_token`
 
-**All other fields** (`database.*`, `redis.url`, `base_dir`, `monorepo.*`, `git.*`, `pack.*`, `lfs.*`, `blame.*`, `object_storage.*`, `oauth.*`, `storage_events.*`, `github_sync.*`, buck upload limits, `vault.audit`, `cedar`, etc.) are only recorded in `restart_required_fields` — visible in the logs, snapshot unchanged — and take effect on process restart. Hot reload never writes new secret values back into the snapshot, and reports never contain secret values.
+**All other fields** (`database.*`, `redis.url`, `base_dir`, `monorepo.*`, `git.*`, `pack.*`, `lfs.*`, `blame.*`, `object_storage.*`, `oauth.*`, `storage_events.*`, `github_sync.*`, `views.enabled`, `views.allow_anonymous_register`, buck upload limits, `vault.audit`, `cedar`, etc.) are only recorded in `restart_required_fields` — visible in the logs, snapshot unchanged — and take effect on process restart. Hot reload never writes new secret values back into the snapshot, and reports never contain secret values.
 
 ## 4. Section guide
 
@@ -93,6 +94,7 @@ One line of purpose and the key entries per section; full comments and defaults 
 - **`[redis]`**: `url`. Cache / distributed locks / snowflake worker leases, etc.; may be Vault-backed via SecretRef.
 - **`[buck]`**: Buck upload API: session and file limits (`session_timeout` / `max_file_size` / `max_files` / `max_concurrent_uploads`), server-side rate limiting (`upload_concurrency_limit` / `large_file_concurrency_limit` / `large_file_threshold`), session cleanup task (`enable_session_cleanup` / `cleanup_interval` / `completed_retention_days`, partially hot-reloadable — see §3).
 - **`[artifacts_gc]`**: GC of unreferenced artifact blobs (`enable` / `interval_secs` / `grace_secs` / `batch_limit`), default off; tuning hot-reloads, enabling from false requires a restart.
+- **`[views]`**: experimental deterministic history projections, default off. `enabled = true` requires `monorepo.push_policy = "trunk"` and `monorepo.object_format = "sha1"`; see [`config/config.toml`](../config/config.toml) for fields and defaults.
 - **`[notification]`**: `enabled` global kill switch (hot-reloadable); optional `[notification.webhook]` outbound channel (`url` is non-secret, `token_ref` is a SecretRef). The sample config documents every supported field.
 - **`[vault.audit]`**: see §2.
 - **`[cedar]`**: `enforcement = "off" | "shadow" | "enforce"` (ADR-UN-01; default off). Trunk mode requires `off`. The Architecture Guide summarizes authorization behavior.

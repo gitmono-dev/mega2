@@ -72,8 +72,9 @@ mega2 --config /etc/mega2/config.toml config secret check redis.url \
 - `artifacts_gc.interval_secs` / `grace_secs` / `batch_limit`；`artifacts_gc.enable` 仅 **true → false** 热生效，false → true 需重启
 - `buck.cleanup_interval` / `completed_retention_days`；`buck.enable_session_cleanup` 仅 **true → false** 热生效，从 false 开启需重启
 - `notification.enabled`（notification 段快照整体热替换；enabled 翻转计入 applied）
+- `views.worker_interval_secs` / `batch_size` / `max_append_walk` / `sync_catch_up_commits` / `max_filters` / `max_concurrent_cold_starts` / `register_rate_per_token`
 
-**其余全部字段**（`database.*`、`redis.url`、`base_dir`、`monorepo.*`、`git.*`、`pack.*`、`lfs.*`、`blame.*`、`object_storage.*`、`oauth.*`、`storage_events.*`、`github_sync.*`、`buck` 上传限额、`vault.audit`、`cedar` 等）变更只记入 `restart_required_fields`，日志可见，快照不更新——需重启进程生效。热加载不会把新密值写回快照，报告里也不出现密值。
+**其余全部字段**（`database.*`、`redis.url`、`base_dir`、`monorepo.*`、`git.*`、`pack.*`、`lfs.*`、`blame.*`、`object_storage.*`、`oauth.*`、`storage_events.*`、`github_sync.*`、`views.enabled`、`views.allow_anonymous_register`、`buck` 上传限额、`vault.audit`、`cedar` 等）变更只记入 `restart_required_fields`，日志可见，快照不更新——需重启进程生效。热加载不会把新密值写回快照，报告里也不出现密值。
 
 ## 4. 分区指南
 
@@ -93,6 +94,7 @@ mega2 --config /etc/mega2/config.toml config secret check redis.url \
 - **`[redis]`**：`url`。缓存 / 分布式锁 / snowflake worker 租约等；可作 Vault SecretRef 托管。
 - **`[buck]`**：Buck 上传 API：会话与文件限额（`session_timeout` / `max_file_size` / `max_files` / `max_concurrent_uploads`）、服务端并发限流（`upload_concurrency_limit` / `large_file_concurrency_limit` / `large_file_threshold`）、会话清理任务（`enable_session_cleanup` / `cleanup_interval` / `completed_retention_days`，部分热加载，见第 3 节）。
 - **`[artifacts_gc]`**：无引用 artifact blob 的 GC（`enable` / `interval_secs` / `grace_secs` / `batch_limit`），默认关；运行中调参热加载，从关闭到开启需重启。
+- **`[views]`**：实验功能，用于确定性历史投影，默认关闭。`enabled = true` 要求 `monorepo.push_policy = "trunk"` 与 `monorepo.object_format = "sha1"`；字段与缺省值见 [`config/config.toml`](../config/config.toml)。
 - **`[notification]`**：`enabled` 全局开关（热加载）；可选 `[notification.webhook]` 出站通道（`url` 非密，`token_ref` 为 SecretRef）。行为与边界见 [`refactoring/notification.md`](./refactoring/notification.md)。
 - **`[vault.audit]`**：见第 2 节。
 - **`[cedar]`**：`enforcement = "off" | "shadow" | "enforce"`（ADR-UN-01；默认 off）。trunk 形态必须为 `off`。语义与快照构建见 [`manual/authz.md`](./manual/authz.md)。

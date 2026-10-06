@@ -272,6 +272,28 @@ interval_secs = 3600
 grace_secs = 86400
 batch_limit = 100
 
+# Experimental history projections are default off. Enabling them requires
+# monorepo.push_policy = "trunk" and monorepo.object_format = "sha1".
+[views]
+# Restart-required: workers and route mounting are decided at startup.
+enabled = false
+# Hot-reloadable: background projection worker interval in seconds.
+worker_interval_secs = 10
+# Hot-reloadable: root commits projected in one batch.
+batch_size = 1000
+# Hot-reloadable: root-chain commits processed by an advertise or B0 walk.
+max_append_walk = 1000
+# Hot-reloadable: commits an advertise may synchronously project.
+sync_catch_up_commits = 64
+# Hot-reloadable: maximum filters that occupy derived state.
+max_filters = 100
+# Hot-reloadable: maximum concurrent cold-starting filters.
+max_concurrent_cold_starts = 2
+# Hot-reloadable: new registrations per requester in a 3600 second window.
+register_rate_per_token = 10
+# Restart-required: anonymous registration changes the write authorization surface.
+allow_anonymous_register = false
+
 [notification]
 # Global notification kill switch.
 enabled = true
