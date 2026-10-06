@@ -23,6 +23,10 @@ pub mod push_queue_storage;
 pub mod stg_common;
 pub mod user_storage;
 pub mod vault_storage;
+pub mod view_root_chain;
+pub mod view_storage;
+#[cfg(test)]
+pub(crate) mod view_test_fixtures;
 pub mod webhook_storage;
 
 use std::sync::Arc;
@@ -71,6 +75,7 @@ use crate::{
             push_queue_storage::PushQueueStorage,
             user_storage::UserStorage,
             vault_storage::VaultStorage,
+            view_storage::ViewStorage,
             webhook_storage::WebhookStorage,
         },
     },
@@ -85,6 +90,7 @@ pub struct AppService {
     pub user_storage: UserStorage,
     pub group_storage: GroupStorage,
     pub vault_storage: VaultStorage,
+    pub view_storage: ViewStorage,
     pub cl_storage: ClStorage,
     pub issue_storage: IssueStorage,
     pub conversation_storage: ConversationStorage,
@@ -112,6 +118,7 @@ impl AppService {
             user_storage: UserStorage { base: mock.clone() },
             group_storage: GroupStorage { base: mock.clone() },
             vault_storage: VaultStorage { base: mock.clone() },
+            view_storage: ViewStorage::new(mock.clone()),
             cl_storage: ClStorage { base: mock.clone() },
             issue_storage: IssueStorage { base: mock.clone() },
             conversation_storage: ConversationStorage { base: mock.clone() },
@@ -252,6 +259,7 @@ impl Storage {
             user_storage,
             group_storage,
             vault_storage,
+            view_storage: ViewStorage::new(base.clone()),
             cl_storage: cl_storage.clone(),
             issue_storage,
             conversation_storage,
@@ -571,6 +579,10 @@ impl Storage {
 
     pub fn vault_storage(&self) -> VaultStorage {
         self.app_service.vault_storage.clone()
+    }
+
+    pub fn view_storage(&self) -> ViewStorage {
+        self.app_service.view_storage.clone()
     }
 
     pub fn cl_storage(&self) -> ClStorage {

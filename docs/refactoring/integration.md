@@ -171,6 +171,47 @@ schema；八个 SeaORM 实体各写入后按主键读回；以及预建同名
 `mega_view_register_log` view 使最终索引失败时，八张表和迁移记录全部回滚，
 移除冲突对象后可直接重跑。
 
+## DB 模块覆盖：视图根链（HP-10）
+
+`ViewStorage::extend_root_chain(budget, batch_size, lock_mode)` 在短事务中持有
+根链锁 L_C，返回 `CaughtUp`、`NotCaughtUp` 或 `RolledBack`、`Forked`、
+`UnrelatedHistory`、`MultiParent`、`MissingFirstParent`、`RowConflict` 六种不连续原因。扫描提交的首父链
+先落入 `mega_view_root_chain_scan`，再按 `seq` 递增分段写入
+`mega_view_root_chain`；每段把插入和锚点切换放在同一个事务中。预算同时计算暂存
+写入与根链插入，每批回走和每段接入都按剩余预算截断；锚点判定不写行，也不耗
+预算。耗尽时保留锚点供下次继续。`insert_segment` 在调用方的段事务内
+执行；主键冲突核对失败时，调用方回滚整个段，因此不会留下该段已先插入的部分行。
+不连续事务不改根链表，同一调用先前已经提交的段保持有效。
+
+锁键使用 `VIEW_LOCK_NS`、`VIEW_FILTER_LOCK_NS`、`ROOT_CHAIN_KEY`、
+`OBJECT_GC_KEY` 与 `REGISTER_KEY`；段上限是
+`ROOT_CHAIN_SEGMENT_ROWS = 10_000`。`hash32(x) = ((x as u64) ^ ((x as u64) >> 32)) as u32 as i32`
+折叠 64 位 id 的高低两半。
+测试 schema 把第二键映射为 `hashtext(current_schema() || ':' || d)`，使并行 schema
+不相互阻塞。`Blocking` 模式以绑定的 `set_config('lock_timeout', $1, true)` 设置
+`VIEW_LOCK_TIMEOUT`（两秒）等待上限；超时按 SQLSTATE `55P03` 返回未追上，取消等
+其他数据库错误原样上抛。返回 `Ok(false)` 的事务已经 aborted，调用方只能回滚；
+成功设置的 `lock_timeout` 一直持续到事务结束。取锁语句由 `view_lock_stmt_prod` 与
+`view_lock_stmt_test` 单独拼装，语句本身不带 `lock_timeout`；需要不限时等待的调用方
+可直接执行 `Blocking` 语句。
+
+`ViewStorage` 聚合在 `AppService` 中，访问器返回克隆而不新建实例，以便同一进程
+共享告警记录。它的 `base` 字段保持私有；同级实现经 `Deref<Target = BaseStorage>`
+取得连接。`view_test_fixtures` 以 `pub(crate)` 提供参数绑定的路径到 blob 字节和
+预构造 tree 列表、线性/多父/首父缺失/无关根历史，以及可回退的 root `main` CAS
+夹具；它写入 tree 层、返回 blobs，但不写 blob。
+
+六个 lib 用例分别覆盖：线性冷启动和增量；预算耗尽后的续接及回走中途重启；分段
+锚点、每段后的重启、两个连接池按 Try/Blocking 换手，以及扫描期间 `main@/` 前进；
+五类根历史不连续、三种 `insert_segment` 既有行输入和第二段冲突；不成功的
+Try/Blocking/取消等锁；以及全部锁键与同 schema 的两两隔离。
+不连续事件仅从 `view_root_chain` 发出，带 `reason` 与 `commit_id`，按进程中的
+`(reason, commit_id)` 去重，并在 `CaughtUp` 后清除记录。带数据库的事件捕获在
+单线程 Tokio 测试中安装按该模块 target 过滤的线程局部 subscriber，同时持有第二个
+`tracing::Dispatch`，避免并行测试首次命中 callsite 时缓存 no-op interest。取消等锁
+用持锁事务之外的自动提交查询在一秒内轮询 `pg_stat_activity`；事务快照不会看到之后
+才出现的等待者。代码审查点是根链只按 `seq` 递增插入，绝不以 `max(seq)+1` 追加单行。
+
 ## 迁移覆盖：`merge_queue.requester` nullable 列（UN-18）
 
 **历史表。** [`plan-20260910.md`](../plan/plan-20260910.md) MW-05 已 `DROP TABLE merge_queue`；下列描述 UN-18 当时的加列迁移，不再是现行 schema。

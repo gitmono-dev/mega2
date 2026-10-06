@@ -855,7 +855,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
 - **就绪与水位同事务【决策】。** 首次就绪在把水位推进到 tip 的那个批事务内写入，与 3.1、6.5 所说的‘视图首次就绪的那个 catch_up 批事务’一致，只有该批读到的 `main@/` 已经超出根链时，才留给之后 s0 ≥ tip 分支的事务置就绪；6.9 的候选谓词保证它在一个周期内被选中。如果放在不同的事务里，最后一批提交之后、置就绪之前，只要发生以下任一情形，视图就会停在‘水位已到链尾、`ready_seq` 仍为 NULL’的状态：进程退出，该事务遇到瞬时数据库错误，或者后台 worker 对 L_G 试锁失败后返回（4.6）。此后入口要到下一个补偿周期才不再返回 503，名额也多占一个周期。判定是否覆盖 `main@/` 时，与根链中 seq = tip 那一行的 `commit_id` 比较，不重读链尾。【推断】READ COMMITTED 下，`max_seq()` 与链尾是两条语句，各取一次快照；其间 `extend_root_chain` 可能接入新行，重读链尾会把落后的水位误判为已覆盖 `main@/`。
 - **锁【决策】。** 视图锁和根链锁都用两个整数作键：
   - `VIEW_LOCK_NS` 与 `VIEW_FILTER_LOCK_NS` 互不相同，也与 `MONO_WRITE_LOCK` 及初始化锁的 key1 都不同；
-  - 单例锁（根链锁、L_G、L_R）用 `key1 = VIEW_LOCK_NS`，`key2` 分别取 `ROOT_CHAIN_KEY`、`OBJECT_GC_KEY`、`REGISTER_KEY`。视图锁改用独立的 `key1 = VIEW_FILTER_LOCK_NS`，`key2 = hash32(filter_pk)`，与单例锁不会撞键；
+  - 单例锁（根链锁、L_G、L_R）用 `key1 = VIEW_LOCK_NS`，`key2` 分别取 `ROOT_CHAIN_KEY`、`OBJECT_GC_KEY`、`REGISTER_KEY`。视图锁改用独立的 `key1 = VIEW_FILTER_LOCK_NS`，`key2 = hash32(filter_pk)`（`hash32(x) = ((x as u64) ^ ((x as u64) >> 32)) as u32 as i32`，即 64 位 id 的高低 32 位异或折叠），与单例锁不会撞键；
   - `cfg(test)` 下，key2 改为 `hashtext(current_schema() || ':' || d)`，其中 d 是 filter_pk 的十进制文本，或者 `'root_chain'`、`'object_gc'`、`'register'` 之一。这样并行的测试 schema 之间互不争锁，同一 schema 内根链锁与各视图锁也仍然互不相同。`mono_write_lock_sql` 只有一把锁，可以整体替换 key2；这里有多把锁，不能照搬。
 
   投影写入只发生在同时持有视图锁和 L_G 共享锁的 worker 事务中；回收、清扫与 rebuild 的删除按 4.6 执行；B3 等写入判定路径对这些表只读（5.2）。对象维护锁 L_G、各类事务的取锁方式和全局锁顺序，见 4.6。投影是确定的，重复计算无害：写入都是 `ON CONFLICT DO NOTHING`，水位只增不减。抢锁失败时直接返回，不设进程内标记。【推断】这样做不影响正确性：B3 的写入判定只用锁内算出的 `tip_at_R`（4.5）；advertise 与 B0 的同步路径或者带 `lock_timeout` 阻塞等锁，或者在追不上时按 3.3、4.4 广告已投影的 tip、返回可重试错误，都不依赖 worker 何时被唤醒。活性只由周期补偿保证，前提是周期任务的候选谓词覆盖所有未完成的活跃视图（6.9 `worker_interval_secs`）。代价是：持锁者最后一次读取链尾之后落地的提交，在本副本上最多多等一个 `worker_interval_secs`。原来的 dirty 握手也给不出更强的保证：持锁者检查标记之后、提交并释放锁之前，竞争者仍可能置位后离开；而且标记只在进程内可见，跨副本无效。如果实测需要更低的延迟，再加回在释放锁之后复查的版本。
@@ -899,7 +899,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
 |---|---|---|
 | L_M：`MONO_WRITE_LOCK` | 现有 | B3、物化插入、ADR-TP-20 的对账与巡检批次、reaper（试锁） |
 | L_C：根链锁 | `(VIEW_LOCK_NS, ROOT_CHAIN_KEY)` | `extend_root_chain`、全局 rebuild |
-| L_V(F)：视图锁 | `(VIEW_LOCK_NS, view_key(F.pk))` | catch_up(F)、回收与单视图 rebuild |
+| L_V(F)：视图锁 | `(VIEW_FILTER_LOCK_NS, hash32(F.pk))` | catch_up(F)、回收与单视图 rebuild |
 | L_G：对象维护锁（新增，分共享与排他） | `(VIEW_LOCK_NS, OBJECT_GC_KEY)`；`cfg(test)` 下 d 取 `'object_gc'`（4.4） | 共享：catch_up 批事务、回收；排他：清扫、全局 rebuild |
 | L_R：注册准入锁 | `(VIEW_LOCK_NS, REGISTER_KEY)`；`cfg(test)` 下 d 取 `'register'`（4.4） | 6.5 的注册准入事务与重新预热准入事务 |
 
