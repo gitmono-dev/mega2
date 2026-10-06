@@ -23,6 +23,7 @@ pub struct Model {
     pub edge_count: i32,
     pub total_bytes: i64,
     pub state: String,
+    pub deadline_managed: bool,
     pub created_at: DateTimeWithTimeZone,
     pub committed_at: Option<DateTimeWithTimeZone>,
 }

@@ -13,7 +13,8 @@ use super::{
     mst2_retention::PostgresRetentionRepository,
     native_metadata_install::{
         PostgresMetadataInstallRepository, PreparedMetadataReceipt, StoredPlan,
-        check_payload_coverage, load_installed_dag, load_plan, verify_graph_root,
+        check_payload_coverage, load_installed_dag, load_plan, require_unelapsed,
+        verify_graph_root,
     },
 };
 use crate::ceres::snapshot::{
@@ -45,6 +46,7 @@ pub(crate) struct VerifiedMetadataHandoff {
     prepare_id: String,
     install_operation: String,
     install_digest: [u8; 32],
+    deadline_digest: Option<[u8; 32]>,
     storage_uuid: String,
     plan: MetadataInstallPlan,
     dag: ValidatedMetadataDag,
@@ -148,14 +150,20 @@ impl PostgresMetadataLeaseRepository {
         )
         .await?
         .ok_or_else(|| unavailable("metadata preparation is absent"))?;
+        if !["COMMITTED", "CONSUMED"].contains(&stored.record.state.as_str()) {
+            return Err(conflict("metadata handoff preparation is not committed"));
+        }
         if stored.record.prepare_id != intent.prepare_id()
-            || stored.record.state == "PREPARING"
+            || stored.deadline.as_ref().map(|grant| grant.grant_digest) != intent.deadline_digest()
             || stored.plan.root != receipt.metadata_root()
             || stored.plan.total_bytes != receipt.payload_bytes()
         {
             return Err(integrity(
                 "metadata handoff does not bind its durable preparation",
             ));
+        }
+        if stored.record.state == "COMMITTED" {
+            require_unelapsed(self.install.connection(), &stored).await?;
         }
         let descriptor = checked_descriptor(&binding, &stored.plan)?;
         let snapshot_id = descriptor.snapshot_id().map_err(internal)?;
@@ -166,6 +174,7 @@ impl PostgresMetadataLeaseRepository {
             prepare_id: stored.record.prepare_id,
             install_operation: intent.operation_id().into(),
             install_digest: intent.manifest_digest(),
+            deadline_digest: intent.deadline_digest(),
             storage_uuid: self.install.storage_uuid().into(),
             plan: stored.plan,
             dag,
@@ -187,7 +196,10 @@ impl PostgresMetadataLeaseRepository {
         )
         .await?
         .ok_or_else(|| unavailable("metadata handoff preparation is absent"))?;
-        if stored.record.prepare_id != handoff.prepare_id || stored.plan != handoff.plan {
+        if stored.record.prepare_id != handoff.prepare_id
+            || stored.plan != handoff.plan
+            || stored.deadline.as_ref().map(|grant| grant.grant_digest) != handoff.deadline_digest
+        {
             return Err(integrity("metadata handoff changed before consumption").into());
         }
         // Revalidate the current bounded bytes for each mutation attempt;
@@ -239,7 +251,10 @@ impl PostgresMetadataLeaseRepository {
         let stored = load_plan(txn, &handoff.install_operation, &handoff.install_digest)
             .await?
             .ok_or_else(|| unavailable("handoff plan is absent"))?;
-        if stored.record.prepare_id != handoff.prepare_id || stored.plan != handoff.plan {
+        if stored.record.prepare_id != handoff.prepare_id
+            || stored.plan != handoff.plan
+            || stored.deadline.as_ref().map(|grant| grant.grant_digest) != handoff.deadline_digest
+        {
             return Err(integrity("durable handoff plan changed"));
         }
         require_access(txn, access).await?;
@@ -257,6 +272,7 @@ impl PostgresMetadataLeaseRepository {
                 "preparation is not an unconsumed committed handoff",
             ));
         }
+        require_unelapsed(txn, &stored).await?;
         check_payload_coverage(txn, &stored).await?;
         verify_graph_root(
             txn,
