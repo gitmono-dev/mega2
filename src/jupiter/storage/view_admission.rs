@@ -2,14 +2,16 @@ use std::time::Duration;
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbErr,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+    ActiveModelTrait,
+    ActiveValue::{NotSet, Set},
+    ColumnTrait, Condition, ConnectionTrait, DbBackend, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait, Value,
     sea_query::OnConflict,
 };
 use serde_json::Value as JsonValue;
 
 use crate::{
-    callisto::{mega_view, mega_view_filter},
+    callisto::{mega_view, mega_view_filter, mega_view_register_log},
     common::{errors::MegaError, utils::generate_id},
     config::ViewsConfig,
     jupiter::storage::{
@@ -21,6 +23,35 @@ use crate::{
 };
 
 const REJECT_RETRY_AFTER: Duration = Duration::from_secs(30);
+const REGISTER_RATE_WINDOW_SECS: u64 = 3600;
+
+fn register_rate_window_stmt(requester: &str) -> Statement {
+    Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        format!(
+            "SELECT count(*)::bigint AS count, \
+             least({REGISTER_RATE_WINDOW_SECS}, \
+             ceil(extract(epoch FROM min(created_at) + interval '{REGISTER_RATE_WINDOW_SECS} seconds' - now())))::bigint \
+             AS retry_after \
+             FROM mega_view_register_log \
+             WHERE requester = $1 \
+             AND created_at > now() - interval '{REGISTER_RATE_WINDOW_SECS} seconds'"
+        ),
+        [Value::from(requester.to_owned())],
+    )
+}
+
+fn delete_expired_register_log_stmt(requester: &str) -> Statement {
+    Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        format!(
+            "DELETE FROM mega_view_register_log \
+             WHERE requester = $1 \
+             AND created_at <= now() - interval '{REGISTER_RATE_WINDOW_SECS} seconds'"
+        ),
+        [Value::from(requester.to_owned())],
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AdmitRequest {
@@ -75,6 +106,7 @@ pub(crate) struct FilterDefinition {
 pub(crate) struct AdmitLimits {
     pub(crate) max_filters: u64,
     pub(crate) max_concurrent_cold_starts: u64,
+    pub(crate) register_rate_per_token: u64,
 }
 
 impl From<&ViewsConfig> for AdmitLimits {
@@ -82,6 +114,7 @@ impl From<&ViewsConfig> for AdmitLimits {
         Self {
             max_filters: views.max_filters,
             max_concurrent_cold_starts: views.max_concurrent_cold_starts,
+            register_rate_per_token: views.register_rate_per_token,
         }
     }
 }
@@ -106,6 +139,7 @@ pub(crate) enum AdmitOutcome {
 pub(crate) enum RejectReason {
     MaxFilters,
     ColdStartSlots,
+    Rate,
 }
 
 /// Chooses the HP-10 register lock statement without adding another lock-key
@@ -120,7 +154,7 @@ pub(crate) fn admit_lock_stmt(test: bool) -> Statement {
 
 impl ViewStorage {
     /// Atomically admits a registration or rewarming request under the register
-    /// advisory lock. Rate accounting is intentionally added by HP-31.
+    /// advisory lock.
     pub(crate) async fn admit(
         &self,
         request: AdmitRequest,
@@ -202,6 +236,35 @@ impl ViewStorage {
                 version: latest_view.map(|(version, _)| version),
                 ready,
             });
+        }
+
+        let rate_requester = match &request.mode {
+            AdmitMode::Register { .. } => Some(requester.map(str::to_owned).ok_or_else(|| {
+                MegaError::Other("missing requester for Register admission".to_owned())
+            })?),
+            AdmitMode::Rewarm { .. } => None,
+        };
+
+        if let Some(requester) = rate_requester.as_deref() {
+            let rate_row = txn
+                .query_one_raw(register_rate_window_stmt(requester))
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other("missing register-rate aggregate row".to_owned())
+                })?;
+            let count: i64 = rate_row.try_get("", "count")?;
+            let retry_after: i64 = rate_row.try_get("", "retry_after")?;
+            let count = u64::try_from(count)
+                .map_err(|_| MegaError::Other("negative register-rate count".to_owned()))?;
+            let retry_after = u64::try_from(retry_after)
+                .map_err(|_| MegaError::Other("negative register-rate retry-after".to_owned()))?;
+            if count >= limits.register_rate_per_token {
+                txn.rollback().await?;
+                return Ok(AdmitOutcome::Rejected {
+                    reason: RejectReason::Rate,
+                    retry_after: Duration::from_secs(retry_after),
+                });
+            }
         }
 
         if cold_start {
@@ -303,6 +366,18 @@ impl ViewStorage {
             latest_view.map(|(version, _)| version)
         };
 
+        if let Some(requester) = rate_requester {
+            mega_view_register_log::ActiveModel {
+                id: NotSet,
+                requester: Set(requester.clone()),
+                created_at: NotSet,
+            }
+            .insert(&txn)
+            .await?;
+            txn.execute_raw(delete_expired_register_log_stmt(&requester))
+                .await?;
+        }
+
         txn.commit().await?;
         Ok(AdmitOutcome::Admitted { version, ready })
     }
@@ -321,14 +396,14 @@ mod tests {
     use super::*;
     use crate::{
         callisto::mega_view_register_log,
-        config::{ViewsConfig, testing::isolated_config},
+        config::{ViewsConfig, reload::ConfigHandle, testing::isolated_config},
         jupiter::{
             migration::apply_migrations,
             storage::{
                 Storage,
                 base_storage::BaseStorage,
                 init::database_connection,
-                view_storage::{VIEW_LOCK_TIMEOUT, acquire_view_lock},
+                view_storage::{VIEW_LOCK_NS, VIEW_LOCK_TIMEOUT, acquire_view_lock},
             },
             tests::{
                 TestSchemaGuard, test_db_config, test_db_connection, test_storage_with_config,
@@ -342,6 +417,13 @@ mod tests {
         Warming,
         Partial,
         Reclaimed,
+    }
+
+    #[derive(Clone, Copy)]
+    enum RegisterRateCase {
+        NewFilter,
+        NewVersion,
+        ReclaimedFilter,
     }
 
     fn definition(filter_id: impl Into<String>) -> FilterDefinition {
@@ -366,6 +448,51 @@ mod tests {
 
     fn register(filter_id: impl Into<String>, name: Option<impl Into<String>>) -> AdmitRequest {
         AdmitRequest::register(definition(filter_id), name.map(Into::into), "r1".to_owned())
+    }
+
+    fn register_as(
+        filter_id: impl Into<String>,
+        name: Option<impl Into<String>>,
+        requester: impl Into<String>,
+    ) -> AdmitRequest {
+        AdmitRequest::register(
+            definition(filter_id),
+            name.map(Into::into),
+            requester.into(),
+        )
+    }
+
+    fn rate_case_request(case: RegisterRateCase, suffix: &str, requester: &str) -> AdmitRequest {
+        match case {
+            RegisterRateCase::NewFilter => {
+                register_as(format!("new-{suffix}"), None::<String>, requester)
+            }
+            RegisterRateCase::NewVersion => {
+                register_as("ready", Some(format!("ready-{suffix}")), requester)
+            }
+            RegisterRateCase::ReclaimedFilter => {
+                register_as("reclaimed", None::<String>, requester)
+            }
+        }
+    }
+
+    async fn prepare_rate_case(db: &DatabaseConnection, case: RegisterRateCase) {
+        if matches!(case, RegisterRateCase::ReclaimedFilter) {
+            reset_reclaimed_filter(db, 2).await;
+        }
+    }
+
+    fn rate_limits(
+        register_rate_per_token: u64,
+        max_filters: u64,
+        max_concurrent_cold_starts: u64,
+    ) -> AdmitLimits {
+        AdmitLimits::from(&ViewsConfig {
+            register_rate_per_token,
+            max_filters,
+            max_concurrent_cold_starts,
+            ..ViewsConfig::default()
+        })
     }
 
     async fn storage_for(temp: &tempfile::TempDir) -> (Arc<DatabaseConnection>, ViewStorage) {
@@ -439,6 +566,76 @@ mod tests {
         .collect()
     }
 
+    async fn clear_register_logs(db: &DatabaseConnection) {
+        mega_view_register_log::Entity::delete_many()
+            .exec(db)
+            .await
+            .unwrap();
+    }
+
+    async fn insert_register_log(db: &DatabaseConnection, requester: &str, offset_secs: i64) {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO mega_view_register_log (requester, created_at) \
+             VALUES ($1, localtimestamp + ($2::bigint * interval '1 second'))",
+            [
+                sea_orm::Value::from(requester.to_owned()),
+                sea_orm::Value::from(offset_secs),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn insert_window_rows(db: &DatabaseConnection, requester: &str, count: usize) {
+        for age_secs in 1..=count {
+            insert_register_log(db, requester, -(age_secs as i64)).await;
+        }
+    }
+
+    async fn register_log_models(db: &DatabaseConnection) -> Vec<mega_view_register_log::Model> {
+        mega_view_register_log::Entity::find()
+            .order_by_asc(mega_view_register_log::Column::Id)
+            .all(db)
+            .await
+            .unwrap()
+    }
+
+    async fn reset_reclaimed_filter(db: &DatabaseConnection, id: i64) {
+        mega_view_filter::Entity::update_many()
+            .col_expr(
+                mega_view_filter::Column::ProjectedSeq,
+                sea_orm::sea_query::Expr::value(0),
+            )
+            .col_expr(
+                mega_view_filter::Column::ReadySeq,
+                sea_orm::sea_query::Expr::value(None::<i64>),
+            )
+            .col_expr(
+                mega_view_filter::Column::WarmingSince,
+                sea_orm::sea_query::Expr::value(None::<chrono::NaiveDateTime>),
+            )
+            .filter(mega_view_filter::Column::Id.eq(id))
+            .exec(db)
+            .await
+            .unwrap();
+    }
+
+    async fn retry_after_upper_bound(db: &DatabaseConnection, requester: &str) -> i64 {
+        db.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT ceil(extract(epoch FROM (SELECT min(created_at) \
+             FROM mega_view_register_log WHERE requester = $1) \
+             + interval '3600 seconds' - localtimestamp))::bigint AS retry_after",
+            [sea_orm::Value::from(requester.to_owned())],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "retry_after")
+        .unwrap()
+    }
+
     async fn three_table_snapshot(
         db: &DatabaseConnection,
     ) -> (Vec<String>, Vec<String>, Vec<String>) {
@@ -457,14 +654,14 @@ mod tests {
     }
 
     async fn count_waiting_register_locks(db: &DatabaseConnection) -> i64 {
-        db.query_one_raw(Statement::from_string(
+        db.query_one_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT count(*)::bigint AS count FROM pg_locks \
              WHERE locktype = 'advisory' AND NOT granted \
-             AND classid = 1297043025::oid \
+             AND classid = $1::int4::oid \
              AND objid = hashtext(current_schema() || ':register')::oid \
-             AND objsubid = 2"
-                .to_owned(),
+             AND objsubid = 2",
+            [sea_orm::Value::from(VIEW_LOCK_NS)],
         ))
         .await
         .unwrap()
@@ -1067,10 +1264,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let logs_before = mega_view_register_log::Entity::find()
-            .all(db.as_ref())
-            .await
-            .unwrap();
         assert_eq!(
             storage
                 .admit(register("reclaimed", None::<String>), limits(100, 2))
@@ -1105,6 +1298,10 @@ mod tests {
             views_before_reclaim,
             table_rows(db.as_ref(), "mega_view").await
         );
+        let logs_before = mega_view_register_log::Entity::find()
+            .all(db.as_ref())
+            .await
+            .unwrap();
 
         mega_view_filter::Entity::update_many()
             .col_expr(
@@ -1363,5 +1560,526 @@ mod tests {
             }
         ));
         assert_eq!(before, three_table_snapshot(db).await);
+    }
+
+    #[tokio::test]
+    async fn rate_rejects_iff_requester_window_full() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db, storage) = storage_for(&temp).await;
+        insert_filter(db.as_ref(), 1, "ready", FilterState::Ready).await;
+        insert_filter(db.as_ref(), 2, "reclaimed", FilterState::Reclaimed).await;
+        let limits = rate_limits(3, 100, 100);
+        let cases = [
+            RegisterRateCase::NewFilter,
+            RegisterRateCase::NewVersion,
+            RegisterRateCase::ReclaimedFilter,
+        ];
+
+        for case in cases {
+            clear_register_logs(db.as_ref()).await;
+            prepare_rate_case(db.as_ref(), case).await;
+            assert!(matches!(
+                storage
+                    .admit(rate_case_request(case, "empty", "r1"), limits)
+                    .await
+                    .unwrap(),
+                AdmitOutcome::Admitted { .. }
+            ));
+        }
+
+        for case in cases {
+            clear_register_logs(db.as_ref()).await;
+            insert_window_rows(db.as_ref(), "r1", 2).await;
+            prepare_rate_case(db.as_ref(), case).await;
+            assert!(matches!(
+                storage
+                    .admit(rate_case_request(case, "two", "r1"), limits)
+                    .await
+                    .unwrap(),
+                AdmitOutcome::Admitted { .. }
+            ));
+        }
+
+        for case in cases {
+            clear_register_logs(db.as_ref()).await;
+            insert_window_rows(db.as_ref(), "r1", 3).await;
+            prepare_rate_case(db.as_ref(), case).await;
+            assert!(matches!(
+                storage
+                    .admit(rate_case_request(case, "full", "r1"), limits)
+                    .await
+                    .unwrap(),
+                AdmitOutcome::Rejected {
+                    reason: RejectReason::Rate,
+                    ..
+                }
+            ));
+        }
+
+        for case in cases {
+            clear_register_logs(db.as_ref()).await;
+            for _ in 0..5 {
+                insert_register_log(db.as_ref(), "r1", -3601).await;
+            }
+            insert_window_rows(db.as_ref(), "r1", 2).await;
+            prepare_rate_case(db.as_ref(), case).await;
+            assert!(matches!(
+                storage
+                    .admit(rate_case_request(case, "expired", "r1"), limits)
+                    .await
+                    .unwrap(),
+                AdmitOutcome::Admitted { .. }
+            ));
+        }
+
+        for case in cases {
+            clear_register_logs(db.as_ref()).await;
+            insert_window_rows(db.as_ref(), "r1", 2).await;
+            insert_window_rows(db.as_ref(), "r2", 3).await;
+            prepare_rate_case(db.as_ref(), case).await;
+            assert!(matches!(
+                storage
+                    .admit(rate_case_request(case, "isolation-r1", "r1"), limits)
+                    .await
+                    .unwrap(),
+                AdmitOutcome::Admitted { .. }
+            ));
+
+            clear_register_logs(db.as_ref()).await;
+            insert_window_rows(db.as_ref(), "r1", 2).await;
+            insert_window_rows(db.as_ref(), "r2", 3).await;
+            prepare_rate_case(db.as_ref(), case).await;
+            assert!(matches!(
+                storage
+                    .admit(rate_case_request(case, "isolation-r2", "r2"), limits)
+                    .await
+                    .unwrap(),
+                AdmitOutcome::Rejected {
+                    reason: RejectReason::Rate,
+                    ..
+                }
+            ));
+        }
+
+        for case in cases {
+            clear_register_logs(db.as_ref()).await;
+            insert_window_rows(db.as_ref(), "r1", 3).await;
+            let mut config = isolated_config(temp.path().join("rate-config"));
+            config.views.register_rate_per_token = 3;
+            config.views.max_filters = 100;
+            config.views.max_concurrent_cold_starts = 100;
+            let handle = ConfigHandle::new(config);
+            prepare_rate_case(db.as_ref(), case).await;
+            let request = rate_case_request(case, "reloaded", "r1");
+            let current_limits = AdmitLimits::from(&handle.snapshot().unwrap().views);
+            assert!(matches!(
+                storage
+                    .admit(request.clone(), current_limits)
+                    .await
+                    .unwrap(),
+                AdmitOutcome::Rejected {
+                    reason: RejectReason::Rate,
+                    ..
+                }
+            ));
+            let mut candidate = handle.snapshot().unwrap().as_ref().clone();
+            candidate.views.register_rate_per_token = 4;
+            let report = handle.reload(candidate).unwrap();
+            assert!(
+                report
+                    .applied_fields
+                    .contains(&"views.register_rate_per_token")
+            );
+            let reloaded_limits = AdmitLimits::from(&handle.snapshot().unwrap().views);
+            assert!(matches!(
+                storage.admit(request, reloaded_limits).await.unwrap(),
+                AdmitOutcome::Admitted { .. }
+            ));
+        }
+
+        let ordering_temp = tempfile::tempdir().unwrap();
+        let (ordering_db, ordering_storage) = storage_for(&ordering_temp).await;
+        insert_filter(ordering_db.as_ref(), 1, "ready", FilterState::Ready).await;
+        insert_filter(ordering_db.as_ref(), 2, "warming-a", FilterState::Warming).await;
+        insert_filter(ordering_db.as_ref(), 3, "warming-b", FilterState::Warming).await;
+        let full_limits = rate_limits(3, 2, 1);
+        insert_window_rows(ordering_db.as_ref(), "r1", 3).await;
+        assert!(matches!(
+            ordering_storage
+                .admit(
+                    register("new-rate-before-quotas", None::<String>),
+                    full_limits
+                )
+                .await
+                .unwrap(),
+            AdmitOutcome::Rejected {
+                reason: RejectReason::Rate,
+                ..
+            }
+        ));
+        clear_register_logs(ordering_db.as_ref()).await;
+        insert_window_rows(ordering_db.as_ref(), "r1", 2).await;
+        assert!(matches!(
+            ordering_storage
+                .admit(
+                    register("new-quotas-after-rate", None::<String>),
+                    full_limits
+                )
+                .await
+                .unwrap(),
+            AdmitOutcome::Rejected {
+                reason: RejectReason::MaxFilters,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rate_rejection_writes_nothing() {
+        async fn assert_rejected_unchanged(
+            db: &DatabaseConnection,
+            storage: &ViewStorage,
+            request: AdmitRequest,
+            limits: AdmitLimits,
+            reason: RejectReason,
+        ) {
+            let before = three_table_snapshot(db).await;
+            let outcome = storage.admit(request, limits).await.unwrap();
+            assert!(matches!(
+                outcome,
+                AdmitOutcome::Rejected { reason: actual, .. } if actual == reason
+            ));
+            assert_eq!(before, three_table_snapshot(db).await);
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let (db, storage) = storage_for(&temp).await;
+        insert_filter(db.as_ref(), 1, "ready", FilterState::Ready).await;
+        insert_filter(db.as_ref(), 2, "reclaimed", FilterState::Reclaimed).await;
+        let ordinary_limits = rate_limits(3, 100, 100);
+
+        for request in [
+            register("new-rate-rejected", None::<String>),
+            register("ready", Some("ready-rate-rejected")),
+            register("reclaimed", None::<String>),
+        ] {
+            clear_register_logs(db.as_ref()).await;
+            insert_register_log(db.as_ref(), "r1", -7200).await;
+            insert_window_rows(db.as_ref(), "r1", 3).await;
+            assert_rejected_unchanged(
+                db.as_ref(),
+                &storage,
+                request,
+                ordinary_limits,
+                RejectReason::Rate,
+            )
+            .await;
+        }
+
+        insert_filter(db.as_ref(), 3, "warming-a", FilterState::Warming).await;
+        insert_filter(db.as_ref(), 4, "warming-b", FilterState::Warming).await;
+        let full_limits = rate_limits(3, 2, 1);
+        for request in [
+            register("new-max-filters", None::<String>),
+            register("reclaimed", None::<String>),
+        ] {
+            clear_register_logs(db.as_ref()).await;
+            insert_register_log(db.as_ref(), "r1", -7200).await;
+            insert_window_rows(db.as_ref(), "r1", 2).await;
+            assert_rejected_unchanged(
+                db.as_ref(),
+                &storage,
+                request,
+                full_limits,
+                RejectReason::MaxFilters,
+            )
+            .await;
+            let reclaimed = mega_view_filter::Entity::find_by_id(2)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(reclaimed.warming_since.is_none());
+        }
+
+        mega_view_filter::Entity::delete_by_id(3)
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        mega_view_filter::Entity::delete_by_id(4)
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        insert_filter(db.as_ref(), 5, "warming-slot", FilterState::Warming).await;
+        let slot_limits = rate_limits(3, 100, 1);
+        for request in [
+            register("new-slot", None::<String>),
+            register("reclaimed", None::<String>),
+        ] {
+            clear_register_logs(db.as_ref()).await;
+            insert_register_log(db.as_ref(), "r1", -7200).await;
+            insert_window_rows(db.as_ref(), "r1", 2).await;
+            assert_rejected_unchanged(
+                db.as_ref(),
+                &storage,
+                request,
+                slot_limits,
+                RejectReason::ColdStartSlots,
+            )
+            .await;
+        }
+        assert!(
+            mega_view_filter::Entity::find_by_id(2)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .warming_since
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_retry_after_from_oldest_row() {
+        async fn insert_retry_window(db: &DatabaseConnection) {
+            clear_register_logs(db).await;
+            db.execute_unprepared(
+                "INSERT INTO mega_view_register_log (requester, created_at) VALUES \
+                 ('r1', localtimestamp - interval '3000.4 seconds'), \
+                 ('r1', localtimestamp - interval '1200 seconds'), \
+                 ('r1', localtimestamp - interval '10 seconds'), \
+                 ('r2', localtimestamp - interval '3500 seconds')",
+            )
+            .await
+            .unwrap();
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let (db, storage) = storage_for(&temp).await;
+        insert_filter(db.as_ref(), 1, "ready", FilterState::Ready).await;
+        insert_filter(db.as_ref(), 2, "reclaimed", FilterState::Reclaimed).await;
+        let limits = rate_limits(3, 100, 100);
+
+        for request in [
+            register("new-retry", None::<String>),
+            register("ready", Some("ready-retry")),
+            register("reclaimed", None::<String>),
+        ] {
+            insert_retry_window(db.as_ref()).await;
+            let upper = retry_after_upper_bound(db.as_ref(), "r1").await;
+            let outcome = storage.admit(request, limits).await.unwrap();
+            let lower = retry_after_upper_bound(db.as_ref(), "r1").await;
+            let AdmitOutcome::Rejected {
+                reason: RejectReason::Rate,
+                retry_after,
+            } = outcome
+            else {
+                panic!("rate window should reject");
+            };
+            let retry_after = i64::try_from(retry_after.as_secs()).unwrap();
+            assert!(lower <= retry_after && retry_after <= upper);
+        }
+
+        clear_register_logs(db.as_ref()).await;
+        for offset in [10, 20, 30] {
+            insert_register_log(db.as_ref(), "r1", offset).await;
+        }
+        assert_eq!(
+            storage
+                .admit(register("new-clamped", None::<String>), limits)
+                .await
+                .unwrap(),
+            AdmitOutcome::Rejected {
+                reason: RejectReason::Rate,
+                retry_after: Duration::from_secs(REGISTER_RATE_WINDOW_SECS),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_admitted_appends_and_trims() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db, storage) = storage_for(&temp).await;
+        insert_filter(db.as_ref(), 1, "ready", FilterState::Ready).await;
+        insert_filter(db.as_ref(), 2, "reclaimed", FilterState::Reclaimed).await;
+        let limits = rate_limits(3, 100, 100);
+
+        for case in 0..4 {
+            clear_register_logs(db.as_ref()).await;
+            insert_register_log(db.as_ref(), "r1", -7200).await;
+            insert_register_log(db.as_ref(), "r1", -3601).await;
+            insert_register_log(db.as_ref(), "r1", -60).await;
+            insert_register_log(db.as_ref(), "r2", -7200).await;
+            insert_register_log(db.as_ref(), "r2", -60).await;
+            if matches!(case, 2 | 3) {
+                reset_reclaimed_filter(db.as_ref(), 2).await;
+            }
+
+            let before = register_log_models(db.as_ref()).await;
+            let r1_expired = before
+                .iter()
+                .filter(|row| row.requester == "r1")
+                .take(2)
+                .map(|row| row.id)
+                .collect::<Vec<_>>();
+            let views_before = mega_view::Entity::find()
+                .filter(mega_view::Column::FilterPk.eq(2))
+                .count(db.as_ref())
+                .await
+                .unwrap();
+            let request = match case {
+                0 => register("new-log", None::<String>),
+                1 => register("ready", Some("ready-log")),
+                2 => register("reclaimed", None::<String>),
+                3 => register("reclaimed", Some("reclaimed-log")),
+                _ => unreachable!(),
+            };
+            assert!(matches!(
+                storage.admit(request, limits).await.unwrap(),
+                AdmitOutcome::Admitted { .. }
+            ));
+            let after = register_log_models(db.as_ref()).await;
+            let before_ids = before.iter().map(|row| row.id).collect::<Vec<_>>();
+            let after_ids = after.iter().map(|row| row.id).collect::<Vec<_>>();
+            let added = after
+                .iter()
+                .filter(|row| !before_ids.contains(&row.id))
+                .collect::<Vec<_>>();
+            let removed = before
+                .iter()
+                .filter(|row| !after_ids.contains(&row.id))
+                .map(|row| row.id)
+                .collect::<Vec<_>>();
+            assert_eq!(added.len(), 1);
+            assert_eq!(added[0].requester, "r1");
+            assert_eq!(removed, r1_expired);
+            assert!(after.iter().any(|row| row.requester == "r1"));
+            assert_eq!(after.iter().filter(|row| row.requester == "r2").count(), 2);
+            if case == 3 {
+                assert!(
+                    mega_view_filter::Entity::find_by_id(2)
+                        .one(db.as_ref())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .warming_since
+                        .is_some()
+                );
+                assert_eq!(
+                    mega_view::Entity::find()
+                        .filter(mega_view::Column::FilterPk.eq(2))
+                        .count(db.as_ref())
+                        .await
+                        .unwrap(),
+                    views_before + 1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_idempotent_and_rewarm_not_counted() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db, storage) = storage_for(&temp).await;
+        insert_filter(db.as_ref(), 1, "ready", FilterState::Ready).await;
+        insert_filter(db.as_ref(), 2, "warming", FilterState::Warming).await;
+        insert_filter(db.as_ref(), 3, "reclaimed", FilterState::Reclaimed).await;
+        insert_view(db.as_ref(), 1, "n1", 1, 1).await;
+        insert_window_rows(db.as_ref(), "r1", 3).await;
+        insert_register_log(db.as_ref(), "r1", -7200).await;
+        insert_window_rows(db.as_ref(), "anonymous", 3).await;
+        let limits = rate_limits(3, 100, 100);
+
+        let before = register_log_models(db.as_ref()).await;
+        assert!(matches!(
+            storage
+                .admit(register("ready", Some("n1")), limits)
+                .await
+                .unwrap(),
+            AdmitOutcome::Idempotent { .. }
+        ));
+        assert_eq!(before, register_log_models(db.as_ref()).await);
+        assert!(matches!(
+            storage
+                .admit(register("warming", None::<String>), limits)
+                .await
+                .unwrap(),
+            AdmitOutcome::Idempotent { .. }
+        ));
+        assert_eq!(before, register_log_models(db.as_ref()).await);
+        assert!(matches!(
+            storage
+                .admit(AdmitRequest::rewarm(3), limits)
+                .await
+                .unwrap(),
+            AdmitOutcome::Admitted { .. }
+        ));
+        assert_eq!(before, register_log_models(db.as_ref()).await);
+    }
+
+    #[tokio::test]
+    async fn rate_concurrent_last_quota() {
+        let temp = tempfile::tempdir().unwrap();
+        let (first, _second, holder, a, b, _guard) = multi_pool_storages(&temp).await;
+        let limits = rate_limits(3, 100, 100);
+
+        for round in 0..10 {
+            clear_register_logs(first.as_ref()).await;
+            insert_window_rows(first.as_ref(), "r1", 2).await;
+            let filters_before = mega_view_filter::Entity::find()
+                .count(first.as_ref())
+                .await
+                .unwrap();
+            let txn = holder.begin().await.unwrap();
+            assert!(
+                acquire_view_lock(&txn, ViewLock::Register, ViewLockMode::Blocking)
+                    .await
+                    .unwrap()
+            );
+            let admission_a = a.admit(register(format!("rate-a-{round}"), None::<String>), limits);
+            let admission_b = b.admit(register(format!("rate-b-{round}"), None::<String>), limits);
+            let gate_holder = holder.clone();
+            let gate = async move {
+                if !wait_for_register_waiters(gate_holder.as_ref(), 2).await {
+                    txn.rollback().await.unwrap();
+                    panic!("did not observe two rate-register waiters");
+                }
+                txn.commit().await.unwrap();
+            };
+            let (a_result, b_result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::join!(admission_a, admission_b, gate)
+            })
+            .await
+            .expect("rate gate and admissions finish within 30 seconds");
+            let outcomes = [a_result.unwrap(), b_result.unwrap()];
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, AdmitOutcome::Admitted { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(
+                        outcome,
+                        AdmitOutcome::Rejected {
+                            reason: RejectReason::Rate,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(register_log_models(first.as_ref()).await.len(), 3);
+            assert_eq!(
+                mega_view_filter::Entity::find()
+                    .count(first.as_ref())
+                    .await
+                    .unwrap(),
+                filters_before + 1
+            );
+        }
     }
 }

@@ -225,8 +225,9 @@ Try/Blocking/取消等锁；以及全部锁键与同 schema 的两两隔离。
 
 `AdmitRequest`、`AdmitMode`、`FilterDefinition`、`AdmitLimits`、
 `AdmitOutcome` 与 `RejectReason` 都限定在 storage crate 内。限额仅来自调用方传入的
-`AdmitLimits`，其 `From<&ViewsConfig>` 实现读取 `max_filters` 与
-`max_concurrent_cold_starts`；准入自身不读取 `Storage` 的配置快照。拒绝返回
+`AdmitLimits`：HP-13 的 `max_filters` 与 `max_concurrent_cold_starts`，以及 HP-31
+追加的 `register_rate_per_token` 都由 `From<&ViewsConfig>` 读取；准入自身不读取
+`Storage` 的配置快照。总数与名额拒绝返回
 `Rejected { reason, retry_after: 30 秒 }` 并回滚；幂等命中没有写入。新过滤器以
 `ON CONFLICT (filter_id) DO NOTHING RETURNING` 写入，若 L_R 以外的写入方在查询后
 抢先提交，SeaORM 的零返回行会规范为
@@ -249,6 +250,28 @@ L_R，并轮询确认两个准入正在等待再释放；轮询失败分支会�
 快照验证拒绝、幂等、Rewarm 与错误都不写行；改名列注入第 6 步写失败，并让 L_R 外部
 未提交的同键插入与准入经 `tokio::join!` 在 30 秒内运行，在观测到 transactionid 等待后
 提交；观测失败先显式回滚写入事务，验证零行冲突回滚。
+
+## DB 模块覆盖：视图注册速率窗口（HP-31）
+
+`AdmitLimits` 从调用方的配置快照额外携带
+`register_rate_per_token`，`RejectReason::Rate` 表示按 requester 的速率拒绝。
+`ViewStorage::admit` 在 Register 的幂等判定之后、总数和冷启动名额之前，以同一短事务
+读取 requester 在 `REGISTER_RATE_WINDOW_SECS`（3600 秒）内的注册行数和最早一行的
+离窗秒数。达到阈值时显式回滚并返回向上取整、最多 3600 秒的 `retry_after`；成功的
+计速率 Register 在提交前插入一条默认时间戳的日志，并仅删除该 requester 的过期行。
+`Idempotent` 与 `Rewarm` 不读写 `mega_view_register_log`。
+
+六个 lib 用例覆盖：`rate_rejects_iff_requester_window_full` 的三类计速率 Register、
+过期行、requester 隔离和热加载阈值；`rate_rejection_writes_nothing` 的速率、总数和
+名额拒绝逐行三表快照；`rate_retry_after_from_oldest_row` 的 SQL 时间边界和 3600 秒上限；
+`rate_admitted_appends_and_trims` 的插入与 requester 范围内清理；
+`rate_idempotent_and_rewarm_not_counted` 的不计数路径；以及
+`rate_concurrent_last_quota` 的跨副本最后一个速率配额。窗口状态由直接插入的
+`created_at = localtimestamp - k 秒` 行构造，并在各状态之间清空运行态表；重试秒数由
+调用前后的 SQL 值夹定，Rust 不直接比较时间。并发用例用 `test_db_config` 和
+`database_connection` 共享 schema，先预热三个连接池，再由第三个连接以
+`ViewLockMode::Blocking` 持有 L_R；只有观察到两个等待者才释放锁，10 秒内未观察到则
+显式回滚，整个 `tokio::join!` 另有 30 秒上限。
 
 ## DB 模块覆盖：根链停追与恢复（HP-28）
 

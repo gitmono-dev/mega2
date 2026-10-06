@@ -1266,7 +1266,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
     5. **名额。** 需要冷启动时，统计 `warming_since IS NOT NULL` 的行数，达到 `max_concurrent_cold_starts` 即拒绝。
     6. **写入。** 插入新过滤器行（`warming_since = now()`，`ON CONFLICT (filter_id) DO NOTHING`），或者对已回收的行置 `warming_since = now()`（P1 起，在同一语句中置 `last_access_at = now()`，见 4.6）；需要时插入 `mega_view` 新 version；计入速率时，插入一行 `mega_view_register_log`，并删除本 requester 窗口外的旧行。提交后发 4.4 的进程内信号。
     由读者访问触发的重新预热（4.6）只执行第 1、2、4、5、6 步，不计速率。
-  - **拒绝应答。** 第 3、4、5 步任一项不满足时，事务回滚，不写任何行，返回 429 加 `Retry-After`。速率超限时，取窗口内最早一行还要多久离开窗口；其余情形固定为 30 秒。【代码】`ApiError` 不携带响应头，注册接口要自行构造响应，参照 `lfs_media.rs::map_media_error`（约 L79–85）。
+  - **拒绝应答。** 第 3、4、5 步任一项不满足时，事务回滚，不写任何行，返回 429 加 `Retry-After`。速率超限时，取窗口内最早一行还要多久离开窗口，向上取整到秒，上限 3600 秒；其余情形固定为 30 秒。【代码】`ApiError` 不携带响应头，注册接口要自行构造响应，参照 `lfs_media.rs::map_media_error`（约 L79–85）。
   - **名额的释放与崩溃回收。** 名额记在数据库状态中，不是进程持有的租约，所以不需要心跳或 TTL。
     - 释放只有两处：视图首次就绪的那个 catch_up 批事务内清空 `warming_since`（4.4）；回收与 rebuild 时清空（4.6）。
     - 处理冷启动的副本崩溃时，名额与 `projected_seq` 都已持久化。任一副本的补偿任务都把 `warming_since` 非空的过滤器视为活跃视图，从已提交的水位接着做（4.4 触发方式第 2 条）。水位已到链尾、尚未就绪的过滤器同样是补偿候选（6.9），由下一次 catch_up 置就绪并释放名额。
@@ -1468,7 +1468,7 @@ P1 的清扫周期，以及闲置阈值 `idle_recycle_secs`（下界为 2T = 720
 
 **注册准入（P0）：**
   - 用两个连接模拟两个副本。在活跃过滤器数为 `max_filters − 1`、且名额只剩一个时，并发注册两个不同的新过滤器：恰好一个成功，另一个得到 429，且没有留下过滤器行、视图行或速率行。同一个新过滤器并发注册两次：只建一行，只占一个名额；
-  - 同一 token 在窗口内第 `register_rate_per_token + 1` 次产生新定义的注册得到 429，`Retry-After` 不超过窗口的剩余时间；幂等的重复注册不计数；不同 token 互不影响；
+  - 同一 token 在窗口内第 `register_rate_per_token + 1` 次产生新定义的注册得到 429，`Retry-After` 等于最早一行离开窗口的剩余时间向上取整到秒，不超过 3600 秒；幂等的重复注册不计数；不同 token 互不影响；
   - 冷启动进行中丢弃处理它的 worker，当前批不提交；另一个 worker 实例在同一 schema 上续做到就绪，名额在就绪的同一事务内释放；
   - 冷启动的最后一批：如果根链已覆盖 `main@/`，`projected_seq`、`ready_seq` 与 `warming_since` 在同一事务内更新，提交后不存在‘水位到链尾、`ready_seq` 为 NULL’的中间状态。如果最后一批时 `main@/` 已前进到根链之外，则不置就绪；根链扩展后，视图续追到就绪。另在测试中直接写出以下状态：`projected_seq` 等于链尾、`ready_seq` 为 NULL、`warming_since` 非空、`main@/` 等于链尾，此后不再推进根。只运行另一个 worker 实例的补偿任务，断言视图在一个周期内就绪并释放名额。
   - 4.2 前提校验失败的冷启动仍占用名额，并能由指标观测到；
