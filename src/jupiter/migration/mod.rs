@@ -139,6 +139,11 @@ mod m20260921_000100_fix_git_tag_unique;
 mod m20260923_000100_import_repo_cleanups;
 mod m20260923_000200_canonicalize_import_repo_paths;
 mod m20260925_000100_media_paging;
+mod m20261005_000100_add_mst2_publication_request_digest;
+mod m20261005_000100_add_mst2_retention_durability;
+mod m20261005_000200_add_mst2_native_head;
+mod m20261005_000200_harden_mst2_retention_graph;
+mod m20261005_000300_add_mst2_metadata_install;
 mod m20261006_000100_add_view_tables;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
@@ -267,6 +272,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260923_000100_import_repo_cleanups::Migration),
             Box::new(m20260923_000200_canonicalize_import_repo_paths::Migration),
             Box::new(m20260925_000100_media_paging::Migration),
+            Box::new(m20261005_000100_add_mst2_publication_request_digest::Migration),
+            Box::new(m20261005_000200_add_mst2_native_head::Migration),
+            Box::new(m20261005_000100_add_mst2_retention_durability::Migration),
+            Box::new(m20261005_000200_harden_mst2_retention_graph::Migration),
+            Box::new(m20261005_000300_add_mst2_metadata_install::Migration),
             Box::new(m20261006_000100_add_view_tables::Migration),
         ]
     }
@@ -1178,13 +1188,18 @@ mod tests {
     async fn import_repo_alias_rows_canonicalized() {
         let names = migration_names();
         assert_eq!(
-            &names[names.len() - 3..],
+            &names[names.len() - 8..],
             &[
                 "m20260923_000200_canonicalize_import_repo_paths".to_string(),
                 "m20260925_000100_media_paging".to_string(),
+                "m20261005_000100_add_mst2_publication_request_digest".to_string(),
+                "m20261005_000200_add_mst2_native_head".to_string(),
+                "m20261005_000100_add_mst2_retention_durability".to_string(),
+                "m20261005_000200_harden_mst2_retention_graph".to_string(),
+                "m20261005_000300_add_mst2_metadata_install".to_string(),
                 VIEW_MIGRATION_NAME.to_string(),
             ],
-            "view tables are registered last"
+            "native retention, metadata installation and view tables follow media paging"
         );
 
         let db = alias_db().await;

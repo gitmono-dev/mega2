@@ -26,7 +26,7 @@ use sea_orm::{
 use crate::{
     callisto::{
         mega_blob, mega_cl, mega_commit, mega_ref_tombstones, mega_refs, mega_tag, mega_tree,
-        mst2_publication, mst2_publication_outbox, mst2_verified_object,
+        mst2_verified_object,
     },
     common::{
         errors::MegaError,
@@ -272,6 +272,24 @@ impl MonoStorage {
             .one(self.get_connection())
             .await?;
         Ok(result)
+    }
+
+    pub(crate) async fn get_native_main_ref_in_txn(
+        &self,
+        path: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<mega_refs::Model>, MegaError> {
+        let rows = mega_refs::Entity::find()
+            .filter(mega_refs::Column::Path.eq(path))
+            .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME))
+            .filter(mega_refs::Column::IsCl.eq(false))
+            .all(txn)
+            .await?;
+        match rows.len() {
+            0 => Ok(None),
+            1 => Ok(rows.into_iter().next()),
+            _ => Err(MegaError::Other("selected native ref is ambiguous".into())),
+        }
     }
 
     pub async fn get_main_ref_in_txn(
@@ -1362,6 +1380,7 @@ impl MonoStorage {
                        updated_at = $3
                  WHERE path = '/'
                    AND ref_name = $4
+                   AND is_cl = false
                    AND ref_commit_hash IS NOT DISTINCT FROM $5
                    AND ref_tree_hash IS NOT DISTINCT FROM $6
                 "#,
@@ -1870,112 +1889,6 @@ impl MonoStorage {
             Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
             Err(e) => Err(e.into()),
         }
-    }
-
-    /// Record one namespace publication inside the caller's transaction
-    /// (spec 09 §1/§7): bump the per-namespace sequence, insert the
-    /// receipt and append the outbox event — atomically with the ref CAS
-    /// the same transaction performs.
-    ///
-    /// Idempotent per (namespace, operation_id): a retried writer gets
-    /// back the original sequence and neither the counter nor the outbox
-    /// advances twice (PUB-11). The uniqueness is scoped to the namespace
-    /// because push operation ids (`old→new`) are only unique within one
-    /// repo: two namespaces landing the same (old,new) pair are distinct
-    /// publications, not replays.
-    pub async fn record_publication_in_txn(
-        &self,
-        txn: &DatabaseTransaction,
-        operation_id: &str,
-        namespace: &str,
-        old_oid: &str,
-        new_oid: &str,
-        writer_kind: &str,
-    ) -> Result<i64, MegaError> {
-        // One SELECT by operation id answers both questions: the same id
-        // under this namespace is a replay (PUB-11) and returns the original
-        // sequence; the same id under a different namespace means the id is
-        // not actually unique to this publication — refuse rather than
-        // silently double-bind it.
-        if let Some(existing) = mst2_publication::Entity::find()
-            .filter(mst2_publication::Column::OperationId.eq(operation_id))
-            .one(txn)
-            .await?
-        {
-            if existing.namespace == namespace {
-                return Ok(existing.sequence);
-            }
-            return Err(MegaError::Other(format!(
-                "operation id {operation_id} already published under a different namespace"
-            )));
-        }
-        // Upsert the sequence row and bump it atomically; the unique
-        // namespace key makes this a single-winner counter.
-        let backend = txn.get_database_backend();
-        let bump = sea_orm::Statement::from_sql_and_values(
-            backend,
-            r#"INSERT INTO mst2_namespace_seq ("namespace", "sequence", "epoch")
-               VALUES ($1, 1, 1)
-               ON CONFLICT ("namespace") DO UPDATE SET "sequence" = "mst2_namespace_seq"."sequence" + 1
-               RETURNING "sequence""#,
-            [namespace.into()],
-        );
-        let row = txn
-            .query_one_raw(bump)
-            .await?
-            .ok_or_else(|| MegaError::Other("mst2_namespace_seq upsert returned no row".into()))?;
-        let sequence: i64 = row.try_get_by_index(0)?;
-        let now = chrono::Utc::now().fixed_offset();
-
-        // Concurrency-safe insert: the receipt is unique per
-        // (namespace, operation_id). The replay check above covers a
-        // committed prior publication; a truly concurrent same-operation
-        // writer loses at the outbox insert's unique operation_id below,
-        // rolling this transaction back rather than double-publishing.
-        let insert = mst2_publication::ActiveModel {
-            id: sea_orm::ActiveValue::NotSet,
-            operation_id: Set(operation_id.to_string()),
-            namespace: Set(namespace.to_string()),
-            sequence: Set(sequence),
-            old_oid: Set(old_oid.to_string()),
-            new_oid: Set(new_oid.to_string()),
-            writer_epoch: Set(1),
-            writer_kind: Set(writer_kind.to_string()),
-            created_at: Set(now),
-        };
-        match mst2_publication::Entity::insert(insert)
-            .on_conflict(
-                OnConflict::columns([
-                    mst2_publication::Column::Namespace,
-                    mst2_publication::Column::OperationId,
-                ])
-                .do_nothing()
-                .to_owned(),
-            )
-            .exec(txn)
-            .await
-        {
-            // RecordNotInserted means a receipt with this identity already
-            // exists; see the outbox insert below for how a racing writer
-            // of the same operation is resolved.
-            Ok(_) | Err(DbErr::RecordNotInserted) => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        // The replay check above already returned for a pre-existing receipt,
-        // so reaching here means this call owns `sequence`; the outbox row
-        // inserts normally.
-        mst2_publication_outbox::ActiveModel {
-            id: sea_orm::ActiveValue::NotSet,
-            operation_id: Set(operation_id.to_string()),
-            namespace: Set(namespace.to_string()),
-            sequence: Set(sequence),
-            state: Set("PENDING".to_string()),
-            created_at: Set(now),
-        }
-        .insert(txn)
-        .await?;
-        Ok(sequence)
     }
 
     /// Canonical publication namespace for a repository path: a leading
@@ -3491,7 +3404,7 @@ mod tests {
         // Rollback ⇒ nothing visible: the receipt commits only with the
         // ref CAS in the same transaction (spec 09 §1).
         let txn = mono.get_connection().begin().await.unwrap();
-        mono.record_publication_in_txn(&txn, "op-roll", "/", "", "aaa", "trunk_push")
+        mono.record_test_publication_in_txn(&txn, "op-roll", "/", "", "aaa", "trunk_push")
             .await
             .unwrap();
         txn.rollback().await.unwrap();
@@ -3511,7 +3424,7 @@ mod tests {
         for (op, old, new) in [("op-1", "", "a1"), ("op-2", "a1", "a2")] {
             let txn = mono.get_connection().begin().await.unwrap();
             let seq = mono
-                .record_publication_in_txn(&txn, op, "/", old, new, "trunk_push")
+                .record_test_publication_in_txn(&txn, op, "/", old, new, "trunk_push")
                 .await
                 .unwrap();
             txn.commit().await.unwrap();
@@ -3530,7 +3443,7 @@ mod tests {
         // adds nothing (PUB-11) — the push retry path depends on this.
         let txn = mono.get_connection().begin().await.unwrap();
         let again = mono
-            .record_publication_in_txn(&txn, "op-1", "/", "", "a1", "trunk_push")
+            .record_test_publication_in_txn(&txn, "op-1", "/", "", "a1", "trunk_push")
             .await
             .unwrap();
         txn.commit().await.unwrap();
@@ -3547,7 +3460,7 @@ mod tests {
         // Distinct namespaces keep independent sequences.
         let txn = mono.get_connection().begin().await.unwrap();
         let other = mono
-            .record_publication_in_txn(&txn, "op-child", "/child", "", "c1", "trunk_push")
+            .record_test_publication_in_txn(&txn, "op-child", "/child", "", "c1", "trunk_push")
             .await
             .unwrap();
         txn.commit().await.unwrap();
@@ -3564,13 +3477,13 @@ mod tests {
         // replay: refuse rather than silently double-bind the id (the
         // reviewer's P3.1 — a silent no-op left /b's counter at 0 forever).
         let txn = mono.get_connection().begin().await.unwrap();
-        mono.record_publication_in_txn(&txn, "shared-op", "/", "", "a1", "trunk_push")
+        mono.record_test_publication_in_txn(&txn, "shared-op", "/", "", "a1", "trunk_push")
             .await
             .unwrap();
         txn.commit().await.unwrap();
         let txn = mono.get_connection().begin().await.unwrap();
         let err = mono
-            .record_publication_in_txn(&txn, "shared-op", "/b", "", "a1", "trunk_push")
+            .record_test_publication_in_txn(&txn, "shared-op", "/b", "", "a1", "trunk_push")
             .await;
         assert!(err.is_err(), "cross-namespace reuse must be refused");
         drop(txn); // the failed transaction rolls back on drop
@@ -3593,7 +3506,7 @@ mod tests {
                 let m = base.mono_storage();
                 let txn = m.get_connection().begin().await.unwrap();
                 let seq = m
-                    .record_publication_in_txn(
+                    .record_test_publication_in_txn(
                         &txn,
                         &format!("op-c{i}"),
                         "/",

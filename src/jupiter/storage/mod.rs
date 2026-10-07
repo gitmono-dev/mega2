@@ -16,6 +16,10 @@ pub mod issue_storage;
 pub mod lfs_db_storage;
 pub mod media_paging_storage;
 pub mod mono_storage;
+pub(crate) mod mst2_publication_storage;
+pub mod mst2_retention;
+pub mod native_metadata_install;
+pub(crate) mod native_publication_storage;
 pub mod notification_storage;
 pub mod object_storage;
 pub mod oci_db_storage;
@@ -151,6 +155,11 @@ impl AppService {
 #[derive(Clone)]
 pub struct Storage {
     pub(crate) app_service: Arc<AppService>,
+    /// Derived native projection memoization, scoped to this storage assembly.
+    /// Clones share it; independent databases/backends never share entries.
+    pub(crate) native_projection_cache: Arc<crate::ceres::snapshot::pages::NativeProjectionCache>,
+    pub(crate) projection_observation_sink:
+        Option<Arc<crate::ceres::snapshot::projection_writer::ProjectionObservationSink>>,
     pub cl_service: CLService,
     pub push_queue_service: PushQueueService,
     pub artifact_service: ArtifactService,
@@ -224,7 +233,8 @@ impl Storage {
         };
 
         let commit_binding_storage = CommitBindingStorage { base: base.clone() };
-        let push_queue_storage = PushQueueStorage::new(base.clone());
+        let push_queue_storage = PushQueueStorage::new(base.clone())
+            .with_native_publication(config.mst2.publication_enabled);
         let buck_storage = BuckStorage { base: base.clone() };
 
         let bots_storage = BotsStorage { base: base.clone() };
@@ -291,7 +301,8 @@ impl Storage {
         let push_queue_service =
             PushQueueService::new(base.clone(), config.monorepo.push_policy.clone())
                 .with_view_signal(view_runtime.signal())
-                .with_max_push_commits(config.monorepo.max_push_commits);
+                .with_max_push_commits(config.monorepo.max_push_commits)
+                .with_native_publication(config.mst2.publication_enabled);
         let artifact_service = ArtifactService::new(base.clone(), object_store.clone());
         let buck_service = BuckService::new(
             base.clone(),
@@ -310,6 +321,8 @@ impl Storage {
 
         Ok(Storage {
             app_service: app_service.into(),
+            native_projection_cache: Arc::default(),
+            projection_observation_sink: None,
             config_handle,
             config,
             cl_service: CLService::new(base.clone()),
@@ -685,6 +698,8 @@ impl Storage {
 
         Storage {
             app_service,
+            native_projection_cache: Arc::default(),
+            projection_observation_sink: None,
             // app_service: AppService::mock(),
             cl_service: CLService::mock(),
             push_queue_service: PushQueueService::new(

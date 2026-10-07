@@ -359,7 +359,8 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         view_storage: ViewStorage::new(base.clone()),
         conversation_storage: ConversationStorage { base: base.clone() },
         commit_binding_storage: CommitBindingStorage { base: base.clone() },
-        push_queue_storage: PushQueueStorage::new(base.clone()),
+        push_queue_storage: PushQueueStorage::new(base.clone())
+            .with_native_publication(config.mst2.publication_enabled),
         buck_storage: BuckStorage { base: base.clone() },
         bots_storage: BotsStorage { base: base.clone() },
         webhook_storage: WebhookStorage { base: base.clone() },
@@ -376,6 +377,8 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
 
     Storage {
         app_service: Arc::new(svc),
+        native_projection_cache: Arc::default(),
+        projection_observation_sink: None,
         cl_service: CLService::mock(),
         push_queue_service: PushQueueService::new(
             base.clone(),
@@ -383,7 +386,8 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         )
         .with_view_signal(view_runtime.signal())
         .with_timeouts(Duration::from_secs(30), Duration::from_millis(20))
-        .with_max_push_commits(config.monorepo.max_push_commits),
+        .with_max_push_commits(config.monorepo.max_push_commits)
+        .with_native_publication(config.mst2.publication_enabled),
         artifact_service: ArtifactService::new(base.clone(), mock_object_storage()),
         buck_service: BuckService::mock(),
         config_handle: ConfigHandle::from_arc(config.clone()),

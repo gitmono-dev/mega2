@@ -6,25 +6,36 @@
 //! yields identical page_ids across requests.
 
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
 };
 
 use base64::Engine;
-use mst2_codec::metapage::{Entry, EntryKind, Page, page_id};
+use git_internal::{hash::ObjectHash, internal::object::tree::Tree};
+use mst2_codec::{
+    descriptor::{
+        ACCESS_PROJECTION_EXACT_FULL, FS_SEMANTICS_LINUX_CODE_V1,
+        MATERIALIZATION_POLICY_GIT_RAW_V1, METADATA_CODEC, SCHEMA_VERSION,
+    },
+    metapage::{Entry, EntryKind, Page, page_id},
+};
 use sea_orm::ActiveValue::Set;
 use sha2::{Digest, Sha256};
 
+pub use crate::ceres::snapshot::projection_observation::ProjectionWork;
 use crate::{
     ceres::{
         api_service::ApiHandler,
         snapshot::{
             error::{SnapshotError, SnapshotErrorCode},
+            projection_observation::NATIVE_PROJECTION_REVISION,
             resolver::FsKind,
+            retention_dag::{MetadataDagBuilder, MetadataDagLimits, ValidatedMetadataDag},
             view::hex,
         },
     },
-    jupiter::storage::mono_storage::MST2_VERIFICATION_VERSION,
+    jupiter::storage::{Storage, mono_storage::MST2_VERIFICATION_VERSION},
 };
 
 /// A directory page plus everything the JSON layer needs.
@@ -38,6 +49,189 @@ pub struct BuiltDirectory {
     /// The codec entries the page was built from, so callers can walk a route
     /// through the same canonical tree (`Page::pages_along_route`).
     pub codec_entries: Vec<Entry>,
+    /// Bounds proven while validating this subtree; rechecked at every new
+    /// prefix so an identical tree cannot bypass full-path limits after a move.
+    path_budget: DescendantPathBudget,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DescendantPathBudget {
+    /// Includes the slash before each descendant name.
+    suffix_bytes: usize,
+    components: usize,
+}
+
+impl DescendantPathBudget {
+    fn include(&mut self, name: &str, child: Self) {
+        self.suffix_bytes = self.suffix_bytes.max(1 + name.len() + child.suffix_bytes);
+        self.components = self.components.max(1 + child.components);
+    }
+
+    fn validate_at(self, prefix: &str) -> Result<(), SnapshotError> {
+        crate::ceres::snapshot::view::validate_scope_relative_path(prefix)?;
+        let (bytes, components) = if prefix == "/" {
+            (0, 0)
+        } else {
+            (prefix.len(), prefix[1..].split('/').count())
+        };
+        if bytes + self.suffix_bytes > 4096 || components + self.components > 256 {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                "subtree exceeds full-path budget at this prefix",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NativeProjectionKey {
+    source_domain: &'static str,
+    /// Tagged OID preserves SHA-256 vs BLAKE3 even though both are 64 hex.
+    tree_oid: String,
+    schema_version: u16,
+    metadata_codec: u16,
+    materialization_policy: u16,
+    fs_semantics: u16,
+    access_projection: u16,
+    verification_revision: i32,
+    projection_revision: u16,
+}
+
+impl NativeProjectionKey {
+    fn new(oid: ObjectHash) -> Self {
+        Self {
+            source_domain: "native-git",
+            tree_oid: oid.to_tagged_string(),
+            schema_version: SCHEMA_VERSION,
+            metadata_codec: METADATA_CODEC,
+            materialization_policy: MATERIALIZATION_POLICY_GIT_RAW_V1,
+            fs_semantics: FS_SEMANTICS_LINUX_CODE_V1,
+            access_projection: ACCESS_PROJECTION_EXACT_FULL,
+            verification_revision: MST2_VERIFICATION_VERSION,
+            projection_revision: NATIVE_PROJECTION_REVISION,
+        }
+    }
+}
+
+/// Storage-owned, disposable derived facts. This cache grants no authorization
+/// and provides no durable retention evidence. Clearing it only costs a rebuild.
+#[derive(Default)]
+pub(crate) struct NativeProjectionCache {
+    state: Mutex<NativeProjectionCacheState>,
+}
+
+#[derive(Default)]
+struct NativeProjectionCacheState {
+    pages: HashMap<NativeProjectionKey, Arc<BuiltDirectory>>,
+    retained_payload_bytes: usize,
+    retention_dags: HashMap<NativeRetentionKey, Arc<ValidatedMetadataDag>>,
+    retained_dag_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NativeRetentionKey {
+    projection: NativeProjectionKey,
+    scope: String,
+}
+
+impl NativeProjectionCache {
+    fn retention_dag(&self, key: &NativeRetentionKey) -> Option<Arc<ValidatedMetadataDag>> {
+        self.state.lock().ok()?.retention_dags.get(key).cloned()
+    }
+
+    fn insert_retention_dag(&self, key: NativeRetentionKey, dag: Arc<ValidatedMetadataDag>) {
+        // The memo has one aggregate residency bound, independent of the page
+        // cache. Caller Arcs may outlive eviction; this is no request admission.
+        const MAX_DAG_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
+        const MAX_DAG_ENTRIES: usize = 16;
+        self.insert_retention_dag_with_budget(key, dag, MAX_DAG_RESIDENT_BYTES, MAX_DAG_ENTRIES);
+    }
+
+    fn insert_retention_dag_with_budget(
+        &self,
+        key: NativeRetentionKey,
+        dag: Arc<ValidatedMetadataDag>,
+        maximum_bytes: usize,
+        maximum_entries: usize,
+    ) {
+        let Some(bytes) = dag
+            .residency_bytes()
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    std::mem::size_of::<NativeRetentionKey>()
+                        + std::mem::size_of::<Arc<ValidatedMetadataDag>>(),
+                )
+            })
+            .and_then(|bytes| bytes.checked_add(key.scope.capacity()))
+            .and_then(|bytes| bytes.checked_add(key.projection.tree_oid.capacity()))
+        else {
+            return;
+        };
+        if bytes > maximum_bytes || maximum_entries == 0 {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            if state.retention_dags.contains_key(&key) {
+                return;
+            }
+            if state.retention_dags.len() >= maximum_entries
+                || state.retained_dag_bytes > maximum_bytes - bytes
+            {
+                state.retention_dags.clear();
+                state.retained_dag_bytes = 0;
+            }
+            state.retained_dag_bytes += bytes;
+            state.retention_dags.insert(key, dag);
+        }
+    }
+
+    fn get(&self, oid: ObjectHash) -> Option<Arc<BuiltDirectory>> {
+        // A poisoned optimization cache is a miss, not a serving failure.
+        self.state
+            .lock()
+            .ok()?
+            .pages
+            .get(&NativeProjectionKey::new(oid))
+            .cloned()
+    }
+
+    fn insert(&self, oid: ObjectHash, directory: Arc<BuiltDirectory>) {
+        // Bound retained payload as well as directory count: a wide directory
+        // retains all entries and codec names even though its root is <=16 KiB.
+        const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+        let payload_bytes = std::mem::size_of::<BuiltDirectory>()
+            + directory.page_bytes.capacity()
+            + directory.entries.capacity() * std::mem::size_of::<DirEntry>()
+            + directory.codec_entries.capacity() * std::mem::size_of::<Entry>()
+            + directory
+                .entries
+                .iter()
+                .map(|entry| entry.name.capacity() + entry.oid.capacity())
+                .sum::<usize>()
+            + directory
+                .codec_entries
+                .iter()
+                .map(|entry| entry.name.capacity())
+                .sum::<usize>();
+        if payload_bytes > MAX_PAYLOAD_BYTES {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            let key = NativeProjectionKey::new(oid);
+            if state.pages.contains_key(&key) {
+                return;
+            }
+            if state.pages.len() >= 8192
+                || state.retained_payload_bytes + payload_bytes > MAX_PAYLOAD_BYTES
+            {
+                state.pages.clear();
+                state.retained_payload_bytes = 0;
+            }
+            state.retained_payload_bytes += payload_bytes;
+            state.pages.insert(key, directory);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,54 +246,375 @@ pub struct DirEntry {
     pub content_digest: Option<[u8; 32]>,
     /// Child directory page id (directories only).
     pub directory_root: Option<[u8; 32]>,
+    /// Preserve the source hash kind when preparing a cached child closure.
+    directory_tree_oid: Option<ObjectHash>,
+}
+
+/// Fixed source/profile identity for a prepared metadata closure. This grants
+/// no authorization, durable retention or coverage of file/chunk payloads.
+#[derive(Debug)]
+pub struct PreparedNativeMetadataRetention {
+    key: NativeRetentionKey,
+    dag: Arc<ValidatedMetadataDag>,
+}
+
+impl PreparedNativeMetadataRetention {
+    #[cfg(test)]
+    pub(crate) fn test_installation(dag: Arc<ValidatedMetadataDag>, scope: &str) -> Self {
+        let tree_oid =
+            ObjectHash::from_hex_for_kind(git_internal::hash::HashKind::Sha1, &"a".repeat(40))
+                .unwrap();
+        Self {
+            key: NativeRetentionKey {
+                projection: NativeProjectionKey::new(tree_oid),
+                scope: scope.to_owned(),
+            },
+            dag,
+        }
+    }
+    pub(crate) fn install_plan(
+        &self,
+    ) -> Result<super::metadata_install::MetadataInstallPlan, SnapshotError> {
+        use super::metadata_install::{MetadataInstallIdentity, MetadataInstallPlan};
+        let key = &self.key.projection;
+        MetadataInstallPlan::from_validated(
+            MetadataInstallIdentity {
+                source_domain: key.source_domain.to_owned(),
+                tagged_root_tree_oid: key.tree_oid.clone(),
+                scope: self.key.scope.clone(),
+                schema_version: key.schema_version,
+                metadata_codec: key.metadata_codec,
+                materialization_policy: key.materialization_policy,
+                fs_semantics: key.fs_semantics,
+                access_projection: key.access_projection,
+                verification_revision: key.verification_revision,
+                projection_revision: key.projection_revision,
+            },
+            &self.dag,
+        )
+    }
+    pub fn fixed_root_tree_oid(&self) -> &str {
+        &self.key.projection.tree_oid
+    }
+    pub fn scope(&self) -> &str {
+        &self.key.scope
+    }
+    pub fn metadata_codec(&self) -> u16 {
+        self.key.projection.metadata_codec
+    }
+    pub fn schema_version(&self) -> u16 {
+        self.key.projection.schema_version
+    }
+    pub fn dag(&self) -> &Arc<ValidatedMetadataDag> {
+        &self.dag
+    }
+}
+
+/// Explicit preparation, separate from resolve/lease success. A hit returns
+/// the immutable Arc before traversing any child Git tree. A miss collects
+/// from existing native codec entries, rebuilding an evicted child as needed.
+pub async fn prepare_native_metadata_retention<T: ApiHandler + ?Sized>(
+    handler: &T,
+    root_tree: &Tree,
+    scope: &str,
+    limits: MetadataDagLimits,
+) -> Result<PreparedNativeMetadataRetention, SnapshotError> {
+    crate::ceres::snapshot::view::validate_scope_relative_path(scope)?;
+    if !handler.native_snapshot_projection() {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            "retention preparation requires native Git projection",
+        ));
+    }
+    let storage = handler.get_context();
+    let limits = limits.effective();
+    let key = NativeRetentionKey {
+        projection: NativeProjectionKey::new(root_tree.id),
+        scope: scope.to_owned(),
+    };
+    if let Some(dag) = storage.native_projection_cache.retention_dag(&key) {
+        dag.check_limits(limits)?;
+        return Ok(PreparedNativeMetadataRetention { key, dag });
+    }
+    let mut projection_budget = MetadataProjectionBudget::new(limits);
+    let mut work = ProjectionWork::default();
+    let root = if scope == "/" {
+        build_subtree_inner(
+            handler,
+            &storage,
+            root_tree,
+            scope,
+            true,
+            &mut work,
+            Some(&mut projection_budget),
+        )
+        .await?
+    } else {
+        let tree = fetch_tree_with_work(handler, root_tree, scope, &mut work).await?;
+        build_subtree_inner(
+            handler,
+            &storage,
+            &tree,
+            scope,
+            true,
+            &mut work,
+            Some(&mut projection_budget),
+        )
+        .await?
+    };
+    let root_id = root.page_id;
+    let mut builder = MetadataDagBuilder::new(limits);
+    let mut scheduled = HashSet::from([root_id]);
+    let mut pending = vec![(root, scope.to_owned())];
+    while let Some((directory, path)) = pending.pop() {
+        builder.add_directory(&directory.page_bytes, &directory.codec_entries)?;
+        for entry in directory
+            .entries
+            .iter()
+            .filter(|entry| entry.fs_kind == FsKind::Directory)
+        {
+            let child_id = entry.directory_root.ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "directory lacks its metadata root",
+                )
+            })?;
+            if !scheduled.insert(child_id) {
+                continue;
+            }
+            let child_oid = entry.directory_tree_oid.ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "directory lacks its tagged source identity",
+                )
+            })?;
+            let child_path = if path == "/" {
+                format!("/{}", entry.name)
+            } else {
+                format!("{path}/{}", entry.name)
+            };
+            let child = if let Some(hit) =
+                cached_subtree(&storage, child_oid, &child_path, true, &mut work)?
+            {
+                hit
+            } else {
+                let tree = handler
+                    .get_tree_by_hash(&entry.oid)
+                    .await
+                    .map_err(|error| {
+                        SnapshotError::new(SnapshotErrorCode::Internal, error.to_string())
+                    })?;
+                if tree.id != child_oid {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::IntegrityError,
+                        "retention child tree identity mismatch",
+                    ));
+                }
+                build_subtree_inner(
+                    handler,
+                    &storage,
+                    &tree,
+                    &child_path,
+                    true,
+                    &mut work,
+                    Some(&mut projection_budget),
+                )
+                .await?
+            };
+            if child.page_id != child_id {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "retention child page disagrees with fixed parent",
+                ));
+            }
+            pending.push((child, child_path));
+        }
+    }
+    let dag = Arc::new(builder.finish(root_id)?);
+    storage
+        .native_projection_cache
+        .insert_retention_dag(key.clone(), Arc::clone(&dag));
+    Ok(PreparedNativeMetadataRetention { key, dag })
 }
 
 /// Build the MTP2 page for one directory of the fixed view. `rel_path` is
-/// scope-relative ("/" = the root directory); `root_tree` is the fixed view's
-/// root tree — never a current-ref read. Every entry is represented;
+/// an absolute path within the fixed global view, including the descriptor
+/// scope prefix ("/" = the global root); `root_tree` is that view's global
+/// root tree — never a rebased scope tree or current-ref read. Every entry is represented;
 /// unsupported entries reject the whole projection (spec: no silent drops).
 ///
-/// Results are memoized per (root tree, path): a page is a pure function of
-/// the pinned root tree, and the recursive build otherwise re-walks the same
-/// subtree once per ancestor and once per request (a sync over N directories
-/// would rebuild the tree N times). Blob sizes/digests are persisted in
-/// `mst2_verified_object`, so a cache miss after eviction is a bounded,
-/// correctness-identical recomputation.
-/// Page memoization table: (root tree id, scope-relative path) → built page.
-type PageCache = Mutex<HashMap<(String, String), Arc<BuiltDirectory>>>;
-
+/// Native results are memoized by storage assembly, tagged subtree tree OID
+/// and verification/profile revision. A new global root does not invalidate
+/// unchanged subtrees. The fixed root is resolved to `rel_path` once; recursive
+/// descent then follows direct child OIDs rather than re-walking from the root.
 pub async fn build_directory_page<T: ApiHandler + ?Sized>(
     handler: &T,
     root_tree: &git_internal::internal::object::tree::Tree,
     rel_path: &str,
 ) -> Result<Arc<BuiltDirectory>, SnapshotError> {
-    static PAGE_CACHE: OnceLock<PageCache> = OnceLock::new();
-    // Pages are small (≤16 KiB + entries); 200k pages is far beyond any real
-    // view. On overflow the cache clears wholesale — a miss only costs a
-    // rebuild, never correctness.
-    const PAGE_CACHE_MAX: usize = 200_000;
-
-    let key = (root_tree.id.to_string(), rel_path.to_string());
-    let cache = PAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache.lock().unwrap().get(&key) {
-        return Ok(Arc::clone(hit));
-    }
-    let built = Arc::new(build_directory_page_uncached(handler, root_tree, rel_path).await?);
-    let mut cache = cache.lock().unwrap();
-    if cache.len() >= PAGE_CACHE_MAX {
-        cache.clear();
-    }
-    cache.insert(key, Arc::clone(&built));
-    Ok(built)
+    let (directory, work) = build_directory_page_with_work(handler, root_tree, rel_path).await?;
+    tracing::debug!(
+        ?work,
+        path = rel_path,
+        "native snapshot projection memoization work"
+    );
+    Ok(directory)
 }
 
-async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
+/// Build one directory, returning operation-local counters. Authorization and
+/// the fixed-view source selection remain the caller's responsibility.
+pub async fn build_directory_page_with_work<T: ApiHandler + ?Sized>(
     handler: &T,
-    root_tree: &git_internal::internal::object::tree::Tree,
+    root_tree: &Tree,
     rel_path: &str,
-) -> Result<BuiltDirectory, SnapshotError> {
-    let tree = fetch_tree(handler, root_tree, rel_path).await?;
-    let dirents = crate::ceres::snapshot::resolver::direct_entries(&tree)?;
+) -> Result<(Arc<BuiltDirectory>, ProjectionWork), SnapshotError> {
+    let storage = handler.get_context();
+    let mut work = ProjectionWork::default();
+    let native = handler.native_snapshot_projection();
+    if rel_path == "/" {
+        // Even cloning a wide fixed root would copy all its entries on a hit.
+        let directory =
+            build_subtree(handler, &storage, root_tree, rel_path, native, &mut work).await?;
+        return Ok((directory, work));
+    }
+    let tree = fetch_tree_with_work(handler, root_tree, rel_path, &mut work).await?;
+    let directory = build_subtree(handler, &storage, &tree, rel_path, native, &mut work).await?;
+    Ok((directory, work))
+}
+
+fn cached_subtree(
+    storage: &Storage,
+    oid: ObjectHash,
+    rel_path: &str,
+    native: bool,
+    work: &mut ProjectionWork,
+) -> Result<Option<Arc<BuiltDirectory>>, SnapshotError> {
+    if native && let Some(hit) = storage.native_projection_cache.get(oid) {
+        hit.path_budget.validate_at(rel_path)?;
+        work.reused_subtree_roots += 1;
+        work.directory_root_pages_reused += 1;
+        work.directory_root_page_bytes_reused += hit.page_bytes.len() as u64;
+        return Ok(Some(hit));
+    }
+    Ok(None)
+}
+
+async fn build_subtree<T: ApiHandler + ?Sized>(
+    handler: &T,
+    storage: &Storage,
+    tree: &Tree,
+    rel_path: &str,
+    native: bool,
+    work: &mut ProjectionWork,
+) -> Result<Arc<BuiltDirectory>, SnapshotError> {
+    build_subtree_inner(handler, storage, tree, rel_path, native, work, None).await
+}
+
+struct MetadataProjectionBudget {
+    limits: MetadataDagLimits,
+    seen: HashSet<ObjectHash>,
+    required: HashSet<ObjectHash>,
+    edges: HashSet<(ObjectHash, ObjectHash)>,
+    entries: usize,
+    encoded_entry_bytes: u64,
+}
+
+impl MetadataProjectionBudget {
+    fn new(limits: MetadataDagLimits) -> Self {
+        Self {
+            limits,
+            seen: HashSet::new(),
+            required: HashSet::new(),
+            edges: HashSet::new(),
+            entries: 0,
+            encoded_entry_bytes: 0,
+        }
+    }
+
+    fn tree(&mut self, tree: &Tree) -> Result<(), SnapshotError> {
+        let failed = || {
+            SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "native metadata source projection budget exceeded",
+            )
+        };
+        if self.seen.contains(&tree.id) {
+            return Ok(());
+        }
+        self.require_node(tree.id)?;
+        self.entries = self
+            .entries
+            .checked_add(tree.tree_items.len())
+            .filter(|count| *count <= self.limits.entries)
+            .ok_or_else(failed)?;
+        self.encoded_entry_bytes = self
+            .encoded_entry_bytes
+            .checked_add(mst2_codec::metapage::HEADER_LEN as u64)
+            .filter(|bytes| *bytes <= self.limits.payload_bytes)
+            .ok_or_else(failed)?;
+        for item in &tree.tree_items {
+            let kind = FsKind::from_git_mode(item.mode).ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::UnsupportedEntry,
+                    "unsupported entry in native retention projection",
+                )
+            })?;
+            let value_bytes = if kind == FsKind::Directory { 32 } else { 40 };
+            self.encoded_entry_bytes = self
+                .encoded_entry_bytes
+                .checked_add((3 + item.name.len() + value_bytes) as u64)
+                .filter(|bytes| *bytes <= self.limits.payload_bytes)
+                .ok_or_else(failed)?;
+            if kind == FsKind::Directory {
+                self.require_node(item.id)?;
+                if !self.edges.contains(&(tree.id, item.id)) {
+                    if self.edges.len() >= self.limits.edges {
+                        return Err(failed());
+                    }
+                    self.edges.insert((tree.id, item.id));
+                }
+            }
+        }
+        if self.required.len() > self.limits.nodes {
+            return Err(failed());
+        }
+        self.seen.insert(tree.id);
+        Ok(())
+    }
+
+    fn require_node(&mut self, id: ObjectHash) -> Result<(), SnapshotError> {
+        if !self.required.contains(&id) {
+            if self.required.len() >= self.limits.nodes {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::LimitExceeded,
+                    "native metadata source node budget exceeded",
+                ));
+            }
+            self.required.insert(id);
+        }
+        Ok(())
+    }
+}
+
+async fn build_subtree_inner<T: ApiHandler + ?Sized>(
+    handler: &T,
+    storage: &Storage,
+    tree: &Tree,
+    rel_path: &str,
+    native: bool,
+    work: &mut ProjectionWork,
+    mut budget: Option<&mut MetadataProjectionBudget>,
+) -> Result<Arc<BuiltDirectory>, SnapshotError> {
+    crate::ceres::snapshot::view::validate_scope_relative_path(rel_path)?;
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.tree(tree)?;
+    }
+    if let Some(hit) = cached_subtree(storage, tree.id, rel_path, native, work)? {
+        return Ok(hit);
+    }
+    let dirents = crate::ceres::snapshot::resolver::direct_entries(tree)?;
+    work.directories_rebuilt += 1;
+    work.directory_entries_scanned += dirents.len() as u64;
 
     // T03 write-through verification: consult verified records first, then
     // fetch + hash the misses and persist them. Invalid records and lookup
@@ -109,8 +624,7 @@ async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
         .filter(|(_, k, _)| *k != FsKind::Directory)
         .map(|(_, _, oid)| oid.clone())
         .collect();
-    let verified = handler
-        .get_context()
+    let verified = storage
         .mono_storage()
         .get_verified_blobs(blob_oids)
         .await
@@ -128,6 +642,7 @@ async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
         })?;
 
     let mut new_verified = HashMap::new();
+    let mut path_budget = DescendantPathBudget::default();
     let mut entries = Vec::with_capacity(dirents.len());
     let mut codec_entries = Vec::with_capacity(dirents.len());
     for (name, fs_kind, oid) in dirents {
@@ -139,8 +654,37 @@ async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
         crate::ceres::snapshot::view::validate_scope_relative_path(&child_rel)?;
         match fs_kind {
             FsKind::Directory => {
-                let child_page =
-                    Box::pin(build_directory_page(handler, root_tree, &child_rel)).await?;
+                let child_oid =
+                    ObjectHash::from_hex_for_kind(tree.id.kind(), &oid).map_err(|e| {
+                        SnapshotError::new(SnapshotErrorCode::IntegrityError, e.to_string())
+                    })?;
+                let child_page = if let Some(hit) =
+                    cached_subtree(storage, child_oid, &child_rel, native, work)?
+                {
+                    hit
+                } else {
+                    work.tree_fetches += 1;
+                    let child_tree = handler.get_tree_by_hash(&oid).await.map_err(|e| {
+                        SnapshotError::new(SnapshotErrorCode::Internal, e.to_string())
+                    })?;
+                    if child_tree.id != child_oid {
+                        return Err(SnapshotError::new(
+                            SnapshotErrorCode::IntegrityError,
+                            "fetched child tree identity mismatch",
+                        ));
+                    }
+                    Box::pin(build_subtree_inner(
+                        handler,
+                        storage,
+                        &child_tree,
+                        &child_rel,
+                        native,
+                        work,
+                        budget.as_deref_mut(),
+                    ))
+                    .await?
+                };
+                path_budget.include(&name, child_page.path_budget);
                 codec_entries.push(Entry::dir(name.as_bytes(), child_page.page_id));
                 entries.push(DirEntry {
                     name,
@@ -149,10 +693,13 @@ async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
                     size: None,
                     content_digest: None,
                     directory_root: Some(child_page.page_id),
+                    directory_tree_oid: Some(child_oid),
                 });
             }
             FsKind::Regular | FsKind::Executable | FsKind::Symlink => {
+                path_budget.include(&name, DescendantPathBudget::default());
                 let (size, digest) = if let Some(v) = verified.get(&oid) {
+                    work.verified_blob_hits += 1;
                     // Verified record: 64-bit size + raw digest, no content read.
                     let d: [u8; 32] = v.raw_sha256.as_slice().try_into().map_err(|_| {
                         SnapshotError::new(
@@ -168,9 +715,12 @@ async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
                     })?;
                     (size, d)
                 } else {
+                    work.verified_blob_misses += 1;
                     let raw = fetch_raw_blob(handler, &oid).await?;
+                    work.raw_bytes_fetched += raw.len() as u64;
                     let mut h = Sha256::new();
                     h.update(&raw);
+                    work.raw_bytes_hashed += raw.len() as u64;
                     let digest: [u8; 32] = h.finalize().into();
                     new_verified.entry(oid.clone()).or_insert(
                         crate::callisto::mst2_verified_object::ActiveModel {
@@ -201,6 +751,7 @@ async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
                     size: Some(size),
                     content_digest: Some(digest),
                     directory_root: None,
+                    directory_tree_oid: None,
                 });
             }
         }
@@ -208,8 +759,7 @@ async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
     if !new_verified.is_empty() {
         // Records only ever describe already-fetched content; a persist
         // failure loses an optimization, never correctness.
-        if let Err(e) = handler
-            .get_context()
+        if let Err(e) = storage
             .mono_storage()
             .insert_verified_blobs(new_verified.into_values().collect())
             .await
@@ -224,13 +774,22 @@ async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
             format!("MTP2 build failed for {rel_path}: {e}"),
         )
     })?;
+    work.directory_root_pages_built += 1;
+    work.directory_root_page_bytes_built += page_bytes.len() as u64;
     let pid = page_id(&page_bytes);
-    Ok(BuiltDirectory {
+    let built = Arc::new(BuiltDirectory {
         page_bytes,
         page_id: pid,
         entries,
         codec_entries,
-    })
+        path_budget,
+    });
+    if native {
+        storage
+            .native_projection_cache
+            .insert(tree.id, Arc::clone(&built));
+    }
+    Ok(built)
 }
 
 /// Proof pages from the scope root down to (and including) `rel_path`,
@@ -259,23 +818,24 @@ pub fn base64_of(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-async fn fetch_tree<T: ApiHandler + ?Sized>(
+async fn fetch_tree_with_work<T: ApiHandler + ?Sized>(
     handler: &T,
     root_tree: &git_internal::internal::object::tree::Tree,
     rel_path: &str,
+    work: &mut ProjectionWork,
 ) -> Result<git_internal::internal::object::tree::Tree, SnapshotError> {
     crate::ceres::snapshot::view::validate_scope_relative_path(rel_path)?;
     if rel_path == "/" {
         return Ok(root_tree.clone());
     }
     let comps: Vec<&str> = rel_path[1..].split('/').collect();
-    let mut current = root_tree.clone();
-    for (i, comp) in comps.iter().enumerate() {
-        let last = i == comps.len() - 1;
-        let item = current
-            .tree_items
-            .iter()
-            .find(|x| x.name == *comp)
+    let mut current = Cow::Borrowed(root_tree);
+    for comp in comps {
+        let position = current.tree_items.iter().position(|x| x.name == comp);
+        work.scope_path_entries_examined +=
+            position.map_or(current.tree_items.len(), |index| index + 1) as u64;
+        let item = position
+            .map(|index| &current.tree_items[index])
             .ok_or_else(|| {
                 SnapshotError::new(
                     SnapshotErrorCode::PathNotFound,
@@ -288,30 +848,15 @@ async fn fetch_tree<T: ApiHandler + ?Sized>(
                 "gitlink entries are not supported in this profile",
             )
         })?;
-        if last {
-            if kind != FsKind::Directory {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::NotDirectory,
-                    format!("{rel_path} is not a directory"),
-                ));
-            }
-            return handler
-                .get_tree_by_hash(&item.id.to_string())
-                .await
-                .map_err(|e| {
-                    SnapshotError::new(
-                        SnapshotErrorCode::Internal,
-                        format!("tree fetch failed for {rel_path}: {e}"),
-                    )
-                });
-        }
         if kind != FsKind::Directory {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::NotDirectory,
-                "intermediate component is not a directory",
+                format!("{rel_path} is not a directory"),
             ));
         }
-        current = handler
+        let expected_oid = item.id;
+        work.tree_fetches += 1;
+        let fetched = handler
             .get_tree_by_hash(&item.id.to_string())
             .await
             .map_err(|e| {
@@ -320,8 +865,15 @@ async fn fetch_tree<T: ApiHandler + ?Sized>(
                     format!("tree fetch failed for component '{comp}': {e}"),
                 )
             })?;
+        if fetched.id != expected_oid {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "fetched scope tree identity mismatch",
+            ));
+        }
+        current = Cow::Owned(fetched);
     }
-    unreachable!("loop returns on the last component")
+    Ok(current.into_owned())
 }
 
 /// Outcome of resolving one absolute view path (spec 04 §7 statuses).
@@ -352,16 +904,51 @@ pub async fn resolve_abs<T: ApiHandler + ?Sized>(
     root_tree: &git_internal::internal::object::tree::Tree,
     abs_path: &str,
 ) -> Result<WalkOutcome, SnapshotError> {
+    Ok(
+        match resolve_abs_metadata(handler, root_tree, abs_path).await? {
+            MetadataWalkOutcome::FoundDir => WalkOutcome::FoundDir,
+            MetadataWalkOutcome::Absent => WalkOutcome::Absent,
+            MetadataWalkOutcome::NotDirectory { symlink } => WalkOutcome::NotDirectory { symlink },
+            MetadataWalkOutcome::FoundFile { fs_kind, oid } => {
+                let raw = fetch_raw_blob(handler, &oid).await?;
+                let mut h = Sha256::new();
+                h.update(&raw);
+                WalkOutcome::FoundFile {
+                    fs_kind,
+                    oid,
+                    size: raw.len() as u64,
+                    digest: h.finalize().into(),
+                    raw,
+                }
+            }
+        },
+    )
+}
+
+/// Fixed Git path metadata, without reading or hashing file content.
+#[derive(Debug)]
+pub(crate) enum MetadataWalkOutcome {
+    FoundDir,
+    FoundFile { fs_kind: FsKind, oid: String },
+    Absent,
+    NotDirectory { symlink: bool },
+}
+
+pub(crate) async fn resolve_abs_metadata<T: ApiHandler + ?Sized>(
+    handler: &T,
+    root_tree: &git_internal::internal::object::tree::Tree,
+    abs_path: &str,
+) -> Result<MetadataWalkOutcome, SnapshotError> {
     crate::ceres::snapshot::view::validate_scope_relative_path(abs_path)?;
     if abs_path == "/" {
-        return Ok(WalkOutcome::FoundDir);
+        return Ok(MetadataWalkOutcome::FoundDir);
     }
     let comps: Vec<&str> = abs_path[1..].split('/').collect();
-    let mut current = root_tree.clone();
+    let mut current = Cow::Borrowed(root_tree);
     for (i, comp) in comps.iter().enumerate() {
         let last = i == comps.len() - 1;
         let Some(item) = current.tree_items.iter().find(|x| x.name == *comp) else {
-            return Ok(WalkOutcome::Absent);
+            return Ok(MetadataWalkOutcome::Absent);
         };
         let Some(kind) = FsKind::from_git_mode(item.mode) else {
             return Err(SnapshotError::new(
@@ -372,33 +959,31 @@ pub async fn resolve_abs<T: ApiHandler + ?Sized>(
         let oid = item.id.to_string();
         if last {
             return match kind {
-                FsKind::Directory => Ok(WalkOutcome::FoundDir),
+                FsKind::Directory => Ok(MetadataWalkOutcome::FoundDir),
                 FsKind::Regular | FsKind::Executable | FsKind::Symlink => {
-                    let raw = fetch_raw_blob(handler, &oid).await?;
-                    let mut h = Sha256::new();
-                    h.update(&raw);
-                    let digest: [u8; 32] = h.finalize().into();
-                    Ok(WalkOutcome::FoundFile {
-                        fs_kind: kind,
-                        oid,
-                        size: raw.len() as u64,
-                        digest,
-                        raw,
-                    })
+                    Ok(MetadataWalkOutcome::FoundFile { fs_kind: kind, oid })
                 }
             };
         }
         if kind != FsKind::Directory {
-            return Ok(WalkOutcome::NotDirectory {
+            return Ok(MetadataWalkOutcome::NotDirectory {
                 symlink: kind == FsKind::Symlink,
             });
         }
-        current = handler.get_tree_by_hash(&oid).await.map_err(|e| {
+        let expected_oid = item.id;
+        let fetched = handler.get_tree_by_hash(&oid).await.map_err(|e| {
             SnapshotError::new(
                 SnapshotErrorCode::Internal,
                 format!("tree fetch failed for component '{comp}': {e}"),
             )
         })?;
+        if fetched.id != expected_oid {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "fetched fixed tree identity mismatch",
+            ));
+        }
+        current = Cow::Owned(fetched);
     }
     unreachable!("loop returns on the last component")
 }
@@ -445,6 +1030,14 @@ fn chrono_now() -> chrono::DateTime<chrono::FixedOffset> {
 pub fn hex_of(id: &[u8; 32]) -> String {
     hex(id)
 }
+
+#[cfg(test)]
+#[path = "native_projection_tests.rs"]
+mod native_projection_tests;
+
+#[cfg(test)]
+#[path = "retention_prepare_tests.rs"]
+mod retention_prepare_tests;
 
 #[cfg(test)]
 mod tests {
@@ -829,9 +1422,16 @@ mod tests {
         ])
         .unwrap();
         let handler = crate::ceres::api_service::mono_api_service::MonoApiService::from(&state);
-        let built = build_directory_page_uncached(&handler, &tree, "/")
-            .await
-            .unwrap();
+        let built = build_subtree(
+            &handler,
+            &state.storage,
+            &tree,
+            "/",
+            false,
+            &mut ProjectionWork::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(built.entries.len(), 2);
         assert!(built.entries.iter().all(|entry| entry.size == Some(10)
             && entry.content_digest == Some(Sha256::digest(raw).into())));

@@ -15,16 +15,23 @@ use axum::{
 };
 use base64::Engine;
 use bytes::Bytes;
+use git_internal::hash::{ObjectHash, get_hash_kind};
 use mst2_codec::descriptor;
+use request::Mst2Bytes;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{
     api::MonoApiServiceState,
     ceres::snapshot::{
         descriptor::build as build_descriptor,
         error::{SnapshotError, SnapshotErrorCode},
-        pages::{WalkOutcome, base64_of, build_directory_page, hex_of, proof_pages, resolve_abs},
+        pages::{
+            WalkOutcome, base64_of, build_directory_page, build_directory_page_with_work, hex_of,
+            proof_pages, resolve_abs,
+        },
+        projection_observation::{NativeResolveSource, ResolvedProjection},
         runtime::{now_unix, runtime},
         view::{SnapshotView, validate_scope_relative_path},
     },
@@ -72,14 +79,72 @@ pub fn routers(api_state: MonoApiServiceState) -> Router<MonoApiServiceState> {
 #[path = "snapshot_content.rs"]
 mod content;
 
+#[path = "snapshot_request.rs"]
+mod request;
+
+#[cfg(test)]
+#[path = "snapshot_request_tests.rs"]
+mod request_tests;
+
 /// Spec 14 §4: JSON request bytes hard limit.
 pub(crate) const JSON_REQUEST_LIMIT: usize = 131_072;
+
+/// The media type is part of the MST/2 TreeFrame wire contract (spec 06
+/// §1). Keep it in one place so every frame-producing endpoint has the same
+/// response representation.
+pub(crate) const TREEFRAME_MEDIA_TYPE: &str = "application/vnd.mega.treeframe;version=2";
+
+/// Build a TreeFrame response with the protocol identity headers. The request
+/// digest covers the exact bytes that were parsed, including JSON whitespace
+/// and key ordering, so callers must pass the original body.
+pub(crate) fn treeframe_response(
+    snapshot_id: &str,
+    request_body: &[u8],
+    body: Vec<u8>,
+) -> Result<Response, SnapshotError> {
+    let request_digest: [u8; 32] = Sha256::digest(request_body).into();
+    Response::builder()
+        .header("content-type", TREEFRAME_MEDIA_TYPE)
+        .header("x-mega-snapshot-id", snapshot_id)
+        .header(
+            "x-mega-request-digest",
+            format!("sha256:{}", hex_of(&request_digest)),
+        )
+        .header("cache-control", "private, no-cache, no-transform")
+        .header("vary", "Authorization, Accept")
+        .body(axum::body::Body::from(Bytes::from(body)))
+        .map_err(|e| internal(format!("TreeFrame response build failed: {e}")))
+}
 
 tokio::task_local! {
     /// Per-request id for the error envelope (spec 14 §5). Sourced from the
     /// global `TraceContext` so the envelope, the `X-Request-Id` response
     /// header and log spans all carry the same id.
     static REQUEST_ID: String;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static NATIVE_RESOLVE_BARRIERS: (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+    static REJECT_NATIVE_OBSERVATION_SOURCE: bool;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_rejected_native_observation_source<F: std::future::Future>(
+    future: F,
+) -> F::Output {
+    REJECT_NATIVE_OBSERVATION_SOURCE.scope(true, future).await
+}
+
+#[cfg(test)]
+pub(crate) async fn with_native_resolve_barriers<F: std::future::Future>(
+    captured: std::sync::Arc<tokio::sync::Barrier>,
+    release: std::sync::Arc<tokio::sync::Barrier>,
+    future: F,
+) -> F::Output {
+    NATIVE_RESOLVE_BARRIERS
+        .scope((captured, release), future)
+        .await
 }
 
 /// The request id of the in-flight request, for error envelopes.
@@ -97,28 +162,36 @@ const LEASE_HEADER: &str = "x-mega-snapshot-lease";
 /// knowing the snapshot id alone is not a capability.
 async fn snapshot_auth_middleware(
     State(state): State<MonoApiServiceState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    // Same id the global trace layer echoes on responses and logs.
+    // Nested routes may be added after the server's trace layer. Reuse an
+    // existing context or establish one here, including rejection responses.
     let id = req
         .extensions()
         .get::<crate::server::trace_context::TraceContext>()
-        .map(|c| c.trace_id.to_string())
-        .unwrap_or_default();
-    REQUEST_ID
-        .scope(id, async {
+        .map(|c| c.trace_id.clone())
+        .unwrap_or_else(|| crate::server::trace_context::resolve_trace_id(req.headers()));
+    req.extensions_mut()
+        .insert(crate::server::trace_context::TraceContext {
+            trace_id: id.clone(),
+        });
+    let mut response = REQUEST_ID
+        .scope(id.to_string(), async {
             if let Some(res) = auth_error(&state, req.headers(), req.uri().path()) {
                 return res;
             }
             next.run(req).await
         })
-        .await
+        .await;
+    if let Ok(value) = HeaderValue::from_str(&id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
 }
 
-/// Spec 14 §4 enforcement with the MST/2 error envelope (DefaultBodyLimit's
-/// own rejection is plain-text). Content-Length is checked here; a lying
-/// chunked body still trips DefaultBodyLimit inside the extractor.
+/// Reject an oversized declared length before consuming any body. Actual
+/// bytes and the overall read deadline are checked by `Mst2Bytes`.
 async fn reject_oversize_body(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -142,12 +215,14 @@ async fn reject_oversize_body(
 /// (spec 14 §5 INVALID_REQUEST). Size is enforced by the router layers.
 #[allow(clippy::result_large_err)]
 pub(crate) fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
-    serde_json::from_slice(body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::InvalidRequest,
-            format!("malformed request body: {e}"),
-        ))
-    })
+    request::validate_json_keys(body)
+        .and_then(|()| serde_json::from_slice(body))
+        .map_err(|e| {
+            mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                format!("malformed request body: {e}"),
+            ))
+        })
 }
 
 /// Bearer-token check shared by the auth middleware; the parsing rule is the
@@ -216,7 +291,10 @@ fn mst2_error_response(err: SnapshotError) -> Response {
                 "request_id": current_request_id(),
                 "retryable": matches!(
                     err.code,
-                    SnapshotErrorCode::SnapshotNotReady | SnapshotErrorCode::Internal
+                    SnapshotErrorCode::SnapshotNotReady
+                        | SnapshotErrorCode::MetadataNotReady
+                        | SnapshotErrorCode::TemporaryUnavailable
+                        | SnapshotErrorCode::Internal
                 ),
             }
         })),
@@ -230,6 +308,12 @@ impl From<SnapshotError> for Response {
     }
 }
 
+impl IntoResponse for SnapshotError {
+    fn into_response(self) -> Response {
+        mst2_error_response(self)
+    }
+}
+
 /// MegaError → snapshot error: storage/lease failures must surface as errors,
 /// never as absence (spec 00 SYS-04).
 fn internal<E: std::fmt::Display>(e: E) -> SnapshotError {
@@ -237,32 +321,45 @@ fn internal<E: std::fmt::Display>(e: E) -> SnapshotError {
 }
 
 async fn capabilities() -> Json<serde_json::Value> {
-    // Honest capability set for this build (spec 04 §3): only what this slice
-    // serves is true; everything else stays false until accepted.
+    // Keep this document on the canonical discovery contract consumed by the
+    // v3 reader.  The full delivery path serves the complete metadata/object
+    // closure, so advertising `full_hydration` as false would make a typed
+    // resolve reject before it reaches this router.
     Json(json!({
         "protocol_versions": [2],
         "metadata_codecs": [1],
-        "frame_encodings": ["identity", "zstd"],
+        "frame_encodings": ["identity"],
         "features": {
-            "resolve": true,
+            "strict_publication": true,
             "directory": true,
-            "leases": true,
             "lookup": true,
             "metadata_pages": true,
             "raw_blob": true,
-            "objects": true,
+            "small_objects": true,
             "chunk_reads": true,
-            "full_hydration": false,
+            "full_hydration": true,
+            "region_hints": false,
             "offline_export": false,
-            "bindings": false,
-            "immutable_release": false,
         },
         "limits": {
+            "max_file_bytes": "8796093022208",
+            "max_path_bytes": 4096,
+            "max_path_components": 256,
             "metadata_page_bytes": 16384,
             "metadata_leaf_entries": 128,
-            "max_directory_page_limit": 256,
+            "max_json_request_bytes": 131072,
+            "max_json_response_bytes": 1048576,
+            "max_directory_entries": 256,
+            "max_request_items": 128,
+            "max_metadata_items": 64,
+            "small_object_bytes": 262144,
+            "small_batch_bytes": 8388608,
+            "object_frame_raw_bytes": 1048576,
+            "chunk_frame_raw_bytes": 1048652,
+            "frame_wire_bytes": 2097152,
+            "zstd_window_bytes": 8388608,
             "chunk_size": 1048576,
-            "small_object_bytes": 262144
+            "chunk_batch_bytes": 134217728
         }
     }))
 }
@@ -319,7 +416,10 @@ fn ensure_enabled(state: &MonoApiServiceState) -> Result<(), SnapshotError> {
 // `lfs_router::enforce_lfs_access` (where the error is the rare arm and is
 // boxed), there is nothing to gain here, so the lint is allowed outright.
 #[allow(clippy::result_large_err)]
-async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Response, Response> {
+async fn resolve(
+    state: State<MonoApiServiceState>,
+    Mst2Bytes(body): Mst2Bytes,
+) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: ResolveRequest = parse_json_body(&body)?;
     // Unknown target kinds are client errors, never a silent fallback to
@@ -349,21 +449,103 @@ async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Respo
         ))
     })?;
 
-    // Fix the view on exactly one commit read; nothing below may re-read refs.
-    let main = state
-        .storage
-        .mono_storage()
-        .get_main_ref("/")
-        .await
-        .map_err(internal)?
-        .ok_or_else(|| {
-            mst2_error_response(SnapshotError::new(
+    let config = state.storage.config();
+    let mut native_source = None;
+    let (commit_oid, tree_oid, sequence, writer_epoch) = if config.mst2.publication_enabled {
+        let Some(instance) = config.mst2.instance_uuid.as_deref() else {
+            return Err(mst2_error_response(SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
-                "monorepo main ref missing; run service init",
-            ))
-        })?;
-    let commit_oid = main.ref_commit_hash.clone();
-    let tree_oid = main.ref_tree_hash.clone();
+                "native publication instance missing",
+            )));
+        };
+        let head = state
+            .storage
+            .mono_storage()
+            .read_native_publication_head(instance)
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "native publication observation failed");
+                mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "native publication is not ready",
+                ))
+            })?;
+        let observation_source = ObjectHash::from_hex_for_kind(get_hash_kind(), &head.root.commit)
+            .and_then(|commit| {
+                ObjectHash::from_hex_for_kind(get_hash_kind(), &head.root.tree)
+                    .map(|tree| (commit, tree))
+            })
+            .map_err(|_| {
+                SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "invalid fixed native source identity",
+                )
+            })
+            .and_then(|(commit, tree)| {
+                let certificate = head.token.certificate;
+                #[cfg(test)]
+                let certificate = if REJECT_NATIVE_OBSERVATION_SOURCE
+                    .try_with(|reject| *reject)
+                    .unwrap_or(false)
+                {
+                    None
+                } else {
+                    certificate
+                };
+                NativeResolveSource::capture(
+                    &head.instance_id,
+                    commit,
+                    tree,
+                    certificate,
+                    head.token.epoch,
+                    head.token.sequence,
+                )
+            });
+        native_source = match observation_source {
+            Ok(source) => Some(source),
+            Err(_) => {
+                if let Some(sink) = &state.storage.projection_observation_sink {
+                    sink.reject_binding();
+                }
+                tracing::warn!("native resolve observation source rejected");
+                None
+            }
+        };
+        (
+            head.root.commit,
+            head.root.tree,
+            head.token.sequence.to_string(),
+            head.token.epoch.to_string(),
+        )
+    } else {
+        let main = state
+            .storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "monorepo main ref missing",
+                ))
+            })?;
+        let sequence = runtime()
+            .publication_sequence(&main.ref_commit_hash)
+            .to_string();
+        (
+            main.ref_commit_hash,
+            main.ref_tree_hash,
+            sequence,
+            "1".to_owned(),
+        )
+    };
+
+    #[cfg(test)]
+    if let Ok((captured, release)) = NATIVE_RESOLVE_BARRIERS.try_with(|value| value.clone()) {
+        captured.wait().await;
+        release.wait().await;
+    }
     let view = SnapshotView::from_commit(&commit_oid, &tree_oid);
     if let Some(want) = &req.target.view_id {
         let kind_matches = req.target.kind == "view";
@@ -385,47 +567,54 @@ async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Respo
         .map_err(internal)?;
     // The scope root doubles as metadata_root; building it also validates
     // that the scope exists and is a directory in this view.
-    let scope_page = build_directory_page(handler.as_ref(), &root_tree, &req.scope)
-        .await
+    let projection_started = std::time::Instant::now();
+    let (scope_page, projection_work) =
+        build_directory_page_with_work(handler.as_ref(), &root_tree, &req.scope)
+            .await
+            .map_err(mst2_error_response)?;
+    let projection_elapsed = projection_started.elapsed();
+
+    let built = build_descriptor(&config.mst2, &view, &req.scope, scope_page.page_id)
+        .map_err(mst2_error_response)?;
+    let ctx = runtime()
+        .insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds)
         .map_err(mst2_error_response)?;
 
-    let built = build_descriptor(
-        &state.storage.config().mst2,
-        &view,
-        &req.scope,
-        scope_page.page_id,
-    )
-    .map_err(mst2_error_response)?;
-    let ctx = runtime().insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds);
-    // Publication identity: with T05 enabled the sequence is the durable
-    // per-namespace counter written atomically with the ref CAS; a read
-    // failure there is surfaced rather than silently falling back, because
-    // the sequence is what binds a client to a version. When publication is
-    // disabled the provisional per-tip counter is the honest answer.
-    //
-    // Namespace note: the counter is keyed on the writer's repo path, and
-    // resolve maps the request scope onto it. That mapping is the identity
-    // only while a scope names one native namespace (true for the default
-    // scope and for deployments without composite bindings); the general
-    // scope→namespace map arrives with the T04 binding layer (see
-    // ISSUES.md ISS-01/ISS-06).
-    let seq = if state.storage.config().mst2.publication_enabled {
-        let namespace = state.storage.mono_storage().normalize_namespace(&req.scope);
-        let durable = state
-            .storage
-            .mono_storage()
-            .publication_sequence(&namespace)
-            .await
-            .map_err(internal)?;
-        durable.to_string()
-    } else {
-        runtime().publication_sequence(&commit_oid).to_string()
-    };
+    if let Some(source) = native_source {
+        let request_id = current_request_id();
+        match source.observe(
+            ResolvedProjection {
+                descriptor: &ctx.built.descriptor,
+                snapshot_id: &ctx.built.snapshot_id,
+                metadata_root: &ctx.built.metadata_root,
+                context_commit: &ctx.commit_oid,
+                context_root_tree: &ctx.root_tree_oid,
+                fixed_root_tree: root_tree.id,
+                requested_scope: &req.scope,
+                request_id: &request_id,
+            },
+            projection_work,
+            projection_elapsed,
+        ) {
+            Ok(observation) => {
+                if let Some(sink) = &state.storage.projection_observation_sink {
+                    let _ = sink.enqueue(&observation);
+                }
+                observation.emit();
+            }
+            Err(_) => {
+                if let Some(sink) = &state.storage.projection_observation_sink {
+                    sink.reject_binding();
+                }
+                tracing::warn!("native resolve observation context rejected");
+            }
+        }
+    }
 
     let body = json!({
         "descriptor": descriptor_json(&built),
-        "publication_sequence": seq.to_string(),
-        "writer_epoch": "1",
+        "publication_sequence": sequence,
+        "writer_epoch": writer_epoch,
         "lease_id": ctx.lease_id,
         "lease_expires_at": crate::ceres::snapshot::runtime::rfc3339(ctx.lease_expires_at_unix),
         "authorization_epoch": "1",
@@ -483,18 +672,13 @@ struct RenewRequest {
 async fn lease_renew(
     state: State<MonoApiServiceState>,
     AxumPath(lease_id): AxumPath<String>,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: RenewRequest = if body.is_empty() {
         RenewRequest::default()
     } else {
-        serde_json::from_slice(&body).map_err(|e| {
-            mst2_error_response(SnapshotError::new(
-                SnapshotErrorCode::ScopeInvalid,
-                format!("malformed renew body: {e}"),
-            ))
-        })?
+        parse_json_body(&body)?
     };
     let renewed = runtime()
         .renew_lease(&lease_id, req.lease_seconds.unwrap_or(600))
@@ -854,7 +1038,7 @@ async fn lookup(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     _headers: HeaderMap,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: LookupRequest = parse_json_body(&body)?;
@@ -1011,7 +1195,7 @@ async fn metadata_pages(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     _headers: HeaderMap,
-    body: Bytes,
+    Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
     let req: MetadataPagesRequest = parse_json_body(&body)?;
@@ -1136,9 +1320,75 @@ async fn metadata_pages(
     );
     out.extend_from_slice(&end);
 
-    Response::builder()
-        .header("content-type", "application/octet-stream")
-        .header("cache-control", "private, no-cache, no-transform")
-        .body(axum::body::Body::from(Bytes::from(out)))
-        .map_err(|e| mst2_error_response(internal(format!("body build failed: {e}"))))
+    treeframe_response(&snapshot_id, &body, out).map_err(mst2_error_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capabilities_advertise_the_canonical_full_delivery_contract() {
+        let Json(value) = capabilities().await;
+        assert_eq!(
+            value,
+            json!({
+                "protocol_versions": [2],
+                "metadata_codecs": [1],
+                "frame_encodings": ["identity"],
+                "features": {
+                    "strict_publication": true,
+                    "directory": true,
+                    "lookup": true,
+                    "metadata_pages": true,
+                    "raw_blob": true,
+                    "small_objects": true,
+                    "chunk_reads": true,
+                    "full_hydration": true,
+                    "region_hints": false,
+                    "offline_export": false,
+                },
+                "limits": {
+                    "max_file_bytes": "8796093022208",
+                    "max_path_bytes": 4096,
+                    "max_path_components": 256,
+                    "metadata_page_bytes": 16384,
+                    "metadata_leaf_entries": 128,
+                    "max_json_request_bytes": 131072,
+                    "max_json_response_bytes": 1048576,
+                    "max_directory_entries": 256,
+                    "max_request_items": 128,
+                    "max_metadata_items": 64,
+                    "small_object_bytes": 262144,
+                    "small_batch_bytes": 8388608,
+                    "object_frame_raw_bytes": 1048576,
+                    "chunk_frame_raw_bytes": 1048652,
+                    "frame_wire_bytes": 2097152,
+                    "zstd_window_bytes": 8388608,
+                    "chunk_size": 1048576,
+                    "chunk_batch_bytes": 134217728
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn treeframe_response_emits_protocol_identity_headers() {
+        let snapshot_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let request_body = br#"{"items":[], "encoding":"identity"}"#;
+        let response = treeframe_response(snapshot_id, request_body, vec![1, 2, 3]).unwrap();
+
+        assert_eq!(response.headers()["content-type"], TREEFRAME_MEDIA_TYPE);
+        assert_eq!(response.headers()["x-mega-snapshot-id"], snapshot_id);
+        let digest: [u8; 32] = Sha256::digest(request_body).into();
+        assert_eq!(
+            response.headers()["x-mega-request-digest"],
+            format!("sha256:{}", hex_of(&digest))
+        );
+        assert_eq!(
+            response.headers()["cache-control"],
+            "private, no-cache, no-transform"
+        );
+        assert_eq!(response.headers()["vary"], "Authorization, Accept");
+    }
 }

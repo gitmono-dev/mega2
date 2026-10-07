@@ -669,6 +669,12 @@ fn collect_static_restart_fields(
     candidate: &Config,
     report: &mut ConfigReloadReport,
 ) {
+    if current.mst2.projection_observation_enabled != candidate.mst2.projection_observation_enabled
+    {
+        report
+            .restart_required_fields
+            .push("mst2.projection_observation_enabled");
+    }
     if current.base_dir != candidate.base_dir {
         report.restart_required_fields.push("base_dir");
     }
@@ -1207,6 +1213,33 @@ mod tests {
             let snapshot = handle.snapshot().expect("snapshot after rejection");
             assert!(Arc::ptr_eq(&before, &snapshot));
         }
+    }
+
+    #[test]
+    fn projection_writer_toggle_requires_restart_and_preserves_live_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut current = isolated_config(temp.path().join("config"));
+        current.mst2.enabled = true;
+        current.mst2.publication_enabled = true;
+        current.mst2.instance_uuid = Some("12345678-1234-4234-9234-123456789abc".into());
+        let handle = ConfigHandle::new(current);
+        let before = handle.snapshot().unwrap();
+        let mut candidate = before.as_ref().clone();
+        candidate.mst2.projection_observation_enabled = true;
+        let report = handle.reload(candidate).unwrap();
+        assert_eq!(
+            report.restart_required_fields,
+            vec!["mst2.projection_observation_enabled"]
+        );
+        assert!(!report.applied());
+        assert!(Arc::ptr_eq(&before, &handle.snapshot().unwrap()));
+        assert!(
+            !handle
+                .snapshot()
+                .unwrap()
+                .mst2
+                .projection_observation_enabled
+        );
     }
 
     #[test]

@@ -31,6 +31,11 @@ use crate::{
             blob_path_index::BlobPathIndexMode,
             git_db_storage::GitDbStorage,
             mono_storage::MonoStorage,
+            mst2_publication_storage::{
+                PreparedPublication, PublicationPreparation, PublicationReceiptError,
+                PublicationRequest,
+            },
+            native_publication_storage::PreparedNativePublication,
             push_queue_storage::{
                 ClaimOutcome, EnqueueOutcome, EnqueueParams, EnqueueRejectReason, PushQueueStorage,
             },
@@ -419,13 +424,19 @@ pub struct PushExecContext {
     pub storage: crate::jupiter::storage::Storage,
     pub git_object_cache: std::sync::Arc<crate::ceres::api_service::cache::GitObjectCache>,
     /// Test-only: two-phase sync inside the B3 txn right before
-    /// `apply_push_in_txn` (after the baseline read): the executor signals
+    /// `apply_push_in_txn` or the n=0 root CAS (after the baseline read): the executor signals
     /// "race window open" on the enter barrier, then blocks on the release
     /// barrier until the test's queue-bypassing writer has committed — a
     /// deterministic apply-time root CAS miss (WH-03).
     pub pre_apply_enter_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
     /// Test-only: the executor resumes only after this barrier completes.
     pub pre_apply_release_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+}
+
+struct PushRefBaseline<'a> {
+    cur_commit: Option<&'a str>,
+    cur_tree: Option<&'a str>,
+    root: Option<&'a crate::callisto::mega_refs::Model>,
 }
 
 /// Context required to execute a claimed `kind=merge` round under B3.
@@ -694,6 +705,11 @@ impl PushQueueService {
     pub fn with_timeouts(mut self, wait_timeout: Duration, poll_interval: Duration) -> Self {
         self.wait_timeout = wait_timeout;
         self.poll_interval = poll_interval;
+        self
+    }
+
+    pub(crate) fn with_native_publication(mut self, enabled: bool) -> Self {
+        self.push_queue_storage = self.push_queue_storage.with_native_publication(enabled);
         self
     }
 
@@ -1277,8 +1293,56 @@ impl PushQueueService {
             return Ok(ExecuteOutcome::HardStopped { id: req.id });
         }
 
+        // Receipt replay precedes baseline/ref writes: the root may already
+        // have advanced since a committed operation lost its response.
+        let publication = if let Some(ctx) = push_ctx
+            && ctx.storage.config().mst2.publication_enabled
+            && row.kind != PushQueueKindEnum::Attach
+            && !(row.kind == PushQueueKindEnum::Merge && merge_ctx.is_some())
+        {
+            let request = match PublicationRequest::from_trunk_queue(&row) {
+                Ok(request) => request,
+                Err(error) => {
+                    return self
+                        .b3_fail_merge(txn, req.id, "Conflict", error.to_string())
+                        .await;
+                }
+            };
+            let preparation = match self
+                .mono_storage
+                .begin_publication_in_txn(&txn, request)
+                .await
+            {
+                Ok(preparation) => preparation,
+                Err(PublicationReceiptError::Database(error)) => return Err(error.into()),
+                Err(error) => {
+                    return self
+                        .b3_fail_merge(txn, req.id, "Conflict", error.to_string())
+                        .await;
+                }
+            };
+            match preparation {
+                PublicationPreparation::Prepared(prepared) => Some(prepared),
+                PublicationPreparation::AlreadyCommitted(committed) => {
+                    return self
+                        .b3_replay_committed_operation(txn, req.id, committed.receipt.new_oid)
+                        .await;
+                }
+                PublicationPreparation::AlreadyCommittedNoop(receipt) => {
+                    return self
+                        .b3_replay_committed_operation(txn, req.id, receipt.landed_commit_id)
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
+
         // Expected-root baseline compare (NULL-safe).
-        let root = self.mono_storage.get_main_ref_in_txn("/", &txn).await?;
+        let root = self
+            .mono_storage
+            .get_native_main_ref_in_txn("/", &txn)
+            .await?;
         let (cur_commit, cur_tree) = match &root {
             Some(r) => (
                 Some(r.ref_commit_hash.as_str()),
@@ -1308,6 +1372,55 @@ impl PushQueueService {
             txn.commit().await?;
             return Ok(ExecuteOutcome::BypassDetected { id: req.id });
         }
+
+        // Native publication currently has no merge projection. Refuse the
+        // real merge writer before it can mutate refs, commits, or CL state;
+        // keeping this gate ahead of dispatch makes publication fail closed
+        // while the writer matrix is still incomplete.
+        if row.kind == PushQueueKindEnum::Merge
+            && merge_ctx.is_some_and(|ctx| ctx.storage.config().mst2.publication_enabled)
+        {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    req.id,
+                    "Conflict",
+                    "MST2 native publication does not cover merge writer".into(),
+                )
+                .await;
+        }
+
+        let native_publication = if publication.is_some() && row.kind == PushQueueKindEnum::Push {
+            let ctx = push_ctx.ok_or_else(|| {
+                MegaError::Other("native publication requires the real push writer".into())
+            })?;
+            let config = ctx.storage.config();
+            let Some(instance) = config.mst2.instance_uuid.as_deref() else {
+                return self
+                    .b3_fail_merge(
+                        txn,
+                        req.id,
+                        "Conflict",
+                        "native publication instance missing".into(),
+                    )
+                    .await;
+            };
+            match self
+                .mono_storage
+                .reserve_native_publication_in_txn(&txn, &row, instance)
+                .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(PublicationReceiptError::Database(error)) => return Err(error.into()),
+                Err(error) => {
+                    return self
+                        .b3_fail_merge(txn, req.id, "Conflict", error.to_string())
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
 
         if req.force_conflict() {
             return self
@@ -1359,7 +1472,18 @@ impl PushQueueService {
                 }
                 if let Some(ctx) = push_ctx {
                     return self
-                        .b3_execute_push(txn, &row, ctx, cur_commit, cur_tree, root.as_ref())
+                        .b3_execute_push(
+                            txn,
+                            &row,
+                            ctx,
+                            PushRefBaseline {
+                                cur_commit,
+                                cur_tree,
+                                root: root.as_ref(),
+                            },
+                            publication,
+                            native_publication,
+                        )
                         .await;
                 }
                 tracing::trace!(policy = ?self.push_policy, id = req.id, "B3 push stub");
@@ -1462,26 +1586,16 @@ impl PushQueueService {
             return Ok(self.outcome_claim_lost(req.id));
         }
 
-        // T05 (spec 09 §1): record the publication receipt, outbox event and
-        // per-namespace sequence in the *same* transaction as the root CAS
-        // above, so the visible change, its sequence and its outbox commit
-        // atomically. Gated off by default (`mst2.publication_enabled`), so
-        // an unconfigured deployment keeps the exact prior behavior.
-        if let Some(ctx) = push_ctx
-            && ctx.storage.config().mst2.publication_enabled
-        {
-            let old_oid = cur_commit.unwrap_or(ZERO_ID);
-            let namespace = self.mono_storage.normalize_namespace(&row.path);
+        if let Some(prepared) = publication {
             self.mono_storage
                 .record_publication_in_txn(
                     &txn,
-                    &row.operation_id,
-                    &namespace,
-                    old_oid,
+                    prepared,
+                    cur_commit.unwrap_or(ZERO_ID),
                     &new_commit,
-                    "trunk_push",
                 )
-                .await?;
+                .await
+                .map_err(|error| MegaError::Other(error.to_string()))?;
         }
 
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
@@ -1491,6 +1605,25 @@ impl PushQueueService {
             id: req.id,
             landed_commit_id: new_commit,
             root_cas_writes,
+        })
+    }
+
+    async fn b3_replay_committed_operation(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        id: i64,
+        landed_commit_id: String,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        if !PushQueueStorage::mark_done_if_running_in_txn(&txn, id, &landed_commit_id).await? {
+            txn.rollback().await?;
+            return Ok(self.outcome_claim_lost(id));
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+        Ok(ExecuteOutcome::Done {
+            id,
+            landed_commit_id,
+            root_cas_writes: 0,
         })
     }
 
@@ -2321,13 +2454,13 @@ impl PushQueueService {
         txn: sea_orm::DatabaseTransaction,
         row: &push_queue::Model,
         ctx: &PushExecContext,
-        cur_commit: Option<&str>,
-        cur_tree: Option<&str>,
-        root: Option<&crate::callisto::mega_refs::Model>,
+        baseline: PushRefBaseline<'_>,
+        publication: Option<PreparedPublication>,
+        native_publication: Option<PreparedNativePublication>,
     ) -> Result<ExecuteOutcome, MegaError> {
         let id = row.id;
         match self
-            .b3_execute_push_inner(txn, row, ctx, cur_commit, cur_tree, root)
+            .b3_execute_push_inner(txn, row, ctx, baseline, publication, native_publication)
             .await
         {
             Ok(outcome) => Ok(outcome),
@@ -2370,10 +2503,15 @@ impl PushQueueService {
         txn: sea_orm::DatabaseTransaction,
         row: &push_queue::Model,
         ctx: &PushExecContext,
-        cur_commit: Option<&str>,
-        cur_tree: Option<&str>,
-        root: Option<&crate::callisto::mega_refs::Model>,
+        baseline: PushRefBaseline<'_>,
+        publication: Option<PreparedPublication>,
+        native_publication: Option<PreparedNativePublication>,
     ) -> Result<ExecuteOutcome, MegaError> {
+        let PushRefBaseline {
+            cur_commit,
+            cur_tree,
+            root,
+        } = baseline;
         use std::path::PathBuf;
 
         use git_internal::{
@@ -2423,7 +2561,7 @@ impl PushQueueService {
 
         let path_row = self
             .mono_storage
-            .get_main_ref_in_txn(&row.path, &txn)
+            .get_native_main_ref_in_txn(&row.path, &txn)
             .await?;
 
         if path_row.is_none() {
@@ -2494,6 +2632,12 @@ impl PushQueueService {
                     )
                     .await;
             }
+            if let Some(barrier) = &ctx.pre_apply_enter_barrier {
+                barrier.wait().await;
+            }
+            if let Some(barrier) = &ctx.pre_apply_release_barrier {
+                barrier.wait().await;
+            }
             PushQueueStorage::savepoint(&txn, "b3_kind").await?;
             let cas_ok = self
                 .mono_storage
@@ -2529,6 +2673,24 @@ impl PushQueueService {
             if !updated {
                 txn.rollback().await?;
                 return Ok(self.outcome_claim_lost(row.id));
+            }
+            if let Some(prepared) = native_publication {
+                self.mono_storage
+                    .finish_native_noop_in_txn(&txn, prepared)
+                    .await
+                    .map_err(|error| MegaError::Other(error.to_string()))?;
+            }
+            if let Some(prepared) = publication {
+                self.mono_storage
+                    .record_noop_operation_in_txn(
+                        &txn,
+                        prepared,
+                        &root.ref_commit_hash,
+                        &root.ref_tree_hash,
+                        &pref.ref_commit_hash,
+                    )
+                    .await
+                    .map_err(|error| MegaError::Other(error.to_string()))?;
             }
             PushQueueStorage::notify_mono_write_queue(&txn).await?;
             txn.commit().await?;
@@ -2799,26 +2961,23 @@ impl PushQueueService {
             return Ok(self.outcome_claim_lost(row.id));
         }
 
-        // T05 (spec 09 §1/§7): record the publication receipt, outbox event
-        // and per-namespace sequence in the *same* transaction as the ref CAS
-        // above, so the visible change, its sequence and its outbox commit
-        // atomically (trunk push = the primary default-namespace writer of
-        // spec 09 §5). Gated off by default (`mst2.publication_enabled`):
-        // a deployment that has not passed the §9 shadow comparison keeps
-        // the exact prior behavior. Replaying the same operation id lands
-        // the receipt once (PUB-11).
-        if ctx.storage.config().mst2.publication_enabled {
-            let namespace = self.mono_storage.normalize_namespace(&normalized);
-            self.mono_storage
+        if let Some(prepared) = publication {
+            let committed = self
+                .mono_storage
                 .record_publication_in_txn(
                     &txn,
-                    &row.operation_id,
-                    &namespace,
+                    prepared,
                     cur_commit.unwrap_or(ZERO_ID),
                     &landed_commit_id,
-                    "trunk_push",
                 )
-                .await?;
+                .await
+                .map_err(|error| MegaError::Other(error.to_string()))?;
+            let native = native_publication
+                .ok_or_else(|| MegaError::Other("native push reservation missing".into()))?;
+            self.mono_storage
+                .record_native_publication_in_txn(&txn, native, &committed)
+                .await
+                .map_err(|error| MegaError::Other(error.to_string()))?;
         }
 
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
@@ -3398,10 +3557,10 @@ fn reject_to_error(reason: EnqueueRejectReason) -> MegaError {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::ConnectionTrait;
     use serde_json::json;
 
     use super::*;
+    include!("native_publication_push_tests.rs");
     use crate::{
         callisto::{mega_refs, sea_orm_active_enums::PushQueueFailureEnum},
         jupiter::{
@@ -4828,6 +4987,503 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mst2_receipt_real_push_replays_before_root_baseline_and_rejects_changed_request() {
+        use sea_orm::{
+            ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Statement,
+        };
+
+        use crate::callisto::{mst2_publication, mst2_publication_outbox, mst2_queue_noop_receipt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        config.mst2.publication_enabled = true;
+        config.mst2.instance_uuid = Some("6ab219b0-4275-45ba-9d7b-7b0b633018cd".to_owned());
+        let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+        let storage = crate::jupiter::tests::with_test_vault(storage, temp.path()).await;
+        let (old_commit, path) = wh03_path_fixture(&storage, "receipt").await;
+        storage
+            .mono_storage()
+            .initialize_native_publication("6ab219b0-4275-45ba-9d7b-7b0b633018cd")
+            .await
+            .unwrap();
+        let old_id = old_commit.id.to_string();
+        let (new_id, payload) = wh03_save_n1_commit(
+            &storage,
+            old_commit.id,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "receipt new",
+        )
+        .await;
+        let id = wh03_enqueue_push(&storage, &path, &old_id, &new_id, &payload).await;
+        assert!(matches!(
+            wh03_exec(&storage, id).await,
+            ExecuteOutcome::Done {
+                root_cas_writes: 1,
+                ..
+            }
+        ));
+        let mono = storage.mono_storage();
+        let root_after = mono.get_main_ref("/").await.unwrap().unwrap();
+        let operation_id = format!("mst2:trunk-queue:{id}");
+        let receipt = mst2_publication::Entity::find()
+            .filter(mst2_publication::Column::OperationId.eq(&operation_id))
+            .one(mono.get_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.request_digest_version, Some(1));
+        assert!(receipt.request_digest.is_some());
+        assert_eq!(receipt.new_oid, new_id);
+        assert_eq!(
+            mst2_publication_outbox::Entity::find()
+                .count(mono.get_connection())
+                .await
+                .unwrap(),
+            1
+        );
+
+        let retry = |requester: Option<String>, payload: JsonValue| EnqueueRequest {
+            kind: PushQueueKindEnum::Push,
+            operation_id: push_operation_id(&old_id, &new_id),
+            path: path.clone(),
+            old_id: old_id.clone(),
+            new_id: new_id.clone(),
+            requester,
+            payload,
+            ref_name: Some(MEGA_BRANCH_NAME.to_owned()),
+            is_delete: false,
+        };
+        assert!(
+            matches!(storage.push_queue_service.enqueue(retry(None, payload.to_json())).await.unwrap(),
+            EnqueueOutcome::Replay { id: replay_id, .. } if replay_id == id)
+        );
+        let error = storage
+            .push_queue_service
+            .enqueue(retry(Some("different-actor".to_owned()), payload.to_json()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("MST2_PUBLICATION_CONFLICT"));
+        let mut different = payload.to_json();
+        different["fork_base"] = serde_json::json!("different-base");
+        let error = storage
+            .push_queue_service
+            .enqueue(retry(None, different))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("MST2_PUBLICATION_CONFLICT"));
+
+        // Model recovery of a Running queue row after COMMIT lost its response.
+        // Original claim baselines remain old, so a late replay would fail them.
+        mono.get_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                mono.get_connection().get_database_backend(),
+                "UPDATE push_queue SET status = 'Running', landed_commit_id = NULL WHERE id = $1",
+                [id.into()],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            wh03_exec(&storage, id).await,
+            ExecuteOutcome::Done {
+                id,
+                landed_commit_id: new_id.clone(),
+                root_cas_writes: 0,
+            }
+        );
+        let root = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(root.ref_commit_hash, root_after.ref_commit_hash);
+        assert_eq!(root.ref_tree_hash, root_after.ref_tree_hash);
+        let check_txn = mono.get_connection().begin().await.unwrap();
+        assert!(
+            !PushQueueStorage::is_hard_stopped_in_txn(&check_txn)
+                .await
+                .unwrap()
+        );
+        check_txn.rollback().await.unwrap();
+        assert_eq!(mono.publication_sequence(&path).await.unwrap(), 1);
+        assert_eq!(
+            mst2_publication::Entity::find()
+                .count(mono.get_connection())
+                .await
+                .unwrap(),
+            1
+        );
+
+        mono.get_connection().execute_raw(Statement::from_sql_and_values(
+            mono.get_connection().get_database_backend(),
+            "UPDATE push_queue SET status = 'Running', requester = 'changed-actor' WHERE id = $1",
+            [id.into()],
+        )).await.unwrap();
+        assert!(
+            matches!(wh03_exec(&storage, id).await, ExecuteOutcome::Failed { ref failure, ref message, .. }
+            if failure == "Conflict" && message.contains("MST2_PUBLICATION_CONFLICT"))
+        );
+        assert_eq!(
+            mono.get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap()
+                .ref_commit_hash,
+            root_after.ref_commit_hash
+        );
+        assert_eq!(mono.publication_sequence(&path).await.unwrap(), 1);
+        assert_eq!(
+            mst2_publication_outbox::Entity::find()
+                .count(mono.get_connection())
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Distinct internal no-op operations do not create publications.
+        let n0_payload = PushPayload {
+            commits: Vec::new(),
+            fork_base: None,
+            n: 0,
+        };
+        let mut noop_ids = Vec::new();
+        for round in 0..3 {
+            let operation_id = format!("internal-noop-{round}");
+            let outcome = storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Push,
+                    operation_id: operation_id.clone(),
+                    path: path.clone(),
+                    old_id: new_id.clone(),
+                    new_id: new_id.clone(),
+                    requester: None,
+                    payload: n0_payload.to_json(),
+                    ref_name: Some(MEGA_BRANCH_NAME.to_owned()),
+                    is_delete: false,
+                })
+                .await
+                .unwrap();
+            let EnqueueOutcome::Inserted { id: n0_id } = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(
+                storage
+                    .push_queue_service
+                    .storage()
+                    .claim_for_execution(n0_id)
+                    .await
+                    .unwrap(),
+                ClaimOutcome::Claimed
+            );
+            assert!(matches!(
+                wh03_exec(&storage, n0_id).await,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 1,
+                    ..
+                }
+            ));
+            let noop = mst2_queue_noop_receipt::Entity::find()
+                .filter(
+                    mst2_queue_noop_receipt::Column::OperationId
+                        .eq(format!("mst2:trunk-queue:{n0_id}")),
+                )
+                .one(mono.get_connection())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(noop.observed_sequence, 1);
+            assert_eq!(noop.observed_root_commit, root_after.ref_commit_hash);
+            assert_eq!(noop.observed_root_tree, root_after.ref_tree_hash);
+            assert_eq!(noop.landed_commit_id, new_id);
+            assert_eq!(mono.publication_sequence(&path).await.unwrap(), 1);
+            assert_eq!(
+                mst2_publication::Entity::find()
+                    .count(mono.get_connection())
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                mst2_publication_outbox::Entity::find()
+                    .count(mono.get_connection())
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(matches!(storage.push_queue_service.enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Push, operation_id: operation_id.clone(),
+                path: path.clone(), old_id: new_id.clone(), new_id: new_id.clone(),
+                requester: None, payload: n0_payload.to_json(),
+                ref_name: Some(MEGA_BRANCH_NAME.to_owned()), is_delete: false,
+            }).await.unwrap(), EnqueueOutcome::Replay { id: replay_id, .. } if replay_id == n0_id));
+            let error = storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Push,
+                    operation_id: operation_id.clone(),
+                    path: path.clone(),
+                    old_id: new_id.clone(),
+                    new_id: new_id.clone(),
+                    requester: Some("changed-actor".to_owned()),
+                    payload: n0_payload.to_json(),
+                    ref_name: Some(MEGA_BRANCH_NAME.to_owned()),
+                    is_delete: false,
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("MST2_PUBLICATION_CONFLICT"));
+            let mut changed_payload = n0_payload.to_json();
+            changed_payload["fork_base"] = serde_json::json!("changed-intent");
+            let error = storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Push,
+                    operation_id,
+                    path: path.clone(),
+                    old_id: new_id.clone(),
+                    new_id: new_id.clone(),
+                    requester: None,
+                    payload: changed_payload,
+                    ref_name: Some(MEGA_BRANCH_NAME.to_owned()),
+                    is_delete: false,
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("MST2_PUBLICATION_CONFLICT"));
+            noop_ids.push(n0_id);
+        }
+        let (later_id, later_payload) = wh03_save_n1_commit(
+            &storage,
+            new_id.parse().unwrap(),
+            "ffffffffffffffffffffffffffffffffffffffff",
+            "after no-op",
+        )
+        .await;
+        let later_queue_id =
+            wh03_enqueue_push(&storage, &path, &new_id, &later_id, &later_payload).await;
+        assert!(matches!(
+            wh03_exec(&storage, later_queue_id).await,
+            ExecuteOutcome::Done {
+                root_cas_writes: 1,
+                ..
+            }
+        ));
+        let later_root = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_ne!(later_root.ref_commit_hash, root_after.ref_commit_hash);
+        for &n0_id in &noop_ids {
+            mono.get_connection().execute_raw(Statement::from_sql_and_values(
+                mono.get_connection().get_database_backend(),
+                "UPDATE push_queue SET status = 'Running', landed_commit_id = NULL WHERE id = $1",
+                [n0_id.into()],
+            )).await.unwrap();
+            assert_eq!(
+                wh03_exec(&storage, n0_id).await,
+                ExecuteOutcome::Done {
+                    id: n0_id,
+                    landed_commit_id: new_id.clone(),
+                    root_cas_writes: 0,
+                }
+            );
+        }
+        let root = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(root.ref_commit_hash, later_root.ref_commit_hash);
+        assert_eq!(root.ref_tree_hash, later_root.ref_tree_hash);
+        assert_eq!(mono.publication_sequence(&path).await.unwrap(), 2);
+        assert_eq!(
+            mst2_publication::Entity::find()
+                .count(mono.get_connection())
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            mst2_publication_outbox::Entity::find()
+                .count(mono.get_connection())
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            mst2_queue_noop_receipt::Entity::find()
+                .count(mono.get_connection())
+                .await
+                .unwrap(),
+            3
+        );
+        let n0_id = noop_ids[0];
+        mono.get_connection().execute_raw(Statement::from_sql_and_values(
+            mono.get_connection().get_database_backend(),
+            "UPDATE push_queue SET status = 'Running', requester = 'changed-actor' WHERE id = $1",
+            [n0_id.into()],
+        )).await.unwrap();
+        assert!(
+            matches!(wh03_exec(&storage, n0_id).await, ExecuteOutcome::Failed { ref failure, ref message, .. }
+            if failure == "Conflict" && message.contains("MST2_PUBLICATION_CONFLICT"))
+        );
+        assert_eq!(
+            mono.get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap()
+                .ref_commit_hash,
+            later_root.ref_commit_hash
+        );
+        assert_eq!(mono.publication_sequence(&path).await.unwrap(), 2);
+        assert_eq!(
+            mst2_queue_noop_receipt::Entity::find()
+                .count(mono.get_connection())
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn mst2_noop_real_push_checks_epoch_baseline_and_net_zero_cas_fences() {
+        use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait, Statement};
+
+        use crate::callisto::{mst2_publication, mst2_publication_outbox, mst2_queue_noop_receipt};
+
+        for fence in ["epoch", "baseline", "cas"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+            config.monorepo.push_policy = PushPolicy::Trunk;
+            config.mst2.publication_enabled = true;
+            config.mst2.instance_uuid = Some("6ab219b0-4275-45ba-9d7b-7b0b633018cd".to_owned());
+            let storage =
+                crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+            let storage = crate::jupiter::tests::with_test_vault(storage, temp.path()).await;
+            let (tip, path) = wh03_path_fixture(&storage, &format!("noop-{fence}")).await;
+            storage
+                .mono_storage()
+                .initialize_native_publication("6ab219b0-4275-45ba-9d7b-7b0b633018cd")
+                .await
+                .unwrap();
+            let tip_id = tip.id.to_string();
+            let payload = PushPayload {
+                commits: Vec::new(),
+                fork_base: None,
+                n: 0,
+            };
+            let id = wh03_enqueue_push(&storage, &path, &tip_id, &tip_id, &payload).await;
+            let mono = storage.mono_storage();
+            let root_before = mono.get_main_ref("/").await.unwrap().unwrap();
+            let outcome = if fence == "epoch" {
+                mono.get_connection().execute_raw(Statement::from_sql_and_values(
+                    mono.get_connection().get_database_backend(),
+                    "INSERT INTO mst2_namespace_seq (namespace, sequence, epoch) VALUES ($1, 0, 2)",
+                    [path.clone().into()],
+                )).await.unwrap();
+                wh03_exec(&storage, id).await
+            } else if fence == "baseline" {
+                mono.get_connection()
+                    .execute_raw(Statement::from_sql_and_values(
+                        mono.get_connection().get_database_backend(),
+                        "UPDATE push_queue SET expected_commit_hash = $1 WHERE id = $2",
+                        ["f".repeat(40).into(), id.into()],
+                    ))
+                    .await
+                    .unwrap();
+                wh03_exec(&storage, id).await
+            } else {
+                let enter = Arc::new(tokio::sync::Barrier::new(2));
+                let release = Arc::new(tokio::sync::Barrier::new(2));
+                let ctx = PushExecContext {
+                    storage: storage.clone(),
+                    git_object_cache: Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+                        connection: crate::jupiter::tests::test_redis_manager().await,
+                        prefix: String::new(),
+                    }),
+                    pre_apply_enter_barrier: Some(Arc::clone(&enter)),
+                    pre_apply_release_barrier: Some(Arc::clone(&release)),
+                };
+                let exec_storage = storage.clone();
+                let mut worker = tokio::spawn(async move {
+                    exec_storage
+                        .push_queue_service
+                        .execute_b3(
+                            ExecuteRequest {
+                                id,
+                                ..Default::default()
+                            },
+                            None,
+                            None,
+                            Some(&ctx),
+                        )
+                        .await
+                });
+                let handshake = async {
+                    tokio::time::timeout(Duration::from_secs(5), enter.wait()).await.map_err(|_| "no-op did not reach CAS".to_owned())?;
+                    tokio::time::timeout(Duration::from_secs(5), mono.get_connection().execute_raw(Statement::from_sql_and_values(
+                        mono.get_connection().get_database_backend(),
+                        "UPDATE mega_refs SET ref_commit_hash = $1 WHERE path = '/' AND ref_name = $2",
+                        ["f".repeat(40).into(), MEGA_BRANCH_NAME.into()],
+                    ))).await.map_err(|_| "bypass writer timed out".to_owned())?.map_err(|error| error.to_string())?;
+                    tokio::time::timeout(Duration::from_secs(5), release.wait()).await.map_err(|_| "no-op CAS release timed out".to_owned())
+                }.await;
+                if let Err(error) = handshake {
+                    worker.abort();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut worker).await;
+                    panic!("{error}");
+                }
+                match tokio::time::timeout(Duration::from_secs(10), &mut worker).await {
+                    Ok(result) => result.unwrap().unwrap(),
+                    Err(_) => {
+                        worker.abort();
+                        let _ = tokio::time::timeout(Duration::from_secs(5), &mut worker).await;
+                        panic!("no-op CAS worker did not finish");
+                    }
+                }
+            };
+            if fence == "epoch" {
+                assert!(
+                    matches!(outcome, ExecuteOutcome::Failed { ref failure, ref message, .. }
+                    if failure == "Conflict" && message.contains("writer epoch is fenced"))
+                );
+            } else {
+                assert_eq!(outcome, ExecuteOutcome::BypassDetected { id });
+            }
+            let root = mono.get_main_ref("/").await.unwrap().unwrap();
+            assert_eq!(
+                root.ref_commit_hash,
+                if fence == "cas" {
+                    "f".repeat(40)
+                } else {
+                    root_before.ref_commit_hash
+                }
+            );
+            assert_eq!(root.ref_tree_hash, root_before.ref_tree_hash);
+            assert_eq!(mono.publication_sequence(&path).await.unwrap(), 0);
+            assert_eq!(
+                mst2_publication::Entity::find()
+                    .count(mono.get_connection())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                mst2_publication_outbox::Entity::find()
+                    .count(mono.get_connection())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                mst2_queue_noop_receipt::Entity::find()
+                    .count(mono.get_connection())
+                    .await
+                    .unwrap(),
+                0
+            );
+            let txn = mono.get_connection().begin().await.unwrap();
+            assert_eq!(
+                PushQueueStorage::is_hard_stopped_in_txn(&txn)
+                    .await
+                    .unwrap(),
+                fence != "epoch"
+            );
+            txn.rollback().await.unwrap();
+        }
     }
 
     async fn assert_view_signal(signal: &ViewSignal, context: &str) {
