@@ -306,6 +306,20 @@ pub trait MegaObjectStorage: Send + Sync {
         end: Option<u64>,
     ) -> OrbitResult<(ObjectByteStream, ObjectMeta)>;
 
+    /// Exact raw byte range, with no full-download fallback. `None` means
+    /// unsupported and must be returned without source I/O. Implementations
+    /// must validate the backend's actual start/end before exposing the stream;
+    /// metadata describes the complete object. Consumers still verify EOF,
+    /// length and content hashes. This does not promise bounded producer RSS.
+    async fn get_range_stream_exact(
+        &self,
+        _key: &ObjectKey,
+        _start: u64,
+        _end: u64,
+    ) -> OrbitResult<Option<(ObjectByteStream, ObjectMeta)>> {
+        Ok(None)
+    }
+
     /// Check whether an object exists.
     async fn exists(&self, key: &ObjectKey) -> OrbitResult<bool>;
 
@@ -680,6 +694,24 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("atomic metadata put is not supported")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_range_default_is_unsupported_without_calling_fallback() {
+        let store = UnsupportedBoundedStore;
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: "abcdef".to_string(),
+        };
+        // Its general range getter returns an error; the new default must
+        // return typed absence without invoking that method or full get.
+        assert!(
+            store
+                .get_range_stream_exact(&key, 1, 2)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

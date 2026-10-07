@@ -35,6 +35,51 @@ pub async fn build_object_storage(
         })
 }
 
+#[cfg(test)]
+mod exact_range_tests {
+    use super::*;
+    use crate::orbit_api::object_storage::ObjectNamespace;
+
+    #[tokio::test]
+    async fn memory_exact_range_has_no_clipped_or_empty_success() {
+        let storage = mock_object_storage();
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: "abcdef1234567890".to_string(),
+        };
+        storage
+            .inner
+            .put_stream(
+                &key,
+                Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"abcdef"))])),
+                ObjectMeta {
+                    size: 6,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (mut stream, meta) = storage
+            .inner
+            .get_range_stream_exact(&key, 2, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.size, 6);
+        assert_eq!(stream.next().await.unwrap().unwrap(), b"cde".as_slice());
+        assert!(stream.next().await.is_none());
+        for (start, end) in [(5, 7), (6, 7), (4, 4), (u64::MAX, u64::MAX)] {
+            assert!(
+                storage
+                    .inner
+                    .get_range_stream_exact(&key, start, end)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+}
+
 #[derive(Default)]
 struct InMemoryObjectStorage {
     objects: Mutex<HashMap<ObjectKey, (Bytes, ObjectMeta)>>,
@@ -125,6 +170,32 @@ impl MegaObjectStorage for InMemoryObjectStorage {
             return Err(IoOrbitError::object_store("invalid object range"));
         }
         Ok((Self::stream_bytes(bytes.slice(start..end)), meta))
+    }
+
+    async fn get_range_stream_exact(
+        &self,
+        key: &ObjectKey,
+        start: u64,
+        end: u64,
+    ) -> OrbitResult<Option<(ObjectByteStream, ObjectMeta)>> {
+        let (bytes, meta) = self
+            .objects
+            .lock()
+            .map_err(|_| IoOrbitError::Other("object storage lock poisoned".to_string()))?
+            .get(key)
+            .cloned()
+            .ok_or_else(|| IoOrbitError::object_store_not_found(key.default_sharding()))?;
+        let start =
+            usize::try_from(start).map_err(|_| IoOrbitError::object_store("range overflow"))?;
+        let end = usize::try_from(end).map_err(|_| IoOrbitError::object_store("range overflow"))?;
+        if start >= end || end > bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "exact object range is outside stored bytes",
+            )
+            .into());
+        }
+        Ok(Some((Self::stream_bytes(bytes.slice(start..end)), meta)))
     }
 
     async fn exists(&self, key: &ObjectKey) -> OrbitResult<bool> {

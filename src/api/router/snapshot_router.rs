@@ -131,15 +131,51 @@ fn guarded_treeframe_response(
     request_body: &[u8],
     frames: Vec<Vec<u8>>,
 ) -> Result<Response, SnapshotError> {
+    guarded_treeframe_response_with_budget(state, context, snapshot_id, request_body, frames, None)
+}
+
+fn guarded_treeframe_response_with_budget(
+    state: &MonoApiServiceState,
+    context: &crate::ceres::snapshot::runtime::SnapshotContext,
+    snapshot_id: &str,
+    request_body: &[u8],
+    frames: Vec<Vec<u8>>,
+    memory: Option<crate::ceres::snapshot::content_budget::MemoryLease>,
+) -> Result<Response, SnapshotError> {
+    // Field order also keeps admission credits until frame allocations drop
+    // on failures before ownership has moved into individual Bytes.
+    struct FrameAllocation {
+        frames: Vec<Vec<u8>>,
+        memory: Option<crate::ceres::snapshot::content_budget::MemoryLease>,
+    }
+    let mut allocation = FrameAllocation { frames, memory };
+    if let Some(lease) = &allocation.memory {
+        let allocated = allocation
+            .frames
+            .iter()
+            .try_fold(0usize, |total, frame| total.checked_add(frame.capacity()));
+        if allocated.is_none_or(|allocated| allocated > lease.bytes) {
+            return Err(internal("encoded frames exceed their memory reservation"));
+        }
+    }
     let headers = REQUEST_HEADERS.try_with(Clone::clone).map_err(|_| {
         SnapshotError::new(
             SnapshotErrorCode::Unauthenticated,
             "request authentication context missing",
         )
     })?;
-    let units = frames
+    let memory = allocation.memory.take().map(std::sync::Arc::new);
+    let units = std::mem::take(&mut allocation.frames)
         .into_iter()
-        .map(Bytes::from)
+        .map(|bytes| match &memory {
+            Some(lease) => {
+                Bytes::from_owner(crate::ceres::snapshot::content_budget::BudgetedFrame {
+                    bytes,
+                    lease: lease.clone(),
+                })
+            }
+            None => Bytes::from(bytes),
+        })
         .collect::<std::collections::VecDeque<_>>();
     let stream = futures::stream::unfold(
         (units, state.clone(), context.clone(), headers),

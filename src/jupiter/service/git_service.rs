@@ -119,6 +119,26 @@ impl GitService {
         Ok(stream)
     }
 
+    pub async fn get_object_range_stream_exact(
+        &self,
+        hash: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<(ObjectByteStream, ObjectMeta)>, MegaError> {
+        if !is_full_hex_object_id(hash) {
+            return Err(MegaError::Other("Invalid object ID format".to_string()));
+        }
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: hash.to_string(),
+        };
+        Ok(self
+            .obj_storage
+            .inner
+            .get_range_stream_exact(&key, start, end)
+            .await?)
+    }
+
     pub fn get_objects_stream(&self, hashes: Vec<String>) -> MultiObjectByteStream<'_> {
         // Filter out obviously invalid object ids early to avoid spurious backend requests.
         // Callers that need strict validation should validate up-front and return 4xx.

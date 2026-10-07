@@ -106,6 +106,43 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         Ok((Box::pin(stream), meta))
     }
 
+    async fn get_range_stream_exact(
+        &self,
+        key: &ObjectKey,
+        start: u64,
+        end: u64,
+    ) -> OrbitResult<Option<(ObjectByteStream, ObjectMeta)>> {
+        if start >= end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid exact object range",
+            )
+            .into());
+        }
+        let path = Self::checked_path(key)?;
+        let res = self
+            .to_store()
+            .get_opts(
+                &path,
+                object_store::GetOptions {
+                    range: Some(object_store::GetRange::Bounded(start..end)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(IoOrbitError::from)?;
+        if res.range != (start..end) || end > res.meta.size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "backend returned a different object range",
+            )
+            .into());
+        }
+        let meta = build_object_meta(&res.meta);
+        let stream = res.into_stream().map_err(std::io::Error::other);
+        Ok(Some((Box::pin(stream), meta)))
+    }
+
     async fn signed_url(
         &self,
         key: &ObjectKey,
@@ -147,5 +184,57 @@ impl MegaObjectStorage for ObjectStoreAdapter {
             .await
             .map_err(IoOrbitError::from)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod exact_range_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_exact_range_returns_selected_bytes_and_full_object_size_without_clipping() {
+        let directory = tempfile::tempdir().unwrap();
+        let adapter = ObjectStoreAdapter {
+            store: BackendStore::Local(Arc::new(
+                LocalFileSystem::new_with_prefix(directory.path()).unwrap(),
+            )),
+            upload_strategy: UploadStrategy::SinglePut,
+            presign_store: None,
+        };
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: "abcdef1234567890".to_string(),
+        };
+        adapter
+            .put_stream(
+                &key,
+                Box::pin(stream::iter([Ok(Bytes::from_static(b"0123456789"))])),
+                ObjectMeta::default(),
+            )
+            .await
+            .unwrap();
+        let (input, meta) = adapter
+            .get_range_stream_exact(&key, 3, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.size, 10);
+        assert_eq!(
+            ObjectStoreAdapter::buffer_stream(input, 4).await.unwrap(),
+            b"3456".as_slice()
+        );
+        let (input, meta) = adapter
+            .get_range_stream_exact(&key, 9, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.size, 10);
+        assert_eq!(
+            ObjectStoreAdapter::buffer_stream(input, 1).await.unwrap(),
+            b"9".as_slice()
+        );
+        assert!(adapter.get_range_stream_exact(&key, 9, 11).await.is_err());
+        assert!(adapter.get_range_stream_exact(&key, 5, 5).await.is_err());
+        assert!(adapter.get_range_stream_exact(&key, 10, 11).await.is_err());
     }
 }

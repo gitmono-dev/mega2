@@ -191,6 +191,31 @@ pub trait ApiHandler: Send + Sync {
         }
     }
 
+    async fn get_raw_blob_range_stream_exact(
+        &self,
+        hash: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<
+        Option<(
+            crate::orbit_api::object_storage::ObjectByteStream,
+            crate::orbit_api::object_storage::ObjectMeta,
+        )>,
+        MegaError,
+    > {
+        let storage = self.get_context();
+        match storage
+            .git_service
+            .get_object_range_stream_exact(hash, start, end)
+            .await
+        {
+            Ok(range) => Ok(range),
+            Err(error) => Err(storage
+                .classify_blob_objstorage_not_found(hash, error)
+                .await),
+        }
+    }
+
     /// Preview unified diff for a single file change
     async fn preview_file_diff(
         &self,
