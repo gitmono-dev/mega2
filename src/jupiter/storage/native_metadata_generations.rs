@@ -97,7 +97,7 @@ impl GenerationBindings {
             ));
         }
         let mut bindings = BTreeMap::new();
-        for entry in bytes[12..].chunks_exact(48) {
+        for entry in bytes[12..].as_chunks::<48>().0 {
             let page: [u8; 32] = entry[..32].try_into().map_err(internal)?;
             let generation = i64::from_be_bytes(entry[32..40].try_into().map_err(internal)?);
             let size = u64::from_be_bytes(entry[40..48].try_into().map_err(internal)?);
