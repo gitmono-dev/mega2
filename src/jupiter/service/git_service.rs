@@ -108,6 +108,13 @@ impl GitService {
     }
 
     pub async fn get_object_stream(&self, hash: &str) -> Result<ObjectByteStream, MegaError> {
+        Ok(self.get_object_stream_with_meta(hash).await?.0)
+    }
+
+    pub async fn get_object_stream_with_meta(
+        &self,
+        hash: &str,
+    ) -> Result<(ObjectByteStream, ObjectMeta), MegaError> {
         if !is_full_hex_object_id(hash) {
             return Err(MegaError::Other("Invalid object ID format".to_string()));
         }
@@ -115,8 +122,7 @@ impl GitService {
             namespace: ObjectNamespace::Git,
             key: hash.to_string(),
         };
-        let (stream, _) = self.obj_storage.inner.get_stream(&key).await?;
-        Ok(stream)
+        Ok(self.obj_storage.inner.get_stream(&key).await?)
     }
 
     pub async fn get_object_range_stream_exact(

@@ -28,8 +28,8 @@ use crate::{
         descriptor::build as build_descriptor,
         error::{SnapshotError, SnapshotErrorCode},
         pages::{
-            MetadataWalkOutcome, WalkOutcome, base64_of, build_directory_page,
-            build_directory_page_with_work, hex_of, proof_pages, resolve_abs, resolve_abs_metadata,
+            MetadataWalkOutcome, base64_of, build_directory_page, build_directory_page_with_work,
+            hex_of, proof_pages, resolve_abs_metadata,
         },
         projection_observation::{NativeResolveSource, ResolvedProjection},
         runtime::{now_unix, runtime},
@@ -47,7 +47,7 @@ pub fn routers(api_state: MonoApiServiceState) -> Router<MonoApiServiceState> {
         .route("/snapshots/{snapshot_id}/directory", get(directory))
         .route(
             "/snapshots/{snapshot_id}/blob",
-            get(blob).head(content::blob_head),
+            get(raw_blob::blob).head(content::blob_head),
         )
         .route("/snapshots/{snapshot_id}/lookup", post(lookup))
         .route(
@@ -78,6 +78,9 @@ pub fn routers(api_state: MonoApiServiceState) -> Router<MonoApiServiceState> {
 
 #[path = "snapshot_content.rs"]
 mod content;
+
+#[path = "snapshot_raw_blob.rs"]
+mod raw_blob;
 
 #[path = "snapshot_request.rs"]
 mod request;
@@ -1163,127 +1166,6 @@ async fn directory(
         HeaderValue::from_static("private, no-cache, no-transform"),
     );
     Ok(resp)
-}
-
-#[derive(Deserialize, Debug)]
-struct BlobQuery {
-    path: String,
-    #[serde(default)]
-    expected_digest: Option<String>,
-}
-
-#[allow(clippy::result_large_err, clippy::too_many_lines)]
-async fn blob(
-    state: State<MonoApiServiceState>,
-    AxumPath(snapshot_id): AxumPath<String>,
-    Query(q): Query<BlobQuery>,
-    headers: HeaderMap,
-) -> Result<Response, Response> {
-    ensure_enabled(&state).map_err(mst2_error_response)?;
-    let ctx = request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
-    validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
-    if headers.contains_key("range") {
-        // Spec 04 section 9: raw blob has no Range semantics this profile.
-        return Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::RangeNotSupported,
-            "raw blob reads are whole-file; use chunks for ranges",
-        )));
-    }
-
-    let handler = state
-        .api_handler(std::path::Path::new("/"))
-        .await
-        .map_err(internal)?;
-    let root_tree = handler
-        .get_tree_by_hash(&ctx.root_tree_oid)
-        .await
-        .map_err(internal)?;
-    let abs_path = abs_view_path(&ctx.built.descriptor.scope, &q.path);
-
-    match resolve_abs(handler.as_ref(), &root_tree, &abs_path)
-        .await
-        .map_err(mst2_error_response)?
-    {
-        WalkOutcome::FoundFile {
-            fs_kind,
-            raw,
-            digest,
-            ..
-        } => {
-            if let Some(expected) = &q.expected_digest
-                && expected != &format!("sha256:{}", hex_of(&digest))
-            {
-                return Err(mst2_error_response(SnapshotError::new(
-                    SnapshotErrorCode::DigestMismatch,
-                    "content does not match expected_digest",
-                )));
-            }
-            let fs_kind_str = match fs_kind {
-                crate::ceres::snapshot::resolver::FsKind::Regular => "regular",
-                crate::ceres::snapshot::resolver::FsKind::Executable => "executable",
-                crate::ceres::snapshot::resolver::FsKind::Symlink => "symlink",
-                crate::ceres::snapshot::resolver::FsKind::Directory => "directory",
-            };
-            revalidate_request(&state, &ctx)
-                .await
-                .map_err(mst2_error_response)?;
-            let headers = REQUEST_HEADERS.try_with(Clone::clone).map_err(|_| {
-                mst2_error_response(SnapshotError::new(
-                    SnapshotErrorCode::Unauthenticated,
-                    "request authentication context missing",
-                ))
-            })?;
-            let stream_state = state.0.clone();
-            let stream_context = ctx.clone();
-            let blocks = futures::stream::unfold(
-                (
-                    Bytes::from(raw),
-                    0usize,
-                    stream_state,
-                    stream_context,
-                    headers,
-                ),
-                |(raw, offset, state, context, headers)| async move {
-                    if offset >= raw.len() {
-                        return None;
-                    }
-                    if let Err(error) = revalidate_access(&state, &context, &headers).await {
-                        return Some((Err(error), (raw, usize::MAX, state, context, headers)));
-                    }
-                    let end = (offset + 1_048_576).min(raw.len());
-                    let bytes = raw.slice(offset..end);
-                    Some((Ok(bytes), (raw, end, state, context, headers)))
-                },
-            );
-            Response::builder()
-                .header("etag", format!("\"sha256:{}\"", hex_of(&digest)))
-                .header("cache-control", "private, no-cache, no-transform")
-                .header("x-mega-fs-kind", fs_kind_str)
-                .body(axum::body::Body::from_stream(blocks))
-                .map_err(|e| {
-                    mst2_error_response(SnapshotError::new(
-                        SnapshotErrorCode::Internal,
-                        format!("body build failed: {e}"),
-                    ))
-                })
-        }
-        WalkOutcome::FoundDir => Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::NotDirectory,
-            "path is a directory",
-        ))),
-        WalkOutcome::Absent => Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::PathNotFound,
-            "path absent in the fixed view",
-        ))),
-        WalkOutcome::NotDirectory { symlink } => Err(mst2_error_response(SnapshotError::new(
-            if symlink {
-                SnapshotErrorCode::SymlinkTraversal
-            } else {
-                SnapshotErrorCode::NotDirectory
-            },
-            "intermediate component is not a directory",
-        ))),
-    }
 }
 
 /// Scope-relative request path -> absolute view path (spec 04 section 1).

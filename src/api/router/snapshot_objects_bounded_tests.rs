@@ -26,6 +26,14 @@ pub(super) enum FaultKind {
         release: Arc<Notify>,
         drops: Arc<AtomicUsize>,
     },
+    HeldFragment {
+        prefix: Bytes,
+        fragment: Option<Bytes>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        tail_polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    },
 }
 
 struct DropCount(Arc<AtomicUsize>);
@@ -39,6 +47,46 @@ impl Drop for DropCount {
 impl StreamFault {
     pub(super) fn stream(self) -> ObjectByteStream {
         match self.kind {
+            FaultKind::HeldFragment {
+                prefix,
+                fragment,
+                entered,
+                release,
+                tail_polls,
+                drops,
+            } => Box::pin(futures::stream::unfold(
+                (
+                    prefix,
+                    fragment,
+                    entered,
+                    release,
+                    tail_polls,
+                    DropCount(drops),
+                    0u8,
+                ),
+                |(prefix, fragment, entered, release, tail_polls, owner, turn)| async move {
+                    match turn {
+                        0 => Some((
+                            Ok(prefix.clone()),
+                            (prefix, fragment, entered, release, tail_polls, owner, 1),
+                        )),
+                        1 => {
+                            entered.notify_one();
+                            release.notified().await;
+                            fragment.clone().map(|part| {
+                                (
+                                    Ok(part),
+                                    (prefix, fragment, entered, release, tail_polls, owner, 2),
+                                )
+                            })
+                        }
+                        _ => {
+                            tail_polls.fetch_add(1, Ordering::SeqCst);
+                            std::future::pending().await
+                        }
+                    }
+                },
+            )),
             FaultKind::HeldThenError {
                 entered,
                 release,

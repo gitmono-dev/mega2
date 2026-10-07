@@ -27,15 +27,15 @@ use crate::ceres::snapshot::{
 };
 
 pub(super) struct ResolvedFileMetadata {
-    fs_kind: FsKind,
-    oid: String,
+    pub(super) fs_kind: FsKind,
+    pub(super) oid: String,
     pub(super) digest: [u8; 32],
     pub(super) size: u64,
     fact: crate::callisto::mst2_verified_object::Model,
 }
 
 #[allow(clippy::result_large_err)]
-async fn fixed_root_tree<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+pub(super) async fn fixed_root_tree<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     handler: &T,
     oid: &str,
 ) -> Result<git_internal::internal::object::tree::Tree, Response> {
@@ -50,7 +50,7 @@ async fn fixed_root_tree<T: crate::ceres::api_service::ApiHandler + ?Sized>(
 }
 
 #[allow(clippy::result_large_err)]
-async fn resolve_file_metadata<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+pub(super) async fn resolve_file_metadata<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     handler: &T,
     root_tree: &git_internal::internal::object::tree::Tree,
     scope: &str,
@@ -479,7 +479,7 @@ async fn project_for<T: crate::ceres::api_service::ApiHandler + ?Sized>(
 }
 
 #[allow(clippy::result_large_err)]
-async fn project_resolved<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+pub(super) async fn project_resolved<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     handler: &T,
     f: &ResolvedFileMetadata,
 ) -> Result<std::sync::Arc<crate::jupiter::storage::native_chunk_map::PersistedChunkMap>, Response>
@@ -789,7 +789,7 @@ struct ResolvedChunk {
     map_id: String,
 }
 
-fn content_read_error(error: crate::common::errors::MegaError) -> SnapshotError {
+pub(super) fn content_read_error(error: crate::common::errors::MegaError) -> SnapshotError {
     use crate::common::errors::MegaError;
     let code = match &error {
         MegaError::ObjStorageNotFound(_) => SnapshotErrorCode::ObjectUnavailable,

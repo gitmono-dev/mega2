@@ -191,6 +191,26 @@ pub trait ApiHandler: Send + Sync {
         }
     }
 
+    /// Raw whole-file stream with the physical object's complete size.
+    async fn get_raw_blob_stream_with_meta(
+        &self,
+        hash: &str,
+    ) -> Result<
+        (
+            crate::orbit_api::object_storage::ObjectByteStream,
+            crate::orbit_api::object_storage::ObjectMeta,
+        ),
+        MegaError,
+    > {
+        let storage = self.get_context();
+        match storage.git_service.get_object_stream_with_meta(hash).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(storage
+                .classify_blob_objstorage_not_found(hash, error)
+                .await),
+        }
+    }
+
     async fn get_raw_blob_range_stream_exact(
         &self,
         hash: &str,
