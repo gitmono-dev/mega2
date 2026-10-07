@@ -72,7 +72,7 @@ jobs:
           set -euo pipefail
           source .env.test
           export no_proxy="$NO_PROXY"
-          cargo test --all
+          cargo test --all -- --nocapture
 
       - name: Stop isolated test dependencies
         if: always()

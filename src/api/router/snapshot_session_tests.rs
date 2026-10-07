@@ -1,4 +1,4 @@
-use sea_orm::{DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use tokio::sync::Barrier;
 
 use super::*;
@@ -22,7 +22,7 @@ fn resolve_request(scope: &str) -> Request<Body> {
         .unwrap()
 }
 
-async fn scalar(db: &DatabaseConnection, sql: &str) -> i64 {
+async fn scalar<C: ConnectionTrait>(db: &C, sql: &str) -> i64 {
     db.query_one_raw(Statement::from_string(DbBackend::Postgres, sql.to_owned()))
         .await
         .unwrap()
@@ -575,8 +575,14 @@ async fn mst2_durable_http_renew_waits_for_lock_before_checking_database_deadlin
     };
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
+            held.execute_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT pg_stat_clear_snapshot()".to_owned(),
+            ))
+            .await
+            .unwrap();
             let blocked = scalar(
-                db,
+                &held,
                 "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid
               WHERE l.locktype='advisory' AND NOT l.granted AND a.datname=current_database()
                 AND a.application_name=current_schema()",
