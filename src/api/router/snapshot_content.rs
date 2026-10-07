@@ -34,11 +34,11 @@ struct ResolvedFile {
     raw: Vec<u8>,
 }
 
-struct ResolvedFileMetadata {
+pub(super) struct ResolvedFileMetadata {
     fs_kind: FsKind,
     oid: String,
-    digest: [u8; 32],
-    size: u64,
+    pub(super) digest: [u8; 32],
+    pub(super) size: u64,
 }
 
 #[allow(clippy::result_large_err)]
@@ -93,6 +93,17 @@ async fn resolve_file_metadata<T: crate::ceres::api_service::ApiHandler + ?Sized
             )));
         }
     };
+    verified_file_metadata(handler, fs_kind, oid, path, expected_digest).await
+}
+
+#[allow(clippy::result_large_err)]
+pub(super) async fn verified_file_metadata<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+    handler: &T,
+    fs_kind: FsKind,
+    oid: String,
+    path: &str,
+    expected_digest: Option<&str>,
+) -> Result<ResolvedFileMetadata, Response> {
     let storage = handler.get_context();
     let mut verified = storage
         .mono_storage()

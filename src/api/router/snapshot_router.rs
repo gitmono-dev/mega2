@@ -28,8 +28,8 @@ use crate::{
         descriptor::build as build_descriptor,
         error::{SnapshotError, SnapshotErrorCode},
         pages::{
-            WalkOutcome, base64_of, build_directory_page, build_directory_page_with_work, hex_of,
-            proof_pages, resolve_abs,
+            MetadataWalkOutcome, WalkOutcome, base64_of, build_directory_page,
+            build_directory_page_with_work, hex_of, proof_pages, resolve_abs, resolve_abs_metadata,
         },
         projection_observation::{NativeResolveSource, ResolvedProjection},
         runtime::{now_unix, runtime},
@@ -1299,11 +1299,11 @@ async fn lookup(
         validate_scope_relative_path(path).map_err(mst2_error_response)?;
         let abs_path = abs_view_path(&ctx.built.descriptor.scope, path);
         let mut entry = json!({"path": path});
-        match resolve_abs(handler.as_ref(), &root_tree, &abs_path)
+        match resolve_abs_metadata(handler.as_ref(), &root_tree, &abs_path)
             .await
             .map_err(mst2_error_response)?
         {
-            WalkOutcome::FoundDir => {
+            MetadataWalkOutcome::FoundDir => {
                 let built = build_directory_page(handler.as_ref(), &root_tree, &abs_path)
                     .await
                     .map_err(mst2_error_response)?;
@@ -1320,25 +1320,23 @@ async fn lookup(
                 entry["node"] = node;
                 deepest_dirs.push(abs_path);
             }
-            WalkOutcome::FoundFile {
-                fs_kind,
-                size,
-                digest,
-                ..
-            } => {
+            MetadataWalkOutcome::FoundFile { fs_kind, oid } => {
+                let fact =
+                    content::verified_file_metadata(handler.as_ref(), fs_kind, oid, path, None)
+                        .await?;
                 entry["status"] = json!("found");
                 let mut node = json!({"fs_kind": fs_kind.as_str()});
                 if let Some(name) = path.rsplit('/').next() {
                     node["name"] = json!(name);
                 }
-                node["size"] = json!(size.to_string());
-                node["content_digest"] = json!(format!("sha256:{}", hex_of(&digest)));
+                node["size"] = json!(fact.size.to_string());
+                node["content_digest"] = json!(format!("sha256:{}", hex_of(&fact.digest)));
                 entry["node"] = node;
             }
-            WalkOutcome::Absent => {
+            MetadataWalkOutcome::Absent => {
                 entry["status"] = json!("absent");
             }
-            WalkOutcome::NotDirectory { symlink } => {
+            MetadataWalkOutcome::NotDirectory { symlink } => {
                 entry["status"] = if symlink {
                     json!("symlink_traversal")
                 } else {
