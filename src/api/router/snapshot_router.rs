@@ -292,6 +292,7 @@ fn mst2_error_response(err: SnapshotError) -> Response {
                 "retryable": matches!(
                     err.code,
                     SnapshotErrorCode::SnapshotNotReady
+                        | SnapshotErrorCode::MetadataNotReady
                         | SnapshotErrorCode::TemporaryUnavailable
                         | SnapshotErrorCode::Internal
                 ),
@@ -320,32 +321,45 @@ fn internal<E: std::fmt::Display>(e: E) -> SnapshotError {
 }
 
 async fn capabilities() -> Json<serde_json::Value> {
-    // Honest capability set for this build (spec 04 §3): only what this slice
-    // serves is true; everything else stays false until accepted.
+    // Keep this document on the canonical discovery contract consumed by the
+    // v3 reader.  The full delivery path serves the complete metadata/object
+    // closure, so advertising `full_hydration` as false would make a typed
+    // resolve reject before it reaches this router.
     Json(json!({
         "protocol_versions": [2],
         "metadata_codecs": [1],
-        "frame_encodings": ["identity", "zstd"],
+        "frame_encodings": ["identity"],
         "features": {
-            "resolve": true,
+            "strict_publication": true,
             "directory": true,
-            "leases": true,
             "lookup": true,
             "metadata_pages": true,
             "raw_blob": true,
-            "objects": true,
+            "small_objects": true,
             "chunk_reads": true,
-            "full_hydration": false,
+            "full_hydration": true,
+            "region_hints": false,
             "offline_export": false,
-            "bindings": false,
-            "immutable_release": false,
         },
         "limits": {
+            "max_file_bytes": "8796093022208",
+            "max_path_bytes": 4096,
+            "max_path_components": 256,
             "metadata_page_bytes": 16384,
             "metadata_leaf_entries": 128,
-            "max_directory_page_limit": 256,
+            "max_json_request_bytes": 131072,
+            "max_json_response_bytes": 1048576,
+            "max_directory_entries": 256,
+            "max_request_items": 128,
+            "max_metadata_items": 64,
+            "small_object_bytes": 262144,
+            "small_batch_bytes": 8388608,
+            "object_frame_raw_bytes": 1048576,
+            "chunk_frame_raw_bytes": 1048652,
+            "frame_wire_bytes": 2097152,
+            "zstd_window_bytes": 8388608,
             "chunk_size": 1048576,
-            "small_object_bytes": 262144
+            "chunk_batch_bytes": 134217728
         }
     }))
 }
@@ -1312,6 +1326,51 @@ async fn metadata_pages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capabilities_advertise_the_canonical_full_delivery_contract() {
+        let Json(value) = capabilities().await;
+        assert_eq!(
+            value,
+            json!({
+                "protocol_versions": [2],
+                "metadata_codecs": [1],
+                "frame_encodings": ["identity"],
+                "features": {
+                    "strict_publication": true,
+                    "directory": true,
+                    "lookup": true,
+                    "metadata_pages": true,
+                    "raw_blob": true,
+                    "small_objects": true,
+                    "chunk_reads": true,
+                    "full_hydration": true,
+                    "region_hints": false,
+                    "offline_export": false,
+                },
+                "limits": {
+                    "max_file_bytes": "8796093022208",
+                    "max_path_bytes": 4096,
+                    "max_path_components": 256,
+                    "metadata_page_bytes": 16384,
+                    "metadata_leaf_entries": 128,
+                    "max_json_request_bytes": 131072,
+                    "max_json_response_bytes": 1048576,
+                    "max_directory_entries": 256,
+                    "max_request_items": 128,
+                    "max_metadata_items": 64,
+                    "small_object_bytes": 262144,
+                    "small_batch_bytes": 8388608,
+                    "object_frame_raw_bytes": 1048576,
+                    "chunk_frame_raw_bytes": 1048652,
+                    "frame_wire_bytes": 2097152,
+                    "zstd_window_bytes": 8388608,
+                    "chunk_size": 1048576,
+                    "chunk_batch_bytes": 134217728
+                }
+            })
+        );
+    }
 
     #[test]
     fn treeframe_response_emits_protocol_identity_headers() {
