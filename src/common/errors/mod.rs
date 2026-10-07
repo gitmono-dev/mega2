@@ -1,8 +1,8 @@
-use std::convert::Infallible;
+use std::{convert::Infallible, fmt};
 
 use axum::{
     Json,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use cedar_policy::ParseErrors;
@@ -24,6 +24,26 @@ pub use policy::{ContextError, SaturnContextError};
 pub use vault::{RvError, VaultError, VaultResult};
 
 pub type MegaResult = Result<(), MegaError>;
+
+pub const VIEW_UNAVAILABLE_RETRY_AFTER_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewUnavailableReason {
+    WarmingUp,
+    RootChainHalted,
+    DefinitionCorrupt,
+}
+
+impl fmt::Display for ViewUnavailableReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match self {
+            Self::WarmingUp => "warming up",
+            Self::RootChainHalted => "root chain halted",
+            Self::DefinitionCorrupt => "definition corrupt",
+        };
+        formatter.write_str(reason)
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum MegaError {
@@ -61,6 +81,13 @@ pub enum MegaError {
     StaleMonorepoRootRef,
     #[error("lazy materialize aborted after concurrent root updates; retry the advertise")]
     MaterializeAborted,
+    #[error("view {filter_id} unavailable: {reason}")]
+    ViewUnavailable {
+        filter_id: String,
+        reason: ViewUnavailableReason,
+    },
+    #[error("{0}")]
+    ViewPackRejected(String),
     /// New-branch push whose first-parent chain, walked through the pack,
     /// reaches a parentless root (plan-20260923 ADR-FU-07): for a new tip no
     /// known commit on the way to fork from; for a known tip any chain that
@@ -367,12 +394,23 @@ pub enum ProtocolError {
     Disabled,
     #[error("lazy materialize aborted after concurrent root updates; retry the advertise")]
     AdvertiseFailed,
+    #[error("view {filter_id} unavailable: {reason}")]
+    ViewUnavailable {
+        filter_id: String,
+        reason: ViewUnavailableReason,
+    },
+    #[error("{0}")]
+    PackRejected(String),
 }
 
 impl From<MegaError> for ProtocolError {
     fn from(err: MegaError) -> ProtocolError {
         match err {
             MegaError::MaterializeAborted => ProtocolError::AdvertiseFailed,
+            MegaError::ViewUnavailable { filter_id, reason } => {
+                ProtocolError::ViewUnavailable { filter_id, reason }
+            }
+            MegaError::ViewPackRejected(message) => ProtocolError::PackRejected(message),
             other => ProtocolError::InvalidInput(other.to_string()),
         }
     }
@@ -380,23 +418,43 @@ impl From<MegaError> for ProtocolError {
 
 impl IntoResponse for ProtocolError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            ProtocolError::Deny(err) => (StatusCode::UNAUTHORIZED, err),
-            ProtocolError::Forbidden(err) => (StatusCode::FORBIDDEN, err),
-            ProtocolError::TooLarge(err) => (StatusCode::PAYLOAD_TOO_LARGE, err),
-            ProtocolError::NotFound(err) => (StatusCode::NOT_FOUND, err),
-            ProtocolError::InvalidInput(err) => (StatusCode::BAD_REQUEST, err),
-            ProtocolError::AdvertiseFailed => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                MegaError::MaterializeAborted.to_string(),
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Something went wrong".to_owned(),
-            ),
-        };
+        match self {
+            ProtocolError::ViewUnavailable { filter_id, reason } => {
+                let message = format!("view {filter_id} unavailable: {reason}");
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(CommonResult::<String>::failed(&message)),
+                )
+                    .into_response();
+                response.headers_mut().insert(
+                    "Retry-After",
+                    HeaderValue::from(VIEW_UNAVAILABLE_RETRY_AFTER_SECS),
+                );
+                response
+            }
+            ProtocolError::PackRejected(message) => {
+                crate::contract::git_protocol::http::pack_rejected_response(&message)
+            }
+            error => {
+                let (status, message) = match error {
+                    ProtocolError::Deny(err) => (StatusCode::UNAUTHORIZED, err),
+                    ProtocolError::Forbidden(err) => (StatusCode::FORBIDDEN, err),
+                    ProtocolError::TooLarge(err) => (StatusCode::PAYLOAD_TOO_LARGE, err),
+                    ProtocolError::NotFound(err) => (StatusCode::NOT_FOUND, err),
+                    ProtocolError::InvalidInput(err) => (StatusCode::BAD_REQUEST, err),
+                    ProtocolError::AdvertiseFailed => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        MegaError::MaterializeAborted.to_string(),
+                    ),
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Something went wrong".to_owned(),
+                    ),
+                };
 
-        (status, Json(CommonResult::<String>::failed(&message))).into_response()
+                (status, Json(CommonResult::<String>::failed(&message))).into_response()
+            }
+        }
     }
 }
 
@@ -676,6 +734,71 @@ mod tests {
         let parse: ProtocolError = MegaError::Other("bad pkt-line".to_owned()).into();
         let parse_response = parse.into_response();
         assert_eq!(parse_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn view_errors_http_contract() {
+        let filter_id = "a".repeat(64);
+        for (reason, expected) in [
+            (ViewUnavailableReason::WarmingUp, "warming up"),
+            (ViewUnavailableReason::RootChainHalted, "root chain halted"),
+            (
+                ViewUnavailableReason::DefinitionCorrupt,
+                "definition corrupt",
+            ),
+        ] {
+            let mega_error = MegaError::ViewUnavailable {
+                filter_id: filter_id.clone(),
+                reason,
+            };
+            let protocol_error: ProtocolError = mega_error.into();
+            let expected_message = format!("view {filter_id} unavailable: {expected}");
+            assert_eq!(protocol_error.to_string(), expected_message);
+
+            let response = protocol_error.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .expect("Retry-After header")
+                .to_str()
+                .expect("Retry-After is ASCII")
+                .parse::<u64>()
+                .expect("Retry-After integer");
+            assert!(retry_after > 0);
+        }
+
+        for message in [
+            format!("upload-pack: not our ref {}", "b".repeat(40)),
+            format!(
+                "view {} pack aborted: tree {} is missing",
+                "c".repeat(64),
+                "d".repeat(40)
+            ),
+        ] {
+            assert_eq!(
+                MegaError::ViewPackRejected(message.clone()).to_string(),
+                message
+            );
+            let protocol_error: ProtocolError = MegaError::ViewPackRejected(message.clone()).into();
+            assert_eq!(protocol_error.to_string(), message);
+
+            let response = protocol_error.into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get("Content-Type").unwrap(),
+                "application/x-git-upload-pack-result"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("ERR pkt-line body");
+            let mut expected = bytes::BytesMut::new();
+            crate::ceres::protocol::smart::add_pkt_line_string(
+                &mut expected,
+                format!("ERR {message}\n"),
+            );
+            assert_eq!(body, expected.freeze());
+        }
     }
 
     #[test]
