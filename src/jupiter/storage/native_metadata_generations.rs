@@ -398,7 +398,11 @@ impl PostgresMetadataGenerationRepository {
         let fixed = self.require_fixed_plan(txn, intent).await?;
         check_generation_payloads(txn, &fixed).await?;
         let legacy = if intent.graph_domain == GraphDomain::Qualified {
-            qualified::finalize_graph(txn, &fixed, &observation.dag).await?
+            if self.inner.qualified_family.is_some() {
+                qualified::finalize_canonical_graph(txn, &fixed, &observation.dag).await?
+            } else {
+                qualified::finalize_graph(txn, &fixed, &observation.dag).await?
+            }
         } else {
             self.inner
                 .finalize_stored_plan_in_txn(txn, &intent.legacy, &observation.dag, fixed.stored)

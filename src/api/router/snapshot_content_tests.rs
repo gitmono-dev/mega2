@@ -107,6 +107,8 @@ mod generation_qualified_fixture;
 mod install_capability_fixture;
 
 type ReceiptWriteHold = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+#[path = "snapshot_rooted_metadata_tests.rs"]
+mod rooted_metadata;
 
 #[derive(Default)]
 struct ReadCounts {
@@ -393,6 +395,7 @@ impl LogStorage for CountingStorage {
 struct Fixture {
     app: Router,
     state: MonoApiServiceState,
+    generic_history: bool,
     snapshot: String,
     lease: String,
     oid: String,
@@ -504,11 +507,46 @@ impl Fixture {
         directory_count: usize,
         objects: &[(String, Vec<u8>)],
     ) -> Self {
+        Self::new_in_metadata_family(rebuildable, directory_count, objects, false).await
+    }
+
+    async fn new_generic_history_with_pg_config(rebuildable: bool) -> Self {
+        Self::new_generic_history_with_pg_config_and_directories(rebuildable, 0).await
+    }
+
+    async fn new_generic_history_with_pg_config_and_directories(
+        rebuildable: bool,
+        directory_count: usize,
+    ) -> Self {
+        Self::new_in_metadata_family(rebuildable, directory_count, &[], true).await
+    }
+
+    async fn new_in_metadata_family(
+        rebuildable: bool,
+        directory_count: usize,
+        objects: &[(String, Vec<u8>)],
+        generic_history: bool,
+    ) -> Self {
+        Self::new_in_publication_mode(rebuildable, directory_count, objects, generic_history, true)
+            .await
+    }
+
+    async fn new_without_publication() -> Self {
+        Self::new_in_publication_mode(true, 0, &[], false, false).await
+    }
+
+    async fn new_in_publication_mode(
+        rebuildable: bool,
+        directory_count: usize,
+        objects: &[(String, Vec<u8>)],
+        generic_history: bool,
+        publication_enabled: bool,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let mut config = isolated_config(temp.path().join("config"));
         config.monorepo.push_policy = PushPolicy::Trunk;
         config.mst2.enabled = true;
-        config.mst2.publication_enabled = true;
+        config.mst2.publication_enabled = publication_enabled;
         config.mst2.instance_uuid = Some(uuid::Uuid::new_v4().to_string());
         config.mst2.auth_token = Some(TOKEN.to_string());
         let backend = build_object_storage(&config.object_storage).await.unwrap();
@@ -516,22 +554,37 @@ impl Fixture {
         let (mut storage, schema) = if rebuildable {
             let (database, schema) = test_db_config(temp.path()).await;
             config.database = database;
-            let connection = crate::jupiter::storage::init::database_connection(&config.database)
-                .await
-                .unwrap();
-            (
+            let assembly = async {
+                let connection =
+                    crate::jupiter::storage::init::database_connection(&config.database)
+                        .await
+                        .unwrap();
                 crate::jupiter::storage::Storage::new_with_connection(
                     Arc::new(config),
                     Arc::new(connection),
                     backend.clone(),
                 )
                 .await
-                .unwrap(),
-                Some(schema),
-            )
+                .unwrap()
+            };
+            let storage = if generic_history {
+                crate::jupiter::storage::init::with_generic_history_bootstrap(assembly).await
+            } else {
+                assembly.await
+            };
+            (storage, Some(schema))
         } else {
             (test_storage_with_config(temp.path(), config).await, None)
         };
+        if generic_history {
+            let q_rows:i64=storage.mono_storage().get_connection().query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,"SELECT count(*) FROM mst2_metadata_namespace WHERE graph_domain='qualified-v1'"))
+                .await.unwrap().unwrap().try_get_by_index(0).unwrap();
+            assert_eq!(
+                q_rows, 0,
+                "G history fixtures must not create or erase actual Q ownership"
+            );
+        }
         storage.git_service = GitService {
             obj_storage: MegaObjectStorageWrapper::new(Arc::new(CountingStorage {
                 inner: backend,
@@ -664,18 +717,24 @@ impl Fixture {
         )
         .await
         .unwrap();
-        mono.initialize_native_publication(storage.config().mst2.instance_uuid.as_deref().unwrap())
+        if publication_enabled {
+            mono.initialize_native_publication(
+                storage.config().mst2.instance_uuid.as_deref().unwrap(),
+            )
             .await
             .unwrap();
-        publish_native_push(&storage, "/project", old_tip.id, &new_tip).await;
-        let head = mono
-            .read_native_publication_head(storage.config().mst2.instance_uuid.as_deref().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(head.token.sequence, 1);
-        assert!(head.token.certificate.is_some());
-        assert_eq!(head.root.commit, commit.id.to_string());
-        assert_eq!(head.root.tree, root.id.to_string());
+            publish_native_push(&storage, "/project", old_tip.id, &new_tip).await;
+            let head = mono
+                .read_native_publication_head(
+                    storage.config().mst2.instance_uuid.as_deref().unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(head.token.sequence, 1);
+            assert!(head.token.certificate.is_some());
+            assert_eq!(head.root.commit, commit.id.to_string());
+            assert_eq!(head.root.tree, root.id.to_string());
+        }
         let state = MonoApiServiceState {
             entity_store: storage.entity_store.clone(),
             storage,
@@ -686,7 +745,12 @@ impl Fixture {
             }),
             listen_addr: "127.0.0.1:0".to_string(),
         };
-        let app = Router::new().nest("/api/v2", routers(state.clone()).with_state(state.clone()));
+        let routes = if generic_history {
+            crate::api::router::snapshot_router::generic_history_routers(state.clone())
+        } else {
+            routers(state.clone())
+        };
+        let app = Router::new().nest("/api/v2", routes.with_state(state.clone()));
         let response = app
             .clone()
             .oneshot(
@@ -724,6 +788,7 @@ impl Fixture {
             digest: Sha256::digest(&raw).into(),
             raw,
             counts,
+            generic_history,
             _temp: temp,
             _schema: schema,
         }
@@ -913,6 +978,123 @@ async fn mst2_fixed_head_uses_verified_facts_without_body_reads_and_preserves_ra
     assert_eq!(bytes.as_ref(), fixture.raw);
     fixture.counts.assert(2, 2 * fixture.raw.len());
     assert_eq!(fixture.counts.receipt_writes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn mst2_publication_disabled_resolve_preserves_head_body_object_map_page_and_chunk_content() {
+    let fixture = Fixture::new_without_publication().await;
+    assert!(!fixture.state.storage.config().mst2.publication_enabled);
+    assert_eq!(
+        fixture
+            .state
+            .storage
+            .snapshot_metadata_family(&fixture.lease, true)
+            .await
+            .unwrap(),
+        None
+    );
+    let routes: i64 = fixture
+        .state
+        .storage
+        .mono_storage()
+        .get_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            "SELECT count(*) FROM mst2_snapshot_storage_route",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(
+        routes, 0,
+        "runtime resolve does not create a permanent SID route"
+    );
+    let head = fixture.send("HEAD", "blob?path=/file", Body::empty()).await;
+    assert_eq!(head.status(), 200);
+    assert_eq!(
+        head.headers()["content-length"],
+        fixture.raw.len().to_string()
+    );
+    assert_eq!(
+        head.headers()["etag"],
+        format!("\"{}\"", fixture.digest_string())
+    );
+    assert!(to_bytes(head.into_body(), 1024).await.unwrap().is_empty());
+    fixture.counts.assert(0, 0);
+    let body = fixture.send("GET", "blob?path=/file", Body::empty()).await;
+    assert_eq!(body.status(), 200);
+    assert_eq!(
+        to_bytes(body.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap()
+            .as_ref(),
+        fixture.raw
+    );
+    let link_digest = digest(b"file");
+    let request=json!({"items":[{"path":"/link","expected_digest":format!("sha256:{}",hex_of(&link_digest))}],"encoding":"identity"}).to_string();
+    let objects = fixture
+        .send("POST", "objects", Body::from(request.clone()))
+        .await;
+    assert_eq!(objects.status(), 200);
+    let wire = to_bytes(objects.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    let frames = parse_stream(&wire).unwrap();
+    let [Frame::Object(object), Frame::End(end)] = frames.as_slice() else {
+        panic!("expected OBJECT and terminal END");
+    };
+    assert_eq!(object.objects, vec![(link_digest, b"file".to_vec())]);
+    assert_eq!(end.request_item_count, 1);
+    assert_eq!(end.logical_bytes, 4);
+    assert_eq!(
+        end.request_body_sha256,
+        <[u8; 32]>::from(Sha256::digest(request.as_bytes()))
+    );
+    let map = fixture.map("/file").await;
+    let map_id = map["map"]["map_id"].as_str().unwrap();
+    assert_eq!(map["map"]["file_content_id"], fixture.digest_string());
+    let page = success_json(
+        fixture
+            .send(
+                "GET",
+                &format!("chunk-map/pages?path=/file&map_id={map_id}&page_index=0"),
+                Body::empty(),
+            )
+            .await,
+    )
+    .await;
+    let leaf = ChunkLeaf::decode(
+        &STANDARD
+            .decode(page["leaf_base64"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let hashes: Vec<[u8; 32]> = fixture
+        .raw
+        .chunks(CHUNK_SIZE as usize)
+        .map(|bytes| Sha256::digest(bytes).into())
+        .collect();
+    assert_eq!(leaf.chunk_sha256, hashes);
+    let chunks = fixture
+        .send(
+            "POST",
+            "chunks",
+            Body::from(fixture.chunk_body("/file", map_id, "0").to_string()),
+        )
+        .await;
+    assert_eq!(chunks.status(), 200);
+    let wire = to_bytes(chunks.into_body(), 2 * 1024 * 1024).await.unwrap();
+    let frames = parse_stream(&wire).unwrap();
+    let [Frame::Chunk(chunk), Frame::End(end)] = frames.as_slice() else {
+        panic!("expected CHUNK and terminal END");
+    };
+    assert_eq!(chunk.chunk_bytes, &fixture.raw[..CHUNK_SIZE as usize]);
+    assert_eq!(chunk.file_content_id, fixture.digest);
+    assert_eq!(chunk.chunk_index, 0);
+    assert_eq!(end.request_item_count, 1);
+    assert_eq!(end.logical_bytes, CHUNK_SIZE);
 }
 
 #[tokio::test]

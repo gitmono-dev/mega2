@@ -17,7 +17,7 @@ async fn scalar(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
 
 #[tokio::test]
 async fn mst2_generation_additive_upgrade_preserves_legacy_v3_sid_lease_and_new_resolve() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     assert_eq!(
@@ -102,10 +102,12 @@ async fn mst2_generation_additive_upgrade_preserves_legacy_v3_sid_lease_and_new_
     let connection = crate::jupiter::storage::init::postgres_connection(&config.database)
         .await
         .unwrap();
-    let storage = crate::jupiter::storage::Storage::new_with_connection(
-        config,
-        Arc::new(connection),
-        fixture.state.storage.git_service.obj_storage.clone(),
+    let storage = crate::jupiter::storage::init::with_generic_history_bootstrap(
+        crate::jupiter::storage::Storage::new_with_connection(
+            config,
+            Arc::new(connection),
+            fixture.state.storage.git_service.obj_storage.clone(),
+        ),
     )
     .await
     .unwrap();
@@ -113,7 +115,11 @@ async fn mst2_generation_additive_upgrade_preserves_legacy_v3_sid_lease_and_new_
         storage,
         ..fixture.state.clone()
     };
-    let app = Router::new().nest("/api/v2", routers(state.clone()).with_state(state));
+    let app = Router::new().nest(
+        "/api/v2",
+        crate::api::router::snapshot_router::generic_history_routers(state.clone())
+            .with_state(state),
+    );
     let restored = success_json(
         app.clone()
             .oneshot(fixture.request("GET", "descriptor", Body::empty()))

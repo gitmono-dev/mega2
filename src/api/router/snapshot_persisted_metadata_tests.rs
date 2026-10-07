@@ -65,7 +65,7 @@ fn assert_metadata(bytes: &[u8], body: &[u8], count: u32, expected: &[([u8; 32],
 #[tokio::test]
 async fn mst2_persisted_meta_matches_canonical_routes_after_rebuild_and_advance_without_git_reads()
 {
-    let fixture = Fixture::new_with_pg_config_and_directories(true, 140).await;
+    let fixture = Fixture::new_generic_history_with_pg_config_and_directories(true, 140).await;
     let context = fixture
         .state
         .storage
@@ -184,7 +184,7 @@ async fn mst2_persisted_meta_matches_canonical_routes_after_rebuild_and_advance_
 
 #[tokio::test]
 async fn mst2_persisted_meta_absence_scope_digest_limits_and_release_oracles() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     for (items, status, code) in [
         (
             json!([{"directory_path":"/missing"}]),
@@ -336,7 +336,7 @@ async fn damage_page(fixture: &Fixture, id: [u8; 32], remove: bool) {
 #[tokio::test]
 async fn mst2_persisted_meta_warm_missing_and_corrupt_pages_never_reproject_from_git() {
     for remove in [true, false] {
-        let fixture = Fixture::new_with_pg_config(true).await;
+        let fixture = Fixture::new_generic_history_with_pg_config(true).await;
         let (id, _) = page_row(&fixture, "/nested").await;
         damage_page(&fixture, id, remove).await;
         let body = metadata_body(json!([{"directory_path":"/nested"}]), "identity");
@@ -398,7 +398,7 @@ async fn wait_retention_waiter(txn: &sea_orm::DatabaseTransaction) {
 #[tokio::test]
 async fn mst2_persisted_meta_rechecks_deadline_and_release_after_waiting_for_retention_lock() {
     for expire in [true, false] {
-        let fixture = Fixture::new_with_pg_config(true).await;
+        let fixture = Fixture::new_generic_history_with_pg_config(true).await;
         let mono = fixture.state.storage.mono_storage();
         let held = mono.get_connection().begin().await.unwrap();
         held.execute_unprepared(
@@ -441,7 +441,7 @@ async fn bound_fixture() -> (
     Fixture,
     crate::ceres::snapshot::retention_dag::MetadataPagePayload,
 ) {
-    let mut fixture = Fixture::new_with_pg_config(true).await;
+    let mut fixture = Fixture::new_generic_history_with_pg_config(true).await;
     advance(&fixture).await;
     let mono = fixture.state.storage.mono_storage();
     let head = mono
@@ -546,7 +546,7 @@ async fn mst2_persisted_meta_serves_bound_generic_pages_with_null_members_and_ex
 #[tokio::test]
 async fn mst2_persisted_meta_rejects_touched_graph_damage_and_prepare_membership_loss() {
     for case in 0..5 {
-        let fixture = Fixture::new_with_pg_config(true).await;
+        let fixture = Fixture::new_generic_history_with_pg_config(true).await;
         let (id, _) = page_row(&fixture, "/nested").await;
         let mono = fixture.state.storage.mono_storage();
         let db = mono.get_connection();
@@ -618,7 +618,7 @@ async fn mst2_persisted_meta_reader_holds_protection_until_all_route_bytes_are_o
     use crate::jupiter::storage::native_snapshot_session::with_metadata_read_barriers;
 
     for release_lease in [false, true] {
-        let fixture = Fixture::new_with_pg_config(true).await;
+        let fixture = Fixture::new_generic_history_with_pg_config(true).await;
         let expected = vec![
             page_row(&fixture, "/nested").await,
             page_row(&fixture, "/directory").await,
@@ -691,10 +691,11 @@ async fn mst2_persisted_meta_reader_holds_protection_until_all_route_bytes_are_o
         assert_eq!(observer_config.max_connection, 2);
         observer_config.max_connection = 1;
         observer_config.min_connection = 0;
-        let observer_connection =
-            crate::jupiter::storage::init::database_connection(&observer_config)
-                .await
-                .unwrap();
+        let observer_connection = crate::jupiter::storage::init::with_generic_history_bootstrap(
+            crate::jupiter::storage::init::database_connection(&observer_config),
+        )
+        .await
+        .unwrap();
         let observer = observer_connection.begin().await.unwrap();
         tokio::select! {
             () = wait_retention_waiter(&observer) => {},

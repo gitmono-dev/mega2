@@ -176,7 +176,11 @@ async fn lease_control(fixture: &Fixture, lease: &str, renew: bool) -> Response 
 
 async fn rebuilt(fixture: &Fixture) -> Router {
     let state = rebuilt_state(fixture).await;
-    Router::new().nest("/api/v2", routers(state.clone()).with_state(state))
+    Router::new().nest(
+        "/api/v2",
+        crate::api::router::snapshot_router::generic_history_routers(state.clone())
+            .with_state(state),
+    )
 }
 
 async fn rebuilt_state(fixture: &Fixture) -> MonoApiServiceState {
@@ -187,10 +191,12 @@ async fn rebuilt_state(fixture: &Fixture) -> MonoApiServiceState {
     let connection = crate::jupiter::storage::init::postgres_connection(&database)
         .await
         .unwrap();
-    let storage = crate::jupiter::storage::Storage::new_with_connection(
-        config,
-        Arc::new(connection),
-        fixture.state.storage.git_service.obj_storage.clone(),
+    let storage = crate::jupiter::storage::init::with_generic_history_bootstrap(
+        crate::jupiter::storage::Storage::new_with_connection(
+            config,
+            Arc::new(connection),
+            fixture.state.storage.git_service.obj_storage.clone(),
+        ),
     )
     .await
     .unwrap();
@@ -326,7 +332,7 @@ async fn rejected(db: &DatabaseConnection, sql: &str) {
 
 #[tokio::test]
 async fn mst2_generic_storage_routes_actual_resolve_warm_and_fresh_service_keep_exact_tuple() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     assert_exact_bindings(db, 1).await;
@@ -374,7 +380,7 @@ async fn mst2_generic_storage_routes_actual_resolve_warm_and_fresh_service_keep_
 
 #[tokio::test]
 async fn mst2_generic_storage_routes_every_member_delete_and_truncate_are_immutable() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let original = routes(db).await;
@@ -431,7 +437,7 @@ fn lease_insert(lease: &str) -> String {
 
 #[tokio::test]
 async fn mst2_generic_storage_routes_raw_lease_derives_atomically_and_half_rows_roll_back() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let original = routes(db).await;
@@ -488,7 +494,7 @@ async fn mst2_generic_storage_routes_raw_lease_derives_atomically_and_half_rows_
 
 #[tokio::test]
 async fn mst2_generic_storage_routes_renew_terminal_and_unknown_release_preserve_route_and_roots() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let original = routes(db).await;
@@ -592,7 +598,7 @@ async fn lock_count(held: &DatabaseTransaction, pid: i64, key: i32) -> i64 {
 
 #[tokio::test]
 async fn mst2_generic_storage_routes_raw_statement_waits_mono_then_route_then_retention() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     for held_key in [MONO_WRITE_LOCK_KEY1, ROUTE_LOCK_KEY, RETENTION_LOCK_KEY] {
@@ -692,8 +698,8 @@ async fn mst2_generic_storage_routes_raw_statement_waits_mono_then_route_then_re
 #[tokio::test]
 async fn mst2_generic_storage_routes_schema_isolation_wrong_caller_rr_and_temp_shadow_fail_closed()
 {
-    let fixture = Fixture::new_with_pg_config(true).await;
-    let alien = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
+    let alien = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let original = routes(db).await;
@@ -801,7 +807,7 @@ async fn mst2_generic_storage_routes_schema_isolation_wrong_caller_rr_and_temp_s
 #[tokio::test]
 async fn mst2_generic_storage_routes_additive_backfill_keeps_active_terminal_sources_bytes_and_roots()
  {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let warm = success_json(
@@ -862,9 +868,13 @@ async fn mst2_generic_storage_routes_additive_backfill_keeps_active_terminal_sou
 
 #[tokio::test]
 async fn mst2_generic_storage_routes_actual_http_ignores_temp_source_and_ledger_shadows() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let state = rebuilt_state(&fixture).await;
-    let app = Router::new().nest("/api/v2", routers(state.clone()).with_state(state.clone()));
+    let app = Router::new().nest(
+        "/api/v2",
+        crate::api::router::snapshot_router::generic_history_routers(state.clone())
+            .with_state(state.clone()),
+    );
     let mono = state.storage.mono_storage();
     let db = mono.get_connection();
     let original = routes(db).await;
@@ -936,7 +946,7 @@ async fn mst2_generic_storage_routes_actual_http_ignores_temp_source_and_ledger_
 #[tokio::test]
 async fn mst2_generic_storage_routes_temp_prepare_shadow_rejects_qualified_context_and_registered_generic_rebind()
  {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let original_routes = routes(db).await;
@@ -1118,7 +1128,7 @@ async fn mst2_generic_storage_routes_temp_prepare_shadow_rejects_qualified_conte
 #[tokio::test]
 async fn mst2_generic_storage_routes_corrupt_original_incarnation_rejects_reads_renew_release_without_repair()
  {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let source = sources(db).await;

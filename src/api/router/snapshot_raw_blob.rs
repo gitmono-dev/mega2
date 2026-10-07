@@ -91,11 +91,9 @@ pub(super) async fn blob_with_budgets(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root = content::fixed_root_tree(handler.as_ref(), &context.root_tree_oid).await?;
-    let file = content::resolve_file_metadata(
-        handler.as_ref(),
-        &root,
-        &context.built.descriptor.scope,
+    let file = content::resolve_snapshot_file_metadata(
+        &state,
+        &context,
         &query.path,
         query.expected_digest.as_deref(),
     )

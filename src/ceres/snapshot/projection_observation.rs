@@ -74,6 +74,7 @@ pub(crate) struct NativeProjectionObservation {
     request_id: String,
     projection_elapsed_micros: u64,
     work: ProjectionWork,
+    rooted_work: Option<super::rooted_metadata_projection::RootedProjectionWork>,
 }
 
 /// Closed wire fields, borrowed only from the already validated observation.
@@ -106,7 +107,9 @@ pub(crate) struct ProjectionWireRecord<'a> {
     page_counter_scope: &'static str,
     codec_radix_work: &'static str,
     #[serde(flatten)]
-    work: &'a ProjectionWork,
+    work: Option<&'a ProjectionWork>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rooted_work: Option<&'a super::rooted_metadata_projection::RootedProjectionWork>,
     message: &'static str,
 }
 
@@ -190,15 +193,32 @@ impl NativeResolveSource {
             projection_elapsed_micros: u64::try_from(projection_elapsed.as_micros())
                 .map_err(|_| invalid())?,
             work,
+            rooted_work: None,
         })
+    }
+
+    pub(crate) fn observe_rooted(
+        self,
+        resolved: ResolvedProjection<'_>,
+        work: super::rooted_metadata_projection::RootedProjectionWork,
+        projection_elapsed: Duration,
+    ) -> Result<NativeProjectionObservation, SnapshotError> {
+        let mut observation =
+            self.observe(resolved, ProjectionWork::default(), projection_elapsed)?;
+        observation.rooted_work = Some(work);
+        Ok(observation)
     }
 }
 
 impl NativeProjectionObservation {
     pub(crate) fn wire_record(&self) -> ProjectionWireRecord<'_> {
         ProjectionWireRecord {
-            observation_revision: 1,
-            phase: "resolve_directory_projection",
+            observation_revision: if self.rooted_work.is_some() { 2 } else { 1 },
+            phase: if self.rooted_work.is_some() {
+                "resolve_rooted_projection"
+            } else {
+                "resolve_directory_projection"
+            },
             source_domain: "native-git",
             request_id: &self.request_id,
             instance_id: self.source.instance.to_string(),
@@ -219,14 +239,37 @@ impl NativeProjectionObservation {
             snapshot_id: &self.snapshot_id,
             metadata_root: &self.metadata_root,
             projection_elapsed_micros: self.projection_elapsed_micros,
-            page_counter_scope: "returned-directory-root-pages",
-            codec_radix_work: "NOT_EXPOSED",
-            work: &self.work,
+            page_counter_scope: if self.rooted_work.is_some() {
+                "physical-delta-and-reuse-boundaries"
+            } else {
+                "returned-directory-root-pages"
+            },
+            codec_radix_work: if self.rooted_work.is_some() {
+                "OPERATION_CALLS_ONLY_NOT_TOTAL_SQL"
+            } else {
+                "NOT_EXPOSED"
+            },
+            work: self.rooted_work.is_none().then_some(&self.work),
+            rooted_work: self.rooted_work.as_ref(),
             message: "native resolve directory projection succeeded",
         }
     }
 
     pub(crate) fn emit(self) {
+        if let Some(work) = &self.rooted_work {
+            tracing::debug!(target:"mst2::native_projection_observation",
+                observation_revision=2u16,phase="resolve_rooted_projection",source_domain="native-git",
+                request_id=%self.request_id,instance_id=%self.source.instance,
+                root_commit_oid=%self.source.commit.to_tagged_string(),root_tree_oid=%self.source.tree.to_tagged_string(),
+                native_certificate_receipt_id=self.source.certificate_receipt_id,
+                native_writer_epoch=self.source.writer_epoch,native_publication_sequence=self.source.publication_sequence,
+                scope=?self.scope,snapshot_id=%self.snapshot_id,metadata_root=%self.metadata_root,
+                projection_elapsed_micros=self.projection_elapsed_micros,rooted_work=?work,
+                "native rooted projection succeeded; counters exclude total SQL body and catalog work");
+            #[cfg(test)]
+            let _ = OBSERVATIONS.try_with(|observations| observations.lock().unwrap().push(self));
+            return;
+        }
         tracing::debug!(
             target: "mst2::native_projection_observation",
             observation_revision = 1u16,
@@ -404,6 +447,45 @@ mod tests {
         assert_eq!(observation.work, work);
         assert_eq!(observation.scope, "/project");
         assert_eq!(observation.snapshot_id, fixture.snapshot_id);
+    }
+
+    #[test]
+    fn rooted_observation_exposes_delta_boundaries_without_legacy_or_total_sql_counters() {
+        let fixture = Fixture::new();
+        let commit = fixture.commit.to_string();
+        let tree = fixture.tree.to_string();
+        let work = super::super::rooted_metadata_projection::RootedProjectionWork {
+            tree_fetches: 1,
+            delta_pages: 2,
+            reused_roots: 7,
+            ..Default::default()
+        };
+        let observation = fixture
+            .source()
+            .observe_rooted(
+                fixture.resolved(&commit, &tree),
+                work,
+                Duration::from_micros(456),
+            )
+            .unwrap();
+        let wire = serde_json::to_value(observation.wire_record()).unwrap();
+        assert_eq!(wire["observation_revision"], 2);
+        assert_eq!(wire["phase"], "resolve_rooted_projection");
+        assert_eq!(
+            wire["page_counter_scope"],
+            "physical-delta-and-reuse-boundaries"
+        );
+        assert_eq!(
+            wire["codec_radix_work"],
+            "OPERATION_CALLS_ONLY_NOT_TOTAL_SQL"
+        );
+        assert_eq!(wire["rooted_work"]["tree_fetches"], 1);
+        assert_eq!(wire["rooted_work"]["delta_pages"], 2);
+        assert_eq!(wire["rooted_work"]["reused_roots"], 7);
+        assert!(wire.get("directories_rebuilt").is_none());
+        assert!(wire.get("directory_root_pages_returned").is_none());
+        assert_eq!(wire["snapshot_id"], fixture.snapshot_id);
+        assert_eq!(wire["projection_elapsed_micros"], 456);
     }
 
     #[test]

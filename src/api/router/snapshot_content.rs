@@ -50,7 +50,7 @@ pub(super) async fn fixed_root_tree<T: crate::ceres::api_service::ApiHandler + ?
 }
 
 #[allow(clippy::result_large_err)]
-pub(super) async fn resolve_file_metadata<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+async fn resolve_legacy_file_metadata<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     handler: &T,
     root_tree: &git_internal::internal::object::tree::Tree,
     scope: &str,
@@ -87,6 +87,132 @@ pub(super) async fn resolve_file_metadata<T: crate::ceres::api_service::ApiHandl
         }
     };
     verified_file_metadata(handler, fs_kind, oid, path, expected_digest).await
+}
+
+#[allow(clippy::result_large_err)]
+async fn fixed_content_root<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+    handler: &T,
+    ctx: &crate::ceres::snapshot::runtime::SnapshotContext,
+) -> Result<Option<git_internal::internal::object::tree::Tree>, Response> {
+    use crate::jupiter::storage::qualified_metadata_family::SnapshotMetadataFamily;
+    if !handler.get_context().config().mst2.publication_enabled {
+        return fixed_root_tree(handler, &ctx.root_tree_oid).await.map(Some);
+    }
+    match handler
+        .get_context()
+        .snapshot_metadata_family(&ctx.lease_id, true)
+        .await
+        .map_err(mst2_error_response)?
+    {
+        Some(SnapshotMetadataFamily::Rooted) => Ok(None),
+        Some(SnapshotMetadataFamily::Generic) => {
+            fixed_root_tree(handler, &ctx.root_tree_oid).await.map(Some)
+        }
+        None => Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::SnapshotGone,
+            "fixed content lease has no permanent storage route",
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn resolve_file_metadata<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+    handler: &T,
+    root_tree: Option<&git_internal::internal::object::tree::Tree>,
+    ctx: &crate::ceres::snapshot::runtime::SnapshotContext,
+    path: &str,
+    expected_digest: Option<&str>,
+) -> Result<ResolvedFileMetadata, Response> {
+    if let Some(root_tree) = root_tree {
+        return resolve_legacy_file_metadata(
+            handler,
+            root_tree,
+            &ctx.built.descriptor.scope,
+            path,
+            expected_digest,
+        )
+        .await;
+    }
+    use crate::jupiter::storage::qualified_metadata_family::RootedLookupStatus;
+    let storage = handler.get_context();
+    let repository = storage
+        .rooted_qualified_metadata_writer()
+        .await
+        .map_err(internal)?;
+    let (entry, git_oid) = match repository
+        .fixed_path_metadata(ctx, path)
+        .await
+        .map_err(mst2_error_response)?
+    {
+        RootedLookupStatus::File { entry, git_oid } => (entry, git_oid),
+        RootedLookupStatus::Directory(_) => {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::NotDirectory,
+                format!("{path} is a directory"),
+            )));
+        }
+        RootedLookupStatus::Absent => {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::PathNotFound,
+                format!("{path} absent in the fixed view"),
+            )));
+        }
+        RootedLookupStatus::NotDirectory { symlink } => {
+            return Err(mst2_error_response(SnapshotError::new(
+                if symlink {
+                    SnapshotErrorCode::SymlinkTraversal
+                } else {
+                    SnapshotErrorCode::NotDirectory
+                },
+                format!("{path}: intermediate component is not a directory"),
+            )));
+        }
+    };
+    let fs_kind = match entry.kind {
+        mst2_codec::metapage::EntryKind::Regular => FsKind::Regular,
+        mst2_codec::metapage::EntryKind::Executable => FsKind::Executable,
+        mst2_codec::metapage::EntryKind::Symlink => FsKind::Symlink,
+        mst2_codec::metapage::EntryKind::Directory => {
+            return Err(mst2_error_response(internal(
+                "fixed source file has a directory kind",
+            )));
+        }
+    };
+    let oid = git_oid
+        .split_once(':')
+        .ok_or_else(|| mst2_error_response(internal("fixed source OID has no hash kind")))?
+        .1
+        .to_owned();
+    let file = verified_file_metadata(handler, fs_kind, oid, path, expected_digest).await?;
+    if file.size != entry.size || file.digest != entry.content_id {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "fixed content metadata changed from its certified current source occurrence",
+        )));
+    }
+    Ok(file)
+}
+
+#[allow(clippy::result_large_err)]
+pub(super) async fn resolve_snapshot_file_metadata(
+    state: &crate::api::MonoApiServiceState,
+    ctx: &crate::ceres::snapshot::runtime::SnapshotContext,
+    path: &str,
+    expected_digest: Option<&str>,
+) -> Result<ResolvedFileMetadata, Response> {
+    let handler = state
+        .api_handler(std::path::Path::new("/"))
+        .await
+        .map_err(internal)?;
+    let root_tree = fixed_content_root(handler.as_ref(), ctx).await?;
+    resolve_file_metadata(
+        handler.as_ref(),
+        root_tree.as_ref(),
+        ctx,
+        path,
+        expected_digest,
+    )
+    .await
 }
 
 #[allow(clippy::result_large_err)]
@@ -264,11 +390,11 @@ pub(super) async fn blob_head(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
+    let root_tree = fixed_content_root(handler.as_ref(), &ctx).await?;
     let f = resolve_file_metadata(
         handler.as_ref(),
-        &root_tree,
-        &ctx.built.descriptor.scope,
+        root_tree.as_ref(),
+        &ctx,
         &q.path,
         q.expected_digest.as_deref(),
     )
@@ -331,20 +457,19 @@ pub(super) async fn objects(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
-    let scope = ctx.built.descriptor.scope.clone();
+    let root_tree = fixed_content_root(handler.as_ref(), &ctx).await?;
     // Copied references: each per-item future borrows the shared walk state
     // without moving it (the stream is an FnMut over owned items).
     let handler_ref = handler.as_ref();
-    let root_ref = &root_tree;
-    let scope_ref = &scope;
+    let root_ref = root_tree.as_ref();
+    let ctx_ref = &ctx;
     let resolved: Vec<Result<_, Response>> = futures::stream::iter(req.items.clone())
         .map(move |item| async move {
             validate_scope_relative_path(&item.path).map_err(mst2_error_response)?;
             let f = resolve_file_metadata(
                 handler_ref,
                 root_ref,
-                scope_ref,
+                ctx_ref,
                 &item.path,
                 Some(&item.expected_digest),
             )
@@ -468,13 +593,13 @@ pub(super) struct ChunkMapQuery {
 #[allow(clippy::result_large_err)]
 async fn project_for<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     handler: &T,
-    root_tree: &git_internal::internal::object::tree::Tree,
-    scope: &str,
+    root_tree: Option<&git_internal::internal::object::tree::Tree>,
+    ctx: &crate::ceres::snapshot::runtime::SnapshotContext,
     path: &str,
     expected_digest: Option<&str>,
 ) -> Result<std::sync::Arc<crate::jupiter::storage::native_chunk_map::PersistedChunkMap>, Response>
 {
-    let f = resolve_file_metadata(handler, root_tree, scope, path, expected_digest).await?;
+    let f = resolve_file_metadata(handler, root_tree, ctx, path, expected_digest).await?;
     project_resolved(handler, &f).await
 }
 
@@ -552,12 +677,11 @@ pub(super) async fn chunk_map(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
-    let scope = ctx.built.descriptor.scope.clone();
+    let root_tree = fixed_content_root(handler.as_ref(), &ctx).await?;
     let proj = project_for(
         handler.as_ref(),
-        &root_tree,
-        &scope,
+        root_tree.as_ref(),
+        &ctx,
         &q.path,
         q.expected_digest.as_deref(),
     )
@@ -619,12 +743,11 @@ pub(super) async fn chunk_map_pages(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
-    let scope = ctx.built.descriptor.scope.clone();
+    let root_tree = fixed_content_root(handler.as_ref(), &ctx).await?;
     let proj = project_for(
         handler.as_ref(),
-        &root_tree,
-        &scope,
+        root_tree.as_ref(),
+        &ctx,
         &q.path,
         q.expected_digest.as_deref(),
     )
@@ -894,8 +1017,7 @@ pub(super) async fn chunks(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
-    let scope = ctx.built.descriptor.scope.clone();
+    let root_tree = fixed_content_root(handler.as_ref(), &ctx).await?;
     let mut planned: Vec<Planned> = Vec::new();
     let mut resolved: Vec<ResolvedChunk> = Vec::new();
     let mut units: Vec<(String, u64)> = Vec::new();
@@ -907,8 +1029,8 @@ pub(super) async fn chunks(
             parse_decimal_count(&item.chunk_index, "chunk_index").map_err(mst2_error_response)?;
         let file = resolve_file_metadata(
             handler.as_ref(),
-            &root_tree,
-            &scope,
+            root_tree.as_ref(),
+            &ctx,
             &item.path,
             Some(&item.expected_digest),
         )

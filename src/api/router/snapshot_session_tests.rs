@@ -84,12 +84,16 @@ async fn rebuilt(fixture: &Fixture) -> MonoApiServiceState {
     let connection = crate::jupiter::storage::init::postgres_connection(&config.database)
         .await
         .unwrap();
-    let storage = crate::jupiter::storage::Storage::new_with_connection(
+    let assembly = crate::jupiter::storage::Storage::new_with_connection(
         config,
         Arc::new(connection),
         fixture.state.storage.git_service.obj_storage.clone(),
-    )
-    .await
+    );
+    let storage = if fixture.generic_history {
+        crate::jupiter::storage::init::with_generic_history_bootstrap(assembly).await
+    } else {
+        assembly.await
+    }
     .unwrap();
     MonoApiServiceState {
         storage,
@@ -102,7 +106,11 @@ async fn rebuilt(fixture: &Fixture) -> MonoApiServiceState {
 }
 
 fn app(state: &MonoApiServiceState) -> Router {
-    Router::new().nest("/api/v2", routers(state.clone()).with_state(state.clone()))
+    Router::new().nest(
+        "/api/v2",
+        crate::api::router::snapshot_router::generic_history_routers(state.clone())
+            .with_state(state.clone()),
+    )
 }
 
 async fn lease_control(fixture: &Fixture, lease: &str, method: &str, renew: bool) -> Value {
@@ -150,7 +158,7 @@ async fn advance(fixture: &Fixture) {
 
 #[tokio::test]
 async fn mst2_durable_http_resolve_installs_complete_dag_and_warm_leases_share_it() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let pages = scalar(db, "SELECT count(*) FROM mst2_metadata_payload").await;
@@ -306,7 +314,7 @@ async fn mst2_durable_http_resolve_installs_complete_dag_and_warm_leases_share_i
 
 #[tokio::test]
 async fn mst2_durable_http_old_sid_and_original_lease_survive_real_publication_and_fresh_service() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let old = success_json(fixture.send("GET", "descriptor", Body::empty()).await).await;
     advance(&fixture).await;
     let next = success_json(
@@ -376,7 +384,7 @@ async fn mst2_durable_http_old_sid_and_original_lease_survive_real_publication_a
 
 #[tokio::test]
 async fn mst2_durable_http_renew_release_expiry_and_last_lease_retire_protection() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let another = success_json(
         fixture
             .app
@@ -491,7 +499,7 @@ async fn mst2_durable_http_renew_release_expiry_and_last_lease_retire_protection
 
 #[tokio::test]
 async fn mst2_durable_http_live_to_deleting_winner_rejects_paused_resolve_without_leak() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let captured = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
     let resolving = {
@@ -542,7 +550,7 @@ async fn mst2_durable_http_live_to_deleting_winner_rejects_paused_resolve_withou
 
 #[tokio::test]
 async fn mst2_durable_http_lease_winner_blocks_gc_until_the_last_release() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let another = success_json(
         fixture
             .app
@@ -595,7 +603,7 @@ async fn mst2_durable_http_lease_winner_blocks_gc_until_the_last_release() {
 
 #[tokio::test]
 async fn mst2_durable_http_renew_waits_for_lock_before_checking_database_deadline() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let held = db.begin().await.unwrap();
@@ -671,7 +679,7 @@ async fn mst2_durable_http_renew_waits_for_lock_before_checking_database_deadlin
 
 #[tokio::test]
 async fn mst2_durable_http_publication_advance_rejects_mixed_resolve_then_retries_current() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let captured = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
     let resolving = {
@@ -725,7 +733,7 @@ async fn mst2_durable_http_publication_advance_rejects_mixed_resolve_then_retrie
 
 #[tokio::test]
 async fn mst2_durable_http_install_fault_never_hands_off_or_returns_success() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let prepared = root_metadata(&fixture).await;
@@ -828,7 +836,7 @@ async fn mst2_durable_http_install_fault_never_hands_off_or_returns_success() {
 #[tokio::test]
 async fn mst2_durable_http_frame_and_raw_delivery_recheck_after_release() {
     for raw in [false, true] {
-        let fixture = Fixture::new_with_pg_config(true).await;
+        let fixture = Fixture::new_generic_history_with_pg_config(true).await;
         let response = if raw {
             fixture.send("GET", "blob?path=/file", Body::empty()).await
         } else {
@@ -862,7 +870,7 @@ async fn mst2_durable_http_frame_and_raw_delivery_recheck_after_release() {
 
 #[tokio::test]
 async fn mst2_durable_http_current_state_wrong_lease_and_corrupt_source_reject_warm_reads() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     let warm = success_json(fixture.send("GET", "descriptor", Body::empty()).await).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
@@ -935,7 +943,7 @@ async fn mst2_durable_http_current_state_wrong_lease_and_corrupt_source_reject_w
 
 #[tokio::test]
 async fn mst2_durable_http_large_dag_batches_handoff_without_scanning_pages_or_edges() {
-    let fixture = Fixture::new_with_pg_config_and_directories(true, 80).await;
+    let fixture = Fixture::new_generic_history_with_pg_config_and_directories(true, 80).await;
     let mono = fixture.state.storage.mono_storage();
     let db = mono.get_connection();
     let projected = root_metadata(&fixture).await;
@@ -1083,7 +1091,7 @@ async fn mst2_durable_http_handoff_rejects_changed_plan_or_receipt_summary() {
         "projection_revision=projection_revision+1",
         "total_bytes=total_bytes+1",
     ] {
-        let fixture = Fixture::new_with_pg_config_and_directories(true, 80).await;
+        let fixture = Fixture::new_generic_history_with_pg_config_and_directories(true, 80).await;
         let prepared = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let resolving = {
@@ -1254,7 +1262,7 @@ async fn overwrite_primary_scope_for_test(db: &DatabaseConnection, storage_uuid:
 
 #[tokio::test]
 async fn mst2_durable_http_warm_reads_renew_and_frame_delivery_reject_primary_scope_drift() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    let fixture = Fixture::new_generic_history_with_pg_config(true).await;
     success_json(fixture.send("GET", "descriptor", Body::empty()).await).await;
     let response = fixture
         .send(

@@ -76,6 +76,19 @@ pub fn routers(api_state: MonoApiServiceState) -> Router<MonoApiServiceState> {
         ))
 }
 
+/// Explicit fixture for the historical G authority and corruption contracts.
+/// Production resolve always installs the rooted family for a new SID.
+#[cfg(test)]
+pub(crate) fn generic_history_routers(
+    api_state: MonoApiServiceState,
+) -> Router<MonoApiServiceState> {
+    routers(api_state).layer(axum::middleware::from_fn(
+        |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            GENERIC_HISTORY_RESOLVE.scope(true, next.run(request)).await
+        },
+    ))
+}
+
 #[path = "snapshot_content.rs"]
 mod content;
 
@@ -212,6 +225,7 @@ tokio::task_local! {
     static NATIVE_RESOLVE_BARRIERS: (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
     static NATIVE_HANDOFF_BARRIERS: (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
     static REJECT_NATIVE_OBSERVATION_SOURCE: bool;
+    static GENERIC_HISTORY_RESOLVE: bool;
 }
 
 #[cfg(test)]
@@ -770,48 +784,141 @@ async fn resolve(
     // The scope root doubles as metadata_root; building it also validates
     // that the scope exists and is a directory in this view.
     let projection_started = std::time::Instant::now();
-    let (scope_page, projection_work) =
-        build_directory_page_with_work(handler.as_ref(), &root_tree, &req.scope)
+    #[cfg(test)]
+    let prepared_generic = if selected_native_head.is_some()
+        && GENERIC_HISTORY_RESOLVE
+            .try_with(|value| *value)
+            .unwrap_or(false)
+    {
+        let (page, work) = build_directory_page_with_work(handler.as_ref(), &root_tree, &req.scope)
             .await
             .map_err(mst2_error_response)?;
-    let projection_elapsed = projection_started.elapsed();
-
-    let built = build_descriptor(&config.mst2, &view, &req.scope, scope_page.page_id)
+        let prepared = crate::ceres::snapshot::pages::prepare_native_metadata_retention(
+            handler.as_ref(),
+            &root_tree,
+            &req.scope,
+            crate::ceres::snapshot::retention_dag::MetadataDagLimits::default(),
+        )
+        .await
         .map_err(mst2_error_response)?;
-    let ctx = if let Some(head) = selected_native_head.as_ref() {
-        let sessions = state.storage.snapshot_sessions().await;
-        if let Some(context) = sessions
-            .open(head, &built, None, req.lease_seconds)
+        Some((page.page_id, work, prepared))
+    } else {
+        None
+    };
+    #[cfg(not(test))]
+    let prepared_generic: Option<(
+        [u8; 32],
+        crate::ceres::snapshot::pages::ProjectionWork,
+        crate::ceres::snapshot::pages::PreparedNativeMetadataRetention,
+    )> = None;
+    let (metadata_root, projection_work, prepared_rooted) = if let Some((root, work, _)) =
+        prepared_generic.as_ref()
+    {
+        (*root, Some(work.clone()), None)
+    } else if selected_native_head.is_some() {
+        let repository = state
+            .storage
+            .rooted_qualified_metadata_writer()
             .await
-            .map_err(mst2_error_response)?
-        {
-            context
-        } else {
-            let prepared = crate::ceres::snapshot::pages::prepare_native_metadata_retention(
+            .map_err(internal)?;
+        let prepared =
+            crate::ceres::snapshot::rooted_metadata_projection::prepare_rooted_native_metadata(
                 handler.as_ref(),
                 &root_tree,
                 &req.scope,
-                crate::ceres::snapshot::retention_dag::MetadataDagLimits::default(),
+                repository,
             )
             .await
             .map_err(mst2_error_response)?;
-            let receipt = sessions
-                .install(&built, &prepared)
+        (prepared.plan.root, None, Some(prepared))
+    } else {
+        let (page, work) = build_directory_page_with_work(handler.as_ref(), &root_tree, &req.scope)
+            .await
+            .map_err(mst2_error_response)?;
+        (page.page_id, Some(work), None)
+    };
+    let projection_elapsed = projection_started.elapsed();
+
+    let built = build_descriptor(&config.mst2, &view, &req.scope, metadata_root)
+        .map_err(mst2_error_response)?;
+    let ctx = if let Some(head) = selected_native_head.as_ref() {
+        use crate::jupiter::storage::qualified_metadata_family::SnapshotMetadataFamily;
+        let family = state
+            .storage
+            .snapshot_metadata_family(&built.snapshot_id, false)
+            .await
+            .map_err(mst2_error_response)?;
+        if family == Some(SnapshotMetadataFamily::Generic) || prepared_generic.is_some() {
+            // A permanent SID route retains its original physical family.
+            let existing = state
+                .storage
+                .snapshot_sessions()
+                .await
+                .open(head, &built, None, req.lease_seconds)
                 .await
                 .map_err(mst2_error_response)?;
-            #[cfg(test)]
-            if let Ok((prepared, release)) = NATIVE_HANDOFF_BARRIERS.try_with(|value| value.clone())
-            {
-                prepared.wait().await;
-                release.wait().await;
+            if let Some(existing) = existing {
+                existing
+            } else {
+                let (_, _, prepared) = prepared_generic.as_ref().ok_or_else(|| {
+                    mst2_error_response(internal("existing generic route has no durable session"))
+                })?;
+                let sessions = state.storage.snapshot_sessions().await;
+                let receipt = sessions
+                    .install(&built, prepared)
+                    .await
+                    .map_err(mst2_error_response)?;
+                #[cfg(test)]
+                if let Ok((prepared, release)) = NATIVE_HANDOFF_BARRIERS.try_with(Clone::clone) {
+                    prepared.wait().await;
+                    release.wait().await;
+                }
+                sessions
+                    .open(head, &built, Some(&receipt), req.lease_seconds)
+                    .await
+                    .map_err(mst2_error_response)?
+                    .ok_or_else(|| {
+                        mst2_error_response(internal(
+                            "generic history fixture handoff returned no context",
+                        ))
+                    })?
             }
-            sessions
-                .open(head, &built, Some(&receipt), req.lease_seconds)
+        } else {
+            let repository = state
+                .storage
+                .rooted_qualified_metadata_writer()
+                .await
+                .map_err(internal)?;
+            if let Some(context) = repository
+                .open_session(head, &built, None, req.lease_seconds)
                 .await
                 .map_err(mst2_error_response)?
-                .ok_or_else(|| {
-                    mst2_error_response(internal("durable session handoff returned no context"))
-                })?
+            {
+                context
+            } else {
+                let prepared = prepared_rooted.as_ref().ok_or_else(|| {
+                    mst2_error_response(internal("rooted resolve has no source projection"))
+                })?;
+                let receipt = repository
+                    .install(&built, prepared)
+                    .await
+                    .map_err(crate::jupiter::storage::native_snapshot_session::install_error)
+                    .map_err(mst2_error_response)?;
+                #[cfg(test)]
+                if let Ok((prepared, release)) =
+                    NATIVE_HANDOFF_BARRIERS.try_with(|value| value.clone())
+                {
+                    prepared.wait().await;
+                    release.wait().await;
+                }
+                repository
+                    .open_session(head, &built, Some(&receipt), req.lease_seconds)
+                    .await
+                    .map_err(mst2_error_response)?
+                    .ok_or_else(|| {
+                        mst2_error_response(internal("durable session handoff returned no context"))
+                    })?
+            }
         }
     } else {
         runtime()
@@ -821,20 +928,26 @@ async fn resolve(
 
     if let Some(source) = native_source {
         let request_id = current_request_id();
-        match source.observe(
-            ResolvedProjection {
-                descriptor: &ctx.built.descriptor,
-                snapshot_id: &ctx.built.snapshot_id,
-                metadata_root: &ctx.built.metadata_root,
-                context_commit: &ctx.commit_oid,
-                context_root_tree: &ctx.root_tree_oid,
-                fixed_root_tree: root_tree.id,
-                requested_scope: &req.scope,
-                request_id: &request_id,
-            },
-            projection_work,
-            projection_elapsed,
-        ) {
+        let resolved = ResolvedProjection {
+            descriptor: &ctx.built.descriptor,
+            snapshot_id: &ctx.built.snapshot_id,
+            metadata_root: &ctx.built.metadata_root,
+            context_commit: &ctx.commit_oid,
+            context_root_tree: &ctx.root_tree_oid,
+            fixed_root_tree: root_tree.id,
+            requested_scope: &req.scope,
+            request_id: &request_id,
+        };
+        let observation = if let Some(prepared) = prepared_rooted {
+            source.observe_rooted(resolved, prepared.work, projection_elapsed)
+        } else {
+            source.observe(
+                resolved,
+                projection_work.unwrap_or_default(),
+                projection_elapsed,
+            )
+        };
+        match observation {
             Ok(observation) => {
                 if let Some(sink) = &state.storage.projection_observation_sink {
                     let _ = sink.enqueue(&observation);
@@ -963,6 +1076,9 @@ struct DirectoryQuery {
     ancestors: Option<String>,
 }
 
+#[path = "snapshot_rooted_metadata.rs"]
+mod rooted_metadata;
+
 fn default_limit() -> u32 {
     128
 }
@@ -985,6 +1101,18 @@ async fn directory(
             SnapshotErrorCode::ScopeInvalid,
             "limit must be 1..256",
         )));
+    }
+    if state.storage.config().mst2.publication_enabled
+        && state
+            .storage
+            .snapshot_metadata_family(&ctx.lease_id, true)
+            .await
+            .map_err(mst2_error_response)?
+            == Some(
+                crate::jupiter::storage::qualified_metadata_family::SnapshotMetadataFamily::Rooted,
+            )
+    {
+        return rooted_metadata::directory_response(&state, &ctx, &snapshot_id, &q).await;
     }
 
     let handler = state
@@ -1201,11 +1329,24 @@ async fn lookup(
         )));
     }
 
+    let ctx = request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
+    if state.storage.config().mst2.publication_enabled
+        && state
+            .storage
+            .snapshot_metadata_family(&ctx.lease_id, true)
+            .await
+            .map_err(mst2_error_response)?
+            == Some(
+                crate::jupiter::storage::qualified_metadata_family::SnapshotMetadataFamily::Rooted,
+            )
+    {
+        return rooted_metadata::lookup_response(&state, &ctx, &snapshot_id, &req).await;
+    }
+
     let handler = state
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let ctx = request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     let root_tree = handler
         .get_tree_by_hash(&ctx.root_tree_oid)
         .await
@@ -1371,9 +1512,7 @@ async fn metadata_pages(
             .collect();
         let batch = state
             .storage
-            .snapshot_sessions()
-            .await
-            .metadata_routes(&ctx, &items)
+            .snapshot_metadata_routes(&ctx, &items)
             .await
             .map_err(mst2_error_response)?;
         tracing::debug!(

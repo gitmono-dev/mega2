@@ -223,6 +223,45 @@ fn drop_test_schema(admin_url: &str, schema: &str) {
                 [Value::from(schema)],
             ))
             .await?;
+        // A bootstrap-created physical Q family belongs to this exact test
+        // core schema. Drop the pair even on panic, before its core FK targets.
+        let registry = admin
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_catalog.to_regclass($1) IS NOT NULL AS present",
+                [format!("{schema}.mst2_metadata_namespace").into()],
+            ))
+            .await?
+            .unwrap()
+            .try_get::<bool>("", "present")?;
+        if registry {
+            let families = admin
+                .query_all_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "SELECT n.nspname FROM {schema}.mst2_metadata_namespace q
+                 JOIN pg_catalog.pg_namespace n ON n.oid=q.metadata_schema_oid
+                 JOIN pg_catalog.pg_namespace c ON c.oid=q.core_schema_oid
+                 WHERE q.graph_domain='qualified-v1' AND c.nspname='{schema}'
+                   AND q.core_schema='{schema}' AND q.family_identity='v3-rooted-qualified-1'"
+                    ),
+                ))
+                .await?;
+            for family in families {
+                let q_schema: String = family.try_get("", "nspname")?;
+                if !q_schema.starts_with("mst2q_") {
+                    return Err(sea_orm::DbErr::Custom(
+                        "test Q schema escaped its generated prefix".into(),
+                    ));
+                }
+                let quoted = format!("\"{}\"", q_schema.replace('"', "\"\""));
+                admin
+                    .execute_unprepared(&format!(
+                        "SET lock_timeout='120s'; DROP SCHEMA {quoted} CASCADE"
+                    ))
+                    .await?;
+            }
+        }
         // The timeout turns a lock held by anything else into a leaked schema
         // and a message, not a hung test run.
         admin
@@ -380,6 +419,8 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         native_projection_cache: Arc::default(),
         native_snapshot_sessions: Arc::default(),
         native_chunk_maps: Arc::default(),
+        shadow_qualified_metadata: Arc::default(),
+        rooted_qualified_metadata: Arc::default(),
         projection_observation_sink: None,
         cl_service: CLService::mock(),
         push_queue_service: PushQueueService::new(
