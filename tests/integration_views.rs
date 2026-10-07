@@ -1,6 +1,7 @@
 mod common;
 
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -11,6 +12,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use git_internal::{
+    hash::{HashKind, ObjectHash},
+    internal::object::{
+        ObjectTrait,
+        blob::Blob,
+        commit::Commit,
+        tree::{Tree, TreeItem, TreeItemMode},
+        types::ObjectType,
+    },
+};
 use reqwest::{Method, StatusCode, blocking::Client};
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement, Value};
 use tempfile::TempDir;
@@ -89,6 +100,15 @@ struct Case {
 
 impl Case {
     fn boot(enabled: bool, push_auth: &str, anonymous_access: bool) -> Self {
+        Self::boot_with_env(enabled, push_auth, anonymous_access, &[])
+    }
+
+    fn boot_with_env(
+        enabled: bool,
+        push_auth: &str,
+        anonymous_access: bool,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let database = TestDatabase::create();
         let config_path = temp.path().join("config.toml");
@@ -102,6 +122,9 @@ impl Case {
             .unwrap()
             .port();
         let mut init = Self::command(&temp, &database, &config_path, enabled, port);
+        for (key, value) in extra_env {
+            init.env(key, value);
+        }
         let result = init.args(["service", "init", "--yes"]).output().unwrap();
         assert!(
             result.status.success(),
@@ -111,6 +134,9 @@ impl Case {
         let stdout = temp.path().join("service.out");
         let stderr = temp.path().join("service.err");
         let mut command = Self::command(&temp, &database, &config_path, enabled, port);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         let mut child = command
             .args([
                 "service",
@@ -539,6 +565,466 @@ impl Drop for Case {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+struct PrecheckHttpFixture {
+    case: Case,
+    root_tip: String,
+    prior_root: String,
+    views: HashMap<&'static str, (i64, String, Vec<String>)>,
+    mode_tree: String,
+    gbk_tree: String,
+    missing_tree: String,
+    missing_tree_refs: usize,
+}
+
+fn hp23_tree(items: Vec<TreeItem>, trees: &mut Vec<Tree>) -> Tree {
+    let tree = Tree::from_tree_items_with_kind(HashKind::Sha1, items).unwrap();
+    trees.push(tree.clone());
+    tree
+}
+
+fn hp23_blob(content: &str) -> ObjectHash {
+    Blob::from_content_bytes_with_kind(HashKind::Sha1, content.as_bytes().to_vec())
+        .unwrap()
+        .id
+}
+
+fn hp23_raw_l0_tree(mode: &str, name: &[u8], blob: ObjectHash) -> (ObjectHash, Vec<u8>) {
+    let mut raw = format!("{mode} ").into_bytes();
+    raw.extend_from_slice(name);
+    raw.push(0);
+    raw.extend(hex::decode(blob.to_string()).unwrap());
+    let id =
+        ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Tree, &raw).unwrap();
+    let stored = <Tree as ObjectTrait>::from_bytes(&raw, id)
+        .unwrap()
+        .to_data()
+        .unwrap();
+    assert_ne!(
+        ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Tree, &stored).unwrap(),
+        id
+    );
+    (id, stored)
+}
+
+fn hp23_pkt(payload: &str) -> Vec<u8> {
+    format!("{:04x}{payload}", payload.len() + 4).into_bytes()
+}
+
+fn hp23_fetch_request(v2: bool, want: &str, have: Option<&str>, done: bool) -> Vec<u8> {
+    let mut body = Vec::new();
+    if v2 {
+        body.extend(hp23_pkt("command=fetch\n"));
+        body.extend(b"0001");
+        body.extend(hp23_pkt(&format!("want {want}\n")));
+    } else {
+        let capability = if have.is_some() {
+            " multi_ack_detailed"
+        } else {
+            ""
+        };
+        body.extend(hp23_pkt(&format!("want {want}{capability}\n")));
+    }
+    if let Some(have) = have {
+        body.extend(hp23_pkt(&format!("have {have}\n")));
+    }
+    if v2 && done {
+        body.extend(hp23_pkt("done\n"));
+    }
+    body.extend(b"0000");
+    body
+}
+
+impl PrecheckHttpFixture {
+    fn new() -> Self {
+        let case = Case::boot_with_env(
+            true,
+            "none",
+            true,
+            &[("MEGA_VIEWS__ALLOW_ANONYMOUS_REGISTER", "true")],
+        );
+        let db_url = case._database.url.clone();
+        let (root_tip, prior_root, mode_tree, gbk_tree, missing_tree, missing_tree_refs) =
+            with_runtime(async {
+                let db = Database::connect(&db_url).await.unwrap();
+                let row = db
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT ref_commit_hash FROM mega_refs \
+                     WHERE path = '/' AND ref_name = 'refs/heads/main' AND NOT is_cl"
+                            .to_owned(),
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let r0: String = row.try_get("", "ref_commit_hash").unwrap();
+                let r0_hash = ObjectHash::from_hex_for_kind(HashKind::Sha1, &r0).unwrap();
+                let mut trees = Vec::new();
+                let mode_good = hp23_tree(
+                    vec![TreeItem::new(
+                        TreeItemMode::Blob,
+                        hp23_blob("mode good"),
+                        "good.txt".to_owned(),
+                    )],
+                    &mut trees,
+                );
+                let gbk_good = hp23_tree(
+                    vec![TreeItem::new(
+                        TreeItemMode::Blob,
+                        hp23_blob("gbk good"),
+                        "good.txt".to_owned(),
+                    )],
+                    &mut trees,
+                );
+                let missing = hp23_tree(
+                    vec![TreeItem::new(
+                        TreeItemMode::Blob,
+                        hp23_blob("missing only"),
+                        "hp23-only-in-miss-d.txt".to_owned(),
+                    )],
+                    &mut trees,
+                );
+                let miss = hp23_tree(
+                    vec![TreeItem::new(
+                        TreeItemMode::Tree,
+                        missing.id,
+                        "d".to_owned(),
+                    )],
+                    &mut trees,
+                );
+                let ok = hp23_tree(
+                    vec![TreeItem::new(
+                        TreeItemMode::Blob,
+                        hp23_blob("ok good"),
+                        "ok.txt".to_owned(),
+                    )],
+                    &mut trees,
+                );
+                let hp23_r1 = hp23_tree(
+                    vec![
+                        TreeItem::new(TreeItemMode::Tree, gbk_good.id, "gbk".to_owned()),
+                        TreeItem::new(TreeItemMode::Tree, miss.id, "miss".to_owned()),
+                        TreeItem::new(TreeItemMode::Tree, mode_good.id, "mode".to_owned()),
+                        TreeItem::new(TreeItemMode::Tree, ok.id, "ok".to_owned()),
+                    ],
+                    &mut trees,
+                );
+                let root_r1 = hp23_tree(
+                    vec![TreeItem::new(
+                        TreeItemMode::Tree,
+                        hp23_r1.id,
+                        "hp23".to_owned(),
+                    )],
+                    &mut trees,
+                );
+                let (mode_id, mode_stored) =
+                    hp23_raw_l0_tree("100664", b"mode.txt", hp23_blob("mode raw"));
+                let (gbk_id, gbk_stored) = hp23_raw_l0_tree(
+                    "100644",
+                    &[0xc4, 0xe3, 0xba, 0xc3, b'.', b't', b'x', b't'],
+                    hp23_blob("gbk raw"),
+                );
+                let hp23_r2 = hp23_tree(
+                    vec![
+                        TreeItem::new(TreeItemMode::Tree, gbk_id, "gbk".to_owned()),
+                        TreeItem::new(TreeItemMode::Tree, miss.id, "miss".to_owned()),
+                        TreeItem::new(TreeItemMode::Tree, mode_id, "mode".to_owned()),
+                        TreeItem::new(TreeItemMode::Tree, ok.id, "ok".to_owned()),
+                    ],
+                    &mut trees,
+                );
+                let root_r2 = hp23_tree(
+                    vec![TreeItem::new(
+                        TreeItemMode::Tree,
+                        hp23_r2.id,
+                        "hp23".to_owned(),
+                    )],
+                    &mut trees,
+                );
+                let r1 = Commit::from_tree_id_with_kind(
+                    HashKind::Sha1,
+                    root_r1.id,
+                    vec![r0_hash],
+                    "hp23 R1",
+                )
+                .unwrap();
+                let r2 = Commit::from_tree_id_with_kind(
+                    HashKind::Sha1,
+                    root_r2.id,
+                    vec![r1.id],
+                    "hp23 R2",
+                )
+                .unwrap();
+                let missing_tree_refs = trees
+                    .iter()
+                    .flat_map(|tree| &tree.tree_items)
+                    .filter(|item| item.id == missing.id)
+                    .count();
+                let mut next_id = 8_000_000_i64;
+                for (tree_id, bytes) in trees
+                    .into_iter()
+                    .map(|tree| (tree.id, tree.to_data().unwrap()))
+                    .chain([(mode_id, mode_stored), (gbk_id, gbk_stored)])
+                {
+                    db.execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "INSERT INTO mega_tree \
+                     (id, tree_id, sub_trees, size, created_at, pack_id, pack_offset, commit_id) \
+                     VALUES ($1, $2, $3, 0, now(), '', 0, $4) \
+                     ON CONFLICT (tree_id) DO NOTHING",
+                        [
+                            Value::from(next_id),
+                            Value::from(tree_id.to_string()),
+                            Value::from(bytes),
+                            Value::from(r2.id.to_string()),
+                        ],
+                    ))
+                    .await
+                    .unwrap();
+                    next_id += 1;
+                }
+                for commit in [&r1, &r2] {
+                    db.execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "INSERT INTO mega_commit \
+                     (id, commit_id, tree, parents_id, author, committer, content, \
+                      created_at, pack_id, pack_offset) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, now(), '', 0)",
+                        [
+                            Value::from(next_id),
+                            Value::from(commit.id.to_string()),
+                            Value::from(commit.tree_id.to_string()),
+                            Value::from(serde_json::json!(
+                                commit
+                                    .parent_commit_ids
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                            )),
+                            Value::from(
+                                String::from_utf8(commit.author.to_data().unwrap()).unwrap(),
+                            ),
+                            Value::from(
+                                String::from_utf8(commit.committer.to_data().unwrap()).unwrap(),
+                            ),
+                            Value::from(commit.message.clone()),
+                        ],
+                    ))
+                    .await
+                    .unwrap();
+                    next_id += 1;
+                }
+                let result = db
+                    .execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "UPDATE mega_refs SET ref_commit_hash = $1, ref_tree_hash = $2, \
+                     updated_at = now() WHERE path = '/' AND ref_name = 'refs/heads/main' \
+                     AND NOT is_cl AND ref_commit_hash = $3",
+                        [
+                            Value::from(r2.id.to_string()),
+                            Value::from(root_r2.id.to_string()),
+                            Value::from(r0),
+                        ],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(result.rows_affected(), 1);
+                (
+                    r2.id.to_string(),
+                    r1.id.to_string(),
+                    mode_id.to_string(),
+                    gbk_id.to_string(),
+                    missing.id.to_string(),
+                    missing_tree_refs,
+                )
+            });
+        let mut views = HashMap::new();
+        for (name, spec) in [
+            ("mode", ":/hp23/mode"),
+            ("gbk", ":/hp23/gbk:prefix=p"),
+            ("ok", ":/hp23/ok"),
+            ("miss", ":/hp23/miss"),
+        ] {
+            let (pk, filter_id) = case.register_filter(spec);
+            let url = case._database.url.clone();
+            let commits = with_runtime(async move {
+                let db = Database::connect(&url).await.unwrap();
+                db.query_all_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT view_commit FROM mega_view_commit_map \
+                     WHERE filter_pk = $1 AND view_commit IS NOT NULL ORDER BY seq_from",
+                    [Value::from(pk)],
+                ))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.try_get("", "view_commit").unwrap())
+                .collect::<Vec<String>>()
+            });
+            assert!(!commits.is_empty(), "{name}");
+            views.insert(name, (pk, filter_id, commits));
+        }
+        Self {
+            case,
+            root_tip,
+            prior_root,
+            views,
+            mode_tree,
+            gbk_tree,
+            missing_tree,
+            missing_tree_refs,
+        }
+    }
+
+    fn metric(&self) -> u64 {
+        let response = self
+            .case
+            .response(Method::GET, "/api/v1/views/metrics", false, false, None);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().unwrap();
+        body["data"]["view_pack_tree_mismatch_total"]
+            .as_u64()
+            .unwrap()
+    }
+
+    fn fetch(&self, name: &str, v2: bool, body: &[u8]) -> Vec<u8> {
+        let filter_id = &self.views[name].1;
+        let response = self.case.response(
+            Method::POST,
+            &format!("/.filter/{filter_id}.git/git-upload-pack"),
+            v2,
+            false,
+            Some(body),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/x-git-upload-pack-result"
+        );
+        response.bytes().unwrap().to_vec()
+    }
+}
+
+#[test]
+fn view_precheck_http_want_not_ours() {
+    let fixture = PrecheckHttpFixture::new();
+    let tip = fixture.views["ok"].2.last().unwrap();
+    let initial_metric = fixture.metric();
+    for (v2, have, done) in [
+        (false, None, false),
+        (false, Some(tip.as_str()), false),
+        (true, None, true),
+        (true, Some(fixture.prior_root.as_str()), false),
+        (true, Some(tip.as_str()), false),
+    ] {
+        let body = hp23_fetch_request(v2, &fixture.root_tip, have, done);
+        assert_eq!(
+            fixture.fetch("ok", v2, &body),
+            hp23_pkt(&format!(
+                "ERR upload-pack: not our ref {}\n",
+                fixture.root_tip
+            ))
+        );
+    }
+    let body = hp23_fetch_request(true, tip, Some(&fixture.prior_root), false);
+    let mut expected = hp23_pkt("acknowledgments\n");
+    expected.extend(hp23_pkt("NAK\n"));
+    expected.extend(b"0000");
+    assert_eq!(fixture.fetch("ok", true, &body), expected);
+    assert_eq!(fixture.metric(), initial_metric);
+}
+
+#[test]
+fn view_precheck_http_l0_mismatch() {
+    let fixture = PrecheckHttpFixture::new();
+    for (name, tree_id) in [("mode", &fixture.mode_tree), ("gbk", &fixture.gbk_tree)] {
+        let (_, filter_id, commits) = &fixture.views[name];
+        assert_eq!(commits.len(), 2);
+        let want = &commits[1];
+        let have = &commits[0];
+        let message = format!(
+            "ERR view {filter_id} pack aborted: tree {tree_id} does not match its stored entries\n"
+        );
+        for (v2, have, done) in [
+            (false, None, false),
+            (false, Some(have.as_str()), false),
+            (true, None, true),
+            (true, Some(have.as_str()), false),
+        ] {
+            let before = fixture.metric();
+            let body = hp23_fetch_request(v2, want, have, done);
+            assert_eq!(fixture.fetch(name, v2, &body), hp23_pkt(&message));
+            assert_eq!(fixture.metric(), before + 1);
+            for v2 in [false, true] {
+                let response = fixture.case.response(
+                    Method::GET,
+                    &format!("/.filter/{filter_id}.git/info/refs?service=git-upload-pack"),
+                    v2,
+                    false,
+                    None,
+                );
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+        let before = fixture.metric();
+        let body = hp23_fetch_request(true, want, Some(&fixture.prior_root), false);
+        let mut expected = hp23_pkt("acknowledgments\n");
+        expected.extend(hp23_pkt("NAK\n"));
+        expected.extend(b"0000");
+        assert_eq!(fixture.fetch(name, true, &body), expected);
+        assert_eq!(fixture.metric(), before);
+        let body = hp23_fetch_request(true, want, Some(&fixture.prior_root), true);
+        assert_eq!(fixture.fetch(name, true, &body), hp23_pkt(&message));
+        assert_eq!(fixture.metric(), before + 1);
+    }
+}
+
+#[test]
+fn view_precheck_http_missing_tree() {
+    let fixture = PrecheckHttpFixture::new();
+    assert_eq!(fixture.missing_tree_refs, 1);
+    let (_, filter_id, commits) = &fixture.views["miss"];
+    let tree_id = &fixture.missing_tree;
+    let url = fixture.case._database.url.clone();
+    let id = tree_id.clone();
+    with_runtime(async move {
+        let db = Database::connect(&url).await.unwrap();
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT COUNT(*)::bigint AS count FROM mega_tree WHERE tree_id = $1",
+                [Value::from(id.clone())],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let count: i64 = row.try_get("", "count").unwrap();
+        assert_eq!(count, 1);
+        db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM mega_tree WHERE tree_id = $1",
+            [Value::from(id)],
+        ))
+        .await
+        .unwrap();
+    });
+    let metric = fixture.metric();
+    let message = format!("ERR view {filter_id} pack aborted: tree {tree_id} is missing\n");
+    let tip = commits.last().unwrap();
+    for v2 in [false, true] {
+        let body = hp23_fetch_request(v2, tip, None, v2);
+        assert_eq!(fixture.fetch("miss", v2, &body), hp23_pkt(&message));
+        assert_eq!(fixture.metric(), metric);
+        let response = fixture.case.response(
+            Method::GET,
+            &format!("/.filter/{filter_id}.git/info/refs?service=git-upload-pack"),
+            v2,
+            false,
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::Utc;
 use sea_orm::{
@@ -17,7 +17,8 @@ use crate::{
     },
     common::{errors::MegaError, utils::MEGA_BRANCH_NAME},
     jupiter::storage::{
-        base_storage::StorageConnector, view_root_chain::ROOT_CHAIN_HALTED_SQL,
+        base_storage::{BaseStorage, StorageConnector},
+        view_root_chain::ROOT_CHAIN_HALTED_SQL,
         view_storage::ViewStorage,
     },
 };
@@ -59,10 +60,12 @@ pub(crate) struct ViewWantState {
     pub(crate) wants: Vec<(String, Option<i64>)>,
 }
 
-pub(crate) struct ViewPackBounds {
-    pub(crate) want_seq: i64,
-    pub(crate) have_seq: i64,
+pub(crate) struct ViewPackSnapshot {
+    pub(crate) ready_seq: Option<i64>,
+    pub(crate) halted: bool,
+    pub(crate) wants_valid: bool,
     pub(crate) have_tree: Option<String>,
+    pub(crate) commits: Vec<ViewPackCommit>,
 }
 
 pub(crate) struct ViewPackCommit {
@@ -72,48 +75,110 @@ pub(crate) struct ViewPackCommit {
 }
 
 impl ViewStorage {
-    pub(crate) async fn view_pack_bounds(
+    pub(crate) async fn view_pack_snapshot(
         &self,
         filter_pk: i64,
         wants: &[String],
         haves: &[String],
-    ) -> Result<ViewPackBounds, MegaError> {
-        let row = self
+    ) -> Result<Option<ViewPackSnapshot>, MegaError> {
+        let rows = self
             .get_connection()
-            .query_one_raw(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DbBackend::Postgres,
-                "WITH requested AS ( \
-                     SELECT 'want' AS role, unnest($2::text[]) AS oid \
-                     UNION ALL SELECT 'have', unnest($3::text[]) \
-                 ), matched AS ( \
-                     SELECT r.role, m.seq_from FROM requested r \
-                     JOIN mega_view_commit_map m ON m.filter_pk = $1 AND m.view_commit = r.oid \
-                 ), bounds AS ( \
-                     SELECT max(seq_from) FILTER (WHERE role = 'want') AS want_seq, \
-                            coalesce(max(seq_from) FILTER (WHERE role = 'have'), 0) AS have_seq \
-                     FROM matched \
-                 ) \
-                 SELECT b.want_seq, b.have_seq, m.view_tree AS have_tree \
-                 FROM bounds b LEFT JOIN mega_view_commit_map m \
-                   ON m.filter_pk = $1 AND m.seq_from = b.have_seq",
+                format!(
+                    "WITH state AS MATERIALIZED ( \
+                         SELECT f.id, f.ready_seq, f.projected_seq, \
+                                {ROOT_CHAIN_HALTED_SQL} AS halted \
+                         FROM mega_view_filter f WHERE f.id = $1 \
+                     ), wanted AS ( \
+                         SELECT mapped.seq_from FROM state s \
+                         CROSS JOIN LATERAL unnest($2::text[]) AS w(oid) \
+                         LEFT JOIN LATERAL ( \
+                             SELECT m.seq_from FROM mega_view_commit_map m \
+                             WHERE m.filter_pk = s.id AND m.view_commit = w.oid \
+                               AND m.seq_from <= s.projected_seq \
+                             ORDER BY m.seq_from LIMIT 1 \
+                         ) mapped ON TRUE \
+                     ), bounds AS ( \
+                         SELECT (SELECT max(seq_from) FROM wanted) AS want_seq, \
+                                (SELECT coalesce(bool_and(seq_from IS NOT NULL), FALSE) FROM wanted) \
+                                    AS wants_valid, \
+                                (SELECT coalesce(max(m.seq_from), 0) FROM state s \
+                                 JOIN mega_view_commit_map m ON m.filter_pk = s.id \
+                                 WHERE m.view_commit = ANY($3::text[]) \
+                                   AND m.seq_from <= s.projected_seq) AS have_seq \
+                     ) \
+                     SELECT s.ready_seq, s.halted, b.wants_valid, \
+                            h.view_tree AS have_tree, m.view_commit, m.view_tree, o.data \
+                     FROM state s CROSS JOIN bounds b \
+                     LEFT JOIN mega_view_commit_map h \
+                       ON h.filter_pk = s.id AND h.seq_from = b.have_seq \
+                     LEFT JOIN mega_view_commit_map m \
+                       ON m.filter_pk = s.id AND m.seq_from > b.have_seq \
+                          AND m.seq_from <= b.want_seq AND m.view_commit IS NOT NULL \
+                     LEFT JOIN mega_view_object o \
+                       ON o.object_id = m.view_commit AND o.kind = 1 \
+                     ORDER BY m.seq_from"
+                ),
                 [
                     Value::from(filter_pk),
                     Value::from(wants.to_vec()),
                     Value::from(haves.to_vec()),
                 ],
             ))
-            .await?
-            .ok_or_else(|| MegaError::Other("view pack bounds returned no row".to_owned()))?;
-        let want_seq: Option<i64> = row.try_get("", "want_seq")?;
-        Ok(ViewPackBounds {
-            want_seq: want_seq.ok_or_else(|| {
-                MegaError::Other("view pack want is outside the view chain".to_owned())
-            })?,
-            have_seq: row.try_get("", "have_seq")?,
-            have_tree: row.try_get("", "have_tree")?,
-        })
+            .await?;
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let mut snapshot = ViewPackSnapshot {
+            ready_seq: first.try_get("", "ready_seq")?,
+            halted: first.try_get("", "halted")?,
+            wants_valid: first.try_get("", "wants_valid")?,
+            have_tree: first.try_get("", "have_tree")?,
+            commits: Vec::new(),
+        };
+        if snapshot.halted || snapshot.ready_seq.is_none() || !snapshot.wants_valid {
+            return Ok(Some(snapshot));
+        }
+        for row in rows {
+            let Some(object_id) = row.try_get::<Option<String>>("", "view_commit")? else {
+                continue;
+            };
+            let data: Option<Vec<u8>> = row.try_get("", "data")?;
+            snapshot.commits.push(ViewPackCommit {
+                tree_id: row.try_get("", "view_tree")?,
+                data: data.ok_or_else(|| {
+                    MegaError::Other(format!("view commit object missing: {object_id}"))
+                })?,
+                object_id,
+            });
+        }
+        Ok(Some(snapshot))
     }
 
+    pub(crate) async fn view_pack_view_trees(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, Vec<u8>>, MegaError> {
+        let mut trees = HashMap::new();
+        for chunk in ids.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+            let rows = self
+                .get_connection()
+                .query_all_raw(Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "SELECT object_id, data FROM mega_view_object \
+                     WHERE kind = 2 AND object_id = ANY($1::text[])",
+                    [Value::from(chunk.to_vec())],
+                ))
+                .await?;
+            for row in rows {
+                trees.insert(row.try_get("", "object_id")?, row.try_get("", "data")?);
+            }
+        }
+        Ok(trees)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn view_pack_commits(
         &self,
         filter_pk: i64,

@@ -18,14 +18,14 @@ use git_internal::{
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     ceres::{
         pack::RepoHandler,
         protocol::import_refs::{RefCommand, Refs},
-        view::tree_source::{TreeSource, empty_tree_id, read_tree},
+        view::tree_source::{InMemoryTreeSource, TreeSource, empty_tree_id, read_tree},
     },
     common::{
         errors::{MegaError, ViewUnavailableReason},
@@ -53,6 +53,7 @@ pub(crate) struct ViewRepo {
     projection: ViewProjectionService,
     filter_pk: i64,
     filter_id: String,
+    pack_plan: Mutex<Option<ViewPackPlan>>,
 }
 
 struct ViewPackPlan {
@@ -63,23 +64,86 @@ struct ViewPackPlan {
 }
 
 impl ViewRepo {
+    async fn count_trees(
+        &self,
+        kind: HashKind,
+        ids: &[String],
+        empty: &str,
+    ) -> Result<HashMap<String, Tree>, MegaError> {
+        let view_storage = self.storage.view_storage();
+        let requested = ids
+            .iter()
+            .filter(|id| id.as_str() != empty)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut view_trees = view_storage.view_pack_view_trees(&requested).await?;
+        let remaining = requested
+            .iter()
+            .filter(|id| !view_trees.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mono = self.storage.mono_storage();
+        let l0_trees = mono
+            .get_trees_by_hashes_fallible(view_storage.get_connection(), &remaining)
+            .await?;
+        for tree in l0_trees {
+            let actual =
+                ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Tree, &tree.sub_trees)
+                    .map_err(GitError::from)?;
+            if actual.to_string() != tree.tree_id {
+                self.storage.view_metrics().increment_pack_tree_mismatch();
+                tracing::error!(
+                    metric = %"view_pack_tree_mismatch_total",
+                    filter_id = %self.filter_id,
+                    tree_id = %tree.tree_id,
+                    "view pack tree does not match its stored entries"
+                );
+                return Err(MegaError::ViewPackRejected(format!(
+                    "view {} pack aborted: tree {} does not match its stored entries",
+                    self.filter_id, tree.tree_id
+                )));
+            }
+            view_trees.insert(tree.tree_id, tree.sub_trees);
+        }
+        let source = InMemoryTreeSource::new(kind, view_trees, HashSet::new());
+        ids.iter()
+            .map(|id| {
+                let tree = read_tree(kind, &source, id).map_err(|_| {
+                    tracing::error!(
+                        filter_id = %self.filter_id,
+                        tree_id = %id,
+                        "view pack tree is missing"
+                    );
+                    MegaError::ViewPackRejected(format!(
+                        "view {} pack aborted: tree {} is missing",
+                        self.filter_id, id
+                    ))
+                })?;
+                Ok((id.clone(), tree))
+            })
+            .collect()
+    }
+
     async fn count_pack(
         &self,
         kind: HashKind,
         wants: &[String],
         haves: &[String],
-    ) -> Result<ViewPackPlan, GitError> {
+    ) -> Result<ViewPackPlan, MegaError> {
         let view_storage = self.storage.view_storage();
-        let bounds = view_storage
-            .view_pack_bounds(self.filter_pk, wants, haves)
-            .await
-            .map_err(GitError::from)?;
-        let commits = view_storage
-            .view_pack_commits(self.filter_pk, bounds.have_seq, bounds.want_seq)
-            .await
-            .map_err(GitError::from)?;
-        let empty = empty_tree_id(kind)?.to_string();
-        let mut previous = bounds.have_tree.unwrap_or_else(|| empty.clone());
+        let snapshot = view_storage
+            .view_pack_snapshot(self.filter_pk, wants, haves)
+            .await?
+            .ok_or_else(|| self.unavailable(ViewUnavailableReason::WarmingUp))?;
+        if snapshot.halted {
+            return Err(self.unavailable(ViewUnavailableReason::RootChainHalted));
+        }
+        if snapshot.ready_seq.is_none() || !snapshot.wants_valid {
+            return Err(self.unavailable(ViewUnavailableReason::WarmingUp));
+        }
+        let commits = snapshot.commits;
+        let empty = empty_tree_id(kind).map_err(GitError::from)?.to_string();
+        let mut previous = snapshot.have_tree.unwrap_or_else(|| empty.clone());
         let mut frontier = BTreeSet::new();
         for commit in &commits {
             if commit.tree_id != previous {
@@ -98,18 +162,7 @@ impl ViewRepo {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            let mono = self.storage.mono_storage();
-            let mut source = ViewTreeSource::new(&mono, view_storage.get_connection(), kind)
-                .map_err(GitError::from)?;
-            source.prefetch(&ids).await.map_err(GitError::from)?;
-            let trees = ids
-                .iter()
-                .map(|id| {
-                    read_tree(kind, &source, id)
-                        .map(|tree| (id.clone(), tree))
-                        .map_err(|missing| GitError::CustomError(format!("view tree {missing:?}")))
-                })
-                .collect::<Result<HashMap<_, _>, _>>()?;
+            let trees = self.count_trees(kind, &ids, &empty).await?;
             let mut next = BTreeSet::new();
             let mut level = Vec::new();
             for (old_id, new_id) in frontier {
@@ -292,6 +345,7 @@ impl ViewRepo {
             projection,
             filter_pk,
             filter_id,
+            pack_plan: Mutex::new(None),
         }
     }
 
@@ -423,6 +477,14 @@ impl RepoHandler for ViewRepo {
         Ok(())
     }
 
+    async fn prepare_pack(&self, want: &[String], have: &[String]) -> Result<(), MegaError> {
+        *self.pack_plan.lock().await = None;
+        let kind = self.object_hash_kind()?;
+        let plan = self.count_pack(kind, want, have).await?;
+        *self.pack_plan.lock().await = Some(plan);
+        Ok(())
+    }
+
     async fn finalize_receive_pack(&self) -> Result<(), MegaError> {
         Err(read_only_mega_error())
     }
@@ -442,19 +504,29 @@ impl RepoHandler for ViewRepo {
         Err(read_only_git_error())
     }
 
-    async fn full_pack(&self, want: Vec<String>) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+    async fn full_pack(&self, _want: Vec<String>) -> Result<ReceiverStream<Vec<u8>>, GitError> {
         let kind = self.object_hash_kind().map_err(GitError::from)?;
-        let plan = self.count_pack(kind, &want, &[]).await?;
+        let plan = self
+            .pack_plan
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| GitError::CustomError("view pack was not prepared".to_owned()))?;
         self.encode_pack(plan, kind).await
     }
 
     async fn incremental_pack(
         &self,
-        want: Vec<String>,
-        have: Vec<String>,
+        _want: Vec<String>,
+        _have: Vec<String>,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
         let kind = self.object_hash_kind().map_err(GitError::from)?;
-        let plan = self.count_pack(kind, &want, &have).await?;
+        let plan = self
+            .pack_plan
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| GitError::CustomError("view pack was not prepared".to_owned()))?;
         self.encode_pack(plan, kind).await
     }
 
@@ -582,8 +654,105 @@ mod tests {
                 },
             },
             tests::{test_db_config, test_storage_with_config},
+            utils::converter::{MegaObjectModel, process_entry},
         },
     };
+
+    fn raw_l0_tree(mode: &str, name: &[u8], blob: ObjectHash) -> (ObjectHash, Vec<u8>) {
+        let mut bytes = format!("{mode} ").into_bytes();
+        bytes.extend_from_slice(name);
+        bytes.push(0);
+        bytes.extend(hex::decode(blob.to_string()).unwrap());
+        let id = ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Tree, &bytes)
+            .unwrap();
+        (id, bytes)
+    }
+
+    fn replace_fixture_subtree(
+        fixture: &mut RootTreeFixture,
+        parent_name: &str,
+        child_name: &str,
+        child_id: ObjectHash,
+    ) {
+        let old_root = fixture.root.id;
+        let old_parent = fixture
+            .root
+            .tree_items
+            .iter()
+            .find(|item| item.name == parent_name)
+            .unwrap()
+            .id;
+        let mut parent_items = fixture
+            .trees
+            .iter()
+            .find(|tree| tree.id == old_parent)
+            .unwrap()
+            .tree_items
+            .clone();
+        let old_child = parent_items
+            .iter_mut()
+            .find(|item| item.name == child_name)
+            .unwrap();
+        let old_child_id = old_child.id;
+        old_child.id = child_id;
+        let new_parent = Tree::from_tree_items_with_kind(HashKind::Sha1, parent_items).unwrap();
+        let mut root_items = fixture.root.tree_items.clone();
+        root_items
+            .iter_mut()
+            .find(|item| item.name == parent_name)
+            .unwrap()
+            .id = new_parent.id;
+        let new_root = Tree::from_tree_items_with_kind(HashKind::Sha1, root_items).unwrap();
+        fixture
+            .trees
+            .retain(|tree| tree.id != old_root && tree.id != old_parent && tree.id != old_child_id);
+        fixture.trees.extend([new_parent, new_root.clone()]);
+        fixture.root = new_root;
+    }
+
+    fn capture_tracing<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::io::Write;
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for TestWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl MakeWriter<'_> for TestWriter {
+            type Writer = TestWriter;
+
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let _pin_registry = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(TestWriter(buffer.clone()))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        (result, text)
+    }
 
     struct Fixture {
         _temp: TempDir,
@@ -795,6 +964,20 @@ mod tests {
         (declared, unique)
     }
 
+    async fn prepared_full_pack(repo: &ViewRepo, want: Vec<String>) -> ReceiverStream<Vec<u8>> {
+        repo.prepare_pack(&want, &[]).await.unwrap();
+        repo.full_pack(want).await.unwrap()
+    }
+
+    async fn prepared_incremental_pack(
+        repo: &ViewRepo,
+        want: Vec<String>,
+        have: Vec<String>,
+    ) -> ReceiverStream<Vec<u8>> {
+        repo.prepare_pack(&want, &have).await.unwrap();
+        repo.incremental_pack(want, have).await.unwrap()
+    }
+
     fn fixture_view_closure(root: &RootCommitFixture, view_tree: &str) -> HashSet<String> {
         let mut ids = HashSet::new();
         let mut pending = vec![view_tree.to_owned()];
@@ -852,7 +1035,7 @@ mod tests {
             for index in [2, 7] {
                 let want = commits[index].object_id.clone();
                 let (count, ids) =
-                    pack_ids(repo.full_pack(vec![want]).await.unwrap(), &fixture._temp).await;
+                    pack_ids(prepared_full_pack(&repo, vec![want]).await, &fixture._temp).await;
                 let mut expected = HashSet::new();
                 for (source_index, commit) in commits.iter().take(index + 1).enumerate() {
                     expected.insert(commit.object_id.clone());
@@ -983,9 +1166,7 @@ mod tests {
         assert_eq!(commits.len(), 8);
         for index in [2, 7] {
             let (_, ids) = pack_ids(
-                repo.full_pack(vec![commits[index].object_id.clone()])
-                    .await
-                    .unwrap(),
+                prepared_full_pack(&repo, vec![commits[index].object_id.clone()]).await,
                 &fixture._temp,
             )
             .await;
@@ -1086,12 +1267,12 @@ mod tests {
         let want = commits[11].object_id.clone();
         for have_index in [1, 4, 8] {
             let (_, ids) = pack_ids(
-                repo.incremental_pack(
+                prepared_incremental_pack(
+                    &repo,
                     vec![want.clone()],
                     vec![commits[have_index].object_id.clone()],
                 )
-                .await
-                .unwrap(),
+                .await,
                 &fixture._temp,
             )
             .await;
@@ -1131,20 +1312,24 @@ mod tests {
             assert!(have_closure.is_superset(&want_closure));
         }
         let (_, full) = pack_ids(
-            repo.full_pack(vec![want.clone()]).await.unwrap(),
+            prepared_full_pack(&repo, vec![want.clone()]).await,
             &fixture._temp,
         )
         .await;
         assert!(!full.contains(&old_target) && !full.contains(&new_target));
         let (_, one_have) = pack_ids(
-            repo.incremental_pack(vec![want.clone()], vec![commits[4].object_id.clone()])
-                .await
-                .unwrap(),
+            prepared_incremental_pack(
+                &repo,
+                vec![want.clone()],
+                vec![commits[4].object_id.clone()],
+            )
+            .await,
             &fixture._temp,
         )
         .await;
         let (_, multiple_haves) = pack_ids(
-            repo.incremental_pack(
+            prepared_incremental_pack(
+                &repo,
                 vec![want.clone()],
                 vec![
                     commits[1].object_id.clone(),
@@ -1152,8 +1337,7 @@ mod tests {
                     fixture.roots[0].commit.id.to_string(),
                 ],
             )
-            .await
-            .unwrap(),
+            .await,
             &fixture._temp,
         )
         .await;
@@ -1174,7 +1358,8 @@ mod tests {
             .view_tip
             .unwrap();
         let (_, off_chain) = pack_ids(
-            repo.incremental_pack(
+            prepared_incremental_pack(
+                &repo,
                 vec![want],
                 vec![
                     fixture.roots[0].commit.id.to_string(),
@@ -1182,8 +1367,7 @@ mod tests {
                     "f".repeat(40),
                 ],
             )
-            .await
-            .unwrap(),
+            .await,
             &fixture._temp,
         )
         .await;
@@ -1271,44 +1455,438 @@ mod tests {
         assert_eq!(a_commits.len(), 200);
         assert_eq!(b_commits.len(), 10);
         counter.store(0, Ordering::Relaxed);
-        a_repo
-            .full_pack(vec![a_commits[199].object_id.clone()])
+        prepared_full_pack(&a_repo, vec![a_commits[199].object_id.clone()])
             .await
-            .unwrap()
             .concat()
             .await;
         let full_a = counter.load(Ordering::Relaxed);
         counter.store(0, Ordering::Relaxed);
-        b_repo
-            .full_pack(vec![b_commits[9].object_id.clone()])
+        prepared_full_pack(&b_repo, vec![b_commits[9].object_id.clone()])
             .await
-            .unwrap()
             .concat()
             .await;
         let full_b = counter.load(Ordering::Relaxed);
         assert_eq!(full_a, full_b);
         counter.store(0, Ordering::Relaxed);
-        a_repo
-            .incremental_pack(
-                vec![a_commits[199].object_id.clone()],
-                vec![a_commits[198].object_id.clone()],
-            )
-            .await
-            .unwrap()
-            .concat()
-            .await;
+        prepared_incremental_pack(
+            &a_repo,
+            vec![a_commits[199].object_id.clone()],
+            vec![a_commits[198].object_id.clone()],
+        )
+        .await
+        .concat()
+        .await;
         let short = counter.load(Ordering::Relaxed);
         counter.store(0, Ordering::Relaxed);
-        a_repo
-            .incremental_pack(
-                vec![a_commits[199].object_id.clone()],
-                vec![a_commits[49].object_id.clone()],
-            )
-            .await
-            .unwrap()
-            .concat()
-            .await;
+        prepared_incremental_pack(
+            &a_repo,
+            vec![a_commits[199].object_id.clone()],
+            vec![a_commits[49].object_id.clone()],
+        )
+        .await
+        .concat()
+        .await;
         assert_eq!(short, counter.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn commit_map_read_only_by_prepare_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db_config, _schema) = test_db_config(temp.path()).await;
+        let mut config = isolated_config(temp.path().join("config"));
+        config.database = db_config.clone();
+        let statements = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = statements.clone();
+        let mut connection = database_connection(&db_config).await.unwrap();
+        connection.set_metric_callback(move |info| {
+            recorded.lock().unwrap().push(info.statement.to_string());
+        });
+        let storage = Storage::new_with_connection(
+            Arc::new(config),
+            Arc::new(connection),
+            mock_object_storage(),
+        )
+        .await
+        .unwrap();
+        let trees = (0..3)
+            .map(|index| {
+                root_tree_from_paths(
+                    HashKind::Sha1,
+                    &[("a/file".to_owned(), format!("content-{index}").into_bytes())],
+                )
+            })
+            .collect::<Vec<_>>();
+        let roots = seed_linear_root_history_with_trees(
+            storage.view_storage().get_connection(),
+            HashKind::Sha1,
+            trees,
+        )
+        .await;
+        for root in &roots {
+            for blob in &root.blobs {
+                storage
+                    .git_service
+                    .save_object_from_raw(Bytes::copy_from_slice(&blob.data))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            storage
+                .view_storage()
+                .extend_root_chain(None, 100, ViewLockMode::Try)
+                .await
+                .unwrap(),
+            RootChainOutcome::CaughtUp
+        );
+        let filter_id = insert_filter(&storage, 5001, ":/a").await;
+        let projection = ViewProjectionService::new(storage.clone(), storage.view_metrics());
+        projection
+            .catch_up_one_batch(5001, &storage.config(), 100)
+            .await
+            .unwrap();
+        let commits = storage
+            .view_storage()
+            .view_pack_commits(5001, 0, 3)
+            .await
+            .unwrap();
+        assert_eq!(commits.len(), 3);
+        let want = vec![commits[2].object_id.clone()];
+        for have in [Vec::new(), vec![commits[0].object_id.clone()]] {
+            let repo = ViewRepo::new(
+                storage.clone(),
+                storage.config(),
+                projection.clone(),
+                5001,
+                filter_id.clone(),
+            );
+            statements.lock().unwrap().clear();
+            repo.prepare_pack(&want, &have).await.unwrap();
+            {
+                let sql = statements.lock().unwrap();
+                let filter_reads = sql
+                    .iter()
+                    .filter(|statement| statement.contains("mega_view_filter"))
+                    .collect::<Vec<_>>();
+                assert_eq!(filter_reads.len(), 1);
+                assert!(filter_reads[0].contains("mega_view_commit_map"));
+            }
+            if have.is_empty() {
+                repo.full_pack(want.clone()).await.unwrap().concat().await;
+            } else {
+                repo.incremental_pack(want.clone(), have)
+                    .await
+                    .unwrap()
+                    .concat()
+                    .await;
+            }
+            assert_eq!(
+                statements
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|statement| statement.contains("mega_view_commit_map"))
+                    .count(),
+                1
+            );
+        }
+        let config = storage.config();
+        let control = ViewRepo::new(storage, config, projection, 5001, filter_id);
+        statements.lock().unwrap().clear();
+        assert!(control.full_pack(want).await.is_err());
+        assert_eq!(
+            statements
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|statement| statement.contains("mega_view_commit_map"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn prepare_pack_rejects_l0_and_missing_trees() {
+        let (expected, logs) = capture_tracing(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let paths = |index| {
+                    [
+                        (
+                            "a/mode/good.txt".to_owned(),
+                            format!("mode-{index}").into_bytes(),
+                        ),
+                        (
+                            "b/gbk/good.txt".to_owned(),
+                            format!("gbk-{index}").into_bytes(),
+                        ),
+                        (
+                            "c/d/hp23-only-in-c-d.txt".to_owned(),
+                            format!("missing-{index}").into_bytes(),
+                        ),
+                        (
+                            "e/ok.txt".to_owned(),
+                            format!("control-{index}").into_bytes(),
+                        ),
+                    ]
+                };
+                let first = root_tree_from_paths(HashKind::Sha1, &paths(0));
+                let mut second = root_tree_from_paths(HashKind::Sha1, &paths(1));
+                let blob = second.blobs[0].id;
+                let (mode_id, mode_raw) = raw_l0_tree("100664", b"file.txt", blob);
+                let (gbk_id, gbk_raw) =
+                    raw_l0_tree("100644", &[0xc4, 0xe3, 0xba, 0xc3, b'.', b't', b'x', b't'], blob);
+                replace_fixture_subtree(&mut second, "a", "mode", mode_id);
+                replace_fixture_subtree(&mut second, "b", "gbk", gbk_id);
+                let fixture = Fixture::from_trees(vec![first, second], ":/a/mode", 2, 100).await;
+                let db = fixture.storage.view_storage();
+                for (tree_id, raw) in [(mode_id, mode_raw), (gbk_id, gbk_raw)] {
+                    let entry = Entry {
+                        obj_type: ObjectType::Tree,
+                        data: raw,
+                        hash: tree_id,
+                        chain_len: 0,
+                    };
+                    let MegaObjectModel::Tree(mut model) =
+                        process_entry(entry).convert_to_mega_model(EntryMeta::new())
+                    else {
+                        panic!("tree entry must make a tree model")
+                    };
+                    model.commit_id = fixture.roots[1].commit.id.to_string();
+                    assert_ne!(
+                        ObjectHash::from_type_and_data_for_kind(
+                            HashKind::Sha1,
+                            ObjectType::Tree,
+                            &model.sub_trees
+                        )
+                        .unwrap()
+                        .to_string(),
+                        model.tree_id
+                    );
+                    fixture
+                        .storage
+                        .mono_storage()
+                        .base
+                        .batch_save_model::<mega_tree::Entity, mega_tree::ActiveModel>(vec![
+                            model.into_active_model(),
+                        ])
+                        .await
+                        .unwrap();
+                }
+                let c_d_id = fixture.roots[1]
+                    .trees
+                    .iter()
+                    .find(|tree| {
+                        tree.tree_items
+                            .iter()
+                            .any(|item| item.name == "hp23-only-in-c-d.txt")
+                    })
+                    .unwrap()
+                    .id
+                    .to_string();
+                let filters = [
+                    (5001, fixture.filter_id.clone(), mode_id.to_string()),
+                    (
+                        5002,
+                        insert_filter(&fixture.storage, 5002, ":/b/gbk:prefix=p").await,
+                        gbk_id.to_string(),
+                    ),
+                    (
+                        5003,
+                        insert_filter(&fixture.storage, 5003, ":/c").await,
+                        c_d_id.clone(),
+                    ),
+                    (
+                        5004,
+                        insert_filter(&fixture.storage, 5004, ":/e").await,
+                        String::new(),
+                    ),
+                ];
+                let mut original = HashMap::new();
+                for (pk, _, _) in &filters {
+                    ViewProjectionService::new(
+                        fixture.storage.clone(),
+                        fixture.storage.view_metrics(),
+                    )
+                    .catch_up_one_batch(*pk, &fixture.storage.config(), 100)
+                    .await
+                    .unwrap();
+                    let commits = db.view_pack_commits(*pk, 0, 2).await.unwrap();
+                    assert_eq!(commits.len(), 2);
+                    original.insert(
+                        *pk,
+                        commits
+                            .into_iter()
+                            .map(|commit| commit.object_id)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                for table in ["mega_view_object_ref", "mega_view_commit_map"] {
+                    db.get_connection()
+                        .execute_unprepared(&format!("DELETE FROM {table}"))
+                        .await
+                        .unwrap();
+                }
+                db.get_connection()
+                    .execute_unprepared("DELETE FROM mega_view_object")
+                    .await
+                    .unwrap();
+                db.get_connection()
+                    .execute_unprepared(
+                        "UPDATE mega_view_filter SET projected_seq = 0, ready_seq = NULL, \
+                         warming_since = now() WHERE id BETWEEN 5001 AND 5004",
+                    )
+                    .await
+                    .unwrap();
+                for (pk, _, _) in &filters {
+                    ViewProjectionService::new(
+                        fixture.storage.clone(),
+                        fixture.storage.view_metrics(),
+                    )
+                    .catch_up_one_batch(*pk, &fixture.storage.config(), 100)
+                    .await
+                    .unwrap();
+                    let current = db
+                        .view_pack_commits(*pk, 0, 2)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|commit| commit.object_id)
+                        .collect::<Vec<_>>();
+                    assert_eq!(current, original[pk]);
+                    assert!(
+                        db.view_reader_state(*pk)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .ready_seq
+                            .is_some()
+                    );
+                }
+                for (pk, filter_id, tree_id) in [&filters[0], &filters[1], &filters[3]] {
+                    let before = mega_view_filter::Entity::find_by_id(*pk)
+                        .one(db.get_connection())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let repo = ViewRepo::new(
+                        fixture.storage.clone(),
+                        fixture.storage.config(),
+                        ViewProjectionService::new(
+                            fixture.storage.clone(),
+                            fixture.storage.view_metrics(),
+                        ),
+                        *pk,
+                        filter_id.clone(),
+                    );
+                    let want = vec![original[pk][1].clone()];
+                    repo.check_wants_and_ready(&want).await.unwrap();
+                    let result = repo.prepare_pack(&want, &[]).await;
+                    if *pk == 5004 {
+                        result.unwrap();
+                    } else {
+                        assert!(matches!(
+                            result.unwrap_err(),
+                            MegaError::ViewPackRejected(message)
+                            if message == format!(
+                                "view {filter_id} pack aborted: tree {tree_id} does not match its stored entries"
+                            )
+                        ));
+                    }
+                    let after = mega_view_filter::Entity::find_by_id(*pk)
+                        .one(db.get_connection())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(before, after);
+                }
+                assert_eq!(
+                    fixture
+                        .storage
+                        .view_metrics()
+                        .counters()
+                        .view_pack_tree_mismatch_total,
+                    2
+                );
+                assert_eq!(
+                    fixture
+                        .roots
+                        .iter()
+                        .flat_map(|root| &root.trees)
+                        .filter(|tree| tree.id.to_string() == c_d_id)
+                        .count(),
+                    1
+                );
+                db.get_connection()
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "DELETE FROM mega_tree WHERE tree_id = $1",
+                        [sea_orm::Value::from(c_d_id.clone())],
+                    ))
+                    .await
+                    .unwrap();
+                let (pk, filter_id, tree_id) = &filters[2];
+                let before = mega_view_filter::Entity::find_by_id(*pk)
+                    .one(db.get_connection())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let repo = ViewRepo::new(
+                    fixture.storage.clone(),
+                    fixture.storage.config(),
+                    ViewProjectionService::new(
+                        fixture.storage.clone(),
+                        fixture.storage.view_metrics(),
+                    ),
+                    *pk,
+                    filter_id.clone(),
+                );
+                let want = vec![original[pk][1].clone()];
+                repo.check_wants_and_ready(&want).await.unwrap();
+                assert!(matches!(
+                    repo.prepare_pack(&want, &[]).await.unwrap_err(),
+                    MegaError::ViewPackRejected(message)
+                    if message == format!("view {filter_id} pack aborted: tree {tree_id} is missing")
+                ));
+                let after = mega_view_filter::Entity::find_by_id(*pk)
+                    .one(db.get_connection())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(before, after);
+                assert_eq!(
+                    fixture
+                        .storage
+                        .view_metrics()
+                        .counters()
+                        .view_pack_tree_mismatch_total,
+                    2
+                );
+                filters
+            })
+        });
+        for (pk, filter_id, tree_id) in &expected {
+            let lines = logs
+                .lines()
+                .filter(|line| {
+                    line.contains("ERROR")
+                        && line.contains(&format!("filter_id={filter_id}"))
+                        && (*pk == 5004 || line.contains(&format!("tree_id={tree_id}")))
+                })
+                .collect::<Vec<_>>();
+            if *pk == 5004 {
+                assert!(lines.is_empty());
+            } else {
+                assert_eq!(lines.len(), 1, "{pk}: {logs}");
+                assert_eq!(
+                    lines[0].contains("metric=view_pack_tree_mismatch_total"),
+                    *pk != 5003
+                );
+            }
+        }
     }
 
     async fn insert_filter(storage: &Storage, filter_pk: i64, spec: &str) -> String {
@@ -1351,6 +1929,93 @@ mod tests {
                 assert_eq!(actual_reason, reason);
             }
             other => panic!("expected ViewUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_pack_rechecks_single_snapshot() {
+        for scenario in 0..5 {
+            let fixture = Fixture::new(3, ":/repo").await;
+            fixture.catch_up(1).await;
+            let commits = fixture
+                .storage
+                .view_storage()
+                .view_pack_commits(fixture.filter_pk, 0, 3)
+                .await
+                .unwrap();
+            assert_eq!(commits.len(), 3);
+            let want = vec![commits[2].object_id.clone()];
+            let r1 = fixture.current_repo();
+            let r2 = fixture.current_repo();
+            r1.check_wants_and_ready(&want).await.unwrap();
+            r2.check_wants_and_ready(&want).await.unwrap();
+            let db = fixture.storage.view_storage();
+            match scenario {
+                0 => {
+                    fixture.set_state(0, None, false).await;
+                    db.get_connection()
+                        .execute_raw(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "DELETE FROM mega_view_object_ref WHERE filter_pk = $1",
+                            [sea_orm::Value::from(fixture.filter_pk)],
+                        ))
+                        .await
+                        .unwrap();
+                    db.get_connection()
+                        .execute_raw(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "DELETE FROM mega_view_commit_map WHERE filter_pk = $1",
+                            [sea_orm::Value::from(fixture.filter_pk)],
+                        ))
+                        .await
+                        .unwrap();
+                }
+                1 => fixture.set_state(3, None, false).await,
+                2 => {
+                    db.get_connection()
+                        .execute_raw(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "DELETE FROM mega_view_commit_map \
+                             WHERE filter_pk = $1 AND view_commit = $2",
+                            [
+                                sea_orm::Value::from(fixture.filter_pk),
+                                sea_orm::Value::from(want[0].clone()),
+                            ],
+                        ))
+                        .await
+                        .unwrap();
+                }
+                3 => {
+                    assert!(
+                        cas_fixture_main(db.get_connection(), &fixture.roots[2], &fixture.roots[0])
+                            .await
+                    );
+                    assert!(matches!(
+                        db.extend_root_chain(None, 100, ViewLockMode::Try)
+                            .await
+                            .unwrap(),
+                        RootChainOutcome::Discontinuous(_)
+                    ));
+                }
+                4 => {}
+                _ => unreachable!(),
+            }
+            for (repo, have) in [(&r1, Vec::new()), (&r2, vec![commits[0].object_id.clone()])] {
+                let result = repo.prepare_pack(&want, &have).await;
+                if scenario == 4 {
+                    result.unwrap();
+                } else {
+                    assert_unavailable(
+                        result.unwrap_err(),
+                        &fixture.filter_id,
+                        if scenario == 3 {
+                            ViewUnavailableReason::RootChainHalted
+                        } else {
+                            ViewUnavailableReason::WarmingUp
+                        },
+                    );
+                }
+            }
         }
     }
 

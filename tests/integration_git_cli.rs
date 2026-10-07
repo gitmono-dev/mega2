@@ -5951,6 +5951,243 @@ fn hp22_http_boot() -> (GitCliEnv, ServiceProcess, u16, PathBuf) {
     (env, service, port, err)
 }
 
+fn hp23_host_git_input(case_dir: &Path, repo: &str, args: &[&str], input: &[u8]) -> String {
+    let mut child = Command::new("git")
+        .current_dir(case_dir)
+        .args(["-C", repo])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    git_cli::assert_git_success(&output, "HP-23 fixture git");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn hp23_http_fixture(
+    case_dir: &Path,
+    port: u16,
+    db_url: &str,
+) -> (String, Vec<(String, String)>, String, String) {
+    git_ok_no_auth(
+        case_dir,
+        &["clone", &trunk_subpath_url(port, "/project"), "hp23-source"],
+    );
+    configure_git_identity_no_auth(case_dir, "hp23-source");
+    for name in ["mode", "gbk", "ok", "miss/d"] {
+        let file = if name == "miss/d" {
+            "hp23-only-in-miss-d.txt"
+        } else {
+            "good.txt"
+        };
+        let path = case_dir
+            .join("hp23-source")
+            .join(format!("hp23-{name}"))
+            .join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, name).unwrap();
+    }
+    git_ok_no_auth(
+        case_dir,
+        &[
+            "-C",
+            "hp23-source",
+            "add",
+            "hp23-mode",
+            "hp23-gbk",
+            "hp23-ok",
+            "hp23-miss",
+        ],
+    );
+    git_ok_no_auth(case_dir, &["-C", "hp23-source", "commit", "-m", "HP23 R1"]);
+    git_cli::assert_git_success(&trunk_push(case_dir, "hp23-source"), "HP-23 R1 push");
+    let blob = git_stdout_no_auth(
+        case_dir,
+        &["-C", "hp23-source", "rev-parse", "HEAD:hp23-mode/good.txt"],
+    );
+    let mode_input = format!("100664 blob {blob}\tmode.txt\n");
+    let mode_tree =
+        hp23_host_git_input(case_dir, "hp23-source", &["mktree"], mode_input.as_bytes());
+    let gbk_input = format!("100644 blob {blob}\t\"\\304\\343\\272\\303.txt\"\n");
+    let gbk_tree = hp23_host_git_input(case_dir, "hp23-source", &["mktree"], gbk_input.as_bytes());
+    let ok_tree = git_stdout_no_auth(
+        case_dir,
+        &["-C", "hp23-source", "rev-parse", "HEAD:hp23-ok"],
+    );
+    let miss_tree = git_stdout_no_auth(
+        case_dir,
+        &["-C", "hp23-source", "rev-parse", "HEAD:hp23-miss"],
+    );
+    let prior_root = git_stdout_no_auth(case_dir, &["-C", "hp23-source", "ls-tree", "HEAD"]);
+    let root_input = prior_root
+        .lines()
+        .map(|line| {
+            let name = line.rsplit_once('\t').unwrap().1;
+            let replacement = match name {
+                "hp23-mode" => Some(&mode_tree),
+                "hp23-gbk" => Some(&gbk_tree),
+                "hp23-ok" => Some(&ok_tree),
+                "hp23-miss" => Some(&miss_tree),
+                _ => None,
+            };
+            replacement.map_or_else(
+                || format!("{line}\n"),
+                |id| format!("040000 tree {id}\t{name}\n"),
+            )
+        })
+        .collect::<String>();
+    let root_tree =
+        hp23_host_git_input(case_dir, "hp23-source", &["mktree"], root_input.as_bytes());
+    let parent = git_stdout_no_auth(case_dir, &["-C", "hp23-source", "rev-parse", "HEAD"]);
+    let r2 = hp23_host_git_input(
+        case_dir,
+        "hp23-source",
+        &["commit-tree", &root_tree, "-p", &parent, "-m", "HP23 R2"],
+        b"",
+    );
+    git_ok_no_auth(
+        case_dir,
+        &["-C", "hp23-source", "update-ref", "refs/heads/main", &r2],
+    );
+    git_cli::assert_git_success(&trunk_push(case_dir, "hp23-source"), "HP-23 R2 push");
+    let rows = with_runtime(async {
+        let db = Database::connect(db_url).await.unwrap();
+        let mut rows = Vec::new();
+        for id in [&mode_tree, &gbk_tree] {
+            let row = db
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!("SELECT sub_trees FROM mega_tree WHERE tree_id = '{id}'"),
+                ))
+                .await
+                .unwrap()
+                .expect("L0 tree row");
+            let bytes: Vec<u8> = row.try_get("", "sub_trees").unwrap();
+            let actual = git_internal::hash::ObjectHash::from_type_and_data_for_kind(
+                git_internal::hash::HashKind::Sha1,
+                git_internal::internal::object::types::ObjectType::Tree,
+                &bytes,
+            )
+            .unwrap();
+            assert_ne!(actual.to_string(), *id, "L0 fixture must be noncanonical");
+            rows.push(id.to_owned());
+        }
+        rows
+    });
+    let mut views = Vec::new();
+    for (name, spec) in [
+        ("mode", ":/project/hp23-mode"),
+        ("gbk", ":/project/hp23-gbk:prefix=p"),
+        ("ok", ":/project/hp23-ok"),
+        ("miss", ":/project/hp23-miss"),
+    ] {
+        let id = hp22_register(port, &format!("hp23-{name}"), spec);
+        hp22_wait_lag_zero(port, &id);
+        views.push((name.to_owned(), id));
+    }
+    assert_eq!(rows, vec![mode_tree.clone(), gbk_tree.clone()]);
+    (r2, views, mode_tree, gbk_tree)
+}
+
+#[test]
+fn integration_git_cli_view_precheck_not_our_ref() {
+    let (env, mut service, port, err) = hp22_http_boot();
+    let (root_tip, views, _, _) = hp23_http_fixture(&env.case_dir, port, &env.database.db_url);
+    let ok = &views.iter().find(|(name, _)| name == "ok").unwrap().1;
+    let url = git_cli::mega2_http_url(port, &format!("/.filter/{ok}.git"));
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(&env.case_dir, &["init", "hp23-fetch"]),
+        "HP-23 init fetch client",
+    );
+    let output = git_cli::git_cli_no_auth(
+        &env.case_dir,
+        &[
+            "-C",
+            "hp23-fetch",
+            "-c",
+            "protocol.version=2",
+            "fetch",
+            &url,
+            &root_tip,
+        ],
+    );
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "remote error: upload-pack: not our ref {root_tip}"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+#[test]
+fn integration_git_cli_view_precheck_l0_clone() {
+    let (env, mut service, port, err) = hp22_http_boot();
+    let (_, views, mode_tree, gbk_tree) =
+        hp23_http_fixture(&env.case_dir, port, &env.database.db_url);
+    for (name, id) in &views {
+        if name == "miss" {
+            continue;
+        }
+        let url = git_cli::mega2_http_url(port, &format!("/.filter/{id}.git"));
+        for version in ["0", "2"] {
+            let clone = format!("hp23-{name}-v{version}");
+            let output = git_cli::git_cli_no_auth(
+                &env.case_dir,
+                &[
+                    "-c",
+                    &format!("protocol.version={version}"),
+                    "clone",
+                    &url,
+                    &clone,
+                ],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if name == "ok" {
+                git_cli::assert_git_success(&output, "HP-23 control clone");
+            } else {
+                assert!(!output.status.success(), "{output:?}");
+                let tree_id = if name == "mode" {
+                    &mode_tree
+                } else {
+                    &gbk_tree
+                };
+                assert!(
+                    stderr.contains("remote error:") && stderr.contains(tree_id),
+                    "{stderr}"
+                );
+                assert!(
+                    stderr.contains("tree ")
+                        && stderr.contains("does not match its stored entries"),
+                    "{stderr}"
+                );
+                assert!(
+                    !stderr.contains("did not send all necessary objects"),
+                    "{stderr}"
+                );
+            }
+        }
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
 fn hp22_register(port: u16, name: &str, spec: &str) -> String {
     let response = reqwest::blocking::Client::builder()
         .no_proxy()
