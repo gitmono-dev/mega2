@@ -69,9 +69,13 @@ impl PostgresNativeSessionRepository {
             .begin_intent(&format!("http:{}", built.snapshot_id), prepared)
             .await
             .map_err(install_error)?;
+        let capability = installer
+            .mint_legacy_install_capability(&intent)
+            .await
+            .map_err(install_error)?;
         for pages in prepared.dag().payloads().chunks(64) {
             installer
-                .install_pages(&intent, pages)
+                .install_pages_validated(&capability, pages)
                 .await
                 .map_err(install_error)?;
         }

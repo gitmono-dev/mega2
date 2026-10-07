@@ -1279,3 +1279,6 @@ async fn native_metadata_query_loss_after_recovery_barrier_preserves_typed_unkno
         MetadataPrepareObservation::Committed(_)
     ));
 }
+
+#[path = "native_metadata_install_capability_fault_tests.rs"]
+mod capability_fault_tests;

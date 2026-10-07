@@ -149,6 +149,7 @@ mod m20261007_000100_add_mst2_snapshot_sessions;
 mod m20261007_000200_add_mst2_metadata_generations;
 mod m20261007_000300_add_mst2_metadata_lifetime_history;
 mod m20261007_000400_add_mst2_qualified_metadata_gc;
+mod m20261007_000500_add_mst2_install_capability;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -286,6 +287,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261007_000200_add_mst2_metadata_generations::Migration),
             Box::new(m20261007_000300_add_mst2_metadata_lifetime_history::Migration),
             Box::new(m20261007_000400_add_mst2_qualified_metadata_gc::Migration),
+            Box::new(m20261007_000500_add_mst2_install_capability::Migration),
         ]
     }
 }
@@ -1196,7 +1198,7 @@ mod tests {
     async fn import_repo_alias_rows_canonicalized() {
         let names = migration_names();
         assert_eq!(
-            &names[names.len() - 12..names.len() - 3],
+            &names[names.len() - 13..names.len() - 4],
             &[
                 "m20260923_000200_canonicalize_import_repo_paths".to_string(),
                 "m20260925_000100_media_paging".to_string(),
@@ -1211,16 +1213,20 @@ mod tests {
             "native retention, metadata installation and view tables follow media paging"
         );
         assert_eq!(
-            &names[names.len() - 3],
+            &names[names.len() - 4],
             "m20261007_000200_add_mst2_metadata_generations"
         );
         assert_eq!(
-            &names[names.len() - 2],
+            &names[names.len() - 3],
             "m20261007_000300_add_mst2_metadata_lifetime_history"
         );
         assert_eq!(
-            names.last().unwrap(),
+            &names[names.len() - 2],
             "m20261007_000400_add_mst2_qualified_metadata_gc"
+        );
+        assert_eq!(
+            names.last().unwrap(),
+            "m20261007_000500_add_mst2_install_capability"
         );
 
         let db = alias_db().await;

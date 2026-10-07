@@ -1050,6 +1050,14 @@ fn unavailable(message: &str) -> SnapshotError {
     SnapshotError::new(SnapshotErrorCode::ObjectUnavailable, message)
 }
 
+#[path = "native_metadata_install_capability.rs"]
+mod capability;
+pub(crate) use capability::ValidatedLegacyInstallCapability;
+
+#[cfg(test)]
+#[path = "native_metadata_install_capability_tests.rs"]
+mod capability_tests;
+
 // Additive repository only. HTTP sessions continue using the existing installer
 // until session anchors and lease adoption bind the generation seal.
 #[path = "native_metadata_generations.rs"]
