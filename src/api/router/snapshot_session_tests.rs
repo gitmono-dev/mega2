@@ -995,11 +995,7 @@ async fn mst2_durable_http_handoff_rejects_changed_plan_or_receipt_summary() {
         prepared.wait().await;
         let mono = fixture.state.storage.mono_storage();
         let db = mono.get_connection();
-        db.execute_unprepared(&format!(
-            "UPDATE mst2_metadata_prepare SET {mutation} WHERE scope='/'"
-        ))
-        .await
-        .unwrap();
+        corrupt_registered_handoff_plan_for_test(db, mutation).await;
         release.wait().await;
         error(resolving.await.unwrap(), 502, "INTEGRITY_ERROR", false).await;
         assert_eq!(
@@ -1035,6 +1031,95 @@ async fn mst2_durable_http_handoff_rejects_changed_plan_or_receipt_summary() {
         );
         fixture.counts.assert(0, 0);
     }
+}
+
+async fn corrupt_registered_handoff_plan_for_test(db: &DatabaseConnection, mutation: &str) {
+    let guard_modes = handoff_trigger_modes_for_test(db).await;
+    assert!(guard_modes.iter().any(|(table, trigger, mode)| {
+        table == "mst2_metadata_prepare"
+            && trigger == "mst2_install_capability_prepare_guard"
+            && mode == "O"
+    }));
+    let prepares = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT prepare_id FROM mst2_metadata_prepare WHERE scope='/'",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(prepares.len(), 1);
+    let prepare_id: String = prepares[0].try_get("", "prepare_id").unwrap();
+    let protected_update = || {
+        Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE mst2_metadata_prepare SET total_bytes=total_bytes+1 WHERE prepare_id=$1",
+            [prepare_id.clone().into()],
+        )
+    };
+    assert!(
+        db.execute_raw(protected_update())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("registered metadata preparation identity is immutable")
+    );
+    // The isolated fault injection restores this exact production guard in the
+    // same transaction. Acquire the statement barrier before ALTER's table lock.
+    let txn = db
+        .begin_with_config(Some(sea_orm::IsolationLevel::ReadCommitted), None)
+        .await
+        .unwrap();
+    txn.execute_unprepared("SELECT pg_advisory_xact_lock(1296717362,hashtext(current_schema()))")
+        .await
+        .unwrap();
+    txn.execute_unprepared(
+        "ALTER TABLE mst2_metadata_prepare DISABLE TRIGGER mst2_install_capability_prepare_guard",
+    )
+    .await
+    .unwrap();
+    let changed = txn
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            format!("UPDATE mst2_metadata_prepare SET {mutation} WHERE prepare_id=$1"),
+            [prepare_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    txn.execute_unprepared(
+        "ALTER TABLE mst2_metadata_prepare ENABLE TRIGGER mst2_install_capability_prepare_guard",
+    )
+    .await
+    .unwrap();
+    txn.commit().await.unwrap();
+    assert_eq!(handoff_trigger_modes_for_test(db).await, guard_modes);
+    assert!(
+        db.execute_raw(protected_update())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("registered metadata preparation identity is immutable")
+    );
+}
+
+async fn handoff_trigger_modes_for_test(db: &DatabaseConnection) -> Vec<(String, String, String)> {
+    db.query_all_raw(Statement::from_string(
+        DbBackend::Postgres,
+        "SELECT c.relname,t.tgname,t.tgenabled::text AS mode FROM pg_trigger t
+         JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname=current_schema() AND NOT t.tgisinternal ORDER BY c.relname,t.tgname",
+    ))
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get("", "relname").unwrap(),
+            row.try_get("", "tgname").unwrap(),
+            row.try_get("", "mode").unwrap(),
+        )
+    })
+    .collect()
 }
 
 async fn overwrite_primary_scope_for_test(db: &DatabaseConnection, storage_uuid: String) {
