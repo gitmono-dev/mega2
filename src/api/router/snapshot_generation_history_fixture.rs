@@ -1,6 +1,7 @@
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 
 pub(super) async fn restore_empty_g1_schema(db: &DatabaseConnection) {
+    super::generation_qualified_fixture::restore_empty_history_schema(db).await;
     let count = db
         .query_one_raw(Statement::from_string(
             DbBackend::Postgres,

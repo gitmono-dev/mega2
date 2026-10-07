@@ -11,6 +11,7 @@ pub struct Model {
     pub state: String,
     pub metadata_codec: i16,
     pub expected_size: i32,
+    pub graph_domain: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
