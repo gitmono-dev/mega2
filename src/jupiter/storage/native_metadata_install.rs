@@ -1056,7 +1056,7 @@ fn unavailable(message: &str) -> SnapshotError {
 
 #[path = "native_metadata_install_capability.rs"]
 mod capability;
-pub(crate) use capability::ValidatedLegacyInstallCapability;
+pub(crate) use capability::{LegacyPayloadInstallWork, ValidatedLegacyInstallCapability};
 
 #[cfg(test)]
 #[path = "native_metadata_install_capability_tests.rs"]

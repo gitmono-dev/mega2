@@ -64,6 +64,41 @@ impl PostgresNativeSessionRepository {
         built: &BuiltDescriptor,
         prepared: &PreparedNativeMetadataRetention,
     ) -> Result<PreparedMetadataReceipt, SnapshotError> {
+        let (receipt, work) = self.install_with_work(built, prepared).await?;
+        tracing::debug!(
+            snapshot_id = %built.snapshot_id,
+            requested_pages = work.requested_pages,
+            payload_pages_omitted = work.payload_pages_omitted,
+            payload_pages_encoded = work.payload_pages_encoded,
+            requested_payload_bytes_validated = work.requested_payload_bytes_validated,
+            payload_bytes_omitted = work.payload_bytes_omitted,
+            payload_bytes_encoded = work.payload_bytes_encoded,
+            metadata_parameter_bytes = work.metadata_parameter_bytes,
+            payload_parameter_bytes = work.payload_parameter_bytes,
+            payload_transactions = work.transactions,
+            registration_queries = work.registration_queries,
+            requested_member_queries = work.requested_member_queries,
+            classification_batches = work.classification_batches,
+            insert_statements = work.insert_statements,
+            byte_comparison_queries = work.byte_comparison_queries,
+            committed_replay_pages = work.committed_replay_pages,
+            payload_batch_elapsed_micros = work.elapsed_micros,
+            "native metadata payload batch work"
+        );
+        Ok(receipt)
+    }
+
+    pub(crate) async fn install_with_work(
+        &self,
+        built: &BuiltDescriptor,
+        prepared: &PreparedNativeMetadataRetention,
+    ) -> Result<
+        (
+            PreparedMetadataReceipt,
+            super::native_metadata_install::LegacyPayloadInstallWork,
+        ),
+        SnapshotError,
+    > {
         if prepared.dag().root() != built.descriptor.metadata_root
             || prepared.scope() != built.descriptor.scope
         {
@@ -80,13 +115,16 @@ impl PostgresNativeSessionRepository {
             .mint_legacy_install_capability(&intent)
             .await
             .map_err(install_error)?;
+        let mut work = super::native_metadata_install::LegacyPayloadInstallWork::default();
         for pages in prepared.dag().payloads().chunks(64) {
-            installer
-                .install_pages_validated(&capability, pages)
+            let batch = installer
+                .install_missing_pages_validated(&capability, pages)
                 .await
                 .map_err(install_error)?;
+            work.record(batch);
         }
-        installer.finalize(&intent).await.map_err(install_error)
+        let receipt = installer.finalize(&intent).await.map_err(install_error)?;
+        Ok((receipt, work))
     }
 
     /// Projection and payload installation happen before this boundary.
