@@ -158,6 +158,7 @@ pub(crate) fn spawn_view_worker_with_round(
         .config_handle()
         .subscribe(config_reload_view_worker_subscriber(control.clone()))?;
     let mut config_updates = control.subscribe();
+    let signal = storage.view_signal();
 
     Ok(Some(tokio::spawn(async move {
         let mut config = control.current();
@@ -219,6 +220,9 @@ pub(crate) fn spawn_view_worker_with_round(
                     }
                 }
                 _ = ticker.tick(), if config.enabled => {
+                    running_round = Some(round(storage.clone()));
+                }
+                _ = signal.notified(), if config.enabled => {
                     running_round = Some(round(storage.clone()));
                 }
             }
@@ -299,14 +303,17 @@ mod tests {
         path::Path,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::Poll,
         time::Duration,
     };
 
     use chrono::Utc;
-    use git_internal::hash::HashKind;
+    use git_internal::{
+        hash::HashKind,
+        internal::object::{commit::Commit, signature::Signature},
+    };
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DbBackend, EntityTrait, Statement,
         TransactionTrait,
@@ -324,10 +331,13 @@ mod tests {
                 base_storage::StorageConnector,
                 init::database_connection,
                 object_storage::mock_object_storage,
+                view_admission::{AdmitLimits, AdmitOutcome, AdmitRequest, FilterDefinition},
                 view_root_chain::DiscontinuityReason,
                 view_storage::{ViewLock, ViewLockMode, acquire_view_lock},
                 view_test_fixtures::{
-                    cas_fixture_main, seed_linear_root_history, seed_single_parent_root_commit,
+                    RootCommitFixture, cas_fixture_main, root_tree_from_paths,
+                    seed_linear_root_history, seed_linear_root_history_with_trees,
+                    seed_single_parent_root_commit, seed_single_parent_root_commit_with_tree,
                     seed_unrelated_root_history, set_fixture_main,
                 },
             },
@@ -388,6 +398,69 @@ mod tests {
         .unwrap();
     }
 
+    struct WorkerRoundHook {
+        started: AtomicUsize,
+        completed: AtomicUsize,
+        pause_next: AtomicBool,
+        paused: AtomicBool,
+        release: Notify,
+        outcomes: Mutex<Vec<CatchUpOutcome>>,
+    }
+
+    impl WorkerRoundHook {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                started: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+                pause_next: AtomicBool::new(false),
+                paused: AtomicBool::new(false),
+                release: Notify::new(),
+                outcomes: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn round(self: &Arc<Self>) -> ViewWorkerRound {
+            let hook = self.clone();
+            Arc::new(move |storage| {
+                let hook = hook.clone();
+                Box::pin(async move {
+                    hook.started.fetch_add(1, Ordering::SeqCst);
+                    if hook.pause_next.swap(false, Ordering::SeqCst) {
+                        hook.paused.store(true, Ordering::SeqCst);
+                        hook.release.notified().await;
+                        hook.paused.store(false, Ordering::SeqCst);
+                    }
+                    let service = storage.view_projection_service();
+                    let outcomes = hook.clone();
+                    let per_candidate: PerCandidate = Arc::new(move |filter_id| {
+                        let service = service.clone();
+                        let outcomes = outcomes.clone();
+                        Box::pin(async move {
+                            let result = service.catch_up(filter_id).await;
+                            if let Ok(outcome) = &result {
+                                outcomes.outcomes.lock().unwrap().push(outcome.clone());
+                            }
+                            result
+                        })
+                    });
+                    let result = compensation_round(storage, per_candidate).await;
+                    hook.completed.fetch_add(1, Ordering::SeqCst);
+                    result
+                })
+            })
+        }
+
+        async fn wait_paused(&self) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self.paused.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("worker round paused");
+        }
+    }
+
     async fn wait_for_count(count: &AtomicUsize, expected: usize, limit: Duration) {
         tokio::time::timeout(limit, async {
             while count.load(Ordering::SeqCst) < expected {
@@ -435,6 +508,140 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    async fn admit_a_filter(storage: &Storage) -> i64 {
+        let canonical = parse_for_registration(":/a").unwrap();
+        let outcome = storage
+            .view_storage()
+            .admit(
+                AdmitRequest::register(
+                    FilterDefinition {
+                        filter_id: canonical.filter_id,
+                        canonical_spec: canonical.canonical_text,
+                        algo_version: 1,
+                        object_format: "sha1".to_owned(),
+                        src_paths: serde_json::json!(["/a"]),
+                        push_enabled: false,
+                    },
+                    None,
+                    "hp32-worker".to_owned(),
+                ),
+                AdmitLimits::from(&storage.config().views),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AdmitOutcome::Admitted { .. }));
+        mega_view_filter::Entity::find()
+            .one(storage.view_storage().get_connection())
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    async fn fixed_root_history(storage: &Storage) -> Vec<RootCommitFixture> {
+        let view_storage = storage.view_storage();
+        let db = view_storage.get_connection();
+        // The shared fixture inserts root main; fixed commits replace that seed.
+        seed_linear_root_history_with_trees(
+            db,
+            HashKind::Sha1,
+            vec![root_tree_from_paths(
+                HashKind::Sha1,
+                &[("fixture.txt".to_owned(), b"seed".to_vec())],
+            )],
+        )
+        .await;
+        let author =
+            Signature::from_data(b"author hp32 <hp32@example.invalid> 1700000000 +0000".to_vec())
+                .unwrap();
+        let committer = Signature::from_data(
+            b"committer hp32 <hp32@example.invalid> 1700000000 +0000".to_vec(),
+        )
+        .unwrap();
+        let mut roots: Vec<RootCommitFixture> = Vec::new();
+        for seq in 0..4 {
+            let tree = root_tree_from_paths(
+                HashKind::Sha1,
+                &[("a/file.txt".to_owned(), format!("r{seq}").into_bytes())],
+            );
+            let commit = Commit::new_with_kind(
+                HashKind::Sha1,
+                author.clone(),
+                committer.clone(),
+                tree.root.id,
+                roots
+                    .last()
+                    .map(|root| root.commit.id)
+                    .into_iter()
+                    .collect(),
+                &format!("fixed r{seq}"),
+            )
+            .unwrap();
+            storage
+                .mono_storage()
+                .save_mega_trees(tree.trees.clone(), commit.id, None)
+                .await
+                .unwrap();
+            storage
+                .mono_storage()
+                .save_mega_commits(vec![commit.clone()], None)
+                .await
+                .unwrap();
+            roots.push(RootCommitFixture {
+                commit,
+                trees: tree.trees,
+                blobs: tree.blobs,
+            });
+        }
+        set_fixture_main(
+            db,
+            &roots[0].commit.id.to_string(),
+            &roots[0].commit.tree_id.to_string(),
+        )
+        .await;
+        roots
+    }
+
+    async fn projection_rows(
+        storage: &Storage,
+    ) -> (Vec<(i64, String)>, Vec<(i64, String, String)>) {
+        let view_storage = storage.view_storage();
+        let db = view_storage.get_connection();
+        let chain = db
+            .query_all_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT seq, commit_id FROM mega_view_root_chain ORDER BY seq".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get("", "seq").unwrap(),
+                    row.try_get("", "commit_id").unwrap(),
+                )
+            })
+            .collect();
+        let map = db
+            .query_all_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT seq_from, view_commit, view_tree FROM mega_view_commit_map ORDER BY seq_from"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get("", "seq_from").unwrap(),
+                    row.try_get("", "view_commit").unwrap(),
+                    row.try_get("", "view_tree").unwrap(),
+                )
+            })
+            .collect();
+        (chain, map)
     }
 
     #[tokio::test]
@@ -1075,6 +1282,245 @@ mod tests {
         wait_until_ready(&storage, 1, 1).await;
         token.cancel();
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signal_permit_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = views_config(temp.path().join("signal"));
+        config.views.worker_interval_secs = 3_600;
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let view_storage = storage.view_storage();
+        let roots = seed_linear_root_history_with_trees(
+            view_storage.get_connection(),
+            HashKind::Sha1,
+            (0..4)
+                .map(|seq| {
+                    root_tree_from_paths(
+                        HashKind::Sha1,
+                        &[("a/file.txt".to_owned(), format!("r{seq}").into_bytes())],
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        assert_eq!(
+            view_storage
+                .extend_root_chain(None, 1000, ViewLockMode::Try)
+                .await
+                .unwrap(),
+            RootChainOutcome::CaughtUp
+        );
+        let filter_pk = admit_a_filter(&storage).await;
+        let r4 = seed_single_parent_root_commit_with_tree(
+            view_storage.get_connection(),
+            HashKind::Sha1,
+            root_tree_from_paths(HashKind::Sha1, &[("a/file.txt".to_owned(), b"r4".to_vec())]),
+            &roots[3],
+            "r4",
+        )
+        .await;
+        assert!(cas_fixture_main(view_storage.get_connection(), &roots[3], &r4).await);
+        assert_eq!(
+            storage
+                .view_projection_service()
+                .catch_up(filter_pk)
+                .await
+                .unwrap(),
+            CatchUpOutcome::MainNotCovered
+        );
+        let check_filter = || async {
+            let row = mega_view_filter::Entity::find_by_id(filter_pk)
+                .one(view_storage.get_connection())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.projected_seq, 4);
+            assert_eq!(row.ready_seq, None);
+            assert!(row.warming_since.is_some());
+        };
+        check_filter().await;
+        let txn = view_storage.get_connection().begin().await.unwrap();
+        assert!(
+            acquire_view_lock(&txn, ViewLock::RootChain, ViewLockMode::Try)
+                .await
+                .unwrap()
+        );
+        let signal = storage.view_signal();
+        while tokio::time::timeout(Duration::from_millis(20), signal.notified())
+            .await
+            .is_ok()
+        {}
+        let token = CancellationToken::new();
+        let hook = WorkerRoundHook::new();
+        let worker = spawn_view_worker_with_round(storage.clone(), token.clone(), hook.round())
+            .unwrap()
+            .unwrap();
+        wait_for_count(&hook.started, 1, Duration::from_secs(2)).await;
+        wait_for_count(&hook.completed, 1, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(hook.started.load(Ordering::SeqCst), 1);
+
+        signal.notify_worker();
+        wait_for_count(&hook.completed, 2, Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(hook.started.load(Ordering::SeqCst), 2);
+
+        hook.pause_next.store(true, Ordering::SeqCst);
+        signal.notify_worker();
+        hook.wait_paused().await;
+        assert_eq!(hook.started.load(Ordering::SeqCst), 3);
+        signal.notify_worker();
+        hook.release.notify_one();
+        wait_for_count(&hook.completed, 4, Duration::from_secs(2)).await;
+        assert_eq!(hook.started.load(Ordering::SeqCst), 4);
+
+        hook.pause_next.store(true, Ordering::SeqCst);
+        signal.notify_worker();
+        hook.wait_paused().await;
+        assert_eq!(hook.started.load(Ordering::SeqCst), 5);
+        for _ in 0..3 {
+            signal.notify_worker();
+        }
+        hook.release.notify_one();
+        wait_for_count(&hook.completed, 6, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(hook.started.load(Ordering::SeqCst), 6);
+
+        hook.pause_next.store(true, Ordering::SeqCst);
+        signal.notify_worker();
+        hook.wait_paused().await;
+        assert_eq!(hook.started.load(Ordering::SeqCst), 7);
+        hook.release.notify_one();
+        wait_for_count(&hook.completed, 7, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(hook.started.load(Ordering::SeqCst), 7);
+        assert_eq!(hook.outcomes.lock().unwrap().len(), 7);
+        assert!(
+            hook.outcomes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|outcome| *outcome == CatchUpOutcome::MainNotCovered)
+        );
+        check_filter().await;
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), signal.notified())
+                .await
+                .is_err(),
+            "worker must not signal itself"
+        );
+        txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn out_of_order_signals_numbering() {
+        async fn run_case(
+            order: char,
+        ) -> (
+            Vec<String>,
+            (Vec<(i64, String)>, Vec<(i64, String, String)>),
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = views_config(temp.path().join(format!("order-{order}")));
+            config.views.worker_interval_secs = 3_600;
+            let storage = test_storage_with_config(temp.path(), config).await;
+            let roots = fixed_root_history(&storage).await;
+            let ids = roots
+                .iter()
+                .map(|root| root.commit.id.to_string())
+                .collect::<Vec<_>>();
+            let view_storage = storage.view_storage();
+            let db = view_storage.get_connection();
+            if order == 'R' {
+                for next in 1..4 {
+                    assert!(cas_fixture_main(db, &roots[next - 1], &roots[next]).await);
+                }
+            }
+            let filter_pk = admit_a_filter(&storage).await;
+            let hook = WorkerRoundHook::new();
+            let token = CancellationToken::new();
+            let worker = spawn_view_worker_with_round(storage.clone(), token.clone(), hook.round())
+                .unwrap()
+                .unwrap();
+            wait_for_count(&hook.completed, 1, Duration::from_secs(5)).await;
+            wait_until_ready(&storage, filter_pk, if order == 'R' { 4 } else { 1 }).await;
+            let mut completed = 1;
+            match order {
+                'A' => {
+                    for next in 1..4 {
+                        assert!(cas_fixture_main(db, &roots[next - 1], &roots[next]).await);
+                        storage.view_signal().notify_worker();
+                        completed += 1;
+                        wait_for_count(&hook.completed, completed, Duration::from_secs(5)).await;
+                    }
+                }
+                'B' => {
+                    for next in 1..4 {
+                        assert!(cas_fixture_main(db, &roots[next - 1], &roots[next]).await);
+                    }
+                    for _label in [3, 1, 2] {
+                        storage.view_signal().notify_worker();
+                        completed += 1;
+                        wait_for_count(&hook.completed, completed, Duration::from_secs(5)).await;
+                    }
+                }
+                'C' => {
+                    for next in 1..3 {
+                        assert!(cas_fixture_main(db, &roots[next - 1], &roots[next]).await);
+                    }
+                    storage.view_signal().notify_worker(); // r2
+                    completed += 1;
+                    wait_for_count(&hook.completed, completed, Duration::from_secs(5)).await;
+                    assert!(cas_fixture_main(db, &roots[2], &roots[3]).await);
+                    for _label in [1, 3] {
+                        storage.view_signal().notify_worker();
+                        completed += 1;
+                        wait_for_count(&hook.completed, completed, Duration::from_secs(5)).await;
+                    }
+                }
+                'R' => {}
+                _ => unreachable!(),
+            }
+            wait_until_projected(&storage, filter_pk, 4).await;
+            let row = mega_view_filter::Entity::find_by_id(filter_pk)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(row.ready_seq.is_some());
+            let result = projection_rows(&storage).await;
+            assert_eq!(
+                result.0.iter().map(|row| row.0).collect::<Vec<_>>(),
+                vec![1, 2, 3, 4]
+            );
+            token.cancel();
+            tokio::time::timeout(Duration::from_secs(5), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            (ids, result)
+        }
+
+        let (reference_ids, reference_rows) = run_case('R').await;
+        for order in ['A', 'B', 'C'] {
+            let (ids, rows) = run_case(order).await;
+            assert_eq!(ids, reference_ids, "fixed root IDs differ in order {order}");
+            assert_eq!(
+                rows.0, reference_rows.0,
+                "root chain differs in order {order}"
+            );
+            assert_eq!(
+                rows.1, reference_rows.1,
+                "view map differs in order {order}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -489,3 +489,34 @@ SMTP dependency.
 **这个 target 只有一个用例，且必须 `--test-threads=1`**：它用 `std::env::set_var` 把数据库与对象存储指向本用例专属的库（`.env.test` 里的 `MEGA_DATABASE__DB_URL` 指向共享 admin 库，而环境变量优先级高于配置文件）。这条约束不是靠注释请求后来者小心，而是**运行期强制**：第二次构造 fixture 直接 panic 并说明原因——两个 fixture 会互相覆盖对方的数据库地址，而且谁都不会报错，于是比对会静悄悄地跑在别人的库上。
 
 **这一面量得到什么、量不到什么**：快照收录的是「最终存在的条目」，因此**创建后又删除**的临时文件不会被发现；两个受监视根目录之外的写也不会。前者是快照法的固有边界（要抓它需要的是事件流而不是快照），后者是登记范围的选择。两条都写在这里，是因为一份不说明边界的「零副作用」证明会被读成比它实际更强的东西。
+
+## DB 模块覆盖：C 段信号与推送驱动投影（HP-32）
+
+`PushQueueService` 在已提交轮次的 C 段索引结束后只向所属 `Storage` 的
+`ViewSignal` 写入一个 `Notify::notify_one` 许可。该动作不等待 worker，也不查询
+`mega_view_*` 表；索引成功、被后续同路径轮次跳过和索引失败的补偿路径都保留这一
+通知。句柄在 `PushQueueService` 构造时注入，随后不再变更。detach 中无根树的
+`Done` 路径与已挂载 ImportRepo 只更新 refs 的 `Done` 路径均不经过 C 段，根不前进，
+因此不发送通知。缺省关闭 `[views].enabled` 时没有 worker 消费许可。
+
+`spawn_view_worker_with_round` 同时等待周期 tick 与同一信号。worker 正在执行一轮时
+到达的多个通知由 `Notify` 合并为一个许可，因此当前轮结束后只追加一轮；worker 不会
+给自己发送信号。信号是进程内机制，其他副本通过周期补偿追平。
+
+覆盖入口（进程级用例需要 `docker compose ... --profile git up -d --wait`，且
+`MEGA2_IT_SKIP_GIT_CLI` 不得设置）：
+
+- `jupiter::service::push_queue_service::tests::c_segment_signal_after_done` 覆盖 push、merge、attach、跳过和索引错误；
+- `c_segment_signal_no_view_sql` 记录 push 与 merge 的 SQL，断言没有 `mega_view_` 表访问；
+- `c_segment_signal_never_blocks_round` 对 push、merge、attach 各自比较无 worker、worker 轮次暂停和任务终止时的有界 B3 返回；
+- `jupiter::service::view_worker::tests::signal_permit_rules` 通过实例级钩子在补偿轮开始前暂停，并在 `per_candidate` 包装中记录真实 `catch_up` 返回值，验证许可合并及不会自行续发；补偿轮本身不变；
+- `out_of_order_signals_numbering` 在三个独立 schema 中按不同顺序落地根提交并发送无内容信号，与第四个冷启动 schema 逐行比较根链及映射行；
+- `integration_git_cli_view_push_driven_projection_rows` 以 3600 秒周期排除后续 tick，覆盖 N=1、N>1、源路径外和排除目录的推送；净零推送确认根链及映射行不变；
+- `integration_git_cli_view_enabled_trunk_path_regression` 复用原有两个 trunk 用例的完整正文与断言，通过注册及关停前回调额外验证启用侧追平与 I3。两个进程级用例覆盖 `start_http` 启动 worker 与 SIGINT 关停等待 worker 的路径。
+
+ER-05 检查点：sea-orm 的 metric 回调不记录 `execute_unprepared`，因此
+`c_segment_signal_no_view_sql` 的 SQL 记录不能覆盖这类语句。push B3、merge B3、
+C 段的生产路径及本卡新增生产代码均不调用它：`blob_path_index.rs`、
+`push_queue_storage.rs` 无此调用，`push_queue_service.rs` 与 `mono_storage.rs`
+的命中只在测试模块内。启用视图的物化链回归按 ADR-HP-11 重跑 N=1 三轮快进与
+N>1 squash 对齐两例并增加 I3；其他缺省配置下的 trunk 用例仍由全量门覆盖。

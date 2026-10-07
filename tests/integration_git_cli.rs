@@ -29,6 +29,7 @@ use std::{
 };
 
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+use sha2::Digest;
 use tempfile::TempDir;
 
 const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
@@ -1872,13 +1873,20 @@ fn integration_git_cli_trunk_n1_identity_three_ff_and_no_cl_refs() {
         eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
+    run_trunk_n1_identity(&trunk_boot_env(), |_, _| {}, |_, _| {});
+}
 
+fn run_trunk_n1_identity<F, G>(extra: &[(&str, &str)], after_seed: F, before_shutdown: G)
+where
+    F: FnOnce(&GitCliEnv, u16),
+    G: FnOnce(&GitCliEnv, u16),
+{
     let env = GitCliEnv::new();
-    let extra = trunk_boot_env();
     let (mut service, port, _stdout_path, stderr_path) =
-        boot_service_http_with_env(&env, None, None, &extra);
+        boot_service_http_with_env(&env, None, None, extra);
 
     seed_project_foo(&env.case_dir, port);
+    after_seed(&env, port);
     let foo_url = trunk_subpath_url(port, "/project/foo");
     git_ok_no_auth(&env.case_dir, &["clone", &foo_url, "foo"]);
     configure_git_identity_no_auth(&env.case_dir, "foo");
@@ -1936,11 +1944,248 @@ fn integration_git_cli_trunk_n1_identity_three_ff_and_no_cl_refs() {
         "push_auth=none must record NULL requester: {requesters:?}"
     );
 
+    before_shutdown(&env, port);
     let status = service.shutdown_via_sigint(Duration::from_secs(60));
     assert!(
         status.success(),
         "service did not shut down cleanly: {status}\nstderr:\n{}",
         read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_view_push_driven_projection_rows() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for push-driven view projection"
+    );
+
+    let env = GitCliEnv::new();
+    let mut extra = trunk_boot_env().to_vec();
+    extra.extend([
+        ("MEGA_VIEWS__ENABLED", "true"),
+        ("MEGA_VIEWS__WORKER_INTERVAL_SECS", "3600"),
+    ]);
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &extra);
+
+    seed_project_foo(&env.case_dir, port);
+    let foo_url = trunk_subpath_url(port, "/project/foo");
+    git_ok_no_auth(&env.case_dir, &["clone", &foo_url, "foo-view"]);
+    configure_git_identity_no_auth(&env.case_dir, "foo-view");
+
+    // Create the excluded subtree before registering the active filter. The
+    // later warmup push gives the worker another signal to project this root.
+    let excluded = env.case_dir.join("foo-view").join("gen").join("seed.txt");
+    fs::create_dir_all(excluded.parent().expect("gen parent")).expect("mkdir gen");
+    fs::write(&excluded, "excluded seed\n").expect("write excluded seed");
+    git_ok_no_auth(&env.case_dir, &["-C", "foo-view", "add", "gen/seed.txt"]);
+    git_ok_no_auth(
+        &env.case_dir,
+        &["-C", "foo-view", "commit", "-m", "seed excluded subtree"],
+    );
+    git_cli::assert_git_success(&trunk_push(&env.case_dir, "foo-view"), "excluded seed push");
+
+    insert_active_view_filter(
+        &env.database.db_url,
+        1,
+        ":/project/foo:exclude[::gen/]",
+        "d4ac1c179b443ca088dfc86eebbd11190ee8930675d22b390538832c749b9c1c",
+    );
+
+    let project_url = trunk_subpath_url(port, "/project");
+    git_ok_no_auth(&env.case_dir, &["clone", &project_url, "project-view"]);
+    configure_git_identity_no_auth(&env.case_dir, "project-view");
+    let bar_seed = env
+        .case_dir
+        .join("project-view")
+        .join("bar")
+        .join("seed.txt");
+    fs::create_dir_all(bar_seed.parent().expect("bar parent")).expect("mkdir bar");
+    fs::write(&bar_seed, "bar seed\n").expect("write bar seed");
+    git_ok_no_auth(
+        &env.case_dir,
+        &["-C", "project-view", "add", "bar/seed.txt"],
+    );
+    git_ok_no_auth(
+        &env.case_dir,
+        &[
+            "-C",
+            "project-view",
+            "commit",
+            "-m",
+            "warm view from sibling path",
+        ],
+    );
+    git_cli::assert_git_success(
+        &trunk_push(&env.case_dir, "project-view"),
+        "view warmup trunk push",
+    );
+    let m0 = wait_for_view_projection(&env.database.db_url, 1, true);
+
+    fs::write(
+        env.case_dir.join("foo-view").join("x.txt"),
+        "first projected change\n",
+    )
+    .expect("write first projected change");
+    git_ok_no_auth(&env.case_dir, &["-C", "foo-view", "add", "x.txt"]);
+    git_ok_no_auth(
+        &env.case_dir,
+        &["-C", "foo-view", "commit", "-m", "first projected change"],
+    );
+    git_cli::assert_git_success(&trunk_push(&env.case_dir, "foo-view"), "first trunk push");
+    assert_eq!(
+        wait_for_view_projection(&env.database.db_url, 1, false),
+        m0 + 1,
+        "a filtered N=1 source change must add one view map row"
+    );
+
+    for round in 1..=3 {
+        fs::write(
+            env.case_dir.join("foo-view").join("y.txt"),
+            format!("batch {round}\n"),
+        )
+        .expect("write batch change");
+        git_ok_no_auth(&env.case_dir, &["-C", "foo-view", "add", "y.txt"]);
+        git_ok_no_auth(
+            &env.case_dir,
+            &["-C", "foo-view", "commit", "-m", &format!("batch {round}")],
+        );
+    }
+    git_cli::assert_git_success(&trunk_push(&env.case_dir, "foo-view"), "batched trunk push");
+    assert_eq!(
+        wait_for_view_projection(&env.database.db_url, 1, false),
+        m0 + 2,
+        "a filtered N>1 squash must add one view map row"
+    );
+    git_ok_no_auth(&env.case_dir, &["-C", "foo-view", "fetch", "origin"]);
+    git_ok_no_auth(
+        &env.case_dir,
+        &["-C", "foo-view", "reset", "--hard", "origin/main"],
+    );
+    assert_eq!(
+        git_stdout_no_auth(&env.case_dir, &["-C", "foo-view", "rev-parse", "HEAD"]),
+        ref_commit_tree(&env.database.db_url, "/project/foo", "refs/heads/main")
+            .expect("project/foo ref after squash")
+            .0,
+        "the source clone must align to the materialized subpath ref"
+    );
+
+    let bar_url = trunk_subpath_url(port, "/project/bar");
+    git_ok_no_auth(&env.case_dir, &["clone", &bar_url, "bar-view"]);
+    configure_git_identity_no_auth(&env.case_dir, "bar-view");
+    fs::write(
+        env.case_dir.join("bar-view").join("outside.txt"),
+        "outside\n",
+    )
+    .expect("write outside change");
+    git_ok_no_auth(&env.case_dir, &["-C", "bar-view", "add", "outside.txt"]);
+    git_ok_no_auth(
+        &env.case_dir,
+        &["-C", "bar-view", "commit", "-m", "outside view source path"],
+    );
+    git_cli::assert_git_success(&trunk_push(&env.case_dir, "bar-view"), "outside path push");
+    assert_eq!(
+        wait_for_view_projection(&env.database.db_url, 1, false),
+        m0 + 2
+    );
+
+    fs::write(
+        env.case_dir.join("foo-view").join("gen").join("seed.txt"),
+        "excluded update\n",
+    )
+    .expect("write excluded update");
+    git_ok_no_auth(&env.case_dir, &["-C", "foo-view", "add", "gen/seed.txt"]);
+    git_ok_no_auth(
+        &env.case_dir,
+        &["-C", "foo-view", "commit", "-m", "excluded update"],
+    );
+    git_cli::assert_git_success(&trunk_push(&env.case_dir, "foo-view"), "excluded path push");
+    assert_eq!(
+        wait_for_view_projection(&env.database.db_url, 1, false),
+        m0 + 2
+    );
+
+    let root_before_empty = root_chain_count(&env.database.db_url);
+    git_ok_no_auth(
+        &env.case_dir,
+        &[
+            "-C",
+            "foo-view",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "net zero",
+        ],
+    );
+    git_cli::assert_git_success(
+        &trunk_push(&env.case_dir, "foo-view"),
+        "net-zero trunk push",
+    );
+    assert_eq!(
+        wait_for_view_projection(&env.database.db_url, 1, false),
+        m0 + 2
+    );
+    assert_eq!(
+        root_chain_count(&env.database.db_url),
+        root_before_empty,
+        "a net-zero push must not advance the root chain"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_view_enabled_trunk_path_regression() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for view-enabled trunk regressions"
+    );
+    let mut extra = trunk_boot_env().to_vec();
+    extra.extend([
+        ("MEGA_VIEWS__ENABLED", "true"),
+        ("MEGA_VIEWS__WORKER_INTERVAL_SECS", "1"),
+    ]);
+    run_trunk_n1_identity(
+        &extra,
+        |env, _| insert_view_enabled_trunk_filter(env),
+        assert_view_enabled_trunk_state,
+    );
+    run_trunk_n_gt1_squash(
+        &extra,
+        |env, _| insert_view_enabled_trunk_filter(env),
+        assert_view_enabled_trunk_state,
+    );
+}
+
+fn insert_view_enabled_trunk_filter(env: &GitCliEnv) {
+    insert_active_view_filter(
+        &env.database.db_url,
+        1,
+        ":/project/foo",
+        "8fc638cef18f06b23a788f7eb21c085cb4b7aa40974f29010e2e7e60f045834f",
+    );
+}
+
+fn assert_view_enabled_trunk_state(env: &GitCliEnv, port: u16) {
+    assert!(wait_for_view_projection(&env.database.db_url, 1, true) > 0);
+    let root_url = trunk_subpath_url(port, "/");
+    git_ok_no_auth(&env.case_dir, &["clone", &root_url, "view-root-verify"]);
+    let root_project_tree = git_stdout_no_auth(
+        &env.case_dir,
+        &["-C", "view-root-verify", "rev-parse", "HEAD:project/foo"],
+    );
+    assert_eq!(
+        ref_commit_tree(&env.database.db_url, "/project/foo", "refs/heads/main")
+            .expect("project/foo ref after view-enabled trunk run")
+            .1,
+        root_project_tree,
+        "I3: the materialized path ref tree must equal its root-tree resolution"
     );
 }
 
@@ -2022,13 +2267,20 @@ fn integration_git_cli_trunk_n_gt1_squash_sideband_and_nff_align() {
         eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
+    run_trunk_n_gt1_squash(&trunk_boot_env(), |_, _| {}, |_, _| {});
+}
 
+fn run_trunk_n_gt1_squash<F, G>(extra: &[(&str, &str)], after_seed: F, before_shutdown: G)
+where
+    F: FnOnce(&GitCliEnv, u16),
+    G: FnOnce(&GitCliEnv, u16),
+{
     let env = GitCliEnv::new();
-    let extra = trunk_boot_env();
     let (mut service, port, _stdout_path, stderr_path) =
-        boot_service_http_with_env(&env, None, None, &extra);
+        boot_service_http_with_env(&env, None, None, extra);
 
     seed_project_foo(&env.case_dir, port);
+    after_seed(&env, port);
     let foo_url = trunk_subpath_url(port, "/project/foo");
     git_ok_no_auth(&env.case_dir, &["clone", &foo_url, "foo-batch"]);
     configure_git_identity_no_auth(&env.case_dir, "foo-batch");
@@ -2130,6 +2382,7 @@ fn integration_git_cli_trunk_n_gt1_squash_sideband_and_nff_align() {
     );
     assert_eq!(origin_parent, pre_push, "squash parent is the pre-push tip");
 
+    before_shutdown(&env, port);
     let status = service.shutdown_via_sigint(Duration::from_secs(60));
     assert!(
         status.success(),
@@ -5062,6 +5315,105 @@ fn remote_rejected_lines(output: &std::process::Output) -> Vec<String> {
         .filter(|line| line.contains("[remote rejected]"))
         .map(str::to_string)
         .collect()
+}
+
+/// Create the active filter used by the push-driven worker smoke.
+fn insert_active_view_filter(
+    db_url: &str,
+    id: i64,
+    canonical_spec: &str,
+    expected_filter_id: &str,
+) {
+    let actual_filter_id = hex::encode(sha2::Sha256::digest(
+        format!("mega-view-filter/v1\n{canonical_spec}").as_bytes(),
+    ));
+    assert_eq!(
+        actual_filter_id, expected_filter_id,
+        "filter id golden vector"
+    );
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for view filter: {err}"));
+        db.execute_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO mega_view_filter (id, filter_id, canonical_spec, algo_version, object_format, src_paths, push_enabled, projected_seq, ready_seq, warming_since, last_access_at, created_at) VALUES ({id}, '{actual_filter_id}', '{canonical_spec}', 1, 'sha1', '[\"/project/foo\"]'::jsonb, true, 0, NULL, now(), NULL, now())"
+            ),
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("insert active view filter: {err}"));
+    });
+}
+
+/// Wait for a C-segment signal to let the worker project the current root tip.
+/// `ready_seq` records the first covered root, so later advances deliberately
+/// preserve it; only warmup needs to require an initial ready value.
+fn wait_for_view_projection(db_url: &str, filter_id: i64, require_ready: bool) -> i64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = with_runtime(async {
+            let db = Database::connect(db_url)
+                .await
+                .unwrap_or_else(|err| panic!("connect integration DB for view status: {err}"));
+            let row = db
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "SELECT filter.projected_seq, filter.ready_seq, COALESCE((SELECT MAX(seq) FROM mega_view_root_chain), 0) AS tip, (SELECT commit_id FROM mega_view_root_chain ORDER BY seq DESC LIMIT 1) AS tail_commit, (SELECT ref_commit_hash FROM mega_refs WHERE path = '/' AND ref_name = 'refs/heads/main' AND NOT is_cl LIMIT 1) AS main_commit, (SELECT COUNT(*)::bigint FROM mega_view_commit_map WHERE filter_pk = {filter_id}) AS map_count FROM mega_view_filter filter WHERE filter.id = {filter_id}"
+                    ),
+                ))
+                .await
+                .unwrap_or_else(|err| panic!("query view projection status: {err}"))
+                .unwrap_or_else(|| panic!("view filter {filter_id} missing"));
+            (
+                row.try_get::<i64>("", "projected_seq")
+                    .expect("projected_seq"),
+                row.try_get::<Option<i64>>("", "ready_seq")
+                    .expect("ready_seq"),
+                row.try_get::<i64>("", "tip").expect("tip"),
+                row.try_get::<Option<String>>("", "tail_commit")
+                    .expect("tail_commit"),
+                row.try_get::<Option<String>>("", "main_commit")
+                    .expect("main_commit"),
+                row.try_get::<i64>("", "map_count").expect("map_count"),
+            )
+        });
+        if snapshot.0 == snapshot.2
+            && snapshot.3 == snapshot.4
+            && (!require_ready || snapshot.1.is_some())
+        {
+            return snapshot.5;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "view filter {filter_id} did not catch up before deadline: projected={}, ready={:?}, tip={}, tail={:?}, main={:?}, maps={}",
+            snapshot.0,
+            snapshot.1,
+            snapshot.2,
+            snapshot.3,
+            snapshot.4,
+            snapshot.5,
+        );
+        sleep(Duration::from_millis(100));
+    }
+}
+
+fn root_chain_count(db_url: &str) -> i64 {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for root count: {err}"));
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COUNT(*)::bigint AS count FROM mega_view_root_chain".to_owned(),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("count root chain: {err}"))
+            .expect("root chain count row");
+        row.try_get("", "count").expect("root chain count")
+    })
 }
 
 /// `(ref_commit_hash, ref_tree_hash)` of one `mega_refs` row, if it exists.
