@@ -134,7 +134,8 @@ async fn oid_for(fixture: &Fixture, path: &str) -> String {
 }
 
 async fn set_fact(fixture: &Fixture, oid: &str, size: u64, digest: [u8; 32]) {
-    let db = fixture.state.storage.mono_storage().get_connection();
+    let storage = fixture.state.storage.mono_storage();
+    let db = storage.get_connection();
     let fact = mst2_verified_object::Entity::find()
         .filter(mst2_verified_object::Column::GitOid.eq(oid))
         .one(db)
