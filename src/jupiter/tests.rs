@@ -373,6 +373,7 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
     apply_migrations(&connection, true).await.unwrap();
 
     let webhook_service = WebhookService::mock(svc.webhook_storage.clone());
+    let view_runtime = Arc::new(ViewRuntime::new());
 
     Storage {
         app_service: Arc::new(svc),
@@ -383,6 +384,7 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
             base.clone(),
             config.monorepo.push_policy.clone(),
         )
+        .with_view_signal(view_runtime.signal())
         .with_timeouts(Duration::from_secs(30), Duration::from_millis(20))
         .with_max_push_commits(config.monorepo.max_push_commits)
         .with_native_publication(config.mst2.publication_enabled),
@@ -400,7 +402,7 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         storage_event_emitter:
             crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         notification_storage: NotificationStorage::new(connection.clone()),
-        view_runtime: Arc::new(ViewRuntime::new()),
+        view_runtime,
         entity_store: Arc::new(SharedEntityStore::default()),
         vault: None,
     }
