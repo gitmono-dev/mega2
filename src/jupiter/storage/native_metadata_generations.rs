@@ -6,6 +6,33 @@ use super::*;
 
 const MAX_BINDINGS_BYTES: usize = 12 + 48 * 4096;
 const MAX_PRIMARY_SCOPE_BYTES: usize = 16384;
+const GENERIC_GRAPH_DOMAIN: &str = "generic-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphDomain {
+    LegacyGeneric,
+    Generic,
+    Qualified,
+}
+
+impl GraphDomain {
+    fn from_stored(domain: Option<&str>) -> Result<Self, SnapshotError> {
+        match domain {
+            None => Ok(Self::LegacyGeneric),
+            Some(GENERIC_GRAPH_DOMAIN) => Ok(Self::Generic),
+            Some("qualified-v1") => Ok(Self::Qualified),
+            _ => Err(integrity("unknown stored metadata graph domain")),
+        }
+    }
+
+    fn stored(self) -> Option<&'static str> {
+        match self {
+            Self::LegacyGeneric => None,
+            Self::Generic => Some(GENERIC_GRAPH_DOMAIN),
+            Self::Qualified => Some("qualified-v1"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationPrepareIntent {
@@ -13,8 +40,9 @@ pub struct GenerationPrepareIntent {
     metadata_root: [u8; 32],
     root_generation: i64,
     bindings_digest: [u8; 32],
-    primary_scope: Vec<u8>,
+    primary_scope: Box<[u8]>,
     storage_seal: [u8; 32],
+    graph_domain: GraphDomain,
 }
 
 impl GenerationPrepareIntent {
@@ -125,12 +153,14 @@ struct FixedPlan {
 #[derive(Clone)]
 pub struct PostgresMetadataGenerationRepository {
     inner: PostgresMetadataInstallRepository,
+    graph_domain: &'static str,
 }
 
 impl PostgresMetadataGenerationRepository {
     pub async fn new(connection: DatabaseConnection) -> Result<Self, SnapshotError> {
         Ok(Self {
             inner: PostgresMetadataInstallRepository::new(connection).await?,
+            graph_domain: GENERIC_GRAPH_DOMAIN,
         })
     }
 
@@ -149,7 +179,7 @@ impl PostgresMetadataGenerationRepository {
             if let Some(fixed) = self.load_fixed_plan(&txn, operation_id, &digest).await? {
                 return Ok(fixed.intent);
             }
-            let bindings = allocate_lifetimes(&txn, &plan).await?;
+            let bindings = allocate_lifetimes(&txn, &plan, self.graph_domain).await?;
             let canonical_bindings = bindings.encode()?;
             let bindings_digest = Sha256::digest(&canonical_bindings).into();
             let prepare_id = uuid::Uuid::new_v4().to_string();
@@ -158,16 +188,17 @@ impl PostgresMetadataGenerationRepository {
                 metadata_root: plan.root,
                 root_generation: bindings.0.get(&plan.root).ok_or_else(|| integrity("root lifetime is missing"))?.0,
                 bindings_digest,
-                storage_seal: seal(&prepare_id, &digest, &plan.root, &bindings_digest, &primary_scope)?,
-                primary_scope,
+                storage_seal: seal(&prepare_id, &digest, &plan.root, &bindings_digest, &primary_scope,Some(self.graph_domain))?,
+                primary_scope:primary_scope.into_boxed_slice(),
+                graph_domain:GraphDomain::from_stored(Some(self.graph_domain))?,
             };
             let identity = &plan.identity;
             txn.execute_raw(statement(
                 "INSERT INTO mst2_metadata_prepare(prepare_id,operation_id,manifest_digest,canonical_plan,
                  source_domain,tagged_root_tree_oid,scope,schema_version,metadata_codec,materialization_policy,
                  fs_semantics,access_projection,verification_revision,projection_revision,metadata_root,
-                 node_count,edge_count,total_bytes,state,canonical_bindings,bindings_digest,primary_scope,storage_seal)
-                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'PREPARING',$19,$20,$21,$22)",
+                 node_count,edge_count,total_bytes,state,canonical_bindings,bindings_digest,primary_scope,storage_seal,graph_domain)
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'PREPARING',$19,$20,$21,$22,$23)",
                 [prepare_id.clone().into(),operation_id.into(),digest.to_vec().into(),plan.encode()?.into(),
                  identity.source_domain.clone().into(),identity.tagged_root_tree_oid.clone().into(),identity.scope.clone().into(),
                  (identity.schema_version as i16).into(),(identity.metadata_codec as i16).into(),
@@ -175,7 +206,7 @@ impl PostgresMetadataGenerationRepository {
                  (identity.access_projection as i16).into(),identity.verification_revision.into(),
                  (identity.projection_revision as i16).into(),plan.root.to_vec().into(),(plan.pages.len() as i32).into(),
                  (plan.edges.len() as i32).into(),(plan.total_bytes as i64).into(),canonical_bindings.into(),
-                 intent.bindings_digest.to_vec().into(),intent.primary_scope.clone().into(),intent.storage_seal.to_vec().into()],
+                 intent.bindings_digest.to_vec().into(),intent.primary_scope.to_vec().into(),intent.storage_seal.to_vec().into(),self.graph_domain.into()],
             )).await.map_err(internal)?;
             let pages: Vec<_> = bindings.0.iter().map(|(page,(generation,size))|
                 json!({"page_id":hex::encode(page),"generation":generation,"size":size})).collect();
@@ -380,24 +411,38 @@ impl PostgresMetadataGenerationRepository {
             .verify_receipt_in_txn(txn, &receipt.legacy, tagged_root_tree_oid, scope)
             .await?;
         let row=txn.query_one_raw(statement(
-            "SELECT p.bindings_digest,p.primary_scope,p.storage_seal,
+            "SELECT p.bindings_digest,p.primary_scope,p.storage_seal,p.graph_domain,p.coverage_retired_at IS NOT NULL AS retired,
              CASE WHEN octet_length(p.canonical_bindings)<=$2 THEN sha256(p.canonical_bindings) END AS actual_bindings_digest,
              l.generation,l.state,l.metadata_codec,l.expected_size,m.generation AS root_generation,
              b.generation AS payload_generation,b.byte_size
              FROM mst2_metadata_prepare p LEFT JOIN mst2_metadata_prepare_page m
                ON m.prepare_id=p.prepare_id AND m.page_id=p.metadata_root
              LEFT JOIN mst2_metadata_lifetime l ON l.page_id=m.page_id AND l.generation=m.generation
+             LEFT JOIN mst2_metadata_current c ON c.page_id=l.page_id AND c.generation=l.generation
              LEFT JOIN mst2_metadata_payload b ON b.page_id=m.page_id
-             WHERE p.prepare_id=$1",
+             WHERE p.prepare_id=$1 AND c.page_id IS NOT NULL",
             [receipt.intent.prepare_id().into(),(MAX_BINDINGS_BYTES as i32).into()],
         )).await.map_err(internal)?.ok_or_else(|| unavailable("metadata generation receipt is missing"))?;
+        let domain = row
+            .try_get::<Option<String>>("", "graph_domain")
+            .map_err(internal)?;
+        if GraphDomain::from_stored(domain.as_deref())? != receipt.intent.graph_domain {
+            return Err(integrity(
+                "metadata generation receipt graph domain differs from storage",
+            ));
+        }
+        if row.try_get::<bool>("", "retired").map_err(internal)? {
+            return Err(unavailable(
+                "metadata generation receipt coverage was retired",
+            ));
+        }
         for (column, expected) in [
             ("bindings_digest", receipt.intent.bindings_digest.as_slice()),
             (
                 "actual_bindings_digest",
                 receipt.intent.bindings_digest.as_slice(),
             ),
-            ("primary_scope", receipt.intent.primary_scope.as_slice()),
+            ("primary_scope", receipt.intent.primary_scope.as_ref()),
             ("storage_seal", receipt.intent.storage_seal.as_slice()),
         ] {
             if row
@@ -525,6 +570,9 @@ impl PostgresMetadataGenerationRepository {
         let Some(stored) = load_plan(connection, operation_id, digest).await? else {
             return Ok(None);
         };
+        if stored.record.coverage_retired_at.is_some() {
+            return Err(unavailable("metadata preparation coverage was retired"));
+        }
         let canonical = stored
             .record
             .canonical_bindings
@@ -543,6 +591,7 @@ impl PostgresMetadataGenerationRepository {
             &stored.plan.root,
             &bindings_digest,
             &primary_scope,
+            stored.record.graph_domain.as_deref(),
         )?;
         if stored.record.bindings_digest.as_deref() != Some(bindings_digest.as_slice())
             || stored.record.storage_seal.as_deref() != Some(storage_seal.as_slice())
@@ -558,8 +607,9 @@ impl PostgresMetadataGenerationRepository {
                 .ok_or_else(|| integrity("root lifetime is missing"))?
                 .0,
             bindings_digest,
-            primary_scope,
+            primary_scope: primary_scope.into_boxed_slice(),
             storage_seal,
+            graph_domain: GraphDomain::from_stored(stored.record.graph_domain.as_deref())?,
         };
         self.require_scope(&intent)?;
         let mut actual = BTreeMap::new();
@@ -602,9 +652,14 @@ impl PostgresMetadataGenerationRepository {
     }
 
     fn require_scope(&self, intent: &GenerationPrepareIntent) -> Result<(), SnapshotError> {
-        if intent.primary_scope != self.primary_scope()? {
+        if intent.primary_scope.as_ref() != self.primary_scope()?.as_slice() {
             return Err(integrity(
                 "metadata seal belongs to another captured primary storage scope",
+            ));
+        }
+        if intent.graph_domain.stored().unwrap_or(GENERIC_GRAPH_DOMAIN) != self.graph_domain {
+            return Err(integrity(
+                "metadata seal belongs to another immutable graph domain",
             ));
         }
         Ok(())
@@ -617,13 +672,24 @@ fn seal(
     root: &[u8; 32],
     bindings: &[u8; 32],
     scope: &[u8],
+    graph_domain: Option<&str>,
 ) -> Result<[u8; 32], SnapshotError> {
     if scope.is_empty() || scope.len() > MAX_PRIMARY_SCOPE_BYTES {
         return Err(integrity("invalid metadata generation seal primary scope"));
     }
     let id = uuid::Uuid::parse_str(prepare_id).map_err(internal)?;
     let mut hash = Sha256::new();
-    hash.update(b"MST2-METADATA-STORAGE-SEAL-1\0");
+    match graph_domain {
+        None => hash.update(b"MST2-METADATA-STORAGE-SEAL-1\0"),
+        Some(domain) => {
+            if ![GENERIC_GRAPH_DOMAIN, "qualified-v1"].contains(&domain) {
+                return Err(integrity("unknown metadata graph domain"));
+            }
+            hash.update(b"MST2-METADATA-STORAGE-SEAL-2\0");
+            hash.update((domain.len() as u32).to_be_bytes());
+            hash.update(domain.as_bytes());
+        }
+    }
     hash.update(id.as_bytes());
     hash.update(manifest);
     hash.update(root);
@@ -636,6 +702,7 @@ fn seal(
 async fn allocate_lifetimes(
     txn: &DatabaseTransaction,
     plan: &MetadataInstallPlan,
+    graph_domain: &str,
 ) -> Result<GenerationBindings, SnapshotError> {
     let pages: Vec<_> = plan
         .pages
@@ -647,9 +714,26 @@ async fn allocate_lifetimes(
         "INSERT INTO mst2_metadata_lifetime(page_id,node_id,generation,state,metadata_codec,expected_size)
          SELECT decode(p.page_id,'hex'),'page:sha256:'||p.page_id,1,'RESERVED',$1,p.size
          FROM jsonb_to_recordset($2::jsonb) AS p(page_id text,size integer)
-         ON CONFLICT(page_id) DO NOTHING",
+         ON CONFLICT(page_id,generation) DO NOTHING",
         [(plan.identity.metadata_codec as i16).into(),encoded.clone().into()],
     )).await.map_err(internal)?;
+    txn.execute_raw(statement(
+        "INSERT INTO mst2_metadata_current(page_id,generation)
+         SELECT decode(p.page_id,'hex'),1 FROM jsonb_to_recordset($1::jsonb) AS p(page_id text,size integer)
+         ON CONFLICT(page_id) DO NOTHING",
+        [encoded.clone().into()],
+    )).await.map_err(internal)?;
+    if txn.query_one_raw(statement(
+        "SELECT p.page_id FROM jsonb_to_recordset($1::jsonb) AS p(page_id text,size integer)
+         JOIN mst2_metadata_prepare_page m ON m.page_id=decode(p.page_id,'hex')
+         JOIN mst2_metadata_current c ON c.page_id=m.page_id AND c.generation=m.generation
+         JOIN mst2_metadata_prepare q ON q.prepare_id=m.prepare_id
+         WHERE coalesce(q.graph_domain,'generic-v1')<>$2
+           AND (q.state='PREPARING' OR (q.state='COMMITTED' AND q.coverage_retired_at IS NULL)) LIMIT 1",
+        [encoded.clone().into(),graph_domain.into()],
+    )).await.map_err(internal)?.is_some() {
+        return Err(unavailable("metadata lifetime is covered by another graph domain"));
+    }
     let rows=txn.query_all_raw(statement(
         "SELECT decode(p.page_id,'hex') AS page_id,p.size,l.generation,l.state,l.metadata_codec,l.expected_size,
          n.state AS graph_state,n.kind AS graph_kind,n.bytes AS graph_bytes,
@@ -658,7 +742,8 @@ async fn allocate_lifetimes(
          EXISTS(SELECT 1 FROM mst2_retention_gc_op g WHERE g.node_id=l.node_id
            AND g.operation='REMOVE' AND g.state IN ('PENDING','APPLIED')) AS tombstone
          FROM jsonb_to_recordset($1::jsonb) AS p(page_id text,size integer)
-         JOIN mst2_metadata_lifetime l ON l.page_id=decode(p.page_id,'hex')
+         JOIN mst2_metadata_current c ON c.page_id=decode(p.page_id,'hex')
+         JOIN mst2_metadata_lifetime l ON l.page_id=c.page_id AND l.generation=c.generation
          LEFT JOIN mst2_retention_node n ON n.node_id=l.node_id
          LEFT JOIN mst2_metadata_payload b ON b.page_id=l.page_id ORDER BY l.page_id",
         [encoded.into()],
@@ -748,9 +833,10 @@ async fn check_lifetimes<C: ConnectionTrait>(
          n.state AS graph_state,n.kind AS graph_kind,n.bytes AS graph_bytes,
          EXISTS(SELECT 1 FROM mst2_retention_gc_op g WHERE g.node_id=l.node_id
            AND g.operation='REMOVE' AND g.state IN ('PENDING','APPLIED')) AS tombstone
-         FROM mst2_metadata_prepare_page p LEFT JOIN mst2_metadata_lifetime l ON l.page_id=p.page_id
+         FROM mst2_metadata_prepare_page p LEFT JOIN mst2_metadata_lifetime l ON l.page_id=p.page_id AND l.generation=p.generation
+         LEFT JOIN mst2_metadata_current c ON c.page_id=p.page_id AND c.generation=p.generation
          LEFT JOIN mst2_retention_node n ON n.node_id=l.node_id WHERE p.prepare_id=$1
-           AND (l.page_id IS NULL OR l.generation IS DISTINCT FROM p.generation OR l.metadata_codec<>$2
+           AND (l.page_id IS NULL OR c.page_id IS NULL OR l.generation IS DISTINCT FROM p.generation OR l.metadata_codec<>$2
              OR l.expected_size<>p.expected_size OR l.state NOT IN ('RESERVED','LIVE')
              OR ($3='COMMITTED' AND l.state<>'LIVE')
              OR (l.state='LIVE' AND n.node_id IS NULL)
@@ -864,3 +950,6 @@ async fn lock_prepare(txn: &DatabaseTransaction, prepare_id: &str) -> Result<(),
 #[cfg(test)]
 #[path = "native_metadata_generation_tests.rs"]
 mod tests;
+
+#[path = "native_metadata_history.rs"]
+pub mod history;

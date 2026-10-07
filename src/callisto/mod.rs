@@ -66,6 +66,7 @@ pub mod mega_view_root_chain_scan;
 pub mod mega_webhook;
 pub mod mega_webhook_delivery;
 pub mod mega_webhook_event_type;
+pub mod mst2_metadata_current;
 pub mod mst2_metadata_lifetime;
 pub mod mst2_metadata_payload;
 pub mod mst2_metadata_prepare;

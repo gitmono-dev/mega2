@@ -12,6 +12,7 @@ pub struct Model {
     pub bindings_digest: Option<Vec<u8>>,
     pub primary_scope: Option<Vec<u8>>,
     pub storage_seal: Option<Vec<u8>>,
+    pub graph_domain: Option<String>,
     pub source_domain: String,
     pub tagged_root_tree_oid: String,
     pub scope: String,
@@ -29,6 +30,8 @@ pub struct Model {
     pub state: String,
     pub created_at: DateTimeWithTimeZone,
     pub committed_at: Option<DateTimeWithTimeZone>,
+    pub aborted_at: Option<DateTimeWithTimeZone>,
+    pub coverage_retired_at: Option<DateTimeWithTimeZone>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
