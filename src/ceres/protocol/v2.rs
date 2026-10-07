@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use git_internal::hash::HashKind;
@@ -7,6 +7,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     ceres::{
         api_service::state::ProtocolApiState,
+        pack::RepoHandler,
         protocol::{
             SmartSession,
             import_refs::Refs,
@@ -138,6 +139,16 @@ pub struct V2FetchResponse {
     pub has_packfile: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct V2FetchRequest {
+    want: Vec<String>,
+    have: Vec<String>,
+    deepen_depth: Option<u32>,
+    deepen_relative: bool,
+    done: bool,
+    filter_spec: Option<String>,
+}
+
 pub async fn handle_v2_fetch(
     session: &mut SmartSession,
     state: &ProtocolApiState,
@@ -197,6 +208,30 @@ pub async fn handle_v2_fetch(
     let repo_handler = session
         .repo_handler_with_commands(state, Vec::new())
         .await?;
+    let request = V2FetchRequest {
+        want: want.into_iter().collect(),
+        have: have.into_iter().collect(),
+        deepen_depth,
+        deepen_relative,
+        done,
+        filter_spec,
+    };
+    handle_v2_fetch_with_handler(session, request, repo_handler).await
+}
+
+pub(crate) async fn handle_v2_fetch_with_handler(
+    _session: &mut SmartSession,
+    request: V2FetchRequest,
+    repo_handler: Arc<dyn RepoHandler>,
+) -> Result<V2FetchResponse, ProtocolError> {
+    let V2FetchRequest {
+        want,
+        have,
+        deepen_depth,
+        deepen_relative,
+        done,
+        filter_spec,
+    } = request;
 
     // Capability honesty: `fetch=shallow filter` is advertised globally, but
     // only Monorepo genuinely implements shallow/filter pack generation.
@@ -229,8 +264,7 @@ pub async fn handle_v2_fetch(
         ));
     }
 
-    let want: Vec<String> = want.into_iter().collect();
-    let have: Vec<String> = have.into_iter().collect();
+    repo_handler.check_wants_and_ready(&want).await?;
 
     let mut protocol_buf = BytesMut::new();
     let mut shallow_commits: Vec<String> = Vec::new();
@@ -264,6 +298,8 @@ pub async fn handle_v2_fetch(
             });
         }
     }
+
+    repo_handler.prepare_pack(&want, &have).await?;
 
     let pack_data = if let Some(ref spec) = filter_spec {
         repo_handler
@@ -407,7 +443,7 @@ pub fn is_v2_upload_pack_request(body: &mut Bytes) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
 
     use tempfile::TempDir;
 
@@ -415,7 +451,10 @@ mod tests {
     use crate::{
         ceres::{
             api_service::state::ProtocolApiState,
-            protocol::{ServiceType, TransportProtocol},
+            protocol::{
+                ServiceType, TransportProtocol,
+                smart::test::{DefaultHooksProbe, HookFailure, HookProbe, assert_hook_failure},
+            },
         },
         common::utils::ZERO_ID,
         jupiter::storage::git_db_storage::fu18_support::{test_cache, wired_storage},
@@ -437,6 +476,31 @@ mod tests {
         }
         expected.extend_from_slice(smart::PKT_LINE_END_MARKER);
         expected
+    }
+
+    fn v2_request(
+        want: Vec<String>,
+        have: Vec<String>,
+        deepen_depth: Option<u32>,
+        done: bool,
+        filter_spec: Option<&str>,
+    ) -> V2FetchRequest {
+        V2FetchRequest {
+            want,
+            have,
+            deepen_depth,
+            deepen_relative: false,
+            done,
+            filter_spec: filter_spec.map(str::to_owned),
+        }
+    }
+
+    fn v2_session() -> SmartSession {
+        SmartSession::new(
+            PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        )
     }
 
     #[test]
@@ -487,6 +551,323 @@ mod tests {
 
         let err = parse_v2_command(&mut buf.freeze()).unwrap_err();
         assert!(err.to_string().contains("missing command"));
+    }
+
+    #[tokio::test]
+    async fn view_hooks_call_sites_v2() {
+        let want = "6".repeat(40);
+        let common = "7".repeat(40);
+        let missing = "8".repeat(40);
+
+        let handler = Arc::new(HookProbe::new());
+        assert!(matches!(
+            handle_v2_fetch_with_handler(
+                &mut v2_session(),
+                v2_request(
+                    vec![want.clone()],
+                    Vec::new(),
+                    None,
+                    true,
+                    Some("blob:none")
+                ),
+                handler.clone(),
+            )
+            .await,
+            Err(ProtocolError::InvalidInput(_))
+        ));
+        assert!(handler.events().is_empty());
+
+        let handler = Arc::new(HookProbe::new());
+        assert!(matches!(
+            handle_v2_fetch_with_handler(
+                &mut v2_session(),
+                v2_request(vec![want.clone()], Vec::new(), Some(1), true, None),
+                handler.clone(),
+            )
+            .await,
+            Err(ProtocolError::InvalidInput(_))
+        ));
+        assert!(handler.events().is_empty());
+
+        let handler = Arc::new(HookProbe::new());
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(vec![want.clone()], vec![missing.clone()], None, false, None),
+            handler.clone(),
+        )
+        .await
+        .expect("NAK round");
+        assert_eq!(
+            &response.protocol_buf[..],
+            b"0014acknowledgments\n0008NAK\n0000"
+        );
+        assert!(!response.has_packfile);
+        assert_eq!(
+            handler.events(),
+            ["check_wants_and_ready", "check_commit_exist"]
+        );
+
+        let handler = Arc::new(HookProbe::new().with_common(&common));
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(vec![want.clone()], vec![common.clone()], None, false, None),
+            handler.clone(),
+        )
+        .await
+        .expect("ready round");
+        assert_eq!(
+            &response.protocol_buf[..],
+            format!("0014acknowledgments\n0031ACK {common}\n000aready\n0001").as_bytes()
+        );
+        assert!(response.has_packfile);
+        assert_eq!(
+            handler.events(),
+            [
+                "check_wants_and_ready",
+                "check_commit_exist",
+                "prepare_pack",
+                "incremental_pack",
+            ]
+        );
+
+        let handler = Arc::new(HookProbe::new());
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(vec![want.clone()], Vec::new(), None, true, None),
+            handler.clone(),
+        )
+        .await
+        .expect("done full pack");
+        assert!(response.protocol_buf.is_empty());
+        assert!(response.has_packfile);
+        assert_eq!(
+            handler.events(),
+            ["check_wants_and_ready", "prepare_pack", "full_pack"]
+        );
+
+        let handler = Arc::new(HookProbe::new());
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(vec![want.clone()], vec![common.clone()], None, true, None),
+            handler.clone(),
+        )
+        .await
+        .expect("done incremental pack");
+        assert!(response.protocol_buf.is_empty());
+        assert!(response.has_packfile);
+        assert_eq!(
+            handler.events(),
+            ["check_wants_and_ready", "prepare_pack", "incremental_pack"]
+        );
+
+        let handler = Arc::new(HookProbe::new().with_filtered_fetch());
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(
+                vec![want.clone()],
+                Vec::new(),
+                None,
+                true,
+                Some("blob:none"),
+            ),
+            handler.clone(),
+        )
+        .await
+        .expect("filtered pack");
+        assert!(response.protocol_buf.is_empty());
+        assert!(response.has_packfile);
+        assert_eq!(
+            handler.events(),
+            ["check_wants_and_ready", "prepare_pack", "filtered_pack"]
+        );
+
+        let default = Arc::new(DefaultHooksProbe::new());
+        assert!(matches!(
+            handle_v2_fetch_with_handler(
+                &mut v2_session(),
+                v2_request(
+                    vec![want.clone()],
+                    Vec::new(),
+                    None,
+                    true,
+                    Some("blob:none")
+                ),
+                default.clone(),
+            )
+            .await,
+            Err(ProtocolError::InvalidInput(_))
+        ));
+        assert!(default.events().is_empty());
+
+        let default = Arc::new(DefaultHooksProbe::new());
+        assert!(matches!(
+            handle_v2_fetch_with_handler(
+                &mut v2_session(),
+                v2_request(vec![want.clone()], Vec::new(), Some(1), true, None),
+                default.clone(),
+            )
+            .await,
+            Err(ProtocolError::InvalidInput(_))
+        ));
+        assert!(default.events().is_empty());
+
+        let default = Arc::new(DefaultHooksProbe::new());
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(vec![want.clone()], vec![missing], None, false, None),
+            default.clone(),
+        )
+        .await
+        .expect("default NAK round");
+        assert_eq!(
+            &response.protocol_buf[..],
+            b"0014acknowledgments\n0008NAK\n0000"
+        );
+        assert!(!response.has_packfile);
+        assert_eq!(default.events(), ["check_commit_exist"]);
+
+        let default = Arc::new(DefaultHooksProbe::new().with_common(&common));
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(vec![want.clone()], vec![common.clone()], None, false, None),
+            default.clone(),
+        )
+        .await
+        .expect("default ready round");
+        assert_eq!(
+            &response.protocol_buf[..],
+            format!("0014acknowledgments\n0031ACK {common}\n000aready\n0001").as_bytes()
+        );
+        assert!(response.has_packfile);
+        assert_eq!(default.events(), ["check_commit_exist", "incremental_pack"]);
+
+        let default = Arc::new(DefaultHooksProbe::new());
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(vec![want.clone()], Vec::new(), None, true, None),
+            default.clone(),
+        )
+        .await
+        .expect("default full pack");
+        assert!(response.protocol_buf.is_empty());
+        assert!(response.has_packfile);
+        assert_eq!(default.events(), ["full_pack"]);
+
+        let default = Arc::new(DefaultHooksProbe::new());
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(vec![want.clone()], vec![common], None, true, None),
+            default.clone(),
+        )
+        .await
+        .expect("default incremental pack");
+        assert!(response.protocol_buf.is_empty());
+        assert!(response.has_packfile);
+        assert_eq!(default.events(), ["incremental_pack"]);
+
+        let default = Arc::new(DefaultHooksProbe::new().with_filtered_fetch());
+        let response = handle_v2_fetch_with_handler(
+            &mut v2_session(),
+            v2_request(vec![want], Vec::new(), None, true, Some("blob:none")),
+            default.clone(),
+        )
+        .await
+        .expect("default filtered pack");
+        assert!(response.protocol_buf.is_empty());
+        assert!(response.has_packfile);
+        assert_eq!(default.events(), ["filtered_pack"]);
+    }
+
+    #[tokio::test]
+    async fn view_hook_errors_v2() {
+        let want = "9".repeat(40);
+        let common = "a".repeat(40);
+        let missing = "b".repeat(40);
+        for failure in [HookFailure::RootChainHalted, HookFailure::PackRejected] {
+            let handler = Arc::new(HookProbe::new().failing_check(failure));
+            let err = match handle_v2_fetch_with_handler(
+                &mut v2_session(),
+                v2_request(vec![want.clone()], vec![missing.clone()], None, false, None),
+                handler.clone(),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("NAK check hook error"),
+            };
+            assert_hook_failure(&err, failure);
+            assert_eq!(handler.events(), ["check_wants_and_ready"]);
+
+            let ready_request =
+                v2_request(vec![want.clone()], vec![common.clone()], None, false, None);
+            let handler = Arc::new(HookProbe::new().with_common(&common).failing_check(failure));
+            let err = match handle_v2_fetch_with_handler(
+                &mut v2_session(),
+                ready_request.clone(),
+                handler.clone(),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("ready check hook error"),
+            };
+            assert_hook_failure(&err, failure);
+            assert_eq!(handler.events(), ["check_wants_and_ready"]);
+
+            let handler = Arc::new(
+                HookProbe::new()
+                    .with_common(&common)
+                    .failing_prepare(failure),
+            );
+            let err = match handle_v2_fetch_with_handler(
+                &mut v2_session(),
+                ready_request,
+                handler.clone(),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("ready prepare hook error"),
+            };
+            assert_hook_failure(&err, failure);
+            assert_eq!(
+                handler.events(),
+                [
+                    "check_wants_and_ready",
+                    "check_commit_exist",
+                    "prepare_pack",
+                ]
+            );
+
+            let done_request = v2_request(vec![want.clone()], Vec::new(), None, true, None);
+            let handler = Arc::new(HookProbe::new().failing_check(failure));
+            let err = match handle_v2_fetch_with_handler(
+                &mut v2_session(),
+                done_request.clone(),
+                handler.clone(),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("done check hook error"),
+            };
+            assert_hook_failure(&err, failure);
+            assert_eq!(handler.events(), ["check_wants_and_ready"]);
+
+            let handler = Arc::new(HookProbe::new().failing_prepare(failure));
+            let err = match handle_v2_fetch_with_handler(
+                &mut v2_session(),
+                done_request,
+                handler.clone(),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("done prepare hook error"),
+            };
+            assert_hook_failure(&err, failure);
+            assert_eq!(handler.events(), ["check_wants_and_ready", "prepare_pack"]);
+        }
     }
 
     #[test]

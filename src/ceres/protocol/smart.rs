@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     pin::Pin,
+    sync::Arc,
     time::Instant,
 };
 
@@ -134,6 +135,29 @@ impl SmartSession {
     ) -> Result<(ReceiverStream<Vec<u8>>, BytesMut), ProtocolError> {
         let repo_handler = self.repo_handler_with_commands(state, Vec::new()).await?;
 
+        self.git_upload_pack_with_handler_and_shallow_info(
+            upload_request,
+            shallow_info_sent,
+            repo_handler,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_upload_pack_with_handler(
+        &mut self,
+        upload_request: &mut Bytes,
+        repo_handler: Arc<dyn RepoHandler>,
+    ) -> Result<(ReceiverStream<Vec<u8>>, BytesMut), ProtocolError> {
+        self.git_upload_pack_with_handler_and_shallow_info(upload_request, false, repo_handler)
+            .await
+    }
+
+    async fn git_upload_pack_with_handler_and_shallow_info(
+        &mut self,
+        upload_request: &mut Bytes,
+        shallow_info_sent: bool,
+        repo_handler: Arc<dyn RepoHandler>,
+    ) -> Result<(ReceiverStream<Vec<u8>>, BytesMut), ProtocolError> {
         let mut want: HashSet<String> = HashSet::new();
         let mut have: HashSet<String> = HashSet::new();
         let mut last_common_commit = String::new();
@@ -269,7 +293,10 @@ impl SmartSession {
             ));
         }
 
+        repo_handler.check_wants_and_ready(&want).await?;
+
         if have.is_empty() {
+            repo_handler.prepare_pack(&want, &have).await?;
             if let Some(depth) = deepen_depth {
                 let (stream, shallow_commits) = repo_handler
                     .shallow_pack(want, depth, deepen_relative)
@@ -301,6 +328,7 @@ impl SmartSession {
             add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
         } else {
             if self.capabilities.contains(&Capability::MultiAckDetailed) {
+                repo_handler.prepare_pack(&want, &have).await?;
                 for hash in &have {
                     if repo_handler.check_commit_exist(hash).await {
                         add_pkt_line_string(&mut protocol_buf, format!("ACK {hash} common\n"));
@@ -974,21 +1002,38 @@ pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<PktLine, ProtocolError> {
 
 #[cfg(test)]
 pub mod test {
-    use std::{path::PathBuf, process::Command, time::Duration};
+    use std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+        process::Command,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
+    use async_trait::async_trait;
     use bytes::{BufMut, Bytes, BytesMut};
     use futures::future;
-    use git_internal::hash::HashKind;
+    use git_internal::{
+        errors::GitError,
+        hash::HashKind,
+        internal::{
+            metadata::{EntryMeta, MetaAttached},
+            object::tree::Tree,
+            pack::entry::Entry,
+        },
+    };
     use tempfile::TempDir;
     use tokio::{task, time::sleep};
+    use tokio_stream::wrappers::ReceiverStream;
 
     use crate::{
         callisto::sea_orm_active_enums::RefTypeEnum,
         ceres::{
             api_service::state::ProtocolApiState,
+            pack::RepoHandler,
             protocol::{
                 Capability, ServiceType, SmartSession, TransportProtocol,
-                import_refs::{CommandType, RefCommand},
+                import_refs::{CommandType, RefCommand, Refs},
                 smart::{
                     PKT_LINE_END_MARKER, PktLine, add_pkt_line_string, advertised_capabilities,
                     read_until_white_space, try_read_pkt_line,
@@ -996,11 +1041,323 @@ pub mod test {
             },
         },
         common::{
-            errors::ProtocolError,
+            errors::{MegaError, ProtocolError, ViewUnavailableReason},
             utils::{MEGA_BRANCH_NAME, ZERO_ID},
         },
         jupiter::storage::git_db_storage::fu18_support::{test_cache, wired_storage},
+        orbit_api::object_storage::MultiObjectByteStream,
     };
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum HookFailure {
+        WarmingUp,
+        RootChainHalted,
+        PackRejected,
+    }
+
+    impl HookFailure {
+        fn into_error(self) -> MegaError {
+            match self {
+                Self::WarmingUp => MegaError::ViewUnavailable {
+                    filter_id: "a".repeat(64),
+                    reason: ViewUnavailableReason::WarmingUp,
+                },
+                Self::RootChainHalted => MegaError::ViewUnavailable {
+                    filter_id: "a".repeat(64),
+                    reason: ViewUnavailableReason::RootChainHalted,
+                },
+                Self::PackRejected => MegaError::ViewPackRejected(format!(
+                    "upload-pack: not our ref {}",
+                    "b".repeat(40)
+                )),
+            }
+        }
+    }
+
+    pub fn assert_hook_failure(error: &ProtocolError, failure: HookFailure) {
+        match (failure, error) {
+            (HookFailure::WarmingUp, ProtocolError::ViewUnavailable { filter_id, reason }) => {
+                assert_eq!(filter_id, &"a".repeat(64));
+                assert_eq!(*reason, ViewUnavailableReason::WarmingUp);
+            }
+            (
+                HookFailure::RootChainHalted,
+                ProtocolError::ViewUnavailable { filter_id, reason },
+            ) => {
+                assert_eq!(filter_id, &"a".repeat(64));
+                assert_eq!(*reason, ViewUnavailableReason::RootChainHalted);
+            }
+            (HookFailure::PackRejected, ProtocolError::PackRejected(message)) => {
+                assert_eq!(
+                    message,
+                    &format!("upload-pack: not our ref {}", "b".repeat(40))
+                );
+            }
+            _ => panic!("unexpected protocol error for {failure:?}: {error:?}"),
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ProbeState {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        common: HashSet<String>,
+        supports_shallow: bool,
+        supports_filtered: bool,
+    }
+
+    impl ProbeState {
+        fn record(&self, event: &'static str) {
+            self.events.lock().expect("probe events lock").push(event);
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().expect("probe events lock").clone()
+        }
+
+        fn empty_stream() -> ReceiverStream<Vec<u8>> {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            ReceiverStream::new(rx)
+        }
+    }
+
+    pub struct HookProbe {
+        state: ProbeState,
+        check_failure: Option<HookFailure>,
+        prepare_failure: Option<HookFailure>,
+    }
+
+    impl HookProbe {
+        pub fn new() -> Self {
+            Self {
+                state: ProbeState::default(),
+                check_failure: None,
+                prepare_failure: None,
+            }
+        }
+
+        pub fn with_common(mut self, hash: &str) -> Self {
+            self.state.common.insert(hash.to_owned());
+            self
+        }
+
+        pub fn with_shallow_fetch(mut self) -> Self {
+            self.state.supports_shallow = true;
+            self
+        }
+
+        pub fn with_filtered_fetch(mut self) -> Self {
+            self.state.supports_filtered = true;
+            self
+        }
+
+        pub fn failing_check(mut self, failure: HookFailure) -> Self {
+            self.check_failure = Some(failure);
+            self
+        }
+
+        pub fn failing_prepare(mut self, failure: HookFailure) -> Self {
+            self.prepare_failure = Some(failure);
+            self
+        }
+
+        pub fn events(&self) -> Vec<&'static str> {
+            self.state.events()
+        }
+    }
+
+    impl Default for HookProbe {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    pub struct DefaultHooksProbe {
+        state: ProbeState,
+    }
+
+    impl DefaultHooksProbe {
+        pub fn new() -> Self {
+            Self {
+                state: ProbeState::default(),
+            }
+        }
+
+        pub fn with_common(mut self, hash: &str) -> Self {
+            self.state.common.insert(hash.to_owned());
+            self
+        }
+
+        pub fn with_shallow_fetch(mut self) -> Self {
+            self.state.supports_shallow = true;
+            self
+        }
+
+        pub fn with_filtered_fetch(mut self) -> Self {
+            self.state.supports_filtered = true;
+            self
+        }
+
+        pub fn events(&self) -> Vec<&'static str> {
+            self.state.events()
+        }
+    }
+
+    impl Default for DefaultHooksProbe {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    macro_rules! probe_handler_methods {
+        ($type:ty, $($hooks:item),* $(,)?) => {
+            #[async_trait]
+            impl RepoHandler for $type {
+                fn is_monorepo(&self) -> bool {
+                    false
+                }
+
+                fn object_hash_kind(&self) -> Result<HashKind, MegaError> {
+                    Ok(HashKind::Sha1)
+                }
+
+                async fn refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError> {
+                    Ok((ZERO_ID.to_owned(), Vec::new()))
+                }
+
+                async fn finalize_receive_pack(&self) -> Result<(), MegaError> {
+                    Ok(())
+                }
+
+                async fn save_entry(
+                    &self,
+                    _entry_list: Vec<MetaAttached<Entry, EntryMeta>>,
+                ) -> Result<(), MegaError> {
+                    Ok(())
+                }
+
+                async fn update_pack_id(
+                    &self,
+                    _temp_pack_id: &str,
+                    _pack_id: &str,
+                ) -> Result<(), MegaError> {
+                    Ok(())
+                }
+
+                async fn check_entry(&self, _entry: &Entry) -> Result<(), GitError> {
+                    Ok(())
+                }
+
+                async fn full_pack(
+                    &self,
+                    _want: Vec<String>,
+                ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+                    self.state.record("full_pack");
+                    Ok(ProbeState::empty_stream())
+                }
+
+                async fn incremental_pack(
+                    &self,
+                    _want: Vec<String>,
+                    _have: Vec<String>,
+                ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+                    self.state.record("incremental_pack");
+                    Ok(ProbeState::empty_stream())
+                }
+
+                async fn shallow_pack(
+                    &self,
+                    want: Vec<String>,
+                    _depth: u32,
+                    _deepen_relative: bool,
+                ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+                    self.state.record("shallow_pack");
+                    Ok((ProbeState::empty_stream(), want))
+                }
+
+                fn supports_shallow_fetch(&self) -> bool {
+                    self.state.supports_shallow
+                }
+
+                async fn filtered_pack(
+                    &self,
+                    _want: Vec<String>,
+                    _have: Vec<String>,
+                    _filter_spec: &str,
+                ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+                    self.state.record("filtered_pack");
+                    Ok(ProbeState::empty_stream())
+                }
+
+                fn supports_filtered_fetch(&self) -> bool {
+                    self.state.supports_filtered
+                }
+
+                async fn get_trees_by_hashes(
+                    &self,
+                    _hashes: Vec<String>,
+                ) -> Result<Vec<Tree>, MegaError> {
+                    Ok(Vec::new())
+                }
+
+                async fn get_blobs_by_hashes(
+                    &self,
+                    _hashes: Vec<String>,
+                ) -> Result<MultiObjectByteStream<'_>, MegaError> {
+                    Err(MegaError::Other("probe does not read blobs".to_owned()))
+                }
+
+                async fn get_blob_metadata_by_hashes(
+                    &self,
+                    _hashes: Vec<String>,
+                ) -> Result<HashMap<String, EntryMeta>, MegaError> {
+                    Ok(HashMap::new())
+                }
+
+                async fn update_refs(&self, _refs: &RefCommand) -> Result<(), GitError> {
+                    Ok(())
+                }
+
+                async fn check_commit_exist(&self, hash: &str) -> bool {
+                    self.state.record("check_commit_exist");
+                    self.state.common.contains(hash)
+                }
+
+                async fn check_object_exist(&self, _hash: &str) -> bool {
+                    false
+                }
+
+                async fn check_default_branch(&self) -> bool {
+                    false
+                }
+
+                async fn traverses_tree_and_update_filepath(&self) -> Result<(), MegaError> {
+                    Ok(())
+                }
+
+                $($hooks)*
+            }
+        };
+    }
+
+    probe_handler_methods!(
+        HookProbe,
+        async fn check_wants_and_ready(&self, _want: &[String]) -> Result<(), MegaError> {
+            self.state.record("check_wants_and_ready");
+            match self.check_failure {
+                Some(failure) => Err(failure.into_error()),
+                None => Ok(()),
+            }
+        },
+        async fn prepare_pack(&self, _want: &[String], _have: &[String]) -> Result<(), MegaError> {
+            self.state.record("prepare_pack");
+            match self.prepare_failure {
+                Some(failure) => Err(failure.into_error()),
+                None => Ok(()),
+            }
+        }
+    );
+
+    probe_handler_methods!(DefaultHooksProbe,);
 
     #[test]
     pub fn test_read_pkt_line() {
@@ -1141,6 +1498,246 @@ pub mod test {
         );
         expected.extend_from_slice(PKT_LINE_END_MARKER);
         assert_eq!(response, expected);
+    }
+
+    fn v0_request(lines: &[String]) -> Bytes {
+        let mut request = BytesMut::new();
+        for line in lines {
+            add_pkt_line_string(&mut request, line.clone());
+        }
+        request.extend_from_slice(PKT_LINE_END_MARKER);
+        request.freeze()
+    }
+
+    fn v0_session() -> SmartSession {
+        SmartSession::new(
+            PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        )
+    }
+
+    #[tokio::test]
+    async fn view_hooks_call_sites_v0() {
+        let want = "1".repeat(40);
+        let common = "2".repeat(40);
+        let missing = "3".repeat(40);
+
+        let handler = Arc::new(HookProbe::new());
+        let mut request = v0_request(&[]);
+        let (_, protocol) = v0_session()
+            .git_upload_pack_with_handler(&mut request, handler.clone())
+            .await
+            .expect("empty want remains a NAK");
+        assert_eq!(&protocol[..], b"0008NAK\n");
+        assert!(handler.events().is_empty());
+
+        let handler = Arc::new(HookProbe::new());
+        let mut request = v0_request(&[format!("want {want}\n"), "deepen 1\n".to_owned()]);
+        assert!(matches!(
+            v0_session()
+                .git_upload_pack_with_handler(&mut request, handler.clone())
+                .await,
+            Err(ProtocolError::InvalidInput(_))
+        ));
+        assert!(handler.events().is_empty());
+
+        let handler = Arc::new(HookProbe::new());
+        let mut request = v0_request(&[format!("want {want}\n")]);
+        let (_, protocol) = v0_session()
+            .git_upload_pack_with_handler(&mut request, handler.clone())
+            .await
+            .expect("full pack request");
+        assert_eq!(
+            handler.events(),
+            ["check_wants_and_ready", "prepare_pack", "full_pack"]
+        );
+        assert_eq!(&protocol[..], b"0008NAK\n");
+
+        let handler = Arc::new(HookProbe::new().with_shallow_fetch());
+        let mut request = v0_request(&[format!("want {want}\n"), "deepen 1\n".to_owned()]);
+        let (_, protocol) = v0_session()
+            .git_upload_pack_with_handler(&mut request, handler.clone())
+            .await
+            .expect("supported shallow request");
+        let mut expected_shallow = BytesMut::new();
+        add_pkt_line_string(&mut expected_shallow, format!("shallow {want}\n"));
+        expected_shallow.extend_from_slice(PKT_LINE_END_MARKER);
+        assert_eq!(protocol, expected_shallow);
+        assert_eq!(
+            handler.events(),
+            ["check_wants_and_ready", "prepare_pack", "shallow_pack"]
+        );
+
+        for (have, expected_protocol) in [
+            (
+                common.as_str(),
+                vec![
+                    format!("ACK {common} common\n"),
+                    format!("ACK {want} ready\n"),
+                    format!("ACK {common} \n"),
+                ],
+            ),
+            (missing.as_str(), vec!["NAK\n".to_owned()]),
+        ] {
+            let handler = Arc::new(HookProbe::new().with_common(&common));
+            let mut request = v0_request(&[
+                format!("want {want} multi_ack_detailed no-done\n"),
+                format!("have {have}\n"),
+            ]);
+            let (_, protocol) = v0_session()
+                .git_upload_pack_with_handler(&mut request, handler.clone())
+                .await
+                .expect("multi-ack request");
+            let mut expected = BytesMut::new();
+            for line in expected_protocol {
+                add_pkt_line_string(&mut expected, line);
+            }
+            assert_eq!(protocol, expected);
+            assert_eq!(
+                handler.events(),
+                [
+                    "check_wants_and_ready",
+                    "prepare_pack",
+                    "check_commit_exist",
+                    "incremental_pack",
+                ]
+            );
+        }
+
+        let handler = Arc::new(HookProbe::new().with_common(&common));
+        let mut request = v0_request(&[format!("want {want}\n"), format!("have {common}\n")]);
+        let (_, protocol) = v0_session()
+            .git_upload_pack_with_handler(&mut request, handler.clone())
+            .await
+            .expect("legacy have request");
+        assert_eq!(&protocol[..], b"000aACK  \n");
+        assert_eq!(handler.events(), ["check_wants_and_ready"]);
+
+        let default = Arc::new(DefaultHooksProbe::new());
+        let mut request = v0_request(&[]);
+        let (_, protocol) = v0_session()
+            .git_upload_pack_with_handler(&mut request, default.clone())
+            .await
+            .expect("default empty want");
+        assert_eq!(&protocol[..], b"0008NAK\n");
+        assert!(default.events().is_empty());
+
+        let default = Arc::new(DefaultHooksProbe::new());
+        let mut request = v0_request(&[format!("want {want}\n"), "deepen 1\n".to_owned()]);
+        assert!(matches!(
+            v0_session()
+                .git_upload_pack_with_handler(&mut request, default.clone())
+                .await,
+            Err(ProtocolError::InvalidInput(_))
+        ));
+        assert!(default.events().is_empty());
+
+        let default = Arc::new(DefaultHooksProbe::new());
+        let mut request = v0_request(&[format!("want {want}\n")]);
+        let (_, protocol) = v0_session()
+            .git_upload_pack_with_handler(&mut request, default.clone())
+            .await
+            .expect("default full pack");
+        assert_eq!(&protocol[..], b"0008NAK\n");
+        assert_eq!(default.events(), ["full_pack"]);
+
+        let default = Arc::new(DefaultHooksProbe::new().with_shallow_fetch());
+        let mut request = v0_request(&[format!("want {want}\n"), "deepen 1\n".to_owned()]);
+        let (_, protocol) = v0_session()
+            .git_upload_pack_with_handler(&mut request, default.clone())
+            .await
+            .expect("default shallow pack");
+        assert_eq!(protocol, expected_shallow);
+        assert_eq!(default.events(), ["shallow_pack"]);
+
+        for (have, expected_protocol) in [
+            (
+                common.as_str(),
+                vec![
+                    format!("ACK {common} common\n"),
+                    format!("ACK {want} ready\n"),
+                    format!("ACK {common} \n"),
+                ],
+            ),
+            (missing.as_str(), vec!["NAK\n".to_owned()]),
+        ] {
+            let default = Arc::new(DefaultHooksProbe::new().with_common(&common));
+            let mut request = v0_request(&[
+                format!("want {want} multi_ack_detailed no-done\n"),
+                format!("have {have}\n"),
+            ]);
+            let (_, protocol) = v0_session()
+                .git_upload_pack_with_handler(&mut request, default.clone())
+                .await
+                .expect("default multi-ack request");
+            let mut expected = BytesMut::new();
+            for line in expected_protocol {
+                add_pkt_line_string(&mut expected, line);
+            }
+            assert_eq!(protocol, expected);
+            assert_eq!(default.events(), ["check_commit_exist", "incremental_pack"]);
+        }
+
+        let default = Arc::new(DefaultHooksProbe::new().with_common(&common));
+        let mut request = v0_request(&[format!("want {want}\n"), format!("have {common}\n")]);
+        let (_, protocol) = v0_session()
+            .git_upload_pack_with_handler(&mut request, default.clone())
+            .await
+            .expect("default legacy have request");
+        assert_eq!(&protocol[..], b"000aACK  \n");
+        assert!(default.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn view_hook_errors_v0() {
+        let want = "4".repeat(40);
+        let have = "5".repeat(40);
+        for failure in [HookFailure::WarmingUp, HookFailure::PackRejected] {
+            for template in [
+                v0_request(&[format!("want {want}\n")]),
+                v0_request(&[
+                    format!("want {want} multi_ack_detailed\n"),
+                    format!("have {have}\n"),
+                ]),
+            ] {
+                let handler = Arc::new(HookProbe::new().failing_check(failure));
+                let mut request = template.clone();
+                let err = v0_session()
+                    .git_upload_pack_with_handler(&mut request, handler.clone())
+                    .await
+                    .expect_err("check hook error");
+                assert_hook_failure(&err, failure);
+                assert_eq!(handler.events(), ["check_wants_and_ready"]);
+
+                let handler = Arc::new(HookProbe::new().failing_prepare(failure));
+                let mut request = template;
+                let err = v0_session()
+                    .git_upload_pack_with_handler(&mut request, handler.clone())
+                    .await
+                    .expect_err("prepare hook error");
+                assert_hook_failure(&err, failure);
+                assert_eq!(handler.events(), ["check_wants_and_ready", "prepare_pack"]);
+            }
+
+            let handler = Arc::new(HookProbe::new().failing_check(failure));
+            let mut request = v0_request(&[format!("want {want}\n"), format!("have {have}\n")]);
+            let err = v0_session()
+                .git_upload_pack_with_handler(&mut request, handler.clone())
+                .await
+                .expect_err("legacy check hook error");
+            assert_hook_failure(&err, failure);
+            assert_eq!(handler.events(), ["check_wants_and_ready"]);
+
+            let handler = Arc::new(HookProbe::new().failing_prepare(failure));
+            let mut request = v0_request(&[format!("want {want}\n"), format!("have {have}\n")]);
+            let (_, protocol) = v0_session()
+                .git_upload_pack_with_handler(&mut request, handler.clone())
+                .await
+                .expect("legacy branch does not call prepare_pack");
+            assert_eq!(&protocol[..], b"000aACK  \n");
+            assert_eq!(handler.events(), ["check_wants_and_ready"]);
+        }
     }
 
     #[test]

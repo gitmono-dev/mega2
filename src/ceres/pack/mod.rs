@@ -96,6 +96,19 @@ pub trait RepoHandler: Send + Sync + 'static {
 
     async fn refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError>;
 
+    /// Check that the requested objects are readable and the repository is ready
+    /// before upload-pack writes negotiation bytes. View-backed handlers override
+    /// this; existing repository handlers preserve their current behavior.
+    async fn check_wants_and_ready(&self, _want: &[String]) -> Result<(), MegaError> {
+        Ok(())
+    }
+
+    /// Perform final validation immediately before upload-pack starts building a
+    /// pack. The default preserves the behavior of Monorepo and ImportRepo.
+    async fn prepare_pack(&self, _want: &[String], _have: &[String]) -> Result<(), MegaError> {
+        Ok(())
+    }
+
     async fn receiver_handler(
         self: Arc<Self>,
         mut rx: UnboundedReceiver<MetaAttached<Entry, EntryMeta>>,

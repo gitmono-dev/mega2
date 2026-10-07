@@ -163,6 +163,21 @@ report-status 行为 `ng refs/heads/main <文本>`；`git push` 显示为 `! [re
 - 500 `Internal server error` 可重试（写入队列暂停 / 硬停 / 满、detach 轮次未完成、存储错误；计划 `DEFER-FU-42`）；带 `cleanup_id` 的续做重试对重新导入安全，只带 `path`（不带 `cleanup_id`）的重试会 detach 当时存活的仓库。请求、结局语义与客户端协议见 [refactoring/directory-entry-api.md](refactoring/directory-entry-api.md) 的「ImportRepo 叶子清理」。
 - 运维 CLI `mega2 import-repo remove`（FU-21 起）把本域的错误原文写到 stderr、不输出结局行，以退出码 1 结束；结局行、其它退出码与续做见[使用指南](./user-guide.zh.md#26-importrepo-生命周期)第 2.6 节。
 
+## MegaError::ViewUnavailable / ViewPackRejected：视图协议错误（plan-20261002）
+
+`MegaError::ViewUnavailable { filter_id: String, reason: ViewUnavailableReason }` 与
+`MegaError::ViewPackRejected(String)` 是 Git upload-pack 的视图预检错误。前者的
+`ViewUnavailableReason` 为 `WarmingUp`、`RootChainHalted` 或 `DefinitionCorrupt`，显示为
+`warming up`、`root chain halted` 或 `definition corrupt`；后者的字符串是已验证的
+protocol message。两个变体原样映射为相应的 `ProtocolError` 变体，不经过会压缩错误
+类型的 `GitError` 通道。
+
+`ViewUnavailable` 的 HTTP 应答为 503，并带固定 30 秒的 `Retry-After`；
+`ViewPackRejected` 的 HTTP 应答为 200、`application/x-git-upload-pack-result`，正文只有一条
+`ERR <message>\n` pkt-line。完整的四类视图错误应答表见
+[history-projection 设计 §6.1「错误契约」](./refactoring/history-projection.md#61-url-与路由决策)；预检调用位置见
+[协议重构说明](./refactoring/protocol.md#视图协议错误契约与预检钩子hp-17)。
+
 ## 响应安全
 
 - `ApiError` 只向客户端暴露 4xx 细节。

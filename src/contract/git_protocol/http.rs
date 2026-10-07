@@ -468,6 +468,22 @@ fn add_default_header<T>(
     Ok(response)
 }
 
+pub(crate) fn pack_rejected_response(message: &str) -> Response<Body> {
+    let mut body = BytesMut::new();
+    smart::add_pkt_line_string(&mut body, format!("ERR {message}\n"));
+
+    let mut response = Response::new(Body::from(body.freeze()));
+    response.headers_mut().insert(
+        "Content-Type",
+        HeaderValue::from_static("application/x-git-upload-pack-result"),
+    );
+    response.headers_mut().insert(
+        "Cache-Control",
+        HeaderValue::from_static("no-cache, max-age=0, must-revalidate"),
+    );
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use futures::stream;
