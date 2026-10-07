@@ -138,6 +138,16 @@ mega2 --config /etc/mega2/config.toml import-repo remove --path /third-party/<re
 
 清理台账表由升级时的自动数据库迁移创建；0.40.4 起升级还会规范化存量的 ImportRepo 别名路径，见 [`deploy-trunk.md`](./deploy-trunk.md) 第 9.2 节。
 
+### 2.7 视图 URL（只读）
+
+启用与注册方法见[配置指南](./configuration.zh.md)的 `[views]` 条目和[部署指南](./deploy-trunk.md)的视图运维节。HTTP 与 SSH 均可通过 `/.filter/<filter_id>.git`、`/.view/<name>.git`、`/.view/<name>@<version>.git` clone 和 fetch；不带版本的命名 URL 只供人工浏览，Agent 和自动化必须使用 `@version`。视图不是读安全边界，读授权规则与 `/<path>.git` 相同。
+
+视图历史从仓库起点开始投影；即使文件内容相同，视图提交与 `/<path>.git` 提交的哈希也不同。同一个 remote 不得混用这两种 URL。创建新版本后，不带版本的命名 URL 会整体切换历史，已有克隆 fetch 可能遇到非快进，应重新 clone。
+
+视图 URL 只读：HTTP 推送返回 403，SSH 推送返回一行 `ERR view URLs are read-only`。经 HTTP 以 v0 或 v2 使用 `--depth`，或以 v2 使用 `--filter`，服务返回 400，git 报 `RPC failed; HTTP 400`；v0 不宣告 filter，git 会忽略 `--filter` 并完整 clone。SSH 下 depth 和 v2 filter 也被拒，但当前应答是裸文本 `error: …`，git 可能只报告协议错误。
+
+未就绪时，HTTP 返回 503 与 `Retry-After`；SSH 返回一行 `ERR view <filter_id> unavailable: <reason>` 并以退出码 75 结束，git stderr 包含 `remote error: view <filter_id> unavailable`。稍后重试即可。
+
 ## 3. 大文件:LFS
 
 - **Git LFS(标准)**:端点 `/info/lfs` 与 `/api/v1/lfs`,stock `git-lfs` 客户端直接可用;LFS 写授权与 Git receive-pack 共用 `git.push_auth`(矩阵见 [`deploy-trunk.md`](./deploy-trunk.md) 第 6 节)。

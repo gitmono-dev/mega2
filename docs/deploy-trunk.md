@@ -487,7 +487,7 @@ DELETE FROM mega_view_root_chain_scan;
 
 `recycle-filter` 与 `rebuild-all` 都有显式事务。`COMMIT` 之前的语句失败时，psql 会停止并断开连接，事务不会提交。recycle-filter 只回收目标过滤器的派生提交映射与对象引用，保留对象以供后续清扫；rebuild-all 清掉全部派生状态。两者把过滤器置为回收态：`projected_seq = 0`，且 `ready_seq`、`warming_since` 为 NULL。worker 只为活跃视图（`ready_seq` 或 `warming_since` 非空）执行 catch_up，因此回收态视图会等待重新预热。clear-root-chain-scan 只清暂存表，不改视图状态；下一次根链扩展会按当前的 `main@/` 重新判定。
 
-三段 SQL 都不用 `TRUNCATE`，不删除 `mega_view_filter`、`mega_view` 或 `mega_view_register_log`，也不改 `last_access_at` 与过滤器定义列。rebuild-all 是全表 `DELETE`，停服窗口随派生行数增长。本节只记录停服运维与恢复语义；视图 Git URL 的对象读取尚未开放。
+三段 SQL 都不用 `TRUNCATE`，不删除 `mega_view_filter`、`mega_view` 或 `mega_view_register_log`，也不改 `last_access_at` 与过滤器定义列。rebuild-all 是全表 `DELETE`，停服窗口随派生行数增长。本节记录停服运维与恢复语义；视图 Git URL 已支持只读 clone 与 fetch，用法见[用户指南](./user-guide.zh.md#27-视图-url只读)。
 
 投影停止时，首个失败点会以 ERROR 事件给出。除 message 外，停止告警字段为 `metric=view_projection_stops_total`、`filter_id`、`s`、`commit_id`、`reason`；当 reason 是 `row_absent` 或 `unparsable` 时还带 `tree_id`。例如：`metric=view_projection_stops_total s=7 reason=row_absent`。按 reason 处理：
 

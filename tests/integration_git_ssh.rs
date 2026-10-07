@@ -3619,6 +3619,265 @@ fn integration_git_ssh_view_layer3_ls_remote() {
     );
 }
 
+fn hp22_ssh_boot() -> (GitSshEnv, ServiceProcess, u16, u16, PathBuf) {
+    assert!(!git_cli::git_cli_skip_requested());
+    git_cli::require_git_cli_runner();
+    let env = GitSshEnv::new();
+    git_cli::generate_client_ed25519(&env.ssh_dir.join("client_ed25519"));
+    let extra = [
+        ("MEGA_VIEWS__ENABLED", "true"),
+        ("MEGA_VIEWS__ALLOW_ANONYMOUS_REGISTER", "true"),
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "none"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+        ("MEGA_GIT__ANONYMOUS_ACCESS", "true"),
+    ];
+    let (mut first, _, _, _, first_err) = boot_service_multi_with_extra(&env, "off", None, &extra);
+    assert!(
+        first.shutdown_via_sigint(Duration::from_secs(10)).success(),
+        "{}",
+        read_log(&first_err)
+    );
+    drop(first);
+    let (service, http_port, ssh_port, _, err) =
+        boot_service_multi_with_extra(&env, "off", None, &extra);
+    git_cli::write_known_hosts_via_keyscan(&env.ssh_dir.join("known_hosts"), ssh_port);
+    (env, service, http_port, ssh_port, err)
+}
+
+fn hp22_ssh_register(port: u16, name: &str, spec: &str) -> String {
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(git_cli::mega2_host_http_url(
+            port,
+            "/api/v1/views?wait=true",
+        ))
+        .json(&serde_json::json!({"name": name, "filter_spec": spec}))
+        .send()
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().unwrap();
+    assert!(status.is_success(), "register {spec}: {status} {body}");
+    assert_eq!(body["data"]["ready"], true, "{body}");
+    body["data"]["filter_id"].as_str().unwrap().to_owned()
+}
+
+fn hp22_ssh_wait_lag_zero(port: u16, filter_id: &str) {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let path = format!("/api/v1/views/{filter_id}");
+        let response = client
+            .get(git_cli::mega2_host_http_url(port, &path))
+            .send()
+            .unwrap();
+        if response.status().is_success() {
+            let body: serde_json::Value = response.json().unwrap();
+            if body["data"]["lag_commits"] == 0 {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "view {filter_id} did not catch up"
+        );
+        sleep(Duration::from_millis(250));
+    }
+}
+
+fn hp22_ssh_host_git(case_dir: &Path, args: &[&str]) -> String {
+    let output = git_host_ssh(case_dir, "", args);
+    git_cli::assert_git_success(&output, "HP-22 host HTTP git");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn hp22_ssh_source_commit(case_dir: &Path, relative_path: &str, message: &str) {
+    let path = case_dir.join("hp22-source").join(relative_path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"contents1\n").unwrap();
+    hp22_ssh_host_git(case_dir, &["-C", "hp22-source", "add", relative_path]);
+    hp22_ssh_host_git(case_dir, &["-C", "hp22-source", "commit", "-m", message]);
+    hp22_ssh_host_git(
+        case_dir,
+        &[
+            "-C",
+            "hp22-source",
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+}
+
+#[test]
+fn integration_git_ssh_view_pack_ssh_josh_proxy() {
+    let (env, mut service, http_port, ssh_port, err) = hp22_ssh_boot();
+    let case_dir = env.case_dir.as_path();
+    let project_url = git_cli::mega2_host_http_url(http_port, "/project");
+    hp22_ssh_host_git(case_dir, &["clone", &project_url, "hp22-source"]);
+    hp22_ssh_host_git(
+        case_dir,
+        &["-C", "hp22-source", "config", "user.name", "HP22"],
+    );
+    hp22_ssh_host_git(
+        case_dir,
+        &[
+            "-C",
+            "hp22-source",
+            "config",
+            "user.email",
+            "hp22@example.invalid",
+        ],
+    );
+    let ssh_command = git_cli::git_ssh_command(case_dir, ssh_port);
+    for (case, first) in [
+        ("subtree", "sub1/file1"),
+        ("subsubtree", "sub1/subsub/file1"),
+        ("prefix", "sub1/file1"),
+    ] {
+        hp22_ssh_source_commit(case_dir, &format!("hp22-{case}/{first}"), "add file1");
+        hp22_ssh_source_commit(case_dir, &format!("hp22-{case}/sub2/file2"), "add file2");
+        let spec = match case {
+            "subtree" => ":/project/hp22-subtree/sub1",
+            "subsubtree" => ":/project/hp22-subsubtree/sub1/subsub",
+            _ => ":/project/hp22-prefix:prefix=pre",
+        };
+        let id = hp22_ssh_register(http_port, &format!("hp22-{case}"), spec);
+        hp22_ssh_wait_lag_zero(http_port, &id);
+        let path = if case == "prefix" {
+            ".view/hp22-prefix@1.git".to_owned()
+        } else {
+            format!(".filter/{id}.git")
+        };
+        let url = format!("{}{}", git_cli::mega2_ssh_repo_url(ssh_port, "git"), path);
+        let expected_log = fs::read(format!("tests/fixtures/views/josh_proxy/{case}.log")).unwrap();
+        let expected_tree =
+            fs::read(format!("tests/fixtures/views/josh_proxy/{case}.tree")).unwrap();
+        for (label, v0) in [("v0", true), ("v2", false)] {
+            let clone = format!("hp22-{case}-{label}");
+            let mut args = Vec::new();
+            if v0 {
+                args.extend(["-c", "protocol.version=0"]);
+            }
+            args.extend(["clone", &url, &clone]);
+            let output = git_cli::git_cli_ssh(case_dir, &ssh_command, &args);
+            git_cli::assert_git_success(&output, "HP-22 SSH clone");
+            let log = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "log", "--graph", "--pretty=%s"],
+            );
+            git_cli::assert_git_success(&log, "HP-22 SSH log");
+            assert_eq!(log.stdout, expected_log);
+            let tree = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "ls-tree", "-r", "--name-only", "HEAD"],
+            );
+            git_cli::assert_git_success(&tree, "HP-22 SSH tree");
+            assert_eq!(tree.stdout, expected_tree);
+            git_cli::assert_git_success(
+                &git_cli::git_cli_ssh(case_dir, &ssh_command, &["-C", &clone, "fsck", "--strict"]),
+                "HP-22 SSH fsck",
+            );
+        }
+        let third = if case == "subsubtree" {
+            "sub1/subsub/file3"
+        } else {
+            "sub1/file3"
+        };
+        hp22_ssh_source_commit(case_dir, &format!("hp22-{case}/{third}"), "add file3");
+        hp22_ssh_wait_lag_zero(http_port, &id);
+        let expected_log =
+            fs::read(format!("tests/fixtures/views/josh_proxy/{case}.fetch.log")).unwrap();
+        let expected_tree =
+            fs::read(format!("tests/fixtures/views/josh_proxy/{case}.fetch.tree")).unwrap();
+        for (label, v0) in [("v0", true), ("v2", false)] {
+            let clone = format!("hp22-{case}-{label}");
+            let mut args = vec!["-C", clone.as_str()];
+            if v0 {
+                args.extend(["-c", "protocol.version=0"]);
+            }
+            args.push("fetch");
+            let fetch = git_cli::git_cli_ssh(case_dir, &ssh_command, &args);
+            git_cli::assert_git_success(&fetch, "HP-22 SSH Josh fetch");
+            let merge = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "merge", "--ff-only", "@{upstream}"],
+            );
+            git_cli::assert_git_success(&merge, "HP-22 SSH Josh fast forward");
+            let log = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "log", "--graph", "--pretty=%s"],
+            );
+            git_cli::assert_git_success(&log, "HP-22 SSH Josh fetched log");
+            assert_eq!(log.stdout, expected_log);
+            let tree = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "ls-tree", "-r", "--name-only", "HEAD"],
+            );
+            git_cli::assert_git_success(&tree, "HP-22 SSH Josh fetched tree");
+            assert_eq!(tree.stdout, expected_tree);
+            git_cli::assert_git_success(
+                &git_cli::git_cli_ssh(case_dir, &ssh_command, &["-C", &clone, "fsck", "--strict"]),
+                "HP-22 SSH Josh fetched fsck",
+            );
+        }
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+#[test]
+fn integration_git_ssh_view_pack_ssh_ready_empty() {
+    let (env, mut service, http_port, ssh_port, err) = hp22_ssh_boot();
+    let id = hp22_ssh_register(http_port, "hp22-empty", ":/project/hp22-absent");
+    hp22_ssh_wait_lag_zero(http_port, &id);
+    let url = format!(
+        "{}.filter/{id}.git",
+        git_cli::mega2_ssh_repo_url(ssh_port, "git")
+    );
+    let ssh_command = git_cli::git_ssh_command(&env.case_dir, ssh_port);
+    for (clone, v0) in [("hp22-empty-v0", true), ("hp22-empty-v2", false)] {
+        let mut args = Vec::new();
+        if v0 {
+            args.extend(["-c", "protocol.version=0"]);
+        }
+        args.extend(["clone", &url, clone]);
+        let output = git_cli::git_cli_ssh(&env.case_dir, &ssh_command, &args);
+        git_cli::assert_git_success(&output, "HP-22 SSH empty clone");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("You appear to have cloned an empty repository")
+        );
+        let refs =
+            git_cli::git_cli_ssh(&env.case_dir, &ssh_command, &["-C", clone, "for-each-ref"]);
+        git_cli::assert_git_success(&refs, "HP-22 SSH empty refs");
+        assert!(refs.stdout.is_empty());
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
 fn layer3_pkt(payload: &str) -> Vec<u8> {
     format!("{:04x}{payload}", payload.len() + 4).into_bytes()
 }

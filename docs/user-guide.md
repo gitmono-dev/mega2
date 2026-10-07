@@ -138,6 +138,16 @@ mega2 --config /etc/mega2/config.toml import-repo remove --path /third-party/<re
 
 The cleanup ledger table is created by the automatic database migration on upgrade; from 0.40.4, upgrades also normalize existing ImportRepo alias paths, see section 9.2 of [`deploy-trunk.md`](./deploy-trunk.md) (Chinese).
 
+### 2.7 View URLs (read-only)
+
+For enablement and registration, see the `[views]` entry in the [Configuration Guide](./configuration.md) and the views operations section of the [Deployment Guide](./deploy-trunk.md). HTTP and SSH can clone and fetch `/.filter/<filter_id>.git`, `/.view/<name>.git`, and `/.view/<name>@<version>.git`. The unversioned named URL is for human browsing; agents and automation must use `@version`. Views are not a read security boundary; read authorization is the same as for `/<path>.git`.
+
+View history is projected from the repository beginning. Commits have different hashes from `/<path>.git` even when file contents match, so do not mix these URLs in one remote. Creating a new version replaces the history served by the unversioned named URL. Existing clones may see a non-fast-forward fetch and should be cloned again.
+
+View URLs are read-only: HTTP push returns 403; SSH push returns one line, `ERR view URLs are read-only`. Over HTTP, `--depth` with v0 or v2, and `--filter` with v2, return 400 and git reports `RPC failed; HTTP 400`. V0 does not advertise filter, so git ignores `--filter` and performs a full clone. SSH rejects depth and v2 filter too, but currently writes plain `error: …` text, so git may only report a protocol error.
+
+When a view is not ready, HTTP returns 503 with `Retry-After`; SSH returns `ERR view <filter_id> unavailable: <reason>` and exits with code 75, while git stderr contains `remote error: view <filter_id> unavailable`. Retry later.
+
 ## 3. Large files: LFS
 
 - **Git LFS (standard)**: endpoints `/info/lfs` and `/api/v1/lfs` work with standard `git-lfs` clients. LFS writes use the same `git.push_auth` setting as Git receive-pack; see the [Deployment Guide](./deployment.md) for authentication modes.

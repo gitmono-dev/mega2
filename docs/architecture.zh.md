@@ -114,6 +114,8 @@ HTTP router 在 `server::http_server::app`（`src/server/http_server.rs:681`）�
 | SSH | `service ssh`（独立端口） | storage-only 下只读（upload-pack）；`git.ssh_receive_pack=false` 为强制项，省略会拒绝启动 |
 | Git LFS | `/info/lfs` + `/api/v1/lfs` | 两种形态均挂载；写授权随 `push_auth` |
 | 产品 API | `/api/v1/*`（status、file/blob、file/tree、preview 读 + create-entry/delete-entry/move-entry/edit/save 写 + tags） | trunk / storage-only 形态 |
+| Git 视图 URL（只读） | `/.filter/<filter_id>.git`、`/.view/<name>.git`、`/.view/<name>@<version>.git`（HTTP 与 SSH upload-pack） | `[views].enabled` 缺省关闭，重启生效；receive-pack 拒绝，视图前缀 LFS 返回 404 |
+| 视图 API | `/api/v1/views`（`POST ?wait=true` 注册、`GET ?name=&version=`）、`GET /api/v1/views/{filter_id}`、`GET /api/v1/views/metrics`；请求见[视图运维](./deploy-trunk.md) | `[views].enabled` 缺省关闭，重启生效；只在 trunk / storage-only 挂载，关闭时返回 404 |
 | OCI registry | `/v2/` | `[oci].enabled` 且 storage-only；review 形态 fail-closed 不注册 |
 | Agent Capture | `/api/v1/agent-capture` | `[agent_capture].enabled` 且 storage-only |
 | MST/2 快照面 | `/api/v2` | nest 静态注册，handler 在 `[mst2].enabled` 为 false 时 fail-closed；切换需重启 |

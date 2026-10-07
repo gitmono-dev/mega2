@@ -59,7 +59,99 @@ pub(crate) struct ViewWantState {
     pub(crate) wants: Vec<(String, Option<i64>)>,
 }
 
+pub(crate) struct ViewPackBounds {
+    pub(crate) want_seq: i64,
+    pub(crate) have_seq: i64,
+    pub(crate) have_tree: Option<String>,
+}
+
+pub(crate) struct ViewPackCommit {
+    pub(crate) object_id: String,
+    pub(crate) tree_id: String,
+    pub(crate) data: Vec<u8>,
+}
+
 impl ViewStorage {
+    pub(crate) async fn view_pack_bounds(
+        &self,
+        filter_pk: i64,
+        wants: &[String],
+        haves: &[String],
+    ) -> Result<ViewPackBounds, MegaError> {
+        let row = self
+            .get_connection()
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "WITH requested AS ( \
+                     SELECT 'want' AS role, unnest($2::text[]) AS oid \
+                     UNION ALL SELECT 'have', unnest($3::text[]) \
+                 ), matched AS ( \
+                     SELECT r.role, m.seq_from FROM requested r \
+                     JOIN mega_view_commit_map m ON m.filter_pk = $1 AND m.view_commit = r.oid \
+                 ), bounds AS ( \
+                     SELECT max(seq_from) FILTER (WHERE role = 'want') AS want_seq, \
+                            coalesce(max(seq_from) FILTER (WHERE role = 'have'), 0) AS have_seq \
+                     FROM matched \
+                 ) \
+                 SELECT b.want_seq, b.have_seq, m.view_tree AS have_tree \
+                 FROM bounds b LEFT JOIN mega_view_commit_map m \
+                   ON m.filter_pk = $1 AND m.seq_from = b.have_seq",
+                [
+                    Value::from(filter_pk),
+                    Value::from(wants.to_vec()),
+                    Value::from(haves.to_vec()),
+                ],
+            ))
+            .await?
+            .ok_or_else(|| MegaError::Other("view pack bounds returned no row".to_owned()))?;
+        let want_seq: Option<i64> = row.try_get("", "want_seq")?;
+        Ok(ViewPackBounds {
+            want_seq: want_seq.ok_or_else(|| {
+                MegaError::Other("view pack want is outside the view chain".to_owned())
+            })?,
+            have_seq: row.try_get("", "have_seq")?,
+            have_tree: row.try_get("", "have_tree")?,
+        })
+    }
+
+    pub(crate) async fn view_pack_commits(
+        &self,
+        filter_pk: i64,
+        have_seq: i64,
+        want_seq: i64,
+    ) -> Result<Vec<ViewPackCommit>, MegaError> {
+        let rows = self
+            .get_connection()
+            .query_all_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT m.view_commit, m.view_tree, o.data \
+                 FROM mega_view_commit_map m \
+                 LEFT JOIN mega_view_object o ON o.object_id = m.view_commit AND o.kind = 1 \
+                 WHERE m.filter_pk = $1 AND m.seq_from > $2 AND m.seq_from <= $3 \
+                   AND m.view_commit IS NOT NULL \
+                 ORDER BY m.seq_from",
+                [
+                    Value::from(filter_pk),
+                    Value::from(have_seq),
+                    Value::from(want_seq),
+                ],
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let object_id: String = row.try_get("", "view_commit")?;
+                let data: Option<Vec<u8>> = row.try_get("", "data")?;
+                Ok(ViewPackCommit {
+                    tree_id: row.try_get("", "view_tree")?,
+                    data: data.ok_or_else(|| {
+                        MegaError::Other(format!("view commit object missing: {object_id}"))
+                    })?,
+                    object_id,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) async fn view_reader_state(
         &self,
         filter_pk: i64,
