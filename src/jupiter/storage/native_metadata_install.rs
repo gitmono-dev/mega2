@@ -163,6 +163,10 @@ impl PostgresMetadataInstallRepository {
         })
     }
 
+    pub(crate) fn captured_schema(&self) -> &str {
+        &self.storage_scope.schema
+    }
+
     /// These columns are returned by the same query that authorizes a lease,
     /// so a warm cache cannot authorize a stale replica or another schema.
     pub(crate) fn verify_primary_scope_row(&self, row: &QueryResult) -> Result<(), SnapshotError> {

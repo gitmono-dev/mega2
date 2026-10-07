@@ -1346,3 +1346,9 @@ async fn mst2_fixed_metadata_walker_rejects_real_tree_gitlinks_without_body_read
     ));
     fixture.counts.assert(0, 0);
 }
+
+#[path = "snapshot_storage_route_tests.rs"]
+mod storage_routes;
+
+#[path = "snapshot_storage_route_fixture.rs"]
+mod storage_route_fixture;

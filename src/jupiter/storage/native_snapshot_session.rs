@@ -17,7 +17,6 @@ use super::{
         MetadataInstallError, PostgresMetadataInstallRepository, PreparedMetadataReceipt,
     },
     native_publication_storage::{NativePublicationHead, decode_native_observation},
-    push_queue_storage::PushQueueStorage,
 };
 use crate::{
     callisto::mst2_snapshot_context,
@@ -34,6 +33,7 @@ use crate::{
 pub(crate) struct PostgresNativeSessionRepository {
     connection: DatabaseConnection,
     installer: OnceCell<PostgresMetadataInstallRepository>,
+    qualified_session_sql: OnceCell<String>,
     restored: Mutex<HashMap<String, Arc<OnceCell<()>>>>,
 }
 
@@ -42,6 +42,7 @@ impl PostgresNativeSessionRepository {
         Self {
             connection,
             installer: OnceCell::new(),
+            qualified_session_sql: OnceCell::new(),
             restored: Mutex::new(HashMap::new()),
         }
     }
@@ -49,6 +50,12 @@ impl PostgresNativeSessionRepository {
     async fn installer(&self) -> Result<&PostgresMetadataInstallRepository, SnapshotError> {
         self.installer
             .get_or_try_init(|| PostgresMetadataInstallRepository::new(self.connection.clone()))
+            .await
+    }
+
+    async fn session_sql(&self, installer: &PostgresMetadataInstallRepository) -> &str {
+        self.qualified_session_sql
+            .get_or_init(|| async { routes::session_sql(installer) })
             .await
     }
 
@@ -95,14 +102,14 @@ impl PostgresNativeSessionRepository {
         let installer = self.installer().await?;
         let txn = self.transaction().await?;
         let result = async {
-            PushQueueStorage::acquire_mono_write_lock(&txn).await.map_err(internal)?;
-            installer.verify_primary_connection(&txn).await?;
+            routes::enter(&txn, installer).await?;
             let current = MonoStorage::read_native_publication_head_from(&txn, &expected.instance_id)
                 .await.map_err(|_| not_ready("native publication is not ready"))?;
             if current.root != expected.root || current.token != expected.token {
                 return Err(not_ready("native publication advanced during preparation; retry resolve"));
             }
             retention_lock(&txn).await?;
+            routes::snapshot(&txn, installer, &built.snapshot_id).await?;
             let existing = mst2_snapshot_context::Entity::find_by_id(built.snapshot_id.clone())
                 .one(&txn).await.map_err(internal)?;
             let prepare_id = if let Some(existing) = existing {
@@ -175,10 +182,17 @@ impl PostgresNativeSessionRepository {
         instance_id: &str,
     ) -> Result<SnapshotContext, SnapshotError> {
         let installer = self.installer().await?;
+        if routes::lease(&self.connection, installer, lease_id)
+            .await?
+            .as_deref()
+            != Some(snapshot_id)
+        {
+            return Err(expired());
+        }
         let row = self
             .connection
             .query_one_raw(statement(
-                SESSION_SQL,
+                self.session_sql(installer).await,
                 [snapshot_id.into(), lease_id.into()],
             ))
             .await
@@ -191,6 +205,9 @@ impl PostgresNativeSessionRepository {
                 if error.code == SnapshotErrorCode::LeaseExpired {
                     let txn = self.transaction().await?;
                     let result = async {
+                        installer.verify_primary_connection(&txn).await?;
+                        routes::lease(&txn, installer, lease_id).await?;
+                        routes::generic_path(&txn, installer).await?;
                         retention_lock(&txn).await?;
                         expire_specific_locked(&txn, lease_id).await
                     }
@@ -218,15 +235,23 @@ impl PostgresNativeSessionRepository {
         seconds: u64,
         instance: &str,
     ) -> Result<LeaseRenewed, SnapshotError> {
+        let installer = self.installer().await?;
         let txn = self.transaction().await?;
         let result = async {
+            installer.verify_primary_connection(&txn).await?;
+            let selected_sid = routes::lease(&txn, installer, lease_id).await?
+                .ok_or_else(|| SnapshotError::new(SnapshotErrorCode::LeaseUnknown,"unknown lease_id"))?;
+            routes::generic_path(&txn, installer).await?;
             retention_lock(&txn).await?;
             let lease = txn.query_one_raw(statement(
                 "SELECT snapshot_id FROM mst2_snapshot_lease WHERE lease_id=$1 FOR UPDATE",
                 [lease_id.into()],
             )).await.map_err(internal)?.ok_or_else(|| SnapshotError::new(SnapshotErrorCode::LeaseUnknown,"unknown lease_id"))?;
             let sid: String = lease.try_get("","snapshot_id").map_err(internal)?;
-            let row = txn.query_one_raw(statement(SESSION_SQL,[sid.clone().into(),lease_id.into()]))
+            if sid != selected_sid {
+                return Err(integrity("lease changed after immutable route selection"));
+            }
+            let row = txn.query_one_raw(statement(self.session_sql(installer).await,[sid.clone().into(),lease_id.into()]))
                 .await.map_err(internal)?.ok_or_else(expired)?;
             self.installer().await?.verify_primary_scope_row(&row)?;
             if let Err(error)=decode_context(&row,&sid,lease_id,instance) {
@@ -257,8 +282,12 @@ impl PostgresNativeSessionRepository {
         let installer = self.installer().await?;
         let txn = self.transaction().await?;
         let result = async {
-            retention_lock(&txn).await?;
             installer.verify_primary_connection(&txn).await?;
+            if routes::lease(&txn, installer, lease_id).await?.is_none() {
+                return Ok(false);
+            }
+            routes::generic_path(&txn, installer).await?;
+            retention_lock(&txn).await?;
             let changed=txn.query_one_raw(statement(
                 "UPDATE mst2_snapshot_lease SET state='RELEASED' WHERE lease_id=$1 AND state='ACTIVE' RETURNING snapshot_id",
                 [lease_id.into()],
@@ -292,6 +321,9 @@ impl PostgresNativeSessionRepository {
             .map_err(internal)
     }
 }
+
+#[path = "native_snapshot_routes.rs"]
+mod routes;
 
 const SESSION_SQL: &str = "SELECT s.snapshot_id,s.canonical_descriptor,s.commit_oid,s.root_tree_oid,
  (SELECT storage_uuid FROM mst2_metadata_storage_scope WHERE singleton=1) AS authority_storage_uuid,
