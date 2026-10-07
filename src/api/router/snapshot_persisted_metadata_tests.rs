@@ -377,9 +377,10 @@ async fn wait_retention_waiter(txn: &sea_orm::DatabaseTransaction) {
                 .unwrap();
             if scalar(
                 txn,
-                "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid
-              WHERE l.locktype='advisory' AND NOT l.granted AND a.datname=current_database()
-                AND a.application_name=current_schema() AND l.classid=1296717362::oid
+                "SELECT count(*) FROM pg_locks l
+              WHERE l.locktype='advisory' AND NOT l.granted
+                AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
+                AND l.pid<>pg_backend_pid() AND l.classid=1296717362::oid
                 AND l.objid=hashtext(current_schema())::oid AND l.objsubid=2",
             )
             .await
@@ -664,7 +665,7 @@ async fn mst2_persisted_meta_reader_holds_protection_until_all_route_bytes_are_o
             .await
             .unwrap();
         let root = format!("page:{}", context.built.metadata_root);
-        let competing = {
+        let mut competing = {
             let state = fixture.state.clone();
             let lease = fixture.lease.clone();
             let root = root.clone();
@@ -692,7 +693,12 @@ async fn mst2_persisted_meta_reader_holds_protection_until_all_route_bytes_are_o
             .begin()
             .await
             .unwrap();
-        wait_retention_waiter(&observer).await;
+        tokio::select! {
+            () = wait_retention_waiter(&observer) => {},
+            outcome = &mut competing => {
+                panic!("retention competitor completed before waiting: release_lease={release_lease}, outcome={outcome:?}");
+            },
+        }
         assert!(!reading.is_finished());
         assert!(!competing.is_finished());
         resume.wait().await;
@@ -834,6 +840,30 @@ async fn fault_binding(fixture: &Fixture, id: [u8; 32], case: usize, restore: bo
         .rows_affected(),
         1
     );
+    if case == 1 {
+        let protection = txn
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT t.tgenabled::text AS mode,t.tgdeferrable AS deferrable,t.tginitdeferred AS deferred
+                 FROM pg_trigger t WHERE t.tgrelid='mst2_metadata_current'::regclass
+                   AND t.tgname='mst2_metadata_current_protected' AND NOT t.tgisinternal",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            protection.try_get::<String>("", "mode").unwrap().as_str(),
+            "O" | "A"
+        ));
+        assert!(protection.try_get::<bool>("", "deferrable").unwrap());
+        assert!(protection.try_get::<bool>("", "deferred").unwrap());
+        txn.execute_unprepared("SET CONSTRAINTS mst2_metadata_current_protected IMMEDIATE")
+            .await
+            .unwrap();
+        txn.execute_unprepared("SET CONSTRAINTS mst2_metadata_current_protected DEFERRED")
+            .await
+            .unwrap();
+    }
     txn.execute_unprepared(&format!("ALTER TABLE {table} ENABLE TRIGGER {guard}"))
         .await
         .unwrap();
