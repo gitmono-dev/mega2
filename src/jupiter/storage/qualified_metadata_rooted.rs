@@ -18,7 +18,7 @@ mod sessions;
 mod gc;
 #[path = "qualified_metadata_reader.rs"]
 mod reader;
-pub(crate) use reader::{RootedDirectoryWindow, RootedLookupBatch, RootedLookupStatus};
+pub(crate) use reader::RootedLookupStatus;
 #[cfg(test)]
 pub(crate) use reader::{
     with_rooted_reader_barriers, with_rooted_source_fact_barriers,
