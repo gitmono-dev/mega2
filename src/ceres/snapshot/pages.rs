@@ -259,6 +259,40 @@ pub struct PreparedNativeMetadataRetention {
 }
 
 impl PreparedNativeMetadataRetention {
+    #[cfg(test)]
+    pub(crate) fn test_installation(dag: Arc<ValidatedMetadataDag>, scope: &str) -> Self {
+        let tree_oid =
+            ObjectHash::from_hex_for_kind(git_internal::hash::HashKind::Sha1, &"a".repeat(40))
+                .unwrap();
+        Self {
+            key: NativeRetentionKey {
+                projection: NativeProjectionKey::new(tree_oid),
+                scope: scope.to_owned(),
+            },
+            dag,
+        }
+    }
+    pub(crate) fn install_plan(
+        &self,
+    ) -> Result<super::metadata_install::MetadataInstallPlan, SnapshotError> {
+        use super::metadata_install::{MetadataInstallIdentity, MetadataInstallPlan};
+        let key = &self.key.projection;
+        MetadataInstallPlan::from_validated(
+            MetadataInstallIdentity {
+                source_domain: key.source_domain.to_owned(),
+                tagged_root_tree_oid: key.tree_oid.clone(),
+                scope: self.key.scope.clone(),
+                schema_version: key.schema_version,
+                metadata_codec: key.metadata_codec,
+                materialization_policy: key.materialization_policy,
+                fs_semantics: key.fs_semantics,
+                access_projection: key.access_projection,
+                verification_revision: key.verification_revision,
+                projection_revision: key.projection_revision,
+            },
+            &self.dag,
+        )
+    }
     pub fn fixed_root_tree_oid(&self) -> &str {
         &self.key.projection.tree_oid
     }

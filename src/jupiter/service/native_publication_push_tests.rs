@@ -41,7 +41,15 @@ async fn native_fixture() -> (tempfile::TempDir, crate::jupiter::storage::Storag
     mono.save_refs(mega_refs::Model::new(
         path.clone(), MEGA_BRANCH_NAME.to_owned(), tip.id.to_string(), child.id.to_string(), false,
     ), None).await.unwrap();
-    storage.mono_storage().initialize_native_publication(NATIVE_INSTANCE).await.unwrap();
+    storage.push_queue_service.push_queue_storage.set_control_flags(Some(true), None, None).await.unwrap();
+    mono.initialize_native_publication_for_maintenance(
+        NATIVE_INSTANCE,
+        &crate::jupiter::storage::native_publication_storage::NativeRoot {
+            commit: root_commit.id.to_string(), tree: root_tree.id.to_string(),
+        },
+    ).await.unwrap();
+    assert!(mono.read_native_publication_head(NATIVE_INSTANCE).await.is_err());
+    storage.push_queue_service.push_queue_storage.set_control_flags(Some(false), None, None).await.unwrap();
     (temp, storage, tip, path)
 }
 
@@ -80,6 +88,43 @@ async fn real_same_tree_push_advances_one_global_certificate_and_n0_replay_stays
     assert!(matches!(wh03_exec(&storage,id).await, ExecuteOutcome::Done { root_cas_writes:0,.. }));
     assert_eq!(mono.read_native_publication_head(NATIVE_INSTANCE).await.unwrap().token,head.token);
     assert_eq!(mst2_native_publication::Entity::find().count(mono.get_connection()).await.unwrap(),1);
+}
+
+#[tokio::test]
+async fn maintenance_cannot_reinitialize_published_history_after_head_loss() {
+    let (_temp, storage, tip, path) = native_fixture().await;
+    let mono = storage.mono_storage();
+    let (new, payload) = save_same_tree_commit(&storage, &tip).await;
+    let id = wh03_enqueue_push(&storage, &path, &tip.id.to_string(), &new, &payload).await;
+    assert!(matches!(wh03_exec(&storage, id).await, ExecuteOutcome::Done { .. }));
+    let head = mono.read_native_publication_head(NATIVE_INSTANCE).await.unwrap();
+    let certificates = mst2_native_publication::Entity::find().all(mono.get_connection()).await.unwrap();
+    let receipts = mst2_publication::Entity::find().all(mono.get_connection()).await.unwrap();
+    let outbox = mst2_publication_outbox::Entity::find().all(mono.get_connection()).await.unwrap();
+    assert_eq!(certificates.len(), 1);
+    storage.push_queue_service.push_queue_storage.set_control_flags(Some(true), None, None).await.unwrap();
+    mono.get_connection().execute_unprepared("DELETE FROM mst2_native_head").await.unwrap();
+    for instance in [NATIVE_INSTANCE, "11111111-2222-4333-8444-555555555555"] {
+        let error = mono.initialize_native_publication_for_maintenance(instance, &head.root).await.unwrap_err();
+        assert!(error.to_string().contains("native publication history exists"));
+    }
+    assert_eq!(mst2_native_head::Entity::find().count(mono.get_connection()).await.unwrap(), 0);
+    assert_eq!(mst2_native_publication::Entity::find().all(mono.get_connection()).await.unwrap(), certificates);
+    assert_eq!(mst2_publication::Entity::find().all(mono.get_connection()).await.unwrap(), receipts);
+    assert_eq!(mst2_publication_outbox::Entity::find().all(mono.get_connection()).await.unwrap(), outbox);
+    assert!(storage.push_queue_service.push_queue_storage.get_control().await.unwrap().paused);
+    mono.get_connection().execute_unprepared("DELETE FROM mst2_native_publication").await.unwrap();
+    for instance in [NATIVE_INSTANCE, "11111111-2222-4333-8444-555555555555"] {
+        let error = mono.initialize_native_publication_for_maintenance(instance, &head.root).await.unwrap_err();
+        assert!(error.to_string().contains("native publication history exists"));
+    }
+    assert_eq!(mst2_native_head::Entity::find().count(mono.get_connection()).await.unwrap(), 0);
+    assert_eq!(mst2_native_publication::Entity::find().count(mono.get_connection()).await.unwrap(), 0);
+    assert_eq!(mst2_publication::Entity::find().all(mono.get_connection()).await.unwrap(), receipts);
+    assert_eq!(mst2_publication_outbox::Entity::find().all(mono.get_connection()).await.unwrap(), outbox);
+    assert!(storage.push_queue_service.push_queue_storage.get_control().await.unwrap().paused);
+    let root = mono.get_main_ref("/").await.unwrap().unwrap();
+    assert_eq!((root.ref_commit_hash, root.ref_tree_hash), (head.root.commit, head.root.tree));
 }
 
 #[tokio::test]

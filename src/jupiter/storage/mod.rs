@@ -18,6 +18,7 @@ pub mod media_paging_storage;
 pub mod mono_storage;
 pub(crate) mod mst2_publication_storage;
 pub mod mst2_retention;
+pub mod native_metadata_install;
 pub(crate) mod native_publication_storage;
 pub mod notification_storage;
 pub mod object_storage;
