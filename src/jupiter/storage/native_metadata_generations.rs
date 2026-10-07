@@ -169,6 +169,15 @@ impl PostgresMetadataGenerationRepository {
         operation_id: &str,
         prepared: &PreparedNativeMetadataRetention,
     ) -> Result<GenerationPrepareIntent, MetadataInstallError> {
+        self.begin_with_reopens(operation_id, prepared, &[]).await
+    }
+
+    async fn begin_with_reopens(
+        &self,
+        operation_id: &str,
+        prepared: &PreparedNativeMetadataRetention,
+        reopens: &[qualified::MetadataGcReceipt],
+    ) -> Result<GenerationPrepareIntent, MetadataInstallError> {
         validate_operation_id(operation_id)?;
         let plan = prepared.install_plan()?;
         let digest = plan.digest()?;
@@ -177,7 +186,11 @@ impl PostgresMetadataGenerationRepository {
         let result = async {
             self.inner.barrier(&txn).await?;
             if let Some(fixed) = self.load_fixed_plan(&txn, operation_id, &digest).await? {
+                qualified::verify_reopen_replay(&txn, &fixed, reopens).await?;
                 return Ok(fixed.intent);
+            }
+            if !reopens.is_empty() {
+                qualified::reopen_in_txn(&txn, &plan, reopens).await?;
             }
             let bindings = allocate_lifetimes(&txn, &plan, self.graph_domain).await?;
             let canonical_bindings = bindings.encode()?;
@@ -218,6 +231,9 @@ impl PostgresMetadataGenerationRepository {
             )).await.map_err(internal)?;
             // Reuse only already LIVE graph rows. RESERVED pages without a graph
             // are protected by the durable mappings, without inventing a DAG.
+            if self.graph_domain == "qualified-v1" {
+                qualified::retain_existing_roots(&txn, &intent).await?;
+            } else {
             txn.execute_raw(statement(
                 "INSERT INTO mst2_retention_root(node_id,root_key,root_kind,created_at)
                  SELECT l.node_id,'prepare:'||p.prepare_id,'prepare',now()
@@ -227,6 +243,7 @@ impl PostgresMetadataGenerationRepository {
                  WHERE p.prepare_id=$1 ON CONFLICT(node_id,root_key) DO NOTHING",
                 [prepare_id.into()],
             )).await.map_err(internal)?;
+            }
             Ok(intent)
         }.await;
         commit(
@@ -288,6 +305,7 @@ impl PostgresMetadataGenerationRepository {
                 "INSERT INTO mst2_metadata_payload(page_id,generation,metadata_codec,byte_size,payload)
                  SELECT decode(p.page_id,'hex'),p.generation,$1,p.size,decode(p.payload,'hex')
                  FROM jsonb_to_recordset($2::jsonb) AS p(page_id text,generation bigint,size integer,payload text)
+                 WHERE NOT EXISTS(SELECT 1 FROM mst2_metadata_payload b WHERE b.page_id=decode(p.page_id,'hex'))
                  ON CONFLICT(page_id) DO NOTHING",
                 [fixed.stored.record.metadata_codec.into(),encoded.clone().into()],
             )).await.map_err(internal)?;
@@ -379,10 +397,13 @@ impl PostgresMetadataGenerationRepository {
         lock_prepare(txn, intent.prepare_id()).await?;
         let fixed = self.require_fixed_plan(txn, intent).await?;
         check_generation_payloads(txn, &fixed).await?;
-        let legacy = self
-            .inner
-            .finalize_stored_plan_in_txn(txn, &intent.legacy, &observation.dag, fixed.stored)
-            .await?;
+        let legacy = if intent.graph_domain == GraphDomain::Qualified {
+            qualified::finalize_graph(txn, &fixed, &observation.dag).await?
+        } else {
+            self.inner
+                .finalize_stored_plan_in_txn(txn, &intent.legacy, &observation.dag, fixed.stored)
+                .await?
+        };
         txn.execute_raw(statement(
             "UPDATE mst2_metadata_lifetime l SET state='LIVE'
              FROM mst2_metadata_prepare_page p WHERE p.prepare_id=$1 AND p.page_id=l.page_id
@@ -407,6 +428,9 @@ impl PostgresMetadataGenerationRepository {
         scope: &str,
     ) -> Result<(), SnapshotError> {
         self.require_scope(&receipt.intent)?;
+        if receipt.intent.graph_domain == GraphDomain::Qualified {
+            return Err(unavailable("qualified production handoff is not admitted"));
+        }
         self.inner
             .verify_receipt_in_txn(txn, &receipt.legacy, tagged_root_tree_oid, scope)
             .await?;
@@ -515,7 +539,7 @@ impl PostgresMetadataGenerationRepository {
                 Some(fixed) if fixed.stored.record.state == "COMMITTED" => {
                     check_generation_payloads(&txn, &fixed).await?;
                     load_fixed_dag(&txn, &fixed).await?;
-                    verify_graph(&txn, &fixed.stored).await?;
+                    verify_fixed_graph(&txn, &fixed).await?;
                     Ok(GenerationPrepareObservation::Committed(Box::new(
                         GenerationMetadataReceipt {
                             legacy: fixed.stored.receipt()?,
@@ -704,6 +728,9 @@ async fn allocate_lifetimes(
     plan: &MetadataInstallPlan,
     graph_domain: &str,
 ) -> Result<GenerationBindings, SnapshotError> {
+    if graph_domain == "qualified-v1" {
+        return qualified::allocate_lifetimes(txn, plan).await;
+    }
     let pages: Vec<_> = plan
         .pages
         .iter()
@@ -828,6 +855,9 @@ async fn check_lifetimes<C: ConnectionTrait>(
     connection: &C,
     stored: &StoredPlan,
 ) -> Result<(), SnapshotError> {
+    if stored.record.graph_domain.as_deref() == Some("qualified-v1") {
+        return qualified::check_lifetimes(connection, stored).await;
+    }
     let row=connection.query_one_raw(statement(
         "SELECT p.page_id,l.generation,l.state,l.metadata_codec,l.expected_size,p.generation AS expected_generation,
          n.state AS graph_state,n.kind AS graph_kind,n.bytes AS graph_bytes,
@@ -953,3 +983,17 @@ mod tests;
 
 #[path = "native_metadata_history.rs"]
 pub mod history;
+
+#[path = "native_metadata_qualified.rs"]
+pub mod qualified;
+
+async fn verify_fixed_graph<C: ConnectionTrait>(
+    connection: &C,
+    fixed: &FixedPlan,
+) -> Result<(), SnapshotError> {
+    if fixed.intent.graph_domain == GraphDomain::Qualified {
+        qualified::verify_graph(connection, fixed).await
+    } else {
+        verify_graph(connection, &fixed.stored).await
+    }
+}

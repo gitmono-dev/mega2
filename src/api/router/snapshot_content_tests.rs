@@ -88,6 +88,9 @@ mod generation_upgrade;
 #[path = "snapshot_generation_history_fixture.rs"]
 mod generation_history_fixture;
 
+#[path = "snapshot_generation_qualified_fixture.rs"]
+mod generation_qualified_fixture;
+
 #[derive(Default)]
 struct ReadCounts {
     whole: AtomicUsize,

@@ -39,11 +39,77 @@ impl MetadataTerminalReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataTerminalObservation {
+    /// The stored state matches this action; mutation still requires its full CAS proof.
     Active,
     Terminated(Box<MetadataTerminalReceipt>),
 }
 
 impl PostgresMetadataGenerationRepository {
+    /// Recover an immutable sealed intent after restart, including retired/aborted history.
+    /// Current lifetimes and payloads are deliberately not consulted or revived.
+    pub async fn capture_terminal_intent(
+        &self,
+        operation_id: &str,
+        manifest_digest: [u8; 32],
+    ) -> Result<GenerationPrepareIntent, SnapshotError> {
+        validate_operation_id(operation_id)?;
+        let txn = self.inner.transaction().await?;
+        self.inner.barrier(&txn).await?;
+        let result = async {
+            let record = mst2_metadata_prepare::Entity::find()
+                .filter(mst2_metadata_prepare::Column::OperationId.eq(operation_id))
+                .one(&txn)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| unavailable("terminal preparation history is missing"))?;
+            if record.manifest_digest.as_slice() != manifest_digest {
+                return Err(integrity(
+                    "terminal recovery manifest differs from durable history",
+                ));
+            }
+            let plan = MetadataInstallPlan::decode(&record.canonical_plan, &manifest_digest)?;
+            let canonical = record.canonical_bindings.as_deref().ok_or_else(|| {
+                unavailable("legacy unsealed preparation has no fixed terminal capability")
+            })?;
+            let bindings = GenerationBindings::decode(canonical, &plan)?;
+            let digest: [u8; 32] = Sha256::digest(canonical).into();
+            let primary = record
+                .primary_scope
+                .as_deref()
+                .ok_or_else(|| integrity("terminal history has no primary scope"))?;
+            let domain = GraphDomain::from_stored(record.graph_domain.as_deref())?;
+            let intent = GenerationPrepareIntent {
+                legacy: MetadataPrepareIntent {
+                    prepare_id: record.prepare_id.clone(),
+                    operation_id: operation_id.into(),
+                    manifest_digest,
+                },
+                metadata_root: plan.root,
+                root_generation: bindings
+                    .0
+                    .get(&plan.root)
+                    .ok_or_else(|| integrity("terminal root binding is missing"))?
+                    .0,
+                bindings_digest: digest,
+                primary_scope: primary.into(),
+                graph_domain: domain,
+                storage_seal: seal(
+                    &record.prepare_id,
+                    &manifest_digest,
+                    &plan.root,
+                    &digest,
+                    primary,
+                    domain.stored(),
+                )?,
+            };
+            self.require_terminal_record(&txn, &intent).await?;
+            Ok(intent)
+        }
+        .await;
+        txn.rollback().await.map_err(internal)?;
+        result
+    }
+
     pub async fn abort(
         &self,
         intent: &GenerationPrepareIntent,
@@ -85,7 +151,7 @@ impl PostgresMetadataGenerationRepository {
         }
     }
 
-    async fn terminate_in_txn(
+    pub(super) async fn terminate_in_txn(
         &self,
         txn: &DatabaseTransaction,
         intent: &GenerationPrepareIntent,
@@ -119,44 +185,63 @@ impl PostgresMetadataGenerationRepository {
                 ));
             }
             check_generation_payloads(txn, &fixed).await?;
-            verify_graph(txn, &fixed.stored).await?;
+            verify_fixed_graph(txn, &fixed).await?;
         }
-        let roots = mst2_retention_root::Entity::find()
-            .filter(
-                mst2_retention_root::Column::RootKey.eq(format!("prepare:{}", intent.prepare_id())),
+        if intent.graph_domain == GraphDomain::Qualified {
+            qualified::verify_roots(
+                txn,
+                &fixed,
+                action == MetadataTerminalAction::RetireCoverage,
             )
-            .limit((MetadataDagLimits::default().nodes + 1) as u64)
-            .all(txn)
+            .await?;
+            txn.execute_raw(statement(
+                "DELETE FROM mst2_metadata_graph_root WHERE prepare_id=$1 AND storage_seal=$2",
+                [
+                    intent.prepare_id().into(),
+                    intent.storage_seal.to_vec().into(),
+                ],
+            ))
             .await
             .map_err(internal)?;
-        let expected_nodes: BTreeSet<_> = fixed.bindings.0.keys().map(node_id).collect();
-        if roots
-            .iter()
-            .any(|root| root.root_kind != "prepare" || !expected_nodes.contains(&root.node_id))
-        {
-            return Err(integrity(
-                "terminal prepare coverage differs from its fixed lifetime mappings",
-            ));
-        }
-        if action == MetadataTerminalAction::RetireCoverage
-            && roots
+        } else {
+            let roots = mst2_retention_root::Entity::find()
+                .filter(
+                    mst2_retention_root::Column::RootKey
+                        .eq(format!("prepare:{}", intent.prepare_id())),
+                )
+                .limit((MetadataDagLimits::default().nodes + 1) as u64)
+                .all(txn)
+                .await
+                .map_err(internal)?;
+            let expected_nodes: BTreeSet<_> = fixed.bindings.0.keys().map(node_id).collect();
+            if roots
                 .iter()
-                .map(|root| root.node_id.clone())
-                .collect::<BTreeSet<_>>()
-                != expected_nodes
-        {
-            return Err(unavailable(
-                "coverage retirement cannot recover missing or transferred prepare roots",
-            ));
-        }
-        txn.execute_raw(statement(
-            "DELETE FROM mst2_retention_root r USING mst2_metadata_prepare_page p
+                .any(|root| root.root_kind != "prepare" || !expected_nodes.contains(&root.node_id))
+            {
+                return Err(integrity(
+                    "terminal prepare coverage differs from its fixed lifetime mappings",
+                ));
+            }
+            if action == MetadataTerminalAction::RetireCoverage
+                && roots
+                    .iter()
+                    .map(|root| root.node_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    != expected_nodes
+            {
+                return Err(unavailable(
+                    "coverage retirement cannot recover missing or transferred prepare roots",
+                ));
+            }
+            txn.execute_raw(statement(
+                "DELETE FROM mst2_retention_root r USING mst2_metadata_prepare_page p
              WHERE p.prepare_id=$1 AND r.root_key='prepare:'||p.prepare_id AND r.root_kind='prepare'
                AND r.node_id='page:sha256:'||encode(p.page_id,'hex')",
-            [intent.prepare_id().into()],
-        ))
-        .await
-        .map_err(internal)?;
+                [intent.prepare_id().into()],
+            ))
+            .await
+            .map_err(internal)?;
+        }
         let sql=match action {
             MetadataTerminalAction::Abort=>
                 "UPDATE mst2_metadata_prepare SET state='ABORTED',aborted_at=clock_timestamp()
@@ -212,7 +297,19 @@ impl PostgresMetadataGenerationRepository {
                     verify_no_prepare_coverage(&txn, intent).await?;
                     Ok(MetadataTerminalObservation::Terminated(Box::new(receipt)))
                 }
-                None => Ok(MetadataTerminalObservation::Active),
+                None => {
+                    let expected = match action {
+                        MetadataTerminalAction::Abort => "PREPARING",
+                        MetadataTerminalAction::RetireCoverage => "COMMITTED",
+                    };
+                    if record.state != expected {
+                        return Err(SnapshotError::new(
+                            SnapshotErrorCode::Conflict,
+                            "metadata prepare is in another terminal state",
+                        ));
+                    }
+                    Ok(MetadataTerminalObservation::Active)
+                }
             }
         }
         .await;
@@ -325,6 +422,22 @@ async fn verify_no_prepare_coverage<C: ConnectionTrait>(
     connection: &C,
     intent: &GenerationPrepareIntent,
 ) -> Result<(), SnapshotError> {
+    if intent.graph_domain == GraphDomain::Qualified {
+        if connection
+            .query_one_raw(statement(
+                "SELECT prepare_id FROM mst2_metadata_graph_root WHERE prepare_id=$1 LIMIT 1",
+                [intent.prepare_id().into()],
+            ))
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            return Err(integrity(
+                "terminal qualified preparation still has coverage",
+            ));
+        }
+        return Ok(());
+    }
     if connection
         .query_one_raw(statement(
             "SELECT node_id FROM mst2_retention_root WHERE root_key='prepare:'||$1 LIMIT 1",
