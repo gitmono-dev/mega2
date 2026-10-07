@@ -63,7 +63,10 @@ use crate::{
             object_storage::{MegaObjectStorageWrapper, build_object_storage},
             push_queue_storage::{ClaimOutcome, EnqueueOutcome},
         },
-        tests::{test_redis_manager, test_storage_with_config, with_test_vault},
+        tests::{
+            TestSchemaGuard, test_db_config, test_redis_manager, test_storage_with_config,
+            with_test_vault,
+        },
     },
     orbit_api::{
         error::OrbitResult,
@@ -75,6 +78,9 @@ use crate::{
 };
 
 const TOKEN: &str = "mst2-fixed-content-test";
+
+#[path = "snapshot_session_tests.rs"]
+mod durable_sessions;
 
 #[derive(Default)]
 struct ReadCounts {
@@ -214,6 +220,7 @@ struct Fixture {
     digest: [u8; 32],
     counts: Arc<ReadCounts>,
     _temp: tempfile::TempDir,
+    _schema: Option<TestSchemaGuard>,
 }
 
 fn tree(items: Vec<TreeItem>) -> Tree {
@@ -301,6 +308,14 @@ async fn publish_native_push(
 
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_pg_config(false).await
+    }
+
+    async fn new_with_pg_config(rebuildable: bool) -> Self {
+        Self::new_with_pg_config_and_directories(rebuildable, 0).await
+    }
+
+    async fn new_with_pg_config_and_directories(rebuildable: bool, directory_count: usize) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let mut config = isolated_config(temp.path().join("config"));
         config.monorepo.push_policy = PushPolicy::Trunk;
@@ -310,7 +325,25 @@ impl Fixture {
         config.mst2.auth_token = Some(TOKEN.to_string());
         let backend = build_object_storage(&config.object_storage).await.unwrap();
         let counts = Arc::new(ReadCounts::default());
-        let mut storage = test_storage_with_config(temp.path(), config).await;
+        let (mut storage, schema) = if rebuildable {
+            let (database, schema) = test_db_config(temp.path()).await;
+            config.database = database;
+            let connection = crate::jupiter::storage::init::database_connection(&config.database)
+                .await
+                .unwrap();
+            (
+                crate::jupiter::storage::Storage::new_with_connection(
+                    Arc::new(config),
+                    Arc::new(connection),
+                    backend.clone(),
+                )
+                .await
+                .unwrap(),
+                Some(schema),
+            )
+        } else {
+            (test_storage_with_config(temp.path(), config).await, None)
+        };
         storage.git_service = GitService {
             obj_storage: MegaObjectStorageWrapper::new(Arc::new(CountingStorage {
                 inner: backend,
@@ -344,7 +377,7 @@ impl Fixture {
         let empty_oid = ObjectHash::from_hex_for_kind(HashKind::Sha1, &empty_oid).unwrap();
         let empty_dir = tree(vec![]);
         let nested = tree(vec![item(TreeItemMode::Blob, blob_oid, "file")]);
-        let project = tree(vec![
+        let mut project_items = vec![
             item(TreeItemMode::Blob, blob_oid, "alias"),
             item(TreeItemMode::Tree, empty_dir.id, "directory"),
             item(TreeItemMode::Blob, empty_oid, "empty"),
@@ -352,7 +385,24 @@ impl Fixture {
             item(TreeItemMode::Blob, blob_oid, "file"),
             item(TreeItemMode::Link, link_oid, "link"),
             item(TreeItemMode::Tree, nested.id, "nested"),
-        ]);
+        ];
+        let mut extra_trees = Vec::new();
+        for index in 0..directory_count {
+            // Distinct names make distinct canonical pages even though all
+            // directories share the same already-verified immutable blob.
+            let child = tree(vec![item(
+                TreeItemMode::Blob,
+                blob_oid,
+                &format!("file-{index:03}"),
+            )]);
+            project_items.push(item(
+                TreeItemMode::Tree,
+                child.id,
+                &format!("wide-{index:03}"),
+            ));
+            extra_trees.push(child);
+        }
+        let project = tree(project_items);
         let old_tip = Commit::from_tree_id_with_kind(
             HashKind::Sha1,
             project.id,
@@ -379,13 +429,9 @@ impl Fixture {
         )
         .unwrap();
         let mono = storage.mono_storage();
-        mono.save_mega_trees(
-            vec![empty_dir, nested, project, root.clone()],
-            commit.id,
-            None,
-        )
-        .await
-        .unwrap();
+        let mut trees = vec![empty_dir, nested, project, root.clone()];
+        trees.extend(extra_trees);
+        mono.save_mega_trees(trees, commit.id, None).await.unwrap();
         mono.save_mega_commits(vec![commit.clone(), old_tip.clone(), new_tip.clone()], None)
             .await
             .unwrap();
@@ -474,6 +520,7 @@ impl Fixture {
             raw,
             counts,
             _temp: temp,
+            _schema: schema,
         }
     }
 

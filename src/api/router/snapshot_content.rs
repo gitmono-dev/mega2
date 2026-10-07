@@ -13,7 +13,9 @@ use futures::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{abs_view_path, internal, mst2_error_response, request::Mst2Bytes, treeframe_response};
+use super::{
+    abs_view_path, guarded_treeframe_response, internal, mst2_error_response, request::Mst2Bytes,
+};
 use crate::ceres::snapshot::{
     chunks::{ChunkProjection, get_or_project},
     error::{SnapshotError, SnapshotErrorCode},
@@ -22,7 +24,6 @@ use crate::ceres::snapshot::{
         resolve_abs_metadata,
     },
     resolver::FsKind,
-    runtime::runtime,
     view::validate_scope_relative_path,
 };
 
@@ -226,9 +227,7 @@ pub(super) async fn blob_head(
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     ensure(&state)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = super::request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
     if headers.contains_key("range") {
         return Err(mst2_error_response(SnapshotError::new(
@@ -286,9 +285,7 @@ pub(super) async fn objects(
     Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure(&state)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = super::request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     let req: ObjectsRequest = super::parse_json_body(&body)?;
     if req.items.is_empty() || req.items.len() > OBJECT_MAX_ITEMS {
         return Err(mst2_error_response(SnapshotError::new(
@@ -365,7 +362,7 @@ pub(super) async fn objects(
     // then exactly one END. Encoding is negotiated per request.
     use crate::ceres::snapshot::frame_stream::FrameStream;
     let mut stream = FrameStream::new(1, encoding);
-    let mut out: Vec<u8> = Vec::new();
+    let mut out: Vec<Vec<u8>> = Vec::new();
     let mut frame: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut frame_raw = 0usize;
     for (cid, data) in unique {
@@ -377,7 +374,7 @@ pub(super) async fn objects(
             let bytes = stream
                 .object(std::mem::take(&mut frame))
                 .map_err(mst2_error_response)?;
-            out.extend_from_slice(&bytes);
+            out.push(bytes);
             frame_raw = 0;
         }
         frame_raw += data.len();
@@ -385,18 +382,17 @@ pub(super) async fn objects(
     }
     if !frame.is_empty() {
         let bytes = stream.object(frame).map_err(mst2_error_response)?;
-        out.extend_from_slice(&bytes);
+        out.push(bytes);
     }
-
     let end = stream.end(
         req.items.len() as u32,
         seen.len() as u32,
         logical_bytes,
         sha256_of(&body),
     );
-    out.extend_from_slice(&end);
+    out.push(end);
 
-    treeframe_response(&snapshot_id, &body, out).map_err(mst2_error_response)
+    guarded_treeframe_response(&state, &ctx, &snapshot_id, &body, out).map_err(mst2_error_response)
 }
 
 #[derive(Deserialize, Debug)]
@@ -467,9 +463,7 @@ pub(super) async fn chunk_map(
     Query(q): Query<ChunkMapQuery>,
 ) -> Result<Response, Response> {
     ensure(&state)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = super::request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
     let handler = state
         .api_handler(std::path::Path::new("/"))
@@ -513,9 +507,7 @@ pub(super) async fn chunk_map_pages(
     Query(q): Query<ChunkMapQuery>,
 ) -> Result<Response, Response> {
     ensure(&state)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = super::request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
     // Canonical v3 uses `map_id` + `page_index`; retain parsing of the old
     // names only while the legacy client is still present in this checkout.
@@ -622,9 +614,7 @@ pub(super) async fn chunks(
     Mst2Bytes(body): Mst2Bytes,
 ) -> Result<Response, Response> {
     ensure(&state)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = super::request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     let req: ChunksRequest = super::parse_json_body(&body)?;
     if req.items.is_empty() || req.items.len() > CHUNKS_MAX_ITEMS {
         return Err(mst2_error_response(SnapshotError::new(
@@ -707,7 +697,7 @@ pub(super) async fn chunks(
 
     use crate::ceres::snapshot::frame_stream::FrameStream;
     let mut stream = FrameStream::new(1, encoding);
-    let mut out: Vec<u8> = Vec::new();
+    let mut out: Vec<Vec<u8>> = Vec::new();
     for p in planned.iter() {
         // Re-verified slice (digest + length) from the staged projection.
         let bytes = p
@@ -722,7 +712,7 @@ pub(super) async fn chunks(
                 bytes.to_vec(),
             )
             .map_err(mst2_error_response)?;
-        out.extend_from_slice(&frame);
+        out.push(frame);
     }
     let end = stream.end(
         req.items.len() as u32,
@@ -730,9 +720,9 @@ pub(super) async fn chunks(
         logical_bytes,
         sha256_of(&body),
     );
-    out.extend_from_slice(&end);
+    out.push(end);
 
-    treeframe_response(&snapshot_id, &body, out).map_err(mst2_error_response)
+    guarded_treeframe_response(&state, &ctx, &snapshot_id, &body, out).map_err(mst2_error_response)
 }
 
 /// Strict decimal-string parse for unsigned counts (spec 04 §1: no leading

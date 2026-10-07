@@ -223,7 +223,7 @@ pub(crate) fn decode_native_observation(
     })
 }
 
-async fn observe<C: ConnectionTrait>(
+pub(crate) async fn observe<C: ConnectionTrait>(
     connection: &C,
 ) -> Result<NativeObservation, PublicationReceiptError> {
     let rows = connection
@@ -268,7 +268,14 @@ impl MonoStorage {
         &self,
         instance: &str,
     ) -> Result<NativePublicationHead, PublicationReceiptError> {
-        let observation = observe(self.get_connection()).await?;
+        Self::read_native_publication_head_from(self.get_connection(), instance).await
+    }
+
+    pub(crate) async fn read_native_publication_head_from<C: ConnectionTrait>(
+        connection: &C,
+        instance: &str,
+    ) -> Result<NativePublicationHead, PublicationReceiptError> {
+        let observation = observe(connection).await?;
         let head = observation
             .head
             .ok_or_else(|| integrity("native publication is not initialized"))?;

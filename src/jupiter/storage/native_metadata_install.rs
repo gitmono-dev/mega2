@@ -1,5 +1,5 @@
 //! Immutable metadata payload CAS and durable native preparation receipts.
-//! No runtime, publication, lease or physical collector is enabled here.
+//! The native HTTP session authority installs batches and transfers prepare pins.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -9,7 +9,7 @@ use std::{
 use mst2_codec::metapage::{HEADER_LEN, PAGE_MAX_BYTES, Page, page_id};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, EntityTrait,
-    IsolationLevel, QueryFilter, QuerySelect, Statement, TransactionTrait,
+    IsolationLevel, QueryFilter, QueryResult, QuerySelect, Statement, TransactionTrait,
 };
 use serde_json::json;
 
@@ -21,7 +21,7 @@ use crate::{
     },
     ceres::snapshot::{
         error::{SnapshotError, SnapshotErrorCode},
-        metadata_install::MetadataInstallPlan,
+        metadata_install::{MAX_PLAN_BYTES, MetadataInstallIdentity, MetadataInstallPlan},
         pages::PreparedNativeMetadataRetention,
         retention::RetentionRoot,
         retention_dag::{
@@ -71,8 +71,12 @@ impl MetadataPrepareIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedMetadataReceipt {
     intent: MetadataPrepareIntent,
+    identity: MetadataInstallIdentity,
     metadata_root: [u8; 32],
     payload_bytes: u64,
+    root_payload_bytes: u64,
+    node_count: usize,
+    edge_count: usize,
 }
 
 impl PreparedMetadataReceipt {
@@ -115,8 +119,16 @@ impl StoredPlan {
     fn receipt(&self) -> Result<PreparedMetadataReceipt, SnapshotError> {
         Ok(PreparedMetadataReceipt {
             intent: self.intent()?,
+            identity: self.plan.identity.clone(),
             metadata_root: self.plan.root,
             payload_bytes: self.plan.total_bytes,
+            root_payload_bytes: *self
+                .plan
+                .pages
+                .get(&self.plan.root)
+                .ok_or_else(|| integrity("metadata preparation root page is missing"))?,
+            node_count: self.plan.pages.len(),
+            edge_count: self.plan.edges.len(),
         })
     }
 }
@@ -148,6 +160,49 @@ impl PostgresMetadataInstallRepository {
             barrier_timeout: Duration::from_secs(5),
             storage_scope,
         })
+    }
+
+    /// These columns are returned by the same query that authorizes a lease,
+    /// so a warm cache cannot authorize a stale replica or another schema.
+    pub(crate) fn verify_primary_scope_row(&self, row: &QueryResult) -> Result<(), SnapshotError> {
+        let actual = PrimaryStorageScope {
+            storage_uuid: row
+                .try_get::<Option<String>>("", "authority_storage_uuid")
+                .map_err(internal)?
+                .ok_or_else(|| internal("session authority storage scope is missing"))?,
+            database: row.try_get("", "authority_database").map_err(internal)?,
+            database_oid: row
+                .try_get("", "authority_database_oid")
+                .map_err(internal)?,
+            schema: row.try_get("", "authority_schema").map_err(internal)?,
+            schema_oid: row.try_get("", "authority_schema_oid").map_err(internal)?,
+            server_address: row
+                .try_get("", "authority_server_address")
+                .map_err(internal)?,
+            server_port: row.try_get("", "authority_server_port").map_err(internal)?,
+        };
+        if row
+            .try_get::<bool>("", "authority_replica")
+            .map_err(internal)?
+            || actual != self.storage_scope
+        {
+            return Err(internal(
+                "session authority no longer targets its captured primary storage scope",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn verify_primary_connection<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+    ) -> Result<(), SnapshotError> {
+        if read_storage_scope(connection).await? != self.storage_scope {
+            return Err(internal(
+                "session mutation no longer targets its captured primary storage scope",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn begin_intent(
@@ -203,44 +258,62 @@ impl PostgresMetadataInstallRepository {
         intent: &MetadataPrepareIntent,
         payload: &MetadataPagePayload,
     ) -> Result<(), MetadataInstallError> {
-        validate_payload(payload)?;
+        self.install_pages(intent, std::slice::from_ref(payload))
+            .await
+    }
+
+    /// At most 64 pages (1 MiB of canonical payload) per transaction.
+    pub async fn install_pages(
+        &self,
+        intent: &MetadataPrepareIntent,
+        payloads: &[MetadataPagePayload],
+    ) -> Result<(), MetadataInstallError> {
+        if payloads.is_empty() || payloads.len() > 64 {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "metadata installation batch must contain 1..=64 pages",
+            )
+            .into());
+        }
+        let mut ids = BTreeSet::new();
+        for payload in payloads {
+            validate_payload(payload)?;
+            if !ids.insert(payload.id) {
+                return Err(integrity("duplicate page in metadata installation batch").into());
+            }
+        }
         let txn = self.transaction().await?;
         let result = async {
             self.barrier(&txn).await?;
             let stored = require_plan(&txn, intent).await?;
-            if stored.plan.pages.get(&payload.id) != Some(&payload.size) {
-                return Err(integrity(
-                    "metadata payload is not a member of this fixed installation",
-                ));
+            for payload in payloads {
+                if stored.plan.pages.get(&payload.id) != Some(&payload.size) {
+                    return Err(integrity("metadata payload is not a member of this fixed installation"));
+                }
             }
+            let pages: Vec<_> = payloads.iter().map(|p| json!({
+                "page_id":hex::encode(p.id), "size":p.size, "payload":hex::encode(&p.bytes)
+            })).collect();
+            let encoded = serde_json::to_string(&pages).map_err(internal)?;
             txn.execute_raw(statement(
                 "INSERT INTO mst2_metadata_payload(page_id,metadata_codec,byte_size,payload)
-                 VALUES ($1,$2,$3,$4) ON CONFLICT(page_id) DO NOTHING",
-                [
-                    payload.id.to_vec().into(),
-                    (stored.plan.identity.metadata_codec as i16).into(),
-                    (payload.size as i32).into(),
-                    payload.bytes.clone().into(),
-                ],
-            ))
-            .await
-            .map_err(internal)?;
-            let existing = mst2_metadata_payload::Entity::find_by_id(payload.id.to_vec())
-                .one(&txn)
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| integrity("installed metadata payload disappeared"))?;
-            if existing.payload != payload.bytes
-                || existing.byte_size as u64 != payload.size
-                || existing.metadata_codec != stored.plan.identity.metadata_codec as i16
-            {
-                return Err(integrity(
-                    "immutable metadata payload identity conflicts with stored bytes",
-                ));
+                 SELECT decode(p.page_id,'hex'),$1,p.size,decode(p.payload,'hex')
+                 FROM jsonb_to_recordset($2::jsonb) AS p(page_id text,size integer,payload text)
+                 ON CONFLICT(page_id) DO NOTHING",
+                [(stored.plan.identity.metadata_codec as i16).into(),encoded.clone().into()],
+            )).await.map_err(internal)?;
+            let bad = txn.query_one_raw(statement(
+                "SELECT p.page_id FROM jsonb_to_recordset($2::jsonb) AS p(page_id text,size integer,payload text)
+                 LEFT JOIN mst2_metadata_payload b ON b.page_id=decode(p.page_id,'hex')
+                 WHERE b.page_id IS NULL OR b.metadata_codec<>$1 OR b.byte_size<>p.size
+                   OR b.payload<>decode(p.payload,'hex') LIMIT 1",
+                [(stored.plan.identity.metadata_codec as i16).into(),encoded.into()],
+            )).await.map_err(internal)?;
+            if bad.is_some() {
+                return Err(integrity("immutable metadata payload identity conflicts with stored bytes"));
             }
             Ok(())
-        }
-        .await;
+        }.await;
         commit(
             txn,
             result,
@@ -249,6 +322,156 @@ impl PostgresMetadataInstallRepository {
             MetadataCommitPhase::Payload,
         )
         .await
+    }
+
+    pub(crate) async fn verify_receipt_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        receipt: &PreparedMetadataReceipt,
+        tagged_root_tree_oid: &str,
+        scope: &str,
+    ) -> Result<(), SnapshotError> {
+        self.barrier(txn).await?;
+        let identity = &receipt.identity;
+        if identity.tagged_root_tree_oid != tagged_root_tree_oid || identity.scope != scope {
+            return Err(integrity(
+                "metadata receipt belongs to another fixed source",
+            ));
+        }
+        // The private receipt can only be issued after full validation and a
+        // definitive commit. Hash the bounded canonical plan in PostgreSQL,
+        // bind all redundant identity/summary columns to that receipt, and
+        // check its still-protected LIVE root under the retention barrier.
+        // This hashes <=2 MiB; it does not transfer or scan pages/edges here.
+        let row = txn.query_one_raw(statement(
+            "SELECT p.operation_id,p.manifest_digest,
+             CASE WHEN octet_length(p.canonical_plan)<=$2 THEN sha256(p.canonical_plan) END AS plan_digest,
+             p.source_domain,p.tagged_root_tree_oid,p.scope,p.schema_version,p.metadata_codec,
+             p.materialization_policy,p.fs_semantics,p.access_projection,p.verification_revision,
+             p.projection_revision,p.metadata_root,p.node_count,p.edge_count,p.total_bytes,
+             p.state,p.committed_at IS NOT NULL AS committed,
+             n.kind AS root_kind,n.state AS root_state,n.bytes AS root_bytes,
+             EXISTS(SELECT 1 FROM mst2_retention_root r WHERE r.node_id=n.node_id
+               AND r.root_key='prepare:'||p.prepare_id AND r.root_kind='prepare') AS prepare_covered
+             FROM mst2_metadata_prepare p LEFT JOIN mst2_retention_node n
+               ON n.node_id='page:sha256:'||encode(p.metadata_root,'hex') WHERE p.prepare_id=$1",
+            [receipt.intent.prepare_id.clone().into(), (MAX_PLAN_BYTES as i32).into()],
+        )).await.map_err(internal)?.ok_or_else(|| unavailable("metadata preparation is missing"))?;
+        if row
+            .try_get::<String>("", "operation_id")
+            .map_err(internal)?
+            != receipt.intent.operation_id
+            || row
+                .try_get::<Vec<u8>>("", "manifest_digest")
+                .map_err(internal)?
+                != receipt.intent.manifest_digest
+            || row
+                .try_get::<Option<Vec<u8>>>("", "plan_digest")
+                .map_err(internal)?
+                .as_deref()
+                != Some(receipt.intent.manifest_digest.as_slice())
+            || row
+                .try_get::<String>("", "source_domain")
+                .map_err(internal)?
+                != identity.source_domain
+            || row
+                .try_get::<String>("", "tagged_root_tree_oid")
+                .map_err(internal)?
+                != identity.tagged_root_tree_oid
+            || row.try_get::<String>("", "scope").map_err(internal)? != identity.scope
+            || row.try_get::<i16>("", "schema_version").map_err(internal)?
+                != identity.schema_version as i16
+            || row.try_get::<i16>("", "metadata_codec").map_err(internal)?
+                != identity.metadata_codec as i16
+            || row
+                .try_get::<i16>("", "materialization_policy")
+                .map_err(internal)?
+                != identity.materialization_policy as i16
+            || row.try_get::<i16>("", "fs_semantics").map_err(internal)?
+                != identity.fs_semantics as i16
+            || row
+                .try_get::<i16>("", "access_projection")
+                .map_err(internal)?
+                != identity.access_projection as i16
+            || row
+                .try_get::<i32>("", "verification_revision")
+                .map_err(internal)?
+                != identity.verification_revision
+            || row
+                .try_get::<i16>("", "projection_revision")
+                .map_err(internal)?
+                != identity.projection_revision as i16
+            || row
+                .try_get::<Vec<u8>>("", "metadata_root")
+                .map_err(internal)?
+                != receipt.metadata_root
+            || row.try_get::<i32>("", "node_count").map_err(internal)? != receipt.node_count as i32
+            || row.try_get::<i32>("", "edge_count").map_err(internal)? != receipt.edge_count as i32
+            || row.try_get::<i64>("", "total_bytes").map_err(internal)?
+                != receipt.payload_bytes as i64
+            || row.try_get::<String>("", "state").map_err(internal)? != "COMMITTED"
+            || !row.try_get::<bool>("", "committed").map_err(internal)?
+        {
+            return Err(integrity(
+                "metadata preparation differs from its definitive receipt",
+            ));
+        }
+        if row
+            .try_get::<Option<String>>("", "root_kind")
+            .map_err(internal)?
+            .as_deref()
+            != Some("page")
+            || row
+                .try_get::<Option<String>>("", "root_state")
+                .map_err(internal)?
+                .as_deref()
+                != Some("LIVE")
+            || row
+                .try_get::<Option<i64>>("", "root_bytes")
+                .map_err(internal)?
+                != Some(receipt.root_payload_bytes as i64)
+            || !row
+                .try_get::<bool>("", "prepare_covered")
+                .map_err(internal)?
+        {
+            return Err(unavailable(
+                "metadata receipt root is not LIVE and protected by its prepare",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn restore_session_dag(&self, prepare_id: &str) -> Result<(), SnapshotError> {
+        let record = mst2_metadata_prepare::Entity::find_by_id(prepare_id.to_owned())
+            .one(&self.connection)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| unavailable("snapshot preparation is missing"))?;
+        let digest = record
+            .manifest_digest
+            .as_slice()
+            .try_into()
+            .map_err(|_| integrity("invalid metadata preparation digest"))?;
+        let stored = load_plan(&self.connection, &record.operation_id, &digest)
+            .await?
+            .ok_or_else(|| unavailable("snapshot preparation disappeared"))?;
+        if stored.record.state != "COMMITTED" {
+            return Err(unavailable("snapshot preparation is not committed"));
+        }
+        load_installed_dag(&self.connection, &stored).await?;
+        let txn = self.transaction().await?;
+        let result = async {
+            self.barrier(&txn).await?;
+            verify_graph(&txn, &stored).await
+        }
+        .await;
+        match result {
+            Ok(()) => txn.commit().await.map_err(internal),
+            Err(error) => {
+                txn.rollback().await.map_err(internal)?;
+                Err(error)
+            }
+        }
     }
 
     /// Verify all stored bytes outside the graph transaction. Immutable payloads
@@ -702,7 +925,21 @@ async fn verify_graph<C: ConnectionTrait>(
         .all(connection)
         .await
         .map_err(internal)?;
-    if roots.iter().any(|root| root.root_kind != "prepare")
+    if roots.is_empty() {
+        let transferred = connection
+            .query_one_raw(statement(
+                "SELECT s.snapshot_id FROM mst2_snapshot_context s
+             JOIN mst2_retention_root r ON r.root_key='pin:session:'||s.snapshot_id
+               AND r.node_id='page:sha256:'||encode(s.metadata_root,'hex') AND r.root_kind='pin'
+             WHERE s.prepare_id=$1 LIMIT 1",
+                [stored.record.prepare_id.clone().into()],
+            ))
+            .await
+            .map_err(internal)?;
+        if transferred.is_none() {
+            return Err(unavailable("metadata protection handoff is incomplete"));
+        }
+    } else if roots.iter().any(|root| root.root_kind != "prepare")
         || roots
             .into_iter()
             .map(|root| root.node_id)
