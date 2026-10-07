@@ -88,6 +88,9 @@ mod bounded_chunks;
 #[path = "snapshot_persisted_chunk_map_tests.rs"]
 mod persisted_chunk_maps;
 
+#[path = "snapshot_raw_blob_tests.rs"]
+mod raw_blob;
+
 #[path = "snapshot_session_tests.rs"]
 mod durable_sessions;
 
@@ -111,6 +114,7 @@ struct ReadCounts {
     range: AtomicUsize,
     bytes: AtomicUsize,
     object_fault: std::sync::Mutex<Option<bounded_objects::StreamFault>>,
+    object_size_override: std::sync::Mutex<Option<i64>>,
     chunk_faults: std::sync::Mutex<Vec<bounded_chunks::ChunkFault>>,
     receipt_reads: AtomicUsize,
     receipt_writes: AtomicUsize,
@@ -244,7 +248,10 @@ impl MegaObjectStorage for CountingStorage {
                 },
             ));
         }
-        let (stream, meta) = self.inner.inner.get_stream(key).await?;
+        let (stream, mut meta) = self.inner.inner.get_stream(key).await?;
+        if let Some(size) = *self.counts.object_size_override.lock().unwrap() {
+            meta.size = size;
+        }
         let fault = self.counts.object_fault.lock().unwrap().clone();
         let stream = match fault {
             Some(fault) if fault.oid == key.key => fault.stream(),
@@ -904,7 +911,8 @@ async fn mst2_fixed_head_uses_verified_facts_without_body_reads_and_preserves_ra
         .await
         .unwrap();
     assert_eq!(bytes.as_ref(), fixture.raw);
-    fixture.counts.assert(1, fixture.raw.len());
+    fixture.counts.assert(2, 2 * fixture.raw.len());
+    assert_eq!(fixture.counts.receipt_writes.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

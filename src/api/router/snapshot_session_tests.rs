@@ -300,7 +300,8 @@ async fn mst2_durable_http_resolve_installs_complete_dag_and_warm_leases_share_i
             .as_ref(),
         fixture.raw.as_slice()
     );
-    fixture.counts.assert(1, fixture.raw.len());
+    fixture.counts.assert(2, 2 * fixture.raw.len());
+    assert_eq!(fixture.counts.receipt_writes.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
