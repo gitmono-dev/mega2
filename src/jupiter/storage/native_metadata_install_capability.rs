@@ -462,3 +462,53 @@ fn seal(
     hash.update(scope);
     Ok(hash.finalize().into())
 }
+
+#[cfg(test)]
+#[tokio::test]
+async fn install_capability_physical_checker_rejects_real_qualified_owner() {
+    let (db, _other, _schema) = super::capability_tests::fixture().await;
+    let pages = super::capability_tests::prepared(2);
+    let qualified =
+        super::generations::qualified::PostgresQualifiedMetadataRepository::new(db.clone())
+            .await
+            .unwrap();
+    let bound = qualified
+        .begin_intent("physical-qualified", &pages)
+        .await
+        .unwrap();
+    qualified
+        .install_pages(&bound, pages.dag().payloads())
+        .await
+        .unwrap();
+    let legacy = PostgresMetadataInstallRepository::new(db).await.unwrap();
+    let txn = legacy.transaction().await.unwrap();
+    legacy.capability_barrier(&txn).await.unwrap();
+    for page in pages.dag().payloads() {
+        let row = txn.query_one_raw(statement(
+            "SELECT b.page_id IS NOT NULL AS payload_present,b.generation AS payload_generation,
+             c.generation AS current_generation,l.generation AS lifetime_generation,l.graph_domain,
+             l.state AS lifetime_state,l.metadata_codec AS lifetime_codec,l.expected_size AS lifetime_size,
+             n.state AS graph_state,n.kind AS graph_kind,n.bytes AS graph_bytes,
+             EXISTS(SELECT 1 FROM mst2_retention_gc_op g WHERE g.node_id=l.node_id
+               AND g.operation='REMOVE' AND g.state IN ('PENDING','APPLIED')) AS tombstone
+             FROM mst2_metadata_current c JOIN mst2_metadata_lifetime l USING(page_id,generation)
+             JOIN mst2_metadata_payload b USING(page_id,generation)
+             LEFT JOIN mst2_retention_node n ON n.node_id=l.node_id WHERE c.page_id=$1",
+            [page.id.to_vec().into()],
+        )).await.unwrap().unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "graph_domain").unwrap(),
+            "qualified-v1"
+        );
+        assert_eq!(row.try_get::<i64>("", "current_generation").unwrap(), 1);
+        assert_eq!(row.try_get::<i64>("", "payload_generation").unwrap(), 1);
+        assert!(row.try_get::<bool>("", "payload_present").unwrap());
+        let error = check_physical_member(&row, 1, page.size as i32).unwrap_err();
+        assert_eq!(error.code, SnapshotErrorCode::ObjectUnavailable);
+        assert_eq!(
+            error.message,
+            "requested physical lifetime cannot be shared by legacy generic installation"
+        );
+    }
+    txn.rollback().await.unwrap();
+}

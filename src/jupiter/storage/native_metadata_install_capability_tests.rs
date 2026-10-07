@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-fn prepared(children: usize) -> PreparedNativeMetadataRetention {
+pub(super) fn prepared(children: usize) -> PreparedNativeMetadataRetention {
     let mut builder = MetadataDagBuilder::new(MetadataDagLimits::default());
     let mut entries = Vec::new();
     for index in 0..children {
@@ -38,7 +38,7 @@ fn prepared(children: usize) -> PreparedNativeMetadataRetention {
     )
 }
 
-async fn fixture() -> (DatabaseConnection, DatabaseConnection, TestSchemaGuard) {
+pub(super) async fn fixture() -> (DatabaseConnection, DatabaseConnection, TestSchemaGuard) {
     let temp = tempfile::tempdir().unwrap();
     let (config, schema) = test_db_config(temp.path()).await;
     let first = Database::connect(config.db_url.clone()).await.unwrap();
@@ -70,7 +70,7 @@ async fn install(
 }
 
 async fn assert_guard(db: &DatabaseConnection, sql: &str) {
-    let error = db.execute_unprepared(sql).await.unwrap_err();
+    let error = db.execute_unprepared(sql).await.expect_err(sql);
     assert!(
         error.to_string().contains("install capability")
             || error.to_string().contains("registered metadata"),
@@ -88,7 +88,68 @@ async fn install_capability_many_batches_concurrent_mint_and_fresh_repository_fi
         .await
         .unwrap();
     let pages = prepared(130);
-    assert_eq!(pages.dag().payloads().len(), 131);
+    assert_eq!(pages.dag().payloads().len(), 133);
+    assert_eq!(pages.dag().edges().len(), 132);
+    let root = pages
+        .dag()
+        .payloads()
+        .iter()
+        .find(|page| page.id == pages.dag().root())
+        .unwrap();
+    let (
+        Page::Branch {
+            prefix,
+            terminal,
+            children,
+        },
+        count,
+    ) = Page::decode(&root.bytes).unwrap()
+    else {
+        panic!("130 directory entries must use a canonical radix branch");
+    };
+    assert_eq!(prefix, b"dir-");
+    assert!(terminal.is_none());
+    assert_eq!(count, 130);
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| (child.label, child.subtree_entries))
+            .collect::<Vec<_>>(),
+        [(b'0', 100), (b'1', 30)]
+    );
+    for child in children {
+        let payload = pages
+            .dag()
+            .payloads()
+            .iter()
+            .find(|page| page.id == child.child_page_id)
+            .unwrap();
+        let (Page::Leaf { entries }, count) = Page::decode(&payload.bytes).unwrap() else {
+            panic!("each root partition must be one canonical radix leaf");
+        };
+        assert_eq!(count, child.subtree_entries);
+        assert_eq!(entries.len() as u64, count);
+        for entry in entries {
+            assert_eq!(entry.kind, EntryKind::Directory);
+            assert_eq!(entry.name[4], child.label);
+            assert!(
+                pages
+                    .dag()
+                    .payloads()
+                    .iter()
+                    .any(|page| page.id == entry.child_root)
+            );
+        }
+    }
+    assert_eq!(
+        pages
+            .dag()
+            .payloads()
+            .chunks(64)
+            .map(|batch| batch.len())
+            .collect::<Vec<_>>(),
+        [64, 64, 5]
+    );
     let intent = a.begin_intent("many", &pages).await.unwrap();
     let (left, right) = tokio::join!(
         a.mint_legacy_install_capability(&intent),
@@ -128,7 +189,7 @@ async fn install_capability_many_batches_concurrent_mint_and_fresh_repository_fi
             "SELECT count(*) FROM mst2_metadata_payload WHERE generation IS NULL"
         )
         .await,
-        131
+        133
     );
     assert_eq!(
         scalar(
@@ -136,11 +197,11 @@ async fn install_capability_many_batches_concurrent_mint_and_fresh_repository_fi
             "SELECT count(*) FROM mst2_retention_node WHERE state='LIVE'"
         )
         .await,
-        131
+        133
     );
     assert_eq!(
         scalar(&first, "SELECT count(*) FROM mst2_retention_edge").await,
-        130
+        132
     );
     let before = scalar(
         &first,
@@ -180,6 +241,13 @@ async fn install_capability_freezes_every_identity_member_anchor_and_truncate_pa
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        first.execute_raw(statement(
+            "UPDATE mst2_metadata_prepare SET verification_revision=verification_revision WHERE prepare_id=$1",
+            [intent.prepare_id().into()],
+        )).await.unwrap().rows_affected(),
+        1
+    );
     for mutation in [
         "operation_id='changed'",
         "manifest_digest=decode(repeat('01',32),'hex')",
@@ -192,7 +260,7 @@ async fn install_capability_freezes_every_identity_member_anchor_and_truncate_pa
         "materialization_policy=2",
         "fs_semantics=2",
         "access_projection=2",
-        "verification_revision=2",
+        "verification_revision=verification_revision+1",
         "projection_revision=2",
         "metadata_root=decode(repeat('01',32),'hex')",
         "node_count=node_count+1",
@@ -668,20 +736,18 @@ async fn install_capability_reuses_bound_generic_bytes_without_adopting_qualifie
         .install_pages(&bound, pages.dag().payloads())
         .await
         .unwrap();
-    let intent = q_legacy
+    let q_state = domain_state_for_test(&qualified_db).await;
+    let error = q_legacy
         .begin_intent("generic-refusal", &pages)
         .await
-        .unwrap();
-    let cap = q_legacy
-        .mint_legacy_install_capability(&intent)
-        .await
-        .unwrap();
+        .unwrap_err();
     assert!(
-        q_legacy
-            .install_pages_validated(&cap, pages.dag().payloads())
-            .await
-            .is_err()
+        error
+            .to_string()
+            .contains("qualified mapping cannot cross domain/current/state fence"),
+        "{error}"
     );
+    assert_eq!(domain_state_for_test(&qualified_db).await, q_state);
     assert_eq!(
         scalar(&qualified_db, "SELECT count(*) FROM mst2_metadata_payload").await,
         3
@@ -690,6 +756,100 @@ async fn install_capability_reuses_bound_generic_bytes_without_adopting_qualifie
         scalar(&qualified_db, "SELECT count(*) FROM mst2_retention_node").await,
         0
     );
+
+    let (legacy_db, _other, _legacy_schema) = fixture().await;
+    let legacy = PostgresMetadataInstallRepository::new(legacy_db.clone())
+        .await
+        .unwrap();
+    let qualified =
+        generations::qualified::PostgresQualifiedMetadataRepository::new(legacy_db.clone())
+            .await
+            .unwrap();
+    let intent = legacy.begin_intent("generic-first", &pages).await.unwrap();
+    let cap = legacy
+        .mint_legacy_install_capability(&intent)
+        .await
+        .unwrap();
+    let generic_state = domain_state_for_test(&legacy_db).await;
+    let error = qualified
+        .begin_intent("qualified-refusal", &pages)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("metadata lifetime has durable or ambiguous coverage"),
+        "{error}"
+    );
+    assert_eq!(domain_state_for_test(&legacy_db).await, generic_state);
+    install(&legacy, &cap, &pages).await;
+    assert_eq!(
+        legacy.finalize(&intent).await.unwrap().metadata_root(),
+        pages.dag().root()
+    );
+    assert_eq!(
+        scalar(
+            &legacy_db,
+            "SELECT count(*) FROM mst2_metadata_payload WHERE generation IS NULL"
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        scalar(
+            &legacy_db,
+            "SELECT count(*) FROM mst2_retention_node WHERE state='LIVE'"
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        scalar(&legacy_db, "SELECT count(*) FROM mst2_metadata_lifetime").await,
+        0
+    );
+    assert_eq!(
+        scalar(&legacy_db, "SELECT count(*) FROM mst2_metadata_current").await,
+        0
+    );
+    assert_eq!(
+        scalar(&legacy_db, "SELECT count(*) FROM mst2_metadata_graph_node").await,
+        0
+    );
+}
+
+async fn domain_state_for_test(db: &DatabaseConnection) -> Vec<(String, Vec<String>)> {
+    let mut state = Vec::new();
+    for table in [
+        "mst2_metadata_prepare",
+        "mst2_metadata_prepare_page",
+        "mst2_metadata_install_seal",
+        "mst2_metadata_payload",
+        "mst2_metadata_current",
+        "mst2_metadata_lifetime",
+        "mst2_metadata_graph_node",
+        "mst2_metadata_graph_edge",
+        "mst2_metadata_graph_root",
+        "mst2_metadata_gc_op",
+        "mst2_retention_node",
+        "mst2_retention_edge",
+        "mst2_retention_root",
+        "mst2_retention_gc_op",
+        "mst2_snapshot_context",
+        "mst2_snapshot_lease",
+    ] {
+        let rows = db
+            .query_all_raw(statement(
+                &format!("SELECT to_jsonb(t)::text FROM {table} t ORDER BY 1"),
+                [],
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get_by_index(0).unwrap())
+            .collect();
+        state.push((table.into(), rows));
+    }
+    state
 }
 
 #[tokio::test]
