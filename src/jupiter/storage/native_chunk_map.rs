@@ -605,33 +605,6 @@ fn qualify_relations(schema: &str, sql: &str) -> String {
     qualified
 }
 
-#[cfg(test)]
-mod sql_tests {
-    use super::*;
-
-    #[test]
-    fn authority_relations_are_qualified_without_rewriting_catalog_literals() {
-        let sql = "SELECT 'mst2_metadata_storage_scope','quoted ''mst2_chunk_map''',\"mst2_chunk_map\" FROM mst2_metadata_storage_scope s JOIN mst2_verified_object f ON s.singleton=1 JOIN mst2_chunk_map m ON true JOIN mst2_chunk_map_leaf l ON true JOIN mst2_chunk_map_node n ON true JOIN mst2_chunk_map_source r ON true WHERE c.relname='mst2_metadata_storage_scope'";
-        let qualified = qualify_relations("schema\"name", sql);
-        assert!(qualified.contains(&format!(
-            "FROM {}.mst2_metadata_storage_scope",
-            quoted("schema\"name")
-        )));
-        for name in [
-            "mst2_verified_object",
-            "mst2_chunk_map",
-            "mst2_chunk_map_leaf",
-            "mst2_chunk_map_node",
-            "mst2_chunk_map_source",
-        ] {
-            assert!(qualified.contains(&format!("JOIN {}.{name}", quoted("schema\"name"))));
-        }
-        assert!(qualified.starts_with(
-            "SELECT 'mst2_metadata_storage_scope','quoted ''mst2_chunk_map''',\"mst2_chunk_map\""
-        ));
-        assert!(qualified.ends_with("WHERE c.relname='mst2_metadata_storage_scope'"));
-    }
-}
 fn bounded_bytes(row: &QueryResult, name: &str) -> Result<Vec<u8>, SnapshotError> {
     row.try_get::<Option<Vec<u8>>>("", name)
         .map_err(db_error)?
@@ -680,5 +653,33 @@ impl super::Storage {
                 PostgresChunkMapRepository::new(self.mono_storage().get_connection().clone()).await
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod sql_tests {
+    use super::*;
+
+    #[test]
+    fn authority_relations_are_qualified_without_rewriting_catalog_literals() {
+        let sql = "SELECT 'mst2_metadata_storage_scope','quoted ''mst2_chunk_map''',\"mst2_chunk_map\" FROM mst2_metadata_storage_scope s JOIN mst2_verified_object f ON s.singleton=1 JOIN mst2_chunk_map m ON true JOIN mst2_chunk_map_leaf l ON true JOIN mst2_chunk_map_node n ON true JOIN mst2_chunk_map_source r ON true WHERE c.relname='mst2_metadata_storage_scope'";
+        let qualified = qualify_relations("schema\"name", sql);
+        assert!(qualified.contains(&format!(
+            "FROM {}.mst2_metadata_storage_scope",
+            quoted("schema\"name")
+        )));
+        for name in [
+            "mst2_verified_object",
+            "mst2_chunk_map",
+            "mst2_chunk_map_leaf",
+            "mst2_chunk_map_node",
+            "mst2_chunk_map_source",
+        ] {
+            assert!(qualified.contains(&format!("JOIN {}.{name}", quoted("schema\"name"))));
+        }
+        assert!(qualified.starts_with(
+            "SELECT 'mst2_metadata_storage_scope','quoted ''mst2_chunk_map''',\"mst2_chunk_map\""
+        ));
+        assert!(qualified.ends_with("WHERE c.relname='mst2_metadata_storage_scope'"));
     }
 }
