@@ -16,7 +16,7 @@ use crate::{
             admin_router, agent_capture_router, artifacts_router, bot_router, buck_router,
             cl_router, commit_router, gpg_router, group_router, import_repo_router,
             merge_queue_router, preview_router, push_queue_router, repo_router, tag_router,
-            user_router, webhook_router,
+            user_router, view_router, webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
@@ -84,6 +84,18 @@ pub fn storage_only_routers_with(
         .merge(artifacts_router::routers());
     if include_agent_capture {
         router.merge(agent_capture_router::routers())
+    } else {
+        router
+    }
+}
+
+pub(crate) fn storage_only_routers_with_views(
+    include_agent_capture: bool,
+    include_views: bool,
+) -> OpenApiRouter<MonoApiServiceState> {
+    let router = storage_only_routers_with(include_agent_capture);
+    if include_views {
+        router.merge(view_router::routers())
     } else {
         router
     }

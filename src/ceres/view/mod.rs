@@ -1,5 +1,6 @@
 pub mod commit;
 pub mod filter;
+pub(crate) mod name;
 pub mod project;
 pub mod tree;
 pub mod tree_source;
