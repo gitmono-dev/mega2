@@ -1,18 +1,24 @@
-use std::str::FromStr;
+use std::{fmt, str::FromStr, sync::Arc};
 
 use cedar_policy::{Context, EntityId, EntityTypeName, EntityUid};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ceres::{api_service::state::ProtocolApiState, protocol::AuthContext},
-    common::errors::ProtocolError,
-    config::{GitConfig, PushAuth, PushTokenConfig, token_path_authorizes},
-    contract::policy::{
-        context::CedarContext,
-        enforcement::{Enforcement, EnforcementDecision, decide},
-        resource::resolve_resource,
-        util::SaturnEUid,
+    ceres::{
+        api_service::state::ProtocolApiState, protocol::AuthContext,
+        view::filter::recheck_definition,
+    },
+    common::errors::{ProtocolError, ViewUnavailableReason},
+    config::{Config, GitConfig, PushAuth, PushTokenConfig, token_path_authorizes},
+    contract::{
+        git_protocol::path::ViewLocator,
+        policy::{
+            context::CedarContext,
+            enforcement::{Enforcement, EnforcementDecision, decide},
+            resource::resolve_resource,
+            util::SaturnEUid,
+        },
     },
 };
 
@@ -24,6 +30,94 @@ pub mod ssh;
 pub struct InfoRefsParams {
     pub service: Option<String>,
     pub refspec: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedView {
+    pub(crate) filter_pk: i64,
+    pub(crate) filter_id: String,
+    pub(crate) config: Arc<Config>,
+}
+
+impl fmt::Debug for ResolvedView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedView")
+            .field("filter_pk", &self.filter_pk)
+            .field("filter_id", &self.filter_id)
+            .finish()
+    }
+}
+
+fn corrupt_view(filter_pk: i64, filter_id: &str, failed: &str) -> ProtocolError {
+    tracing::error!(filter_pk, filter_id, failed, "view definition corrupt");
+    ProtocolError::ViewUnavailable {
+        filter_id: filter_id.to_owned(),
+        reason: ViewUnavailableReason::DefinitionCorrupt,
+    }
+}
+
+pub(crate) async fn resolve_view_target(
+    state: &ProtocolApiState,
+    locator: &ViewLocator,
+) -> Result<ResolvedView, ProtocolError> {
+    let config = state.storage.config();
+    let view_storage = state.storage.view_storage();
+    let not_found = || ProtocolError::NotFound("view not found".to_owned());
+    let filter_pk = match locator {
+        ViewLocator::Named { name, version } => {
+            let version = version
+                .map(|version| i32::try_from(version).map_err(|_| not_found()))
+                .transpose()?;
+            view_storage
+                .find_view_by_name(name, version)
+                .await?
+                .ok_or_else(not_found)?
+                .filter_pk
+        }
+        ViewLocator::FilterId(filter_id) => {
+            view_storage
+                .get_filter_by_filter_id(filter_id)
+                .await?
+                .ok_or_else(not_found)?
+                .id
+        }
+    };
+    let definition = view_storage
+        .view_definition_state(filter_pk)
+        .await?
+        .ok_or_else(not_found)?;
+    let filter_id = definition.filter_id;
+    if definition.algo_version != 1 {
+        return Err(corrupt_view(filter_pk, &filter_id, "algo_version"));
+    }
+    let expected_format = config.monorepo.object_hash_kind()?.as_str();
+    if definition.object_format != expected_format {
+        return Err(corrupt_view(filter_pk, &filter_id, "object_format"));
+    }
+    if let Err(error) = recheck_definition(&definition.canonical_spec, &filter_id) {
+        let failed = match error.failed {
+            crate::ceres::view::filter::RecheckFailure::RoundTrip => "canonical_spec",
+            crate::ceres::view::filter::RecheckFailure::FilterIdMismatch => "filter_id",
+        };
+        return Err(corrupt_view(filter_pk, &filter_id, failed));
+    }
+    if definition.halted {
+        return Err(ProtocolError::ViewUnavailable {
+            filter_id,
+            reason: ViewUnavailableReason::RootChainHalted,
+        });
+    }
+    if definition.ready_seq.is_none() {
+        return Err(ProtocolError::ViewUnavailable {
+            filter_id,
+            reason: ViewUnavailableReason::WarmingUp,
+        });
+    }
+    Ok(ResolvedView {
+        filter_pk,
+        filter_id,
+        config,
+    })
 }
 
 pub async fn check_upload_pack_access(
@@ -229,11 +323,16 @@ pub fn decide_push(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use chrono::Utc;
+    use sea_orm::{ActiveModelTrait, Set};
+
     use super::*;
     use crate::{
+        callisto::{mega_view, mega_view_filter},
         ceres::{
             api_service::{cache::GitObjectCache, state::ProtocolApiState},
             protocol::PushUserInfo,
+            view::filter::parse_for_registration,
         },
         contract::{
             git_protocol::ssh::SshServer,
@@ -242,6 +341,7 @@ mod tests {
                 entitystore::{SharedEntityStore, generate_entity},
             },
         },
+        jupiter::storage::base_storage::StorageConnector,
     };
 
     fn un02_snapshot(admins: &[&str]) -> crate::contract::policy::builder::EntitySnapshot {
@@ -620,5 +720,223 @@ mod tests {
         };
         apply_push_auth_gate(&empty, &token_auth("ci"), std::path::Path::new("/anywhere"))
             .expect("empty paths authorize the whole repo");
+    }
+
+    async fn resolver_state() -> (tempfile::TempDir, ProtocolApiState) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let connection = crate::jupiter::redis::init_connection(&crate::config::RedisConfig {
+            url: std::env::var("MEGA_REDIS__URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned()),
+        })
+        .await
+        .unwrap();
+        let state = ProtocolApiState {
+            entity_store: storage.entity_store(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection,
+                prefix: "hp20-resolve".to_owned(),
+            }),
+            storage,
+        };
+        (temp, state)
+    }
+
+    async fn insert_resolver_filter(state: &ProtocolApiState, pk: i64, spec: &str) -> String {
+        let canonical = parse_for_registration(spec).unwrap();
+        let filter_id = canonical.filter_id.clone();
+        mega_view_filter::ActiveModel {
+            id: Set(pk),
+            filter_id: Set(filter_id.clone()),
+            canonical_spec: Set(canonical.canonical_text),
+            algo_version: Set(1),
+            object_format: Set("sha1".to_owned()),
+            src_paths: Set(serde_json::json!([])),
+            push_enabled: Set(false),
+            projected_seq: Set(0),
+            ready_seq: Set(Some(0)),
+            warming_since: Set(None),
+            last_access_at: Set(None),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(state.storage.view_storage().get_connection())
+        .await
+        .unwrap();
+        filter_id
+    }
+
+    async fn insert_resolver_name(
+        state: &ProtocolApiState,
+        id: i64,
+        name: &str,
+        version: i32,
+        filter_pk: i64,
+    ) {
+        mega_view::ActiveModel {
+            id: Set(id),
+            name: Set(name.to_owned()),
+            version: Set(version),
+            filter_pk: Set(filter_pk),
+            created_by: Set("hp20".to_owned()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(state.storage.view_storage().get_connection())
+        .await
+        .unwrap();
+    }
+
+    fn assert_view_not_found(result: Result<ResolvedView, ProtocolError>) {
+        assert!(
+            matches!(result, Err(ProtocolError::NotFound(message)) if message == "view not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_view_locator_targets() {
+        let (_temp, state) = resolver_state().await;
+        let first_id = insert_resolver_filter(&state, 101, ":/project/first").await;
+        let second_id = insert_resolver_filter(&state, 102, ":/project/second").await;
+        insert_resolver_name(&state, 201, "hp20/test", 1, 101).await;
+        insert_resolver_name(&state, 202, "hp20/test", 2, 102).await;
+        let latest = resolve_view_target(
+            &state,
+            &ViewLocator::Named {
+                name: "hp20/test".to_owned(),
+                version: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (latest.filter_pk, latest.filter_id.as_str()),
+            (102, second_id.as_str())
+        );
+        let earlier = resolve_view_target(
+            &state,
+            &ViewLocator::Named {
+                name: "hp20/test".to_owned(),
+                version: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (earlier.filter_pk, earlier.filter_id.as_str()),
+            (101, first_id.as_str())
+        );
+        let direct = resolve_view_target(&state, &ViewLocator::FilterId(first_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (direct.filter_pk, direct.filter_id.as_str()),
+            (101, first_id.as_str())
+        );
+        assert!(!format!("{latest:?}").contains("config"));
+        for locator in [
+            ViewLocator::Named {
+                name: "not-registered".to_owned(),
+                version: None,
+            },
+            ViewLocator::Named {
+                name: "hp20/test".to_owned(),
+                version: Some(3),
+            },
+            ViewLocator::Named {
+                name: "hp20/test".to_owned(),
+                version: Some(u32::MAX),
+            },
+            ViewLocator::FilterId("f".repeat(64)),
+        ] {
+            assert_view_not_found(resolve_view_target(&state, &locator).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_view_definition_corrupt() {
+        use std::{io::Write, sync::Mutex};
+
+        use tracing_subscriber::fmt::MakeWriter;
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl MakeWriter<'_> for Writer {
+            type Writer = Writer;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let (_temp, state) = resolver_state().await;
+        let good_id = insert_resolver_filter(&state, 300, ":/project/good").await;
+        assert!(
+            resolve_view_target(&state, &ViewLocator::FilterId(good_id))
+                .await
+                .is_ok()
+        );
+        for (index, failed) in [
+            "algo_version",
+            "object_format",
+            "canonical_spec",
+            "filter_id",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let pk = 301 + index as i64;
+            let spec = format!(":/project/corrupt-{index}");
+            let canonical = parse_for_registration(&spec).unwrap();
+            let mut filter_id = canonical.filter_id.clone();
+            let mut canonical_spec = canonical.canonical_text;
+            let mut algo_version = 1;
+            let mut object_format = "sha1".to_owned();
+            match *failed {
+                "algo_version" => algo_version = 2,
+                "object_format" => object_format = "sha256".to_owned(),
+                "canonical_spec" => canonical_spec.push('/'),
+                "filter_id" => {
+                    filter_id.replace_range(..1, if filter_id.starts_with('0') { "1" } else { "0" })
+                }
+                _ => unreachable!(),
+            }
+            mega_view_filter::ActiveModel {
+                id: Set(pk),
+                filter_id: Set(filter_id.clone()),
+                canonical_spec: Set(canonical_spec),
+                algo_version: Set(algo_version),
+                object_format: Set(object_format),
+                src_paths: Set(serde_json::json!([])),
+                push_enabled: Set(false),
+                projected_seq: Set(0),
+                ready_seq: Set(Some(0)),
+                warming_since: Set(None),
+                last_access_at: Set(None),
+                created_at: Set(Utc::now().naive_utc()),
+            }
+            .insert(state.storage.view_storage().get_connection())
+            .await
+            .unwrap();
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(Writer(bytes.clone()))
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            let result =
+                resolve_view_target(&state, &ViewLocator::FilterId(filter_id.clone())).await;
+            drop(guard);
+            assert!(
+                matches!(result, Err(ProtocolError::ViewUnavailable { filter_id: actual, reason: ViewUnavailableReason::DefinitionCorrupt }) if actual == filter_id)
+            );
+            let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert_eq!(log.matches("view definition corrupt").count(), 1, "{log}");
+            assert!(log.contains(&filter_id), "{log}");
+            assert!(log.contains(&format!("failed=\"{failed}\"")), "{log}");
+        }
     }
 }

@@ -264,9 +264,11 @@ SSH 和 HTTP 最终共用 `SmartSession` 与 `src/ceres/protocol/smart.rs` 中�
 - `transport_protocol`：`Http` 或 `Ssh`
 - `auth`
 - `capabilities`
+- `view`：`Option<ResolvedView>`，视图 URL 经第 3 层解析后为 `Some`，其余会话为 `None`；`new` / `from_state` 签名不变。
 
-`repo_handler_with_commands` 会根据 repo path 选择 repo handler：
+`repo_handler_with_commands` 先看 `view`，再根据 repo path 选择 repo handler：
 
+- 如果 `view` 为 `Some`，使用 `ViewRepo`：用解析时取得的配置快照构造，在读取 `state.storage.config()` 前返回，不看 repo path。
 - 如果 path 位于 `config.monorepo.import_dir` 下，使用 `ImportRepo`。
 - 否则使用 `Monorepo`。
 
@@ -499,6 +501,12 @@ SSH `git-lfs-authenticate` 与 `git-lfs-transfer` 对视图路径写一行 `ERR 
 
 本卡 `integration_git_ssh` 中的原始 SSH 请求和 git 客户端沿用该 target 既有 storage-only 用例的宿主回环方式：宿主 `ssh` 和 git 经 `127.0.0.1` 连接。请求与应答字节不取决于执行位置；宿主 git 只断言 `not found`、`returned error: 403`、`remote error: view not found`、`remote error: view URLs are read-only` 四种稳定子串。此执行位置按[设计 §7.4 的 HP-18 例外](history-projection.md#74-测试计划)登记。
 
+### 视图 URL 入口第 3 层（HP-20）
+
+定位符通过认证后才解析；HTTP `git_info_refs` 在认证分支之后、v2 能力宣告短路之前解析，HTTP `git_upload_pack` 在 `check_upload_pack_access` 与读取请求体之间解析，SSH `exec_request` 在 `check_upload_pack_access` 之后、v2 短路之前解析。未认证请求不查视图表。具体顺序及应答见[设计 §6.1「入口分层」「认证先于解析」「逐请求解析」和「错误契约」](history-projection.md#61-url-与路由决策)。
+
+HTTP 每个请求解析一次；SSH 每个 exec 解析一次，`ResolvedView` 随通道状态中的 `SmartSession` 保存。该 exec 内的各条协议命令各建一个 `ViewRepo`，共用 exec 时取得的配置快照。
+
 ### SSH upload-pack 可能把二进制 ACK/pack 数据当 UTF-8 发送
 
 `handle_upload_pack` 当前：
@@ -654,6 +662,8 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 单元格取值只能是：`cargo:<exact_fn>`、`smoke:<case>`、`DEFER-GM-*`、或 `N/A+理由`。本表是唯一完整矩阵；`integration.md` 只保留 target 索引与回链。
 
+同一格需要多个用例时，各取值以 `、` 分隔，每个取值仍须是上述形式之一。
+
 | 用户命令 | HTTP | SSH | Auth | Repo-shape |
 |---|---|---|---|---|
 | ls-remote | smoke:HTTP_ls-remote | smoke:SSH_ls-remote | N/A+只读广告默认匿名 | N/A+Monorepo根路径；ImportRepo见DEFER-GM-01 |
@@ -675,7 +685,9 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 | missing-repo 客户端失败 | DEFER-GM-05 | DEFER-GM-05 | N/A+空仓广告语义 | N/A+原DEFER-IT-12→DEFER-GM-05由GM-11B收口 |
 | 视图 receive-pack 拒绝 | cargo:integration_git_ssh_view_layer2_git_client_read_only | cargo:integration_git_ssh_view_layer2_ssh_read_only | cargo:layer2_receive_pack_forbidden_before_auth_and_body | N/A+视图前缀固定只读 |
 | 视图 LFS 404 | cargo:layer2_lfs_not_found | cargo:integration_git_ssh_view_layer2_ssh_lfs_rejected | cargo:layer2_lfs_not_found | N/A+视图前缀不进入 LFS 命名空间 |
-| 未知或已禁用的视图 | cargo:layer2_disabled_not_found | cargo:integration_git_ssh_view_layer2_ssh_not_found | cargo:layer2_disabled_not_found | cargo:layer2_enabled_unregistered_not_found |
+| 未知或已禁用的视图 | cargo:layer2_disabled_not_found、cargo:integration_git_cli_view_layer3_http_unknown | cargo:integration_git_ssh_view_layer2_ssh_not_found、cargo:integration_git_ssh_view_layer3_unknown | cargo:layer2_disabled_not_found、cargo:layer3_before_resolve_auth | cargo:layer2_enabled_unregistered_not_found |
+| 视图 ls-remote | cargo:integration_git_cli_view_layer3_http_ls_remote | cargo:integration_git_ssh_view_layer3_ls_remote | cargo:layer3_before_resolve_auth | N/A+视图只有 ViewRepo 一种形态 |
+| 未就绪的视图 | cargo:integration_git_cli_view_layer3_http_unready | cargo:integration_git_ssh_view_layer3_unready | cargo:layer3_before_resolve_auth | N/A+视图只有 ViewRepo 一种形态 |
 
 #### GAP 映射（plan-20260803）
 

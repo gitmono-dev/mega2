@@ -15,7 +15,7 @@ use crate::{
     common::errors::MegaError,
     jupiter::storage::{
         base_storage::{BaseStorage, StorageConnector},
-        view_root_chain::DiscontinuityReason,
+        view_root_chain::{DiscontinuityReason, ROOT_CHAIN_HALTED_SQL},
     },
 };
 
@@ -32,6 +32,17 @@ pub(crate) struct ViewByName {
     pub(crate) filter_id: String,
     pub(crate) name: String,
     pub(crate) version: i32,
+}
+
+pub(crate) struct ViewDefinitionState {
+    pub(crate) filter_id: String,
+    pub(crate) canonical_spec: String,
+    pub(crate) algo_version: i16,
+    pub(crate) object_format: String,
+    pub(crate) ready_seq: Option<i64>,
+    pub(crate) warming_since: Option<chrono::NaiveDateTime>,
+    pub(crate) projected_seq: i64,
+    pub(crate) halted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +62,38 @@ pub struct ViewStorage {
 }
 
 impl ViewStorage {
+    pub(crate) async fn view_definition_state(
+        &self,
+        filter_pk: i64,
+    ) -> Result<Option<ViewDefinitionState>, MegaError> {
+        let row = self
+            .get_connection()
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                format!(
+                    "SELECT f.filter_id, f.canonical_spec, f.algo_version, f.object_format, \
+                     f.ready_seq, f.warming_since, f.projected_seq, \
+                     {ROOT_CHAIN_HALTED_SQL} AS halted \
+                     FROM mega_view_filter f WHERE f.id = $1"
+                ),
+                [Value::from(filter_pk)],
+            ))
+            .await?;
+        row.map(|row| {
+            Ok(ViewDefinitionState {
+                filter_id: row.try_get("", "filter_id")?,
+                canonical_spec: row.try_get("", "canonical_spec")?,
+                algo_version: row.try_get("", "algo_version")?,
+                object_format: row.try_get("", "object_format")?,
+                ready_seq: row.try_get("", "ready_seq")?,
+                warming_since: row.try_get("", "warming_since")?,
+                projected_seq: row.try_get("", "projected_seq")?,
+                halted: row.try_get("", "halted")?,
+            })
+        })
+        .transpose()
+    }
+
     pub fn new(base: BaseStorage) -> Self {
         Self {
             base,

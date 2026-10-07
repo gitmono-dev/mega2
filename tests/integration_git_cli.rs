@@ -5921,6 +5921,326 @@ fn import_repo_incremental_updates() {
     fu10_shutdown(service, &stderr_path);
 }
 
+fn layer3_http_boot() -> (GitCliEnv, ServiceProcess, u16, PathBuf) {
+    let env = GitCliEnv::with_config_append(
+        "\n[git]\nanonymous_access = true\npush_auth = \"token\"\nssh_receive_pack = false\n[[git.push_tokens]]\nname = \"hp20\"\ntoken = \"hp20-local-token\"\npaths = [\"/\"]\n",
+    );
+    let extra = [
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "token"),
+        ("MEGA_GIT__ANONYMOUS_ACCESS", "true"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+        ("MEGA_VIEWS__ENABLED", "true"),
+        ("MEGA_VIEWS__WORKER_INTERVAL_SECS", "3600"),
+        ("MEGA_VIEWS__MAX_CONCURRENT_COLD_STARTS", "1"),
+    ];
+    let (service, port, _, err) = boot_service_http_with_env(&env, Some("off"), None, &extra);
+    (env, service, port, err)
+}
+
+fn layer3_http_execute(env: &GitCliEnv, statement: Statement) {
+    with_runtime(async {
+        let db = Database::connect(&env.database.db_url).await.unwrap();
+        db.execute_raw(statement).await.unwrap();
+    });
+}
+
+fn layer3_http_git(
+    case_dir: &Path,
+    port: u16,
+    path: &str,
+    v0: bool,
+    symref: bool,
+) -> std::process::Output {
+    let remote = git_cli::mega2_http_url(port, path);
+    let mut args = Vec::new();
+    if v0 {
+        args.extend(["-c", "protocol.version=0"]);
+    }
+    args.push("ls-remote");
+    if symref {
+        args.push("--symref");
+    }
+    args.push(&remote);
+    git_cli::git_cli_no_auth(case_dir, &args)
+}
+
+fn layer3_http_seed_project(env: &GitCliEnv, port: u16) {
+    let remote = git_cli::mega2_http_url(port, "/project");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(&env.case_dir, &["clone", &remote, "hp20-project"]),
+        "HP-20 clone project",
+    );
+    fs::write(env.case_dir.join("hp20-project/hp20.txt"), b"hp20\n").unwrap();
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(&env.case_dir, &["-C", "hp20-project", "add", "hp20.txt"]),
+        "HP-20 add file",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(
+            &env.case_dir,
+            &[
+                "-c",
+                "user.name=HP20",
+                "-c",
+                "user.email=hp20@example.invalid",
+                "-C",
+                "hp20-project",
+                "commit",
+                "-m",
+                "HP-20 source commit",
+            ],
+        ),
+        "HP-20 commit",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            "hp20-local-token",
+            &[
+                "-C",
+                "hp20-project",
+                "push",
+                "--no-thin",
+                "origin",
+                "HEAD:refs/heads/main",
+            ],
+        ),
+        "HP-20 trunk push",
+    );
+}
+
+fn layer3_http_register(port: u16, name: &str, spec: &str) -> String {
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://127.0.0.1:{port}/api/v1/views?wait=true"))
+        .bearer_auth("hp20-local-token")
+        .json(&serde_json::json!({"name": name, "filter_spec": spec}))
+        .send()
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().unwrap();
+    assert!(status.is_success(), "register {spec}: {status} {body}");
+    assert_eq!(body["data"]["ready"], true, "{body}");
+    body["data"]["filter_id"].as_str().unwrap().to_owned()
+}
+
+fn layer3_http_tip(env: &GitCliEnv, filter_id: &str) -> String {
+    with_runtime(async {
+        let db = Database::connect(&env.database.db_url).await.unwrap();
+        let row = db.query_one_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT m.view_commit FROM mega_view_commit_map m JOIN mega_view_filter f ON f.id = m.filter_pk \
+             WHERE f.filter_id = $1 AND m.seq_from <= f.projected_seq ORDER BY m.seq_from DESC LIMIT 1",
+            [sea_orm::Value::from(filter_id.to_owned())])).await.unwrap().unwrap();
+        row.try_get::<String>("", "view_commit").unwrap()
+    })
+}
+
+fn layer3_http_state(env: &GitCliEnv, filter_id: &str) -> (Option<i64>, i64, bool) {
+    with_runtime(async {
+        let db = Database::connect(&env.database.db_url).await.unwrap();
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT ready_seq, projected_seq, warming_since IS NOT NULL AS warming \
+             FROM mega_view_filter WHERE filter_id = $1",
+                [sea_orm::Value::from(filter_id.to_owned())],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            row.try_get("", "ready_seq").unwrap(),
+            row.try_get("", "projected_seq").unwrap(),
+            row.try_get("", "warming").unwrap(),
+        )
+    })
+}
+
+fn layer3_http_wait_idle(env: &GitCliEnv, filter_ids: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut previous = None;
+    loop {
+        let current: Vec<_> = filter_ids
+            .iter()
+            .map(|id| layer3_http_state(env, id))
+            .collect();
+        if current.iter().all(|state| state.0.is_some()) && previous.as_ref() == Some(&current) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "view worker did not settle: {current:?}"
+        );
+        previous = Some(current);
+        sleep(Duration::from_millis(500));
+    }
+}
+
+#[test]
+fn integration_git_cli_view_layer3_http_unknown() {
+    assert!(!git_cli::git_cli_skip_requested());
+    let (env, mut service, port, err) = layer3_http_boot();
+    for path in [
+        "/.view/missing.git".to_owned(),
+        format!("/.filter/{}.git", "a".repeat(64)),
+    ] {
+        for v0 in [true, false] {
+            let output = layer3_http_git(&env.case_dir, port, &path, v0, false);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("not found"),
+                "{output:?}"
+            );
+        }
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+#[test]
+fn integration_git_cli_view_layer3_http_unready() {
+    assert!(!git_cli::git_cli_skip_requested());
+    let (env, mut service, port, err) = layer3_http_boot();
+    layer3_http_seed_project(&env, port);
+    let cold = layer3_http_register(port, "cold", ":/project");
+    let recycled = layer3_http_register(port, "recycled", ":/project:prefix=recycled");
+    let ready = layer3_http_register(port, "ready", ":/project:prefix=ready");
+    layer3_http_wait_idle(&env, &[&cold, &recycled, &ready]);
+    layer3_http_execute(
+        &env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE mega_view_filter SET ready_seq = NULL, warming_since = now() WHERE filter_id = $1",
+            [sea_orm::Value::from(cold.clone())],
+        ),
+    );
+    layer3_http_execute(
+        &env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM mega_view_object_ref WHERE filter_pk = (SELECT id FROM mega_view_filter WHERE filter_id = $1)",
+            [sea_orm::Value::from(recycled.clone())],
+        ),
+    );
+    layer3_http_execute(
+        &env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM mega_view_commit_map WHERE filter_pk = (SELECT id FROM mega_view_filter WHERE filter_id = $1)",
+            [sea_orm::Value::from(recycled.clone())],
+        ),
+    );
+    layer3_http_execute(
+        &env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE mega_view_filter SET ready_seq = NULL, warming_since = NULL, projected_seq = 0 WHERE filter_id = $1",
+            [sea_orm::Value::from(recycled.clone())],
+        ),
+    );
+    for name in ["cold", "recycled"] {
+        for v0 in [true, false] {
+            let output = layer3_http_git(
+                &env.case_dir,
+                port,
+                &format!("/.view/{name}.git"),
+                v0,
+                false,
+            );
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("returned error: 503"),
+                "{output:?}"
+            );
+        }
+    }
+    layer3_http_execute(
+        &env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO mega_view_root_chain_scan (pos, commit_id, tree_id, parent_count, first_parent) \
+         SELECT COALESCE(MAX(pos), 0) + 1, $1, \
+         (SELECT ref_tree_hash FROM mega_refs WHERE path = '/' AND ref_name = 'refs/heads/main'), \
+         2, NULL FROM mega_view_root_chain_scan",
+            [sea_orm::Value::from("e".repeat(40))],
+        ),
+    );
+    for v0 in [true, false] {
+        let output = layer3_http_git(&env.case_dir, port, "/.view/ready.git", v0, false);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("returned error: 503"),
+            "{output:?}"
+        );
+    }
+    assert_eq!(layer3_http_state(&env, &cold).0, None);
+    assert!(!layer3_http_state(&env, &recycled).2);
+    layer3_http_execute(
+        &env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM mega_view_root_chain_scan WHERE commit_id = $1",
+            [sea_orm::Value::from("e".repeat(40))],
+        ),
+    );
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+#[test]
+fn integration_git_cli_view_layer3_http_ls_remote() {
+    assert!(!git_cli::git_cli_skip_requested());
+    let (env, mut service, port, err) = layer3_http_boot();
+    layer3_http_seed_project(&env, port);
+    let id1 = layer3_http_register(port, "two", ":/project");
+    let id2 = layer3_http_register(port, "two", ":/project:prefix=p");
+    let tip1 = layer3_http_tip(&env, &id1);
+    let tip2 = layer3_http_tip(&env, &id2);
+    assert_ne!(tip1, tip2);
+    for (path, tip) in [
+        ("/.view/two.git".to_owned(), &tip2),
+        ("/.view/two@1.git".to_owned(), &tip1),
+        (format!("/.filter/{id1}.git"), &tip1),
+    ] {
+        for v0 in [true, false] {
+            let output = layer3_http_git(&env.case_dir, port, &path, v0, false);
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains(&format!("{tip}\tHEAD\n")), "{stdout}");
+            assert!(
+                stdout.contains(&format!("{tip}\trefs/heads/main\n")),
+                "{stdout}"
+            );
+        }
+    }
+    let output = layer3_http_git(&env.case_dir, port, "/.view/two.git", false, true);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ref: refs/heads/main\tHEAD"),
+        "{output:?}"
+    );
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
 #[test]
 fn import_repo_ref_cas_force_non_ff() {
     if git_cli::git_cli_skip_requested() {

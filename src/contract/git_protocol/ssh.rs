@@ -25,6 +25,7 @@ use crate::{
     contract::git_protocol::{
         check_push_permission, check_upload_pack_access, lookup_push_token,
         path::{RepoLocator, classify_repo_locator},
+        resolve_view_target,
     },
     jupiter::storage::Storage,
 };
@@ -367,14 +368,16 @@ impl server::Handler for SshServer {
                     SshExecKind::LfsAuthenticate | SshExecKind::LfsTransfer
                 ) || !self.state.storage.config().views.enabled
                 {
-                    SshErrReply::view_not_found()
+                    Some(SshErrReply::view_not_found())
                 } else if matches!(&exec.kind, SshExecKind::Git(ServiceType::ReceivePack)) {
-                    SshErrReply::view_read_only()
+                    Some(SshErrReply::view_read_only())
                 } else {
-                    SshErrReply::view_not_found()
+                    None
                 };
-                self.send_exec_err(channel, session, &reply).await?;
-                return Ok(());
+                if let Some(reply) = reply {
+                    self.send_exec_err(channel, session, &reply).await?;
+                    return Ok(());
+                }
             }
             Ok(RepoLocator::Path(_)) => {}
         }
@@ -421,6 +424,25 @@ impl server::Handler for SshServer {
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if let Ok(RepoLocator::View(locator)) = &exec.locator {
+                        match resolve_view_target(&self.state, locator).await {
+                            Ok(view) => smart_protocol.view = Some(view),
+                            Err(error) => {
+                                let reply = match &error {
+                                    ProtocolError::NotFound(_) => SshErrReply::view_not_found(),
+                                    ProtocolError::ViewUnavailable { .. } => {
+                                        SshErrReply::new(&error, 75)
+                                    }
+                                    _ => {
+                                        tracing::error!(error = %error, "view resolution failed");
+                                        SshErrReply::new("view unavailable", 75)
+                                    }
+                                };
+                                self.send_exec_err(channel, session, &reply).await?;
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
 
                 let is_v2 = self.v2_channels.get(&channel).copied().unwrap_or(false);

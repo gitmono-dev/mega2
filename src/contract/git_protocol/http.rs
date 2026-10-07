@@ -21,7 +21,7 @@ use crate::{
     config::PushAuth,
     contract::git_protocol::{
         InfoRefsParams, check_push_permission, check_upload_pack_access, lookup_push_token,
-        receive_pack_requires_http_auth,
+        path::ViewLocator, receive_pack_requires_http_auth, resolve_view_target,
     },
 };
 
@@ -43,6 +43,7 @@ pub async fn git_info_refs(
     state: &ProtocolApiState,
     params: InfoRefsParams,
     repo_path: std::path::PathBuf,
+    view: Option<ViewLocator>,
     headers: &http::HeaderMap,
 ) -> Result<Response<Body>, ProtocolError> {
     let service_name = params
@@ -60,6 +61,9 @@ pub async fn git_info_refs(
                 .is_err()
             {
                 return auth_failed();
+            }
+            if let Some(locator) = &view {
+                session.view = Some(resolve_view_target(state, locator).await?);
             }
         }
         ServiceType::ReceivePack => {
@@ -227,6 +231,7 @@ pub async fn git_upload_pack(
     state: &ProtocolApiState,
     req: Request<Body>,
     repo_path: std::path::PathBuf,
+    view: Option<ViewLocator>,
 ) -> Result<Response<Body>, ProtocolError> {
     let mut pack_protocol = SmartSession::from_state(
         repo_path,
@@ -236,6 +241,9 @@ pub async fn git_upload_pack(
     )?;
     let _ = git_http_auth(state, &mut pack_protocol, req.headers()).await?;
     check_upload_pack_access(&state.storage.config().git, &pack_protocol.auth).await?;
+    if let Some(locator) = &view {
+        pack_protocol.view = Some(resolve_view_target(state, locator).await?);
+    }
     let upload_request = collect_body_data(req.into_body(), "upload-pack").await?;
     tracing::debug!("Receive bytes: <-------- {:?}", upload_request);
 
