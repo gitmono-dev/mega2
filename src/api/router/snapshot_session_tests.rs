@@ -861,9 +861,15 @@ async fn mst2_durable_http_frame_and_raw_delivery_recheck_after_release() {
             "revocation must suppress the next raw block or END frame"
         );
         assert!(stream.next().await.is_none());
+        // Cold raw first earns an immutable receipt, then opens the separate
+        // authenticated delivery stream. Revocation still suppresses its tail.
         fixture.counts.assert(
-            if raw { 1 } else { 0 },
-            if raw { fixture.raw.len() } else { 0 },
+            if raw { 2 } else { 0 },
+            if raw {
+                fixture.raw.len() + first.len()
+            } else {
+                0
+            },
         );
     }
 }

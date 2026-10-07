@@ -104,7 +104,10 @@ async fn exact_source_builder_admits_all_install_workspace_before_open_and_cance
     let projection = build_source_with_resources(
         digest,
         size,
-        || async { Ok(stream(vec![Ok(raw.clone())])) },
+        || async {
+            opens.fetch_add(1, Ordering::SeqCst);
+            Ok(stream(vec![Ok(raw.clone())]))
+        },
         &budget,
         &builders,
     )
