@@ -48,7 +48,7 @@ use crate::{
         },
     },
     common::utils::MEGA_BRANCH_NAME,
-    config::{model::PushPolicy, testing::isolated_config},
+    config::{PushPolicy, testing::isolated_config},
     jupiter::{
         service::{
             git_service::GitService,
