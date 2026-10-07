@@ -1038,7 +1038,7 @@ async fn mst2_generic_storage_routes_temp_prepare_shadow_rejects_qualified_conte
         scalar(&txn, "SELECT count(*) FROM mst2_metadata_prepare").await,
         0
     );
-    assert_eq!(scalar(&txn, "SELECT (to_regclass('mst2_metadata_prepare')='pg_temp.mst2_metadata_prepare'::regclass)::bigint").await, 1);
+    assert_eq!(scalar(&txn, "SELECT CASE WHEN to_regclass('mst2_metadata_prepare')='pg_temp.mst2_metadata_prepare'::regclass THEN 1::bigint ELSE 0::bigint END").await, 1);
     let rejected = txn.execute_raw(statement(&format!(
         "INSERT INTO {schema}.mst2_snapshot_context(snapshot_id,canonical_descriptor,instance_id,commit_oid,
            root_tree_oid,metadata_root,prepare_id,publication_sequence,writer_epoch,certificate_receipt_id,authorization_epoch,state)

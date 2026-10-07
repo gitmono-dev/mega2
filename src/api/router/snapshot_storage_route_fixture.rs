@@ -65,8 +65,8 @@ pub(super) async fn reject_half_lease_commit_for_test(
         .await
         .unwrap();
     // Simulate an omitted derived write; all statement, identity and deferred
-    // completeness guards remain active, and the deriving trigger is restored
-    // before the actual commit attempt.
+    // completeness guards remain active. Failed commit rolls back the trigger
+    // change; pending deferred events forbid ALTER TABLE before commit.
     txn.execute_unprepared(
         "ALTER TABLE mst2_snapshot_lease DISABLE TRIGGER mst2_route_lease_insert",
     )
@@ -91,12 +91,28 @@ pub(super) async fn reject_half_lease_commit_for_test(
         .unwrap();
     assert_eq!(half.try_get::<i64>("", "actual").unwrap(), 1);
     assert_eq!(half.try_get::<i64>("", "routes").unwrap(), 0);
-    txn.execute_unprepared(
-        "ALTER TABLE mst2_snapshot_lease ENABLE TRIGGER mst2_route_lease_insert",
-    )
-    .await
-    .unwrap();
-    assert_eq!(trigger_modes(&txn).await, before);
+    let paused = before.replacen(
+        "mst2_snapshot_lease:mst2_route_lease_insert:O",
+        "mst2_snapshot_lease:mst2_route_lease_insert:D",
+        1,
+    );
+    assert_ne!(paused, before);
+    assert_eq!(trigger_modes(&txn).await, paused);
+    let complete = txn
+        .query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT t.tgenabled::text AS mode,t.tgdeferrable AS deferrable,t.tginitdeferred AS deferred
+         FROM pg_catalog.pg_trigger t WHERE t.tgrelid='mst2_snapshot_lease'::regclass
+           AND t.tgname='mst2_route_complete' AND NOT t.tgisinternal",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let mode: String = complete.try_get("", "mode").unwrap();
+    assert!(matches!(mode.as_str(), "O" | "A"));
+    assert!(before.contains(&format!("mst2_snapshot_lease:mst2_route_complete:{mode}")));
+    assert!(complete.try_get::<bool>("", "deferrable").unwrap());
+    assert!(complete.try_get::<bool>("", "deferred").unwrap());
     let rejected = txn.commit().await.unwrap_err();
     assert!(
         rejected
