@@ -210,7 +210,7 @@ struct Fixture {
 }
 
 fn tree(items: Vec<TreeItem>) -> Tree {
-    Tree::from_tree_items_with_kind(HashKind::Sha1, items).unwrap()
+    crate::ceres::view::tree_source::build_tree(HashKind::Sha1, items).unwrap()
 }
 
 fn item(mode: TreeItemMode, oid: ObjectHash, name: &str) -> TreeItem {
