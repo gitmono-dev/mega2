@@ -241,6 +241,19 @@ async fn install_capability_freezes_every_identity_member_anchor_and_truncate_pa
         .await
         .unwrap()
         .unwrap();
+    let member_count_before =
+        scalar(&first, "SELECT count(*) FROM mst2_metadata_prepare_page").await;
+    let seal_count_before = scalar(&first, "SELECT count(*) FROM mst2_metadata_install_seal").await;
+    let restrict_error = first
+        .execute_unprepared("TRUNCATE mst2_metadata_prepare_page")
+        .await
+        .expect_err("plain truncate must preserve foreign-key protection");
+    assert!(
+        restrict_error
+            .to_string()
+            .contains("cannot truncate a table referenced in a foreign key constraint"),
+        "{restrict_error}"
+    );
     assert_eq!(
         first.execute_raw(statement(
             "UPDATE mst2_metadata_prepare SET verification_revision=verification_revision WHERE prepare_id=$1",
@@ -311,11 +324,19 @@ async fn install_capability_freezes_every_identity_member_anchor_and_truncate_pa
         "UPDATE mst2_metadata_install_seal SET members_digest=decode(repeat('ff',32),'hex')".into(),
         "DELETE FROM mst2_metadata_install_seal".into(),
         "TRUNCATE mst2_metadata_install_seal".into(),
-        "TRUNCATE mst2_metadata_prepare_page".into(),
+        "TRUNCATE mst2_metadata_prepare_page CASCADE".into(),
         "TRUNCATE mst2_metadata_prepare CASCADE".into(),
     ] {
         assert_guard(&first, &sql).await;
     }
+    assert_eq!(
+        scalar(&first, "SELECT count(*) FROM mst2_metadata_prepare_page").await,
+        member_count_before
+    );
+    assert_eq!(
+        scalar(&first, "SELECT count(*) FROM mst2_metadata_install_seal").await,
+        seal_count_before
+    );
     assert_eq!(
         mst2_metadata_prepare::Entity::find_by_id(intent.prepare_id().to_owned())
             .one(&first)
