@@ -545,6 +545,10 @@ buffer。
 - protocol v1 upload-pack 解析 `deepen` / `deepen-relative`，并返回 `shallow` response。
 - `deepen-since` / `deepen-not` 会明确返回 `ProtocolError::InvalidInput`，不 silent misbehave。
 - HTTP 和 SSH 均支持 protocol v2 capability advertisement、`ls-refs` 和 `fetch`。
+- protocol v2 `ls-refs` 在 head 为零 ID 时不写 HEAD 行，因此不会输出
+  `capabilities^{}` 伪 ref 或 `symref-target`；
+  `ls_refs_zero_head_flush_only` 锁定空 ref 列表只返回 flush。v0 `info/refs`
+  保留伪 ref，以承载 capability 列表。
 - protocol v2 `fetch` 支持 `filter blob:none`，pack 只发送 commits + trees，不发送 blob objects。
 
 仍需后续确认或扩展：
@@ -636,6 +640,7 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 | 用户命令 | HTTP | SSH | Auth | Repo-shape |
 |---|---|---|---|---|
 | ls-remote | smoke:HTTP_ls-remote | smoke:SSH_ls-remote | N/A+只读广告默认匿名 | N/A+Monorepo根路径；ImportRepo见DEFER-GM-01 |
+| v2 ls-refs 空仓库（不存在的 `/<path>.git`） | cargo:integration_git_cli_v2_missing_path_empty | N/A+与 HTTP 共用 `handle_v2_ls_refs`，应答字节由 `ls_refs_missing_monorepo_path_flush_only` 锁定 | N/A+只读广告默认匿名 | N/A+Monorepo 不存在的路径；ImportRepo 缺失返回 NotFound |
 | clone | cargo:integration_git_cli_http_round_trip | cargo:integration_git_ssh_authenticated_clone | cargo:integration_git_cli_auth_anonymous_disabled_rejects_clone | cargo:integration_git_cli_failpath_clone_missing_repo_keeps_service_alive |
 | fetch | smoke:HTTP_fetch | smoke:SSH_fetch | N/A+随clone/token往返覆盖 | N/A+Monorepo；ImportRepo见DEFER-GM-01 |
 | pull（字面） | cargo:integration_git_cli_http_pull_cl_ref_round_trip | cargo:integration_git_ssh_pull_cl_ref_round_trip | N/A+pull用例内鉴权与HTTP匿名默认 | N/A+定向refs/cl；非默认main快进 |

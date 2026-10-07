@@ -4529,6 +4529,92 @@ fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
     );
 }
 
+#[test]
+fn integration_git_cli_v2_missing_path_empty() {
+    assert_ne!(
+        std::env::var("MEGA2_IT_SKIP_GIT_CLI").ok().as_deref(),
+        Some("1"),
+        "HP-16 requires the Git CLI runner; MEGA2_IT_SKIP_GIT_CLI=1 is not permitted"
+    );
+    git_cli::require_git_cli_runner();
+
+    let env = GitCliEnv::new();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    let request_url =
+        git_cli::mega2_host_http_url(port, "/project/hp16-missing.git/git-upload-pack");
+    let repo_url = git_cli::mega2_http_url(port, "/project/hp16-missing.git/");
+    let response_path = env.temp_dir.path().join("hp16-ls-refs-response");
+
+    let curl = Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "30",
+            "-X",
+            "POST",
+            "-H",
+            "Git-Protocol: version=2",
+            "-H",
+            "Content-Type: application/x-git-upload-pack-request",
+            "--data-binary",
+            "0014command=ls-refs\n0001000csymrefs\n0000",
+            "-o",
+            response_path.to_str().expect("UTF-8 response path"),
+            "-w",
+            "%{http_code}",
+            &request_url,
+        ])
+        .output()
+        .expect("run v2 ls-refs curl");
+    let curl_status = String::from_utf8_lossy(&curl.stdout).trim().to_owned();
+    let curl_body = fs::read(&response_path).unwrap_or_default();
+    let step1 = curl.status.success() && curl_status == "200" && curl_body == b"0000";
+
+    let ls_remote = git_cli::git_cli_no_auth(
+        &env.case_dir,
+        &["-c", "protocol.version=2", "ls-remote", &repo_url],
+    );
+    let step2 = ls_remote.status.success() && ls_remote.stdout.is_empty();
+
+    let clone_dir = "hp16-empty";
+    let clone = git_cli::git_cli_no_auth(
+        &env.case_dir,
+        &["-c", "protocol.version=2", "clone", &repo_url, clone_dir],
+    );
+    let for_each_ref = git_cli::git_cli_no_auth(&env.case_dir, &["-C", clone_dir, "for-each-ref"]);
+    let clone_stderr = String::from_utf8_lossy(&clone.stderr);
+    let step3 = clone.status.success()
+        && clone_stderr.contains("You appear to have cloned an empty repository")
+        && for_each_ref.status.success()
+        && for_each_ref.stdout.is_empty();
+
+    let shutdown = service.shutdown_via_sigint(Duration::from_secs(60));
+
+    assert!(
+        step1 && step2 && step3 && shutdown.success(),
+        "hp16 step1={}\nhttp_status={curl_status:?} curl_exit={:?} response={:?} curl_stderr={}\n\
+         hp16 step2={}\nls_remote_exit={:?} stdout={:?} stderr={}\n\
+         hp16 step3={}\nclone_exit={:?} clone_stderr={} for_each_ref_exit={:?} for_each_ref_stdout={:?} for_each_ref_stderr={}\n\
+         service_shutdown_exit={:?} service_stderr={}",
+        if step1 { "PASS" } else { "FAIL" },
+        curl.status.code(),
+        String::from_utf8_lossy(&curl_body),
+        String::from_utf8_lossy(&curl.stderr),
+        if step2 { "PASS" } else { "FAIL" },
+        ls_remote.status.code(),
+        String::from_utf8_lossy(&ls_remote.stdout),
+        String::from_utf8_lossy(&ls_remote.stderr),
+        if step3 { "PASS" } else { "FAIL" },
+        clone.status.code(),
+        clone_stderr,
+        for_each_ref.status.code(),
+        String::from_utf8_lossy(&for_each_ref.stdout),
+        String::from_utf8_lossy(&for_each_ref.stderr),
+        shutdown.code(),
+        read_log(&stderr_path),
+    );
+}
+
 fn normalize_git_cli_error(combined: &str) -> String {
     combined
         .lines()
