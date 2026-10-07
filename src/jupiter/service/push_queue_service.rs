@@ -3557,7 +3557,6 @@ fn reject_to_error(reason: EnqueueRejectReason) -> MegaError {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::ConnectionTrait;
     use serde_json::json;
 
     use super::*;
