@@ -3,6 +3,8 @@
 //! Serving remains native-only. The independent namespace index is an unwired
 //! composition seam; identity, attestation and publication integration remain
 //! separate gates. Fixed-source readers must never look up current refs.
+pub(crate) mod chunk_map_gate;
+pub(crate) mod chunk_map_index;
 pub mod chunks;
 pub(crate) mod content_budget;
 pub mod descriptor;

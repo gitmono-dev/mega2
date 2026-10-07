@@ -122,6 +122,8 @@ pub enum ObjectNamespace {
     Media,
     /// Agent Capture objects (`docs/refactoring/agent-capture.md`).
     Agent,
+    /// Immutable receipts minted by the full-stream chunk-map verifier.
+    ChunkMapReceipt,
 }
 
 impl ObjectNamespace {
@@ -135,6 +137,7 @@ impl ObjectNamespace {
             ObjectNamespace::Oci => "oci",
             ObjectNamespace::Media => "media",
             ObjectNamespace::Agent => "agent",
+            ObjectNamespace::ChunkMapReceipt => "chunk-map-receipt",
         }
     }
 }
@@ -257,6 +260,21 @@ pub trait MegaObjectStorage: Send + Sync {
     ) -> OrbitResult<()> {
         Err(IoOrbitError::Other(
             "atomic metadata put is not supported by this storage backend".to_string(),
+        ))
+    }
+
+    /// Create a complete <=1 MiB immutable metadata object. An existing key
+    /// must retain its original bytes. The caller must read and compare the
+    /// existing object before treating an idempotent replay as success.
+    async fn put_metadata_atomic_create(
+        &self,
+        _key: &ObjectKey,
+        _bytes: Bytes,
+        _meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        Err(IoOrbitError::Other(
+            "immutable atomic metadata creation is not supported by this storage backend"
+                .to_string(),
         ))
     }
 
@@ -527,6 +545,7 @@ mod tests {
             ObjectNamespace::Oci,
             ObjectNamespace::Media,
             ObjectNamespace::Agent,
+            ObjectNamespace::ChunkMapReceipt,
         ] {
             let key = ObjectKey {
                 namespace: ns,
@@ -550,6 +569,10 @@ mod tests {
         assert_eq!(ObjectNamespace::Oci.to_string(), "oci");
         assert_eq!(ObjectNamespace::Media.to_string(), "media");
         assert_eq!(ObjectNamespace::Agent.to_string(), "agent");
+        assert_eq!(
+            ObjectNamespace::ChunkMapReceipt.to_string(),
+            "chunk-map-receipt"
+        );
     }
 
     #[test]

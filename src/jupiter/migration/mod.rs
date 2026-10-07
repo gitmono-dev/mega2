@@ -151,6 +151,7 @@ mod m20261007_000300_add_mst2_metadata_lifetime_history;
 mod m20261007_000400_add_mst2_qualified_metadata_gc;
 mod m20261007_000500_add_mst2_install_capability;
 mod m20261007_000600_add_mst2_storage_routes;
+mod m20261008_000100_add_mst2_chunk_maps;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -290,6 +291,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261007_000400_add_mst2_qualified_metadata_gc::Migration),
             Box::new(m20261007_000500_add_mst2_install_capability::Migration),
             Box::new(m20261007_000600_add_mst2_storage_routes::Migration),
+            Box::new(m20261008_000100_add_mst2_chunk_maps::Migration),
         ]
     }
 }

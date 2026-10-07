@@ -18,6 +18,7 @@ pub mod media_paging_storage;
 pub mod mono_storage;
 pub(crate) mod mst2_publication_storage;
 pub mod mst2_retention;
+pub(crate) mod native_chunk_map;
 pub mod native_metadata_install;
 pub(crate) mod native_publication_storage;
 pub(crate) mod native_snapshot_session;
@@ -159,6 +160,8 @@ pub struct Storage {
     /// Derived native projection memoization, scoped to this storage assembly.
     /// Clones share it; independent databases/backends never share entries.
     pub(crate) native_projection_cache: Arc<crate::ceres::snapshot::pages::NativeProjectionCache>,
+    pub(crate) native_chunk_maps:
+        Arc<tokio::sync::OnceCell<native_chunk_map::PostgresChunkMapRepository>>,
     pub(crate) native_snapshot_sessions:
         Arc<tokio::sync::OnceCell<native_snapshot_session::PostgresNativeSessionRepository>>,
     pub(crate) projection_observation_sink:
@@ -326,6 +329,7 @@ impl Storage {
             app_service: app_service.into(),
             native_projection_cache: Arc::default(),
             native_snapshot_sessions: Arc::default(),
+            native_chunk_maps: Arc::default(),
             projection_observation_sink: None,
             config_handle,
             config,
@@ -704,6 +708,7 @@ impl Storage {
             app_service,
             native_projection_cache: Arc::default(),
             native_snapshot_sessions: Arc::default(),
+            native_chunk_maps: Arc::default(),
             projection_observation_sink: None,
             // app_service: AppService::mock(),
             cl_service: CLService::mock(),

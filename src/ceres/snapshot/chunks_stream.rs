@@ -1,3 +1,5 @@
+use std::sync::{Arc, OnceLock};
+
 use futures::StreamExt;
 use tokio::sync::Semaphore;
 
@@ -7,9 +9,20 @@ use crate::orbit_api::object_storage::ObjectByteStream;
 const STREAM_ITEM_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 const MAX_BUILDERS: usize = 4;
+#[cfg(test)]
+const STAGED_CAP_BYTES: usize = 512 * 1024 * 1024;
 const CONSTRUCTION_ALLOWANCE: usize = 64 * 1024;
 
+#[cfg(test)]
 pub(super) fn reserved_bytes(size: u64) -> Result<usize, SnapshotError> {
+    reserved_bytes_for(size, size <= STAGED_CAP_BYTES as u64)
+}
+
+pub(super) fn reserved_map_bytes(size: u64) -> Result<usize, SnapshotError> {
+    reserved_bytes_for(size, false)
+}
+
+fn reserved_bytes_for(size: u64, inline: bool) -> Result<usize, SnapshotError> {
     if size == 0 || size > MAX_FILE_BYTES {
         return Err(SnapshotError::new(
             if size == 0 {
@@ -22,11 +35,7 @@ pub(super) fn reserved_bytes(size: u64) -> Result<usize, SnapshotError> {
     }
     let chunks = size.div_ceil(CHUNK_SIZE as u64);
     let pages = chunks.div_ceil(CHUNKS_PER_PAGE as u64);
-    let inline = if size <= STAGED_CAP_BYTES as u64 {
-        size
-    } else {
-        0
-    };
+    let inline = if inline { size } else { 0 };
     let bytes = chunks
         .checked_mul(32)
         .and_then(|n| {
@@ -41,65 +50,50 @@ pub(super) fn reserved_bytes(size: u64) -> Result<usize, SnapshotError> {
     Ok(bytes)
 }
 
-fn reserve_projection(
+#[cfg(test)]
+async fn build_stream(
+    content_id: [u8; 32],
     size: u64,
-    budget: &Arc<super::super::content_budget::MemoryBudget>,
-    cache: &Mutex<ProjectionCache>,
-) -> Result<MemoryLease, SnapshotError> {
-    let bytes = reserved_bytes(size)?;
-    loop {
-        match budget.reserve(bytes) {
-            Ok(lease) => return Ok(lease),
-            Err(error) => {
-                if error.code != SnapshotErrorCode::TemporaryUnavailable {
-                    return Err(error);
-                }
-                let victim = cache
-                    .lock()
-                    .map_err(|_| internal("chunk projection cache lock poisoned"))?
-                    .evict_oldest();
-                let Some(victim) = victim else {
-                    return Err(error);
-                };
-                drop(victim);
-            }
-        }
-    }
+    input: ObjectByteStream,
+    lease: MemoryLease,
+) -> Result<ChunkProjection, SnapshotError> {
+    build_stream_with_inline(
+        content_id,
+        size,
+        input,
+        lease,
+        size <= STAGED_CAP_BYTES as u64,
+    )
+    .await
 }
 
-pub async fn get_or_project_stream<F, Fut>(
+pub(super) async fn build_source_stream<F, Fut>(
     content_id: [u8; 32],
     size: u64,
     open: F,
-) -> Result<Arc<ChunkProjection>, SnapshotError>
+    budget: &Arc<super::super::content_budget::MemoryBudget>,
+) -> Result<ChunkProjection, SnapshotError>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<ObjectByteStream, SnapshotError>>,
 {
-    // Profile arithmetic also runs on hits; fixed facts remain per-request.
-    reserved_bytes(size)?;
-    get_or_project_with(content_id, || async {
-        static BUILDERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-        build_with_resources(
-            content_id,
-            size,
-            open,
-            projection_budget(),
-            BUILDERS.get_or_init(|| Arc::new(Semaphore::new(MAX_BUILDERS))),
-            STAGED.get_or_init(|| Mutex::new(ProjectionCache::new())),
-        )
-        .await
-    })
+    static BUILDERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    build_source_with_resources(
+        content_id,
+        size,
+        open,
+        budget,
+        BUILDERS.get_or_init(|| Arc::new(Semaphore::new(MAX_BUILDERS))),
+    )
     .await
 }
 
-async fn build_with_resources<F, Fut>(
+async fn build_source_with_resources<F, Fut>(
     content_id: [u8; 32],
     size: u64,
     open: F,
     budget: &Arc<super::super::content_budget::MemoryBudget>,
     builders: &Arc<Semaphore>,
-    cache: &Mutex<ProjectionCache>,
 ) -> Result<ChunkProjection, SnapshotError>
 where
     F: FnOnce() -> Fut,
@@ -108,20 +102,39 @@ where
     let _builder = builders.clone().try_acquire_owned().map_err(|_| {
         SnapshotError::new(
             SnapshotErrorCode::TemporaryUnavailable,
-            "chunk projection builders are occupied",
+            "chunk map builders are occupied",
         )
     })?;
-    let lease = reserve_projection(size, budget, cache)?;
-    // Source body I/O starts only after builder and retained-memory credit.
+    let lease = budget.reserve(source_reservation_bytes(size)?)?;
     let input = open().await?;
-    build_stream(content_id, size, input, lease).await
+    build_stream_with_inline(content_id, size, input, lease, false).await
 }
 
-async fn build_stream(
+pub(super) fn source_reservation_bytes(size: u64) -> Result<usize, SnapshotError> {
+    let map_bytes = reserved_map_bytes(size)?;
+    let pages = size
+        .div_ceil(CHUNK_SIZE as u64)
+        .div_ceil(CHUNKS_PER_PAGE as u64);
+    let nodes = pages
+        .checked_mul(2)
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|n| {
+            n.checked_mul(std::mem::size_of::<super::super::chunk_map_index::ChunkMapNode>() as u64)
+        })
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| internal("chunk map install reservation overflow"))?;
+    map_bytes
+        .checked_add(nodes)
+        .and_then(|n| n.checked_add(4 * 1024 * 1024))
+        .ok_or_else(|| internal("chunk map install reservation overflow"))
+}
+
+async fn build_stream_with_inline(
     content_id: [u8; 32],
     size: u64,
     mut input: ObjectByteStream,
     lease: MemoryLease,
+    inline: bool,
 ) -> Result<ChunkProjection, SnapshotError> {
     let chunk_count = size.div_ceil(CHUNK_SIZE as u64);
     let page_count = chunk_count.div_ceil(CHUNKS_PER_PAGE as u64);
@@ -129,7 +142,6 @@ async fn build_stream(
     let mut leaves = Vec::new();
     let mut leaf_hashes = Vec::new();
     let mut current = Vec::new();
-    let inline = size <= STAGED_CAP_BYTES as u64;
     if inline {
         raw.try_reserve_exact(size as usize)
             .map_err(allocation_error)?;

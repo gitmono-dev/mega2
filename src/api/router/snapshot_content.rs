@@ -4,10 +4,9 @@
 //! WP and `frame_encodings` advertises identity alone.
 
 use axum::{
-    Json,
     extract::{Path as AxumPath, Query, State},
     http::HeaderMap,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use futures::stream::StreamExt;
 use serde::Deserialize;
@@ -19,8 +18,8 @@ use super::{
     mst2_error_response, request::Mst2Bytes,
 };
 use crate::ceres::snapshot::{
-    chunks::{ChunkProjection, get_or_project_stream, projection_reservation_bytes},
-    content_budget::{PROJECTION_LIVE_BYTES, reserve_range_work, reserve_response},
+    chunks::{ChunkMapSource, VerifiedSourceChunkMap, map_build_reservation_bytes},
+    content_budget::{BudgetedFrame, MemoryLease, reserve_range_work, reserve_response},
     error::{SnapshotError, SnapshotErrorCode},
     pages::{MetadataWalkOutcome, base64_of, hex_of, resolve_abs_metadata},
     resolver::FsKind,
@@ -32,6 +31,7 @@ pub(super) struct ResolvedFileMetadata {
     oid: String,
     pub(super) digest: [u8; 32],
     pub(super) size: u64,
+    fact: crate::callisto::mst2_verified_object::Model,
 }
 
 #[allow(clippy::result_large_err)]
@@ -154,6 +154,7 @@ pub(super) async fn verified_file_metadata<T: crate::ceres::api_service::ApiHand
         oid,
         digest,
         size,
+        fact,
     })
 }
 
@@ -458,10 +459,6 @@ pub(super) struct ChunkMapQuery {
     #[serde(default)]
     pub(super) expected_digest: Option<String>,
     #[serde(default)]
-    pub(super) page: Option<String>,
-    /// Canonical v3 page requests bind the page to the already verified map
-    /// instead of repeating the file digest.
-    #[serde(default)]
     pub(super) map_id: Option<String>,
     #[serde(default)]
     pub(super) page_index: Option<String>,
@@ -475,7 +472,8 @@ async fn project_for<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     scope: &str,
     path: &str,
     expected_digest: Option<&str>,
-) -> Result<std::sync::Arc<ChunkProjection>, Response> {
+) -> Result<std::sync::Arc<crate::jupiter::storage::native_chunk_map::PersistedChunkMap>, Response>
+{
     let f = resolve_file_metadata(handler, root_tree, scope, path, expected_digest).await?;
     project_resolved(handler, &f).await
 }
@@ -484,36 +482,61 @@ async fn project_for<T: crate::ceres::api_service::ApiHandler + ?Sized>(
 async fn project_resolved<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     handler: &T,
     f: &ResolvedFileMetadata,
-) -> Result<std::sync::Arc<ChunkProjection>, Response> {
-    // The first request for a digest builds the projection from the fixed
-    // Git object; later requests slice the cached representation. A miss
-    // rebuilds, never errors with "missing chunk".
-    let digest = f.digest;
-    let size = f.size;
-    let projection = get_or_project_stream(digest, size, || async move {
-        handler
-            .get_raw_blob_stream_by_hash(&f.oid)
-            .await
-            .map_err(content_read_error)
-    })
-    .await
-    .map_err(|error| {
-        mst2_error_response(if error.code == SnapshotErrorCode::DigestMismatch {
-            SnapshotError::new(
-                SnapshotErrorCode::IntegrityError,
-                "fixed blob digest disagrees with its verified fact",
-            )
-        } else {
-            error
-        })
-    })?;
-    if projection.map.file_size != size || projection.map.file_content_id != digest {
+) -> Result<std::sync::Arc<crate::jupiter::storage::native_chunk_map::PersistedChunkMap>, Response>
+{
+    if f.size == 0 {
         return Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::IntegrityError,
-            "cached projection disagrees with the fixed verified fact",
+            SnapshotErrorCode::ScopeInvalid,
+            "empty files have no chunk map",
         )));
     }
-    Ok(projection)
+    let source = ChunkMapSource::from_fact(f.fact.clone(), &f.oid).map_err(mst2_error_response)?;
+    let storage = handler.get_context();
+    let repository = storage.chunk_maps().await.map_err(mst2_error_response)?;
+    let objects = &storage.git_service.obj_storage;
+    if let Some(map) = repository
+        .read(&source, objects)
+        .await
+        .map_err(mst2_error_response)?
+    {
+        return Ok(map);
+    }
+    let flight = crate::ceres::snapshot::chunk_map_gate::InstallFlight::acquire(
+        repository
+            .source_identity(&source)
+            .map_err(mst2_error_response)?,
+    )
+    .map_err(mst2_error_response)?;
+    let _gate = flight.lock().await.map_err(mst2_error_response)?;
+    if let Some(map) = repository
+        .read(&source, objects)
+        .await
+        .map_err(mst2_error_response)?
+    {
+        return Ok(map);
+    }
+    let verified =
+        VerifiedSourceChunkMap::verify(handler, source.clone(), repository.memory_budget())
+            .await
+            .map_err(|error| {
+                mst2_error_response(if error.code == SnapshotErrorCode::DigestMismatch {
+                    SnapshotError::new(
+                        SnapshotErrorCode::IntegrityError,
+                        "fixed blob digest disagrees with its verified fact",
+                    )
+                } else {
+                    error
+                })
+            })?;
+    repository
+        .install(verified, objects)
+        .await
+        .map_err(mst2_error_response)?;
+    repository
+        .read(&source, objects)
+        .await
+        .map_err(mst2_error_response)?
+        .ok_or_else(|| mst2_error_response(internal("installed chunk map source is missing")))
 }
 
 #[allow(clippy::result_large_err)]
@@ -539,10 +562,18 @@ pub(super) async fn chunk_map(
         q.expected_digest.as_deref(),
     )
     .await?;
-    // Canonical v3 uses a closed top-level envelope and a nested map
-    // descriptor.  Keeping the map under `map` is part of profile selection;
-    // the client rejects the legacy flat shape once canonical capabilities
-    // have been advertised.
+    let wire_bound = q
+        .path
+        .len()
+        .checked_mul(6)
+        .and_then(|n| n.checked_add(4096))
+        .ok_or_else(|| mst2_error_response(internal("chunk map response bound overflow")))?;
+    let memory = reserve_response(
+        wire_bound
+            .checked_mul(2)
+            .ok_or_else(|| mst2_error_response(internal("chunk map response credit overflow")))?,
+    )
+    .map_err(mst2_error_response)?;
     let body = json!({
         "snapshot_id": snapshot_id,
         "path": q.path,
@@ -557,7 +588,9 @@ pub(super) async fn chunk_map(
             "map_id": format!("sha256:{}", hex_of(&proj.map_id)),
         },
     });
-    Ok(Json(body).into_response())
+    guarded_map_json_response(&state, &ctx, &body, memory)
+        .await
+        .map_err(mst2_error_response)
 }
 
 #[allow(clippy::result_large_err)]
@@ -569,19 +602,13 @@ pub(super) async fn chunk_map_pages(
     ensure(&state)?;
     let ctx = super::request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
-    // Canonical v3 uses `map_id` + `page_index`; retain parsing of the old
-    // names only while the legacy client is still present in this checkout.
-    let page_index: u64 = match (q.page_index.as_deref(), q.page.as_deref()) {
-        (Some(_), Some(_)) => {
-            return Err(mst2_error_response(SnapshotError::new(
-                SnapshotErrorCode::ScopeInvalid,
-                "page_index and page are mutually exclusive",
-            )));
-        }
-        (Some(s), None) => parse_decimal_count(s, "page_index").map_err(mst2_error_response)?,
-        (None, Some(s)) => parse_decimal_count(s, "page").map_err(mst2_error_response)?,
-        (None, None) => 0,
-    };
+    let page_index = q
+        .page_index
+        .as_deref()
+        .map(|s| parse_decimal_count(s, "page_index"))
+        .transpose()
+        .map_err(mst2_error_response)?
+        .unwrap_or(0);
     if q.page_index.is_some() != q.map_id.is_some() {
         return Err(mst2_error_response(SnapshotError::new(
             SnapshotErrorCode::ScopeInvalid,
@@ -611,9 +638,19 @@ pub(super) async fn chunk_map_pages(
             )));
         }
     }
-    let (leaf, proof) = proj
-        .leaf_and_proof(page_index)
+    let storage = handler.get_context();
+    let page = storage
+        .chunk_maps()
+        .await
+        .map_err(mst2_error_response)?
+        .selected_page(&proj, page_index)
+        .await
         .map_err(mst2_error_response)?;
+    // Reserve both JSON values and the encoded wire buffer before either
+    // allocation. The authenticated leaf/proof retain their own lease.
+    let memory = reserve_response(64 * 1024).map_err(mst2_error_response)?;
+    let leaf = &page.leaf;
+    let proof = &page.proof;
     let leaf_bytes = leaf
         .encode()
         .map_err(|e| mst2_error_response(internal(format!("chunk leaf encode failed: {e}"))))?;
@@ -639,7 +676,84 @@ pub(super) async fn chunk_map_pages(
         "leaf_base64": base64_of(&leaf_bytes),
         "proof": proof_json,
     });
-    Ok(Json(body).into_response())
+    guarded_map_json_response(&state, &ctx, &body, memory)
+        .await
+        .map_err(mst2_error_response)
+}
+
+fn map_json_bytes(
+    value: &serde_json::Value,
+    memory: MemoryLease,
+) -> Result<bytes::Bytes, SnapshotError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(memory.bytes / 2)
+        .map_err(|_| internal("chunk map JSON allocation failed"))?;
+    let limit = memory.bytes / 2;
+    let mut writer = BoundedMapJsonWriter {
+        bytes: &mut bytes,
+        limit,
+    };
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|_| internal("chunk map JSON encoding exceeds its owned credit"))?;
+    if bytes.capacity() > memory.bytes {
+        return Err(internal(
+            "chunk map JSON allocation exceeds its owned credit",
+        ));
+    }
+    Ok(bytes::Bytes::from_owner(BudgetedFrame {
+        bytes,
+        lease: std::sync::Arc::new(memory),
+    }))
+}
+
+struct BoundedMapJsonWriter<'a> {
+    bytes: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedMapJsonWriter<'_> {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        if input.len() > self.limit - self.bytes.len() {
+            return Err(std::io::Error::other(
+                "chunk map JSON exceeds its wire bound",
+            ));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn guarded_map_json_response(
+    state: &crate::api::MonoApiServiceState,
+    context: &crate::ceres::snapshot::runtime::SnapshotContext,
+    value: &serde_json::Value,
+    memory: MemoryLease,
+) -> Result<Response, SnapshotError> {
+    let bytes = map_json_bytes(value, memory)?;
+    let headers = super::REQUEST_HEADERS.try_with(Clone::clone).map_err(|_| {
+        SnapshotError::new(
+            SnapshotErrorCode::Unauthenticated,
+            "request authentication context missing",
+        )
+    })?;
+    super::revalidate_access(state, context, &headers).await?;
+    let state = state.clone();
+    let context = context.clone();
+    let stream = futures::stream::once(async move {
+        super::revalidate_access(&state, &context, &headers).await?;
+        Ok::<_, SnapshotError>(bytes)
+    });
+    Response::builder()
+        .header("content-type", "application/json")
+        .header("cache-control", "private, no-cache, no-transform")
+        .header("vary", "Authorization, Accept")
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|_| internal("chunk map JSON response build failed"))
 }
 
 #[derive(Deserialize, Debug)]
@@ -663,7 +777,8 @@ const CHUNKS_MAX_ITEMS: usize = 128;
 const CHUNKS_TOTAL_MAX: u64 = 128 * 1024 * 1024;
 
 struct Planned {
-    projection: std::sync::Arc<ChunkProjection>,
+    projection: std::sync::Arc<crate::jupiter::storage::native_chunk_map::PersistedChunkMap>,
+    page: std::sync::Arc<crate::jupiter::storage::native_chunk_map::AuthenticatedChunkPage>,
     oid: String,
     index: u64,
 }
@@ -743,8 +858,9 @@ async fn read_chunk_range<T: crate::ceres::api_service::ApiHandler + ?Sized>(
         }
         raw.extend_from_slice(&bytes);
     }
-    projection
-        .verify_chunk(planned.index, &raw)
+    planned
+        .page
+        .verify_chunk(&projection.map, planned.index, &raw)
         .map_err(mst2_error_response)?;
     Ok(raw)
 }
@@ -784,7 +900,6 @@ pub(super) async fn chunks(
     let mut resolved: Vec<ResolvedChunk> = Vec::new();
     let mut units: Vec<(String, u64)> = Vec::new();
     let mut distinct: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
-    let mut projection_bytes = 0usize;
     let mut logical_bytes = 0u64;
     for item in &req.items {
         validate_scope_relative_path(&item.path).map_err(mst2_error_response)?;
@@ -836,16 +951,10 @@ pub(super) async fn chunks(
                 }
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let bytes = projection_reservation_bytes(file.size).map_err(mst2_error_response)?;
-                projection_bytes = projection_bytes.checked_add(bytes).ok_or_else(|| {
-                    mst2_error_response(internal("projection batch memory overflow"))
-                })?;
-                if projection_bytes > PROJECTION_LIVE_BYTES {
-                    return Err(mst2_error_response(SnapshotError::new(
-                        SnapshotErrorCode::LimitExceeded,
-                        "chunk batch exceeds its live projection memory budget",
-                    )));
-                }
+                // Check the profile before any body I/O. Cold construction
+                // owns its credits and is dropped after durable installation;
+                // warm requests retain only descriptors and selected pages.
+                map_build_reservation_bytes(file.size).map_err(mst2_error_response)?;
                 entry.insert(file.size);
             }
         }
@@ -860,8 +969,19 @@ pub(super) async fn chunks(
         .and_then(|bytes| bytes.checked_add(req.items.len() * 1024 + 1024))
         .ok_or_else(|| mst2_error_response(internal("chunk response memory overflow")))?;
     let response_memory = reserve_response(response_bytes).map_err(mst2_error_response)?;
+    let mut maps = std::collections::HashMap::new();
+    let mut pages = std::collections::HashMap::new();
     for item in resolved {
-        let proj = project_resolved(handler.as_ref(), &item.file).await?;
+        let source = ChunkMapSource::from_fact(item.file.fact.clone(), &item.file.oid)
+            .map_err(mst2_error_response)?;
+        let source_key = source.canonical_bytes().map_err(mst2_error_response)?;
+        let proj = if let Some(map) = maps.get(&source_key) {
+            std::sync::Arc::clone(map)
+        } else {
+            let map = project_resolved(handler.as_ref(), &item.file).await?;
+            maps.insert(source_key, std::sync::Arc::clone(&map));
+            map
+        };
         let want_map = format!("sha256:{}", hex_of(&proj.map_id));
         if want_map != item.map_id {
             return Err(mst2_error_response(SnapshotError::new(
@@ -869,8 +989,27 @@ pub(super) async fn chunks(
                 "map_id does not bind to the fixed file",
             )));
         }
+        let page_key = (
+            proj.source_id(),
+            item.index / mst2_codec::chunkmap::CHUNKS_PER_PAGE as u64,
+        );
+        let page = if let Some(page) = pages.get(&page_key) {
+            std::sync::Arc::clone(page)
+        } else {
+            let storage = handler.get_context();
+            let page = storage
+                .chunk_maps()
+                .await
+                .map_err(mst2_error_response)?
+                .selected_page(&proj, page_key.1)
+                .await
+                .map_err(mst2_error_response)?;
+            pages.insert(page_key, std::sync::Arc::clone(&page));
+            page
+        };
         planned.push(Planned {
             projection: proj,
+            page,
             oid: item.file.oid,
             index: item.index,
         });
@@ -883,14 +1022,7 @@ pub(super) async fn chunks(
         let _work_memory = reserve_range_work().map_err(mst2_error_response)?;
         // The source is the current request's fixed OID, never a cached
         // handler/backend/credential from a different scope.
-        let bytes = if p.projection.has_inline_bytes() {
-            p.projection
-                .chunk_bytes(p.index)
-                .map_err(mst2_error_response)?
-                .to_vec()
-        } else {
-            read_chunk_range(handler.as_ref(), p).await?
-        };
+        let bytes = read_chunk_range(handler.as_ref(), p).await?;
         let frame = stream
             .chunk(
                 p.projection.map_id,
