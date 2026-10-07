@@ -178,6 +178,19 @@ pub trait ApiHandler: Send + Sync {
         }
     }
 
+    async fn get_raw_blob_stream_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<crate::orbit_api::object_storage::ObjectByteStream, MegaError> {
+        let storage = self.get_context();
+        match storage.git_service.get_object_stream(hash).await {
+            Ok(stream) => Ok(stream),
+            Err(error) => Err(storage
+                .classify_blob_objstorage_not_found(hash, error)
+                .await),
+        }
+    }
+
     /// Preview unified diff for a single file change
     async fn preview_file_diff(
         &self,

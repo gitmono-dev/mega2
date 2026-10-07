@@ -12,6 +12,7 @@ use axum::{
 use futures::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::{
     abs_view_path, guarded_treeframe_response, internal, mst2_error_response, request::Mst2Bytes,
@@ -19,20 +20,10 @@ use super::{
 use crate::ceres::snapshot::{
     chunks::{ChunkProjection, get_or_project},
     error::{SnapshotError, SnapshotErrorCode},
-    pages::{
-        MetadataWalkOutcome, WalkOutcome, base64_of, fetch_raw_blob, hex_of, resolve_abs,
-        resolve_abs_metadata,
-    },
+    pages::{MetadataWalkOutcome, base64_of, fetch_raw_blob, hex_of, resolve_abs_metadata},
     resolver::FsKind,
     view::validate_scope_relative_path,
 };
-
-/// One file resolved at a fixed path with verified content.
-struct ResolvedFile {
-    digest: [u8; 32],
-    size: u64,
-    raw: Vec<u8>,
-}
 
 pub(super) struct ResolvedFileMetadata {
     fs_kind: FsKind,
@@ -173,52 +164,72 @@ pub(super) fn fs_kind_str(k: FsKind) -> &'static str {
     }
 }
 
-/// Resolve a scope-relative path against the fixed tree and verify the
-/// optional `expected_digest`. Absence/directory/intermediate outcomes stay
-/// typed errors, never an empty body.
 #[allow(clippy::result_large_err)]
-async fn resolve_file<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+async fn read_object<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     handler: &T,
-    root_tree: &git_internal::internal::object::tree::Tree,
-    scope: &str,
+    file: &ResolvedFileMetadata,
     path: &str,
-    expected_digest: Option<&str>,
-) -> Result<ResolvedFile, Response> {
-    let abs_path = abs_view_path(scope, path);
-    match resolve_abs(handler, root_tree, &abs_path)
-        .await
-        .map_err(mst2_error_response)?
-    {
-        WalkOutcome::FoundFile {
-            raw, size, digest, ..
-        } => {
-            if let Some(expected) = expected_digest
-                && expected != format!("sha256:{}", hex_of(&digest))
-            {
-                return Err(mst2_error_response(SnapshotError::new(
-                    SnapshotErrorCode::DigestMismatch,
-                    format!("{path}: content does not match expected_digest"),
-                )));
-            }
-            Ok(ResolvedFile { digest, size, raw })
-        }
-        WalkOutcome::FoundDir => Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::NotDirectory,
-            format!("{path} is a directory"),
-        ))),
-        WalkOutcome::Absent => Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::PathNotFound,
-            format!("{path} absent in the fixed view"),
-        ))),
-        WalkOutcome::NotDirectory { symlink } => Err(mst2_error_response(SnapshotError::new(
-            if symlink {
-                SnapshotErrorCode::SymlinkTraversal
-            } else {
-                SnapshotErrorCode::NotDirectory
-            },
-            format!("{path}: intermediate component is not a directory"),
-        ))),
+) -> Result<Vec<u8>, Response> {
+    if file.size > OBJECT_ITEM_MAX {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            "object exceeds the 256KiB item cap",
+        )));
     }
+    let expected_size = file.size as usize;
+    let mut input = handler
+        .get_raw_blob_stream_by_hash(&file.oid)
+        .await
+        .map_err(|error| {
+            let code = match error {
+                crate::common::errors::MegaError::ObjStorageNotFound(_) => {
+                    SnapshotErrorCode::ObjectUnavailable
+                }
+                crate::common::errors::MegaError::ObjStorageInconsistent(_) => {
+                    SnapshotErrorCode::IntegrityError
+                }
+                _ => SnapshotErrorCode::Internal,
+            };
+            tracing::warn!(error = %error, "fixed-view blob fetch failed");
+            mst2_error_response(SnapshotError::new(
+                code,
+                "fixed-view content could not be read",
+            ))
+        })?;
+    let mut raw = Vec::with_capacity(expected_size);
+    let mut hash = Sha256::new();
+    while let Some(part) = input.next().await {
+        let bytes = part.map_err(|error| {
+            tracing::warn!(error = %error, "fixed-view blob stream failed");
+            mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "fixed-view content could not be read",
+            ))
+        })?;
+        // Reject oversized producer chunks before copying or hashing them.
+        if bytes.len() > expected_size - raw.len() {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "fixed blob length disagrees with its verified size fact",
+            )));
+        }
+        hash.update(&bytes);
+        raw.extend_from_slice(&bytes);
+    }
+    if raw.len() != expected_size {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "fixed blob length disagrees with its verified size fact",
+        )));
+    }
+    let digest: [u8; 32] = hash.finalize().into();
+    if digest != file.digest {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("{path}: content does not match expected_digest"),
+        )));
+    }
+    Ok(raw)
 }
 
 #[derive(Deserialize, Debug)]
@@ -312,9 +323,7 @@ pub(super) async fn objects(
         .map_err(mst2_error_response)?
         .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
 
-    // Verify every member at its fixed path before any 200 is produced.
-    // Members resolve concurrently: a batch is up to 128 files, and a
-    // sequential S3 read per member dominated cold-mount time.
+    // Admit the whole fixed-path batch before opening any object body.
     let handler = state
         .api_handler(std::path::Path::new("/"))
         .await
@@ -329,7 +338,7 @@ pub(super) async fn objects(
     let resolved: Vec<Result<_, Response>> = futures::stream::iter(req.items.clone())
         .map(move |item| async move {
             validate_scope_relative_path(&item.path).map_err(mst2_error_response)?;
-            let f = resolve_file(
+            let f = resolve_file_metadata(
                 handler_ref,
                 root_ref,
                 scope_ref,
@@ -351,21 +360,55 @@ pub(super) async fn objects(
         .buffered(16)
         .collect()
         .await;
-    let mut unique: Vec<([u8; 32], Vec<u8>)> = Vec::new();
-    let mut seen: Vec<[u8; 32]> = Vec::new();
-    let mut logical_bytes = 0u64;
+    let mut sources: Vec<(ObjectItem, ResolvedFileMetadata)> = Vec::new();
+    let mut content_sizes: Vec<([u8; 32], u64)> = Vec::new();
+    let mut planned_bytes = 0u64;
     for pair in resolved {
-        let (_, f) = pair?;
-        if !seen.contains(&f.digest) {
-            if logical_bytes as usize + f.raw.len() > OBJECT_TOTAL_MAX {
+        let (item, f) = pair?;
+        if let Some((_, size)) = content_sizes.iter().find(|(digest, _)| *digest == f.digest) {
+            if *size != f.size {
+                return Err(mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "fixed content digest has conflicting verified sizes",
+                )));
+            }
+        } else {
+            if planned_bytes + f.size > OBJECT_TOTAL_MAX as u64 {
                 return Err(mst2_error_response(SnapshotError::new(
                     SnapshotErrorCode::ScopeInvalid,
                     "unique object content exceeds the 8MiB batch cap",
                 )));
             }
-            logical_bytes += f.raw.len() as u64;
-            seen.push(f.digest);
-            unique.push((f.digest, f.raw));
+            planned_bytes += f.size;
+            content_sizes.push((f.digest, f.size));
+        }
+        if let Some((_, source)) = sources.iter().find(|(_, source)| source.oid == f.oid) {
+            if source.digest != f.digest || source.size != f.size {
+                return Err(mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "fixed object has conflicting verified facts",
+                )));
+            }
+        } else {
+            sources.push((item, f));
+        }
+    }
+    let loaded = futures::stream::iter(sources)
+        .map(|(item, file)| async move {
+            let raw = read_object(handler_ref, &file, &item.path).await?;
+            Ok::<_, Response>((file.digest, raw))
+        })
+        .buffered(16);
+    tokio::pin!(loaded);
+    let mut unique: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut seen: Vec<[u8; 32]> = Vec::new();
+    let mut logical_bytes = 0u64;
+    while let Some(pair) = loaded.next().await {
+        let (digest, raw) = pair?;
+        if !seen.contains(&digest) {
+            logical_bytes += raw.len() as u64;
+            seen.push(digest);
+            unique.push((digest, raw));
         }
     }
 
