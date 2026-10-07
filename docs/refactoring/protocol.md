@@ -901,3 +901,18 @@ LFS:
 `check_push_permission` 切换到三态 helper（ADR-UN-01）：`off` 短路放行（默认，零影响）；`shadow` 放行但记录 would-deny（`event=authz_would_deny` 结构化字段）；`enforce` 拒绝无权限 push。资源经 UN-11 归一为根仓库 `Repository::"/"`，根实体缺失 fail-closed。首建 `ensure` 在 HTTP listener 绑定前完成（`start_http`）。
 
 SSH 面（UN-03）与 HTTP 面共享同一 `AppContext.entity_store` 实例（`service multi` 单进程内四方恒等：context↔storage↔HTTP↔SSH）。独立 `service ssh` 在命令层对 `enforcement != off` 拒绝启动（指引改用 `service multi` 或保持 `off`）；SSH listener 绑定前完成幂等首建。
+
+## 视图协议错误契约与预检钩子（HP-17）
+
+`RepoHandler::check_wants_and_ready(&[String])` 与
+`RepoHandler::prepare_pack(&[String], &[String])` 默认返回 `Ok(())`，因此 Monorepo 和
+ImportRepo 的协商结果保持不变。前者在 v0/v2 每个带 want 的协商轮、任何 ACK、NAK 或
+acknowledgments 之前运行；后者只在确定发包前运行。v0 中 have 非空且没有
+`multi_ack_detailed` 的分支不发包，只运行第一个钩子；对应的设计方法表已按此订正。
+
+钩子失败时不会调用任何 pack 方法。v2 的 ready 轮即使已将 acknowledgments 写入缓冲，
+也会丢弃该缓冲并返回错误。`ViewUnavailable` 的 HTTP 应答是带 `Retry-After` 的 503；
+`PackRejected` 的 HTTP 应答是 200、`application/x-git-upload-pack-result` 和一个 ERR
+pkt-line。错误字段与完整应答表见 [错误文档](../errors.md#megaerrorviewunavailable--viewpackrejected视图协议错误plan-20261002)
+和 [history-projection 设计 §6.1「错误契约」](history-projection.md#61-url-与路由决策)。视图 URL 的错误产生方和
+黑盒覆盖由后续入口与打包卡登记，本节不重复场景覆盖表行。
