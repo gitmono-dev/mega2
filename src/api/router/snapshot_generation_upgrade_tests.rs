@@ -42,6 +42,7 @@ async fn mst2_generation_additive_upgrade_preserves_legacy_v3_sid_lease_and_new_
     );
     let pages = scalar(db, "SELECT count(*) FROM mst2_metadata_payload").await;
     let original = success_json(fixture.send("GET", "descriptor", Body::empty()).await).await;
+    super::generation_history_fixture::restore_empty_g1_schema(db).await;
     // The unchanged v3 installer created these durable rows. Remove only the
     // empty additive schema in this isolated fixture to reproduce the previous
     // deployed schema; the SID, lease, CAS bytes and all original guards survive.

@@ -85,6 +85,9 @@ mod durable_sessions;
 #[path = "snapshot_generation_upgrade_tests.rs"]
 mod generation_upgrade;
 
+#[path = "snapshot_generation_history_fixture.rs"]
+mod generation_history_fixture;
+
 #[derive(Default)]
 struct ReadCounts {
     whole: AtomicUsize,
