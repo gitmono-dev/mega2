@@ -71,6 +71,107 @@ fn rejected(error: MetadataInstallError) -> SnapshotErrorCode {
 }
 
 #[tokio::test]
+async fn native_metadata_scope_ignores_poisoned_temp_table_and_rejects_changed_primary_schema() {
+    let (first, _second, _schema, url) = fixture().await;
+    let (_other, _unused, other_schema, _other_url) = fixture().await;
+    let expected = PostgresMetadataInstallRepository::new(first)
+        .await
+        .unwrap()
+        .storage_scope;
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options.max_connections(1).min_connections(1);
+    let connection = Database::connect(options).await.unwrap();
+    connection
+        .execute_unprepared(
+            "CREATE TEMP TABLE mst2_metadata_storage_scope(singleton integer,storage_uuid text);
+             INSERT INTO pg_temp.mst2_metadata_storage_scope VALUES(1,'temp-poison')",
+        )
+        .await
+        .unwrap();
+    let repository = PostgresMetadataInstallRepository::new(connection.clone())
+        .await
+        .unwrap();
+    assert_eq!(repository.storage_scope, expected);
+    assert_eq!(repository.captured_schema(), _schema.schema());
+    repository
+        .verify_primary_connection(&connection)
+        .await
+        .unwrap();
+    let txn = connection.begin().await.unwrap();
+    repository.barrier(&txn).await.unwrap();
+    txn.rollback().await.unwrap();
+    connection
+        .execute_raw(statement(
+            "UPDATE pg_temp.mst2_metadata_storage_scope SET storage_uuid=$1",
+            [repository.storage_scope.storage_uuid.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let txn = connection.begin().await.unwrap();
+    txn.execute_unprepared(&format!(
+        "SET LOCAL search_path=\"{}\",pg_catalog,pg_temp",
+        other_schema.schema().replace('"', "\"\"")
+    ))
+    .await
+    .unwrap();
+    let error = repository
+        .verify_primary_connection(&txn)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::Internal);
+    assert!(
+        error
+            .message
+            .contains("session mutation no longer targets its captured primary storage scope")
+    );
+    let error = repository.barrier(&txn).await.unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::Internal);
+    assert!(
+        error
+            .message
+            .contains("metadata recovery connection is outside the captured primary storage scope")
+    );
+    txn.rollback().await.unwrap();
+    connection
+        .execute_unprepared("SET search_path=pg_temp,pg_catalog")
+        .await
+        .unwrap();
+    let error = PostgresMetadataInstallRepository::new(connection.clone())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, SnapshotErrorCode::Internal);
+    assert_eq!(
+        error.message,
+        "metadata actual primary storage relation is missing"
+    );
+    connection
+        .execute_unprepared(&format!(
+            "SET search_path=\"{}\",pg_catalog,pg_temp",
+            repository.captured_schema().replace('"', "\"\"")
+        ))
+        .await
+        .unwrap();
+    repository
+        .verify_primary_connection(&connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_one_raw(statement(
+                "SELECT storage_uuid FROM pg_temp.mst2_metadata_storage_scope WHERE singleton=1",
+                [],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "storage_uuid")
+            .unwrap(),
+        expected.storage_uuid
+    );
+}
+
+#[tokio::test]
 async fn native_metadata_two_primary_connections_replay_one_receipt_without_recounting() {
     let (first, second, _schema, _url) = fixture().await;
     let a = PostgresMetadataInstallRepository::new(first.clone())
