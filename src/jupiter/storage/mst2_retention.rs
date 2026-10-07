@@ -129,6 +129,53 @@ impl PostgresRetentionRepository {
         finish(txn, result).await
     }
 
+    /// Attach a root to an already verified immutable DAG root. Incoming edges
+    /// retain descendants; this does not copy every page for each lease.
+    pub(crate) async fn acquire_existing_roots_in_txn(
+        txn: &DatabaseTransaction,
+        node_id: &str,
+        roots: &[RetentionRoot],
+    ) -> Result<(), SnapshotError> {
+        validate_id(node_id)?;
+        if roots.is_empty() || roots.len() > MAX_ROOTS {
+            return Err(limit_error(
+                "existing-root acquisition requires 1..=16 roots",
+            ));
+        }
+        let identities = roots
+            .iter()
+            .map(root_identity)
+            .collect::<Result<Vec<_>, _>>()?;
+        let roots: Vec<_> = identities
+            .iter()
+            .map(|(key, kind)| json!({"key":key,"kind":kind}))
+            .collect();
+        let encoded = serde_json::to_string(&roots).map_err(internal)?;
+        let savepoint = begin_graph(txn).await?;
+        let result=async {
+            let row=savepoint.query_one_raw(statement(
+                "SELECT state FROM mst2_retention_node WHERE node_id=$1 FOR UPDATE",[node_id.into()]
+            )).await.map_err(internal)?.ok_or_else(|| unavailable("metadata root is missing"))?;
+            if row.try_get::<String>("","state").map_err(internal)?!="LIVE" {
+                return Err(unavailable("metadata root is not LIVE"));
+            }
+            if savepoint.query_one_raw(statement(
+                "SELECT r.node_id FROM mst2_retention_root r JOIN jsonb_to_recordset($2::jsonb)
+                 AS p(key text,kind text) ON r.root_key=p.key WHERE r.node_id<>$1 OR r.root_kind<>p.kind LIMIT 1",
+                [node_id.into(),encoded.clone().into()],
+            )).await.map_err(internal)?.is_some() {
+                return Err(integrity("retention root is bound to another DAG or kind"));
+            }
+            savepoint.execute_raw(statement(
+                "INSERT INTO mst2_retention_root(node_id,root_key,root_kind)
+                 SELECT $1,p.key,p.kind FROM jsonb_to_recordset($2::jsonb) AS p(key text,kind text)
+                 ON CONFLICT(node_id,root_key) DO NOTHING",[node_id.into(),encoded.into()],
+            )).await.map_err(internal)?;
+            Ok(())
+        }.await;
+        finish(savepoint, result).await
+    }
+
     pub async fn release_root_in_txn(
         txn: &DatabaseTransaction,
         root: &RetentionRoot,

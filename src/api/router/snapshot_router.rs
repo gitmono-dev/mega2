@@ -102,6 +102,14 @@ pub(crate) fn treeframe_response(
     request_body: &[u8],
     body: Vec<u8>,
 ) -> Result<Response, SnapshotError> {
+    treeframe_response_body(snapshot_id, request_body, axum::body::Body::from(body))
+}
+
+fn treeframe_response_body(
+    snapshot_id: &str,
+    request_body: &[u8],
+    body: axum::body::Body,
+) -> Result<Response, SnapshotError> {
     let request_digest: [u8; 32] = Sha256::digest(request_body).into();
     Response::builder()
         .header("content-type", TREEFRAME_MEDIA_TYPE)
@@ -112,8 +120,43 @@ pub(crate) fn treeframe_response(
         )
         .header("cache-control", "private, no-cache, no-transform")
         .header("vary", "Authorization, Accept")
-        .body(axum::body::Body::from(Bytes::from(body)))
+        .body(body)
         .map_err(|e| internal(format!("TreeFrame response build failed: {e}")))
+}
+
+fn guarded_treeframe_response(
+    state: &MonoApiServiceState,
+    context: &crate::ceres::snapshot::runtime::SnapshotContext,
+    snapshot_id: &str,
+    request_body: &[u8],
+    frames: Vec<Vec<u8>>,
+) -> Result<Response, SnapshotError> {
+    let headers = REQUEST_HEADERS.try_with(Clone::clone).map_err(|_| {
+        SnapshotError::new(
+            SnapshotErrorCode::Unauthenticated,
+            "request authentication context missing",
+        )
+    })?;
+    let units = frames
+        .into_iter()
+        .map(Bytes::from)
+        .collect::<std::collections::VecDeque<_>>();
+    let stream = futures::stream::unfold(
+        (units, state.clone(), context.clone(), headers),
+        |(mut units, state, context, headers)| async move {
+            let unit = units.pop_front()?;
+            if let Err(error) = revalidate_access(&state, &context, &headers).await {
+                units.clear();
+                return Some((Err(error), (units, state, context, headers)));
+            }
+            Some((Ok(unit), (units, state, context, headers)))
+        },
+    );
+    treeframe_response_body(
+        snapshot_id,
+        request_body,
+        axum::body::Body::from_stream(stream),
+    )
 }
 
 tokio::task_local! {
@@ -121,11 +164,14 @@ tokio::task_local! {
     /// global `TraceContext` so the envelope, the `X-Request-Id` response
     /// header and log spans all carry the same id.
     static REQUEST_ID: String;
+    static REQUEST_CONTEXT: Option<crate::ceres::snapshot::runtime::SnapshotContext>;
+    static REQUEST_HEADERS: HeaderMap;
 }
 
 #[cfg(test)]
 tokio::task_local! {
     static NATIVE_RESOLVE_BARRIERS: (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+    static NATIVE_HANDOFF_BARRIERS: (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
     static REJECT_NATIVE_OBSERVATION_SOURCE: bool;
 }
 
@@ -147,6 +193,17 @@ pub(crate) async fn with_native_resolve_barriers<F: std::future::Future>(
         .await
 }
 
+#[cfg(test)]
+pub(crate) async fn with_native_handoff_barriers<F: std::future::Future>(
+    prepared: std::sync::Arc<tokio::sync::Barrier>,
+    release: std::sync::Arc<tokio::sync::Barrier>,
+    future: F,
+) -> F::Output {
+    NATIVE_HANDOFF_BARRIERS
+        .scope((prepared, release), future)
+        .await
+}
+
 /// The request id of the in-flight request, for error envelopes.
 pub(crate) fn current_request_id() -> String {
     REQUEST_ID.try_with(|id| id.clone()).unwrap_or_default()
@@ -158,7 +215,7 @@ const LEASE_HEADER: &str = "x-mega-snapshot-lease";
 /// every endpoint except `capabilities` requires `Authorization: Bearer
 /// <token>` when the deployment configured one, and snapshot-bound endpoints
 /// must additionally present the lease they resolved
-/// (`X-Mega-Snapshot-Lease`), validated against the in-memory lease table —
+/// (`X-Mega-Snapshot-Lease`), validated against the session authority —
 /// knowing the snapshot id alone is not a capability.
 async fn snapshot_auth_middleware(
     State(state): State<MonoApiServiceState>,
@@ -178,10 +235,41 @@ async fn snapshot_auth_middleware(
         });
     let mut response = REQUEST_ID
         .scope(id.to_string(), async {
-            if let Some(res) = auth_error(&state, req.headers(), req.uri().path()) {
-                return res;
-            }
-            next.run(req).await
+            let headers = req.headers().clone();
+            let path = req.uri().path().to_owned();
+            let context = match authenticate_request(&state, &headers, &path).await {
+                Ok(context) => context,
+                Err(response) => return response,
+            };
+            REQUEST_HEADERS
+                .scope(
+                    headers.clone(),
+                    REQUEST_CONTEXT.scope(context.clone(), async {
+                        let response = next.run(req).await;
+                        if response.status().is_success()
+                            || response.status() == StatusCode::NOT_MODIFIED
+                        {
+                            match context {
+                                Some(context) => {
+                                    if let Err(error) =
+                                        revalidate_access(&state, &context, &headers).await
+                                    {
+                                        return mst2_error_response(error);
+                                    }
+                                }
+                                None => {
+                                    if let Err(response) =
+                                        authenticate_request(&state, &headers, &path).await
+                                    {
+                                        return response;
+                                    }
+                                }
+                            }
+                        }
+                        response
+                    }),
+                )
+                .await
         })
         .await;
     if let Ok(value) = HeaderValue::from_str(&id) {
@@ -245,7 +333,11 @@ fn unauthenticated(message: &'static str) -> Response {
 /// Auth decision for one request path (see [`snapshot_auth_middleware`]).
 /// `capabilities` stays open; lease routes need only the bearer; a
 /// snapshot-bound route (`/snapshots/sha256:…/…`) also needs its lease.
-fn auth_error(state: &MonoApiServiceState, headers: &HeaderMap, path: &str) -> Option<Response> {
+async fn authenticate_request(
+    state: &MonoApiServiceState,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<Option<crate::ceres::snapshot::runtime::SnapshotContext>, Response> {
     let config = state.storage.config();
     let token = config.mst2.auth_token.as_deref();
     let path = path.split('?').next().unwrap_or(path);
@@ -253,30 +345,103 @@ fn auth_error(state: &MonoApiServiceState, headers: &HeaderMap, path: &str) -> O
     // middleware runs — accept both the stripped and full forms.
     let rest = path
         .strip_prefix("/api/v2/snapshots/")
-        .or_else(|| path.strip_prefix("/snapshots/"))?;
+        .or_else(|| path.strip_prefix("/snapshots/"));
+    let Some(rest) = rest else {
+        return Ok(None);
+    };
     if rest == "capabilities" {
-        return None;
+        return Ok(None);
     }
     if let Some(token) = token
         && !bearer_ok(headers, token)
     {
-        return Some(unauthenticated("missing or invalid bearer credentials"));
+        return Err(unauthenticated("missing or invalid bearer credentials"));
     }
     let mut segments = rest.split('/');
     match segments.next() {
         // Lease management names the lease in the path, not a snapshot.
-        Some("resolve") | Some("leases") | Some("capabilities") | None => None,
+        Some("resolve") | Some("leases") | Some("capabilities") | None => Ok(None),
         Some(snapshot_id) => {
             let lease = headers.get(LEASE_HEADER).and_then(|v| v.to_str().ok());
             match lease {
-                None => Some(unauthenticated("missing X-Mega-Snapshot-Lease header")),
-                Some(lease) => runtime()
-                    .validate_lease(snapshot_id, lease)
-                    .err()
-                    .map(mst2_error_response),
+                None => Err(unauthenticated("missing X-Mega-Snapshot-Lease header")),
+                Some(lease) => state
+                    .storage
+                    .snapshot_context(snapshot_id, lease)
+                    .await
+                    .map(Some)
+                    .map_err(mst2_error_response),
             }
         }
     }
+}
+
+fn request_context(
+    state: &MonoApiServiceState,
+    snapshot_id: &str,
+) -> Result<crate::ceres::snapshot::runtime::SnapshotContext, SnapshotError> {
+    if let Ok(Some(context)) = REQUEST_CONTEXT.try_with(Clone::clone)
+        && context.built.snapshot_id == snapshot_id
+    {
+        return Ok(context);
+    }
+    if !state.storage.config().mst2.publication_enabled {
+        return runtime().context(snapshot_id);
+    }
+    Err(SnapshotError::new(
+        SnapshotErrorCode::Unauthenticated,
+        "validated snapshot session missing",
+    ))
+}
+
+async fn revalidate_access(
+    state: &MonoApiServiceState,
+    context: &crate::ceres::snapshot::runtime::SnapshotContext,
+    headers: &HeaderMap,
+) -> Result<(), SnapshotError> {
+    let config = state.storage.config();
+    if !config.mst2.enabled {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::SnapshotNotReady,
+            "snapshot surface disabled",
+        ));
+    }
+    if let Some(token) = config.mst2.auth_token.as_deref()
+        && !bearer_ok(headers, token)
+    {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::Unauthenticated,
+            "bearer credentials changed",
+        ));
+    }
+    let current = state
+        .storage
+        .snapshot_context(&context.built.snapshot_id, &context.lease_id)
+        .await?;
+    if current.built.descriptor != context.built.descriptor
+        || current.commit_oid != context.commit_oid
+        || current.root_tree_oid != context.root_tree_oid
+        || current.authorization_epoch != context.authorization_epoch
+    {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "fixed session changed during request",
+        ));
+    }
+    Ok(())
+}
+
+async fn revalidate_request(
+    state: &MonoApiServiceState,
+    context: &crate::ceres::snapshot::runtime::SnapshotContext,
+) -> Result<(), SnapshotError> {
+    let headers = REQUEST_HEADERS.try_with(Clone::clone).map_err(|_| {
+        SnapshotError::new(
+            SnapshotErrorCode::Unauthenticated,
+            "request authentication context missing",
+        )
+    })?;
+    revalidate_access(state, context, &headers).await
 }
 
 fn mst2_error_response(err: SnapshotError) -> Response {
@@ -451,6 +616,7 @@ async fn resolve(
 
     let config = state.storage.config();
     let mut native_source = None;
+    let mut selected_native_head = None;
     let (commit_oid, tree_oid, sequence, writer_epoch) = if config.mst2.publication_enabled {
         let Some(instance) = config.mst2.instance_uuid.as_deref() else {
             return Err(mst2_error_response(SnapshotError::new(
@@ -511,6 +677,7 @@ async fn resolve(
                 None
             }
         };
+        selected_native_head = Some(head.clone());
         (
             head.root.commit,
             head.root.tree,
@@ -576,9 +743,46 @@ async fn resolve(
 
     let built = build_descriptor(&config.mst2, &view, &req.scope, scope_page.page_id)
         .map_err(mst2_error_response)?;
-    let ctx = runtime()
-        .insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds)
-        .map_err(mst2_error_response)?;
+    let ctx = if let Some(head) = selected_native_head.as_ref() {
+        let sessions = state.storage.snapshot_sessions().await;
+        if let Some(context) = sessions
+            .open(head, &built, None, req.lease_seconds)
+            .await
+            .map_err(mst2_error_response)?
+        {
+            context
+        } else {
+            let prepared = crate::ceres::snapshot::pages::prepare_native_metadata_retention(
+                handler.as_ref(),
+                &root_tree,
+                &req.scope,
+                crate::ceres::snapshot::retention_dag::MetadataDagLimits::default(),
+            )
+            .await
+            .map_err(mst2_error_response)?;
+            let receipt = sessions
+                .install(&built, &prepared)
+                .await
+                .map_err(mst2_error_response)?;
+            #[cfg(test)]
+            if let Ok((prepared, release)) = NATIVE_HANDOFF_BARRIERS.try_with(|value| value.clone())
+            {
+                prepared.wait().await;
+                release.wait().await;
+            }
+            sessions
+                .open(head, &built, Some(&receipt), req.lease_seconds)
+                .await
+                .map_err(mst2_error_response)?
+                .ok_or_else(|| {
+                    mst2_error_response(internal("durable session handoff returned no context"))
+                })?
+        }
+    } else {
+        runtime()
+            .insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds)
+            .map_err(mst2_error_response)?
+    };
 
     if let Some(source) = native_source {
         let request_id = current_request_id();
@@ -611,6 +815,9 @@ async fn resolve(
         }
     }
 
+    revalidate_request(&state, &ctx)
+        .await
+        .map_err(mst2_error_response)?;
     let body = json!({
         "descriptor": descriptor_json(&built),
         "publication_sequence": sequence,
@@ -648,9 +855,7 @@ async fn descriptor_get(
     AxumPath(snapshot_id): AxumPath<String>,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     // Reading the descriptor back never touches latest (spec 04 §2).
     let body = json!({
         "snapshot_id": snapshot_id,
@@ -680,8 +885,10 @@ async fn lease_renew(
     } else {
         parse_json_body(&body)?
     };
-    let renewed = runtime()
-        .renew_lease(&lease_id, req.lease_seconds.unwrap_or(600))
+    let renewed = state
+        .storage
+        .snapshot_renew(&lease_id, req.lease_seconds.unwrap_or(600))
+        .await
         .map_err(mst2_error_response)?;
     // Renewal never changes the version or authorization (spec 04 §4).
     let body = json!({
@@ -701,7 +908,11 @@ async fn lease_release(
     ensure_enabled(&state).map_err(mst2_error_response)?;
     // Idempotent: releasing an unknown/already-released lease still succeeds
     // (spec 04 §2). This never deletes Git content.
-    let released = runtime().release_lease(&lease_id);
+    let released = state
+        .storage
+        .snapshot_release(&lease_id)
+        .await
+        .map_err(mst2_error_response)?;
     Ok(Json(json!({ "lease_id": lease_id, "released": released })).into_response())
 }
 
@@ -732,9 +943,7 @@ async fn directory(
     Query(q): Query<DirectoryQuery>,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
     if !(1..=256).contains(&q.limit) {
         return Err(mst2_error_response(SnapshotError::new(
@@ -939,9 +1148,7 @@ async fn blob(
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
     if headers.contains_key("range") {
         // Spec 04 section 9: raw blob has no Range semantics this profile.
@@ -985,11 +1192,42 @@ async fn blob(
                 crate::ceres::snapshot::resolver::FsKind::Symlink => "symlink",
                 crate::ceres::snapshot::resolver::FsKind::Directory => "directory",
             };
+            revalidate_request(&state, &ctx)
+                .await
+                .map_err(mst2_error_response)?;
+            let headers = REQUEST_HEADERS.try_with(Clone::clone).map_err(|_| {
+                mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::Unauthenticated,
+                    "request authentication context missing",
+                ))
+            })?;
+            let stream_state = state.0.clone();
+            let stream_context = ctx.clone();
+            let blocks = futures::stream::unfold(
+                (
+                    Bytes::from(raw),
+                    0usize,
+                    stream_state,
+                    stream_context,
+                    headers,
+                ),
+                |(raw, offset, state, context, headers)| async move {
+                    if offset >= raw.len() {
+                        return None;
+                    }
+                    if let Err(error) = revalidate_access(&state, &context, &headers).await {
+                        return Some((Err(error), (raw, usize::MAX, state, context, headers)));
+                    }
+                    let end = (offset + 1_048_576).min(raw.len());
+                    let bytes = raw.slice(offset..end);
+                    Some((Ok(bytes), (raw, end, state, context, headers)))
+                },
+            );
             Response::builder()
                 .header("etag", format!("\"sha256:{}\"", hex_of(&digest)))
                 .header("cache-control", "private, no-cache, no-transform")
                 .header("x-mega-fs-kind", fs_kind_str)
-                .body(axum::body::Body::from(Bytes::from(raw)))
+                .body(axum::body::Body::from_stream(blocks))
                 .map_err(|e| {
                     mst2_error_response(SnapshotError::new(
                         SnapshotErrorCode::Internal,
@@ -1053,9 +1291,7 @@ async fn lookup(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
     let root_tree = handler
         .get_tree_by_hash(&ctx.root_tree_oid)
         .await
@@ -1208,9 +1444,7 @@ async fn metadata_pages(
     for item in &req.items {
         validate_scope_relative_path(&item.directory_path).map_err(mst2_error_response)?;
     }
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
+    let ctx = request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
 
     let handler = state
         .api_handler(std::path::Path::new("/"))
@@ -1281,18 +1515,18 @@ async fn metadata_pages(
         .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
     use crate::ceres::snapshot::frame_stream::FrameStream;
     let mut stream = FrameStream::new(1, encoding);
-    let mut out: Vec<u8> = Vec::new();
+    let mut out: Vec<Vec<u8>> = Vec::new();
     let mut frame: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut frame_raw: usize = 0;
     let mut flush = |frame: &mut Vec<([u8; 32], Vec<u8>)>,
                      raw: &mut usize,
-                     out: &mut Vec<u8>|
+                     out: &mut Vec<Vec<u8>>|
      -> Result<(), SnapshotError> {
         if frame.is_empty() {
             return Ok(());
         }
         let bytes = stream.meta(std::mem::take(frame))?;
-        out.extend_from_slice(&bytes);
+        out.push(bytes);
         *raw = 0;
         Ok(())
     };
@@ -1318,9 +1552,9 @@ async fn metadata_pages(
         logical_bytes,
         request_body_sha256,
     );
-    out.extend_from_slice(&end);
+    out.push(end);
 
-    treeframe_response(&snapshot_id, &body, out).map_err(mst2_error_response)
+    guarded_treeframe_response(&state, &ctx, &snapshot_id, &body, out).map_err(mst2_error_response)
 }
 
 #[cfg(test)]

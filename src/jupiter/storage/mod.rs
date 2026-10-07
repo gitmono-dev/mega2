@@ -20,6 +20,7 @@ pub(crate) mod mst2_publication_storage;
 pub mod mst2_retention;
 pub mod native_metadata_install;
 pub(crate) mod native_publication_storage;
+pub(crate) mod native_snapshot_session;
 pub mod notification_storage;
 pub mod object_storage;
 pub mod oci_db_storage;
@@ -158,6 +159,8 @@ pub struct Storage {
     /// Derived native projection memoization, scoped to this storage assembly.
     /// Clones share it; independent databases/backends never share entries.
     pub(crate) native_projection_cache: Arc<crate::ceres::snapshot::pages::NativeProjectionCache>,
+    pub(crate) native_snapshot_sessions:
+        Arc<tokio::sync::OnceCell<native_snapshot_session::PostgresNativeSessionRepository>>,
     pub(crate) projection_observation_sink:
         Option<Arc<crate::ceres::snapshot::projection_writer::ProjectionObservationSink>>,
     pub cl_service: CLService,
@@ -322,6 +325,7 @@ impl Storage {
         Ok(Storage {
             app_service: app_service.into(),
             native_projection_cache: Arc::default(),
+            native_snapshot_sessions: Arc::default(),
             projection_observation_sink: None,
             config_handle,
             config,
@@ -699,6 +703,7 @@ impl Storage {
         Storage {
             app_service,
             native_projection_cache: Arc::default(),
+            native_snapshot_sessions: Arc::default(),
             projection_observation_sink: None,
             // app_service: AppService::mock(),
             cl_service: CLService::mock(),

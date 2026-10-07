@@ -92,3 +92,6 @@ pub mod ssh_keys;
 pub mod user_notification_preferences;
 pub mod user_notification_settings;
 pub mod vault;
+
+pub mod mst2_snapshot_context;
+pub mod mst2_snapshot_lease;
