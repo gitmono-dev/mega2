@@ -115,6 +115,8 @@ See the [Configuration Guide](./configuration.md) for SecretRef settings and val
 | SSH | `service ssh` (dedicated port) | read-only (upload-pack) in storage-only; `git.ssh_receive_pack=false` is mandatory — omitting it refuses startup |
 | Git LFS | `/info/lfs` + `/api/v1/lfs` | mounted in both modes; write authorization follows `push_auth` |
 | Product API | `/api/v1/*` (status, file/blob, file/tree, preview reads + create-entry/delete-entry/move-entry/edit/save writes + tags) | trunk / storage-only mode |
+| Git view URLs (read-only) | `/.filter/<filter_id>.git`, `/.view/<name>.git`, `/.view/<name>@<version>.git` (HTTP and SSH upload-pack) | `[views].enabled` defaults off and requires restart; receive-pack is rejected and LFS under view prefixes returns 404 |
+| Views API | `/api/v1/views` (`POST ?wait=true` registration and `GET ?name=&version=`), `GET /api/v1/views/{filter_id}`, `GET /api/v1/views/metrics`; see [views operations](./deploy-trunk.md) | `[views].enabled` defaults off and requires restart; mounted only in trunk / storage-only, returns 404 when disabled |
 | OCI registry | `/v2/` | `[oci].enabled` and storage-only; fail-closed (not registered) under review |
 | Agent Capture | `/api/v1/agent-capture` | `[agent_capture].enabled` and storage-only |
 | MST/2 snapshot surface | `/api/v2` | nest is static; handlers fail closed unless `[mst2].enabled`; toggling needs a restart |

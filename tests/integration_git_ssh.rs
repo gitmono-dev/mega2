@@ -3619,6 +3619,722 @@ fn integration_git_ssh_view_layer3_ls_remote() {
     );
 }
 
+fn hp22_ssh_boot() -> (GitSshEnv, ServiceProcess, u16, u16, PathBuf) {
+    assert!(!git_cli::git_cli_skip_requested());
+    git_cli::require_git_cli_runner();
+    let env = GitSshEnv::new();
+    git_cli::generate_client_ed25519(&env.ssh_dir.join("client_ed25519"));
+    let extra = [
+        ("MEGA_VIEWS__ENABLED", "true"),
+        ("MEGA_VIEWS__ALLOW_ANONYMOUS_REGISTER", "true"),
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "none"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+        ("MEGA_GIT__ANONYMOUS_ACCESS", "true"),
+    ];
+    let (mut first, _, _, _, first_err) = boot_service_multi_with_extra(&env, "off", None, &extra);
+    assert!(
+        first.shutdown_via_sigint(Duration::from_secs(10)).success(),
+        "{}",
+        read_log(&first_err)
+    );
+    drop(first);
+    let (service, http_port, ssh_port, _, err) =
+        boot_service_multi_with_extra(&env, "off", None, &extra);
+    git_cli::write_known_hosts_via_keyscan(&env.ssh_dir.join("known_hosts"), ssh_port);
+    (env, service, http_port, ssh_port, err)
+}
+
+fn hp23_ssh_git_input(case_dir: &Path, args: &[&str], input: &[u8]) -> String {
+    let mut child = Command::new("git")
+        .current_dir(case_dir)
+        .args(["-C", "hp23-source"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    git_cli::assert_git_success(&output, "HP-23 SSH fixture git");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+struct Hp23SshFixture {
+    root_tip: String,
+    prior_root: String,
+    views: Vec<(String, String)>,
+    mode_tree: String,
+    gbk_tree: String,
+    missing_tree: String,
+}
+
+fn hp23_ssh_fixture(env: &GitSshEnv, http_port: u16) -> Hp23SshFixture {
+    let case_dir = env.case_dir.as_path();
+    let project_url = git_cli::mega2_host_http_url(http_port, "/project");
+    hp22_ssh_host_git(case_dir, &["clone", &project_url, "hp23-source"]);
+    hp22_ssh_host_git(
+        case_dir,
+        &["-C", "hp23-source", "config", "user.name", "HP23"],
+    );
+    hp22_ssh_host_git(
+        case_dir,
+        &[
+            "-C",
+            "hp23-source",
+            "config",
+            "user.email",
+            "hp23@example.invalid",
+        ],
+    );
+    for (name, file) in [
+        ("mode", "good.txt"),
+        ("gbk", "good.txt"),
+        ("ok", "good.txt"),
+        ("miss/d", "hp23-only-in-miss-d.txt"),
+    ] {
+        let path = case_dir
+            .join("hp23-source")
+            .join(format!("hp23-{name}"))
+            .join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, name).unwrap();
+    }
+    hp22_ssh_host_git(
+        case_dir,
+        &[
+            "-C",
+            "hp23-source",
+            "add",
+            "hp23-mode",
+            "hp23-gbk",
+            "hp23-ok",
+            "hp23-miss",
+        ],
+    );
+    hp22_ssh_host_git(case_dir, &["-C", "hp23-source", "commit", "-m", "HP23 R1"]);
+    hp22_ssh_host_git(
+        case_dir,
+        &[
+            "-C",
+            "hp23-source",
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+    let blob = hp22_ssh_host_git(
+        case_dir,
+        &["-C", "hp23-source", "rev-parse", "HEAD:hp23-mode/good.txt"],
+    )
+    .trim()
+    .to_owned();
+    let mode_input = format!("100664 blob {blob}\tmode.txt\n");
+    let mode_tree = hp23_ssh_git_input(case_dir, &["mktree"], mode_input.as_bytes());
+    let gbk_input = format!("100644 blob {blob}\t\"\\304\\343\\272\\303.txt\"\n");
+    let gbk_tree = hp23_ssh_git_input(case_dir, &["mktree"], gbk_input.as_bytes());
+    let ok_tree = hp22_ssh_host_git(
+        case_dir,
+        &["-C", "hp23-source", "rev-parse", "HEAD:hp23-ok"],
+    )
+    .trim()
+    .to_owned();
+    let miss_tree = hp22_ssh_host_git(
+        case_dir,
+        &["-C", "hp23-source", "rev-parse", "HEAD:hp23-miss"],
+    )
+    .trim()
+    .to_owned();
+    let missing_tree = hp22_ssh_host_git(
+        case_dir,
+        &["-C", "hp23-source", "rev-parse", "HEAD:hp23-miss/d"],
+    )
+    .trim()
+    .to_owned();
+    let prior_tree = hp22_ssh_host_git(case_dir, &["-C", "hp23-source", "ls-tree", "HEAD"]);
+    let root_input = prior_tree
+        .lines()
+        .map(|line| {
+            let name = line.rsplit_once('\t').unwrap().1;
+            let replacement = match name {
+                "hp23-mode" => Some(&mode_tree),
+                "hp23-gbk" => Some(&gbk_tree),
+                "hp23-ok" => Some(&ok_tree),
+                "hp23-miss" => Some(&miss_tree),
+                _ => None,
+            };
+            replacement.map_or_else(
+                || format!("{line}\n"),
+                |id| format!("040000 tree {id}\t{name}\n"),
+            )
+        })
+        .collect::<String>();
+    let root_tree = hp23_ssh_git_input(case_dir, &["mktree"], root_input.as_bytes());
+    let parent = hp22_ssh_host_git(case_dir, &["-C", "hp23-source", "rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    let r2 = hp23_ssh_git_input(
+        case_dir,
+        &["commit-tree", &root_tree, "-p", &parent, "-m", "HP23 R2"],
+        b"",
+    );
+    hp22_ssh_host_git(
+        case_dir,
+        &["-C", "hp23-source", "update-ref", "refs/heads/main", &r2],
+    );
+    hp22_ssh_host_git(
+        case_dir,
+        &[
+            "-C",
+            "hp23-source",
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+    with_runtime(async {
+        let db = Database::connect(env.database.db_url.as_str())
+            .await
+            .unwrap();
+        for id in [&mode_tree, &gbk_tree] {
+            let row = db
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!("SELECT sub_trees FROM mega_tree WHERE tree_id = '{id}'"),
+                ))
+                .await
+                .unwrap()
+                .expect("L0 tree row");
+            let bytes: Vec<u8> = row.try_get("", "sub_trees").unwrap();
+            let actual = git_internal::hash::ObjectHash::from_type_and_data_for_kind(
+                git_internal::hash::HashKind::Sha1,
+                git_internal::internal::object::types::ObjectType::Tree,
+                &bytes,
+            )
+            .unwrap();
+            assert_ne!(actual.to_string(), *id, "L0 fixture must be noncanonical");
+        }
+    });
+    let mut views = Vec::new();
+    for (name, spec) in [
+        ("mode", ":/project/hp23-mode"),
+        ("gbk", ":/project/hp23-gbk:prefix=p"),
+        ("ok", ":/project/hp23-ok"),
+        ("miss", ":/project/hp23-miss"),
+    ] {
+        let id = hp22_ssh_register(http_port, &format!("hp23-{name}"), spec);
+        hp22_ssh_wait_lag_zero(http_port, &id);
+        views.push((name.to_owned(), id));
+    }
+    Hp23SshFixture {
+        root_tip: r2,
+        prior_root: parent,
+        views,
+        mode_tree,
+        gbk_tree,
+        missing_tree,
+    }
+}
+
+fn hp23_ssh_view<'a>(fixture: &'a Hp23SshFixture, name: &str) -> &'a str {
+    &fixture.views.iter().find(|(key, _)| key == name).unwrap().1
+}
+
+fn hp23_ssh_commits(db_url: &str, filter_id: &str) -> Vec<String> {
+    with_runtime(async {
+        let db = Database::connect(db_url).await.unwrap();
+        db.query_all_raw(Statement::from_string(DatabaseBackend::Postgres,
+            format!("SELECT m.view_commit FROM mega_view_commit_map m JOIN mega_view_filter f ON f.id = m.filter_pk WHERE f.filter_id = '{filter_id}' AND m.view_commit IS NOT NULL ORDER BY m.seq_from")))
+            .await.unwrap().into_iter().map(|row| row.try_get("", "view_commit").unwrap()).collect()
+    })
+}
+
+fn hp23_ssh_fetch_request(v2: bool, want: &str, have: Option<&str>, done: bool) -> Vec<u8> {
+    let mut body = Vec::new();
+    if v2 {
+        body.extend(layer3_pkt("command=fetch\n"));
+        body.extend(b"0001");
+        body.extend(layer3_pkt(&format!("want {want}\n")));
+    } else {
+        let capability = if have.is_some() {
+            " multi_ack_detailed"
+        } else {
+            ""
+        };
+        body.extend(layer3_pkt(&format!("want {want}{capability}\n")));
+    }
+    if let Some(have) = have {
+        body.extend(layer3_pkt(&format!("have {have}\n")));
+    }
+    if v2 && done {
+        body.extend(layer3_pkt("done\n"));
+    }
+    body.extend(b"0000");
+    body
+}
+
+fn hp23_ssh_raw(
+    case_dir: &Path,
+    port: u16,
+    id: &str,
+    v2: bool,
+    request: &[u8],
+    err: bool,
+) -> (Vec<u8>, i32) {
+    let mut child = layer3_spawn_ssh(case_dir, port, v2, &format!("/.filter/{id}.git"));
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let advertisement = layer3_read_to_flush(&mut stdout);
+    assert!(!advertisement.is_empty());
+    stdin.write_all(request).unwrap();
+    stdin.flush().unwrap();
+    drop(stdin);
+    let response = if err {
+        layer3_read_pkt(&mut stdout)
+    } else {
+        layer3_read_to_flush(&mut stdout)
+    };
+    let mut trailing = Vec::new();
+    stdout.read_to_end(&mut trailing).unwrap();
+    assert!(
+        trailing.is_empty(),
+        "unexpected SSH trailing bytes: {trailing:?}"
+    );
+    let code = child.wait().unwrap().code().unwrap();
+    (response, code)
+}
+
+#[test]
+fn integration_git_ssh_view_precheck_raw() {
+    let (env, mut service, http_port, ssh_port, err) = hp22_ssh_boot();
+    let fixture = hp23_ssh_fixture(&env, http_port);
+    let db_url = env.database.db_url.as_str();
+    let ok_id = hp23_ssh_view(&fixture, "ok");
+    let ok_tip = hp23_ssh_commits(db_url, ok_id).last().unwrap().clone();
+    let not_our_ref = format!("ERR upload-pack: not our ref {}\n", fixture.root_tip);
+    for (v2, have, done) in [
+        (false, None, false),
+        (false, Some(ok_tip.as_str()), false),
+        (true, None, true),
+        (true, Some(fixture.prior_root.as_str()), false),
+        (true, Some(ok_tip.as_str()), false),
+    ] {
+        let request = hp23_ssh_fetch_request(v2, &fixture.root_tip, have, done);
+        let (body, code) = hp23_ssh_raw(&env.case_dir, ssh_port, ok_id, v2, &request, true);
+        assert_eq!(body, layer3_pkt(&not_our_ref));
+        assert_eq!(code, 1);
+    }
+    let mut nak = layer3_pkt("acknowledgments\n");
+    nak.extend(layer3_pkt("NAK\n"));
+    nak.extend(b"0000");
+    for name in ["ok", "mode", "gbk"] {
+        let id = hp23_ssh_view(&fixture, name);
+        let commits = hp23_ssh_commits(db_url, id);
+        assert!(!commits.is_empty(), "{name}: {commits:?}");
+        let want = commits.last().unwrap();
+        if name != "ok" {
+            assert!(commits.len() >= 2, "{name}: {commits:?}");
+            let tree = if name == "mode" {
+                &fixture.mode_tree
+            } else {
+                &fixture.gbk_tree
+            };
+            let error = format!(
+                "ERR view {id} pack aborted: tree {tree} does not match its stored entries\n"
+            );
+            for (v2, have, done) in [
+                (false, None, false),
+                (false, Some(commits[commits.len() - 2].as_str()), false),
+                (true, None, true),
+                (true, Some(commits[commits.len() - 2].as_str()), false),
+            ] {
+                let request = hp23_ssh_fetch_request(v2, want, have, done);
+                let (body, code) = hp23_ssh_raw(&env.case_dir, ssh_port, id, v2, &request, true);
+                assert_eq!(body, layer3_pkt(&error));
+                assert_eq!(code, 1);
+            }
+        }
+        let request = hp23_ssh_fetch_request(true, want, Some(&fixture.prior_root), false);
+        let (body, code) = hp23_ssh_raw(&env.case_dir, ssh_port, id, true, &request, false);
+        assert_eq!(body, nak);
+        assert_eq!(code, 0);
+    }
+    for rev in ["HEAD", &fixture.prior_root] {
+        let tree_listing = hp22_ssh_host_git(
+            &env.case_dir,
+            &["-C", "hp23-source", "ls-tree", "-r", "-t", rev],
+        );
+        assert_eq!(tree_listing.matches(&fixture.missing_tree).count(), 1);
+    }
+    with_runtime(async {
+        let db = Database::connect(db_url).await.unwrap();
+        let deleted = db
+            .execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "DELETE FROM mega_tree WHERE tree_id = '{}'",
+                    fixture.missing_tree
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+    });
+    let miss_id = hp23_ssh_view(&fixture, "miss");
+    let want = hp23_ssh_commits(db_url, miss_id).last().unwrap().clone();
+    let error = format!(
+        "ERR view {miss_id} pack aborted: tree {} is missing\n",
+        fixture.missing_tree
+    );
+    for (v2, done) in [(false, false), (true, true)] {
+        let request = hp23_ssh_fetch_request(v2, &want, None, done);
+        let (body, code) = hp23_ssh_raw(&env.case_dir, ssh_port, miss_id, v2, &request, true);
+        assert_eq!(body, layer3_pkt(&error));
+        assert_eq!(code, 1);
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+#[test]
+fn integration_git_ssh_view_precheck_git_client_not_our_ref() {
+    let (env, mut service, http_port, ssh_port, err) = hp22_ssh_boot();
+    let fixture = hp23_ssh_fixture(&env, http_port);
+    let id = hp23_ssh_view(&fixture, "ok");
+    let url = format!(
+        "{}.filter/{id}.git",
+        git_cli::mega2_ssh_repo_url(ssh_port, "git")
+    );
+    let ssh_command = git_cli::git_ssh_command(&env.case_dir, ssh_port);
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &ssh_command, &["init", "hp23-fetch"]),
+        "HP-23 SSH fetch client init",
+    );
+    let output = git_cli::git_cli_ssh(
+        &env.case_dir,
+        &ssh_command,
+        &[
+            "-C",
+            "hp23-fetch",
+            "-c",
+            "protocol.version=2",
+            "fetch",
+            &url,
+            &fixture.root_tip,
+        ],
+    );
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "remote error: upload-pack: not our ref {}",
+            fixture.root_tip
+        )),
+        "{stderr}"
+    );
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+#[test]
+fn integration_git_ssh_view_precheck_git_client_l0_clone() {
+    let (env, mut service, http_port, ssh_port, err) = hp22_ssh_boot();
+    let fixture = hp23_ssh_fixture(&env, http_port);
+    let ssh_command = git_cli::git_ssh_command(&env.case_dir, ssh_port);
+    for (name, id) in &fixture.views {
+        let url = format!(
+            "{}.filter/{id}.git",
+            git_cli::mega2_ssh_repo_url(ssh_port, "git")
+        );
+        let tree_id = if name == "mode" {
+            &fixture.mode_tree
+        } else {
+            &fixture.gbk_tree
+        };
+        for version in ["0", "2"] {
+            let clone = format!("hp23-{name}-v{version}");
+            let output = git_cli::git_cli_ssh(
+                &env.case_dir,
+                &ssh_command,
+                &[
+                    "-c",
+                    &format!("protocol.version={version}"),
+                    "clone",
+                    &url,
+                    &clone,
+                ],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if name == "ok" || name == "miss" {
+                git_cli::assert_git_success(&output, "HP-23 SSH control clone");
+            } else {
+                assert!(!output.status.success(), "{output:?}");
+                assert!(
+                    stderr.contains("remote error:") && stderr.contains(tree_id),
+                    "{stderr}"
+                );
+                assert!(
+                    !stderr.contains("did not send all necessary objects"),
+                    "{stderr}"
+                );
+            }
+        }
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+fn hp22_ssh_register(port: u16, name: &str, spec: &str) -> String {
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(git_cli::mega2_host_http_url(
+            port,
+            "/api/v1/views?wait=true",
+        ))
+        .json(&serde_json::json!({"name": name, "filter_spec": spec}))
+        .send()
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().unwrap();
+    assert!(status.is_success(), "register {spec}: {status} {body}");
+    assert_eq!(body["data"]["ready"], true, "{body}");
+    body["data"]["filter_id"].as_str().unwrap().to_owned()
+}
+
+fn hp22_ssh_wait_lag_zero(port: u16, filter_id: &str) {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let path = format!("/api/v1/views/{filter_id}");
+        let response = client
+            .get(git_cli::mega2_host_http_url(port, &path))
+            .send()
+            .unwrap();
+        if response.status().is_success() {
+            let body: serde_json::Value = response.json().unwrap();
+            if body["data"]["lag_commits"] == 0 {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "view {filter_id} did not catch up"
+        );
+        sleep(Duration::from_millis(250));
+    }
+}
+
+fn hp22_ssh_host_git(case_dir: &Path, args: &[&str]) -> String {
+    let output = git_host_ssh(case_dir, "", args);
+    git_cli::assert_git_success(&output, "HP-22 host HTTP git");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn hp22_ssh_source_commit(case_dir: &Path, relative_path: &str, message: &str) {
+    let path = case_dir.join("hp22-source").join(relative_path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"contents1\n").unwrap();
+    hp22_ssh_host_git(case_dir, &["-C", "hp22-source", "add", relative_path]);
+    hp22_ssh_host_git(case_dir, &["-C", "hp22-source", "commit", "-m", message]);
+    hp22_ssh_host_git(
+        case_dir,
+        &[
+            "-C",
+            "hp22-source",
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+}
+
+#[test]
+fn integration_git_ssh_view_pack_ssh_josh_proxy() {
+    let (env, mut service, http_port, ssh_port, err) = hp22_ssh_boot();
+    let case_dir = env.case_dir.as_path();
+    let project_url = git_cli::mega2_host_http_url(http_port, "/project");
+    hp22_ssh_host_git(case_dir, &["clone", &project_url, "hp22-source"]);
+    hp22_ssh_host_git(
+        case_dir,
+        &["-C", "hp22-source", "config", "user.name", "HP22"],
+    );
+    hp22_ssh_host_git(
+        case_dir,
+        &[
+            "-C",
+            "hp22-source",
+            "config",
+            "user.email",
+            "hp22@example.invalid",
+        ],
+    );
+    let ssh_command = git_cli::git_ssh_command(case_dir, ssh_port);
+    for (case, first) in [
+        ("subtree", "sub1/file1"),
+        ("subsubtree", "sub1/subsub/file1"),
+        ("prefix", "sub1/file1"),
+    ] {
+        hp22_ssh_source_commit(case_dir, &format!("hp22-{case}/{first}"), "add file1");
+        hp22_ssh_source_commit(case_dir, &format!("hp22-{case}/sub2/file2"), "add file2");
+        let spec = match case {
+            "subtree" => ":/project/hp22-subtree/sub1",
+            "subsubtree" => ":/project/hp22-subsubtree/sub1/subsub",
+            _ => ":/project/hp22-prefix:prefix=pre",
+        };
+        let id = hp22_ssh_register(http_port, &format!("hp22-{case}"), spec);
+        hp22_ssh_wait_lag_zero(http_port, &id);
+        let path = if case == "prefix" {
+            ".view/hp22-prefix@1.git".to_owned()
+        } else {
+            format!(".filter/{id}.git")
+        };
+        let url = format!("{}{}", git_cli::mega2_ssh_repo_url(ssh_port, "git"), path);
+        let expected_log = fs::read(format!("tests/fixtures/views/josh_proxy/{case}.log")).unwrap();
+        let expected_tree =
+            fs::read(format!("tests/fixtures/views/josh_proxy/{case}.tree")).unwrap();
+        for (label, v0) in [("v0", true), ("v2", false)] {
+            let clone = format!("hp22-{case}-{label}");
+            let mut args = Vec::new();
+            if v0 {
+                args.extend(["-c", "protocol.version=0"]);
+            }
+            args.extend(["clone", &url, &clone]);
+            let output = git_cli::git_cli_ssh(case_dir, &ssh_command, &args);
+            git_cli::assert_git_success(&output, "HP-22 SSH clone");
+            let log = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "log", "--graph", "--pretty=%s"],
+            );
+            git_cli::assert_git_success(&log, "HP-22 SSH log");
+            assert_eq!(log.stdout, expected_log);
+            let tree = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "ls-tree", "-r", "--name-only", "HEAD"],
+            );
+            git_cli::assert_git_success(&tree, "HP-22 SSH tree");
+            assert_eq!(tree.stdout, expected_tree);
+            git_cli::assert_git_success(
+                &git_cli::git_cli_ssh(case_dir, &ssh_command, &["-C", &clone, "fsck", "--strict"]),
+                "HP-22 SSH fsck",
+            );
+        }
+        let third = if case == "subsubtree" {
+            "sub1/subsub/file3"
+        } else {
+            "sub1/file3"
+        };
+        hp22_ssh_source_commit(case_dir, &format!("hp22-{case}/{third}"), "add file3");
+        hp22_ssh_wait_lag_zero(http_port, &id);
+        let expected_log =
+            fs::read(format!("tests/fixtures/views/josh_proxy/{case}.fetch.log")).unwrap();
+        let expected_tree =
+            fs::read(format!("tests/fixtures/views/josh_proxy/{case}.fetch.tree")).unwrap();
+        for (label, v0) in [("v0", true), ("v2", false)] {
+            let clone = format!("hp22-{case}-{label}");
+            let mut args = vec!["-C", clone.as_str()];
+            if v0 {
+                args.extend(["-c", "protocol.version=0"]);
+            }
+            args.push("fetch");
+            let fetch = git_cli::git_cli_ssh(case_dir, &ssh_command, &args);
+            git_cli::assert_git_success(&fetch, "HP-22 SSH Josh fetch");
+            let merge = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "merge", "--ff-only", "@{upstream}"],
+            );
+            git_cli::assert_git_success(&merge, "HP-22 SSH Josh fast forward");
+            let log = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "log", "--graph", "--pretty=%s"],
+            );
+            git_cli::assert_git_success(&log, "HP-22 SSH Josh fetched log");
+            assert_eq!(log.stdout, expected_log);
+            let tree = git_cli::git_cli_ssh(
+                case_dir,
+                &ssh_command,
+                &["-C", &clone, "ls-tree", "-r", "--name-only", "HEAD"],
+            );
+            git_cli::assert_git_success(&tree, "HP-22 SSH Josh fetched tree");
+            assert_eq!(tree.stdout, expected_tree);
+            git_cli::assert_git_success(
+                &git_cli::git_cli_ssh(case_dir, &ssh_command, &["-C", &clone, "fsck", "--strict"]),
+                "HP-22 SSH Josh fetched fsck",
+            );
+        }
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+#[test]
+fn integration_git_ssh_view_pack_ssh_ready_empty() {
+    let (env, mut service, http_port, ssh_port, err) = hp22_ssh_boot();
+    let id = hp22_ssh_register(http_port, "hp22-empty", ":/project/hp22-absent");
+    hp22_ssh_wait_lag_zero(http_port, &id);
+    let url = format!(
+        "{}.filter/{id}.git",
+        git_cli::mega2_ssh_repo_url(ssh_port, "git")
+    );
+    let ssh_command = git_cli::git_ssh_command(&env.case_dir, ssh_port);
+    for (clone, v0) in [("hp22-empty-v0", true), ("hp22-empty-v2", false)] {
+        let mut args = Vec::new();
+        if v0 {
+            args.extend(["-c", "protocol.version=0"]);
+        }
+        args.extend(["clone", &url, clone]);
+        let output = git_cli::git_cli_ssh(&env.case_dir, &ssh_command, &args);
+        git_cli::assert_git_success(&output, "HP-22 SSH empty clone");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("You appear to have cloned an empty repository")
+        );
+        let refs =
+            git_cli::git_cli_ssh(&env.case_dir, &ssh_command, &["-C", clone, "for-each-ref"]);
+        git_cli::assert_git_success(&refs, "HP-22 SSH empty refs");
+        assert!(refs.stdout.is_empty());
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
 fn layer3_pkt(payload: &str) -> Vec<u8> {
     format!("{:04x}{payload}", payload.len() + 4).into_bytes()
 }

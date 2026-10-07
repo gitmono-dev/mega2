@@ -656,6 +656,12 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 **（2026-06-30）CI 自动化回归 gate 已落地；2026-07-01 扩展 CL push 与 LFS；2026-08-03 对齐 Monorepo 分支/tag 规则）**：`.github/workflows/git-protocol-smoke.yml` 在 PR 和 main push 时自动启动 PostgreSQL + Redis 测试栈、构建 release 二进制、seed mail secret、启动 `service http`，然后以 monorepo 根路径 `http://ci-smoke:<masked-token>@127.0.0.1:9000/` 为目标运行 `scripts/git_protocol_smoke.sh` 的 HTTP 矩阵（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone depth=1、blob:none partial clone、CL push（无新公开分支）、**拒绝** Git-client tag push、LFS push/clone/pull/locks-list）。workflow 直接在 smoke DB 的 `access_token` 表插入一次性 token 并 mask 日志输出，满足 push 所需认证；同时安装 `git-lfs` 并启用 `MEGA2_GIT_SMOKE_LFS=1`，让 LFS round-trip 成为默认 CI gate。该 workflow 在协议路径变更（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/server/http_server.rs`、`scripts/git_protocol_smoke.sh`、`docs/refactoring/protocol.md`）时触发，满足阶段 0 "每个后续阶段都能复用该矩阵防止回归"的验收标准。
 
+### 视图打包预检（HP-23）
+
+`prepare_pack` 以单条 SQL 对就绪状态、根链和 want 归属做单快照复查。未就绪或 want 已被回收时 reason 为 `warming up`；根链停追时为 `root chain halted`。计数阶段读取待发 tree 的存储字节，对 L0 `mega_tree` 行验证哈希，不自洽时拒绝并报告 `does not match its stored entries`；tree 缺失或无法解析时按缺对象处理，报告 `is missing`。这两种拒绝不改变视图就绪状态。
+
+每次 L0 拒绝使 `view_pack_tree_mismatch_total` 加一，并发出含 `metric`、`filter_id`、`tree_id` 的 ERROR 事件。缺对象也发出含 `filter_id`、`tree_id` 的 ERROR 事件，不带 `metric`，不增加该计数。v2 的 `NAK` 轮不做打包预检。打包方法只按计数结果编码，不再读取 `mega_view_commit_map`。四类失败的线上应答见[历史投影设计 §6.1 错误契约](history-projection.md)。
+
 ### 场景覆盖表（权威，plan-20260803 / ADR-GM-01）
 
 > **口径（强制）:** `git clone` / `git fetch` **不等于**覆盖字面 `git pull`。字面 pull 仅以下方 `cargo:…_pull_…` 格计；不得用 clone/fetch 冒充 pull 覆盖。
@@ -687,7 +693,12 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 | 视图 LFS 404 | cargo:layer2_lfs_not_found | cargo:integration_git_ssh_view_layer2_ssh_lfs_rejected | cargo:layer2_lfs_not_found | N/A+视图前缀不进入 LFS 命名空间 |
 | 未知或已禁用的视图 | cargo:layer2_disabled_not_found、cargo:integration_git_cli_view_layer3_http_unknown | cargo:integration_git_ssh_view_layer2_ssh_not_found、cargo:integration_git_ssh_view_layer3_unknown | cargo:layer2_disabled_not_found、cargo:layer3_before_resolve_auth | cargo:layer2_enabled_unregistered_not_found |
 | 视图 ls-remote | cargo:integration_git_cli_view_layer3_http_ls_remote | cargo:integration_git_ssh_view_layer3_ls_remote | cargo:layer3_before_resolve_auth | N/A+视图只有 ViewRepo 一种形态 |
+| 视图 clone | cargo:integration_git_cli_view_pack_http_josh_proxy | cargo:integration_git_ssh_view_pack_ssh_josh_proxy | N/A+读授权与路径仓库相同 | cargo:integration_git_cli_view_pack_http_clone_gitlink |
+| 视图 fetch | cargo:integration_git_cli_view_pack_http_fetch_after_trunk_push | cargo:integration_git_ssh_view_pack_ssh_josh_proxy | N/A+读授权与路径仓库相同 | N/A+视图只有 ViewRepo 一种形态 |
+| 已就绪的空视图 | cargo:integration_git_cli_view_pack_http_clone_ready_empty | cargo:integration_git_ssh_view_pack_ssh_ready_empty | N/A+读授权与路径仓库相同 | N/A+视图只有 ViewRepo 一种形态 |
 | 未就绪的视图 | cargo:integration_git_cli_view_layer3_http_unready | cargo:integration_git_ssh_view_layer3_unready | cargo:layer3_before_resolve_auth | N/A+视图只有 ViewRepo 一种形态 |
+| 视图 fetch 非本视图提交（not our ref） | cargo:integration_git_cli_view_precheck_not_our_ref | cargo:integration_git_ssh_view_precheck_git_client_not_our_ref | N/A+只读，anonymous_access 默认放行 | N/A+视图 URL（/.filter/、/.view/） |
+| 视图 clone 遇 L0 tree 不自洽 | cargo:integration_git_cli_view_precheck_l0_clone | cargo:integration_git_ssh_view_precheck_git_client_l0_clone | N/A+只读，anonymous_access 默认放行 | N/A+视图 URL（/.filter/、/.view/） |
 
 #### GAP 映射（plan-20260803）
 
@@ -818,9 +829,9 @@ LFS:
 | `ofs-delta` | ✅ both | ✅ | ✅ pack decode 委托 `git-internal`（支持 offset delta 编解码，见 `git-internal::internal::pack::decode`） | ✅ advertise/parse：`parse_capabilities_recognizes_ofs_delta` + advertise 断言（pack decode 由 `git-internal` 自测） | OFS_DELTA pack 编解码由 `git-internal` 实现并自测；mega2 侧仅覆盖 advertise/parse |
 | `multi_ack_detailed` | ✅ upload-pack | ✅ | ✅ negotiation ACK 逻辑 | ✅ `parse_capabilities` 单测 | upload-pack negotiation |
 | `no-done` | ✅ upload-pack | ✅ | ✅ 与 multi_ack_detailed 联动 | ✅ negotiation 单测 | 允许在 multi_ack_detailed 下提前发 pack |
-| `shallow` | ✅ upload-pack | ✅ | ✅ `deepen` / `deepen-relative` 生成 shallow pack 和 `shallow` response | ✅ capability parse/advertise 单测 + shallow traversal 单测 | protocol v1 shallow clone 基础语义 |
+| `shallow` | ✅ upload-pack | ✅ | ✅ `deepen` / `deepen-relative` 生成 shallow pack 和 `shallow` response；ViewRepo（P0）不覆写 `supports_shallow_fetch`，HTTP v0/v2 depth 返回 400；SSH 同样拒绝但写裸文本 `error: …`（DEFER-HP-17） | ✅ capability parse/advertise 单测 + shallow traversal 单测 | protocol v1 shallow clone 基础语义 |
 | `ls-refs` | ✅ protocol v2 | ✅ | ✅ 处理 `ref-prefix`、`symrefs`、`peel` | ✅ v2 capability / command parse 单测 | protocol v2 refs discovery |
-| `fetch=shallow filter` | ✅ protocol v2 | ✅ | ✅ v2 fetch 支持 `want`/`have`/`done`、`deepen`、`filter blob:none`；**（2026-06-30）非 Monorepo handler 现在对 shallow/filter 请求返回明确协议错误而非静默 fallback** | ✅ v2 command parse 单测 + pack generation gates + capability honesty 单测 | v2 fetch；`filter blob:none` 只发送 commit/tree objects；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控 |
+| `fetch=shallow filter` | ✅ protocol v2 | ✅ | ✅ v2 fetch 支持 `want`/`have`/`done`、`deepen`、`filter blob:none`；ViewRepo（P0）不覆写 `supports_filtered_fetch`，HTTP v2 depth/filter 返回 400，SSH 同样拒绝但写裸文本 `error: …`（DEFER-HP-17）；v0 不宣告 filter | ✅ v2 command parse 单测 + pack generation gates + capability honesty 单测 | v2 fetch；`filter blob:none` 只发送 commit/tree objects；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控 |
 | `agent=mega/0.1.0` | ✅ both | ❌ | ❌ | ❌ | 信息性，不影响协议行为 |
 | `atomic` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现原子 ref 更新，已从 advertise 移除 |
 | `report-status-v2` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现 v2 语义，已从 advertise 移除 |

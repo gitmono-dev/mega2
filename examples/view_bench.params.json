@@ -1,0 +1,1449 @@
+{
+  "data": {
+    "tag": "v0.99.5",
+    "commit": "3857284f7b892f855edffc5b9c196a0dd74b1b7d",
+    "format": "pack",
+    "path": "target/tmp/view_bench/data/git-v0.99.5.pack",
+    "sha256": "812723cd7e7c540101e3cb297a7dc4f14f18f407cd68d76452e97321e2992003",
+    "h_max": 1231,
+    "git_version": "git version 2.54.0 (Apple Git-157)"
+  },
+  "views_config": {
+    "batch_size": 1000
+  },
+  "views": [
+    ":/Documentation",
+    ":exclude[::t/]"
+  ],
+  "probes": [
+    {
+      "in_view": [
+        {
+          "path": "Documentation/view-bench-in_view-v0-00.txt",
+          "content": "view benchmark in_view view 0 sample 0\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-01.txt",
+          "content": "view benchmark in_view view 0 sample 1\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-02.txt",
+          "content": "view benchmark in_view view 0 sample 2\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-03.txt",
+          "content": "view benchmark in_view view 0 sample 3\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-04.txt",
+          "content": "view benchmark in_view view 0 sample 4\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-05.txt",
+          "content": "view benchmark in_view view 0 sample 5\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-06.txt",
+          "content": "view benchmark in_view view 0 sample 6\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-07.txt",
+          "content": "view benchmark in_view view 0 sample 7\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-08.txt",
+          "content": "view benchmark in_view view 0 sample 8\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-09.txt",
+          "content": "view benchmark in_view view 0 sample 9\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-10.txt",
+          "content": "view benchmark in_view view 0 sample 10\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-11.txt",
+          "content": "view benchmark in_view view 0 sample 11\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-12.txt",
+          "content": "view benchmark in_view view 0 sample 12\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-13.txt",
+          "content": "view benchmark in_view view 0 sample 13\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-14.txt",
+          "content": "view benchmark in_view view 0 sample 14\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-15.txt",
+          "content": "view benchmark in_view view 0 sample 15\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-16.txt",
+          "content": "view benchmark in_view view 0 sample 16\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-17.txt",
+          "content": "view benchmark in_view view 0 sample 17\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-18.txt",
+          "content": "view benchmark in_view view 0 sample 18\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-19.txt",
+          "content": "view benchmark in_view view 0 sample 19\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-20.txt",
+          "content": "view benchmark in_view view 0 sample 20\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-21.txt",
+          "content": "view benchmark in_view view 0 sample 21\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-22.txt",
+          "content": "view benchmark in_view view 0 sample 22\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-23.txt",
+          "content": "view benchmark in_view view 0 sample 23\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-24.txt",
+          "content": "view benchmark in_view view 0 sample 24\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-25.txt",
+          "content": "view benchmark in_view view 0 sample 25\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-26.txt",
+          "content": "view benchmark in_view view 0 sample 26\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-27.txt",
+          "content": "view benchmark in_view view 0 sample 27\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-28.txt",
+          "content": "view benchmark in_view view 0 sample 28\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-29.txt",
+          "content": "view benchmark in_view view 0 sample 29\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-30.txt",
+          "content": "view benchmark in_view view 0 sample 30\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-31.txt",
+          "content": "view benchmark in_view view 0 sample 31\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-32.txt",
+          "content": "view benchmark in_view view 0 sample 32\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-33.txt",
+          "content": "view benchmark in_view view 0 sample 33\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-34.txt",
+          "content": "view benchmark in_view view 0 sample 34\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-35.txt",
+          "content": "view benchmark in_view view 0 sample 35\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-36.txt",
+          "content": "view benchmark in_view view 0 sample 36\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-37.txt",
+          "content": "view benchmark in_view view 0 sample 37\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-38.txt",
+          "content": "view benchmark in_view view 0 sample 38\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-39.txt",
+          "content": "view benchmark in_view view 0 sample 39\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-40.txt",
+          "content": "view benchmark in_view view 0 sample 40\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-41.txt",
+          "content": "view benchmark in_view view 0 sample 41\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-42.txt",
+          "content": "view benchmark in_view view 0 sample 42\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-43.txt",
+          "content": "view benchmark in_view view 0 sample 43\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-44.txt",
+          "content": "view benchmark in_view view 0 sample 44\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-45.txt",
+          "content": "view benchmark in_view view 0 sample 45\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-46.txt",
+          "content": "view benchmark in_view view 0 sample 46\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-47.txt",
+          "content": "view benchmark in_view view 0 sample 47\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-48.txt",
+          "content": "view benchmark in_view view 0 sample 48\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-49.txt",
+          "content": "view benchmark in_view view 0 sample 49\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-50.txt",
+          "content": "view benchmark in_view view 0 sample 50\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-51.txt",
+          "content": "view benchmark in_view view 0 sample 51\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-52.txt",
+          "content": "view benchmark in_view view 0 sample 52\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-53.txt",
+          "content": "view benchmark in_view view 0 sample 53\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v0-54.txt",
+          "content": "view benchmark in_view view 0 sample 54\n"
+        }
+      ],
+      "outside": [
+        {
+          "path": "t/view-bench-outside-v0-00.txt",
+          "content": "view benchmark outside view 0 sample 0\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-01.txt",
+          "content": "view benchmark outside view 0 sample 1\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-02.txt",
+          "content": "view benchmark outside view 0 sample 2\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-03.txt",
+          "content": "view benchmark outside view 0 sample 3\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-04.txt",
+          "content": "view benchmark outside view 0 sample 4\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-05.txt",
+          "content": "view benchmark outside view 0 sample 5\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-06.txt",
+          "content": "view benchmark outside view 0 sample 6\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-07.txt",
+          "content": "view benchmark outside view 0 sample 7\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-08.txt",
+          "content": "view benchmark outside view 0 sample 8\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-09.txt",
+          "content": "view benchmark outside view 0 sample 9\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-10.txt",
+          "content": "view benchmark outside view 0 sample 10\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-11.txt",
+          "content": "view benchmark outside view 0 sample 11\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-12.txt",
+          "content": "view benchmark outside view 0 sample 12\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-13.txt",
+          "content": "view benchmark outside view 0 sample 13\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-14.txt",
+          "content": "view benchmark outside view 0 sample 14\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-15.txt",
+          "content": "view benchmark outside view 0 sample 15\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-16.txt",
+          "content": "view benchmark outside view 0 sample 16\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-17.txt",
+          "content": "view benchmark outside view 0 sample 17\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-18.txt",
+          "content": "view benchmark outside view 0 sample 18\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-19.txt",
+          "content": "view benchmark outside view 0 sample 19\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-20.txt",
+          "content": "view benchmark outside view 0 sample 20\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-21.txt",
+          "content": "view benchmark outside view 0 sample 21\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-22.txt",
+          "content": "view benchmark outside view 0 sample 22\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-23.txt",
+          "content": "view benchmark outside view 0 sample 23\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-24.txt",
+          "content": "view benchmark outside view 0 sample 24\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-25.txt",
+          "content": "view benchmark outside view 0 sample 25\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-26.txt",
+          "content": "view benchmark outside view 0 sample 26\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-27.txt",
+          "content": "view benchmark outside view 0 sample 27\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-28.txt",
+          "content": "view benchmark outside view 0 sample 28\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-29.txt",
+          "content": "view benchmark outside view 0 sample 29\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-30.txt",
+          "content": "view benchmark outside view 0 sample 30\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-31.txt",
+          "content": "view benchmark outside view 0 sample 31\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-32.txt",
+          "content": "view benchmark outside view 0 sample 32\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-33.txt",
+          "content": "view benchmark outside view 0 sample 33\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-34.txt",
+          "content": "view benchmark outside view 0 sample 34\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-35.txt",
+          "content": "view benchmark outside view 0 sample 35\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-36.txt",
+          "content": "view benchmark outside view 0 sample 36\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-37.txt",
+          "content": "view benchmark outside view 0 sample 37\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-38.txt",
+          "content": "view benchmark outside view 0 sample 38\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-39.txt",
+          "content": "view benchmark outside view 0 sample 39\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-40.txt",
+          "content": "view benchmark outside view 0 sample 40\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-41.txt",
+          "content": "view benchmark outside view 0 sample 41\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-42.txt",
+          "content": "view benchmark outside view 0 sample 42\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-43.txt",
+          "content": "view benchmark outside view 0 sample 43\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-44.txt",
+          "content": "view benchmark outside view 0 sample 44\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-45.txt",
+          "content": "view benchmark outside view 0 sample 45\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-46.txt",
+          "content": "view benchmark outside view 0 sample 46\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-47.txt",
+          "content": "view benchmark outside view 0 sample 47\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-48.txt",
+          "content": "view benchmark outside view 0 sample 48\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-49.txt",
+          "content": "view benchmark outside view 0 sample 49\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-50.txt",
+          "content": "view benchmark outside view 0 sample 50\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-51.txt",
+          "content": "view benchmark outside view 0 sample 51\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-52.txt",
+          "content": "view benchmark outside view 0 sample 52\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-53.txt",
+          "content": "view benchmark outside view 0 sample 53\n"
+        },
+        {
+          "path": "t/view-bench-outside-v0-54.txt",
+          "content": "view benchmark outside view 0 sample 54\n"
+        }
+      ],
+      "t_only": [
+        {
+          "path": "t/view-bench-t_only-v0-00.txt",
+          "content": "view benchmark t_only view 0 sample 0\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-01.txt",
+          "content": "view benchmark t_only view 0 sample 1\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-02.txt",
+          "content": "view benchmark t_only view 0 sample 2\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-03.txt",
+          "content": "view benchmark t_only view 0 sample 3\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-04.txt",
+          "content": "view benchmark t_only view 0 sample 4\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-05.txt",
+          "content": "view benchmark t_only view 0 sample 5\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-06.txt",
+          "content": "view benchmark t_only view 0 sample 6\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-07.txt",
+          "content": "view benchmark t_only view 0 sample 7\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-08.txt",
+          "content": "view benchmark t_only view 0 sample 8\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-09.txt",
+          "content": "view benchmark t_only view 0 sample 9\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-10.txt",
+          "content": "view benchmark t_only view 0 sample 10\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-11.txt",
+          "content": "view benchmark t_only view 0 sample 11\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-12.txt",
+          "content": "view benchmark t_only view 0 sample 12\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-13.txt",
+          "content": "view benchmark t_only view 0 sample 13\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-14.txt",
+          "content": "view benchmark t_only view 0 sample 14\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-15.txt",
+          "content": "view benchmark t_only view 0 sample 15\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-16.txt",
+          "content": "view benchmark t_only view 0 sample 16\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-17.txt",
+          "content": "view benchmark t_only view 0 sample 17\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-18.txt",
+          "content": "view benchmark t_only view 0 sample 18\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-19.txt",
+          "content": "view benchmark t_only view 0 sample 19\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-20.txt",
+          "content": "view benchmark t_only view 0 sample 20\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-21.txt",
+          "content": "view benchmark t_only view 0 sample 21\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-22.txt",
+          "content": "view benchmark t_only view 0 sample 22\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-23.txt",
+          "content": "view benchmark t_only view 0 sample 23\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-24.txt",
+          "content": "view benchmark t_only view 0 sample 24\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-25.txt",
+          "content": "view benchmark t_only view 0 sample 25\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-26.txt",
+          "content": "view benchmark t_only view 0 sample 26\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-27.txt",
+          "content": "view benchmark t_only view 0 sample 27\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-28.txt",
+          "content": "view benchmark t_only view 0 sample 28\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-29.txt",
+          "content": "view benchmark t_only view 0 sample 29\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-30.txt",
+          "content": "view benchmark t_only view 0 sample 30\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-31.txt",
+          "content": "view benchmark t_only view 0 sample 31\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-32.txt",
+          "content": "view benchmark t_only view 0 sample 32\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-33.txt",
+          "content": "view benchmark t_only view 0 sample 33\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-34.txt",
+          "content": "view benchmark t_only view 0 sample 34\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-35.txt",
+          "content": "view benchmark t_only view 0 sample 35\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-36.txt",
+          "content": "view benchmark t_only view 0 sample 36\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-37.txt",
+          "content": "view benchmark t_only view 0 sample 37\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-38.txt",
+          "content": "view benchmark t_only view 0 sample 38\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-39.txt",
+          "content": "view benchmark t_only view 0 sample 39\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-40.txt",
+          "content": "view benchmark t_only view 0 sample 40\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-41.txt",
+          "content": "view benchmark t_only view 0 sample 41\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-42.txt",
+          "content": "view benchmark t_only view 0 sample 42\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-43.txt",
+          "content": "view benchmark t_only view 0 sample 43\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-44.txt",
+          "content": "view benchmark t_only view 0 sample 44\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-45.txt",
+          "content": "view benchmark t_only view 0 sample 45\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-46.txt",
+          "content": "view benchmark t_only view 0 sample 46\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-47.txt",
+          "content": "view benchmark t_only view 0 sample 47\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-48.txt",
+          "content": "view benchmark t_only view 0 sample 48\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-49.txt",
+          "content": "view benchmark t_only view 0 sample 49\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-50.txt",
+          "content": "view benchmark t_only view 0 sample 50\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-51.txt",
+          "content": "view benchmark t_only view 0 sample 51\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-52.txt",
+          "content": "view benchmark t_only view 0 sample 52\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-53.txt",
+          "content": "view benchmark t_only view 0 sample 53\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v0-54.txt",
+          "content": "view benchmark t_only view 0 sample 54\n"
+        }
+      ]
+    },
+    {
+      "in_view": [
+        {
+          "path": "Documentation/view-bench-in_view-v1-00.txt",
+          "content": "view benchmark in_view view 1 sample 0\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-01.txt",
+          "content": "view benchmark in_view view 1 sample 1\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-02.txt",
+          "content": "view benchmark in_view view 1 sample 2\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-03.txt",
+          "content": "view benchmark in_view view 1 sample 3\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-04.txt",
+          "content": "view benchmark in_view view 1 sample 4\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-05.txt",
+          "content": "view benchmark in_view view 1 sample 5\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-06.txt",
+          "content": "view benchmark in_view view 1 sample 6\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-07.txt",
+          "content": "view benchmark in_view view 1 sample 7\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-08.txt",
+          "content": "view benchmark in_view view 1 sample 8\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-09.txt",
+          "content": "view benchmark in_view view 1 sample 9\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-10.txt",
+          "content": "view benchmark in_view view 1 sample 10\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-11.txt",
+          "content": "view benchmark in_view view 1 sample 11\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-12.txt",
+          "content": "view benchmark in_view view 1 sample 12\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-13.txt",
+          "content": "view benchmark in_view view 1 sample 13\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-14.txt",
+          "content": "view benchmark in_view view 1 sample 14\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-15.txt",
+          "content": "view benchmark in_view view 1 sample 15\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-16.txt",
+          "content": "view benchmark in_view view 1 sample 16\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-17.txt",
+          "content": "view benchmark in_view view 1 sample 17\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-18.txt",
+          "content": "view benchmark in_view view 1 sample 18\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-19.txt",
+          "content": "view benchmark in_view view 1 sample 19\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-20.txt",
+          "content": "view benchmark in_view view 1 sample 20\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-21.txt",
+          "content": "view benchmark in_view view 1 sample 21\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-22.txt",
+          "content": "view benchmark in_view view 1 sample 22\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-23.txt",
+          "content": "view benchmark in_view view 1 sample 23\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-24.txt",
+          "content": "view benchmark in_view view 1 sample 24\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-25.txt",
+          "content": "view benchmark in_view view 1 sample 25\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-26.txt",
+          "content": "view benchmark in_view view 1 sample 26\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-27.txt",
+          "content": "view benchmark in_view view 1 sample 27\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-28.txt",
+          "content": "view benchmark in_view view 1 sample 28\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-29.txt",
+          "content": "view benchmark in_view view 1 sample 29\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-30.txt",
+          "content": "view benchmark in_view view 1 sample 30\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-31.txt",
+          "content": "view benchmark in_view view 1 sample 31\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-32.txt",
+          "content": "view benchmark in_view view 1 sample 32\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-33.txt",
+          "content": "view benchmark in_view view 1 sample 33\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-34.txt",
+          "content": "view benchmark in_view view 1 sample 34\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-35.txt",
+          "content": "view benchmark in_view view 1 sample 35\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-36.txt",
+          "content": "view benchmark in_view view 1 sample 36\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-37.txt",
+          "content": "view benchmark in_view view 1 sample 37\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-38.txt",
+          "content": "view benchmark in_view view 1 sample 38\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-39.txt",
+          "content": "view benchmark in_view view 1 sample 39\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-40.txt",
+          "content": "view benchmark in_view view 1 sample 40\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-41.txt",
+          "content": "view benchmark in_view view 1 sample 41\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-42.txt",
+          "content": "view benchmark in_view view 1 sample 42\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-43.txt",
+          "content": "view benchmark in_view view 1 sample 43\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-44.txt",
+          "content": "view benchmark in_view view 1 sample 44\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-45.txt",
+          "content": "view benchmark in_view view 1 sample 45\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-46.txt",
+          "content": "view benchmark in_view view 1 sample 46\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-47.txt",
+          "content": "view benchmark in_view view 1 sample 47\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-48.txt",
+          "content": "view benchmark in_view view 1 sample 48\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-49.txt",
+          "content": "view benchmark in_view view 1 sample 49\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-50.txt",
+          "content": "view benchmark in_view view 1 sample 50\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-51.txt",
+          "content": "view benchmark in_view view 1 sample 51\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-52.txt",
+          "content": "view benchmark in_view view 1 sample 52\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-53.txt",
+          "content": "view benchmark in_view view 1 sample 53\n"
+        },
+        {
+          "path": "Documentation/view-bench-in_view-v1-54.txt",
+          "content": "view benchmark in_view view 1 sample 54\n"
+        }
+      ],
+      "outside": [
+        {
+          "path": "t/view-bench-outside-v1-00.txt",
+          "content": "view benchmark outside view 1 sample 0\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-01.txt",
+          "content": "view benchmark outside view 1 sample 1\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-02.txt",
+          "content": "view benchmark outside view 1 sample 2\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-03.txt",
+          "content": "view benchmark outside view 1 sample 3\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-04.txt",
+          "content": "view benchmark outside view 1 sample 4\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-05.txt",
+          "content": "view benchmark outside view 1 sample 5\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-06.txt",
+          "content": "view benchmark outside view 1 sample 6\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-07.txt",
+          "content": "view benchmark outside view 1 sample 7\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-08.txt",
+          "content": "view benchmark outside view 1 sample 8\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-09.txt",
+          "content": "view benchmark outside view 1 sample 9\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-10.txt",
+          "content": "view benchmark outside view 1 sample 10\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-11.txt",
+          "content": "view benchmark outside view 1 sample 11\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-12.txt",
+          "content": "view benchmark outside view 1 sample 12\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-13.txt",
+          "content": "view benchmark outside view 1 sample 13\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-14.txt",
+          "content": "view benchmark outside view 1 sample 14\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-15.txt",
+          "content": "view benchmark outside view 1 sample 15\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-16.txt",
+          "content": "view benchmark outside view 1 sample 16\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-17.txt",
+          "content": "view benchmark outside view 1 sample 17\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-18.txt",
+          "content": "view benchmark outside view 1 sample 18\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-19.txt",
+          "content": "view benchmark outside view 1 sample 19\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-20.txt",
+          "content": "view benchmark outside view 1 sample 20\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-21.txt",
+          "content": "view benchmark outside view 1 sample 21\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-22.txt",
+          "content": "view benchmark outside view 1 sample 22\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-23.txt",
+          "content": "view benchmark outside view 1 sample 23\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-24.txt",
+          "content": "view benchmark outside view 1 sample 24\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-25.txt",
+          "content": "view benchmark outside view 1 sample 25\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-26.txt",
+          "content": "view benchmark outside view 1 sample 26\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-27.txt",
+          "content": "view benchmark outside view 1 sample 27\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-28.txt",
+          "content": "view benchmark outside view 1 sample 28\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-29.txt",
+          "content": "view benchmark outside view 1 sample 29\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-30.txt",
+          "content": "view benchmark outside view 1 sample 30\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-31.txt",
+          "content": "view benchmark outside view 1 sample 31\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-32.txt",
+          "content": "view benchmark outside view 1 sample 32\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-33.txt",
+          "content": "view benchmark outside view 1 sample 33\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-34.txt",
+          "content": "view benchmark outside view 1 sample 34\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-35.txt",
+          "content": "view benchmark outside view 1 sample 35\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-36.txt",
+          "content": "view benchmark outside view 1 sample 36\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-37.txt",
+          "content": "view benchmark outside view 1 sample 37\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-38.txt",
+          "content": "view benchmark outside view 1 sample 38\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-39.txt",
+          "content": "view benchmark outside view 1 sample 39\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-40.txt",
+          "content": "view benchmark outside view 1 sample 40\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-41.txt",
+          "content": "view benchmark outside view 1 sample 41\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-42.txt",
+          "content": "view benchmark outside view 1 sample 42\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-43.txt",
+          "content": "view benchmark outside view 1 sample 43\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-44.txt",
+          "content": "view benchmark outside view 1 sample 44\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-45.txt",
+          "content": "view benchmark outside view 1 sample 45\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-46.txt",
+          "content": "view benchmark outside view 1 sample 46\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-47.txt",
+          "content": "view benchmark outside view 1 sample 47\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-48.txt",
+          "content": "view benchmark outside view 1 sample 48\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-49.txt",
+          "content": "view benchmark outside view 1 sample 49\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-50.txt",
+          "content": "view benchmark outside view 1 sample 50\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-51.txt",
+          "content": "view benchmark outside view 1 sample 51\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-52.txt",
+          "content": "view benchmark outside view 1 sample 52\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-53.txt",
+          "content": "view benchmark outside view 1 sample 53\n"
+        },
+        {
+          "path": "t/view-bench-outside-v1-54.txt",
+          "content": "view benchmark outside view 1 sample 54\n"
+        }
+      ],
+      "t_only": [
+        {
+          "path": "t/view-bench-t_only-v1-00.txt",
+          "content": "view benchmark t_only view 1 sample 0\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-01.txt",
+          "content": "view benchmark t_only view 1 sample 1\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-02.txt",
+          "content": "view benchmark t_only view 1 sample 2\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-03.txt",
+          "content": "view benchmark t_only view 1 sample 3\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-04.txt",
+          "content": "view benchmark t_only view 1 sample 4\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-05.txt",
+          "content": "view benchmark t_only view 1 sample 5\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-06.txt",
+          "content": "view benchmark t_only view 1 sample 6\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-07.txt",
+          "content": "view benchmark t_only view 1 sample 7\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-08.txt",
+          "content": "view benchmark t_only view 1 sample 8\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-09.txt",
+          "content": "view benchmark t_only view 1 sample 9\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-10.txt",
+          "content": "view benchmark t_only view 1 sample 10\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-11.txt",
+          "content": "view benchmark t_only view 1 sample 11\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-12.txt",
+          "content": "view benchmark t_only view 1 sample 12\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-13.txt",
+          "content": "view benchmark t_only view 1 sample 13\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-14.txt",
+          "content": "view benchmark t_only view 1 sample 14\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-15.txt",
+          "content": "view benchmark t_only view 1 sample 15\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-16.txt",
+          "content": "view benchmark t_only view 1 sample 16\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-17.txt",
+          "content": "view benchmark t_only view 1 sample 17\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-18.txt",
+          "content": "view benchmark t_only view 1 sample 18\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-19.txt",
+          "content": "view benchmark t_only view 1 sample 19\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-20.txt",
+          "content": "view benchmark t_only view 1 sample 20\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-21.txt",
+          "content": "view benchmark t_only view 1 sample 21\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-22.txt",
+          "content": "view benchmark t_only view 1 sample 22\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-23.txt",
+          "content": "view benchmark t_only view 1 sample 23\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-24.txt",
+          "content": "view benchmark t_only view 1 sample 24\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-25.txt",
+          "content": "view benchmark t_only view 1 sample 25\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-26.txt",
+          "content": "view benchmark t_only view 1 sample 26\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-27.txt",
+          "content": "view benchmark t_only view 1 sample 27\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-28.txt",
+          "content": "view benchmark t_only view 1 sample 28\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-29.txt",
+          "content": "view benchmark t_only view 1 sample 29\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-30.txt",
+          "content": "view benchmark t_only view 1 sample 30\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-31.txt",
+          "content": "view benchmark t_only view 1 sample 31\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-32.txt",
+          "content": "view benchmark t_only view 1 sample 32\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-33.txt",
+          "content": "view benchmark t_only view 1 sample 33\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-34.txt",
+          "content": "view benchmark t_only view 1 sample 34\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-35.txt",
+          "content": "view benchmark t_only view 1 sample 35\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-36.txt",
+          "content": "view benchmark t_only view 1 sample 36\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-37.txt",
+          "content": "view benchmark t_only view 1 sample 37\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-38.txt",
+          "content": "view benchmark t_only view 1 sample 38\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-39.txt",
+          "content": "view benchmark t_only view 1 sample 39\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-40.txt",
+          "content": "view benchmark t_only view 1 sample 40\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-41.txt",
+          "content": "view benchmark t_only view 1 sample 41\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-42.txt",
+          "content": "view benchmark t_only view 1 sample 42\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-43.txt",
+          "content": "view benchmark t_only view 1 sample 43\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-44.txt",
+          "content": "view benchmark t_only view 1 sample 44\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-45.txt",
+          "content": "view benchmark t_only view 1 sample 45\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-46.txt",
+          "content": "view benchmark t_only view 1 sample 46\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-47.txt",
+          "content": "view benchmark t_only view 1 sample 47\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-48.txt",
+          "content": "view benchmark t_only view 1 sample 48\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-49.txt",
+          "content": "view benchmark t_only view 1 sample 49\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-50.txt",
+          "content": "view benchmark t_only view 1 sample 50\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-51.txt",
+          "content": "view benchmark t_only view 1 sample 51\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-52.txt",
+          "content": "view benchmark t_only view 1 sample 52\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-53.txt",
+          "content": "view benchmark t_only view 1 sample 53\n"
+        },
+        {
+          "path": "t/view-bench-t_only-v1-54.txt",
+          "content": "view benchmark t_only view 1 sample 54\n"
+        }
+      ]
+    }
+  ],
+  "runs": {
+    "w": 5,
+    "n": 50
+  },
+  "thresholds": {
+    "k_h": 1.5,
+    "k_b": 1.0,
+    "c_cold": 50
+  },
+  "scale_limits": {
+    "caps": {
+      "compose_members": 64,
+      "exclude_selectors": 256,
+      "k": 64
+    },
+    "filter": ":[:/benchsrc00:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout00,:/benchsrc01:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout01,:/benchsrc02:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout02,:/benchsrc03:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout03,:/benchsrc04:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout04,:/benchsrc05:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout05,:/benchsrc06:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout06,:/benchsrc07:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout07,:/benchsrc08:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout08,:/benchsrc09:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout09,:/benchsrc10:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout10,:/benchsrc11:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout11,:/benchsrc12:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout12,:/benchsrc13:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout13,:/benchsrc14:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout14,:/benchsrc15:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout15,:/benchsrc16:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout16,:/benchsrc17:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout17,:/benchsrc18:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout18,:/benchsrc19:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout19,:/benchsrc20:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout20,:/benchsrc21:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout21,:/benchsrc22:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout22,:/benchsrc23:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout23,:/benchsrc24:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout24,:/benchsrc25:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout25,:/benchsrc26:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout26,:/benchsrc27:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout27,:/benchsrc28:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout28,:/benchsrc29:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout29,:/benchsrc30:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout30,:/benchsrc31:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout31,:/benchsrc32:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout32,:/benchsrc33:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout33,:/benchsrc34:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout34,:/benchsrc35:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout35,:/benchsrc36:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout36,:/benchsrc37:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout37,:/benchsrc38:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout38,:/benchsrc39:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout39,:/benchsrc40:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout40,:/benchsrc41:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout41,:/benchsrc42:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout42,:/benchsrc43:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout43,:/benchsrc44:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout44,:/benchsrc45:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout45,:/benchsrc46:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout46,:/benchsrc47:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout47,:/benchsrc48:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout48,:/benchsrc49:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout49,:/benchsrc50:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout50,:/benchsrc51:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout51,:/benchsrc52:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout52,:/benchsrc53:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout53,:/benchsrc54:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout54,:/benchsrc55:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout55,:/benchsrc56:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout56,:/benchsrc57:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout57,:/benchsrc58:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout58,:/benchsrc59:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout59,:/benchsrc60:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout60,:/benchsrc61:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout61,:/benchsrc62:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout62,:/benchsrc63:exclude[::hide00/,::hide01/,::hide02/,::hide03/]:prefix=benchout63]",
+    "probe_paths": [
+      "benchsrc00/benchmark.txt",
+      "benchsrc01/benchmark.txt",
+      "benchsrc02/benchmark.txt",
+      "benchsrc03/benchmark.txt",
+      "benchsrc04/benchmark.txt",
+      "benchsrc05/benchmark.txt",
+      "benchsrc06/benchmark.txt",
+      "benchsrc07/benchmark.txt",
+      "benchsrc08/benchmark.txt",
+      "benchsrc09/benchmark.txt",
+      "benchsrc10/benchmark.txt",
+      "benchsrc11/benchmark.txt",
+      "benchsrc12/benchmark.txt",
+      "benchsrc13/benchmark.txt",
+      "benchsrc14/benchmark.txt",
+      "benchsrc15/benchmark.txt",
+      "benchsrc16/benchmark.txt",
+      "benchsrc17/benchmark.txt",
+      "benchsrc18/benchmark.txt",
+      "benchsrc19/benchmark.txt",
+      "benchsrc20/benchmark.txt",
+      "benchsrc21/benchmark.txt",
+      "benchsrc22/benchmark.txt",
+      "benchsrc23/benchmark.txt",
+      "benchsrc24/benchmark.txt",
+      "benchsrc25/benchmark.txt",
+      "benchsrc26/benchmark.txt",
+      "benchsrc27/benchmark.txt",
+      "benchsrc28/benchmark.txt",
+      "benchsrc29/benchmark.txt",
+      "benchsrc30/benchmark.txt",
+      "benchsrc31/benchmark.txt",
+      "benchsrc32/benchmark.txt",
+      "benchsrc33/benchmark.txt",
+      "benchsrc34/benchmark.txt",
+      "benchsrc35/benchmark.txt",
+      "benchsrc36/benchmark.txt",
+      "benchsrc37/benchmark.txt",
+      "benchsrc38/benchmark.txt",
+      "benchsrc39/benchmark.txt",
+      "benchsrc40/benchmark.txt",
+      "benchsrc41/benchmark.txt",
+      "benchsrc42/benchmark.txt",
+      "benchsrc43/benchmark.txt",
+      "benchsrc44/benchmark.txt",
+      "benchsrc45/benchmark.txt",
+      "benchsrc46/benchmark.txt",
+      "benchsrc47/benchmark.txt",
+      "benchsrc48/benchmark.txt",
+      "benchsrc49/benchmark.txt",
+      "benchsrc50/benchmark.txt",
+      "benchsrc51/benchmark.txt",
+      "benchsrc52/benchmark.txt",
+      "benchsrc53/benchmark.txt",
+      "benchsrc54/benchmark.txt",
+      "benchsrc55/benchmark.txt",
+      "benchsrc56/benchmark.txt",
+      "benchsrc57/benchmark.txt",
+      "benchsrc58/benchmark.txt",
+      "benchsrc59/benchmark.txt",
+      "benchsrc60/benchmark.txt",
+      "benchsrc61/benchmark.txt",
+      "benchsrc62/benchmark.txt",
+      "benchsrc63/benchmark.txt"
+    ],
+    "content": "view benchmark scale sample {i}\n",
+    "p95_budget_us": 1000000
+  },
+  "env": {
+    "cpu": "Apple M4 Max",
+    "cores": 16,
+    "memory": "128 GiB",
+    "storage": "USB SSD",
+    "os": "macOS 27.0.1",
+    "postgres_image": "postgres:18.6-alpine3.24"
+  }
+}
