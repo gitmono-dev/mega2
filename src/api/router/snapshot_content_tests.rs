@@ -1094,7 +1094,7 @@ async fn mst2_publication_disabled_resolve_preserves_head_body_object_map_page_a
     assert_eq!(chunk.file_content_id, fixture.digest);
     assert_eq!(chunk.chunk_index, 0);
     assert_eq!(end.request_item_count, 1);
-    assert_eq!(end.logical_bytes, CHUNK_SIZE);
+    assert_eq!(end.logical_bytes, u64::from(CHUNK_SIZE));
 }
 
 #[tokio::test]
