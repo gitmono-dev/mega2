@@ -536,12 +536,33 @@ impl Fixture {
     }
 
     async fn write_raw(&self, bytes: Vec<u8>) {
+        // Git SinglePut is create-if-absent. Remove only this isolated
+        // fixture's object so corruption and repair actually change its bytes.
+        let objects = &self.state.storage.git_service.obj_storage.inner;
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: self.oid.clone(),
+        };
+        if objects.exists(&key).await.unwrap() {
+            objects.delete(&key).await.unwrap();
+        }
         self.state
             .storage
             .git_service
-            .save_object_from_model(bytes, &self.oid)
+            .save_object_from_model(bytes.clone(), &self.oid)
             .await
             .unwrap();
+        assert_eq!(
+            self.state
+                .storage
+                .git_service
+                .get_object_as_bytes(&self.oid)
+                .await
+                .unwrap(),
+            bytes
+        );
+        // Fault setup is outside the HTTP read measurement window.
+        self.counts.reset();
     }
 
     fn chunk_body(&self, path: &str, map_id: &str, index: &str) -> Value {
