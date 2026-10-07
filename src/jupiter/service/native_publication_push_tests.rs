@@ -314,13 +314,22 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
     assert!(matches!(wh03_exec(&storage,id).await,ExecuteOutcome::Done{..}));
     tokio::time::timeout(Duration::from_secs(5),release.wait()).await.unwrap();
     let ((status,delayed),delayed_observations)=tokio::time::timeout(Duration::from_secs(10),&mut reader).await.unwrap().unwrap();
-    assert_eq!(status,200,"{delayed}");assert_eq!(delayed["descriptor"],v1["descriptor"]);
-    assert_eq!(delayed["publication_sequence"],v1["publication_sequence"]);
-    assert_eq!(delayed_observations.len(),1);
-    let delayed_identity=delayed_observations[0].test_identity();
-    for field in ["root_commit_oid","root_tree_oid","native_certificate_receipt_id","native_writer_epoch","native_publication_sequence","snapshot_id","metadata_root"] {
-        assert_eq!(delayed_identity[field],first_identity[field],"{field} mixed with a later publication");
-    }
+    assert_eq!(status,503,"{delayed}");
+    assert_eq!(delayed["error"]["code"],"SNAPSHOT_NOT_READY");
+    assert_eq!(delayed["error"]["retryable"],true);
+    assert!(delayed.get("descriptor").is_none());
+    assert!(delayed.get("publication_sequence").is_none());
+    assert!(delayed_observations.is_empty(),"rejected stale handoff emitted a success observation");
+    use tower::ServiceExt;
+    let old_app=crate::api::router::snapshot_router::routers(state.clone()).with_state(state.clone());
+    let old=old_app.oneshot(axum::http::Request::builder().method("GET")
+        .uri(format!("/snapshots/{}/descriptor",v1["descriptor"]["snapshot_id"].as_str().unwrap()))
+        .header("x-mega-snapshot-lease",v1["lease_id"].as_str().unwrap())
+        .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(old.status(),200);
+    let old=axum::body::to_bytes(old.into_body(),1_048_576).await.unwrap();
+    let old:serde_json::Value=serde_json::from_slice(&old).unwrap();
+    assert_eq!(old["descriptor"],v1["descriptor"],"already protected old SID changed with the writer");
     let ((status,v2),next_observations)=crate::ceres::snapshot::projection_observation::with_observations(http_resolve(state.clone(),"/")).await;
     assert_eq!(status,200,"{v2}");assert_eq!(v2["publication_sequence"],"2");
     assert_ne!(v2["descriptor"]["snapshot_id"],v1["descriptor"]["snapshot_id"]);
@@ -328,6 +337,14 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
     let next_identity=next_observations[0].test_identity();
     assert_eq!(next_identity["native_publication_sequence"],v2["publication_sequence"]);
     assert_eq!(next_identity["snapshot_id"],v2["descriptor"]["snapshot_id"]);
+    assert_eq!(next_identity["metadata_root"],v2["descriptor"]["metadata_root"]);
+    assert_eq!(next_identity["namespace_view_id"],v2["descriptor"]["namespace_view_id"]);
+    assert_eq!(next_identity["instance_id"],v2["descriptor"]["instance_id"]);
+    assert_eq!(next_identity["native_writer_epoch"],v2["writer_epoch"]);
+    let native_v2=storage.mono_storage().read_native_publication_head(storage.config().mst2.instance_uuid.as_deref().unwrap()).await.unwrap();
+    assert_eq!(next_identity["root_commit_oid"],git_internal::hash::ObjectHash::from_hex_for_kind(git_internal::hash::get_hash_kind(),&native_v2.root.commit).unwrap().to_tagged_string());
+    assert_eq!(next_identity["root_tree_oid"],git_internal::hash::ObjectHash::from_hex_for_kind(git_internal::hash::get_hash_kind(),&native_v2.root.tree).unwrap().to_tagged_string());
+    assert_eq!(next_identity["native_certificate_receipt_id"].as_u64(),Some(native_v2.token.certificate.unwrap() as u64));
     assert_ne!(next_identity["native_certificate_receipt_id"],first_identity["native_certificate_receipt_id"]);
     let ((status,_),failed_observations)=crate::ceres::snapshot::projection_observation::with_observations(http_resolve(state,"/absent-observation-scope")).await;
     assert_eq!(status,404);
@@ -338,8 +355,8 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
         let directory=writer.test_directory(_temp.path());
         let records=std::fs::read_to_string(directory.join("records.jsonl")).unwrap();
         let records:Vec<serde_json::Value>=records.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
-        assert_eq!(records.len(),4,"failed resolve must not be a successful observation");
-        for (record,observation) in [(&records[0],&first_observations[0]),(&records[2],&delayed_observations[0]),(&records[3],&next_observations[0])] {
+        assert_eq!(records.len(),3,"failed resolve must not be a successful observation");
+        for (record,observation) in [(&records[0],&first_observations[0]),(&records[2],&next_observations[0])] {
             let typed=serde_json::to_value(observation.wire_record()).unwrap();
             assert_eq!(record["payload"],typed,"writer must preserve the full validated operation tuple");
             assert_eq!(record["payload"].as_object().unwrap().len(),38);
@@ -347,8 +364,8 @@ async fn http_resolve_captured_before_commit_never_mixes_new_sequence_with_old_d
         assert_ne!(records[0]["payload"]["request_id"],records[2]["payload"]["request_id"]);
         let status:serde_json::Value=serde_json::from_slice(&std::fs::read(directory.join("status.json")).unwrap()).unwrap();
         assert_eq!(status["closed"],true);
-        assert_eq!(status["accepted_records"],4);
-        assert_eq!(status["written_records"],4);
+        assert_eq!(status["accepted_records"],3);
+        assert_eq!(status["written_records"],3);
         assert_eq!(status["first_error_code"],0);
     }
 }

@@ -458,24 +458,79 @@ async fn overwrite_installed_payload_for_test(
     bytes: Vec<u8>,
 ) {
     assert_eq!(bytes.len(), page.bytes.len());
+    let guard_modes = payload_trigger_modes_for_test(connection).await;
+    assert!(
+        guard_modes
+            .iter()
+            .any(|(name, _)| name == "mst2_metadata_payload_fenced")
+    );
+    assert!(guard_modes.iter().all(|(_, mode)| mode == "O"));
+    assert!(
+        connection
+            .execute_raw(statement(
+                "UPDATE mst2_metadata_payload SET payload=payload WHERE page_id=$1",
+                [page.id.to_vec().into()],
+            ))
+            .await
+            .is_err(),
+        "production payload UPDATE fence must still reject writes"
+    );
     let txn = connection.begin().await.unwrap();
+    txn.execute_unprepared("SELECT pg_advisory_xact_lock(1296717362,hashtext(current_schema()))")
+        .await
+        .unwrap();
     txn.execute_unprepared(
-        "ALTER TABLE mst2_metadata_payload DISABLE TRIGGER mst2_metadata_payload_immutable",
+        "ALTER TABLE mst2_metadata_payload DISABLE TRIGGER mst2_metadata_payload_fenced",
     )
     .await
     .unwrap();
-    txn.execute_raw(statement(
-        "UPDATE mst2_metadata_payload SET payload=$2 WHERE page_id=$1",
-        [page.id.to_vec().into(), bytes.into()],
-    ))
-    .await
-    .unwrap();
+    let result = txn
+        .execute_raw(statement(
+            "UPDATE mst2_metadata_payload SET payload=$2 WHERE page_id=$1",
+            [page.id.to_vec().into(), bytes.into()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result.rows_affected(), 1);
     txn.execute_unprepared(
-        "ALTER TABLE mst2_metadata_payload ENABLE TRIGGER mst2_metadata_payload_immutable",
+        "ALTER TABLE mst2_metadata_payload ENABLE TRIGGER mst2_metadata_payload_fenced",
     )
     .await
     .unwrap();
     txn.commit().await.unwrap();
+    assert_eq!(
+        payload_trigger_modes_for_test(connection).await,
+        guard_modes
+    );
+    assert!(
+        connection
+            .execute_raw(statement(
+                "UPDATE mst2_metadata_payload SET payload=payload WHERE page_id=$1",
+                [page.id.to_vec().into()],
+            ))
+            .await
+            .is_err(),
+        "corruption injection must restore the production UPDATE fence"
+    );
+}
+
+async fn payload_trigger_modes_for_test(connection: &DatabaseConnection) -> Vec<(String, String)> {
+    connection
+        .query_all_raw(statement(
+            "SELECT tgname,tgenabled::text AS mode FROM pg_trigger \
+         WHERE tgrelid='mst2_metadata_payload'::regclass AND NOT tgisinternal ORDER BY tgname",
+            [],
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get("", "tgname").unwrap(),
+                row.try_get("", "mode").unwrap(),
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]

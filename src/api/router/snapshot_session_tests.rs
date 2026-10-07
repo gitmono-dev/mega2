@@ -1125,3 +1125,6 @@ async fn mst2_durable_http_warm_reads_renew_and_frame_delivery_reject_primary_sc
     success_json(fixture.send("GET", "descriptor", Body::empty()).await).await;
     fixture.counts.assert(0, 0);
 }
+
+#[path = "snapshot_lookup_metadata_tests.rs"]
+mod metadata_lookup;
