@@ -16,13 +16,14 @@ use crate::{
         api_service::state::ProtocolApiState,
         pack::{
             RepoHandler, import_repo::ImportRepo, monorepo::Monorepo,
-            path_policy::check_import_repo_leaf, push_chain,
+            path_policy::check_import_repo_leaf, push_chain, view_repo::ViewRepo,
         },
     },
     common::{
         errors::{MegaError, ProtocolError},
         utils::{canonicalize_mono_ref_path, is_full_hex_object_id, is_protocol_zero_id},
     },
+    contract::git_protocol::ResolvedView,
 };
 
 pub mod import_refs;
@@ -52,6 +53,7 @@ pub struct SmartSession {
     pub capabilities: HashSet<Capability>,
     /// Authoritative repository object hash kind (`MonoConfig.object_hash_kind()`).
     pub hash_kind: HashKind,
+    pub(crate) view: Option<ResolvedView>,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy, Default)]
@@ -173,6 +175,7 @@ impl SmartSession {
             },
             capabilities: HashSet::new(),
             hash_kind: HashKind::Sha1,
+            view: None,
         }
     }
 
@@ -236,6 +239,15 @@ impl SmartSession {
         state: &ProtocolApiState,
         commands: Vec<RefCommand>,
     ) -> Result<Arc<dyn RepoHandler>, ProtocolError> {
+        if let Some(view) = &self.view {
+            return Ok(Arc::new(ViewRepo::new(
+                state.storage.clone(),
+                view.config.clone(),
+                state.storage.view_projection_service(),
+                view.filter_pk,
+                view.filter_id.clone(),
+            )) as Arc<dyn RepoHandler>);
+        }
         let config = state.storage.config();
         let import_dir = config.monorepo.import_dir.clone();
 

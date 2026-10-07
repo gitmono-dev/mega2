@@ -1033,18 +1033,32 @@ async fn handle_smart_protocol(
                 views_enabled,
                 params.service.as_deref() == Some("git-receive-pack"),
             )?;
+            let view = match parsed.locator {
+                RepoLocator::View(locator) => Some(locator),
+                RepoLocator::Path(_) => None,
+            };
             crate::contract::git_protocol::http::git_info_refs(
                 &state,
                 params,
                 parsed.repo_path,
+                view,
                 req.headers(),
             )
             .await
         }
         crate::contract::git_protocol::path::GitProtocolEndpoint::UploadPack => {
             reject_view_route(&parsed.locator, views_enabled, false)?;
-            crate::contract::git_protocol::http::git_upload_pack(&state, req, parsed.repo_path)
-                .await
+            let view = match parsed.locator {
+                RepoLocator::View(locator) => Some(locator),
+                RepoLocator::Path(_) => None,
+            };
+            crate::contract::git_protocol::http::git_upload_pack(
+                &state,
+                req,
+                parsed.repo_path,
+                view,
+            )
+            .await
         }
         crate::contract::git_protocol::path::GitProtocolEndpoint::ReceivePack => {
             reject_view_route(&parsed.locator, views_enabled, true)?;
@@ -1061,12 +1075,14 @@ fn reject_view_route(
 ) -> Result<(), ProtocolError> {
     if matches!(locator, RepoLocator::Path(_)) {
         Ok(())
-    } else if !enabled || !receive_pack {
+    } else if !enabled {
         Err(ProtocolError::NotFound("view not found".to_owned()))
-    } else {
+    } else if receive_pack {
         Err(ProtocolError::Forbidden(
             "view URLs are read-only".to_owned(),
         ))
+    } else {
+        Ok(())
     }
 }
 

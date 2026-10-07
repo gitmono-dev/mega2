@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement, Value};
 use tempfile::TempDir;
 
 const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
@@ -3187,6 +3187,8 @@ fn boot_view_multi(
     let extra = [
         ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
         ("MEGA_VIEWS__ENABLED", enabled),
+        ("MEGA_VIEWS__WORKER_INTERVAL_SECS", "3600"),
+        ("MEGA_VIEWS__MAX_CONCURRENT_COLD_STARTS", "1"),
     ];
     let mut init = env.full_config_command();
     for (key, value) in extra {
@@ -3203,6 +3205,566 @@ fn boot_view_multi(
         boot_service_multi_with_extra(env, "off", None, &extra);
     write_known_hosts_via_host_keyscan(&env.ssh_dir.join("known_hosts"), ssh_port);
     (service, http_port, ssh_port, stdout, stderr)
+}
+
+fn view_ssh_execute(env: &GitSshEnv, statement: Statement) {
+    with_runtime(async {
+        let db = Database::connect(&env.database.db_url).await.unwrap();
+        db.execute_raw(statement).await.unwrap();
+    });
+}
+
+fn layer3_ssh_env() -> GitSshEnv {
+    let env = GitSshEnv::with_config_append(
+        "\n[git]\nanonymous_access = true\npush_auth = \"token\"\nssh_receive_pack = false\n[[git.push_tokens]]\nname = \"hp20\"\ntoken = \"hp20-local-token\"\npaths = [\"/\"]\n",
+    );
+    git_cli::generate_client_ed25519(&env.ssh_dir.join("client_ed25519"));
+    env
+}
+
+fn layer3_ssh_seed_project(env: &GitSshEnv, port: u16) {
+    let remote = git_cli::mega2_http_url(port, "/project");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(&env.case_dir, &["clone", &remote, "hp20-project"]),
+        "HP-20 clone project",
+    );
+    fs::write(env.case_dir.join("hp20-project/hp20.txt"), b"hp20\n").unwrap();
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(&env.case_dir, &["-C", "hp20-project", "add", "hp20.txt"]),
+        "HP-20 add file",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(
+            &env.case_dir,
+            &[
+                "-c",
+                "user.name=HP20",
+                "-c",
+                "user.email=hp20@example.invalid",
+                "-C",
+                "hp20-project",
+                "commit",
+                "-m",
+                "HP-20 source commit",
+            ],
+        ),
+        "HP-20 commit",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            "hp20-local-token",
+            &[
+                "-C",
+                "hp20-project",
+                "push",
+                "--no-thin",
+                "origin",
+                "HEAD:refs/heads/main",
+            ],
+        ),
+        "HP-20 trunk push",
+    );
+}
+
+fn layer3_ssh_register(env: &GitSshEnv, port: u16, name: &str, spec: &str) -> (i64, String) {
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://127.0.0.1:{port}/api/v1/views?wait=true"))
+        .bearer_auth("hp20-local-token")
+        .json(&serde_json::json!({"name": name, "filter_spec": spec}))
+        .send()
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().unwrap();
+    assert!(status.is_success(), "register {spec}: {status} {body}");
+    assert_eq!(body["data"]["ready"], true, "{body}");
+    let filter_id = body["data"]["filter_id"].as_str().unwrap().to_owned();
+    let pk = with_runtime(async {
+        let db = Database::connect(&env.database.db_url).await.unwrap();
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM mega_view_filter WHERE filter_id = $1",
+                [Value::from(filter_id.clone())],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        row.try_get("", "id").unwrap()
+    });
+    (pk, filter_id)
+}
+
+fn layer3_ssh_tip(env: &GitSshEnv, pk: i64) -> String {
+    with_runtime(async {
+        let db = Database::connect(&env.database.db_url).await.unwrap();
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT m.view_commit FROM mega_view_commit_map m JOIN mega_view_filter f ON f.id = m.filter_pk \
+             WHERE m.filter_pk = $1 AND m.seq_from <= f.projected_seq \
+             ORDER BY m.seq_from DESC LIMIT 1",
+                [Value::from(pk)],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        row.try_get("", "view_commit").unwrap()
+    })
+}
+
+fn layer3_ssh_state(env: &GitSshEnv, pk: i64) -> (Option<i64>, i64, bool) {
+    with_runtime(async {
+        let db = Database::connect(&env.database.db_url).await.unwrap();
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT ready_seq, projected_seq, warming_since IS NOT NULL AS warming \
+             FROM mega_view_filter WHERE id = $1",
+                [Value::from(pk)],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            row.try_get("", "ready_seq").unwrap(),
+            row.try_get("", "projected_seq").unwrap(),
+            row.try_get("", "warming").unwrap(),
+        )
+    })
+}
+
+fn layer3_ssh_wait_idle(env: &GitSshEnv, pks: &[i64]) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut previous = None;
+    loop {
+        let current: Vec<_> = pks.iter().map(|pk| layer3_ssh_state(env, *pk)).collect();
+        if current.iter().all(|state| state.0.is_some()) && previous.as_ref() == Some(&current) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "view worker did not settle: {current:?}"
+        );
+        previous = Some(current);
+        sleep(Duration::from_millis(500));
+    }
+}
+
+fn layer3_ssh_recycle(env: &GitSshEnv, pk: i64) {
+    for table in ["mega_view_commit_map", "mega_view_object_ref"] {
+        view_ssh_execute(
+            env,
+            Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!("DELETE FROM {table} WHERE filter_pk = $1"),
+                [Value::from(pk)],
+            ),
+        );
+    }
+    view_ssh_execute(
+        env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE mega_view_filter SET ready_seq = NULL, warming_since = NULL, projected_seq = 0 WHERE id = $1",
+            [Value::from(pk)],
+        ),
+    );
+}
+
+fn layer3_ssh_clear_halt(env: &GitSshEnv) {
+    view_ssh_execute(
+        env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM mega_view_root_chain_scan WHERE commit_id = $1",
+            [Value::from("e".repeat(40))],
+        ),
+    );
+}
+
+fn view_ssh_set_ready(env: &GitSshEnv, pk: i64, warming: bool) {
+    view_ssh_execute(
+        env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE mega_view_filter SET ready_seq = NULL, warming_since = \
+             CASE WHEN $1 THEN now() ELSE NULL END WHERE id = $2",
+            [Value::from(warming), Value::from(pk)],
+        ),
+    );
+}
+
+fn view_ssh_halt_root_chain(env: &GitSshEnv) {
+    view_ssh_execute(
+        env,
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO mega_view_root_chain_scan \
+             (pos, commit_id, tree_id, parent_count, first_parent) \
+             SELECT COALESCE(MAX(pos), 0) + 1, $1, \
+             (SELECT ref_tree_hash FROM mega_refs WHERE path = '/' AND ref_name = 'refs/heads/main'), \
+             2, NULL FROM mega_view_root_chain_scan",
+            [Value::from("e".repeat(40))],
+        ),
+    );
+}
+
+fn view_ssh_container_id() -> String {
+    let output = Command::new("docker")
+        .args([
+            "ps",
+            "-q",
+            "--filter",
+            "label=com.docker.compose.project=mega2-it",
+            "--filter",
+            "label=com.docker.compose.service=git-cli",
+            "--filter",
+            "status=running",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .expect("git-cli container")
+        .to_owned()
+}
+
+fn raw_view_ssh_container(
+    case_dir: &Path,
+    port: u16,
+    v2: bool,
+    path: &str,
+) -> std::process::Output {
+    let mut ssh = git_cli::git_ssh_command(case_dir, port);
+    if v2 {
+        ssh.push_str(" -o SetEnv=GIT_PROTOCOL=version=2");
+    }
+    let shell = format!(
+        "{ssh} git@{} \"git-upload-pack '{path}'\"",
+        git_cli::mega2_reachable_host()
+    );
+    Command::new("docker")
+        .args(["exec", "-i", &view_ssh_container_id(), "sh", "-c", &shell])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn integration_git_ssh_view_layer3_unknown() {
+    git_cli::require_git_cli_runner();
+    let env = layer3_ssh_env();
+    let (mut service, http_port, port, _, err) = boot_view_multi(&env, "true");
+    git_cli::write_known_hosts_via_keyscan(&env.ssh_dir.join("known_hosts"), port);
+    layer3_ssh_seed_project(&env, http_port);
+    layer3_ssh_register(&env, http_port, "known", ":/project");
+    let paths = [
+        "/.view/missing.git".to_owned(),
+        "/.view/known@9.git".to_owned(),
+        format!("/.filter/{}.git", "a".repeat(64)),
+    ];
+    for path in paths {
+        for v2 in [false, true] {
+            let output = raw_view_ssh_container(&env.case_dir, port, v2, &path);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert_eq!(output.stdout, b"0017ERR view not found\n", "{output:?}");
+        }
+        let remote = format!("ssh://git@{}:{port}{path}", git_cli::mega2_reachable_host());
+        let command = git_cli::git_ssh_command(&env.case_dir, port);
+        let output = git_cli::git_cli_ssh(&env.case_dir, &command, &["ls-remote", &remote]);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("remote error: view not found"),
+            "{output:?}"
+        );
+    }
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+#[test]
+fn integration_git_ssh_view_layer3_unready() {
+    git_cli::require_git_cli_runner();
+    let env = layer3_ssh_env();
+    let (mut service, http_port, port, _, err) = boot_view_multi(&env, "true");
+    git_cli::write_known_hosts_via_keyscan(&env.ssh_dir.join("known_hosts"), port);
+    layer3_ssh_seed_project(&env, http_port);
+    let (cold_pk, cold) = layer3_ssh_register(&env, http_port, "cold", ":/project");
+    let (recycled_pk, recycled) =
+        layer3_ssh_register(&env, http_port, "recycled", ":/project:prefix=recycled");
+    let (ready_pk, ready) = layer3_ssh_register(&env, http_port, "ready", ":/project:prefix=ready");
+    layer3_ssh_wait_idle(&env, &[cold_pk, recycled_pk, ready_pk]);
+    view_ssh_set_ready(&env, cold_pk, true);
+    layer3_ssh_recycle(&env, recycled_pk);
+    for (name, filter_id, reason) in [
+        ("cold", &cold, "warming up"),
+        ("recycled", &recycled, "warming up"),
+    ] {
+        for v2 in [false, true] {
+            let output =
+                raw_view_ssh_container(&env.case_dir, port, v2, &format!("/.view/{name}.git"));
+            assert_eq!(output.status.code(), Some(75), "{output:?}");
+            assert_eq!(
+                &output.stdout[4..],
+                format!("ERR view {filter_id} unavailable: {reason}\n").as_bytes(),
+                "{output:?}"
+            );
+        }
+        let remote = format!(
+            "ssh://git@{}:{port}/.view/{name}.git",
+            git_cli::mega2_reachable_host()
+        );
+        let output = git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_cli::git_ssh_command(&env.case_dir, port),
+            &["ls-remote", &remote],
+        );
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("remote error: view {filter_id} unavailable")),
+            "{output:?}"
+        );
+    }
+    view_ssh_halt_root_chain(&env);
+    for v2 in [false, true] {
+        let output = raw_view_ssh_container(&env.case_dir, port, v2, "/.view/ready.git");
+        assert_eq!(output.status.code(), Some(75), "{output:?}");
+        assert_eq!(
+            &output.stdout[4..],
+            format!("ERR view {ready} unavailable: root chain halted\n").as_bytes(),
+            "{output:?}"
+        );
+    }
+    let remote = format!(
+        "ssh://git@{}:{port}/.view/ready.git",
+        git_cli::mega2_reachable_host()
+    );
+    let output = git_cli::git_cli_ssh(
+        &env.case_dir,
+        &git_cli::git_ssh_command(&env.case_dir, port),
+        &["ls-remote", &remote],
+    );
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("remote error: view {ready} unavailable")),
+        "{output:?}"
+    );
+    assert_eq!(layer3_ssh_state(&env, cold_pk).0, None);
+    assert!(!layer3_ssh_state(&env, recycled_pk).2);
+    layer3_ssh_clear_halt(&env);
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+#[test]
+fn integration_git_ssh_view_layer3_ls_remote() {
+    git_cli::require_git_cli_runner();
+    let env = layer3_ssh_env();
+    let (mut service, http_port, port, _, err) = boot_view_multi(&env, "true");
+    git_cli::write_known_hosts_via_keyscan(&env.ssh_dir.join("known_hosts"), port);
+    layer3_ssh_seed_project(&env, http_port);
+    let (ready_pk, _) = layer3_ssh_register(&env, http_port, "ready", ":/project");
+    let tip = layer3_ssh_tip(&env, ready_pk);
+    let remote = format!(
+        "ssh://git@{}:{port}/.view/ready.git",
+        git_cli::mega2_reachable_host()
+    );
+    let ssh = git_cli::git_ssh_command(&env.case_dir, port);
+    for v0 in [true, false] {
+        let args = if v0 {
+            vec!["-c", "protocol.version=0", "ls-remote", &remote]
+        } else {
+            vec!["ls-remote", &remote]
+        };
+        let output = git_cli::git_cli_ssh(&env.case_dir, &ssh, &args);
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(&format!("{tip}\tHEAD\n")), "{stdout}");
+        assert!(
+            stdout.contains(&format!("{tip}\trefs/heads/main\n")),
+            "{stdout}"
+        );
+    }
+    let output = git_cli::git_cli_ssh(&env.case_dir, &ssh, &["ls-remote", "--symref", &remote]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ref: refs/heads/main\tHEAD"),
+        "{output:?}"
+    );
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
+}
+
+fn layer3_pkt(payload: &str) -> Vec<u8> {
+    format!("{:04x}{payload}", payload.len() + 4).into_bytes()
+}
+
+fn layer3_read_pkt(reader: &mut impl Read) -> Vec<u8> {
+    let mut header = [0_u8; 4];
+    reader.read_exact(&mut header).unwrap();
+    let size = usize::from_str_radix(std::str::from_utf8(&header).unwrap(), 16).unwrap();
+    let mut bytes = header.to_vec();
+    if size > 4 {
+        let mut payload = vec![0_u8; size - 4];
+        reader.read_exact(&mut payload).unwrap();
+        bytes.extend(payload);
+    }
+    bytes
+}
+
+fn layer3_read_to_flush(reader: &mut impl Read) -> Vec<u8> {
+    let mut result = Vec::new();
+    loop {
+        let packet = layer3_read_pkt(reader);
+        let flush = packet == b"0000";
+        result.extend(packet);
+        if flush {
+            return result;
+        }
+    }
+}
+
+fn layer3_spawn_ssh(case_dir: &Path, port: u16, v2: bool, path: &str) -> Child {
+    let mut ssh = git_cli::git_ssh_command(case_dir, port);
+    if v2 {
+        ssh.push_str(" -o SetEnv=GIT_PROTOCOL=version=2");
+    }
+    let shell = format!(
+        "{ssh} git@{} \"git-upload-pack '{path}'\"",
+        git_cli::mega2_reachable_host()
+    );
+    Command::new("timeout")
+        .args([
+            "-k",
+            "5",
+            "45",
+            "docker",
+            "exec",
+            "-i",
+            &view_ssh_container_id(),
+            "sh",
+            "-c",
+            &shell,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn integration_git_ssh_view_layer3_unready_after_advertise() {
+    git_cli::require_git_cli_runner();
+    let env = layer3_ssh_env();
+    let (mut service, http_port, port, _, err) = boot_view_multi(&env, "true");
+    git_cli::write_known_hosts_via_keyscan(&env.ssh_dir.join("known_hosts"), port);
+    layer3_ssh_seed_project(&env, http_port);
+    let (ready_pk, filter_id) = layer3_ssh_register(&env, http_port, "ready", ":/project");
+    layer3_ssh_wait_idle(&env, &[ready_pk]);
+    let tip = layer3_ssh_tip(&env, ready_pk);
+
+    let mut v0 = layer3_spawn_ssh(&env.case_dir, port, false, "/.view/ready.git");
+    let mut input = v0.stdin.take().unwrap();
+    let mut output = v0.stdout.take().unwrap();
+    let advertise = layer3_read_to_flush(&mut output);
+    assert!(
+        advertise
+            .windows(tip.len())
+            .any(|part| part == tip.as_bytes())
+    );
+    view_ssh_set_ready(&env, ready_pk, false);
+    input
+        .write_all(&layer3_pkt(&format!("want {}\n", "b".repeat(40))))
+        .unwrap();
+    input.write_all(b"0000").unwrap();
+    input.flush().unwrap();
+    let reply = layer3_read_pkt(&mut output);
+    assert_eq!(
+        &reply[4..],
+        format!("ERR view {filter_id} unavailable: warming up\n").as_bytes()
+    );
+    drop(input);
+    assert_eq!(v0.wait().unwrap().code(), Some(75));
+    let mut trailing = Vec::new();
+    output.read_to_end(&mut trailing).unwrap();
+    assert!(
+        trailing.is_empty(),
+        "unexpected v0 data after ERR: {trailing:?}"
+    );
+
+    view_ssh_execute(
+        &env,
+        Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("UPDATE mega_view_filter SET ready_seq = projected_seq WHERE id = {ready_pk}"),
+        ),
+    );
+    let mut v2 = layer3_spawn_ssh(&env.case_dir, port, true, "/.view/ready.git");
+    let mut input = v2.stdin.take().unwrap();
+    let mut output = v2.stdout.take().unwrap();
+    let capabilities = layer3_read_to_flush(&mut output);
+    assert!(capabilities.windows(7).any(|part| part == b"ls-refs"));
+    let mut fetch = layer3_pkt("command=fetch\n");
+    fetch.extend(b"0001");
+    fetch.extend(layer3_pkt(&format!("want {tip}\n")));
+    fetch.extend(layer3_pkt(&format!("have {}\n", "b".repeat(40))));
+    fetch.extend(b"0000");
+    input.write_all(&fetch).unwrap();
+    input.flush().unwrap();
+    let first = layer3_read_to_flush(&mut output);
+    let mut expected = layer3_pkt("acknowledgments\n");
+    expected.extend(layer3_pkt("NAK\n"));
+    expected.extend(b"0000");
+    assert_eq!(first, expected);
+    view_ssh_set_ready(&env, ready_pk, false);
+    input.write_all(&fetch).unwrap();
+    input.flush().unwrap();
+    let reply = layer3_read_pkt(&mut output);
+    assert_eq!(
+        &reply[4..],
+        format!("ERR view {filter_id} unavailable: warming up\n").as_bytes()
+    );
+    drop(input);
+    assert_eq!(v2.wait().unwrap().code(), Some(75));
+    let mut trailing = Vec::new();
+    output.read_to_end(&mut trailing).unwrap();
+    assert!(
+        trailing.is_empty(),
+        "unexpected v2 data after ERR: {trailing:?}"
+    );
+    assert_eq!(layer3_ssh_state(&env, ready_pk).0, None);
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(10))
+            .success(),
+        "{}",
+        read_log(&err)
+    );
 }
 
 fn view_host_git_http(case_dir: &Path, args: &[&str]) -> std::process::Output {
