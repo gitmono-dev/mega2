@@ -79,6 +79,9 @@ use crate::{
 
 const TOKEN: &str = "mst2-fixed-content-test";
 
+#[path = "snapshot_objects_bounded_tests.rs"]
+mod bounded_objects;
+
 #[path = "snapshot_session_tests.rs"]
 mod durable_sessions;
 
@@ -99,6 +102,7 @@ struct ReadCounts {
     whole: AtomicUsize,
     range: AtomicUsize,
     bytes: AtomicUsize,
+    object_fault: std::sync::Mutex<Option<bounded_objects::StreamFault>>,
 }
 
 impl ReadCounts {
@@ -134,6 +138,11 @@ impl MegaObjectStorage for CountingStorage {
     async fn get_stream(&self, key: &ObjectKey) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
         self.counts.whole.fetch_add(1, Ordering::SeqCst);
         let (stream, meta) = self.inner.inner.get_stream(key).await?;
+        let fault = self.counts.object_fault.lock().unwrap().clone();
+        let stream = match fault {
+            Some(fault) if fault.oid == key.key => fault.stream(),
+            _ => stream,
+        };
         let counts = self.counts.clone();
         let stream = stream.map(move |part| {
             if let Ok(bytes) = &part {
@@ -328,6 +337,14 @@ impl Fixture {
     }
 
     async fn new_with_pg_config_and_directories(rebuildable: bool, directory_count: usize) -> Self {
+        Self::new_with_pg_config_directories_and_objects(rebuildable, directory_count, &[]).await
+    }
+
+    async fn new_with_pg_config_directories_and_objects(
+        rebuildable: bool,
+        directory_count: usize,
+        objects: &[(String, Vec<u8>)],
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let mut config = isolated_config(temp.path().join("config"));
         config.monorepo.push_policy = PushPolicy::Trunk;
@@ -413,6 +430,18 @@ impl Fixture {
                 &format!("wide-{index:03}"),
             ));
             extra_trees.push(child);
+        }
+        for (name, raw) in objects {
+            let oid = storage
+                .git_service
+                .save_object_from_raw(Bytes::copy_from_slice(raw))
+                .await
+                .unwrap();
+            project_items.push(item(
+                TreeItemMode::Blob,
+                ObjectHash::from_hex_for_kind(HashKind::Sha1, &oid).unwrap(),
+                name,
+            ));
         }
         let project = tree(project_items);
         let old_tip = Commit::from_tree_id_with_kind(
