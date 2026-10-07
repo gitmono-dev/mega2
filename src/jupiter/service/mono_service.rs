@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::{StreamExt, stream};
 use git_internal::internal::{
     metadata::{EntryMeta, MetaAttached},
-    object::blob::Blob,
+    object::{ObjectTrait, blob::Blob},
     pack::entry::Entry,
 };
 use sea_orm::{ActiveModelTrait, ConnectionTrait, IntoActiveModel, TransactionTrait};
@@ -19,7 +19,9 @@ use crate::{
             base_storage::{BaseStorage, StorageConnector},
             mono_storage::MonoStorage,
         },
-        utils::converter::{IntoMegaModel, MegaModelConverter, MegaObjectModel, process_entry},
+        utils::converter::{
+            BootstrapCommitTime, IntoMegaModel, MegaModelConverter, MegaObjectModel, process_entry,
+        },
     },
 };
 
@@ -84,7 +86,7 @@ impl MonoService {
 
     pub async fn init_monorepo(&self, mono_config: &MonoConfig) -> Result<(), MegaError> {
         mono_config.ensure_normal_service_object_format()?;
-        self.initialize_monorepo(mono_config).await
+        self.initialize_monorepo(mono_config, None).await
     }
 
     /// Initializes an empty Monorepo for a controlled, one-shot bootstrap.
@@ -97,12 +99,69 @@ impl MonoService {
         mono_config: &MonoConfig,
     ) -> Result<(), MegaError> {
         mono_config.object_hash_kind()?;
-        self.initialize_monorepo(mono_config).await
+        self.initialize_monorepo(mono_config, None).await
     }
 
-    async fn initialize_monorepo(&self, mono_config: &MonoConfig) -> Result<(), MegaError> {
+    pub(crate) async fn bootstrap_monorepo_with_commit_time(
+        &self,
+        mono_config: &MonoConfig,
+        commit_time: Option<BootstrapCommitTime>,
+    ) -> Result<(), MegaError> {
+        mono_config.object_hash_kind()?;
+        self.initialize_monorepo(mono_config, commit_time).await
+    }
+
+    async fn ensure_existing_root_matches_expected(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        root_ref: &crate::callisto::mega_refs::Model,
+        expected: &MegaModelConverter,
+    ) -> Result<(), MegaError> {
+        let mismatch = || {
+            MegaError::Other(
+                "existing Monorepo root does not match the configured initial graph and commit time; refusing to modify it"
+                    .to_string(),
+            )
+        };
+        if root_ref.ref_commit_hash != expected.commit.id.to_string()
+            || root_ref.ref_tree_hash != expected.root_tree.id.to_string()
+        {
+            return Err(mismatch());
+        }
+        let commits = self
+            .mono_storage
+            .get_commits_by_hashes_fallible(txn, std::slice::from_ref(&root_ref.ref_commit_hash))
+            .await?;
+        let commit = commits.first().ok_or_else(mismatch)?;
+        let tree = self
+            .mono_storage
+            .get_tree_by_hash_in_txn(&root_ref.ref_tree_hash, txn)
+            .await?
+            .ok_or_else(mismatch)?;
+        if commit.tree != expected.commit.tree_id.to_string()
+            || commit.parents_id != serde_json::json!([])
+            || commit.author.as_deref().map(str::as_bytes)
+                != Some(expected.commit.author.to_data()?.as_slice())
+            || commit.committer.as_deref().map(str::as_bytes)
+                != Some(expected.commit.committer.to_data()?.as_slice())
+            || commit.content.as_deref() != Some(expected.commit.message.as_str())
+            || tree.sub_trees != expected.root_tree.to_data()?
+        {
+            return Err(mismatch());
+        }
+        Ok(())
+    }
+
+    async fn initialize_monorepo(
+        &self,
+        mono_config: &MonoConfig,
+        commit_time: Option<BootstrapCommitTime>,
+    ) -> Result<(), MegaError> {
         let txn = self.mono_storage.get_connection().begin().await?;
         acquire_monorepo_initialization_lock(&txn).await?;
+        let expected = commit_time
+            .map(|time| MegaModelConverter::init_with_commit_time(mono_config, Some(time)))
+            .transpose()?;
 
         if let Some(root_ref) = self.mono_storage.get_main_ref_in_txn("/", &txn).await? {
             ensure_existing_root_ref_matches_config(
@@ -110,11 +169,18 @@ impl MonoService {
                 &root_ref.ref_commit_hash,
                 &root_ref.ref_tree_hash,
             )?;
+            if let Some(expected) = &expected {
+                self.ensure_existing_root_matches_expected(&txn, &root_ref, expected)
+                    .await?;
+            }
             txn.commit().await?;
             tracing::info!("Monorepo Directory Already Inited, skip init process!");
             return Ok(());
         }
-        let converter = MegaModelConverter::init(mono_config)?;
+        let converter = match expected {
+            Some(expected) => expected,
+            None => MegaModelConverter::init(mono_config)?,
+        };
         let commit = converter
             .commit
             .into_mega_model(EntryMeta::default())

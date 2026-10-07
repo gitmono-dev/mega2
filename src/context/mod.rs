@@ -31,6 +31,7 @@ use crate::{
             mono_storage::MonoStorage,
             vault_storage::VaultStorage,
         },
+        utils::converter::BootstrapCommitTime,
     },
 };
 
@@ -75,6 +76,13 @@ pub struct AppContext {
 /// Redis, notification workers, and Git listeners are deliberately
 /// outside this one-shot path.
 pub(crate) async fn bootstrap_monorepo(config: crate::config::Config) -> Result<(), MegaError> {
+    bootstrap_monorepo_with_commit_time(config, None).await
+}
+
+pub(crate) async fn bootstrap_monorepo_with_commit_time(
+    config: crate::config::Config,
+    commit_time: Option<BootstrapCommitTime>,
+) -> Result<(), MegaError> {
     config.validate()?;
     config.monorepo.object_hash_kind()?;
     let config = Arc::new(config);
@@ -111,7 +119,9 @@ pub(crate) async fn bootstrap_monorepo(config: crate::config::Config) -> Result<
         },
     };
 
-    mono_service.bootstrap_monorepo(&config.monorepo).await
+    mono_service
+        .bootstrap_monorepo_with_commit_time(&config.monorepo, commit_time)
+        .await
 }
 
 impl AppContext {
