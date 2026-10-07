@@ -55,6 +55,150 @@ pub mod authz_audit_ops {
     };
 }
 
+/// Internal assembly seam for the opt-in history projection benchmark (HP-24).
+/// Not a supported API.
+#[doc(hidden)]
+pub mod view_bench_ops {
+    use std::{path::Path, sync::Arc};
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::{commit::Commit, tree::Tree},
+    };
+    use sea_orm::{DatabaseConnection, DatabaseTransaction};
+
+    use crate::{
+        MegaError,
+        config::{Config, DbConfig, testing::isolated_config},
+        jupiter::{
+            service::{
+                view_metrics::ViewMetrics,
+                view_projection_service::{CatchUpOutcome, ViewProjectionService},
+            },
+            storage::{Storage, object_storage::mock_object_storage},
+        },
+    };
+    pub use crate::{
+        ceres::view::filter::{
+            CanonicalFilter, Filter, parse_for_registration,
+            validate::{
+                REGISTER_SCALE_LIMITS, RegistrationCheck, ScaleLimits, validate_for_registration,
+            },
+        },
+        common::utils::generate_id,
+        jupiter::{
+            storage::{
+                init::database_connection, view_root_chain::RootChainOutcome,
+                view_storage::ViewLockMode,
+            },
+            utils::converter::sort_git_tree_items,
+        },
+    };
+
+    pub struct BenchHarness {
+        storage: Storage,
+        projection: ViewProjectionService,
+    }
+
+    impl BenchHarness {
+        pub async fn new(
+            connection: Arc<DatabaseConnection>,
+            batch_size: usize,
+            base_dir: &Path,
+        ) -> Result<Self, MegaError> {
+            let mut config = isolated_config(base_dir);
+            config.views.batch_size = u64::try_from(batch_size)
+                .map_err(|_| MegaError::Other("benchmark batch size is too large".into()))?;
+            let storage =
+                Storage::new_with_connection(Arc::new(config), connection, mock_object_storage())
+                    .await?;
+            let projection = ViewProjectionService::new(storage.clone(), ViewMetrics::default());
+            Ok(Self {
+                storage,
+                projection,
+            })
+        }
+
+        pub fn config(&self) -> Arc<Config> {
+            self.storage.config()
+        }
+
+        pub async fn extend_root_chain(
+            &self,
+            batch_size: usize,
+        ) -> Result<RootChainOutcome, MegaError> {
+            self.storage
+                .view_storage()
+                .extend_root_chain(None, batch_size, ViewLockMode::Try)
+                .await
+        }
+
+        pub async fn catch_up(&self, filter_pk: i64) -> Result<bool, MegaError> {
+            Ok(matches!(
+                self.projection.catch_up(filter_pk).await?,
+                CatchUpOutcome::Ready
+            ))
+        }
+
+        pub async fn save_commits(&self, commits: Vec<Commit>) -> Result<(), MegaError> {
+            self.storage
+                .mono_storage()
+                .save_mega_commits(commits, None)
+                .await
+        }
+
+        pub async fn save_trees(
+            &self,
+            trees: Vec<Tree>,
+            commit_id: ObjectHash,
+        ) -> Result<(), MegaError> {
+            self.storage
+                .mono_storage()
+                .save_mega_trees(trees, commit_id, None)
+                .await
+        }
+
+        pub async fn insert_root_ref(
+            &self,
+            transaction: &DatabaseTransaction,
+            model: crate::mega_refs::Model,
+        ) -> Result<(), MegaError> {
+            self.storage
+                .mono_storage()
+                .insert_ref_if_not_exists_in_txn(transaction, model)
+                .await?;
+            Ok(())
+        }
+
+        pub async fn cas_root_ref(
+            &self,
+            transaction: &DatabaseTransaction,
+            expected_commit: &str,
+            expected_tree: &str,
+            next_commit: &str,
+            next_tree: &str,
+        ) -> Result<bool, MegaError> {
+            self.storage
+                .mono_storage()
+                .cas_update_root_main_ref_in_txn(
+                    transaction,
+                    Some(expected_commit),
+                    Some(expected_tree),
+                    next_commit,
+                    next_tree,
+                )
+                .await
+        }
+    }
+
+    pub fn db_config(db_url: String) -> DbConfig {
+        DbConfig {
+            db_url,
+            ..DbConfig::default()
+        }
+    }
+}
+
 // Public entry points for the thin `mega2` binary (composition root).
 pub use cli::parse;
 pub use common::errors::MegaError;
