@@ -264,7 +264,7 @@ async fn every_alias_is_admitted_and_exact_oid_body_is_loaded_once() {
             .send("POST", "objects", Body::from(request.to_string()))
             .await,
         409,
-        "DIGEST_MISMATCH",
+        "EXPECTED_DIGEST_MISMATCH",
         false,
     )
     .await;
@@ -314,7 +314,7 @@ async fn conflicting_sizes_reject_before_io_and_distinct_oids_still_verify_each_
             .send("POST", "objects", Body::from(request.to_string()))
             .await,
         409,
-        "DIGEST_MISMATCH",
+        "EXPECTED_DIGEST_MISMATCH",
         false,
     )
     .await;
@@ -388,7 +388,7 @@ async fn truncated_wrong_sha_and_late_stream_error_never_produce_200() {
         (
             FaultKind::Parts(vec![Bytes::from(vec![0; 8192])]),
             409,
-            "DIGEST_MISMATCH",
+            "EXPECTED_DIGEST_MISMATCH",
             8192,
         ),
         (
