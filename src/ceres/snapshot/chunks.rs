@@ -13,7 +13,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use mst2_codec::chunkmap::{CHUNK_SIZE, CHUNKS_PER_PAGE, ChunkLeaf, ChunkMap};
@@ -202,7 +202,7 @@ impl ProjectionCache {
             return;
         }
         // Reclaim oldest entries until the new one fits. A file larger than
-        // the cap alone is not cached (rebuild per request) but still
+        // the cap alone is not cached between flights but still
         // served correctly.
         while self.total_bytes + proj.raw.len() > STAGED_CAP_BYTES
             && let Some(victim) = self.order.pop_front()
@@ -219,8 +219,88 @@ impl ProjectionCache {
     }
 }
 
+static FLIGHTS: OnceLock<Mutex<FlightRegistry>> = OnceLock::new();
+const PROJECTION_FLIGHT_CAP: usize = 128;
+
+struct ProjectionFlight {
+    result: tokio::sync::Mutex<Option<Arc<ChunkProjection>>>,
+}
+
+#[derive(Default)]
+struct FlightRegistry {
+    entries: HashMap<[u8; 32], Weak<ProjectionFlight>>,
+}
+
+struct FlightClaim<'a> {
+    content_id: [u8; 32],
+    flight: Option<Arc<ProjectionFlight>>,
+    registry: &'a Mutex<FlightRegistry>,
+}
+
+impl<'a> FlightClaim<'a> {
+    fn acquire(
+        registry: &'a Mutex<FlightRegistry>,
+        content_id: [u8; 32],
+    ) -> Result<Self, SnapshotError> {
+        let mut state = registry
+            .lock()
+            .map_err(|_| internal("chunk projection flight registry lock poisoned"))?;
+        if let Some(flight) = state.entries.get(&content_id).and_then(Weak::upgrade) {
+            return Ok(Self {
+                content_id,
+                flight: Some(flight),
+                registry,
+            });
+        }
+        state.entries.remove(&content_id);
+        if state.entries.len() >= PROJECTION_FLIGHT_CAP {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "too many distinct chunk projections in flight",
+            ));
+        }
+        let flight = Arc::new(ProjectionFlight {
+            result: tokio::sync::Mutex::new(None),
+        });
+        state.entries.insert(content_id, Arc::downgrade(&flight));
+        Ok(Self {
+            content_id,
+            flight: Some(flight),
+            registry,
+        })
+    }
+}
+
+impl Drop for FlightClaim<'_> {
+    fn drop(&mut self) {
+        let Some(flight) = self.flight.take() else {
+            return;
+        };
+        let Ok(mut state) = self.registry.lock() else {
+            return;
+        };
+        if Arc::strong_count(&flight) == 1 {
+            if state
+                .entries
+                .get(&self.content_id)
+                .is_some_and(|registered| registered.ptr_eq(&Arc::downgrade(&flight)))
+            {
+                state.entries.remove(&self.content_id);
+            }
+            drop(state);
+            drop(flight);
+        } else {
+            // Serialize owner release with admission and other final drops.
+            // Another participant keeps the potentially large result alive.
+            drop(flight);
+            drop(state);
+        }
+    }
+}
+
 /// Return the cached projection, or build one via `load` (which must resolve
-/// the file in the fixed view and return its verified bytes).
+/// the file in the fixed view and return its verified bytes). Concurrent
+/// misses for the same digest share one successful load and projection.
 pub async fn get_or_project<F, Fut>(
     content_id: [u8; 32],
     load: F,
@@ -230,14 +310,45 @@ where
     Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
 {
     let cache = STAGED.get_or_init(|| Mutex::new(ProjectionCache::new()));
-    if let Some(p) = cache.lock().unwrap().get(content_id) {
+    if let Some(p) = cache
+        .lock()
+        .map_err(|_| internal("chunk projection cache lock poisoned"))?
+        .get(content_id)
+    {
         return Ok(p);
+    }
+
+    let registry = FLIGHTS.get_or_init(|| Mutex::new(FlightRegistry::default()));
+    let claim = FlightClaim::acquire(registry, content_id)?;
+    let flight = claim
+        .flight
+        .as_ref()
+        .ok_or_else(|| internal("chunk projection flight claim released"))?;
+    let mut result = flight.result.lock().await;
+    if let Some(p) = cache
+        .lock()
+        .map_err(|_| internal("chunk projection cache lock poisoned"))?
+        .get(content_id)
+    {
+        *result = Some(p.clone());
+        return Ok(p);
+    }
+    if let Some(p) = result.as_ref() {
+        return Ok(p.clone());
     }
     let raw = load().await?;
     let proj = std::sync::Arc::new(ChunkProjection::build(content_id, raw)?);
-    cache.lock().unwrap().put(proj.clone());
+    cache
+        .lock()
+        .map_err(|_| internal("chunk projection cache lock poisoned"))?
+        .put(proj.clone());
+    *result = Some(proj.clone());
     Ok(proj)
 }
+
+#[cfg(test)]
+#[path = "chunk_singleflight_tests.rs"]
+mod singleflight_tests;
 
 #[cfg(test)]
 mod tests {
