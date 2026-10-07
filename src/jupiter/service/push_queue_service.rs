@@ -23,14 +23,17 @@ use crate::{
         },
     },
     config::{DEFAULT_MAX_PUSH_COMMITS, PushPolicy},
-    jupiter::storage::{
-        audit_storage::{AuditStorage, IMPORT_REPO_REMOVE_KIND},
-        base_storage::{BaseStorage, StorageConnector},
-        blob_path_index::BlobPathIndexMode,
-        git_db_storage::GitDbStorage,
-        mono_storage::MonoStorage,
-        push_queue_storage::{
-            ClaimOutcome, EnqueueOutcome, EnqueueParams, EnqueueRejectReason, PushQueueStorage,
+    jupiter::{
+        service::view_worker::ViewSignal,
+        storage::{
+            audit_storage::{AuditStorage, IMPORT_REPO_REMOVE_KIND},
+            base_storage::{BaseStorage, StorageConnector},
+            blob_path_index::BlobPathIndexMode,
+            git_db_storage::GitDbStorage,
+            mono_storage::MonoStorage,
+            push_queue_storage::{
+                ClaimOutcome, EnqueueOutcome, EnqueueParams, EnqueueRejectReason, PushQueueStorage,
+            },
         },
     },
 };
@@ -671,6 +674,7 @@ pub struct PushQueueService {
     wait_timeout: Duration,
     poll_interval: Duration,
     metrics: PushQueueMetrics,
+    view_signal: Option<ViewSignal>,
 }
 
 impl PushQueueService {
@@ -683,6 +687,7 @@ impl PushQueueService {
             wait_timeout: DEFAULT_WAIT_TIMEOUT,
             poll_interval: DEFAULT_POLL_INTERVAL,
             metrics: PushQueueMetrics::default(),
+            view_signal: None,
         }
     }
 
@@ -694,6 +699,11 @@ impl PushQueueService {
 
     pub fn with_max_push_commits(mut self, max_push_commits: usize) -> Self {
         self.max_push_commits = max_push_commits;
+        self
+    }
+
+    pub(crate) fn with_view_signal(mut self, signal: ViewSignal) -> Self {
+        self.view_signal = Some(signal);
         self
     }
 
@@ -750,6 +760,9 @@ impl PushQueueService {
                     "C-segment blob_path index failed; compensator will converge"
                 );
             }
+        }
+        if let Some(signal) = &self.view_signal {
+            signal.notify_worker();
         }
     }
 
@@ -3385,6 +3398,7 @@ fn reject_to_error(reason: EnqueueRejectReason) -> MegaError {
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::ConnectionTrait;
     use serde_json::json;
 
     use super::*;
@@ -4510,6 +4524,17 @@ mod tests {
         events_enabled: bool,
         transport: Arc<RecordingTransport>,
     ) -> (tempfile::TempDir, crate::jupiter::storage::Storage) {
+        wh03_storage_with(events_enabled, transport, |_| {}).await
+    }
+
+    async fn wh03_storage_with<F>(
+        events_enabled: bool,
+        transport: Arc<RecordingTransport>,
+        configure: F,
+    ) -> (tempfile::TempDir, crate::jupiter::storage::Storage)
+    where
+        F: FnOnce(&mut crate::config::Config),
+    {
         let temp = tempfile::TempDir::new().unwrap();
         let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
         config.monorepo.push_policy = PushPolicy::Trunk;
@@ -4517,6 +4542,7 @@ mod tests {
         config.git.ssh_receive_pack = Some(false);
         config.storage_events.enabled = events_enabled;
         config.storage_events.installation_id = Some(WH03_INSTALLATION.to_string());
+        configure(&mut config);
         let mut storage =
             crate::jupiter::tests::test_storage_with_config(temp.path(), config.clone()).await;
         storage.set_storage_event_emitter(wh03_emitter(&config, transport));
@@ -4802,6 +4828,423 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    async fn assert_view_signal(signal: &ViewSignal, context: &str) {
+        tokio::time::timeout(Duration::from_secs(1), signal.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{context}: C-segment did not leave a signal permit"));
+    }
+
+    async fn assert_no_view_signal(signal: &ViewSignal, context: &str) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), signal.notified())
+                .await
+                .is_err(),
+            "{context}: unexpected signal permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn c_segment_signal_after_done() {
+        let transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_temp, storage) = wh03_storage(false, transport).await;
+        let (parent, path) = wh03_path_fixture(&storage, "project").await;
+        let (next, payload) = wh03_save_n1_commit(
+            &storage,
+            parent.id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "view signal",
+        )
+        .await;
+        let id = wh03_enqueue_push(&storage, &path, &parent.id.to_string(), &next, &payload).await;
+        let signal = storage.view_signal();
+
+        assert_no_view_signal(&signal, "before push").await;
+        assert!(matches!(
+            wh03_exec(&storage, id).await,
+            ExecuteOutcome::Done { .. }
+        ));
+        assert_view_signal(&signal, "push").await;
+
+        let second_parent: git_internal::hash::ObjectHash = next.parse().unwrap();
+        let (second, second_payload) = wh03_save_n1_commit(
+            &storage,
+            second_parent,
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "later view signal",
+        )
+        .await;
+        let second_id = wh03_enqueue_push(&storage, &path, &next, &second, &second_payload).await;
+        assert_no_view_signal(&signal, "before later push").await;
+        assert!(matches!(
+            wh03_exec(&storage, second_id).await,
+            ExecuteOutcome::Done { .. }
+        ));
+        assert_view_signal(&signal, "later push").await;
+
+        assert_no_view_signal(&signal, "before merge").await;
+        let merge_id = enqueue_and_claim(&storage.push_queue_service, "hp32-merge").await;
+        assert!(matches!(
+            storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id: merge_id,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            ExecuteOutcome::Done { .. }
+        ));
+        assert_view_signal(&signal, "merge").await;
+
+        // Calling C twice for the completed queue row exercises the indexer's
+        // skipped branch. It must still signal, while the direct index call
+        // itself remains signal-free.
+        assert!(
+            storage
+                .mono_storage()
+                .index_blob_paths_c_segment(&path, BlobPathIndexMode::Queue { push_id: id })
+                .await
+                .unwrap()
+                .skipped
+        );
+        assert_no_view_signal(&signal, "direct skipped index").await;
+        storage
+            .push_queue_service
+            .run_c_segment_index(id, &path)
+            .await;
+        assert_view_signal(&signal, "skipped C-segment").await;
+
+        // C failures are deliberately detached from the committed B3 result.
+        // Rename a queried column, invoke C, then restore the schema before
+        // checking that an unbound service never signals this Storage.
+        storage
+            .mono_storage()
+            .get_connection()
+            .execute_unprepared("ALTER TABLE push_queue RENAME COLUMN status TO hp32_gone")
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .mono_storage()
+                .index_blob_paths_c_segment(&path, BlobPathIndexMode::Queue { push_id: id })
+                .await
+                .is_err()
+        );
+        assert_no_view_signal(&signal, "direct failed index").await;
+        storage
+            .push_queue_service
+            .run_c_segment_index(id, &path)
+            .await;
+        assert_view_signal(&signal, "failed C-segment").await;
+        storage
+            .mono_storage()
+            .get_connection()
+            .execute_unprepared("ALTER TABLE push_queue RENAME COLUMN hp32_gone TO status")
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .mono_storage()
+                .index_blob_paths_c_segment(&path, BlobPathIndexMode::Queue { push_id: id })
+                .await
+                .is_ok()
+        );
+        let unbound = PushQueueService::new(storage.mono_storage().base.clone(), PushPolicy::Trunk);
+        unbound.run_c_segment_index(id, &path).await;
+        assert_no_view_signal(&signal, "unbound service").await;
+
+        let attach_temp = tempfile::TempDir::new().unwrap();
+        let attach_storage = fu13_storage(attach_temp.path()).await;
+        let (repo, commit, _) = wh03_seed_import_repo(&attach_storage, "/third-party/hp32").await;
+        let attach_signal = attach_storage.view_signal();
+        assert_no_view_signal(&attach_signal, "before attach").await;
+        assert!(matches!(
+            fu13_attach(
+                &attach_storage,
+                &repo,
+                vec![fu12_cmd(
+                    "refs/heads/main",
+                    "Create",
+                    ZERO_ID,
+                    &commit.id.to_string(),
+                )],
+                &commit.id.to_string(),
+            )
+            .await,
+            ExecuteOutcome::Done {
+                root_cas_writes: 1,
+                ..
+            }
+        ));
+        assert_view_signal(&attach_signal, "attach").await;
+    }
+
+    #[tokio::test]
+    async fn c_segment_signal_no_view_sql() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (db_config, _schema) = crate::jupiter::tests::test_db_config(temp.path()).await;
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.database = db_config.clone();
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        config.git.push_auth = Some(crate::config::PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        config.storage_events.enabled = false;
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let callback_recorded = recorded.clone();
+        let mut connection = crate::jupiter::storage::init::database_connection(&db_config)
+            .await
+            .unwrap();
+        connection.set_metric_callback(move |info| {
+            callback_recorded
+                .lock()
+                .unwrap()
+                .push(info.statement.to_string());
+        });
+        let storage = crate::jupiter::storage::Storage::new_with_connection(
+            Arc::new(config),
+            Arc::new(connection),
+            crate::jupiter::storage::object_storage::mock_object_storage(),
+        )
+        .await
+        .unwrap();
+        let storage = crate::jupiter::tests::with_test_vault(storage, temp.path()).await;
+        let (parent, path) = wh03_path_fixture(&storage, "hp32-sql").await;
+        recorded.lock().unwrap().clear();
+        let (next, payload) = wh03_save_n1_commit(
+            &storage,
+            parent.id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "view SQL boundary",
+        )
+        .await;
+        let id = wh03_enqueue_push(&storage, &path, &parent.id.to_string(), &next, &payload).await;
+        assert!(matches!(
+            wh03_exec(&storage, id).await,
+            ExecuteOutcome::Done { .. }
+        ));
+        assert_view_signal(&storage.view_signal(), "push signal SQL boundary").await;
+        let merge_id = enqueue_and_claim(&storage.push_queue_service, "hp32-sql-merge").await;
+        assert!(matches!(
+            storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id: merge_id,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            ExecuteOutcome::Done { .. }
+        ));
+        assert_view_signal(&storage.view_signal(), "merge signal SQL boundary").await;
+        let recorded = recorded.lock().unwrap().clone();
+        assert!(
+            !recorded.is_empty() && recorded.iter().any(|sql| sql.contains("push_queue")),
+            "the metric callback must capture the exercised B3/C SQL: {recorded:#?}"
+        );
+        let view_sql = recorded
+            .iter()
+            .filter(|sql| sql.to_ascii_lowercase().contains("mega_view_"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            view_sql.is_empty(),
+            "C-segment signal must not access view tables: {view_sql:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn c_segment_signal_never_blocks_round() {
+        use crate::jupiter::service::view_worker::{ViewWorkerRound, spawn_view_worker_with_round};
+
+        async fn worker_state(
+            storage: &crate::jupiter::storage::Storage,
+            state: usize,
+        ) -> Option<(
+            tokio_util::sync::CancellationToken,
+            tokio::task::JoinHandle<()>,
+            Arc<tokio::sync::Notify>,
+        )> {
+            if state == 0 {
+                return None;
+            }
+            let token = tokio_util::sync::CancellationToken::new();
+            let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let release = Arc::new(tokio::sync::Notify::new());
+            let round_started = started.clone();
+            let round_completed = completed.clone();
+            let round_release = release.clone();
+            let round: ViewWorkerRound = Arc::new(move |_| {
+                let started = round_started.clone();
+                let completed = round_completed.clone();
+                let release = round_release.clone();
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    if state == 1 {
+                        release.notified().await;
+                    }
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            let worker = spawn_view_worker_with_round(storage.clone(), token.clone(), round)
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while started.load(Ordering::SeqCst) == 0
+                    || (state == 2 && completed.load(Ordering::SeqCst) == 0)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("worker reached the requested state");
+            if state == 2 {
+                worker.abort();
+                assert!(worker.await.is_err(), "aborted worker must terminate");
+                return None;
+            }
+            Some((token, worker, release))
+        }
+
+        fn done(outcome: ExecuteOutcome) -> u32 {
+            let ExecuteOutcome::Done {
+                root_cas_writes, ..
+            } = outcome
+            else {
+                panic!("expected a committed round: {outcome:?}");
+            };
+            root_cas_writes
+        }
+
+        async fn run_case(state: usize) -> [u32; 3] {
+            let (push_temp, push_storage) = wh03_storage_with(
+                false,
+                Arc::new(RecordingTransport {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    bodies: std::sync::Mutex::new(Vec::new()),
+                    fail: false,
+                }),
+                |config| {
+                    config.views.enabled = true;
+                    config.views.worker_interval_secs = 3_600;
+                },
+            )
+            .await;
+            let attach_temp = tempfile::tempdir().unwrap();
+            let attach_storage = fu13_storage_with(attach_temp.path(), |config| {
+                config.views.enabled = true;
+                config.views.worker_interval_secs = 3_600;
+                config.monorepo.push_policy = PushPolicy::Trunk;
+                config.git.push_auth = Some(crate::config::PushAuth::None);
+                config.git.ssh_receive_pack = Some(false);
+            })
+            .await;
+            let attach_storage =
+                crate::jupiter::tests::with_test_vault(attach_storage, attach_temp.path()).await;
+            assert!(push_storage.config().validate().is_ok());
+            assert!(attach_storage.config().validate().is_ok());
+            let push_worker = worker_state(&push_storage, state).await;
+            let attach_worker = worker_state(&attach_storage, state).await;
+
+            let (parent, path) = wh03_path_fixture(&push_storage, &format!("hp32-{state}")).await;
+            let (next, payload) = wh03_save_n1_commit(
+                &push_storage,
+                parent.id,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &format!("hp32-{state}"),
+            )
+            .await;
+            let id = wh03_enqueue_push(
+                &push_storage,
+                &path,
+                &parent.id.to_string(),
+                &next,
+                &payload,
+            )
+            .await;
+            let pushed = tokio::time::timeout(Duration::from_secs(5), wh03_exec(&push_storage, id))
+                .await
+                .expect("push B3 and C segment must not wait for the view worker");
+            let ExecuteOutcome::Done {
+                landed_commit_id,
+                root_cas_writes: push_cas,
+                ..
+            } = pushed
+            else {
+                panic!("push must commit: {pushed:?}");
+            };
+            assert_eq!(landed_commit_id, next);
+
+            let merge_id = enqueue_and_claim(
+                &push_storage.push_queue_service,
+                &format!("hp32-merge-{state}"),
+            )
+            .await;
+            let merged = tokio::time::timeout(
+                Duration::from_secs(5),
+                push_storage.push_queue_service.execute_b3(
+                    ExecuteRequest {
+                        id: merge_id,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("merge B3 and C segment must not wait for the view worker")
+            .unwrap();
+
+            let (repo, c1, _) =
+                wh03_seed_import_repo(&attach_storage, &format!("/third-party/hp32-{state}")).await;
+            let c1_id = c1.id.to_string();
+            let attached = tokio::time::timeout(
+                Duration::from_secs(5),
+                fu13_attach(
+                    &attach_storage,
+                    &repo,
+                    vec![fu12_cmd("refs/heads/main", "Create", ZERO_ID, &c1_id)],
+                    &c1_id,
+                ),
+            )
+            .await
+            .expect("attach B3 and C segment must not wait for the view worker");
+            let result = [push_cas, done(merged), done(attached)];
+            assert_eq!(result, [1, 1, 1]);
+            for guard in [push_worker, attach_worker].into_iter().flatten() {
+                let (token, worker, release) = guard;
+                release.notify_one();
+                token.cancel();
+                tokio::time::timeout(Duration::from_secs(5), worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            drop((push_temp, attach_temp));
+            result
+        }
+
+        let baseline = run_case(0).await;
+        assert_eq!(run_case(1).await, baseline);
+        assert_eq!(run_case(2).await, baseline);
     }
 
     /// Same as `wh03_exec`, with an explicit request override (force flags).
@@ -6246,7 +6689,19 @@ mod tests {
     // transaction; anything else at the leaf is IMPORT_REPO_PATH_OCCUPIED.
 
     async fn fu13_storage(temp: &std::path::Path) -> crate::jupiter::storage::Storage {
-        let mut storage = crate::jupiter::tests::test_storage(temp).await;
+        fu13_storage_with(temp, |_| {}).await
+    }
+
+    async fn fu13_storage_with<F>(
+        temp: &std::path::Path,
+        configure: F,
+    ) -> crate::jupiter::storage::Storage
+    where
+        F: FnOnce(&mut crate::config::Config),
+    {
+        let mut config = crate::config::testing::isolated_config(temp.join("config"));
+        configure(&mut config);
+        let mut storage = crate::jupiter::tests::test_storage_with_config(temp, config).await;
         let git_service = crate::jupiter::service::git_service::GitService {
             obj_storage: crate::jupiter::storage::object_storage::mock_object_storage(),
         };

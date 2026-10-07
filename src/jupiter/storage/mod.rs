@@ -200,6 +200,7 @@ impl Storage {
         let config_handle = ConfigHandle::from_arc(config.clone());
         let notification_storage = NotificationStorage::new(connection.clone());
         let base = BaseStorage::new(connection.clone());
+        let view_runtime = Arc::new(ViewRuntime::new());
 
         let mono_storage = MonoStorage { base: base.clone() };
         let git_db_storage = GitDbStorage { base: base.clone() };
@@ -289,6 +290,7 @@ impl Storage {
         };
         let push_queue_service =
             PushQueueService::new(base.clone(), config.monorepo.push_policy.clone())
+                .with_view_signal(view_runtime.signal())
                 .with_max_push_commits(config.monorepo.max_push_commits);
         let artifact_service = ArtifactService::new(base.clone(), object_store.clone());
         let buck_service = BuckService::new(
@@ -323,7 +325,7 @@ impl Storage {
             webhook_service,
             storage_event_emitter,
             notification_storage,
-            view_runtime: Arc::new(ViewRuntime::new()),
+            view_runtime,
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
         })
@@ -679,6 +681,7 @@ impl Storage {
 
         let app_service = AppService::mock();
         let webhook_service = WebhookService::mock(app_service.webhook_storage.clone());
+        let view_runtime = Arc::new(ViewRuntime::new());
 
         Storage {
             app_service,
@@ -687,7 +690,8 @@ impl Storage {
             push_queue_service: PushQueueService::new(
                 BaseStorage::mock(),
                 crate::config::PushPolicy::Review,
-            ),
+            )
+            .with_view_signal(view_runtime.signal()),
             artifact_service: ArtifactService::mock(),
             buck_service: BuckService::mock(),
             config_handle: ConfigHandle::from_arc(config.clone()),
@@ -702,7 +706,7 @@ impl Storage {
             storage_event_emitter:
                 crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
-            view_runtime: Arc::new(ViewRuntime::new()),
+            view_runtime,
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
         }
