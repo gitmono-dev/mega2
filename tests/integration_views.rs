@@ -204,6 +204,143 @@ impl Case {
         command
     }
 
+    fn stop_service(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            self.child.kill().unwrap();
+            self.child.wait().unwrap();
+        }
+    }
+
+    fn restart_rewarm(
+        &mut self,
+        enabled: bool,
+        anonymous_access: bool,
+        max_filters: u64,
+        cold_slots: u64,
+    ) {
+        self.stop_service();
+        let config_path = self._temp.path().join("config.toml");
+        let git = format!(
+            "[git]\nanonymous_access = {anonymous_access}\npush_auth = \"none\"\nssh_receive_pack = false\n"
+        );
+        common::write_full_config_with_append(&config_path, &git);
+        let stdout = self._temp.path().join("rewarm-service.out");
+        let stderr = self._temp.path().join("rewarm-service.err");
+        let mut command = Self::command(
+            &self._temp,
+            &self._database,
+            &config_path,
+            enabled,
+            self.port,
+        );
+        command
+            .env("MEGA_VIEWS__ALLOW_ANONYMOUS_REGISTER", "true")
+            .env("MEGA_VIEWS__WORKER_INTERVAL_SECS", "1")
+            .env("MEGA_VIEWS__MAX_FILTERS", max_filters.to_string())
+            .env(
+                "MEGA_VIEWS__MAX_CONCURRENT_COLD_STARTS",
+                cold_slots.to_string(),
+            );
+        self.child = command
+            .args([
+                "service",
+                "http",
+                "--host",
+                "127.0.0.1",
+                "-p",
+                &self.port.to_string(),
+            ])
+            .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+                break;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "service exited {status}: {}",
+                    fs::read_to_string(&stderr).unwrap_or_default()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "service restart timed out: {}",
+                fs::read_to_string(&stderr).unwrap_or_default()
+            );
+            sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn register_filter(&self, spec: &str) -> (i64, String) {
+        let response = self
+            .client
+            .post(format!("http://127.0.0.1:{}/api/v1/views", self.port))
+            .json(&serde_json::json!({"filter_spec": spec}))
+            .send()
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().unwrap();
+        assert!(status.is_success(), "register {spec}: {status} {body}");
+        let filter_id = body["data"]["filter_id"].as_str().unwrap().to_owned();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let status = self
+                .client
+                .get(format!(
+                    "http://127.0.0.1:{}/api/v1/views/{filter_id}",
+                    self.port
+                ))
+                .send()
+                .unwrap();
+            assert_eq!(status.status(), StatusCode::OK);
+            let details: serde_json::Value = status.json().unwrap();
+            if details["data"]["ready"] == true {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "view did not become ready: {filter_id}"
+            );
+            sleep(Duration::from_millis(500));
+        }
+        let url = self._database.url.clone();
+        let id = filter_id.clone();
+        let pk = with_runtime(async move {
+            let db = Database::connect(&url).await.unwrap();
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT id FROM mega_view_filter WHERE filter_id = $1",
+                    [Value::from(id)],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            row.try_get("", "id").unwrap()
+        });
+        (pk, filter_id)
+    }
+
+    fn table_rows(&self, table: &str) -> Vec<String> {
+        let url = self._database.url.clone();
+        let table = table.to_owned();
+        with_runtime(async move {
+            let db = Database::connect(&url).await.unwrap();
+            db.query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT to_jsonb(t)::text AS row FROM {table} t ORDER BY id"),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get("", "row").unwrap())
+            .collect()
+        })
+    }
+
     fn status(&self, method: Method, path: &str, token: bool, body: Option<&str>) -> StatusCode {
         let mut request = self
             .client
@@ -831,4 +968,155 @@ fn layer3_before_body() {
     assert!(retry.trim().parse::<u32>().unwrap() > 0);
     assert_eq!(case.raw_chunked_status("/project.git/git-upload-pack"), 400);
     assert_eq!(case.filter_state(cold).0, None);
+}
+
+fn rewarm_path(filter_id: &str) -> String {
+    format!("/.filter/{filter_id}.git")
+}
+
+fn rewarm_request(
+    case: &Case,
+    filter_id: &str,
+    kind: u8,
+    token: bool,
+) -> reqwest::blocking::Response {
+    let path = rewarm_path(filter_id);
+    let mut request = match kind {
+        0 | 1 => case.client.get(format!(
+            "http://127.0.0.1:{}{path}/info/refs?service=git-upload-pack",
+            case.port
+        )),
+        2 => case
+            .client
+            .post(format!(
+                "http://127.0.0.1:{}{path}/git-upload-pack",
+                case.port
+            ))
+            .header("content-type", "application/x-git-upload-pack-request")
+            .body(b"0000".to_vec()),
+        _ => panic!("unexpected request kind"),
+    };
+    if kind == 1 {
+        request = request.header("Git-Protocol", "version=2");
+    }
+    if token {
+        request = request.bearer_auth(TOKEN);
+    }
+    request.send().unwrap()
+}
+
+fn rewarm_advertised_tip(response: reqwest::blocking::Response) -> String {
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().unwrap();
+    let locate = |label: &[u8]| {
+        body.windows(label.len())
+            .position(|window| window == label)
+            .map(|offset| {
+                let oid = &body[offset - 40..offset];
+                assert!(oid.iter().all(u8::is_ascii_hexdigit));
+                String::from_utf8(oid.to_vec()).unwrap()
+            })
+            .expect("advertised ref")
+    };
+    let head = locate(b" HEAD");
+    assert_eq!(head, locate(b" refs/heads/main"));
+    assert_ne!(head, "0".repeat(40));
+    head
+}
+
+#[test]
+fn rewarm_on_access_recovers() {
+    let mut case = Case::boot(true, "none", true);
+    case.restart_rewarm(true, true, 100, 10);
+    let filters: Vec<_> = [":/project", ":/doc", ":/release"]
+        .iter()
+        .map(|spec| case.register_filter(spec))
+        .collect();
+    let pks: Vec<_> = filters.iter().map(|(pk, _)| *pk).collect();
+    case.wait_idle(&pks);
+    let original_tips: Vec<_> = filters
+        .iter()
+        .map(|(_, id)| rewarm_advertised_tip(rewarm_request(&case, id, 0, false)))
+        .collect();
+    assert!(original_tips.iter().all(|tip| tip.len() == 40));
+    case.stop_service();
+    for pk in pks {
+        case.recycle(pk);
+    }
+    case.restart_rewarm(true, true, 100, 10);
+    let logs_before = case.table_rows("mega_view_register_log");
+    for (kind, (_, id)) in filters.iter().enumerate() {
+        assert_retry(rewarm_request(&case, id, kind as u8, false));
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    for ((_, id), expected) in filters.iter().zip(original_tips) {
+        loop {
+            let response = rewarm_request(&case, id, 0, false);
+            if response.status() == StatusCode::OK {
+                assert_eq!(rewarm_advertised_tip(response), expected);
+                break;
+            }
+            assert_retry(response);
+            assert!(Instant::now() < deadline, "rewarming did not finish: {id}");
+            sleep(Duration::from_secs(1));
+        }
+    }
+    assert_eq!(case.table_rows("mega_view_register_log"), logs_before);
+}
+
+#[test]
+fn rewarm_rejected_on_access() {
+    let mut case = Case::boot(true, "none", true);
+    case.restart_rewarm(true, true, 100, 10);
+    let (ready_pk, _) = case.register_filter(":/project");
+    let (recycled_pk, recycled_id) = case.register_filter(":/doc");
+    case.wait_idle(&[ready_pk, recycled_pk]);
+    case.stop_service();
+    case.recycle(recycled_pk);
+    case.restart_rewarm(true, true, 1, 10);
+    let before: Vec<_> = ["mega_view_filter", "mega_view", "mega_view_register_log"]
+        .iter()
+        .map(|table| case.table_rows(table))
+        .collect();
+    for kind in 0..3 {
+        assert_retry(rewarm_request(&case, &recycled_id, kind, false));
+    }
+    sleep(Duration::from_secs(3));
+    let after: Vec<_> = ["mega_view_filter", "mega_view", "mega_view_register_log"]
+        .iter()
+        .map(|table| case.table_rows(table))
+        .collect();
+    assert_eq!(before, after);
+    assert_eq!(case.filter_state(recycled_pk), (None, 0, false));
+}
+
+#[test]
+fn rewarm_not_triggered_before_layer3() {
+    let mut case = Case::boot(true, "none", true);
+    case.restart_rewarm(true, true, 100, 10);
+    let (pk, id) = case.register_filter(":/project");
+    case.wait_idle(&[pk]);
+    case.stop_service();
+    case.recycle(pk);
+    let before = case.table_rows("mega_view_filter");
+    case.restart_rewarm(false, true, 100, 10);
+    for kind in 0..3 {
+        assert_eq!(
+            rewarm_request(&case, &id, kind, false).status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    sleep(Duration::from_secs(3));
+    assert_eq!(case.table_rows("mega_view_filter"), before);
+    case.restart_rewarm(true, false, 100, 10);
+    for kind in 0..3 {
+        let expected = if kind == 2 {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        assert_eq!(rewarm_request(&case, &id, kind, false).status(), expected);
+    }
+    sleep(Duration::from_secs(3));
+    assert_eq!(case.table_rows("mega_view_filter"), before);
 }

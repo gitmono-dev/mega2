@@ -487,7 +487,7 @@ DELETE FROM mega_view_root_chain_scan;
 
 `recycle-filter` 与 `rebuild-all` 都有显式事务。`COMMIT` 之前的语句失败时，psql 会停止并断开连接，事务不会提交。recycle-filter 只回收目标过滤器的派生提交映射与对象引用，保留对象以供后续清扫；rebuild-all 清掉全部派生状态。两者把过滤器置为回收态：`projected_seq = 0`，且 `ready_seq`、`warming_since` 为 NULL。worker 只为活跃视图（`ready_seq` 或 `warming_since` 非空）执行 catch_up，因此回收态视图会等待重新预热。clear-root-chain-scan 只清暂存表，不改视图状态；下一次根链扩展会按当前的 `main@/` 重新判定。
 
-三段 SQL 都不用 `TRUNCATE`，不删除 `mega_view_filter`、`mega_view` 或 `mega_view_register_log`，也不改 `last_access_at` 与过滤器定义列。rebuild-all 是全表 `DELETE`，停服窗口随派生行数增长。恢复出口的具体操作由 HP-21 补写，本节不表示任何视图 URL 已可用。
+三段 SQL 都不用 `TRUNCATE`，不删除 `mega_view_filter`、`mega_view` 或 `mega_view_register_log`，也不改 `last_access_at` 与过滤器定义列。rebuild-all 是全表 `DELETE`，停服窗口随派生行数增长。本节只记录停服运维与恢复语义；视图 Git URL 的对象读取尚未开放。
 
 投影停止时，首个失败点会以 ERROR 事件给出。除 message 外，停止告警字段为 `metric=view_projection_stops_total`、`filter_id`、`s`、`commit_id`、`reason`；当 reason 是 `row_absent` 或 `unparsable` 时还带 `tree_id`。例如：`metric=view_projection_stops_total s=7 reason=row_absent`。按 reason 处理：
 
@@ -526,3 +526,11 @@ HTTP 服务即可从已提交水位继续。
 `GET /api/v1/views?name=agent%2Ftask-1` 按名字查询。名字含 `/` 时须百分号编码；省略 `version` 取最新版本，`&version=1` 可指定版本。响应只含 `filter_id`、`name` 与 `version`。
 
 `GET /api/v1/views/metrics` 返回进程内原子计数与实时查询的 `view_cold_start_slots_in_use`。这些元数据端点不鉴权：视图不是路径级读权限边界（ADR-HP-05）。若 `/api/v1` 暴露给不可信网络，应在反向代理处对 `/api/v1/views` 限流；可热调低 `views.max_append_walk` 以限制每次滞后量查询的回走步数，代价是根链扩展的单次预算也降低。
+
+### 13.3 回收态视图的恢复出口
+
+停服执行 `recycle-filter` 或 `rebuild-all` 后，回收态视图有两个恢复出口：以同一 `filter_spec` 再次 `POST /api/v1/views`，或者由读者访问已启用的视图 URL 触发重新预热。再次注册计入该 token（或 `anonymous`）的注册速率，超限返回 429；读者访问不计速率。两个出口都占冷启动名额，并受 `max_filters` 约束。
+
+名额不足时，注册返回 429；读者访问返回 503 与 `Retry-After`。释放名额，或热调高 `max_filters`、`max_concurrent_cold_starts` 后，可以再次访问。预热期间访问同样返回 503 与 `Retry-After`，就绪后恢复宣告。[`views.enabled`](configuration.md) 为 `false` 时访问返回 404，不触发预热。
+
+`recycle-filter` 之后的视图历史与回收前相同；`rebuild-all` 之后的视图历史可能改变，需要公告。

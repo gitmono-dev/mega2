@@ -20,6 +20,7 @@ use crate::{
             util::SaturnEUid,
         },
     },
+    jupiter::storage::view_admission::{AdmitLimits, AdmitOutcome, AdmitRequest},
 };
 
 pub mod http;
@@ -100,6 +101,32 @@ pub(crate) async fn resolve_view_target(
             crate::ceres::view::filter::RecheckFailure::FilterIdMismatch => "filter_id",
         };
         return Err(corrupt_view(filter_pk, &filter_id, failed));
+    }
+    if definition.ready_seq.is_none()
+        && definition.warming_since.is_none()
+        && definition.projected_seq == 0
+    {
+        match view_storage
+            .admit(
+                AdmitRequest::rewarm(filter_pk),
+                AdmitLimits::from(&config.views),
+            )
+            .await
+        {
+            Ok(AdmitOutcome::Admitted { .. }) => {
+                state.storage.view_signal().notify_worker();
+                tracing::info!(filter_id, "view rewarming admitted");
+            }
+            Ok(AdmitOutcome::Idempotent { .. }) => {
+                tracing::debug!(filter_id, "view already rewarming");
+            }
+            Ok(AdmitOutcome::Rejected { reason, .. }) => {
+                tracing::info!(filter_id, ?reason, "view rewarming rejected");
+            }
+            Err(error) => {
+                tracing::warn!(filter_id, %error, "view rewarming failed");
+            }
+        }
     }
     if definition.halted {
         return Err(ProtocolError::ViewUnavailable {
@@ -324,7 +351,10 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use chrono::Utc;
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{
+        ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, Set, Statement,
+        TransactionTrait, Value,
+    };
 
     use super::*;
     use crate::{
@@ -937,6 +967,518 @@ mod tests {
             assert_eq!(log.matches("view definition corrupt").count(), 1, "{log}");
             assert!(log.contains(&filter_id), "{log}");
             assert!(log.contains(&format!("failed=\"{failed}\"")), "{log}");
+        }
+    }
+
+    async fn rewarm_state() -> (tempfile::TempDir, ProtocolApiState) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = crate::config::PushPolicy::Trunk;
+        config.cedar.enforcement = "off".to_owned();
+        config.git.push_auth = Some(PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        config.views.enabled = true;
+        let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+        let connection = crate::jupiter::redis::init_connection(&crate::config::RedisConfig {
+            url: std::env::var("MEGA_REDIS__URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned()),
+        })
+        .await
+        .unwrap();
+        let state = ProtocolApiState {
+            entity_store: storage.entity_store(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection,
+                prefix: "hp21-rewarm".to_owned(),
+            }),
+            storage,
+        };
+        (temp, state)
+    }
+
+    async fn rewarm_filter(
+        state: &ProtocolApiState,
+        pk: i64,
+        spec: &str,
+        state_kind: &str,
+    ) -> String {
+        let canonical = parse_for_registration(spec).unwrap();
+        let filter_id = canonical.filter_id.clone();
+        let (projected_seq, ready_seq, warming_since) = match state_kind {
+            "ready" => (5, Some(5), None),
+            "warming" => (0, None, Some(Utc::now().naive_utc())),
+            "recycled" => (0, None, None),
+            _ => panic!("unexpected filter state"),
+        };
+        mega_view_filter::ActiveModel {
+            id: Set(pk),
+            filter_id: Set(filter_id.clone()),
+            canonical_spec: Set(canonical.canonical_text),
+            algo_version: Set(1),
+            object_format: Set("sha1".to_owned()),
+            src_paths: Set(serde_json::json!([format!(
+                "/{}",
+                spec.trim_start_matches(":/")
+            )])),
+            push_enabled: Set(false),
+            projected_seq: Set(projected_seq),
+            ready_seq: Set(ready_seq),
+            warming_since: Set(warming_since),
+            last_access_at: Set(None),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(state.storage.view_storage().get_connection())
+        .await
+        .unwrap();
+        filter_id
+    }
+
+    async fn rewarm_rows(state: &ProtocolApiState) -> Vec<Vec<String>> {
+        let views = state.storage.view_storage();
+        let db = views.get_connection();
+        let mut tables = Vec::new();
+        for table in ["mega_view_filter", "mega_view", "mega_view_register_log"] {
+            let rows = db
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    format!("SELECT to_jsonb(t)::text AS row FROM {table} t ORDER BY id"),
+                ))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.try_get("", "row").unwrap())
+                .collect();
+            tables.push(rows);
+        }
+        tables
+    }
+
+    fn assert_rewarm_unavailable(
+        result: Result<ResolvedView, ProtocolError>,
+        expected_id: &str,
+        expected_reason: ViewUnavailableReason,
+    ) {
+        assert!(
+            matches!(result, Err(ProtocolError::ViewUnavailable { filter_id, reason }) if filter_id == expected_id && reason == expected_reason)
+        );
+    }
+
+    async fn assert_rewarm_signal(state: &ProtocolApiState, expected: bool) {
+        let signaled = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            state.storage.view_signal().notified(),
+        )
+        .await
+        .is_ok();
+        assert_eq!(signaled, expected);
+    }
+
+    async fn capture_rewarm_tracing<F: std::future::Future>(future: F) -> (F::Output, String) {
+        use std::{io::Write, sync::Mutex};
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl MakeWriter<'_> for Writer {
+            type Writer = Writer;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(Writer(bytes.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let result = future.await;
+        drop(guard);
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        (result, output)
+    }
+
+    fn assert_only_warming_changed(before: &str, after: &str) {
+        let mut before: serde_json::Value = serde_json::from_str(before).unwrap();
+        let mut after: serde_json::Value = serde_json::from_str(after).unwrap();
+        assert_eq!(
+            before.as_object_mut().unwrap().remove("warming_since"),
+            Some(serde_json::Value::Null)
+        );
+        assert!(
+            after
+                .as_object_mut()
+                .unwrap()
+                .remove("warming_since")
+                .is_some_and(|value| !value.is_null())
+        );
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn rewarm_admitted_marks_warming_and_signals() {
+        let (_temp, state) = rewarm_state().await;
+        let id = rewarm_filter(&state, 1001, ":/a", "recycled").await;
+        let views = state.storage.view_storage();
+        let db = views.get_connection();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO mega_view_register_log (requester, created_at) VALUES ($1, now() - interval '2 hours')",
+            [Value::from("anonymous")],
+        ))
+        .await
+        .unwrap();
+        let before = rewarm_rows(&state).await;
+        assert_rewarm_unavailable(
+            resolve_view_target(&state, &ViewLocator::FilterId(id.clone())).await,
+            &id,
+            ViewUnavailableReason::WarmingUp,
+        );
+        let after = rewarm_rows(&state).await;
+        assert_only_warming_changed(&before[0][0], &after[0][0]);
+        assert_eq!(after[1..], before[1..]);
+        let filter = mega_view_filter::Entity::find_by_id(1001)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(filter.warming_since.is_some());
+        assert_eq!(filter.projected_seq, 0);
+        assert_eq!(filter.ready_seq, None);
+        assert_eq!(filter.last_access_at, None);
+        assert_rewarm_signal(&state, true).await;
+        assert_rewarm_unavailable(
+            resolve_view_target(&state, &ViewLocator::FilterId(id.clone())).await,
+            &id,
+            ViewUnavailableReason::WarmingUp,
+        );
+        assert_eq!(after, rewarm_rows(&state).await);
+        assert_rewarm_signal(&state, false).await;
+
+        let (_halt_temp, halted) = rewarm_state().await;
+        let halted_id = rewarm_filter(&halted, 1002, ":/b", "recycled").await;
+        halted
+            .storage
+            .view_storage()
+            .get_connection()
+            .execute_raw(Statement::from_string(
+                DbBackend::Postgres,
+                format!("INSERT INTO mega_view_root_chain_scan (pos, commit_id, tree_id, parent_count, first_parent) VALUES (1, '{}', '{}', 2, '{}')", "a".repeat(40), "b".repeat(40), "c".repeat(40)),
+            ))
+            .await
+            .unwrap();
+        assert_rewarm_unavailable(
+            resolve_view_target(&halted, &ViewLocator::FilterId(halted_id.clone())).await,
+            &halted_id,
+            ViewUnavailableReason::RootChainHalted,
+        );
+        let filter = mega_view_filter::Entity::find_by_id(1002)
+            .one(halted.storage.view_storage().get_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(filter.warming_since.is_some());
+        assert_rewarm_signal(&halted, true).await;
+    }
+
+    async fn rewarm_waiter(holder: &sea_orm::DatabaseTransaction) -> Option<i32> {
+        for _ in 0..1000 {
+            let row = holder
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                     AND classid = $1::int4::oid \
+                     AND objid = hashtext(current_schema() || ':' || 'register')::oid \
+                     AND objsubid = 2",
+                    [Value::from(
+                        crate::jupiter::storage::view_storage::VIEW_LOCK_NS,
+                    )],
+                ))
+                .await
+                .unwrap();
+            if let Some(row) = row {
+                return Some(row.try_get("", "pid").unwrap());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn rewarm_not_admitted_still_unavailable() {
+        for (limit, active_kind) in [("max_filters", "ready"), ("cold_slots", "warming")] {
+            let (_temp, state) = rewarm_state().await;
+            let mut config = state.storage.config().as_ref().clone();
+            if limit == "max_filters" {
+                config.views.max_filters = 1;
+            } else {
+                config.views.max_concurrent_cold_starts = 1;
+            }
+            state.storage.config_handle().reload(config).unwrap();
+            rewarm_filter(&state, 1100, ":/a", active_kind).await;
+            let id = rewarm_filter(&state, 1101, ":/b", "recycled").await;
+            let before = rewarm_rows(&state).await;
+            let (result, output) = capture_rewarm_tracing(resolve_view_target(
+                &state,
+                &ViewLocator::FilterId(id.clone()),
+            ))
+            .await;
+            assert_rewarm_unavailable(result, &id, ViewUnavailableReason::WarmingUp);
+            assert!(output.contains(&id), "{output}");
+            assert!(output.contains("view rewarming rejected"), "{output}");
+            let reason = if limit == "max_filters" {
+                "MaxFilters"
+            } else {
+                "ColdStartSlots"
+            };
+            assert!(output.contains(reason), "{output}");
+            assert_eq!(before, rewarm_rows(&state).await);
+            assert_rewarm_signal(&state, false).await;
+        }
+
+        let (_temp, state) = rewarm_state().await;
+        let id = rewarm_filter(&state, 1201, ":/a", "recycled").await;
+        let before = rewarm_rows(&state).await;
+        let views = state.storage.view_storage();
+        let db = views.get_connection();
+        let holder = db.begin().await.unwrap();
+        crate::jupiter::storage::view_storage::acquire_view_lock(
+            &holder,
+            crate::jupiter::storage::view_storage::ViewLock::Register,
+            crate::jupiter::storage::view_storage::ViewLockMode::Blocking,
+        )
+        .await
+        .unwrap();
+        let locator = ViewLocator::FilterId(id.clone());
+        let ((result, observed), output) = capture_rewarm_tracing(async {
+            tokio::join!(resolve_view_target(&state, &locator), async {
+                let pid = rewarm_waiter(&holder).await;
+                if let Some(pid) = pid {
+                    let row = holder
+                        .query_one_raw(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "SELECT pg_cancel_backend($1) AS cancelled",
+                            [Value::from(pid)],
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(row.try_get::<bool>("", "cancelled").unwrap());
+                }
+                holder.rollback().await.unwrap();
+                pid.is_some()
+            })
+        })
+        .await;
+        assert!(observed, "admission did not wait for register lock");
+        assert_rewarm_unavailable(result, &id, ViewUnavailableReason::WarmingUp);
+        assert!(
+            output.lines().any(|line| line.contains("WARN")
+                && line.contains("view rewarming failed")
+                && line.contains(&id)),
+            "{output}"
+        );
+        assert_eq!(before, rewarm_rows(&state).await);
+        assert_rewarm_signal(&state, false).await;
+
+        let (_temp, state) = rewarm_state().await;
+        let id = rewarm_filter(&state, 1301, ":/a", "recycled").await;
+        let before = rewarm_rows(&state).await;
+        let views = state.storage.view_storage();
+        let db = views.get_connection();
+        let holder = db.begin().await.unwrap();
+        crate::jupiter::storage::view_storage::acquire_view_lock(
+            &holder,
+            crate::jupiter::storage::view_storage::ViewLock::Register,
+            crate::jupiter::storage::view_storage::ViewLockMode::Blocking,
+        )
+        .await
+        .unwrap();
+        let locator = ViewLocator::FilterId(id.clone());
+        let (result, written) = tokio::join!(resolve_view_target(&state, &locator), async {
+            let pid = rewarm_waiter(&holder).await;
+            if pid.is_some() {
+                let row = holder
+                    .query_one_raw(Statement::from_string(
+                        DbBackend::Postgres,
+                        "UPDATE mega_view_filter SET warming_since = now() WHERE id = 1301 RETURNING warming_since",
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let written: chrono::NaiveDateTime = row.try_get("", "warming_since").unwrap();
+                holder.commit().await.unwrap();
+                Some(written)
+            } else {
+                holder.rollback().await.unwrap();
+                None
+            }
+        });
+        let written = written.expect("admission did not wait for register lock");
+        assert_rewarm_unavailable(result, &id, ViewUnavailableReason::WarmingUp);
+        let after = rewarm_rows(&state).await;
+        assert_only_warming_changed(&before[0][0], &after[0][0]);
+        assert_eq!(after[1..], before[1..]);
+        let filter = mega_view_filter::Entity::find_by_id(1301)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(filter.warming_since, Some(written));
+        assert_eq!(filter.ready_seq, None);
+        assert_eq!(filter.projected_seq, 0);
+        assert_rewarm_signal(&state, false).await;
+    }
+
+    #[tokio::test]
+    async fn rewarm_limits_follow_reload() {
+        let (_temp, state) = rewarm_state().await;
+        let mut config = state.storage.config().as_ref().clone();
+        config.views.max_concurrent_cold_starts = 1;
+        state.storage.config_handle().reload(config).unwrap();
+        rewarm_filter(&state, 1400, ":/a", "warming").await;
+        let x = rewarm_filter(&state, 1401, ":/b", "recycled").await;
+        let y = rewarm_filter(&state, 1402, ":/c", "recycled").await;
+
+        assert_rewarm_unavailable(
+            resolve_view_target(&state, &ViewLocator::FilterId(x.clone())).await,
+            &x,
+            ViewUnavailableReason::WarmingUp,
+        );
+        let views = state.storage.view_storage();
+        let db = views.get_connection();
+        assert!(
+            mega_view_filter::Entity::find_by_id(1401)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .warming_since
+                .is_none()
+        );
+        assert_rewarm_signal(&state, false).await;
+
+        let mut config = state.storage.config().as_ref().clone();
+        config.views.max_concurrent_cold_starts = 2;
+        let report = state.storage.config_handle().reload(config).unwrap();
+        assert!(
+            report
+                .applied_fields
+                .contains(&"views.max_concurrent_cold_starts")
+        );
+        assert_rewarm_unavailable(
+            resolve_view_target(&state, &ViewLocator::FilterId(x.clone())).await,
+            &x,
+            ViewUnavailableReason::WarmingUp,
+        );
+        assert!(
+            mega_view_filter::Entity::find_by_id(1401)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .warming_since
+                .is_some()
+        );
+        assert_rewarm_signal(&state, true).await;
+
+        let mut config = state.storage.config().as_ref().clone();
+        config.views.max_concurrent_cold_starts = 10;
+        config.views.max_filters = 2;
+        let report = state.storage.config_handle().reload(config).unwrap();
+        assert!(report.applied_fields.contains(&"views.max_filters"));
+        assert_rewarm_unavailable(
+            resolve_view_target(&state, &ViewLocator::FilterId(y.clone())).await,
+            &y,
+            ViewUnavailableReason::WarmingUp,
+        );
+        assert!(
+            mega_view_filter::Entity::find_by_id(1402)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .warming_since
+                .is_none()
+        );
+        assert_rewarm_signal(&state, false).await;
+    }
+
+    #[tokio::test]
+    async fn rewarm_skipped_for_corrupt_definition() {
+        let (_temp, state) = rewarm_state().await;
+        let views = state.storage.view_storage();
+        let db = views.get_connection();
+        for (index, failed) in [
+            "canonical_spec",
+            "algo_version",
+            "object_format",
+            "filter_id",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let pk = 1500 + index as i64;
+            let spec = format!(":/{}", (b'a' + index as u8) as char);
+            let mut id = rewarm_filter(&state, pk, &spec, "recycled").await;
+            match *failed {
+                "canonical_spec" => {
+                    db.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "UPDATE mega_view_filter SET canonical_spec = $1 WHERE id = $2",
+                        [Value::from(format!("{spec}/")), Value::from(pk)],
+                    ))
+                    .await
+                    .unwrap();
+                }
+                "algo_version" => {
+                    db.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "UPDATE mega_view_filter SET algo_version = 2 WHERE id = $1",
+                        [Value::from(pk)],
+                    ))
+                    .await
+                    .unwrap();
+                }
+                "object_format" => {
+                    db.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "UPDATE mega_view_filter SET object_format = 'sha256' WHERE id = $1",
+                        [Value::from(pk)],
+                    ))
+                    .await
+                    .unwrap();
+                }
+                "filter_id" => {
+                    id.replace_range(..1, if id.starts_with('0') { "1" } else { "0" });
+                    db.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "UPDATE mega_view_filter SET filter_id = $1 WHERE id = $2",
+                        [Value::from(id.clone()), Value::from(pk)],
+                    ))
+                    .await
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = rewarm_rows(&state).await;
+            assert_rewarm_unavailable(
+                resolve_view_target(&state, &ViewLocator::FilterId(id.clone())).await,
+                &id,
+                ViewUnavailableReason::DefinitionCorrupt,
+            );
+            assert_eq!(before, rewarm_rows(&state).await);
+            assert_rewarm_signal(&state, false).await;
         }
     }
 }

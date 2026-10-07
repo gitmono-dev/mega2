@@ -38,6 +38,7 @@
 12. §6.1 的 SSH 错误写出点不能继续按事实基线的旧位置查找：`channel_eof` 在 `src/contract/git_protocol/ssh.rs:425` 固定发退出码 0，upload-pack 与 v2 错误的裸文本写出点见 `src/contract/git_protocol/ssh.rs:602`、`src/contract/git_protocol/ssh.rs:669`、`src/contract/git_protocol/ssh.rs:680`、`src/contract/git_protocol/ssh.rs:695`；此处的修正仅定位源码，不提前改变错误契约。
 13. 执行计划「测试」行把 `GIT_CLI_UNAVAILABLE` 标在 `tests/common/git_cli.rs` 约 L20、runner 不可用分支标在约 L440–448；端口分配改造后，常量在 `tests/common/git_cli.rs:21`，该分支在 `tests/common/git_cli.rs:482-537`，仍会在未启用宿主 opt-in 且容器不可用时 panic。
 14. 执行计划「文档」行的 `docs/refactoring/integration.md` 迁移覆盖锚点原为 L129–150；增加 compose 黑盒覆盖表后，迁移覆盖章节从 `docs/refactoring/integration.md:143-164` 开始，原行号不再定位该节。
+15. §6.1 第 3 层的读者触发重新预热未标（P1），但 §3.3、§7.5 与 §7.4 的阶段描述指向 P1。按执行计划 HP-21 与 ADR-HP-08，P0 实现读者触发的准入；本条只校准阶段归属，不改设计正文的算法与错误契约。
 
 ## 当前实现状态速览表
 
