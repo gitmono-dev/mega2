@@ -219,8 +219,8 @@ impl PostgresMetadataGenerationRepository {
             // Reuse only already LIVE graph rows. RESERVED pages without a graph
             // are protected by the durable mappings, without inventing a DAG.
             txn.execute_raw(statement(
-                "INSERT INTO mst2_retention_root(node_id,root_key,root_kind)
-                 SELECT l.node_id,'prepare:'||p.prepare_id,'prepare'
+                "INSERT INTO mst2_retention_root(node_id,root_key,root_kind,created_at)
+                 SELECT l.node_id,'prepare:'||p.prepare_id,'prepare',now()
                  FROM mst2_metadata_prepare_page p JOIN mst2_metadata_lifetime l
                    ON l.page_id=p.page_id AND l.generation=p.generation
                  JOIN mst2_retention_node n ON n.node_id=l.node_id AND n.state='LIVE'

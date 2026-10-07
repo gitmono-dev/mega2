@@ -167,8 +167,8 @@ impl PostgresRetentionRepository {
                 return Err(integrity("retention root is bound to another DAG or kind"));
             }
             savepoint.execute_raw(statement(
-                "INSERT INTO mst2_retention_root(node_id,root_key,root_kind)
-                 SELECT $1,p.key,p.kind FROM jsonb_to_recordset($2::jsonb) AS p(key text,kind text)
+                "INSERT INTO mst2_retention_root(node_id,root_key,root_kind,created_at)
+                 SELECT $1,p.key,p.kind,now() FROM jsonb_to_recordset($2::jsonb) AS p(key text,kind text)
                  ON CONFLICT(node_id,root_key) DO NOTHING",[node_id.into(),encoded.into()],
             )).await.map_err(internal)?;
             Ok(())

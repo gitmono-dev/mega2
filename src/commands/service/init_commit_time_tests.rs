@@ -113,7 +113,7 @@ async fn fixture() -> Fixture {
     let (database, schema) = test_db_config(directory.path()).await;
     let mut config = isolated_config(directory.path().join("config"));
     config.database = database;
-    config.monorepo.root_dirs = vec!["bench".to_string()];
+    config.monorepo.root_dirs = vec!["bench".to_string(), "third-party".to_string()];
     config.redis.url = "redis://127.0.0.1:1".to_string();
     let args = cli()
         .try_get_matches_from(["init", "--yes", "--commit-time", "1790000000"])
