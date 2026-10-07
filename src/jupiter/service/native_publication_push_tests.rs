@@ -106,7 +106,10 @@ async fn maintenance_cannot_reinitialize_published_history_after_head_loss() {
     mono.get_connection().execute_unprepared("DELETE FROM mst2_native_head").await.unwrap();
     for instance in [NATIVE_INSTANCE, "11111111-2222-4333-8444-555555555555"] {
         let error = mono.initialize_native_publication_for_maintenance(instance, &head.root).await.unwrap_err();
-        assert!(error.to_string().contains("native publication history exists"));
+        assert!(error.to_string().contains("native publication history exists"), "rejected initialization for {instance}: {error}");
+        let released = mono.get_connection().begin().await.unwrap();
+        assert!(PushQueueStorage::try_mono_write_lock(&released).await.unwrap(), "rejected initialization must release the mono write lock before returning");
+        released.rollback().await.unwrap();
     }
     assert_eq!(mst2_native_head::Entity::find().count(mono.get_connection()).await.unwrap(), 0);
     assert_eq!(mst2_native_publication::Entity::find().all(mono.get_connection()).await.unwrap(), certificates);
@@ -116,7 +119,10 @@ async fn maintenance_cannot_reinitialize_published_history_after_head_loss() {
     mono.get_connection().execute_unprepared("DELETE FROM mst2_native_publication").await.unwrap();
     for instance in [NATIVE_INSTANCE, "11111111-2222-4333-8444-555555555555"] {
         let error = mono.initialize_native_publication_for_maintenance(instance, &head.root).await.unwrap_err();
-        assert!(error.to_string().contains("native publication history exists"));
+        assert!(error.to_string().contains("native publication history exists"), "rejected initialization for {instance}: {error}");
+        let released = mono.get_connection().begin().await.unwrap();
+        assert!(PushQueueStorage::try_mono_write_lock(&released).await.unwrap(), "rejected initialization must release the mono write lock before returning");
+        released.rollback().await.unwrap();
     }
     assert_eq!(mst2_native_head::Entity::find().count(mono.get_connection()).await.unwrap(), 0);
     assert_eq!(mst2_native_publication::Entity::find().count(mono.get_connection()).await.unwrap(), 0);

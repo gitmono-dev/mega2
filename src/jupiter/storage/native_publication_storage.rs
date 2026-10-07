@@ -351,6 +351,7 @@ impl MonoStorage {
             .await?
             .ok_or_else(|| integrity("native history observation missing"))?;
         if history.try_get::<bool>("", "present")? {
+            txn.rollback().await?;
             return Err(integrity(
                 "native publication history exists; initialization cannot repair or replace it",
             ));
