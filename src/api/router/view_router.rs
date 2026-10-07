@@ -1,12 +1,14 @@
+use std::time::Duration;
+
 use anyhow::anyhow;
 use axum::{
     Json,
-    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
@@ -27,6 +29,11 @@ use crate::{
 };
 
 const REGISTER_BODY_LIMIT: usize = 65_536;
+const REGISTER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const REGISTER_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const REGISTER_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const VIEW_REGISTER: &str = "View registration";
 
 #[derive(Deserialize, ToSchema)]
@@ -43,9 +50,42 @@ struct RegisterViewResponse {
     ready: bool,
 }
 
+#[derive(Default, Deserialize, IntoParams)]
+struct RegisterWaitQuery {
+    #[serde(default)]
+    wait: bool,
+}
+
+#[derive(Deserialize, IntoParams)]
+struct ViewNameQuery {
+    name: String,
+    version: Option<i32>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ViewStatusResponse {
+    filter_id: String,
+    canonical_spec: String,
+    src_paths: serde_json::Value,
+    push_enabled: bool,
+    ready: bool,
+    projected_seq: i64,
+    lag_commits: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ViewByNameResponse {
+    filter_id: String,
+    name: String,
+    version: i32,
+}
+
 pub(crate) fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
         .routes(routes!(register_view))
+        .routes(routes!(get_view_by_name))
+        .routes(routes!(get_view_status))
+        .routes(routes!(get_view_metrics))
         .layer(DefaultBodyLimit::max(REGISTER_BODY_LIMIT))
 }
 
@@ -110,6 +150,7 @@ fn rejection_message(reason: RejectReason) -> &'static str {
 #[utoipa::path(
     post,
     path = "/views",
+    params(RegisterWaitQuery),
     request_body(content = RegisterViewRequest, content_type = "application/json"),
     responses(
         (status = 200, body = CommonResult<RegisterViewResponse>, content_type = "application/json"),
@@ -123,6 +164,7 @@ fn rejection_message(reason: RejectReason) -> &'static str {
 async fn register_view(
     State(state): State<MonoApiServiceState>,
     headers: HeaderMap,
+    Query(query): Query<RegisterWaitQuery>,
     request: Result<Json<RegisterViewRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let config = state.storage.config();
@@ -178,6 +220,12 @@ async fn register_view(
         .map_err(ApiError::internal)?;
     match outcome {
         AdmitOutcome::Admitted { version, ready } | AdmitOutcome::Idempotent { version, ready } => {
+            state.storage.view_signal().notify_worker();
+            let ready = if query.wait && !ready {
+                wait_for_view_ready(&state, &canonical.filter_id).await?
+            } else {
+                ready
+            };
             Ok(Json(CommonResult::success(Some(RegisterViewResponse {
                 filter_id: canonical.filter_id,
                 name: request.name,
@@ -205,9 +253,120 @@ async fn register_view(
     }
 }
 
+async fn wait_for_view_ready(
+    state: &MonoApiServiceState,
+    filter_id: &str,
+) -> Result<bool, ApiError> {
+    let started = tokio::time::Instant::now();
+    while let Some(remaining) = REGISTER_WAIT_TIMEOUT.checked_sub(started.elapsed()) {
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(remaining.min(REGISTER_WAIT_POLL_INTERVAL)).await;
+        let row = state
+            .storage
+            .view_storage()
+            .get_filter_by_filter_id(filter_id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::internal(anyhow!("registered view filter disappeared")))?;
+        if row.ready_seq.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[utoipa::path(
+    get,
+    path = "/views/{filter_id}",
+    params(("filter_id" = String, Path, description = "64-character lowercase hexadecimal filter ID")),
+    responses(
+        (status = 200, body = CommonResult<ViewStatusResponse>, content_type = "application/json"),
+        (status = 404, body = CommonResult<ViewStatusResponse>, content_type = "application/json")
+    ),
+    tag = VIEW_REGISTER
+)]
+async fn get_view_status(
+    State(state): State<MonoApiServiceState>,
+    Path(filter_id): Path<String>,
+) -> Result<Json<CommonResult<ViewStatusResponse>>, ApiError> {
+    if filter_id.len() != 64
+        || !filter_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ApiError::not_found(anyhow!("view not found")));
+    }
+    let config = state.storage.config();
+    let row = state
+        .storage
+        .view_storage()
+        .view_status(&filter_id, config.views.max_append_walk)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(anyhow!("view not found")))?;
+    Ok(Json(CommonResult::success(Some(ViewStatusResponse {
+        filter_id,
+        canonical_spec: row.canonical_spec,
+        src_paths: row.src_paths,
+        push_enabled: row.push_enabled,
+        ready: row.ready,
+        projected_seq: row.projected_seq,
+        lag_commits: row.lag_commits,
+    }))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/views",
+    params(ViewNameQuery),
+    responses(
+        (status = 200, body = CommonResult<ViewByNameResponse>, content_type = "application/json"),
+        (status = 404, body = CommonResult<ViewByNameResponse>, content_type = "application/json")
+    ),
+    tag = VIEW_REGISTER
+)]
+async fn get_view_by_name(
+    State(state): State<MonoApiServiceState>,
+    Query(query): Query<ViewNameQuery>,
+) -> Result<Json<CommonResult<ViewByNameResponse>>, ApiError> {
+    let row = state
+        .storage
+        .view_storage()
+        .find_view_by_name(&query.name, query.version)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(anyhow!("view not found")))?;
+    Ok(Json(CommonResult::success(Some(ViewByNameResponse {
+        filter_id: row.filter_id,
+        name: row.name,
+        version: row.version,
+    }))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/views/metrics",
+    responses((status = 200, body = CommonResult<crate::jupiter::service::view_metrics::ViewMetricsSnapshot>, content_type = "application/json")),
+    tag = VIEW_REGISTER
+)]
+async fn get_view_metrics(
+    State(state): State<MonoApiServiceState>,
+) -> Result<Json<CommonResult<crate::jupiter::service::view_metrics::ViewMetricsSnapshot>>, ApiError>
+{
+    let snapshot = state
+        .storage
+        .view_projection_service()
+        .metrics_snapshot()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(CommonResult::success(Some(snapshot))))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, convert::Infallible, sync::Arc};
+    use std::{collections::HashMap, convert::Infallible, str::FromStr, sync::Arc};
 
     use axum::{
         Router,
@@ -215,6 +374,7 @@ mod tests {
         http::{Request, header},
     };
     use futures::stream;
+    use git_internal::hash::{HashKind, ObjectHash};
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     use serde_json::{Value, json};
     use tower::ServiceExt;
@@ -227,7 +387,16 @@ mod tests {
         config::{Config, PushPolicy, PushTokenConfig, testing::isolated_config},
         contract::policy::entitystore::SharedEntityStore,
         jupiter::{
-            storage::{Storage, base_storage::StorageConnector},
+            storage::{
+                Storage,
+                base_storage::StorageConnector,
+                view_storage::ViewLockMode,
+                view_test_fixtures::{
+                    cas_fixture_main, seed_linear_root_history,
+                    seed_missing_first_parent_root_commit, seed_multi_parent_root_commit,
+                    seed_single_parent_root_commit, seed_unrelated_root_history, set_fixture_main,
+                },
+            },
             tests::test_storage_with_config,
         },
     };
@@ -236,6 +405,8 @@ mod tests {
     const PROJECT: &str = "Bearer hp15-project-secret";
     const SEC: &str = "Bearer hp15-sec-secret";
     const AB: &str = "Bearer hp15-ab-secret";
+    const ROOT33: &str = "Bearer hp33-root-secret";
+    const PROJECT33: &str = "Bearer hp33-project-secret";
 
     struct Harness {
         _temp: tempfile::TempDir,
@@ -290,6 +461,64 @@ mod tests {
             storage,
             app,
         }
+    }
+
+    async fn harness33(configure: impl FnOnce(&mut Config)) -> Harness {
+        harness(|config| {
+            config.git.push_tokens = [
+                ("hp33-root", "/", "hp33-root-secret"),
+                ("hp33-project", "/project", "hp33-project-secret"),
+            ]
+            .into_iter()
+            .map(|(name, path, token)| PushTokenConfig {
+                name: name.to_owned(),
+                token: token.to_owned(),
+                paths: Some(vec![path.to_owned()]),
+            })
+            .collect();
+            configure(config);
+        })
+        .await
+    }
+
+    async fn get(harness: &Harness, uri: &str) -> (StatusCode, Value) {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn register_wait(
+        harness: &Harness,
+        filter_spec: &str,
+        auth: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Value) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/views?wait=true")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(auth) = auth {
+            request = request.header(header::AUTHORIZATION, auth);
+        }
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(json!({"filter_spec": filter_spec}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, headers, serde_json::from_slice(&bytes).unwrap())
     }
 
     async fn send(
@@ -857,5 +1086,522 @@ mod tests {
             snapshot(&anonymous.storage).await[2][0]["requester"],
             "anonymous"
         );
+    }
+
+    #[tokio::test]
+    async fn get_by_filter_id_fields() {
+        let h = harness33(|_| {}).await;
+        for spec in [
+            ":/a",
+            ":exclude[::secret]",
+            ":/a:[:/b:prefix=x,:/c:prefix=y]",
+        ] {
+            let (status, _, registered) = register(&h, spec, None, Some(ROOT33)).await;
+            assert_response(status, &registered, StatusCode::OK);
+            let filter_id = registered["data"]["filter_id"].as_str().unwrap();
+            let (status, response) = get(&h, &format!("/api/v1/views/{filter_id}")).await;
+            assert_response(status, &response, StatusCode::OK);
+            let data = response["data"].as_object().unwrap();
+            let mut keys = data.keys().map(String::as_str).collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "canonical_spec",
+                    "filter_id",
+                    "lag_commits",
+                    "projected_seq",
+                    "push_enabled",
+                    "ready",
+                    "src_paths",
+                ]
+            );
+            let canonical = parse_for_registration(spec).unwrap();
+            let check =
+                validate_for_registration(&canonical.filter, &h.storage.config().monorepo).unwrap();
+            assert_eq!(data["filter_id"], filter_id);
+            assert_eq!(data["canonical_spec"], canonical.canonical_text);
+            assert_eq!(data["src_paths"], json!(check.src_paths));
+            assert_eq!(data["push_enabled"], check.push_enabled);
+            assert_eq!(data["ready"], false);
+            assert_eq!(data["projected_seq"], 0);
+            assert!(data["lag_commits"].is_null() || data["lag_commits"].is_i64());
+            if spec == ":exclude[::secret]" {
+                assert_eq!(data["src_paths"], json!(["/"]));
+                assert_eq!(data["push_enabled"], false);
+            }
+            h.storage
+                .view_storage()
+                .get_connection()
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE mega_view_filter SET projected_seq = 1, ready_seq = 1 WHERE filter_id = $1",
+                    [sea_orm::Value::from(filter_id.to_owned())],
+                ))
+                .await
+                .unwrap();
+            let (status, response) = get(&h, &format!("/api/v1/views/{filter_id}")).await;
+            assert_response(status, &response, StatusCode::OK);
+            assert_eq!(response["data"]["ready"], true);
+            assert_eq!(response["data"]["projected_seq"], 1);
+        }
+        for filter_id in ["0".repeat(64), "not-a-filter-id".to_owned()] {
+            let (status, response) = get(&h, &format!("/api/v1/views/{filter_id}")).await;
+            assert_response(status, &response, StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_by_name_version() {
+        let h = harness33(|_| {}).await;
+        let mut ids = Vec::new();
+        for spec in [":/project/a", ":/project/b"] {
+            let (status, _, response) =
+                register(&h, spec, Some("agent/task-1"), Some(ROOT33)).await;
+            assert_response(status, &response, StatusCode::OK);
+            ids.push(response["data"]["filter_id"].as_str().unwrap().to_owned());
+        }
+        for (uri, id, version) in [
+            ("/api/v1/views?name=agent%2Ftask-1", &ids[1], 2),
+            ("/api/v1/views?name=agent%2Ftask-1&version=1", &ids[0], 1),
+        ] {
+            let (status, response) = get(&h, uri).await;
+            assert_response(status, &response, StatusCode::OK);
+            assert_eq!(
+                response["data"],
+                json!({"filter_id": id, "name": "agent/task-1", "version": version})
+            );
+        }
+        for uri in [
+            "/api/v1/views?name=no-such-view",
+            "/api/v1/views?name=agent%2Ftask-1&version=3",
+        ] {
+            let (status, response) = get(&h, uri).await;
+            assert_response(status, &response, StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_unauthenticated() {
+        let h = harness33(|_| {}).await;
+        let (status, _, response) = register(&h, ":/project/a", None, Some(ROOT33)).await;
+        assert_response(status, &response, StatusCode::OK);
+        let (status, response) = get(&h, "/api/v1/views/metrics").await;
+        assert_response(status, &response, StatusCode::OK);
+        let expected = h
+            .storage
+            .view_projection_service()
+            .metrics_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(response["data"], serde_json::to_value(expected).unwrap());
+        assert_eq!(response["data"]["view_cold_start_slots_in_use"], 1);
+        h.storage.view_metrics().increment_batch_premise_failures();
+        let (status, response) = get(&h, "/api/v1/views/metrics").await;
+        assert_response(status, &response, StatusCode::OK);
+        assert_eq!(response["data"]["view_batch_premise_failures_total"], 1);
+    }
+
+    async fn drain_signal(storage: &Storage) {
+        let _ =
+            tokio::time::timeout(Duration::from_millis(10), storage.view_signal().notified()).await;
+    }
+
+    async fn assert_admitted_signal(
+        h: &Harness,
+        spec: &str,
+        name: Option<&str>,
+        wait: bool,
+        expected_view: Option<(&str, i32)>,
+        expect_warming: bool,
+    ) -> Value {
+        drain_signal(&h.storage).await;
+        let filter_id = parse_for_registration(spec).unwrap().filter_id;
+        let signal = h.storage.view_signal();
+        let committed = async {
+            if expect_warming || expected_view.is_some() {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let row = h
+                                .storage
+                                .view_storage()
+                                .get_filter_by_filter_id(&filter_id)
+                                .await
+                                .unwrap();
+                            let filter_committed = row
+                                .as_ref()
+                                .is_some_and(|row| !expect_warming || row.warming_since.is_some());
+                            let view_committed = if let Some((name, version)) = expected_view {
+                                h.storage
+                                    .view_storage()
+                                    .find_view_by_name(name, Some(version))
+                                    .await
+                                    .unwrap()
+                                    .is_some_and(|view| view.filter_id == filter_id)
+                            } else {
+                                true
+                            };
+                            if filter_committed && view_committed {
+                                break tokio::time::Instant::now();
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                None
+            }
+        };
+        let observed = async {
+            let deadline = if expect_warming || expected_view.is_some() {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_secs(1)
+            };
+            tokio::time::timeout(deadline, signal.notified())
+                .await
+                .unwrap();
+            let woke_at = tokio::time::Instant::now();
+            let row = h
+                .storage
+                .view_storage()
+                .get_filter_by_filter_id(&filter_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if expect_warming {
+                assert!(row.warming_since.is_some());
+            }
+            if let Some((name, version)) = expected_view {
+                let view = h
+                    .storage
+                    .view_storage()
+                    .find_view_by_name(name, Some(version))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(view.filter_pk, row.id);
+                assert_eq!(view.filter_id, filter_id);
+                assert_eq!(view.version, version);
+            }
+            woke_at
+        };
+        let (response, woke_at, committed_at) = if wait {
+            tokio::join!(register_wait(h, spec, Some(ROOT33)), observed, committed)
+        } else {
+            tokio::join!(register(h, spec, name, Some(ROOT33)), observed, committed)
+        };
+        if let Some(committed_at) = committed_at {
+            assert!(woke_at <= committed_at + Duration::from_secs(1));
+        }
+        assert_response(response.0, &response.2, StatusCode::OK);
+        response.2
+    }
+
+    #[tokio::test]
+    async fn wait_true_blocks_until_ready_or_timeout() {
+        let h = harness33(|_| {}).await;
+        drain_signal(&h.storage).await;
+        let signal = h.storage.view_signal();
+        let storage = h.storage.clone();
+        let filter_id = parse_for_registration(":/project/ready").unwrap().filter_id;
+        let updater = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), signal.notified())
+                .await
+                .unwrap();
+            let result = storage
+                .view_storage()
+                .get_connection()
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE mega_view_filter SET projected_seq = 1, ready_seq = 1, warming_since = NULL WHERE filter_id = $1",
+                    [sea_orm::Value::from(filter_id)],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(result.rows_affected(), 1);
+            tokio::time::Instant::now()
+        });
+        let (status, _, ready) = register_wait(&h, ":/project/ready", Some(ROOT33)).await;
+        assert_response(status, &ready, StatusCode::OK);
+        let updated_at = updater.await.unwrap();
+        assert_eq!(ready["data"]["ready"], true);
+        assert_eq!(
+            ready["data"]["filter_id"],
+            parse_for_registration(":/project/ready").unwrap().filter_id
+        );
+        assert!(updated_at.elapsed() <= Duration::from_secs(1));
+
+        let started = tokio::time::Instant::now();
+        let (status, _, timed_out) = register_wait(&h, ":/project/timeout", Some(ROOT33)).await;
+        let elapsed = started.elapsed();
+        assert_response(status, &timed_out, StatusCode::OK);
+        assert_eq!(timed_out["data"]["ready"], false);
+        assert!(elapsed >= REGISTER_WAIT_TIMEOUT);
+        assert!(elapsed <= REGISTER_WAIT_TIMEOUT + Duration::from_secs(2));
+        let (status, _, without_wait) = register(&h, ":/project/timeout", None, Some(ROOT33)).await;
+        assert_response(status, &without_wait, StatusCode::OK);
+        assert_eq!(timed_out["data"], without_wait["data"]);
+
+        let (status, _, without_wait) = register(&h, ":/project/ready", None, Some(ROOT33)).await;
+        assert_response(status, &without_wait, StatusCode::OK);
+        assert_eq!(ready["data"], without_wait["data"]);
+
+        let (status, _, immediate) = register(&h, ":/project/ready", None, Some(ROOT33)).await;
+        assert_response(status, &immediate, StatusCode::OK);
+        let started = tokio::time::Instant::now();
+        let (status, _, already_ready) = register_wait(&h, ":/project/ready", Some(ROOT33)).await;
+        assert_response(status, &already_ready, StatusCode::OK);
+        assert_eq!(already_ready["data"], immediate["data"]);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn signal_after_admission_commit() {
+        let h = harness33(|_| {}).await;
+        let first = assert_admitted_signal(&h, ":/project/a", None, false, None, true).await;
+        let filter_id = first["data"]["filter_id"].as_str().unwrap();
+        assert_admitted_signal(&h, ":/project/a", None, false, None, false).await;
+        assert_admitted_signal(
+            &h,
+            ":/project/a",
+            Some("agent/task-1"),
+            false,
+            Some(("agent/task-1", 1)),
+            false,
+        )
+        .await;
+        assert_admitted_signal(
+            &h,
+            ":/project/b",
+            Some("agent/task-1"),
+            false,
+            Some(("agent/task-1", 2)),
+            true,
+        )
+        .await;
+
+        h.storage
+            .view_storage()
+            .get_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE mega_view_filter SET projected_seq = 0, ready_seq = NULL, warming_since = NULL WHERE filter_id = $1",
+                [sea_orm::Value::from(filter_id.to_owned())],
+            ))
+            .await
+            .unwrap();
+        assert_admitted_signal(&h, ":/project/a", None, false, None, true).await;
+        let waiting = harness33(|_| {}).await;
+        assert_admitted_signal(&waiting, ":/project/wait", None, true, None, true).await;
+
+        let signal = h.storage.view_signal();
+
+        let invalid = [
+            (":[", Some(ROOT33), StatusCode::BAD_REQUEST),
+            (":/project/x", None, StatusCode::UNAUTHORIZED),
+            (":/a", Some(PROJECT33), StatusCode::FORBIDDEN),
+        ];
+        for (spec, auth, expected) in invalid {
+            drain_signal(&h.storage).await;
+            let (status, _, response) = register(&h, spec, None, auth).await;
+            assert_response(status, &response, expected);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), signal.notified())
+                    .await
+                    .is_err()
+            );
+        }
+
+        let rejected = harness33(|config| config.views.max_concurrent_cold_starts = 1).await;
+        let (status, _, response) = register(&rejected, ":/project/a", None, Some(ROOT33)).await;
+        assert_response(status, &response, StatusCode::OK);
+        drain_signal(&rejected.storage).await;
+        let (status, _, response) = register(&rejected, ":/project/b", None, Some(ROOT33)).await;
+        assert_response(status, &response, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                rejected.storage.view_signal().notified()
+            )
+            .await
+            .is_err()
+        );
+
+        let failed = harness33(|_| {}).await;
+        failed
+            .storage
+            .view_storage()
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE mega_view_register_log RENAME COLUMN requester TO hp_gone",
+            )
+            .await
+            .unwrap();
+        drain_signal(&failed.storage).await;
+        let (status, _, response) = register(&failed, ":/project/a", None, Some(ROOT33)).await;
+        assert_response(status, &response, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                failed.storage.view_signal().notified()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn lag_commits_definition() {
+        async fn setup(
+            chain: bool,
+            length: usize,
+            projected_seq: i64,
+        ) -> (
+            Harness,
+            Vec<crate::jupiter::storage::view_test_fixtures::RootCommitFixture>,
+            String,
+        ) {
+            let h = harness33(|config| config.views.max_append_walk = 3).await;
+            let (status, _, response) = register(&h, ":/project/a", None, Some(ROOT33)).await;
+            assert_response(status, &response, StatusCode::OK);
+            let filter_id = response["data"]["filter_id"].as_str().unwrap().to_owned();
+            h.storage
+                .view_storage()
+                .get_connection()
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE mega_view_filter SET projected_seq = $1 WHERE filter_id = $2",
+                    [
+                        sea_orm::Value::from(projected_seq),
+                        sea_orm::Value::from(filter_id.clone()),
+                    ],
+                ))
+                .await
+                .unwrap();
+            let db = h.storage.view_storage().get_connection().clone();
+            let history = seed_linear_root_history(&db, length).await;
+            if chain {
+                h.storage
+                    .view_storage()
+                    .extend_root_chain(None, 5, ViewLockMode::Try)
+                    .await
+                    .unwrap();
+            }
+            (h, history, filter_id)
+        }
+
+        async fn assert_lag(h: &Harness, filter_id: &str, expected: Option<i64>) {
+            let (status, response) = get(h, &format!("/api/v1/views/{filter_id}")).await;
+            assert_response(status, &response, StatusCode::OK);
+            assert_eq!(response["data"]["lag_commits"], json!(expected));
+        }
+
+        let (h, history, id) = setup(true, 5, 2).await;
+        assert_lag(&h, &id, Some(3)).await;
+        let db = h.storage.view_storage().get_connection().clone();
+        db.execute_unprepared("UPDATE mega_view_filter SET projected_seq = 5")
+            .await
+            .unwrap();
+        assert_lag(&h, &id, Some(0)).await;
+        db.execute_unprepared("UPDATE mega_view_filter SET projected_seq = 2")
+            .await
+            .unwrap();
+        let next = seed_single_parent_root_commit(&db, HashKind::Sha1, &history[4], "next").await;
+        let tip = seed_single_parent_root_commit(&db, HashKind::Sha1, &next, "tip").await;
+        assert!(cas_fixture_main(&db, &history[4], &tip).await);
+        assert_lag(&h, &id, Some(5)).await;
+
+        let (h, _, id) = setup(false, 3, 0).await;
+        assert_lag(&h, &id, Some(3)).await;
+        let (h, _, id) = setup(false, 4, 0).await;
+        assert_lag(&h, &id, None).await;
+
+        let (h, _, id) = setup(true, 5, 2).await;
+        h.storage
+            .view_storage()
+            .get_connection()
+            .execute_unprepared(
+                "DELETE FROM mega_refs WHERE path = '/' AND ref_name = 'refs/heads/main'",
+            )
+            .await
+            .unwrap();
+        assert_lag(&h, &id, None).await;
+
+        let (h, history, id) = setup(true, 5, 2).await;
+        let db = h.storage.view_storage().get_connection().clone();
+        let mut tip = history[4].clone();
+        for number in 0..4 {
+            tip = seed_single_parent_root_commit(
+                &db,
+                HashKind::Sha1,
+                &tip,
+                &format!("extra-{number}"),
+            )
+            .await;
+        }
+        assert!(cas_fixture_main(&db, &history[4], &tip).await);
+        assert_lag(&h, &id, None).await;
+
+        let (h, history, id) = setup(true, 5, 2).await;
+        let db = h.storage.view_storage().get_connection().clone();
+        assert!(cas_fixture_main(&db, &history[4], &history[2]).await);
+        assert_lag(&h, &id, None).await;
+
+        let (h, history, id) = setup(true, 5, 2).await;
+        let db = h.storage.view_storage().get_connection().clone();
+        let fork = seed_single_parent_root_commit(&db, HashKind::Sha1, &history[2], "fork").await;
+        set_fixture_main(
+            &db,
+            &fork.commit.id.to_string(),
+            &fork.commit.tree_id.to_string(),
+        )
+        .await;
+        assert_lag(&h, &id, None).await;
+
+        let (h, _, id) = setup(true, 5, 2).await;
+        let db = h.storage.view_storage().get_connection().clone();
+        let unrelated = seed_unrelated_root_history(&db, HashKind::Sha1).await;
+        let unrelated_tip =
+            seed_single_parent_root_commit(&db, HashKind::Sha1, &unrelated, "unrelated tip").await;
+        set_fixture_main(
+            &db,
+            &unrelated_tip.commit.id.to_string(),
+            &unrelated_tip.commit.tree_id.to_string(),
+        )
+        .await;
+        assert_lag(&h, &id, None).await;
+
+        let (h, history, id) = setup(true, 5, 2).await;
+        let db = h.storage.view_storage().get_connection().clone();
+        let unrelated = seed_unrelated_root_history(&db, HashKind::Sha1).await;
+        let merge =
+            seed_multi_parent_root_commit(&db, HashKind::Sha1, &history[4], &unrelated).await;
+        set_fixture_main(
+            &db,
+            &merge.commit.id.to_string(),
+            &merge.commit.tree_id.to_string(),
+        )
+        .await;
+        assert_lag(&h, &id, None).await;
+
+        let (h, _, id) = setup(true, 5, 2).await;
+        let db = h.storage.view_storage().get_connection().clone();
+        let missing = seed_missing_first_parent_root_commit(
+            &db,
+            HashKind::Sha1,
+            ObjectHash::from_str(&"f".repeat(40)).unwrap(),
+        )
+        .await;
+        set_fixture_main(
+            &db,
+            &missing.commit.id.to_string(),
+            &missing.commit.tree_id.to_string(),
+        )
+        .await;
+        assert_lag(&h, &id, None).await;
     }
 }

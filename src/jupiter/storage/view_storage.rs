@@ -5,12 +5,18 @@ use std::{
 };
 
 use sea_orm::{
-    ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, RuntimeErr, Statement, Value, sqlx,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait, QueryFilter,
+    RuntimeErr, Statement, Value, sqlx,
 };
+use serde_json::Value as JsonValue;
 
 use crate::{
+    callisto::mega_view_filter,
     common::errors::MegaError,
-    jupiter::storage::{base_storage::BaseStorage, view_root_chain::DiscontinuityReason},
+    jupiter::storage::{
+        base_storage::{BaseStorage, StorageConnector},
+        view_root_chain::DiscontinuityReason,
+    },
 };
 
 pub(crate) const VIEW_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -19,6 +25,24 @@ pub(crate) const VIEW_FILTER_LOCK_NS: i32 = 1_297_043_026;
 pub(crate) const ROOT_CHAIN_KEY: i32 = 1;
 pub(crate) const OBJECT_GC_KEY: i32 = 2;
 pub(crate) const REGISTER_KEY: i32 = 3;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ViewByName {
+    pub(crate) filter_pk: i64,
+    pub(crate) filter_id: String,
+    pub(crate) name: String,
+    pub(crate) version: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ViewStatusRow {
+    pub(crate) canonical_spec: String,
+    pub(crate) src_paths: JsonValue,
+    pub(crate) push_enabled: bool,
+    pub(crate) ready: bool,
+    pub(crate) projected_seq: i64,
+    pub(crate) lag_commits: Option<i64>,
+}
 
 #[derive(Clone)]
 pub struct ViewStorage {
@@ -32,6 +56,101 @@ impl ViewStorage {
             base,
             discontinuity_alert: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) async fn get_filter_by_filter_id(
+        &self,
+        filter_id: &str,
+    ) -> Result<Option<mega_view_filter::Model>, MegaError> {
+        Ok(mega_view_filter::Entity::find()
+            .filter(mega_view_filter::Column::FilterId.eq(filter_id))
+            .one(self.get_connection())
+            .await?)
+    }
+
+    pub(crate) async fn find_view_by_name(
+        &self,
+        name: &str,
+        version: Option<i32>,
+    ) -> Result<Option<ViewByName>, MegaError> {
+        let row = self
+            .get_connection()
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT f.id AS filter_pk, f.filter_id, v.name, v.version \
+                 FROM mega_view v JOIN mega_view_filter f ON f.id = v.filter_pk \
+                 WHERE v.name = $1 AND ($2::integer IS NULL OR v.version = $2) \
+                 ORDER BY v.version DESC LIMIT 1",
+                [Value::from(name.to_owned()), Value::from(version)],
+            ))
+            .await?;
+        row.map(|row| {
+            Ok(ViewByName {
+                filter_pk: row.try_get("", "filter_pk")?,
+                filter_id: row.try_get("", "filter_id")?,
+                name: row.try_get("", "name")?,
+                version: row.try_get("", "version")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub(crate) async fn view_status(
+        &self,
+        filter_id: &str,
+        walk_limit: u64,
+    ) -> Result<Option<ViewStatusRow>, MegaError> {
+        let walk_limit = i64::try_from(walk_limit)
+            .map_err(|_| MegaError::Other("view walk limit exceeds i64".to_owned()))?;
+        let row = self
+            .get_connection()
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "WITH RECURSIVE tail AS ( \
+                     SELECT max(seq) AS tail_seq FROM mega_view_root_chain \
+                 ), walk AS ( \
+                     SELECT r.ref_commit_hash AS commit_id, 1::bigint AS depth, 0::bigint AS unseen \
+                     FROM mega_refs r WHERE r.path = '/' AND r.ref_name = 'refs/heads/main' \
+                     UNION ALL \
+                     SELECT c.parents_id::jsonb ->> 0, w.depth + 1, w.unseen + 1 \
+                     FROM walk w \
+                     JOIN mega_commit c ON c.commit_id = w.commit_id \
+                     LEFT JOIN mega_view_root_chain chain ON chain.commit_id = w.commit_id \
+                     WHERE chain.seq IS NULL AND jsonb_array_length(c.parents_id::jsonb) = 1 \
+                       AND w.depth < $2 \
+                 ) \
+                 SELECT f.canonical_spec, f.src_paths, f.push_enabled, \
+                        (f.ready_seq IS NOT NULL) AS ready, f.projected_seq, \
+                        (SELECT CASE \
+                             WHEN chain.seq = tail.tail_seq \
+                                 THEN tail.tail_seq + w.unseen - f.projected_seq \
+                             WHEN tail.tail_seq IS NULL AND c.commit_id IS NOT NULL \
+                                  AND jsonb_array_length(c.parents_id::jsonb) = 0 \
+                                 THEN w.unseen + 1 - f.projected_seq \
+                             ELSE NULL END \
+                         FROM walk w \
+                         LEFT JOIN mega_view_root_chain chain ON chain.commit_id = w.commit_id \
+                         LEFT JOIN mega_commit c ON c.commit_id = w.commit_id \
+                         CROSS JOIN tail \
+                         WHERE chain.seq IS NOT NULL \
+                            OR (tail.tail_seq IS NULL AND c.commit_id IS NOT NULL \
+                                AND jsonb_array_length(c.parents_id::jsonb) = 0) \
+                         ORDER BY w.depth LIMIT 1) AS lag_commits \
+                 FROM mega_view_filter f WHERE f.filter_id = $1",
+                [Value::from(filter_id.to_owned()), Value::from(walk_limit)],
+            ))
+            .await?;
+        row.map(|row| {
+            Ok(ViewStatusRow {
+                canonical_spec: row.try_get("", "canonical_spec")?,
+                src_paths: row.try_get("", "src_paths")?,
+                push_enabled: row.try_get("", "push_enabled")?,
+                ready: row.try_get("", "ready")?,
+                projected_seq: row.try_get("", "projected_seq")?,
+                lag_commits: row.try_get("", "lag_commits")?,
+            })
+        })
+        .transpose()
     }
 
     pub(super) fn should_log_discontinuity(

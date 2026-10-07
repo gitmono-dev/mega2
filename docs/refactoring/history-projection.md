@@ -1235,7 +1235,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
 ### 6.5 视图注册（P0）
 - **接口：**
   - `POST /api/v1/views {filter_spec, name?}`：返回 `{filter_id, name, version, ready}`。支持 `wait=true`，阻塞到 ready 或超时为止。
-  - `GET /api/v1/views/{filter_id}`：返回 canonical 文本、`src_paths`、`push_enabled`、ready 状态、投影水位与滞后量。
+  - `GET /api/v1/views/{filter_id}`：返回 canonical 文本、`src_paths`、`push_enabled`、ready 状态、投影水位与滞后量。滞后量按 §4.5 计算；`main@/` 在 `views.max_append_walk` 个提交之内不能按 §3.3 第 3 步连上链尾时返回 null。
   - `GET /api/v1/views?name=<name>&version=<v>`：按名字查询，省略 version 时取最新版本，返回 filter_id。视图名可以含 `/`，所以名字只出现在查询参数中，不进入路径参数。
 - **`[views].enabled = false` 时【决策】。** 本节的三个接口与 6.6 的 REST 读接口（P1）都不挂载，请求由路由层直接返回 404，与 6.1 第 2 层对视图 URL 的应答一致。【代码】先例是 Agent Capture：`mount_agent_capture` 按配置决定是否把 `agent_capture_router` 并入 `storage_only_routers_with`（`src/server/http_server.rs` 约 L769–777、L845–847；`src/api/api_router.rs` 约 L72–90）。关闭时的 404 由测试 `disabled_storage_only_does_not_register_agent_capture` 断言（约 L1583）。OpenAPI 文档也按同一开关取舍（`storage_only_openapi_doc` 约 L849、`trunk_openapi_doc` 约 L870）。不采用 MST/2 在 handler 内判定的做法（`snapshot_router.rs::ensure_enabled` 约 L306），因为那样会以"未就绪"应答，与视图 URL 的 404 不一致。由此：
   - 拒绝早于鉴权、请求体解析和任何查库，不写过滤器行、视图行或速率行，也不占冷启动名额；

@@ -514,3 +514,15 @@ HTTP 服务即可从已提交水位继续。
 
 停服时 worker 丢弃正在执行的轮。已提交的根链段与投影批会保留，未提交的当前事务会回滚；服务
 重启后从这些已提交水位继续追赶。
+
+### 13.2 视图注册的等待、查询与计数（实验）
+
+本节接口处于实验阶段，适用于已按[配置说明](configuration.md)启用 `[views]` 的 trunk、sha1 部署；此处不表示视图 Git URL 已可用。
+
+向 `POST /api/v1/views` 发送 JSON 请求体 `{"filter_spec":":/project/a","name":"agent/task-1"}`。`name` 可省略。注册按 `git.push_auth` 鉴权；使用 token 时，push token 须覆盖过滤器的全部源路径。成功应答包含 `filter_id`、`name`、`version` 与 `ready`。带 `?wait=true` 时，准入提交后等待就绪，最多 20 秒；返回 `ready=false` 时可轮询 `GET /api/v1/views/{filter_id}`。没有 `wait=true` 时注册立即返回。
+
+`GET /api/v1/views/{filter_id}` 返回 `filter_id`、`canonical_spec`、`src_paths`、`push_enabled`、`ready`、`projected_seq`、`lag_commits` 七个字段。`lag_commits` 是 `seq(main@/)` 减去该过滤器的投影水位；`main@/` 尚未进入根链时，也计入它与根链链尾之间尚未接入的提交。`main@/` 缺失、回走不能在 `views.max_append_walk` 个提交内接上根链链尾，或遇到回滚、分叉、多父、缺失首父等不连续历史时为 `null`。
+
+`GET /api/v1/views?name=agent%2Ftask-1` 按名字查询。名字含 `/` 时须百分号编码；省略 `version` 取最新版本，`&version=1` 可指定版本。响应只含 `filter_id`、`name` 与 `version`。
+
+`GET /api/v1/views/metrics` 返回进程内原子计数与实时查询的 `view_cold_start_slots_in_use`。这些元数据端点不鉴权：视图不是路径级读权限边界（ADR-HP-05）。若 `/api/v1` 暴露给不可信网络，应在反向代理处对 `/api/v1/views` 限流；可热调低 `views.max_append_walk` 以限制每次滞后量查询的回走步数，代价是根链扩展的单次预算也降低。

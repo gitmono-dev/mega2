@@ -1239,6 +1239,133 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn disabled_does_not_register_view_queries() {
+        use axum::routing::any;
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        use crate::{
+            config::{PushTokenConfig, testing::isolated_config},
+            jupiter::{storage::base_storage::StorageConnector, tests::test_storage_with_config},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut disabled = isolated_config(temp.path().join("disabled"));
+        disabled.monorepo.push_policy = PushPolicy::Trunk;
+        disabled.git.push_auth = Some(PushAuth::Token);
+        disabled.git.ssh_receive_pack = Some(false);
+        disabled.git.push_tokens = vec![PushTokenConfig {
+            name: "hp33-root".to_owned(),
+            token: "hp33-root-secret".to_owned(),
+            paths: Some(vec!["/".to_owned()]),
+        }];
+        assert!(!mount_views(&disabled));
+        let storage = test_storage_with_config(temp.path(), disabled.clone()).await;
+        let mut state = dummy_api_state();
+        state.storage = storage.clone();
+        let make_app = |state: MonoApiServiceState, config: &Config, with_protocol: bool| {
+            let (router, _) = OpenApiRouter::new()
+                .nest("/api/v1", storage_only_api_v1(config))
+                .split_for_parts();
+            let router = if with_protocol {
+                let protocol = Arc::new(ProtocolApiState::from_ref(&state));
+                router.route(
+                    "/{*path}",
+                    any(move |req: Request<Body>| handle_smart_protocol(req, protocol.clone())),
+                )
+            } else {
+                router
+            };
+            router.with_state(state)
+        };
+        for with_protocol in [false, true] {
+            let app = make_app(state.clone(), &disabled, with_protocol);
+            for auth in [None, Some("Bearer hp33-root-secret")] {
+                for uri in [
+                    "/api/v1/views?wait=true",
+                    &format!("/api/v1/views/{}", "0".repeat(64)),
+                    "/api/v1/views?name=a",
+                    "/api/v1/views/metrics",
+                ] {
+                    let mut request = if uri.contains("wait=true") {
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                    } else {
+                        Request::builder().method("GET").uri(uri)
+                    };
+                    if let Some(auth) = auth {
+                        request = request.header(http::header::AUTHORIZATION, auth);
+                    }
+                    let body = if uri.contains("wait=true") {
+                        Body::from(r#"{"filter_spec":":/project/a"}"#)
+                    } else {
+                        Body::empty()
+                    };
+                    let response = app
+                        .clone()
+                        .oneshot(request.body(body).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+                }
+            }
+        }
+        for table in ["mega_view_filter", "mega_view", "mega_view_register_log"] {
+            let row = storage
+                .view_storage()
+                .get_connection()
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    format!("SELECT count(*) AS total FROM {table}"),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.try_get::<i64>("", "total").unwrap(), 0, "{table}");
+        }
+
+        let mut enabled = disabled.clone();
+        enabled.views.enabled = true;
+        assert!(mount_views(&enabled));
+        let enabled_storage = test_storage_with_config(temp.path(), enabled.clone()).await;
+        let mut enabled_state = dummy_api_state();
+        enabled_state.storage = enabled_storage;
+        for with_protocol in [false, true] {
+            let response = make_app(enabled_state.clone(), &enabled, with_protocol)
+                .oneshot(
+                    Request::get("/api/v1/views/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        for doc in [storage_only_openapi_doc, trunk_openapi_doc] {
+            let disabled_doc = doc(false, false, false);
+            assert!(
+                disabled_doc
+                    .paths
+                    .paths
+                    .keys()
+                    .all(|path| !path.starts_with("/api/v1/views"))
+            );
+            let enabled_doc = doc(false, false, true);
+            for path in ["/api/v1/views/{filter_id}", "/api/v1/views/metrics"] {
+                assert!(
+                    enabled_doc
+                        .paths
+                        .paths
+                        .get(path)
+                        .and_then(|item| item.get.as_ref())
+                        .is_some()
+                );
+            }
+        }
+    }
+
     #[test]
     fn cors_origins_fall_back_to_defaults_when_unset() {
         let origins = cors_allow_origins(None);
