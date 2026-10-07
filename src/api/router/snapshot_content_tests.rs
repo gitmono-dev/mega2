@@ -38,7 +38,7 @@ use crate::{
         MonoApiServiceState, oauth::api_store::BrowserSessionStore,
         router::snapshot_router::routers,
     },
-    callisto::{mega_refs, mst2_verified_object},
+    callisto::{mega_refs, mst2_verified_object, sea_orm_active_enums::PushQueueKindEnum},
     ceres::{
         api_service::{ApiHandler, cache::GitObjectCache, mono_api_service::MonoApiService},
         snapshot::{
@@ -48,15 +48,22 @@ use crate::{
         },
     },
     common::utils::MEGA_BRANCH_NAME,
-    config::testing::isolated_config,
+    config::{model::PushPolicy, testing::isolated_config},
     jupiter::{
-        service::git_service::GitService,
+        service::{
+            git_service::GitService,
+            push_queue_service::{
+                EnqueueRequest, ExecuteOutcome, ExecuteRequest, PushExecContext, PushPayload,
+                push_operation_id,
+            },
+        },
         storage::{
             base_storage::StorageConnector,
             mono_storage::MST2_VERIFICATION_VERSION,
             object_storage::{MegaObjectStorageWrapper, build_object_storage},
+            push_queue_storage::{ClaimOutcome, EnqueueOutcome},
         },
-        tests::{test_redis_manager, test_storage_with_config},
+        tests::{test_redis_manager, test_storage_with_config, with_test_vault},
     },
     orbit_api::{
         error::OrbitResult,
@@ -221,10 +228,82 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+async fn publish_native_push(
+    storage: &crate::jupiter::storage::Storage,
+    path: &str,
+    old: ObjectHash,
+    new: &Commit,
+) {
+    let old_id = old.to_string();
+    let new_id = new.id.to_string();
+    let payload = PushPayload {
+        commits: vec![new_id.clone()],
+        fork_base: Some(old_id.clone()),
+        n: 1,
+    };
+    let outcome = storage
+        .push_queue_service
+        .enqueue(EnqueueRequest {
+            kind: PushQueueKindEnum::Push,
+            operation_id: push_operation_id(&old_id, &new_id),
+            path: path.to_string(),
+            old_id,
+            new_id,
+            requester: None,
+            payload: payload.to_json(),
+            ref_name: Some(MEGA_BRANCH_NAME.to_string()),
+            is_delete: false,
+        })
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted { id } = outcome else {
+        panic!("fresh fixture push must insert: {outcome:?}");
+    };
+    assert_eq!(
+        storage
+            .push_queue_service
+            .storage()
+            .claim_for_execution(id)
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed
+    );
+    let context = PushExecContext {
+        storage: storage.clone(),
+        git_object_cache: Arc::new(GitObjectCache {
+            connection: test_redis_manager().await,
+            prefix: String::new(),
+        }),
+        pre_apply_enter_barrier: None,
+        pre_apply_release_barrier: None,
+    };
+    let outcome = storage
+        .push_queue_service
+        .execute_b3(
+            ExecuteRequest {
+                id,
+                ..Default::default()
+            },
+            None,
+            None,
+            Some(&context),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        ExecuteOutcome::Done {
+            root_cas_writes: 1,
+            ..
+        }
+    ));
+}
+
 impl Fixture {
     async fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let mut config = isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = PushPolicy::Trunk;
         config.mst2.enabled = true;
         config.mst2.publication_enabled = true;
         config.mst2.instance_uuid = Some(uuid::Uuid::new_v4().to_string());
@@ -238,6 +317,7 @@ impl Fixture {
                 counts: counts.clone(),
             })),
         };
+        let storage = with_test_vault(storage, temp.path()).await;
         // Unique bytes prevent another test's process-wide digest cache from
         // turning a required cold read into a hit. These bytes also look like
         // a Git object header, and contain NUL and non-UTF-8 content.
@@ -273,6 +353,20 @@ impl Fixture {
             item(TreeItemMode::Link, link_oid, "link"),
             item(TreeItemMode::Tree, nested.id, "nested"),
         ]);
+        let old_tip = Commit::from_tree_id_with_kind(
+            HashKind::Sha1,
+            project.id,
+            vec![],
+            "fixed content initial path tip",
+        )
+        .unwrap();
+        let new_tip = Commit::from_tree_id_with_kind(
+            HashKind::Sha1,
+            project.id,
+            vec![old_tip.id],
+            "fixed content published path tip",
+        )
+        .unwrap();
         let root = tree(vec![
             item(TreeItemMode::Blob, blob_oid, "outside"),
             item(TreeItemMode::Tree, project.id, "project"),
@@ -292,7 +386,7 @@ impl Fixture {
         )
         .await
         .unwrap();
-        mono.save_mega_commits(vec![commit.clone()], None)
+        mono.save_mega_commits(vec![commit.clone(), old_tip.clone(), new_tip.clone()], None)
             .await
             .unwrap();
         mono.save_refs(
@@ -307,9 +401,30 @@ impl Fixture {
         )
         .await
         .unwrap();
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/project".to_string(),
+                MEGA_BRANCH_NAME.to_string(),
+                old_tip.id.to_string(),
+                old_tip.tree_id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
         mono.initialize_native_publication(storage.config().mst2.instance_uuid.as_deref().unwrap())
             .await
             .unwrap();
+        publish_native_push(&storage, "/project", old_tip.id, &new_tip).await;
+        let head = mono
+            .read_native_publication_head(storage.config().mst2.instance_uuid.as_deref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(head.token.sequence, 1);
+        assert!(head.token.certificate.is_some());
+        assert_eq!(head.root.commit, commit.id.to_string());
+        assert_eq!(head.root.tree, root.id.to_string());
         let state = MonoApiServiceState {
             entity_store: storage.entity_store.clone(),
             storage,
@@ -1018,25 +1133,49 @@ async fn mst2_fixed_warm_map_still_checks_map_indices_batches_and_http_lease() {
 async fn mst2_fixed_old_snapshot_reads_its_original_oid_after_real_ref_advances() {
     let fixture = Fixture::new().await;
     let mono = fixture.state.storage.mono_storage();
-    let mut main = mono.get_main_ref("/").await.unwrap().unwrap();
-    let old_commit = ObjectHash::from_hex_for_kind(HashKind::Sha1, &main.ref_commit_hash).unwrap();
-    let new_root = tree(vec![]);
+    let main = mono.get_main_ref("/").await.unwrap().unwrap();
+    let project = mono.get_main_ref("/project").await.unwrap().unwrap();
+    let old_commit =
+        ObjectHash::from_hex_for_kind(HashKind::Sha1, &project.ref_commit_hash).unwrap();
+    let blob_oid = ObjectHash::from_hex_for_kind(HashKind::Sha1, &fixture.oid).unwrap();
+    let new_tree = tree(vec![item(TreeItemMode::Blob, blob_oid, "new-only")]);
     let new_commit = Commit::from_tree_id_with_kind(
         HashKind::Sha1,
-        new_root.id,
+        new_tree.id,
         vec![old_commit],
-        "advanced empty ref",
+        "advanced project without old paths",
     )
     .unwrap();
-    mono.save_mega_trees(vec![new_root.clone()], new_commit.id, None)
+    mono.save_mega_trees(vec![new_tree.clone()], new_commit.id, None)
         .await
         .unwrap();
     mono.save_mega_commits(vec![new_commit.clone()], None)
         .await
         .unwrap();
-    main.ref_commit_hash = new_commit.id.to_string();
-    main.ref_tree_hash = new_root.id.to_string();
-    mono.update_ref(main, None).await.unwrap();
+    publish_native_push(&fixture.state.storage, "/project", old_commit, &new_commit).await;
+    let head = mono
+        .read_native_publication_head(
+            fixture
+                .state
+                .storage
+                .config()
+                .mst2
+                .instance_uuid
+                .as_deref()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.token.sequence, 2);
+    assert!(head.token.certificate.is_some());
+    assert_ne!(head.root.commit, main.ref_commit_hash);
+    assert_ne!(head.root.tree, main.ref_tree_hash);
+    let published = mono.get_main_ref("/").await.unwrap().unwrap();
+    assert_eq!(head.root.commit, published.ref_commit_hash);
+    assert_eq!(head.root.tree, published.ref_tree_hash);
+    let published_project = mono.get_main_ref("/project").await.unwrap().unwrap();
+    assert_eq!(published_project.ref_commit_hash, new_commit.id.to_string());
+    assert_eq!(published_project.ref_tree_hash, new_tree.id.to_string());
     let response = fixture.send("HEAD", "blob?path=/file", Body::empty()).await;
     assert_eq!(response.status(), 200);
     assert_eq!(
