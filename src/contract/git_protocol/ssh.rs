@@ -22,7 +22,10 @@ use crate::{
     },
     common::errors::ProtocolError,
     config::PushAuth,
-    contract::git_protocol::{check_push_permission, check_upload_pack_access, lookup_push_token},
+    contract::git_protocol::{
+        check_push_permission, check_upload_pack_access, lookup_push_token,
+        path::{RepoLocator, classify_repo_locator},
+    },
     jupiter::storage::Storage,
 };
 
@@ -233,10 +236,11 @@ enum SshExecKind {
     LfsTransfer,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 struct SshExecRequest {
     kind: SshExecKind,
     repo_path: PathBuf,
+    locator: Result<RepoLocator, ProtocolError>,
     lfs_operation: Option<String>,
 }
 
@@ -350,6 +354,30 @@ impl server::Handler for SshServer {
                 return Ok(());
             }
         };
+
+        match &exec.locator {
+            Err(_) => {
+                self.send_exec_err(channel, session, &SshErrReply::view_not_found())
+                    .await?;
+                return Ok(());
+            }
+            Ok(RepoLocator::View(_)) => {
+                let reply = if matches!(
+                    &exec.kind,
+                    SshExecKind::LfsAuthenticate | SshExecKind::LfsTransfer
+                ) || !self.state.storage.config().views.enabled
+                {
+                    SshErrReply::view_not_found()
+                } else if matches!(&exec.kind, SshExecKind::Git(ServiceType::ReceivePack)) {
+                    SshErrReply::view_read_only()
+                } else {
+                    SshErrReply::view_not_found()
+                };
+                self.send_exec_err(channel, session, &reply).await?;
+                return Ok(());
+            }
+            Ok(RepoLocator::Path(_)) => {}
+        }
 
         match exec.kind {
             SshExecKind::Git(service_type) => {
@@ -626,9 +654,11 @@ fn parse_ssh_exec_request(input: &str) -> Result<SshExecRequest, String> {
                 return Err(format!("{command} requires exactly one repository path"));
             }
             let service_type = ServiceType::from_str(command).map_err(|err| err.to_string())?;
+            let repo_path = normalize_ssh_repo_path(&args[1])?;
             Ok(SshExecRequest {
                 kind: SshExecKind::Git(service_type),
-                repo_path: normalize_ssh_repo_path(&args[1])?,
+                repo_path,
+                locator: classify_repo_locator(&args[1]),
                 lfs_operation: None,
             })
         }
@@ -639,10 +669,18 @@ fn parse_ssh_exec_request(input: &str) -> Result<SshExecRequest, String> {
                         .to_owned(),
                 );
             }
+            let repo_path = normalize_ssh_repo_path(&args[1])?;
+            let locator = classify_repo_locator(&args[1]);
+            let lfs_operation = if matches!(&locator, Ok(RepoLocator::Path(_))) {
+                Some(parse_lfs_operation(&args[2])?)
+            } else {
+                None
+            };
             Ok(SshExecRequest {
                 kind: SshExecKind::LfsAuthenticate,
-                repo_path: normalize_ssh_repo_path(&args[1])?,
-                lfs_operation: Some(parse_lfs_operation(&args[2])?),
+                repo_path,
+                locator,
+                lfs_operation,
             })
         }
         "git-lfs-transfer" => {
@@ -652,10 +690,18 @@ fn parse_ssh_exec_request(input: &str) -> Result<SshExecRequest, String> {
                         .to_owned(),
                 );
             }
+            let repo_path = normalize_ssh_repo_path(&args[1])?;
+            let locator = classify_repo_locator(&args[1]);
+            let lfs_operation = if matches!(&locator, Ok(RepoLocator::Path(_))) {
+                Some(parse_lfs_operation(&args[2])?)
+            } else {
+                None
+            };
             Ok(SshExecRequest {
                 kind: SshExecKind::LfsTransfer,
-                repo_path: normalize_ssh_repo_path(&args[1])?,
-                lfs_operation: Some(parse_lfs_operation(&args[2])?),
+                repo_path,
+                locator,
+                lfs_operation,
             })
         }
         _ => Err(format!("unsupported SSH git command: {command}")),
@@ -1873,6 +1919,8 @@ mod tests {
         let err = parse_ssh_exec_request("git-upload-pack").unwrap_err();
 
         assert!(err.contains("requires exactly one repository path"));
+        let empty = parse_ssh_exec_request("git-upload-pack ''").unwrap_err();
+        assert!(empty.contains("repository path is empty"));
     }
 
     #[test]

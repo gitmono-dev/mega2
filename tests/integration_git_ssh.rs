@@ -2052,6 +2052,15 @@ fn boot_service_multi_with_session(
     enforcement: &str,
     session_stub_port: Option<u16>,
 ) -> (ServiceProcess, u16, u16, PathBuf, PathBuf) {
+    boot_service_multi_with_extra(env, enforcement, session_stub_port, &[])
+}
+
+fn boot_service_multi_with_extra(
+    env: &GitSshEnv,
+    enforcement: &str,
+    session_stub_port: Option<u16>,
+    extra_env: &[(&str, &str)],
+) -> (ServiceProcess, u16, u16, PathBuf, PathBuf) {
     let http_port = git_cli::reserve_ephemeral_port();
     let ssh_port = git_cli::reserve_ephemeral_port();
     git_cli::record_allocated_port(http_port);
@@ -2067,6 +2076,9 @@ fn boot_service_multi_with_session(
             "MEGA_OAUTH__WEBSITE_API_BASE_URL",
             format!("http://127.0.0.1:{stub_port}"),
         );
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
     }
     git_cli::apply_mega2_public_http_base_env(&mut command, http_port);
     let http_port_arg = http_port.to_string();
@@ -3023,4 +3035,285 @@ fn expected_mega_cedar_json_bytes() -> Vec<u8> {
     serde_json::to_string_pretty(&json)
         .expect("serialize expected cedar entity")
         .into_bytes()
+}
+
+fn raw_view_ssh(
+    case_dir: &Path,
+    port: u16,
+    protocol_v2: bool,
+    command: &str,
+    path: &str,
+    operation: Option<&str>,
+) -> std::process::Output {
+    let mut ssh = git_ssh_command_loopback(case_dir, port, true);
+    if protocol_v2 {
+        ssh.push_str(" -o SetEnv=GIT_PROTOCOL=version=2");
+    }
+    let remote = match operation {
+        Some(operation) => format!("{command} '{path}' {operation}"),
+        None => format!("{command} '{path}'"),
+    };
+    let shell = format!("{ssh} git@127.0.0.1 \"{remote}\"");
+    Command::new("timeout")
+        .args(["-k", "5", "45", "sh", "-c", &shell])
+        .current_dir(case_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("raw view SSH request")
+}
+
+fn view_ssh_env() -> GitSshEnv {
+    let env = GitSshEnv::with_config_append(
+        r#"
+[git]
+anonymous_access = true
+push_auth = "none"
+ssh_receive_pack = false
+"#,
+    );
+    git_cli::generate_client_ed25519(&env.ssh_dir.join("client_ed25519"));
+    env
+}
+
+fn boot_view_ssh(
+    env: &GitSshEnv,
+    enabled: &'static str,
+) -> (ServiceProcess, u16, PathBuf, PathBuf) {
+    let extra = [
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "none"),
+        ("MEGA_GIT__ANONYMOUS_ACCESS", "true"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+        ("MEGA_CEDAR__ENFORCEMENT", "off"),
+        ("MEGA_VIEWS__ENABLED", enabled),
+    ];
+    boot_storage_only_ssh(env, &extra)
+}
+
+fn assert_view_ssh_reply(output: &std::process::Output, expected: &[u8]) {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.stdout, expected, "{output:?}");
+}
+
+#[test]
+fn integration_git_ssh_view_layer2_ssh_not_found() {
+    git_cli::require_git_cli_runner();
+    let filter_id = "a".repeat(64);
+    for enabled in ["false", "true"] {
+        let env = view_ssh_env();
+        let (mut service, port, _out, err) = boot_view_ssh(&env, enabled);
+        for path in [
+            "/.view/x.git".to_owned(),
+            ".view/x.git".to_owned(),
+            format!("/.filter/{filter_id}.git"),
+        ] {
+            let commands = if enabled == "false" {
+                &["git-upload-pack", "git-receive-pack"][..]
+            } else {
+                &["git-upload-pack"][..]
+            };
+            for command in commands {
+                for v2 in [false, true] {
+                    let output = raw_view_ssh(&env.case_dir, port, v2, command, &path, None);
+                    assert_view_ssh_reply(&output, b"0017ERR view not found\n");
+                }
+            }
+        }
+        let invalid = raw_view_ssh(
+            &env.case_dir,
+            port,
+            false,
+            "git-upload-pack",
+            "/.view/a@0.git",
+            None,
+        );
+        assert_view_ssh_reply(&invalid, b"0017ERR view not found\n");
+        let status = service.shutdown_via_sigint(Duration::from_secs(10));
+        assert!(status.success(), "{}", read_log(&err));
+    }
+}
+
+#[test]
+fn integration_git_ssh_view_layer2_ssh_read_only() {
+    git_cli::require_git_cli_runner();
+    let env = view_ssh_env();
+    let (mut service, port, _out, err) = boot_view_ssh(&env, "true");
+    let output = raw_view_ssh(
+        &env.case_dir,
+        port,
+        false,
+        "git-receive-pack",
+        "/.view/x.git",
+        None,
+    );
+    assert_view_ssh_reply(&output, b"0020ERR view URLs are read-only\n");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("SSH receive-pack is disabled"));
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(status.success(), "{}", read_log(&err));
+}
+
+#[test]
+fn integration_git_ssh_view_layer2_ssh_lfs_rejected() {
+    git_cli::require_git_cli_runner();
+    for enabled in ["false", "true"] {
+        let env = view_ssh_env();
+        let (mut service, port, _out, err) = boot_view_ssh(&env, enabled);
+        for (command, operation) in [
+            ("git-lfs-authenticate", "upload"),
+            ("git-lfs-authenticate", "download"),
+            ("git-lfs-transfer", "upload"),
+            ("git-lfs-authenticate", "verify"),
+        ] {
+            let output = raw_view_ssh(
+                &env.case_dir,
+                port,
+                false,
+                command,
+                "/.view/x.git",
+                Some(operation),
+            );
+            assert_view_ssh_reply(&output, b"0017ERR view not found\n");
+            assert!(!output.stdout.windows(4).any(|window| window == b"href"));
+        }
+        let status = service.shutdown_via_sigint(Duration::from_secs(10));
+        assert!(status.success(), "{}", read_log(&err));
+    }
+}
+
+fn boot_view_multi(
+    env: &GitSshEnv,
+    enabled: &'static str,
+) -> (ServiceProcess, u16, u16, PathBuf, PathBuf) {
+    let extra = [
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_VIEWS__ENABLED", enabled),
+    ];
+    let mut init = env.full_config_command();
+    for (key, value) in extra {
+        init.env(key, value);
+    }
+    init.env("MEGA_CEDAR__ENFORCEMENT", "off");
+    let result = init.args(["service", "init", "--yes"]).output().unwrap();
+    assert!(
+        result.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let (service, http_port, ssh_port, stdout, stderr) =
+        boot_service_multi_with_extra(env, "off", None, &extra);
+    write_known_hosts_via_host_keyscan(&env.ssh_dir.join("known_hosts"), ssh_port);
+    (service, http_port, ssh_port, stdout, stderr)
+}
+
+fn view_host_git_http(case_dir: &Path, args: &[&str]) -> std::process::Output {
+    let home = case_dir.join("git-home-view-http");
+    fs::create_dir_all(&home).unwrap();
+    Command::new("timeout")
+        .args(["-k", "5", "45", "git"])
+        .current_dir(case_dir)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn integration_git_ssh_view_layer2_git_client_not_found() {
+    git_cli::require_git_cli_runner();
+    let env = view_ssh_env();
+    let (mut service, http_port, ssh_port, _out, err) = boot_view_multi(&env, "false");
+    let http = format!("http://127.0.0.1:{http_port}/.view/x.git");
+    let http_result = view_host_git_http(&env.case_dir, &["ls-remote", &http]);
+    assert!(!http_result.status.success(), "{http_result:?}");
+    assert!(
+        String::from_utf8_lossy(&http_result.stderr).contains("not found"),
+        "{http_result:?}"
+    );
+    let ssh_command = git_ssh_command_loopback(&env.case_dir, ssh_port, true);
+    let ssh = format!("ssh://git@127.0.0.1:{ssh_port}/.view/x.git");
+    let ssh_result = git_host_ssh(&env.case_dir, &ssh_command, &["ls-remote", &ssh]);
+    assert!(!ssh_result.status.success(), "{ssh_result:?}");
+    assert!(
+        String::from_utf8_lossy(&ssh_result.stderr).contains("remote error: view not found"),
+        "{ssh_result:?}"
+    );
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(status.success(), "{}", read_log(&err));
+}
+
+#[test]
+fn integration_git_ssh_view_layer2_git_client_read_only() {
+    git_cli::require_git_cli_runner();
+    let env = view_ssh_env();
+    let (mut service, http_port, ssh_port, _out, err) = boot_view_multi(&env, "true");
+    let root = format!("http://127.0.0.1:{http_port}/");
+    let before = view_host_git_http(&env.case_dir, &["ls-remote", &root]);
+    assert!(before.status.success(), "{before:?}");
+    let clone = view_host_git_http(&env.case_dir, &["clone", &root, "view-client-root"]);
+    assert!(clone.status.success(), "{clone:?}");
+    fs::write(
+        env.case_dir.join("view-client-root/view-client.txt"),
+        b"view test\n",
+    )
+    .unwrap();
+    let add = view_host_git_http(&env.case_dir, &["-C", "view-client-root", "add", "."]);
+    assert!(add.status.success(), "{add:?}");
+    let commit = view_host_git_http(
+        &env.case_dir,
+        &[
+            "-C",
+            "view-client-root",
+            "-c",
+            "user.name=HP18 Test",
+            "-c",
+            "user.email=hp18@example.invalid",
+            "commit",
+            "-m",
+            "view rejection probe",
+        ],
+    );
+    assert!(commit.status.success(), "{commit:?}");
+    let http_view = format!("http://127.0.0.1:{http_port}/.view/x.git");
+    let http_push = view_host_git_http(
+        &env.case_dir,
+        &[
+            "-C",
+            "view-client-root",
+            "push",
+            &http_view,
+            "HEAD:refs/heads/main",
+        ],
+    );
+    assert!(!http_push.status.success(), "{http_push:?}");
+    assert!(
+        String::from_utf8_lossy(&http_push.stderr).contains("returned error: 403"),
+        "{http_push:?}"
+    );
+    let ssh_command = git_ssh_command_loopback(&env.case_dir, ssh_port, true);
+    let ssh_view = format!("ssh://git@127.0.0.1:{ssh_port}/.view/x.git");
+    let ssh_push = git_host_ssh(
+        &env.case_dir,
+        &ssh_command,
+        &[
+            "-C",
+            "view-client-root",
+            "push",
+            &ssh_view,
+            "HEAD:refs/heads/main",
+        ],
+    );
+    assert!(!ssh_push.status.success(), "{ssh_push:?}");
+    assert!(
+        String::from_utf8_lossy(&ssh_push.stderr).contains("remote error: view URLs are read-only"),
+        "{ssh_push:?}"
+    );
+    let after = view_host_git_http(&env.case_dir, &["ls-remote", &root]);
+    assert!(after.status.success(), "{after:?}");
+    assert_eq!(before.stdout, after.stdout);
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(status.success(), "{}", read_log(&err));
 }

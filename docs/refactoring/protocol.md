@@ -491,6 +491,14 @@ exec 阶段由 `reject_exec` 依次发送 `channel_success`、ERR、exit-status�
 
 v0 upload-pack、v2 `ls-refs` 和 v2 `fetch` 的数据阶段都经 `write_data_error` 写出视图错误。写出 ERR 后，通道不再写 data 字节，后续数据和 EOF 残留请求都会丢弃。`channel_eof` 先补处理残留请求，再取得退出码；若 `clients` 已没有该通道，说明它已被 `reject_exec` 拒绝，可能是 ERR 进入 russh 待发队列后客户端仍发送 EOF，此时只发送 close，exec 阶段发送的码是该通道唯一的 exit-status。非视图错误继续输出裸文本（`DEFER-HP-17`）。
 
+### 视图 URL 入口第 1、2 层（HP-18）
+
+定位符在 HTTP、SSH 与 LFS 入口共用同步分类，先识别首段视图保留名，再判定名字、版本与 filter ID 语法。HTTP 在分派 Git handler 前、SSH 在建立 `SmartSession` 前，以一次配置快照判定是否启用视图、服务是否只读。启用状态下的 upload-pack 在第 3 层接入前暂返回「不存在」。位置、顺序与状态码见[设计 §6.1「入口分层」和「错误契约」](history-projection.md#61-url-与路由决策)。
+
+SSH `git-lfs-authenticate` 与 `git-lfs-transfer` 对视图路径写一行 `ERR view not found` 并以退出码 1 结束，与 HTTP LFS 的 404 同类；这是设计 §6.1 第 2 层「同样拒绝」的具体形式。
+
+本卡 `integration_git_ssh` 中的原始 SSH 请求和 git 客户端沿用该 target 既有 storage-only 用例的宿主回环方式：宿主 `ssh` 和 git 经 `127.0.0.1` 连接。请求与应答字节不取决于执行位置；宿主 git 只断言 `not found`、`returned error: 403`、`remote error: view not found`、`remote error: view URLs are read-only` 四种稳定子串。此执行位置按[设计 §7.4 的 HP-18 例外](history-projection.md#74-测试计划)登记。
+
 ### SSH upload-pack 可能把二进制 ACK/pack 数据当 UTF-8 发送
 
 `handle_upload_pack` 当前：
@@ -665,6 +673,9 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 | Mega refs fixture | cargo:integration_git_cli_mega_fixture_refs_round_trip | N/A+夹具守卫留在HTTP target | N/A+夹具不改鉴权面 | N/A+GM-09 go/no-go后启用或取消 |
 | shell SSH 广度 CI | N/A+HTTP已有CI smoke | DEFER-GM-04 | N/A+DEFER范围 | N/A+DEFER范围 |
 | missing-repo 客户端失败 | DEFER-GM-05 | DEFER-GM-05 | N/A+空仓广告语义 | N/A+原DEFER-IT-12→DEFER-GM-05由GM-11B收口 |
+| 视图 receive-pack 拒绝 | cargo:integration_git_ssh_view_layer2_git_client_read_only | cargo:integration_git_ssh_view_layer2_ssh_read_only | cargo:layer2_receive_pack_forbidden_before_auth_and_body | N/A+视图前缀固定只读 |
+| 视图 LFS 404 | cargo:layer2_lfs_not_found | cargo:integration_git_ssh_view_layer2_ssh_lfs_rejected | cargo:layer2_lfs_not_found | N/A+视图前缀不进入 LFS 命名空间 |
+| 未知或已禁用的视图 | cargo:layer2_disabled_not_found | cargo:integration_git_ssh_view_layer2_ssh_not_found | cargo:layer2_disabled_not_found | cargo:layer2_enabled_unregistered_not_found |
 
 #### GAP 映射（plan-20260803）
 

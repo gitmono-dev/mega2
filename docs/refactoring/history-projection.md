@@ -1136,7 +1136,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
   2. **按服务与配置拒绝**（同步，不查库，早于认证）。HTTP 在 `handle_smart_protocol`（`http_server.rs` 约 L960）解析出端点与 `service` 参数之后执行；SSH 在 `exec_request` 解析完命令之后执行。对 `View` 定位符：
      - `[views].enabled = false` 时，所有服务都返回 404，不回落到 Monorepo；
      - P0–P1 中 receive-pack 一律拒绝。HTTP 的 `info/refs?service=git-receive-pack` 与 `POST …/git-receive-pack` 返回 403；SSH `git-receive-pack` 没有状态码，按本节‘错误契约’写入一行 `ERR view URLs are read-only`，以退出码 1 结束通道。这一步早于 `receive_pack_requires_http_auth`、`git_http_auth`、`check_push_permission`（0.4-15）与 `ssh_receive_pack_enabled` 检查（`ssh.rs` 约 L149），也早于读取请求体。【代码】现有的 `ssh_receive_pack_enabled` 拒绝（`ssh.rs` 约 L148–162）把消息写到 stderr；Libra 不回显 SSH 的 stderr（Libra `ssh_client.rs` 约 L1715–1733），所以视图路径不沿用它，改用 ERR。git 的推送握手同样见到 ERR 即以 `remote error:` 退出（`transport.c` 约 L352–356）。
-     - LFS 一律拒绝：`rewrite_lfs_request_uri` 对视图前缀不改写 URI，请求落入 `/{*path}` catch-all（`any()`，约 L753），由 `parse_git_protocol_path` 以 NotFound 返回 404。它是同步的 `MapRequestLayer`，不能直接返回响应，而这是唯一能同时覆盖 `lfs_router` 与 `lfs_media` 全部处理函数的位置。SSH 的 `git-lfs-authenticate` 与 `git-lfs-transfer` 对视图路径同样拒绝（`ssh.rs` 约 L223 目前对任意路径都返回固定的 `lfs.ssh.http_url`）。本条与 `enabled` 无关，因为保留名始终生效。
+     - LFS 一律拒绝：`rewrite_lfs_request_uri` 对视图前缀不改写 URI，请求落入 `/{*path}` catch-all（`any()`，约 L753），由 `parse_git_protocol_path` 以 NotFound 返回 404。它是同步的 `MapRequestLayer`，不能直接返回响应，而这是唯一能同时覆盖 `lfs_router` 与 `lfs_media` 全部处理函数的位置。SSH 的 `git-lfs-authenticate` 与 `git-lfs-transfer` 对视图路径发送一行 `ERR view not found`、退出码 1，即错误契约「不存在」行的 SSH 形式，与 HTTP LFS 的 404 同类。本条与 `enabled` 无关，因为保留名始终生效。
   3. **视图解析**（异步，查库）。在 `src/contract/git_protocol/mod.rs` 新增 `resolve_view_target(state, &ViewLocator) -> Result<ResolvedView, ProtocolError>`，与 `check_upload_pack_access` 并列。
      - **调用顺序**：都在 `check_upload_pack_access` 之后调用，并且早于读取请求体和任何宣告。具体位置：HTTP `git_upload_pack` 中，位于 `check_upload_pack_access`（`http.rs` 约 L238）与 `collect_body_data`（约 L239）之间，先解析视图、再读请求体；`git_info_refs` 中，位于认证分支之后、v2 能力宣告的短路（约 L75）之前；SSH `exec_request` 中，位于 `check_upload_pack_access`（`ssh.rs` 约 L172）之后，早于 v2 短路（约 L180）与 `git_info_refs`（约 L193）。【代码】SSH 不需要额外处理：exec 被拒时不登记通道状态，之后到达的数据由 `data` 直接丢弃（`ssh.rs` 约 L349–355），不会缓冲。【推断】这个顺序不改变最坏情况下的内存占用，因为 `GIT_HTTP_MAX_BODY_BYTES`（4 GiB，`http.rs` 约 L173）对所有 upload-pack 路径一视同仁。它的作用是让未知、被禁用或未就绪的视图稳定地得到 404/503，而不是先缓冲请求体，再因读取失败得到 400。
      - **它依次做以下几件事**：
@@ -1515,6 +1515,8 @@ P1 的清扫周期，以及闲置阈值 `idle_recycle_secs`（下界为 2T = 720
   - `last_access_at` 为 NULL 的就绪视图不被闲置回收；正在预热的视图不是候选；重新预热的准入写入了 `last_access_at`，视图就绪后不会在下一轮被立即回收。
 
 **IT。** 黑盒 git 比对在 compose 的 git-cli 容器内运行（`tests/common/git_cli.rs`），不用宿主机上的 git。
+
+HP-18 的 `integration_git_ssh` 视图用例沿用该 target 既有 storage-only 用例的宿主回环写法：宿主 `ssh` 与 git 经 `127.0.0.1` 连接。请求与应答字节与客户端执行位置无关；宿主 git 只断言 `not found`、`returned error: 403`、`remote error: view not found`、`remote error: view URLs are read-only` 这些稳定子串。这是上文「错误契约」原始 SSH 应答与本段容器内 git 比对规则在 HP-18 上的执行位置例外。
 
 **基准【决策】。** 基准作为显式门运行（独立的 bin，或带理由的 opt-in 门），不进入 `cargo test --all`，也不新增 criterion 依赖，计时用 `std::time::Instant`。按以下协议执行，判据见 7.5 P0 验收 11。
 - **开工前冻结。** 下列各项写入任务卡的 `Performance budget` 字段（`docs/plan/plan-template.md` 约 L549），在 ER-03 开工复核时一并确认（约 L185）。开工后改动其中任何一项，都要先修订任务卡，不得在拿到数据之后再调。
