@@ -481,6 +481,15 @@ let service_type = ServiceType::from_str(command[0]).unwrap_or(ServiceType::Uplo
 - `data` 只读写当前 `ChannelId` 的状态。
 - `channel_eof` 只处理对应 channel 的状态，处理完后从 map 移除。
 - 关闭 channel 时清理状态。
+- `GitSshChannelState` 记下视图错误的退出码；`channel_eof` 按它发 exit-status，缺省为 0（HP-34）。
+
+### SSH 视图错误的 ERR 与退出码（HP-34）
+
+设计 [§6.1 的错误契约](history-projection.md#61-url-与路由决策)规定 SSH 对视图不存在和只读分别发送 `ERR view not found`、`ERR view URLs are read-only`，退出码均为 1；暂不可用发送 `ERR view <filter_id> unavailable: <reason>`，退出码为 75；打包预检失败发送错误原文的 `ERR`，退出码为 1。每条消息都是一个 pkt-line。
+
+exec 阶段由 `reject_exec` 依次发送 `channel_success`、ERR、exit-status、EOF 和 close，不登记通道状态，并移除该通道的 `clients` 句柄与 v2 标记。russh 在 close 之后不再回调 `channel_eof` 或 `channel_close`。HP-18 与 HP-20 的 exec 拒绝经 `SshServer::send_exec_err` 调用这条路径。
+
+v0 upload-pack、v2 `ls-refs` 和 v2 `fetch` 的数据阶段都经 `write_data_error` 写出视图错误。写出 ERR 后，通道不再写 data 字节，后续数据和 EOF 残留请求都会丢弃。`channel_eof` 先补处理残留请求，再取得退出码；若 `clients` 已没有该通道，说明它已被 `reject_exec` 拒绝，可能是 ERR 进入 russh 待发队列后客户端仍发送 EOF，此时只发送 close，exec 阶段发送的码是该通道唯一的 exit-status。非视图错误继续输出裸文本（`DEFER-HP-17`）。
 
 ### SSH upload-pack 可能把二进制 ACK/pack 数据当 UTF-8 发送
 

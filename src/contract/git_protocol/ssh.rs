@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, hash::Hash, path::PathBuf, str::FromStr, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Duration, Utc};
@@ -20,6 +20,7 @@ use crate::{
             v2,
         },
     },
+    common::errors::ProtocolError,
     config::PushAuth,
     contract::git_protocol::{check_push_permission, check_upload_pack_access, lookup_push_token},
     jupiter::storage::Storage,
@@ -29,6 +30,201 @@ type ClientMap = HashMap<(usize, ChannelId), Channel<Msg>>;
 
 const LFS_TRANSFER_UNSUPPORTED_ERROR: &str =
     "git-lfs-transfer is not supported; use git-lfs-authenticate HTTP fallback\n";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SshErrReply {
+    payload: Bytes,
+    exit_code: u32,
+}
+
+impl SshErrReply {
+    fn new(message: impl std::fmt::Display, exit_code: u32) -> Self {
+        let mut payload = BytesMut::new();
+        smart::add_pkt_line_string(&mut payload, format!("ERR {message}\n"));
+        Self {
+            payload: payload.freeze(),
+            exit_code,
+        }
+    }
+
+    fn view_not_found() -> Self {
+        Self::new("view not found", 1)
+    }
+
+    fn view_read_only() -> Self {
+        Self::new("view URLs are read-only", 1)
+    }
+
+    fn from_view_error(error: &ProtocolError) -> Option<Self> {
+        match error {
+            ProtocolError::ViewUnavailable { .. } => Some(Self::new(error, 75)),
+            ProtocolError::PackRejected(_) => Some(Self::new(error, 1)),
+            _ => None,
+        }
+    }
+}
+
+trait SshChannelOut {
+    fn channel_success(&mut self) -> Result<(), russh::Error>;
+    fn data(&mut self, data: Bytes) -> Result<(), russh::Error>;
+    fn exit_status_request(&mut self, exit_code: u32) -> Result<(), russh::Error>;
+    fn eof(&mut self) -> Result<(), russh::Error>;
+    fn close(&mut self) -> Result<(), russh::Error>;
+}
+
+struct SessionChannelOut<'a> {
+    channel: ChannelId,
+    session: &'a mut Session,
+}
+
+impl SshChannelOut for SessionChannelOut<'_> {
+    fn channel_success(&mut self) -> Result<(), russh::Error> {
+        self.session.channel_success(self.channel)
+    }
+
+    fn data(&mut self, data: Bytes) -> Result<(), russh::Error> {
+        self.session.data(self.channel, data)
+    }
+
+    fn exit_status_request(&mut self, exit_code: u32) -> Result<(), russh::Error> {
+        self.session.exit_status_request(self.channel, exit_code)
+    }
+
+    fn eof(&mut self) -> Result<(), russh::Error> {
+        self.session.eof(self.channel)
+    }
+
+    fn close(&mut self) -> Result<(), russh::Error> {
+        self.session.close(self.channel)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum V0Exec {
+    Advertise(BytesMut),
+    ViewError(SshErrReply),
+}
+
+fn classify_v0_advertise(result: Result<BytesMut, ProtocolError>) -> Result<V0Exec, ProtocolError> {
+    match result {
+        Ok(advertise) => Ok(V0Exec::Advertise(advertise)),
+        Err(error) => match SshErrReply::from_view_error(&error) {
+            Some(reply) => Ok(V0Exec::ViewError(reply)),
+            None => Err(error),
+        },
+    }
+}
+
+fn reject_exec<K, C, O>(
+    clients: &mut HashMap<(usize, K), C>,
+    v2_channels: &mut HashMap<K, bool>,
+    client_key: (usize, K),
+    reply: &SshErrReply,
+    out: &mut O,
+) -> Result<(), russh::Error>
+where
+    K: Eq + Hash + Copy,
+    O: SshChannelOut,
+{
+    clients.remove(&client_key);
+    v2_channels.remove(&client_key.1);
+    out.channel_success()?;
+    out.data(reply.payload.clone())?;
+    out.exit_status_request(reply.exit_code)?;
+    out.eof()?;
+    out.close()
+}
+
+fn finish_v0_exec<K, C, O>(
+    channels: &mut HashMap<K, GitSshChannelState>,
+    clients: &mut HashMap<(usize, K), C>,
+    v2_channels: &mut HashMap<K, bool>,
+    client_key: (usize, K),
+    smart_protocol: SmartSession,
+    outcome: V0Exec,
+    out: &mut O,
+) -> Result<(), russh::Error>
+where
+    K: Eq + Hash + Copy,
+    O: SshChannelOut,
+{
+    match outcome {
+        V0Exec::Advertise(advertise) => {
+            channels.insert(
+                client_key.1,
+                GitSshChannelState {
+                    smart_protocol,
+                    data_combined: BytesMut::new(),
+                    pending_shallow_request: None,
+                    exit_code: None,
+                },
+            );
+            out.data(advertise.freeze())?;
+            out.channel_success()
+        }
+        V0Exec::ViewError(reply) => reject_exec(clients, v2_channels, client_key, &reply, out),
+    }
+}
+
+fn write_data_error<O: SshChannelOut>(
+    out: &mut O,
+    state: &mut GitSshChannelState,
+    error: &ProtocolError,
+) {
+    if state.exit_code.is_some() {
+        return;
+    }
+    if let Some(reply) = SshErrReply::from_view_error(error) {
+        let _ = out.data(reply.payload);
+        state.exit_code = Some(reply.exit_code);
+    } else {
+        let _ = out.data(Bytes::from(format!("error: {error}\n")));
+    }
+}
+
+fn take_ready_request(state: Option<&mut GitSshChannelState>, data: &[u8]) -> Option<Bytes> {
+    let state = state?;
+    if state.exit_code.is_some() {
+        return None;
+    }
+    match state.smart_protocol.service_type {
+        ServiceType::ReceivePack => {
+            state.data_combined.extend_from_slice(data);
+            None
+        }
+        ServiceType::UploadPack => {
+            // Git may deliver the upload-pack request across multiple SSH
+            // data packets. Process only a complete round, terminated
+            // by a flush pkt-line (`0000`) or a complete `done` packet.
+            // Handling a partial/flush-only chunk as a complete request
+            // previously ran pack generation with want=[] and returned
+            // `error: …` (`bad line length character: erro` on the client).
+            state.data_combined.extend_from_slice(data);
+            if upload_pack_buffer_complete(
+                &state.data_combined,
+                state.pending_shallow_request.is_some(),
+            ) {
+                Some(take_complete_upload_pack_request(&mut state.data_combined))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn take_eof_residual(state: &mut GitSshChannelState) -> Option<Bytes> {
+    if state.exit_code.is_some() || state.data_combined.is_empty() {
+        return None;
+    }
+    Some(state.data_combined.split().freeze())
+}
+
+fn eof_exit_code(state: Option<&GitSshChannelState>, had_client_entry: bool) -> Option<u32> {
+    if !had_client_entry {
+        return None;
+    }
+    Some(state.and_then(|state| state.exit_code).unwrap_or(0))
+}
 
 #[derive(Debug, PartialEq)]
 enum SshExecKind {
@@ -60,6 +256,7 @@ pub struct GitSshChannelState {
     pub data_combined: BytesMut,
     /// Wants/depth from a v0 shallow-info round; SSH sends only `done` next.
     pub pending_shallow_request: Option<Bytes>,
+    pub exit_code: Option<u32>,
 }
 
 impl server::Server for SshServer {
@@ -68,6 +265,25 @@ impl server::Server for SshServer {
         let s = self.clone();
         self.id += 1;
         s
+    }
+}
+
+impl SshServer {
+    async fn send_exec_err(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+        reply: &SshErrReply,
+    ) -> Result<(), russh::Error> {
+        let mut clients = self.clients.lock().await;
+        let mut out = SessionChannelOut { channel, session };
+        reject_exec(
+            &mut clients,
+            &mut self.v2_channels,
+            (self.id, channel),
+            reply,
+            &mut out,
+        )
     }
 }
 
@@ -188,22 +404,25 @@ impl server::Handler for SshServer {
                             smart_protocol,
                             data_combined: BytesMut::new(),
                             pending_shallow_request: None,
+                            exit_code: None,
                         },
                     );
                     session.data(channel, v2_adv.to_vec())?;
                     session.channel_success(channel)?;
                 } else {
-                    let res = smart_protocol.git_info_refs(&self.state).await?;
-                    self.channels.insert(
-                        channel,
-                        GitSshChannelState {
-                            smart_protocol,
-                            data_combined: BytesMut::new(),
-                            pending_shallow_request: None,
-                        },
-                    );
-                    session.data(channel, res.to_vec())?;
-                    session.channel_success(channel)?;
+                    let outcome =
+                        classify_v0_advertise(smart_protocol.git_info_refs(&self.state).await)?;
+                    let mut clients = self.clients.lock().await;
+                    let mut out = SessionChannelOut { channel, session };
+                    finish_v0_exec(
+                        &mut self.channels,
+                        &mut clients,
+                        &mut self.v2_channels,
+                        (self.id, channel),
+                        smart_protocol,
+                        outcome,
+                        &mut out,
+                    )?;
                 }
             }
             //Note that currently mega does not support pure ssh to transfer files, still relay on the https server.
@@ -351,41 +570,8 @@ impl server::Handler for SshServer {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let Some(state) = self.channels.get_mut(&channel) else {
-            tracing::warn!(
-                channel = ?channel,
-                "data received before exec request initialized smart protocol"
-            );
-            return Ok(());
-        };
-        tracing::info!(
-            channel = ?channel,
-            "receiving data length:{}",
-            data.len()
-        );
-        let service_type = state.smart_protocol.service_type;
-        match service_type {
-            ServiceType::UploadPack => {
-                // Git may deliver the upload-pack request across multiple SSH
-                // data packets. Process only a complete round, terminated
-                // by a flush pkt-line (`0000`) or a complete `done` packet.
-                // Handling a partial/flush-only chunk as a complete request
-                // previously ran pack generation with want=[] and returned
-                // `error: …` (`bad line length character: erro` on the client).
-                state.data_combined.extend_from_slice(data);
-                while upload_pack_buffer_complete(
-                    &state.data_combined,
-                    state.pending_shallow_request.is_some(),
-                ) {
-                    let request = take_complete_upload_pack_request(&mut state.data_combined);
-                    handle_upload_pack(state, &self.state, channel, &request, session).await;
-                }
-            }
-            ServiceType::ReceivePack => {
-                state.data_combined.extend_from_slice(data);
-            }
-        };
-        session.channel_success(channel)?;
+        let mut out = SessionChannelOut { channel, session };
+        on_channel_data(&mut self.channels, channel, &self.state, data, &mut out).await?;
         Ok(())
     }
 
@@ -394,36 +580,19 @@ impl server::Handler for SshServer {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(mut state) = self.channels.remove(&channel) {
-            match state.smart_protocol.service_type {
-                ServiceType::ReceivePack => {
-                    let api_state = &self.state;
-                    handle_receive_pack(&mut state, api_state, channel, session).await;
-                }
-                ServiceType::UploadPack => {
-                    // Flush any trailing buffered request that lacked a final
-                    // pkt flush before the client closed stdin.
-                    if !state.data_combined.is_empty() {
-                        let request = state.data_combined.split().freeze();
-                        handle_upload_pack(
-                            &mut state,
-                            &self.state,
-                            channel,
-                            request.as_ref(),
-                            session,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-
-        {
+        let had_client_entry = {
             let mut clients = self.clients.lock().await;
-            clients.remove(&(self.id, channel));
-        }
-        session.exit_status_request(channel, 0000)?;
-        session.close(channel)?;
+            clients.remove(&(self.id, channel)).is_some()
+        };
+        let mut out = SessionChannelOut { channel, session };
+        finish_channel_eof(
+            &mut self.channels,
+            channel,
+            had_client_entry,
+            &self.state,
+            &mut out,
+        )
+        .await?;
         Ok(())
     }
 
@@ -569,16 +738,68 @@ fn split_ssh_exec_args(input: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
-async fn handle_upload_pack(
+async fn on_channel_data<K, O>(
+    channels: &mut HashMap<K, GitSshChannelState>,
+    key: K,
+    api_state: &ProtocolApiState,
+    data: &[u8],
+    out: &mut O,
+) -> Result<(), russh::Error>
+where
+    K: Eq + Hash + std::fmt::Debug,
+    O: SshChannelOut + Send,
+{
+    let Some(state) = channels.get_mut(&key) else {
+        tracing::warn!(
+            channel = ?key,
+            "data received before exec request initialized smart protocol"
+        );
+        return Ok(());
+    };
+    tracing::info!(channel = ?key, "receiving data length:{}", data.len());
+    if let Some(request) = take_ready_request(Some(state), data) {
+        handle_upload_pack(state, api_state, &request, out).await;
+    }
+    out.channel_success()
+}
+
+async fn finish_channel_eof<K, O>(
+    channels: &mut HashMap<K, GitSshChannelState>,
+    key: K,
+    had_client_entry: bool,
+    api_state: &ProtocolApiState,
+    out: &mut O,
+) -> Result<(), russh::Error>
+where
+    K: Eq + Hash,
+    O: SshChannelOut + Send,
+{
+    let mut state = channels.remove(&key);
+    if let Some(state) = state.as_mut() {
+        match state.smart_protocol.service_type {
+            ServiceType::ReceivePack => handle_receive_pack(state, api_state, out).await,
+            ServiceType::UploadPack => {
+                if let Some(request) = take_eof_residual(state) {
+                    handle_upload_pack(state, api_state, &request, out).await;
+                }
+            }
+        }
+    }
+    if let Some(exit_code) = eof_exit_code(state.as_ref(), had_client_entry) {
+        out.exit_status_request(exit_code)?;
+    }
+    out.close()
+}
+
+async fn handle_upload_pack<O: SshChannelOut + Send>(
     state: &mut GitSshChannelState,
     api_state: &ProtocolApiState,
-    channel: ChannelId,
     data: &[u8],
-    session: &mut Session,
+    out: &mut O,
 ) {
     let mut body = Bytes::copy_from_slice(data);
     if v2::is_v2_upload_pack_request(&mut body) {
-        handle_v2_upload_pack_ssh(state, api_state, channel, &mut body, session).await;
+        handle_v2_upload_pack_ssh(state, api_state, &mut body, out).await;
         return;
     }
 
@@ -599,13 +820,13 @@ async fn handle_upload_pack(
         Ok(result) => result,
         Err(e) => {
             tracing::error!(error = %e, "upload-pack protocol error");
-            let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+            write_data_error(out, state, &e);
             return;
         }
     };
 
     tracing::info!("buf is {:?}", buf);
-    let _ = session.data(channel, buf.to_vec());
+    let _ = out.data(buf.clone().freeze());
     if buf.ends_with(smart::PKT_LINE_END_MARKER) {
         state.pending_shallow_request = Some(request);
         return;
@@ -627,10 +848,10 @@ async fn handle_upload_pack(
                 break;
             }
             let bytes_out = smart_protocol.build_side_band_format(temp, length);
-            let _ = session.data(channel, bytes_out.to_vec());
+            let _ = out.data(bytes_out.freeze());
         }
     }
-    let _ = session.data(channel, smart::PKT_LINE_END_MARKER.to_vec());
+    let _ = out.data(Bytes::copy_from_slice(smart::PKT_LINE_END_MARKER));
 }
 
 /// True when `buf` holds at least one terminated upload-pack/v2 command.
@@ -655,18 +876,17 @@ fn take_complete_upload_pack_request(buf: &mut BytesMut) -> Bytes {
     buf.split().freeze()
 }
 
-async fn handle_v2_upload_pack_ssh(
+async fn handle_v2_upload_pack_ssh<O: SshChannelOut + Send>(
     state: &mut GitSshChannelState,
     api_state: &ProtocolApiState,
-    channel: ChannelId,
     body: &mut Bytes,
-    session: &mut Session,
+    out: &mut O,
 ) {
     let (command, _caps) = match v2::parse_v2_command(body) {
-        Ok(cmd) => cmd,
+        Ok(command) => command,
         Err(e) => {
             tracing::error!(error = %e, "v2 command parse error");
-            let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+            let _ = out.data(Bytes::from(format!("error: {e}\n")));
             return;
         }
     };
@@ -677,11 +897,11 @@ async fn handle_v2_upload_pack_ssh(
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "v2 ls-refs error");
-                    let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+                    write_data_error(out, state, &e);
                     return;
                 }
             };
-            let _ = session.data(channel, refs.to_vec());
+            let _ = out.data(refs.freeze());
         }
         "fetch" => {
             let v2::V2FetchResponse {
@@ -692,7 +912,7 @@ async fn handle_v2_upload_pack_ssh(
                 Ok(result) => result,
                 Err(e) => {
                     tracing::error!(error = %e, "v2 fetch error");
-                    let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+                    write_data_error(out, state, &e);
                     return;
                 }
             };
@@ -701,11 +921,11 @@ async fn handle_v2_upload_pack_ssh(
             if !has_packfile {
                 // Negotiation round: the `acknowledgments` section already
                 // closed the response with its flush packet.
-                let _ = session.data(channel, protocol_buf.to_vec());
+                let _ = out.data(protocol_buf.freeze());
                 return;
             }
             v2::add_packfile_section_header(&mut protocol_buf);
-            let _ = session.data(channel, protocol_buf.to_vec());
+            let _ = out.data(protocol_buf.freeze());
 
             while let Some(chunk) = send_pack_data.next().await {
                 let mut reader = chunk.as_slice();
@@ -723,26 +943,24 @@ async fn handle_v2_upload_pack_ssh(
                         break;
                     }
                     let bytes_out = v2::build_packfile_data_packet(temp, length);
-                    let _ = session.data(channel, bytes_out.to_vec());
+                    let _ = out.data(bytes_out.freeze());
                 }
             }
-            let _ = session.data(channel, smart::PKT_LINE_END_MARKER.to_vec());
+            let _ = out.data(Bytes::copy_from_slice(smart::PKT_LINE_END_MARKER));
         }
         other => {
             tracing::warn!(command = %other, "unsupported v2 command");
-            let _ = session.data(
-                channel,
-                format!("error: unsupported v2 command: {other}\n").into_bytes(),
-            );
+            let _ = out.data(Bytes::from(format!(
+                "error: unsupported v2 command: {other}\n"
+            )));
         }
     }
 }
 
-async fn handle_receive_pack(
+async fn handle_receive_pack<O: SshChannelOut + Send>(
     state: &mut GitSshChannelState,
     api_state: &ProtocolApiState,
-    channel: ChannelId,
-    session: &mut Session,
+    out: &mut O,
 ) {
     let smart_protocol = &mut state.smart_protocol;
     let data = state.data_combined.split().freeze();
@@ -750,7 +968,7 @@ async fn handle_receive_pack(
         Ok(split) => split,
         Err(err) => {
             tracing::warn!(error = %err, "invalid receive-pack request");
-            let _ = session.data(channel, format!("error: {err}\n").into_bytes());
+            let _ = out.data(Bytes::from(format!("error: {err}\n")));
             return;
         }
     };
@@ -759,15 +977,15 @@ async fn handle_receive_pack(
         .await
     {
         Ok(status) => status,
-        Err(e) => {
-            tracing::error!(error = %e, "receive-pack protocol error");
-            let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+        Err(err) => {
+            tracing::error!(error = %err, "receive-pack protocol error");
+            let _ = out.data(Bytes::from(format!("error: {err}\n")));
             return;
         }
     };
 
     tracing::info!("report status: {:?}", report_status);
-    let _ = session.data(channel, report_status.to_vec());
+    let _ = out.data(report_status);
 }
 
 async fn lookup_ssh_key_finger_for_review(
@@ -824,6 +1042,582 @@ mod tests {
             v2_channels: HashMap::new(),
             authenticated_user: None,
         }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum RecordedEvent {
+        ChannelSuccess,
+        Data(Bytes),
+        ExitStatus(u32),
+        Eof,
+        Close,
+    }
+
+    #[derive(Default)]
+    struct RecordedOut {
+        events: Vec<RecordedEvent>,
+    }
+
+    impl SshChannelOut for RecordedOut {
+        fn channel_success(&mut self) -> Result<(), russh::Error> {
+            self.events.push(RecordedEvent::ChannelSuccess);
+            Ok(())
+        }
+
+        fn data(&mut self, data: Bytes) -> Result<(), russh::Error> {
+            self.events.push(RecordedEvent::Data(data));
+            Ok(())
+        }
+
+        fn exit_status_request(&mut self, exit_code: u32) -> Result<(), russh::Error> {
+            self.events.push(RecordedEvent::ExitStatus(exit_code));
+            Ok(())
+        }
+
+        fn eof(&mut self) -> Result<(), russh::Error> {
+            self.events.push(RecordedEvent::Eof);
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), russh::Error> {
+            self.events.push(RecordedEvent::Close);
+            Ok(())
+        }
+    }
+
+    fn upload_pack_state() -> GitSshChannelState {
+        GitSshChannelState {
+            smart_protocol: SmartSession::new(
+                PathBuf::from("/"),
+                ServiceType::UploadPack,
+                TransportProtocol::Ssh,
+            ),
+            data_combined: BytesMut::new(),
+            pending_shallow_request: None,
+            exit_code: None,
+        }
+    }
+
+    fn expected_err_packet(message: &str) -> Bytes {
+        let mut packet = BytesMut::new();
+        smart::add_pkt_line_string(&mut packet, format!("ERR {message}\n"));
+        packet.freeze()
+    }
+
+    #[test]
+    fn ssh_err_reply_matches_contract() {
+        for (reply, message) in [
+            (SshErrReply::view_not_found(), "view not found"),
+            (SshErrReply::view_read_only(), "view URLs are read-only"),
+        ] {
+            assert_eq!(reply.payload, expected_err_packet(message));
+            assert_eq!(reply.exit_code, 1);
+            let mut payload = reply.payload.clone();
+            assert_eq!(
+                smart::try_read_pkt_line(&mut payload).expect("ERR packet"),
+                smart::PktLine::Data(Bytes::from(format!("ERR {message}\n")))
+            );
+            assert!(payload.is_empty());
+        }
+
+        let filter_id = "a".repeat(64);
+        for (reason, expected_reason) in [
+            (
+                crate::common::errors::ViewUnavailableReason::WarmingUp,
+                "warming up",
+            ),
+            (
+                crate::common::errors::ViewUnavailableReason::RootChainHalted,
+                "root chain halted",
+            ),
+            (
+                crate::common::errors::ViewUnavailableReason::DefinitionCorrupt,
+                "definition corrupt",
+            ),
+        ] {
+            let error = ProtocolError::ViewUnavailable {
+                filter_id: filter_id.clone(),
+                reason,
+            };
+            let reply = SshErrReply::from_view_error(&error).expect("view unavailable reply");
+            let expected = format!("view {filter_id} unavailable: {expected_reason}");
+            assert_eq!(reply.payload, expected_err_packet(&expected));
+            assert_eq!(reply.exit_code, 75);
+            let mut payload = reply.payload.clone();
+            assert_eq!(
+                smart::try_read_pkt_line(&mut payload).expect("ERR packet"),
+                smart::PktLine::Data(Bytes::from(format!("ERR {expected}\n")))
+            );
+            assert!(payload.is_empty());
+        }
+
+        for message in [
+            format!("upload-pack: not our ref {}", "b".repeat(40)),
+            format!(
+                "view {} pack aborted: tree {} does not match its stored entries",
+                "c".repeat(64),
+                "d".repeat(40),
+            ),
+        ] {
+            let error = ProtocolError::PackRejected(message.clone());
+            let reply = SshErrReply::from_view_error(&error).expect("pack rejected reply");
+            assert_eq!(reply.payload, expected_err_packet(&message));
+            assert_eq!(reply.exit_code, 1);
+            let mut payload = reply.payload.clone();
+            assert_eq!(
+                smart::try_read_pkt_line(&mut payload).expect("ERR packet"),
+                smart::PktLine::Data(Bytes::from(format!("ERR {message}\n")))
+            );
+            assert!(payload.is_empty());
+        }
+
+        for error in [
+            ProtocolError::NotFound("missing".to_owned()),
+            ProtocolError::Forbidden("denied".to_owned()),
+            ProtocolError::InvalidInput("bad input".to_owned()),
+            ProtocolError::AdvertiseFailed,
+        ] {
+            assert!(SshErrReply::from_view_error(&error).is_none());
+        }
+    }
+
+    #[test]
+    fn exec_view_error_sequence() {
+        let filter_id = "e".repeat(64);
+        for (error, exit_code) in [
+            (
+                ProtocolError::ViewUnavailable {
+                    filter_id: filter_id.clone(),
+                    reason: crate::common::errors::ViewUnavailableReason::WarmingUp,
+                },
+                75,
+            ),
+            (
+                ProtocolError::PackRejected(format!("upload-pack: not our ref {}", "f".repeat(40))),
+                1,
+            ),
+        ] {
+            let outcome = classify_v0_advertise(Err(error)).expect("view error outcome");
+            assert!(matches!(outcome, V0Exec::ViewError(_)));
+            let mut channels = HashMap::<u32, GitSshChannelState>::new();
+            let mut clients = HashMap::from([((3_usize, 7_u32), ()), ((3, 8), ()), ((4, 7), ())]);
+            let mut v2_channels = HashMap::from([(7_u32, true), (8_u32, true)]);
+            let mut out = RecordedOut::default();
+            finish_v0_exec(
+                &mut channels,
+                &mut clients,
+                &mut v2_channels,
+                (3, 7),
+                SmartSession::new(
+                    PathBuf::from("/"),
+                    ServiceType::UploadPack,
+                    TransportProtocol::Ssh,
+                ),
+                outcome,
+                &mut out,
+            )
+            .expect("finish view exec");
+            assert_eq!(
+                out.events,
+                [
+                    RecordedEvent::ChannelSuccess,
+                    RecordedEvent::Data(expected_err_packet(&match exit_code {
+                        75 => format!("view {filter_id} unavailable: warming up"),
+                        _ => format!("upload-pack: not our ref {}", "f".repeat(40)),
+                    })),
+                    RecordedEvent::ExitStatus(exit_code),
+                    RecordedEvent::Eof,
+                    RecordedEvent::Close,
+                ]
+            );
+            assert!(channels.is_empty());
+            assert_eq!(clients.len(), 2);
+            assert!(clients.contains_key(&(3, 8)));
+            assert!(clients.contains_key(&(4, 7)));
+            assert_eq!(v2_channels, HashMap::from([(8_u32, true)]));
+        }
+
+        let initial_clients = HashMap::from([((3_usize, 7_u32), ()), ((3, 8), ()), ((4, 7), ())]);
+        let initial_v2_channels = HashMap::from([(7_u32, true), (8_u32, true)]);
+
+        let mut clients = initial_clients.clone();
+        let mut v2_channels = initial_v2_channels.clone();
+        let mut out = RecordedOut::default();
+        reject_exec(
+            &mut clients,
+            &mut v2_channels,
+            (3, 7),
+            &SshErrReply::view_not_found(),
+            &mut out,
+        )
+        .expect("reject exec");
+        assert_eq!(
+            out.events,
+            [
+                RecordedEvent::ChannelSuccess,
+                RecordedEvent::Data(expected_err_packet("view not found")),
+                RecordedEvent::ExitStatus(1),
+                RecordedEvent::Eof,
+                RecordedEvent::Close,
+            ]
+        );
+        assert_eq!(
+            clients,
+            HashMap::from([((3_usize, 8_u32), ()), ((4, 7), ())])
+        );
+        assert_eq!(v2_channels, HashMap::from([(8_u32, true)]));
+
+        let mut channels = HashMap::<u32, GitSshChannelState>::new();
+        let mut clients = initial_clients;
+        let mut v2_channels = initial_v2_channels;
+        let mut out = RecordedOut::default();
+        finish_v0_exec(
+            &mut channels,
+            &mut clients,
+            &mut v2_channels,
+            (3, 7),
+            SmartSession::new(
+                PathBuf::from("/"),
+                ServiceType::UploadPack,
+                TransportProtocol::Ssh,
+            ),
+            V0Exec::Advertise(BytesMut::from(&b"advertise"[..])),
+            &mut out,
+        )
+        .expect("finish advertise");
+        assert_eq!(
+            out.events,
+            [
+                RecordedEvent::Data(Bytes::from_static(b"advertise")),
+                RecordedEvent::ChannelSuccess,
+            ]
+        );
+        assert!(
+            channels
+                .get(&7)
+                .expect("advertise must register channel state")
+                .exit_code
+                .is_none()
+        );
+        assert_eq!(
+            clients,
+            HashMap::from([((3_usize, 7_u32), ()), ((3, 8), ()), ((4, 7), ())])
+        );
+        assert_eq!(v2_channels, HashMap::from([(7_u32, true), (8_u32, true)]));
+    }
+
+    #[test]
+    fn data_view_error_writes_single_err() {
+        let filter_id = "1".repeat(64);
+        for (error, expected_message, expected_exit) in [
+            (
+                ProtocolError::ViewUnavailable {
+                    filter_id: filter_id.clone(),
+                    reason: crate::common::errors::ViewUnavailableReason::RootChainHalted,
+                },
+                format!("view {filter_id} unavailable: root chain halted"),
+                75,
+            ),
+            (
+                ProtocolError::PackRejected(format!("upload-pack: not our ref {}", "2".repeat(40))),
+                format!("upload-pack: not our ref {}", "2".repeat(40)),
+                1,
+            ),
+        ] {
+            let mut state = upload_pack_state();
+            let mut out = RecordedOut::default();
+            write_data_error(&mut out, &mut state, &error);
+            assert_eq!(
+                out.events,
+                [RecordedEvent::Data(expected_err_packet(&expected_message))]
+            );
+            assert_eq!(state.exit_code, Some(expected_exit));
+        }
+    }
+
+    #[test]
+    fn non_view_errors_unchanged() {
+        let advertisement = BytesMut::from(&b"advertise"[..]);
+        assert_eq!(
+            classify_v0_advertise(Ok(advertisement.clone())).expect("advertisement"),
+            V0Exec::Advertise(advertisement)
+        );
+
+        for error in [
+            ProtocolError::NotFound("missing".to_owned()),
+            ProtocolError::Forbidden("denied".to_owned()),
+            ProtocolError::InvalidInput("x".to_owned()),
+            ProtocolError::AdvertiseFailed,
+        ] {
+            let expected = error.to_string();
+            let classified = classify_v0_advertise(Err(error)).unwrap_err();
+            assert_eq!(classified.to_string(), expected);
+        }
+
+        let mut state = upload_pack_state();
+        let mut out = RecordedOut::default();
+        for error in [
+            ProtocolError::InvalidInput("x".to_owned()),
+            ProtocolError::NotFound("y".to_owned()),
+        ] {
+            write_data_error(&mut out, &mut state, &error);
+        }
+        assert_eq!(
+            out.events,
+            [
+                RecordedEvent::Data(Bytes::from_static(b"error: Invalid Input: x\n")),
+                RecordedEvent::Data(Bytes::from_static(b"error: Repository not found: y\n")),
+            ]
+        );
+        assert_eq!(state.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn data_stage_call_sites_use_writer() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let server = ssh_server_with_git(
+            dir.path(),
+            GitConfig {
+                anonymous_access: true,
+                push_auth: Some(PushAuth::None),
+                ssh_receive_pack: Some(false),
+                push_tokens: Vec::new(),
+            },
+        )
+        .await;
+        let expected = Bytes::from_static(
+            b"error: Invalid Input: pkt-line length header is not hexadecimal\n",
+        );
+
+        for request in [
+            Bytes::from_static(b"zzzz"),
+            Bytes::from_static(b"0014command=ls-refs\n0001zzzz"),
+            Bytes::from_static(b"0012command=fetch\n0001zzzz"),
+        ] {
+            let mut state = upload_pack_state();
+            let mut out = RecordedOut::default();
+            handle_upload_pack(&mut state, &server.state, &request, &mut out).await;
+            assert_eq!(out.events, [RecordedEvent::Data(expected.clone())]);
+            assert_eq!(state.exit_code, None);
+
+            let mut state = upload_pack_state();
+            state.exit_code = Some(75);
+            let mut out = RecordedOut::default();
+            handle_upload_pack(&mut state, &server.state, &request, &mut out).await;
+            assert!(out.events.is_empty());
+            assert_eq!(state.exit_code, Some(75));
+        }
+
+        let complete_request = Bytes::from(format!("0032want {}\n00000009done\n", "7".repeat(40)));
+        let mut channels = HashMap::from([(7_u32, upload_pack_state())]);
+        channels.get_mut(&7).expect("channel").exit_code = Some(75);
+        let mut out = RecordedOut::default();
+        on_channel_data(&mut channels, 7, &server.state, &complete_request, &mut out)
+            .await
+            .expect("errored channel data");
+        assert_eq!(out.events, [RecordedEvent::ChannelSuccess]);
+        assert!(channels.get(&7).expect("channel").data_combined.is_empty());
+
+        let mut out = RecordedOut::default();
+        on_channel_data(
+            &mut HashMap::<u32, GitSshChannelState>::new(),
+            7,
+            &server.state,
+            &complete_request,
+            &mut out,
+        )
+        .await
+        .expect("missing channel data");
+        assert!(out.events.is_empty());
+
+        let v2_error_request = Bytes::from_static(b"0012command=fetch\n0001zzzz0000");
+        let mut channels = HashMap::from([(7_u32, upload_pack_state())]);
+        let mut out = RecordedOut::default();
+        on_channel_data(&mut channels, 7, &server.state, &v2_error_request, &mut out)
+            .await
+            .expect("plain error channel data");
+        assert_eq!(
+            out.events,
+            [
+                RecordedEvent::Data(expected.clone()),
+                RecordedEvent::ChannelSuccess
+            ]
+        );
+
+        let mut state = upload_pack_state();
+        state.exit_code = Some(75);
+        state.data_combined.extend_from_slice(b"zzzz");
+        let mut channels = HashMap::from([(7_u32, state)]);
+        let mut out = RecordedOut::default();
+        finish_channel_eof(&mut channels, 7, true, &server.state, &mut out)
+            .await
+            .expect("errored EOF");
+        assert_eq!(
+            out.events,
+            [RecordedEvent::ExitStatus(75), RecordedEvent::Close]
+        );
+        assert!(channels.is_empty());
+
+        let mut out = RecordedOut::default();
+        finish_channel_eof(
+            &mut HashMap::<u32, GitSshChannelState>::new(),
+            7,
+            true,
+            &server.state,
+            &mut out,
+        )
+        .await
+        .expect("missing EOF");
+        assert_eq!(
+            out.events,
+            [RecordedEvent::ExitStatus(0), RecordedEvent::Close]
+        );
+
+        let mut channels = HashMap::from([(7_u32, upload_pack_state())]);
+        let mut out = RecordedOut::default();
+        finish_channel_eof(&mut channels, 7, true, &server.state, &mut out)
+            .await
+            .expect("empty EOF");
+        assert_eq!(
+            out.events,
+            [RecordedEvent::ExitStatus(0), RecordedEvent::Close]
+        );
+        assert!(channels.is_empty());
+
+        let mut residual = upload_pack_state();
+        residual.data_combined.extend_from_slice(b"zzzz");
+        let mut channels = HashMap::from([(7_u32, residual)]);
+        let mut out = RecordedOut::default();
+        finish_channel_eof(&mut channels, 7, true, &server.state, &mut out)
+            .await
+            .expect("residual EOF");
+        assert_eq!(
+            out.events,
+            [
+                RecordedEvent::Data(expected),
+                RecordedEvent::ExitStatus(0),
+                RecordedEvent::Close,
+            ]
+        );
+        assert!(channels.is_empty());
+
+        let mut channels = HashMap::<u32, GitSshChannelState>::new();
+        let mut clients = HashMap::from([((3_usize, 7_u32), ())]);
+        let mut v2_channels = HashMap::new();
+        let mut out = RecordedOut::default();
+        reject_exec(
+            &mut clients,
+            &mut v2_channels,
+            (3, 7),
+            &SshErrReply::view_not_found(),
+            &mut out,
+        )
+        .expect("reject exec");
+        let had_client_entry = clients.remove(&(3, 7)).is_some();
+        finish_channel_eof(&mut channels, 7, had_client_entry, &server.state, &mut out)
+            .await
+            .expect("EOF after rejected exec");
+        assert_eq!(
+            out.events,
+            [
+                RecordedEvent::ChannelSuccess,
+                RecordedEvent::Data(expected_err_packet("view not found")),
+                RecordedEvent::ExitStatus(1),
+                RecordedEvent::Eof,
+                RecordedEvent::Close,
+                RecordedEvent::Close,
+            ]
+        );
+
+        let filter_id = "6".repeat(64);
+        let mut state = upload_pack_state();
+        let mut out = RecordedOut::default();
+        let unavailable = ProtocolError::ViewUnavailable {
+            filter_id: filter_id.clone(),
+            reason: crate::common::errors::ViewUnavailableReason::WarmingUp,
+        };
+        write_data_error(&mut out, &mut state, &unavailable);
+        let mut channels = HashMap::from([(7_u32, state)]);
+        finish_channel_eof(&mut channels, 7, true, &server.state, &mut out)
+            .await
+            .expect("EOF after data error");
+        assert_eq!(
+            out.events,
+            [
+                RecordedEvent::Data(expected_err_packet(&format!(
+                    "view {filter_id} unavailable: warming up"
+                ))),
+                RecordedEvent::ExitStatus(75),
+                RecordedEvent::Close,
+            ]
+        );
+        assert!(channels.is_empty());
+    }
+
+    #[test]
+    fn channel_state_after_err() {
+        let filter_id = "3".repeat(64);
+        let unavailable = ProtocolError::ViewUnavailable {
+            filter_id,
+            reason: crate::common::errors::ViewUnavailableReason::WarmingUp,
+        };
+        let rejected =
+            ProtocolError::PackRejected(format!("upload-pack: not our ref {}", "4".repeat(40)));
+        for (error, expected_exit) in [(unavailable, 75), (rejected, 1)] {
+            let mut state = upload_pack_state();
+            let mut out = RecordedOut::default();
+            write_data_error(&mut out, &mut state, &error);
+            assert_eq!(eof_exit_code(Some(&state), true), Some(expected_exit));
+        }
+        assert_eq!(eof_exit_code(None, true), Some(0));
+        assert_eq!(eof_exit_code(Some(&upload_pack_state()), true), Some(0));
+        let mut non_view_error = upload_pack_state();
+        let mut out = RecordedOut::default();
+        write_data_error(
+            &mut out,
+            &mut non_view_error,
+            &ProtocolError::InvalidInput("bad".to_owned()),
+        );
+        assert_eq!(eof_exit_code(Some(&non_view_error), true), Some(0));
+        assert_eq!(eof_exit_code(None, false), None);
+
+        let request = Bytes::from(format!("0032want {}\n00000009done\n", "5".repeat(40)));
+        assert_eq!(take_ready_request(None, &request), None);
+        let mut errored = upload_pack_state();
+        errored.exit_code = Some(75);
+        assert_eq!(take_ready_request(Some(&mut errored), &request), None);
+        assert!(errored.data_combined.is_empty());
+        let mut ready = upload_pack_state();
+        assert_eq!(
+            take_ready_request(Some(&mut ready), &request),
+            Some(request.clone())
+        );
+        assert!(ready.data_combined.is_empty());
+
+        errored.data_combined.extend_from_slice(b"residual");
+        assert_eq!(take_eof_residual(&mut errored), None);
+        let mut residual = upload_pack_state();
+        residual.data_combined.extend_from_slice(b"residual");
+        assert_eq!(
+            take_eof_residual(&mut residual),
+            Some(Bytes::from_static(b"residual"))
+        );
+
+        let mut out = RecordedOut::default();
+        let mut state = upload_pack_state();
+        state.exit_code = Some(75);
+        let unavailable_again = ProtocolError::ViewUnavailable {
+            filter_id: "3".repeat(64),
+            reason: crate::common::errors::ViewUnavailableReason::WarmingUp,
+        };
+        write_data_error(&mut out, &mut state, &unavailable_again);
+        write_data_error(
+            &mut out,
+            &mut state,
+            &ProtocolError::InvalidInput("bad".to_owned()),
+        );
+        assert!(out.events.is_empty());
+        assert_eq!(state.exit_code, Some(75));
     }
 
     #[tokio::test]
@@ -1105,6 +1899,7 @@ mod tests {
             ),
             data_combined: BytesMut::new(),
             pending_shallow_request: None,
+            exit_code: None,
         };
         let mut channel_b = GitSshChannelState {
             smart_protocol: SmartSession::new(
@@ -1114,6 +1909,7 @@ mod tests {
             ),
             data_combined: BytesMut::new(),
             pending_shallow_request: None,
+            exit_code: None,
         };
 
         channel_a.data_combined.extend_from_slice(b"payload-a");
