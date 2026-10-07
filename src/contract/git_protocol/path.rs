@@ -8,7 +8,62 @@ use std::path::PathBuf;
 
 use http::Method;
 
-use crate::{ceres::protocol::ServiceType, common::errors::ProtocolError};
+use crate::{
+    ceres::{
+        protocol::ServiceType,
+        view::{VIEW_URL_RESERVED_NAMES, name::validate_view_name},
+    },
+    common::errors::ProtocolError,
+};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RepoLocator {
+    Path(PathBuf),
+    View(ViewLocator),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ViewLocator {
+    Named { name: String, version: Option<u32> },
+    FilterId(String),
+}
+
+pub fn classify_repo_locator(raw: &str) -> Result<RepoLocator, ProtocolError> {
+    let stripped = raw.strip_suffix(".git").unwrap_or(raw);
+    let relative = stripped.trim_start_matches('/');
+    let (first, rest) = relative.split_once('/').unwrap_or((relative, ""));
+    if !VIEW_URL_RESERVED_NAMES.contains(&first) {
+        return Ok(RepoLocator::Path(normalize_repo_path(raw)));
+    }
+    let not_found = || ProtocolError::NotFound("view not found".to_owned());
+    if first == ".filter" {
+        if rest.len() != 64
+            || !rest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(not_found());
+        }
+        return Ok(RepoLocator::View(ViewLocator::FilterId(rest.to_owned())));
+    }
+    let (name, version) = if let Some((name, raw_version)) = rest.rsplit_once('@') {
+        if raw_version.is_empty() || !raw_version.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(not_found());
+        }
+        let version = raw_version.parse::<u32>().map_err(|_| not_found())?;
+        if version == 0 {
+            return Err(not_found());
+        }
+        (name, Some(version))
+    } else {
+        (rest, None)
+    };
+    validate_view_name(name).map_err(|_| not_found())?;
+    Ok(RepoLocator::View(ViewLocator::Named {
+        name: name.to_owned(),
+        version,
+    }))
+}
 
 /// A recognized Git smart-protocol HTTP endpoint.
 #[derive(Debug, PartialEq, Eq)]
@@ -37,6 +92,7 @@ impl GitProtocolEndpoint {
 pub struct GitProtocolPath {
     /// Repository path with a single trailing `.git` suffix removed.
     pub repo_path: PathBuf,
+    pub locator: RepoLocator,
     /// Identified endpoint.
     pub endpoint: GitProtocolEndpoint,
 }
@@ -60,6 +116,7 @@ pub fn parse_git_protocol_path(
     const RECEIVE_PACK: &str = "/git-receive-pack";
 
     if let Some(prefix) = full_path.strip_suffix(INFO_REFS) {
+        let locator = classify_repo_locator(prefix)?;
         if method != Method::GET {
             return Err(ProtocolError::InvalidInput(format!(
                 "{INFO_REFS} only supports GET"
@@ -67,11 +124,13 @@ pub fn parse_git_protocol_path(
         }
         return Ok(GitProtocolPath {
             repo_path: normalize_repo_path(prefix),
+            locator,
             endpoint: GitProtocolEndpoint::InfoRefs,
         });
     }
 
     if let Some(prefix) = full_path.strip_suffix(UPLOAD_PACK) {
+        let locator = classify_repo_locator(prefix)?;
         if method != Method::POST {
             return Err(ProtocolError::InvalidInput(format!(
                 "{UPLOAD_PACK} only supports POST"
@@ -79,11 +138,13 @@ pub fn parse_git_protocol_path(
         }
         return Ok(GitProtocolPath {
             repo_path: normalize_repo_path(prefix),
+            locator,
             endpoint: GitProtocolEndpoint::UploadPack,
         });
     }
 
     if let Some(prefix) = full_path.strip_suffix(RECEIVE_PACK) {
+        let locator = classify_repo_locator(prefix)?;
         if method != Method::POST {
             return Err(ProtocolError::InvalidInput(format!(
                 "{RECEIVE_PACK} only supports POST"
@@ -91,6 +152,7 @@ pub fn parse_git_protocol_path(
         }
         return Ok(GitProtocolPath {
             repo_path: normalize_repo_path(prefix),
+            locator,
             endpoint: GitProtocolEndpoint::ReceivePack,
         });
     }
@@ -129,6 +191,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classify_repo_locator_vectors() {
+        for raw in ["/.view/web.git", ".view/web.git", "/.view/web"] {
+            assert_eq!(
+                classify_repo_locator(raw).unwrap(),
+                RepoLocator::View(ViewLocator::Named {
+                    name: "web".to_owned(),
+                    version: None,
+                })
+            );
+        }
+        assert_eq!(
+            classify_repo_locator("/.view/agent/task-1234@3.git").unwrap(),
+            RepoLocator::View(ViewLocator::Named {
+                name: "agent/task-1234".to_owned(),
+                version: Some(3),
+            })
+        );
+        let filter_id = "a".repeat(64);
+        for raw in [
+            format!("/.filter/{filter_id}.git"),
+            format!(".filter/{filter_id}"),
+        ] {
+            assert_eq!(
+                classify_repo_locator(&raw).unwrap(),
+                RepoLocator::View(ViewLocator::FilterId(filter_id.clone()))
+            );
+        }
+        for raw in [
+            "/.view".to_owned(),
+            "/.view.git".to_owned(),
+            "/.filter".to_owned(),
+            format!("/.filter/{}.git", "a".repeat(63)),
+            format!("/.filter/{}.git", "A".repeat(64)),
+            format!("/.filter/{filter_id}/x.git"),
+            "/.view/a@0.git".to_owned(),
+            "/.view/a@x.git".to_owned(),
+            "/.view/a@.git".to_owned(),
+            "/.view/a b.git".to_owned(),
+            "/.view/a//b.git".to_owned(),
+            "/.view/a/../b.git".to_owned(),
+            "/.view/x.git.git".to_owned(),
+        ] {
+            assert!(
+                matches!(classify_repo_locator(&raw), Err(ProtocolError::NotFound(_))),
+                "{raw}"
+            );
+        }
+        for (raw, expected) in [
+            ("/project.git", "/project"),
+            ("/.viewer/a.git", "/.viewer/a"),
+            ("/project/.view/x.git", "/project/.view/x"),
+            ("project.git", "project"),
+            ("", "/"),
+        ] {
+            assert_eq!(
+                classify_repo_locator(raw).unwrap(),
+                RepoLocator::Path(PathBuf::from(expected))
+            );
+        }
+    }
+
+    #[test]
     fn parse_info_refs_requires_get() {
         let parsed = parse_git_protocol_path(&Method::GET, "/project.git/info/refs").unwrap();
         assert_eq!(parsed.repo_path, PathBuf::from("/project"));
@@ -140,6 +264,12 @@ mod tests {
         let err = parse_git_protocol_path(&Method::POST, "/project.git/info/refs").unwrap_err();
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
         assert!(err.to_string().contains("only supports GET"));
+    }
+
+    #[test]
+    fn invalid_view_locator_precedes_method_error() {
+        let err = parse_git_protocol_path(&Method::POST, "/.view/a@0.git/info/refs").unwrap_err();
+        assert!(matches!(err, ProtocolError::NotFound(_)));
     }
 
     #[test]

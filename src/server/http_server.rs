@@ -41,7 +41,10 @@ use crate::{
     },
     context::AppContext,
     contract::{
-        git_protocol::InfoRefsParams,
+        git_protocol::{
+            InfoRefsParams,
+            path::{RepoLocator, classify_repo_locator},
+        },
         policy::{
             enforcement::Enforcement,
             entitystore::{MEGA_CEDAR_PATH, SharedEntityStore},
@@ -941,12 +944,21 @@ fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
         match full_path.rfind("/info/lfs/") {
             Some(pos) => {
                 let lfs_subpath = &full_path[pos..];
-                let target = if let Some(query) = req.uri().query() {
-                    format!("{lfs_subpath}?{query}")
+                let repo_prefix = full_path[..pos].to_owned();
+                let rewrite = matches!(
+                    classify_repo_locator(&repo_prefix),
+                    Ok(RepoLocator::Path(_))
+                );
+                let target = if rewrite {
+                    Some(if let Some(query) = req.uri().query() {
+                        format!("{lfs_subpath}?{query}")
+                    } else {
+                        lfs_subpath.to_owned()
+                    })
                 } else {
-                    lfs_subpath.to_owned()
+                    None
                 };
-                (full_path[..pos].to_owned(), Some(target))
+                (repo_prefix, target)
             }
             None => (String::new(), None),
         }
@@ -1011,10 +1023,16 @@ async fn handle_smart_protocol(
         req.method(),
         req.uri().path(),
     )?;
+    let views_enabled = state.storage.config().views.enabled;
 
     match parsed.endpoint {
         crate::contract::git_protocol::path::GitProtocolEndpoint::InfoRefs => {
             let params = parse_info_refs_params(req.uri().query().unwrap_or(""))?;
+            reject_view_route(
+                &parsed.locator,
+                views_enabled,
+                params.service.as_deref() == Some("git-receive-pack"),
+            )?;
             crate::contract::git_protocol::http::git_info_refs(
                 &state,
                 params,
@@ -1024,13 +1042,31 @@ async fn handle_smart_protocol(
             .await
         }
         crate::contract::git_protocol::path::GitProtocolEndpoint::UploadPack => {
+            reject_view_route(&parsed.locator, views_enabled, false)?;
             crate::contract::git_protocol::http::git_upload_pack(&state, req, parsed.repo_path)
                 .await
         }
         crate::contract::git_protocol::path::GitProtocolEndpoint::ReceivePack => {
+            reject_view_route(&parsed.locator, views_enabled, true)?;
             crate::contract::git_protocol::http::git_receive_pack(&state, req, parsed.repo_path)
                 .await
         }
+    }
+}
+
+fn reject_view_route(
+    locator: &RepoLocator,
+    enabled: bool,
+    receive_pack: bool,
+) -> Result<(), ProtocolError> {
+    if matches!(locator, RepoLocator::Path(_)) {
+        Ok(())
+    } else if !enabled || !receive_pack {
+        Err(ProtocolError::NotFound("view not found".to_owned()))
+    } else {
+        Err(ProtocolError::Forbidden(
+            "view URLs are read-only".to_owned(),
+        ))
     }
 }
 
