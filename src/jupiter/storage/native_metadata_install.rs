@@ -156,7 +156,13 @@ struct PrimaryStorageScope {
 impl PostgresMetadataInstallRepository {
     /// The connection must target the deployment's primary PostgreSQL database.
     pub async fn new(connection: DatabaseConnection) -> Result<Self, SnapshotError> {
-        let storage_scope = read_storage_scope(&connection).await?;
+        let schema = capture_storage_schema(&connection).await?;
+        let storage_scope = read_storage_scope(&connection, &schema).await?;
+        if storage_scope.schema != schema {
+            return Err(internal(
+                "metadata primary schema changed during storage scope capture",
+            ));
+        }
         Ok(Self {
             connection,
             barrier_timeout: Duration::from_secs(5),
@@ -204,7 +210,7 @@ impl PostgresMetadataInstallRepository {
         &self,
         connection: &C,
     ) -> Result<(), SnapshotError> {
-        if read_storage_scope(connection).await? != self.storage_scope {
+        if read_storage_scope(connection, self.captured_schema()).await? != self.storage_scope {
             return Err(internal(
                 "session mutation no longer targets its captured primary storage scope",
             ));
@@ -659,7 +665,7 @@ impl PostgresMetadataInstallRepository {
         if let Some(family) = &self.qualified_family {
             family.enter(txn).await?;
         }
-        if read_storage_scope(txn).await? != self.storage_scope {
+        if read_storage_scope(txn, self.captured_schema()).await? != self.storage_scope {
             return Err(internal(
                 "metadata recovery connection is outside the captured primary storage scope",
             ));
@@ -703,20 +709,44 @@ impl PostgresMetadataInstallRepository {
     }
 }
 
+async fn capture_storage_schema<C: ConnectionTrait>(
+    connection: &C,
+) -> Result<String, SnapshotError> {
+    if connection.get_database_backend() != DbBackend::Postgres {
+        return Err(internal("metadata storage scope requires PostgreSQL"));
+    }
+    let row = connection
+        .query_one_raw(statement(
+            "SELECT n.nspname AS schema FROM pg_catalog.pg_namespace n
+             JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid
+               AND c.relname='mst2_metadata_storage_scope' AND c.relkind='r'
+             WHERE n.nspname=pg_catalog.current_schema() AND n.nspname NOT LIKE 'pg_temp_%'",
+            [],
+        ))
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| internal("metadata actual primary storage relation is missing"))?;
+    row.try_get("", "schema").map_err(internal)
+}
+
 async fn read_storage_scope<C: ConnectionTrait>(
     connection: &C,
+    schema: &str,
 ) -> Result<PrimaryStorageScope, SnapshotError> {
     if connection.get_database_backend() != DbBackend::Postgres {
         return Err(internal("metadata storage scope requires PostgreSQL"));
     }
     let row = connection
         .query_one_raw(statement(
-            "SELECT s.storage_uuid, current_database() AS database, d.oid::bigint AS database_oid,
-          current_schema() AS schema, n.oid::bigint AS schema_oid,
-          inet_server_addr()::text AS server_address, inet_server_port() AS server_port,
-          pg_is_in_recovery() AS replica FROM mst2_metadata_storage_scope s
-          JOIN pg_catalog.pg_database d ON d.datname=current_database()
-          JOIN pg_catalog.pg_namespace n ON n.nspname=current_schema() WHERE s.singleton=1",
+            &format!(
+                "SELECT s.storage_uuid, pg_catalog.current_database() AS database, d.oid::bigint AS database_oid,
+          pg_catalog.current_schema() AS schema, n.oid::bigint AS schema_oid,
+          pg_catalog.inet_server_addr()::text AS server_address, pg_catalog.inet_server_port() AS server_port,
+          pg_catalog.pg_is_in_recovery() AS replica FROM \"{}\".mst2_metadata_storage_scope s
+          JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database()
+          JOIN pg_catalog.pg_namespace n ON n.nspname=pg_catalog.current_schema() WHERE s.singleton=1",
+                schema.replace('"', "\"\"")
+            ),
             [],
         ))
         .await
