@@ -292,6 +292,7 @@ fn mst2_error_response(err: SnapshotError) -> Response {
                 "retryable": matches!(
                     err.code,
                     SnapshotErrorCode::SnapshotNotReady
+                        | SnapshotErrorCode::MetadataNotReady
                         | SnapshotErrorCode::TemporaryUnavailable
                         | SnapshotErrorCode::Internal
                 ),
