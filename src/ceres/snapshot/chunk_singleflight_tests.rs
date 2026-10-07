@@ -70,7 +70,7 @@ fn assert_uncached(content_id: [u8; 32]) {
 fn evict(content_id: [u8; 32]) {
     let mut cache = STAGED.get().unwrap().lock().unwrap();
     let projection = cache.entries.remove(&content_id).unwrap();
-    cache.total_bytes -= projection.raw.len();
+    cache.total_bytes -= projection.retained_bytes();
     let position = cache.order.iter().position(|id| *id == content_id).unwrap();
     cache.order.remove(position);
 }

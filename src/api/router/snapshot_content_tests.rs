@@ -82,6 +82,9 @@ const TOKEN: &str = "mst2-fixed-content-test";
 #[path = "snapshot_objects_bounded_tests.rs"]
 mod bounded_objects;
 
+#[path = "snapshot_chunks_bounded_tests.rs"]
+mod bounded_chunks;
+
 #[path = "snapshot_session_tests.rs"]
 mod durable_sessions;
 
@@ -103,6 +106,7 @@ struct ReadCounts {
     range: AtomicUsize,
     bytes: AtomicUsize,
     object_fault: std::sync::Mutex<Option<bounded_objects::StreamFault>>,
+    chunk_faults: std::sync::Mutex<Vec<bounded_chunks::ChunkFault>>,
 }
 
 impl ReadCounts {
@@ -137,6 +141,31 @@ impl MegaObjectStorage for CountingStorage {
 
     async fn get_stream(&self, key: &ObjectKey) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
         self.counts.whole.fetch_add(1, Ordering::SeqCst);
+        let chunk_fault = self
+            .counts
+            .chunk_faults
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|fault| fault.oid == key.key)
+            .cloned();
+        if let Some(fault) = chunk_fault {
+            let counts = self.counts.clone();
+            let size = fault.size;
+            let stream = fault.full_stream().map(move |part| {
+                if let Ok(bytes) = &part {
+                    counts.bytes.fetch_add(bytes.len(), Ordering::SeqCst);
+                }
+                part
+            });
+            return Ok((
+                Box::pin(stream),
+                ObjectMeta {
+                    size: size as i64,
+                    ..Default::default()
+                },
+            ));
+        }
         let (stream, meta) = self.inner.inner.get_stream(key).await?;
         let fault = self.counts.object_fault.lock().unwrap().clone();
         let stream = match fault {
@@ -161,6 +190,40 @@ impl MegaObjectStorage for CountingStorage {
     ) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
         self.counts.range.fetch_add(1, Ordering::SeqCst);
         self.inner.inner.get_range_stream(key, start, end).await
+    }
+
+    async fn get_range_stream_exact(
+        &self,
+        key: &ObjectKey,
+        start: u64,
+        end: u64,
+    ) -> OrbitResult<Option<(ObjectByteStream, ObjectMeta)>> {
+        self.counts.range.fetch_add(1, Ordering::SeqCst);
+        let fault = self
+            .counts
+            .chunk_faults
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|fault| fault.oid == key.key)
+            .cloned();
+        if let Some(fault) = fault {
+            let range = fault.range_stream(start, end)?;
+            return Ok(range.map(|(stream, meta)| {
+                let counts = self.counts.clone();
+                let stream = stream.map(move |part| {
+                    if let Ok(bytes) = &part {
+                        counts.bytes.fetch_add(bytes.len(), Ordering::SeqCst);
+                    }
+                    part
+                });
+                (Box::pin(stream) as ObjectByteStream, meta)
+            }));
+        }
+        self.inner
+            .inner
+            .get_range_stream_exact(key, start, end)
+            .await
     }
 
     async fn exists(&self, key: &ObjectKey) -> OrbitResult<bool> {

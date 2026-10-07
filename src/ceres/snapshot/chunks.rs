@@ -2,9 +2,9 @@
 //!
 //! Persistent segment/locator storage is T04/T12 work; this identity slice
 //! builds the MCM2 map and MCL2 leaves from a fixed view's verified blob and
-//! stages the raw bytes in a bounded in-process cache, so a CHUNK request
-//! slices its range out of an already-verified representation rather than
-//! reconstructing the whole Git object per chunk (spec 07 §8).
+//! retains inline bytes through 512 MiB and only verified map metadata for
+//! larger files. Large CHUNK reads use the current request's strict raw range
+//! source. This is a reproducible process cache, not a durable locator.
 //!
 //! The cache is an optimization, never the authority: every projected file
 //! is re-hashed against the `content_id` the fixed view advertised, and a
@@ -19,7 +19,17 @@ use std::{
 use mst2_codec::chunkmap::{CHUNK_SIZE, CHUNKS_PER_PAGE, ChunkLeaf, ChunkMap};
 use sha2::{Digest, Sha256};
 
+use super::content_budget::{MemoryLease, projection_budget};
 use crate::ceres::snapshot::error::{SnapshotError, SnapshotErrorCode};
+
+#[path = "chunks_stream.rs"]
+mod streaming;
+
+pub use streaming::get_or_project_stream;
+
+pub(crate) fn projection_reservation_bytes(size: u64) -> Result<usize, SnapshotError> {
+    streaming::reserved_bytes(size)
+}
 
 /// One file's verified range-readable projection.
 pub struct ChunkProjection {
@@ -27,13 +37,15 @@ pub struct ChunkProjection {
     pub map_id: [u8; 32],
     leaves: Vec<ChunkLeaf>,
     leaf_hashes: Vec<[u8; 32]>,
-    /// Full verified content. Indexed by fixed 1 MiB chunk boundaries.
+    /// Empty for range-only projections; empty files have no projection.
     raw: Vec<u8>,
+    memory: Option<MemoryLease>,
 }
 
 impl ChunkProjection {
     /// Build from bytes that the caller already resolved at a fixed path.
     /// `content_id` is the digest the fixed view advertises.
+    #[cfg(test)]
     pub fn build(content_id: [u8; 32], raw: Vec<u8>) -> Result<Self, SnapshotError> {
         let mut hasher = Sha256::new();
         hasher.update(&raw);
@@ -95,7 +107,50 @@ impl ChunkProjection {
             leaves,
             leaf_hashes,
             raw,
+            memory: None,
         })
+    }
+
+    pub fn has_inline_bytes(&self) -> bool {
+        !self.raw.is_empty()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.memory
+            .as_ref()
+            .map_or_else(|| self.allocated_bytes(), |lease| lease.bytes)
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.raw.capacity()
+            + self.leaves.capacity() * std::mem::size_of::<ChunkLeaf>()
+            + self.leaf_hashes.capacity() * 32
+            + self
+                .leaves
+                .iter()
+                .map(|leaf| leaf.chunk_sha256.capacity() * 32)
+                .sum::<usize>()
+    }
+
+    pub fn verify_chunk(&self, index: u64, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let want_len = self.map.chunk_len(index).map_err(codec_err)?;
+        if bytes.len() as u64 != want_len {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "range length disagrees with the verified chunk map",
+            ));
+        }
+        let page = (index / CHUNKS_PER_PAGE as u64) as usize;
+        let slot = (index % CHUNKS_PER_PAGE as u64) as usize;
+        let got: [u8; 32] = Sha256::digest(bytes).into();
+        if got != self.leaves[page].chunk_sha256[slot] {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "range digest disagrees with the verified chunk map",
+            ));
+        }
+        Ok(())
     }
 
     pub fn page_count(&self) -> u64 {
@@ -175,6 +230,7 @@ static STAGED: OnceLock<Mutex<ProjectionCache>> = OnceLock::new();
 /// 512 MiB cap for staged file bytes in this identity slice. The real
 /// persistent RAW_OBJECT locator layout replaces this (spec 10 §4).
 const STAGED_CAP_BYTES: usize = 512 * 1024 * 1024;
+const STAGED_MAX_ENTRIES: usize = 4096;
 
 struct ProjectionCache {
     entries: HashMap<[u8; 32], std::sync::Arc<ChunkProjection>>,
@@ -196,26 +252,39 @@ impl ProjectionCache {
         self.entries.get(&id).cloned()
     }
 
-    fn put(&mut self, proj: std::sync::Arc<ChunkProjection>) {
+    fn evict_oldest(&mut self) -> Option<Arc<ChunkProjection>> {
+        while let Some(victim) = self.order.pop_front() {
+            if let Some(projection) = self.entries.remove(&victim) {
+                self.total_bytes -= projection.retained_bytes();
+                return Some(projection);
+            }
+        }
+        None
+    }
+
+    fn put(&mut self, proj: std::sync::Arc<ChunkProjection>) -> Vec<Arc<ChunkProjection>> {
+        let mut evicted = Vec::new();
         let id = proj.map.file_content_id;
         if self.entries.contains_key(&id) {
-            return;
+            return evicted;
         }
         // Reclaim oldest entries until the new one fits. A file larger than
         // the cap alone is not cached between flights but still
         // served correctly.
-        while self.total_bytes + proj.raw.len() > STAGED_CAP_BYTES
-            && let Some(victim) = self.order.pop_front()
+        let bytes = proj.retained_bytes();
+        if bytes > STAGED_CAP_BYTES {
+            return evicted;
+        }
+        while (self.total_bytes + bytes > STAGED_CAP_BYTES
+            || self.entries.len() >= STAGED_MAX_ENTRIES)
+            && let Some(victim) = self.evict_oldest()
         {
-            if let Some(v) = self.entries.remove(&victim) {
-                self.total_bytes = self.total_bytes.saturating_sub(v.raw.len());
-            }
+            evicted.push(victim);
         }
-        if proj.raw.len() <= STAGED_CAP_BYTES {
-            self.total_bytes += proj.raw.len();
-            self.order.push_back(id);
-            self.entries.insert(id, proj);
-        }
+        self.total_bytes += bytes;
+        self.order.push_back(id);
+        self.entries.insert(id, proj);
+        evicted
     }
 }
 
@@ -301,6 +370,7 @@ impl Drop for FlightClaim<'_> {
 /// Return the cached projection, or build one via `load` (which must resolve
 /// the file in the fixed view and return its verified bytes). Concurrent
 /// misses for the same digest share one successful load and projection.
+#[cfg(test)]
 pub async fn get_or_project<F, Fut>(
     content_id: [u8; 32],
     load: F,
@@ -308,6 +378,20 @@ pub async fn get_or_project<F, Fut>(
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
+{
+    get_or_project_with(content_id, || async {
+        ChunkProjection::build(content_id, load().await?)
+    })
+    .await
+}
+
+async fn get_or_project_with<F, Fut>(
+    content_id: [u8; 32],
+    build: F,
+) -> Result<Arc<ChunkProjection>, SnapshotError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<ChunkProjection, SnapshotError>>,
 {
     let cache = STAGED.get_or_init(|| Mutex::new(ProjectionCache::new()));
     if let Some(p) = cache
@@ -336,12 +420,14 @@ where
     if let Some(p) = result.as_ref() {
         return Ok(p.clone());
     }
-    let raw = load().await?;
-    let proj = std::sync::Arc::new(ChunkProjection::build(content_id, raw)?);
-    cache
+    let proj = Arc::new(build().await?);
+    let evicted = cache
         .lock()
         .map_err(|_| internal("chunk projection cache lock poisoned"))?
         .put(proj.clone());
+    // Final projection/credit drops can be expensive and must not hold the
+    // process cache mutex. Eviction does not refund other Arc owners.
+    drop(evicted);
     *result = Some(proj.clone());
     Ok(proj)
 }

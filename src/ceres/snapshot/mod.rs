@@ -4,6 +4,7 @@
 //! composition seam; identity, attestation and publication integration remain
 //! separate gates. Fixed-source readers must never look up current refs.
 pub mod chunks;
+pub(crate) mod content_budget;
 pub mod descriptor;
 pub mod error;
 pub mod frame_stream;
