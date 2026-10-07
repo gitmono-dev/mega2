@@ -16,6 +16,8 @@ use crate::{
     },
 };
 
+type ProofPages = Vec<([u8; 32], Vec<u8>)>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Binding {
     generation: i64,
@@ -98,7 +100,7 @@ pub(crate) struct RootedDirectoryWindow {
     pub entry_count: u64,
     pub entries: Vec<mst2_codec::metapage::Entry>,
     pub has_more: bool,
-    pub proof_pages: Vec<([u8; 32], Vec<u8>)>,
+    pub proof_pages: ProofPages,
     pub ancestors: Vec<(String, [u8; 32])>,
 }
 
@@ -541,7 +543,7 @@ impl Reader<'_> {
         Ok(children)
     }
 
-    fn proofs(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, SnapshotError> {
+    fn proofs(&self) -> Result<ProofPages, SnapshotError> {
         let bytes: usize = self.cache.values().map(|page| page.bytes.len()).sum();
         if bytes > 1_048_576 {
             return Err(SnapshotError::new(

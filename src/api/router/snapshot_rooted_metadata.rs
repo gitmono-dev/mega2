@@ -8,7 +8,7 @@ use crate::{
     jupiter::storage::qualified_metadata_family::RootedLookupStatus,
 };
 
-fn entry_json(entry: &Entry) -> Result<serde_json::Value, Response> {
+fn entry_json(entry: &Entry) -> Result<serde_json::Value, SnapshotError> {
     let name = std::str::from_utf8(&entry.name).map_err(internal)?;
     let kind = match entry.kind {
         EntryKind::Regular => "regular",
@@ -28,15 +28,19 @@ fn entry_json(entry: &Entry) -> Result<serde_json::Value, Response> {
     Ok(value)
 }
 
-fn cursor_name(sid: &str, path: &str, query: &DirectoryQuery) -> Result<Option<String>, Response> {
+fn cursor_name(
+    sid: &str,
+    path: &str,
+    query: &DirectoryQuery,
+) -> Result<Option<String>, SnapshotError> {
     let Some(cursor) = query.cursor.as_deref() else {
         return Ok(None);
     };
     let invalid = || {
-        mst2_error_response(SnapshotError::new(
+        SnapshotError::new(
             SnapshotErrorCode::CursorInvalid,
             "cursor bound to different parameters or invalid",
-        ))
+        )
     };
     let (payload, signature) = cursor.rsplit_once('.').ok_or_else(invalid)?;
     if runtime().sign_cursor(payload) != signature {

@@ -35,9 +35,7 @@ const GC_SQL: &str = include_str!("qualified_metadata_gc.sql");
 
 #[path = "qualified_metadata_rooted.rs"]
 mod rooted;
-pub(crate) use rooted::{
-    RootedDirectoryWindow, RootedLookupBatch, RootedLookupStatus, RootedQualifiedMetadataRepository,
-};
+pub(crate) use rooted::{RootedLookupStatus, RootedQualifiedMetadataRepository};
 #[cfg(test)]
 pub(crate) use rooted::{
     RootedPrepareIntent, with_rooted_reader_barriers, with_rooted_source_fact_barriers,
