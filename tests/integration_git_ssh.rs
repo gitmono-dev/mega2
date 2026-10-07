@@ -16,7 +16,7 @@ mod git_cli;
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    io::Read,
+    io::{Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -704,6 +704,154 @@ fn boot_storage_only_ssh(
     let (service, port, stdout_path, stderr_path) = boot_service_ssh_with_env(env, extra_env);
     write_known_hosts_via_host_keyscan(&env.ssh_dir.join("known_hosts"), port);
     (service, port, stdout_path, stderr_path)
+}
+
+fn raw_ssh_upload_pack(
+    case_dir: &Path,
+    port: u16,
+    protocol_v2: bool,
+    stdin_body: &[u8],
+) -> std::process::Output {
+    let mut ssh = git_ssh_command_loopback(case_dir, port, true);
+    if protocol_v2 {
+        ssh.push_str(" -o SetEnv=GIT_PROTOCOL=version=2");
+    }
+    let command = format!("{ssh} git@127.0.0.1 \"git-upload-pack '/'\"");
+    let mut child = Command::new("timeout")
+        .args(["-k", "5", "45", "sh", "-c", &command])
+        .current_dir(case_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn raw SSH upload-pack");
+    {
+        let mut stdin = child.stdin.take().expect("raw SSH stdin");
+        stdin
+            .write_all(stdin_body)
+            .expect("write raw SSH upload-pack request");
+    }
+    child
+        .wait_with_output()
+        .expect("wait for raw SSH upload-pack")
+}
+
+fn first_pkt_line_payload(output: &[u8]) -> &[u8] {
+    assert!(
+        output.len() >= 4,
+        "SSH output must start with a pkt-line: {output:?}"
+    );
+    let declared = std::str::from_utf8(&output[..4]).expect("pkt-line length header");
+    let length = usize::from_str_radix(declared, 16).expect("pkt-line hexadecimal length");
+    assert!(
+        (4..=output.len()).contains(&length),
+        "pkt-line length {length} outside output length {}",
+        output.len()
+    );
+    &output[4..length]
+}
+
+#[test]
+fn integration_git_ssh_view_ssh_err_plain_paths_exit_zero() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    let env = GitSshEnv::with_config_append(
+        r#"
+[git]
+anonymous_access = true
+push_auth = "none"
+ssh_receive_pack = false
+"#,
+    );
+    git_cli::generate_client_ed25519(&env.ssh_dir.join("client_ed25519"));
+    let extra = [
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "none"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+        ("MEGA_GIT__ANONYMOUS_ACCESS", "true"),
+    ];
+    let (mut service, port, stdout_path, stderr_path) = boot_storage_only_ssh(&env, &extra);
+
+    let v0 = raw_ssh_upload_pack(&env.case_dir, port, false, b"");
+    assert!(
+        v0.status.success(),
+        "v0 raw SSH upload-pack must exit 0; status={:?}\nstdout:\n{}\nstderr:\n{}\n--- service stdout ---\n{}\n--- service stderr ---\n{}",
+        v0.status,
+        String::from_utf8_lossy(&v0.stdout),
+        String::from_utf8_lossy(&v0.stderr),
+        read_log(&stdout_path),
+        read_log(&stderr_path),
+    );
+    let first = first_pkt_line_payload(&v0.stdout);
+    assert!(
+        first.windows(b"HEAD".len()).any(|bytes| bytes == b"HEAD")
+            || first
+                .windows(b"capabilities^{}".len())
+                .any(|bytes| bytes == b"capabilities^{}"),
+        "v0 SSH advertisement first pkt-line must contain HEAD or capabilities^{{}}: {first:?}"
+    );
+
+    let ls_refs = raw_ssh_upload_pack(&env.case_dir, port, true, b"0014command=ls-refs\n00010000");
+    assert!(
+        ls_refs.status.success(),
+        "v2 ls-refs raw SSH upload-pack must exit 0; status={:?}\nstdout:\n{}\nstderr:\n{}\n--- service stdout ---\n{}\n--- service stderr ---\n{}",
+        ls_refs.status,
+        String::from_utf8_lossy(&ls_refs.stdout),
+        String::from_utf8_lossy(&ls_refs.stderr),
+        read_log(&stdout_path),
+        read_log(&stderr_path),
+    );
+    let ls_refs_stdout = String::from_utf8_lossy(&ls_refs.stdout);
+    assert!(
+        ls_refs_stdout.contains("version 2"),
+        "v2 ls-refs response must advertise version 2: {:?}",
+        ls_refs.stdout
+    );
+    assert!(
+        !ls_refs_stdout.contains("error:"),
+        "v2 ls-refs response must not contain a plain error: {:?}",
+        ls_refs.stdout
+    );
+
+    let bogus = raw_ssh_upload_pack(&env.case_dir, port, true, b"0012command=bogus\n0000");
+    assert!(
+        bogus.status.success(),
+        "v2 bogus raw SSH upload-pack must exit 0; status={:?}\nstdout:\n{}\nstderr:\n{}\n--- service stdout ---\n{}\n--- service stderr ---\n{}",
+        bogus.status,
+        String::from_utf8_lossy(&bogus.stdout),
+        String::from_utf8_lossy(&bogus.stderr),
+        read_log(&stdout_path),
+        read_log(&stderr_path),
+    );
+    assert!(
+        String::from_utf8_lossy(&bogus.stdout).contains("error: unsupported v2 command: bogus"),
+        "v2 bogus response must keep its plain error: {:?}",
+        bogus.stdout
+    );
+
+    for (name, output) in [("v0", &v0), ("v2 ls-refs", &ls_refs), ("v2 bogus", &bogus)] {
+        assert!(
+            !output
+                .stdout
+                .windows(b"ERR ".len())
+                .any(|bytes| bytes == b"ERR "),
+            "{name} plain path must not emit an ERR pkt-line: {:?}",
+            output.stdout
+        );
+    }
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
 }
 
 #[test]
