@@ -363,6 +363,13 @@ impl PostgresNativeSessionRepository {
 #[path = "native_snapshot_routes.rs"]
 mod routes;
 
+#[path = "native_snapshot_metadata_routes.rs"]
+mod metadata_routes;
+
+pub(crate) use metadata_routes::MetadataRouteRequest;
+#[cfg(test)]
+pub(crate) use metadata_routes::with_metadata_read_barriers;
+
 const SESSION_SQL: &str = "SELECT s.snapshot_id,s.canonical_descriptor,s.commit_oid,s.root_tree_oid,
  (SELECT storage_uuid FROM mst2_metadata_storage_scope WHERE singleton=1) AS authority_storage_uuid,
  current_database() AS authority_database,

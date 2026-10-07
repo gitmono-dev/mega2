@@ -643,6 +643,13 @@ impl PostgresMetadataInstallRepository {
             .map_err(internal)
     }
 
+    pub(super) async fn metadata_read_barrier(
+        &self,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), SnapshotError> {
+        self.capability_barrier(txn).await
+    }
+
     async fn barrier(&self, txn: &DatabaseTransaction) -> Result<(), SnapshotError> {
         if txn.get_database_backend() != DbBackend::Postgres {
             return Err(internal("metadata installation requires PostgreSQL"));

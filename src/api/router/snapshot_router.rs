@@ -1476,62 +1476,90 @@ async fn metadata_pages(
     }
     let ctx = request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
 
-    let handler = state
-        .api_handler(std::path::Path::new("/"))
-        .await
-        .map_err(internal)?;
-    let root_tree = handler
-        .get_tree_by_hash(&ctx.root_tree_oid)
-        .await
-        .map_err(internal)?;
-    let scope = &ctx.built.descriptor.scope;
-
-    // Unique pages across all items, in first-seen order.
-    let mut unique: Vec<([u8; 32], Vec<u8>)> = Vec::new();
-    let mut seen: Vec<[u8; 32]> = Vec::new();
-    let mut logical_bytes: u64 = 0;
-    for item in &req.items {
-        let abs_path = abs_view_path(scope, &item.directory_path);
-        let built = build_directory_page(handler.as_ref(), &root_tree, &abs_path)
+    let unique = if state.storage.config().mst2.publication_enabled {
+        use crate::jupiter::storage::native_snapshot_session::MetadataRouteRequest;
+        let items: Vec<_> = req
+            .items
+            .iter()
+            .map(|item| MetadataRouteRequest {
+                directory_path: &item.directory_path,
+                route: &item.route,
+                expected_digest: item.expected_digest.as_deref(),
+            })
+            .collect();
+        let batch = state
+            .storage
+            .snapshot_sessions()
+            .await
+            .metadata_routes(&ctx, &items)
             .await
             .map_err(mst2_error_response)?;
-        let pages =
-            mst2_codec::metapage::Page::pages_along_route(&built.codec_entries, &item.route)
-                .map_err(|e| match e {
-                    // A label the fixed view does not have is proven absence.
-                    mst2_codec::CodecError::BadOrdering(m) => SnapshotError::new(
-                        SnapshotErrorCode::PathNotFound,
-                        format!("{}: route does not resolve ({m})", item.directory_path),
+        tracing::debug!(
+            page_queries = batch.work.page_queries,
+            pages_loaded = batch.work.pages_loaded,
+            payload_bytes = batch.work.payload_bytes,
+            walk_visits = batch.work.walk_visits,
+            edge_references_checked = batch.work.edge_references_checked,
+            "served persisted generic metadata routes"
+        );
+        batch.pages
+    } else {
+        let handler = state
+            .api_handler(std::path::Path::new("/"))
+            .await
+            .map_err(internal)?;
+        let root_tree = handler
+            .get_tree_by_hash(&ctx.root_tree_oid)
+            .await
+            .map_err(internal)?;
+        let scope = &ctx.built.descriptor.scope;
+        let mut unique: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+        let mut seen: Vec<[u8; 32]> = Vec::new();
+        for item in &req.items {
+            let abs_path = abs_view_path(scope, &item.directory_path);
+            let built = build_directory_page(handler.as_ref(), &root_tree, &abs_path)
+                .await
+                .map_err(mst2_error_response)?;
+            let pages =
+                mst2_codec::metapage::Page::pages_along_route(&built.codec_entries, &item.route)
+                    .map_err(|e| match e {
+                        // A label the fixed view does not have is proven absence.
+                        mst2_codec::CodecError::BadOrdering(m) => SnapshotError::new(
+                            SnapshotErrorCode::PathNotFound,
+                            format!("{}: route does not resolve ({m})", item.directory_path),
+                        ),
+                        other => SnapshotError::new(
+                            SnapshotErrorCode::Internal,
+                            format!("{}: route walk failed ({other})", item.directory_path),
+                        ),
+                    })?;
+            let last = pages
+                .last()
+                .expect("pages_along_route returns at least the root page");
+            let last_id = mst2_codec::metapage::page_id(last);
+            if let Some(expected) = &item.expected_digest
+                && expected != &format!("sha256:{}", hex_of(&last_id))
+            {
+                return Err(mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    format!(
+                        "{}: route does not reach expected_digest",
+                        item.directory_path
                     ),
-                    other => SnapshotError::new(
-                        SnapshotErrorCode::Internal,
-                        format!("{}: route walk failed ({other})", item.directory_path),
-                    ),
-                })?;
-        let last = pages
-            .last()
-            .expect("pages_along_route returns at least the root page");
-        let last_id = mst2_codec::metapage::page_id(last);
-        if let Some(expected) = &item.expected_digest
-            && expected != &format!("sha256:{}", hex_of(&last_id))
-        {
-            return Err(mst2_error_response(SnapshotError::new(
-                SnapshotErrorCode::DigestMismatch,
-                format!(
-                    "{}: route does not reach expected_digest",
-                    item.directory_path
-                ),
-            )));
-        }
-        for page in pages {
-            let id = mst2_codec::metapage::page_id(&page);
-            if !seen.contains(&id) {
-                logical_bytes += page.len() as u64;
-                seen.push(id);
-                unique.push((id, page));
+                )));
+            }
+            for page in pages {
+                let id = mst2_codec::metapage::page_id(&page);
+                if !seen.contains(&id) {
+                    seen.push(id);
+                    unique.push((id, page));
+                }
             }
         }
-    }
+        unique
+    };
+    let page_count = unique.len();
+    let logical_bytes = unique.iter().map(|(_, page)| page.len() as u64).sum();
 
     // Frames hold at most 64 pages and at most 1 MiB of raw payload (spec 06),
     // so a wide route set becomes several META frames rather than one
@@ -1578,7 +1606,7 @@ async fn metadata_pages(
     let request_body_sha256: [u8; 32] = sha2::Digest::finalize(hasher).into();
     let end = stream.end(
         req.items.len() as u32,
-        u32::try_from(seen.len()).unwrap_or(u32::MAX),
+        u32::try_from(page_count).unwrap_or(u32::MAX),
         logical_bytes,
         request_body_sha256,
     );
