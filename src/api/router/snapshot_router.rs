@@ -239,7 +239,7 @@ async fn snapshot_auth_middleware(
             let path = req.uri().path().to_owned();
             let context = match authenticate_request(&state, &headers, &path).await {
                 Ok(context) => context,
-                Err(response) => return response,
+                Err(error) => return mst2_error_response(error),
             };
             REQUEST_HEADERS
                 .scope(
@@ -258,10 +258,10 @@ async fn snapshot_auth_middleware(
                                     }
                                 }
                                 None => {
-                                    if let Err(response) =
+                                    if let Err(error) =
                                         authenticate_request(&state, &headers, &path).await
                                     {
-                                        return response;
+                                        return mst2_error_response(error);
                                     }
                                 }
                             }
@@ -323,11 +323,8 @@ fn bearer_ok(headers: &HeaderMap, token: &str) -> bool {
         .is_some_and(|cred| cred == token)
 }
 
-fn unauthenticated(message: &'static str) -> Response {
-    mst2_error_response(SnapshotError::new(
-        SnapshotErrorCode::Unauthenticated,
-        message,
-    ))
+fn unauthenticated(message: &'static str) -> SnapshotError {
+    SnapshotError::new(SnapshotErrorCode::Unauthenticated, message)
 }
 
 /// Auth decision for one request path (see [`snapshot_auth_middleware`]).
@@ -337,7 +334,7 @@ async fn authenticate_request(
     state: &MonoApiServiceState,
     headers: &HeaderMap,
     path: &str,
-) -> Result<Option<crate::ceres::snapshot::runtime::SnapshotContext>, Response> {
+) -> Result<Option<crate::ceres::snapshot::runtime::SnapshotContext>, SnapshotError> {
     let config = state.storage.config();
     let token = config.mst2.auth_token.as_deref();
     let path = path.split('?').next().unwrap_or(path);
@@ -369,8 +366,7 @@ async fn authenticate_request(
                     .storage
                     .snapshot_context(snapshot_id, lease)
                     .await
-                    .map(Some)
-                    .map_err(mst2_error_response),
+                    .map(Some),
             }
         }
     }
