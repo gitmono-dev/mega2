@@ -12,6 +12,7 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         data: ObjectByteStream,
         _meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         let path = Self::checked_path(key)?;
         // Artifacts are keyed by UUID and must not depend on LFS/Git upload_strategy
         // (e.g. S3 often uses `Multipart` for LFS while we still need create-if-absent semantics).
@@ -35,6 +36,7 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         data: ObjectByteStream,
         _meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         let path = Self::checked_path(key)?;
         self.put_multipart(&path, data).await
     }
@@ -45,6 +47,7 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         bytes: Bytes,
         _meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         use crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES;
         if bytes.len() > MAX_METADATA_ATOMIC_BYTES {
             return Err(IoOrbitError::Other(format!(
@@ -59,6 +62,32 @@ impl MegaObjectStorage for ObjectStoreAdapter {
             .await
             .map_err(IoOrbitError::from)?;
         Ok(())
+    }
+
+    async fn put_metadata_atomic_create(
+        &self,
+        key: &ObjectKey,
+        bytes: Bytes,
+        _meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        if bytes.len() > crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES {
+            return Err(IoOrbitError::Other(
+                "immutable atomic metadata exceeds its byte limit".into(),
+            ));
+        }
+        let path = Self::checked_path(key)?;
+        match self
+            .to_store()
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(bytes),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+        {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Err(error) => Err(IoOrbitError::from(error)),
+        }
     }
 
     async fn get_stream(&self, key: &ObjectKey) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
@@ -149,6 +178,11 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         method: Method,
         expires_in: Duration,
     ) -> OrbitResult<Option<String>> {
+        if key.namespace == ObjectNamespace::ChunkMapReceipt && method != Method::GET {
+            return Err(IoOrbitError::Other(
+                "immutable chunk map receipts do not permit presigned mutation".into(),
+            ));
+        }
         let path = Self::checked_path(key)?;
 
         let url = match &self.store {
@@ -178,6 +212,7 @@ impl MegaObjectStorage for ObjectStoreAdapter {
     }
 
     async fn delete(&self, key: &ObjectKey) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         let path = Self::checked_path(key)?;
         self.to_store()
             .delete(&path)
@@ -187,9 +222,33 @@ impl MegaObjectStorage for ObjectStoreAdapter {
     }
 }
 
+pub(super) fn reject_receipt_mutation(key: &ObjectKey) -> OrbitResult<()> {
+    if key.namespace == ObjectNamespace::ChunkMapReceipt {
+        Err(IoOrbitError::Other(
+            "chunk map receipts require immutable atomic creation".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod exact_range_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_chunk_receipts_reject_all_mutation_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let adapter = ObjectStoreAdapter {
+            store: BackendStore::Local(Arc::new(
+                LocalFileSystem::new_with_prefix(directory.path()).unwrap(),
+            )),
+            upload_strategy: UploadStrategy::SinglePut,
+            presign_store: None,
+        };
+        crate::jupiter::storage::object_storage::assert_immutable_chunk_receipt_contract(&adapter)
+            .await;
+    }
 
     #[tokio::test]
     async fn local_exact_range_returns_selected_bytes_and_full_object_size_without_clipping() {

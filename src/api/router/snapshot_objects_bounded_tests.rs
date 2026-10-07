@@ -7,16 +7,21 @@ use super::*;
 #[derive(Clone)]
 pub(super) struct StreamFault {
     pub(super) oid: String,
-    kind: FaultKind,
+    pub(super) kind: FaultKind,
 }
 
 #[derive(Clone)]
-enum FaultKind {
+pub(super) enum FaultKind {
     Parts(Vec<Bytes>),
     LateError(Bytes),
     Oversized(Bytes, Arc<AtomicUsize>),
     Held {
         raw: Bytes,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        drops: Arc<AtomicUsize>,
+    },
+    HeldThenError {
         entered: Arc<Notify>,
         release: Arc<Notify>,
         drops: Arc<AtomicUsize>,
@@ -34,6 +39,24 @@ impl Drop for DropCount {
 impl StreamFault {
     pub(super) fn stream(self) -> ObjectByteStream {
         match self.kind {
+            FaultKind::HeldThenError {
+                entered,
+                release,
+                drops,
+            } => Box::pin(futures::stream::unfold(
+                (true, entered, release, DropCount(drops)),
+                |(first, entered, release, owner)| async move {
+                    if !first {
+                        return None;
+                    }
+                    entered.notify_one();
+                    release.notified().await;
+                    Some((
+                        Err(io::Error::other("held source read failed")),
+                        (false, entered, release, owner),
+                    ))
+                },
+            )),
             FaultKind::Parts(parts) => Box::pin(futures::stream::iter(parts.into_iter().map(Ok))),
             FaultKind::LateError(raw) => Box::pin(futures::stream::iter([
                 Ok(raw),

@@ -14,6 +14,112 @@ fn stream(parts: Vec<Result<Bytes, io::Error>>) -> ObjectByteStream {
     Box::pin(futures::stream::iter(parts))
 }
 
+#[tokio::test]
+async fn exact_source_builder_admits_all_install_workspace_before_open_and_cancellation_releases_it()
+ {
+    let raw = Bytes::from_static(b"exact source body");
+    let digest: [u8; 32] = Sha256::digest(&raw).into();
+    let weight = source_reservation_bytes(raw.len() as u64).unwrap();
+    assert!(weight > 4 * 1024 * 1024);
+    let budget = MemoryBudget::new(weight);
+    let builders = Arc::new(Semaphore::new(1));
+    let opens = Arc::new(AtomicUsize::new(0));
+    let held = budget.reserve(weight).unwrap();
+    let error = build_source_with_resources(
+        digest,
+        raw.len() as u64,
+        || async {
+            opens.fetch_add(1, Ordering::SeqCst);
+            Ok(stream(vec![Ok(raw.clone())]))
+        },
+        &budget,
+        &builders,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.code, SnapshotErrorCode::TemporaryUnavailable);
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+    assert_eq!(builders.available_permits(), 1);
+    drop(held);
+    let held_builder = builders.clone().acquire_owned().await.unwrap();
+    assert_eq!(
+        build_source_with_resources(
+            digest,
+            raw.len() as u64,
+            || async {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(stream(vec![Ok(raw.clone())]))
+            },
+            &budget,
+            &builders
+        )
+        .await
+        .err()
+        .unwrap()
+        .code,
+        SnapshotErrorCode::TemporaryUnavailable
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+    assert_eq!(budget.used(), 0);
+    drop(held_builder);
+    let entered = Arc::new(Notify::new());
+    let task_budget = budget.clone();
+    let task_builders = builders.clone();
+    let task_entered = entered.clone();
+    let task_opens = opens.clone();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let producer_owner = DropCount(drops.clone());
+    let size = raw.len() as u64;
+    let task = tokio::spawn(async move {
+        build_source_with_resources(
+            digest,
+            size,
+            || async {
+                task_opens.fetch_add(1, Ordering::SeqCst);
+                task_entered.notify_one();
+                Ok(Box::pin(futures::stream::unfold(
+                    producer_owner,
+                    |owner| async move {
+                        futures::future::pending::<()>().await;
+                        Some((Ok(Bytes::new()), owner))
+                    },
+                )) as ObjectByteStream)
+            },
+            &task_budget,
+            &task_builders,
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(budget.used(), weight);
+    assert_eq!(builders.available_permits(), 0);
+    task.abort();
+    assert!(task.await.err().unwrap().is_cancelled());
+    assert_eq!(budget.used(), 0);
+    assert_eq!(builders.available_permits(), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let projection = build_source_with_resources(
+        digest,
+        size,
+        || async { Ok(stream(vec![Ok(raw.clone())])) },
+        &budget,
+        &builders,
+    )
+    .await
+    .unwrap();
+    assert!(!projection.has_inline_bytes());
+    assert_eq!(projection.map.file_content_id, digest);
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+    assert_eq!(builders.available_permits(), 1);
+    assert_eq!(budget.used(), weight);
+    projection.verify_chunk(0, &raw).unwrap();
+    drop(projection);
+    assert_eq!(budget.used(), 0);
+}
+
 async fn project(raw: &[u8], parts: Vec<Result<Bytes, io::Error>>) -> ChunkProjection {
     let budget = MemoryBudget::new(reserved_bytes(raw.len() as u64).unwrap());
     let lease = budget
@@ -205,174 +311,11 @@ async fn visible_producer_item_limit_does_not_collect_a_large_item() {
     assert_eq!(budget.used(), 0);
 }
 
-#[tokio::test]
-async fn evicted_projection_remains_charged_until_last_reader_drops() {
-    let raw = b"owned credits";
-    let budget = MemoryBudget::new(reserved_bytes(raw.len() as u64).unwrap());
-    let lease = budget
-        .reserve(reserved_bytes(raw.len() as u64).unwrap())
-        .unwrap();
-    let projection = Arc::new(
-        build_stream(
-            Sha256::digest(raw).into(),
-            raw.len() as u64,
-            stream(vec![Ok(Bytes::from_static(raw))]),
-            lease,
-        )
-        .await
-        .unwrap(),
-    );
-    let weight = projection.retained_bytes();
-    let mut cache = ProjectionCache::new();
-    assert!(cache.put(projection.clone()).is_empty());
-    let reader = projection.clone();
-    drop(projection);
-    drop(cache.evict_oldest());
-    assert_eq!(cache.total_bytes, 0);
-    assert_eq!(budget.used(), weight);
-    assert!(budget.reserve(1).is_err());
-    drop(reader);
-    assert_eq!(budget.used(), 0);
-}
-
 struct DropCount(Arc<AtomicUsize>);
 impl Drop for DropCount {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
-}
-
-#[tokio::test]
-async fn production_admission_rejects_live_credit_and_builder_overload_before_open() {
-    let weight = reserved_bytes(3).unwrap();
-    let cache = Mutex::new(ProjectionCache::new());
-    let budget = MemoryBudget::new(weight);
-    let builders = Arc::new(Semaphore::new(MAX_BUILDERS));
-    let calls = AtomicUsize::new(0);
-    let held = budget.reserve(weight).unwrap();
-    let error = build_with_resources(
-        Sha256::digest(b"abc").into(),
-        3,
-        || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok(stream(vec![Ok(Bytes::from_static(b"abc"))]))
-        },
-        &budget,
-        &builders,
-        &cache,
-    )
-    .await
-    .err()
-    .unwrap();
-    assert_eq!(error.code, SnapshotErrorCode::TemporaryUnavailable);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(builders.available_permits(), MAX_BUILDERS);
-    drop(held);
-    let mut workers = Vec::new();
-    for _ in 0..MAX_BUILDERS {
-        workers.push(builders.clone().try_acquire_owned().unwrap());
-    }
-    let error = build_with_resources(
-        Sha256::digest(b"abc").into(),
-        3,
-        || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok(stream(vec![Ok(Bytes::from_static(b"abc"))]))
-        },
-        &budget,
-        &builders,
-        &cache,
-    )
-    .await
-    .err()
-    .unwrap();
-    assert_eq!(error.code, SnapshotErrorCode::TemporaryUnavailable);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(budget.used(), 0);
-    drop(workers);
-    let projection = build_with_resources(
-        Sha256::digest(b"abc").into(),
-        3,
-        || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok(stream(vec![Ok(Bytes::from_static(b"abc"))]))
-        },
-        &budget,
-        &builders,
-        &cache,
-    )
-    .await
-    .unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(budget.used(), weight);
-    assert_eq!(builders.available_permits(), MAX_BUILDERS);
-    drop(projection);
-    assert_eq!(budget.used(), 0);
-}
-
-#[tokio::test]
-async fn cancelled_stream_owner_refunds_after_stream_drop_and_same_flight_waiter_takes_over() {
-    let raw = Bytes::from(uuid::Uuid::new_v4().as_bytes().to_vec());
-    let id: [u8; 32] = Sha256::digest(&raw).into();
-    let entered = Arc::new(Notify::new());
-    let drops = Arc::new(AtomicUsize::new(0));
-    let leader = tokio::spawn({
-        let entered = entered.clone();
-        let drops = drops.clone();
-        async move {
-            get_or_project_stream(id, 16, || async {
-                let input: ObjectByteStream = Box::pin(futures::stream::unfold(
-                    (entered, DropCount(drops)),
-                    |(entered, owner)| async move {
-                        entered.notify_one();
-                        std::future::pending::<()>().await;
-                        Some((Ok(Bytes::new()), (entered, owner)))
-                    },
-                ));
-                Ok(input)
-            })
-            .await
-        }
-    });
-    timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
-    let waiter = tokio::spawn(async move {
-        get_or_project_stream(id, 16, || async {
-            let input: ObjectByteStream = stream(vec![Ok(raw)]);
-            Ok(input)
-        })
-        .await
-    });
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if FLIGHTS
-                .get()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .entries
-                .get(&id)
-                .map_or(0, Weak::strong_count)
-                == 2
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    leader.abort();
-    assert!(leader.await.err().unwrap().is_cancelled());
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
-    let projection = timeout(Duration::from_secs(5), waiter)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(projection.map.file_content_id, id);
-    assert_eq!(projection.chunk_bytes(0).unwrap().len(), 16);
 }
 
 #[test]

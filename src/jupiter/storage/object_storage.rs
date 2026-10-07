@@ -78,6 +78,110 @@ mod exact_range_tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn memory_chunk_receipts_reject_all_mutation_routes() {
+        let storage = mock_object_storage();
+        super::assert_immutable_chunk_receipt_contract(storage.inner.as_ref()).await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_immutable_chunk_receipt_contract(
+    storage: &dyn crate::orbit_api::factory::MegaObjectStorageWithLog,
+) {
+    let key = ObjectKey {
+        namespace: crate::orbit_api::object_storage::ObjectNamespace::ChunkMapReceipt,
+        key: "a".repeat(64),
+    };
+    let first = Bytes::from_static(b"trusted immutable receipt");
+    storage
+        .put_metadata_atomic_create(&key, first.clone(), ObjectMeta::default())
+        .await
+        .unwrap();
+    storage
+        .put_metadata_atomic_create(
+            &key,
+            Bytes::from_static(b"conflicting replay"),
+            ObjectMeta::default(),
+        )
+        .await
+        .unwrap();
+    let input = || {
+        Box::pin(futures::stream::iter([Ok(Bytes::from_static(
+            b"overwrite",
+        ))])) as ObjectByteStream
+    };
+    assert!(
+        storage
+            .put_stream(&key, input(), ObjectMeta::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .put_stream_bounded(&key, input(), ObjectMeta::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .put_metadata_atomic(
+                &key,
+                Bytes::from_static(b"overwrite"),
+                ObjectMeta::default()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .put_metadata_atomic_create(
+                &key,
+                Bytes::from(vec![
+                    0;
+                    crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES
+                        + 1
+                ]),
+                ObjectMeta::default()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .append(&key, input(), ObjectMeta::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .append_concurrently(&key, input(), ObjectMeta::default())
+            .await
+            .is_err()
+    );
+    assert!(storage.delete(&key).await.is_err());
+    for method in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH] {
+        assert!(
+            storage
+                .signed_url(&key, method, std::time::Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        storage
+            .signed_url(&key, Method::GET, std::time::Duration::from_secs(60))
+            .await
+            .is_ok()
+    );
+    let (mut stream, meta) = storage.get_stream(&key).await.unwrap();
+    assert_eq!(meta.size, first.len() as i64);
+    let mut observed = Vec::new();
+    while let Some(part) = stream.next().await {
+        observed.extend_from_slice(&part.unwrap());
+    }
+    assert_eq!(observed, first.as_ref());
 }
 
 #[derive(Default)]
@@ -111,6 +215,7 @@ impl MegaObjectStorage for InMemoryObjectStorage {
         data: ObjectByteStream,
         mut meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         let bytes = Self::read_stream(data).await?;
         meta.size = bytes.len() as i64;
         self.objects
@@ -126,6 +231,7 @@ impl MegaObjectStorage for InMemoryObjectStorage {
         bytes: Bytes,
         mut meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         use crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES;
         if bytes.len() > MAX_METADATA_ATOMIC_BYTES {
             return Err(IoOrbitError::Other(format!(
@@ -137,6 +243,27 @@ impl MegaObjectStorage for InMemoryObjectStorage {
             .lock()
             .map_err(|_| IoOrbitError::Other("object storage lock poisoned".to_string()))?
             .insert(key.clone(), (bytes, meta));
+        Ok(())
+    }
+
+    async fn put_metadata_atomic_create(
+        &self,
+        key: &ObjectKey,
+        bytes: Bytes,
+        mut meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        if bytes.len() > crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES {
+            return Err(IoOrbitError::Other(
+                "immutable atomic metadata exceeds its byte limit".into(),
+            ));
+        }
+        key.validate()?;
+        meta.size = bytes.len() as i64;
+        self.objects
+            .lock()
+            .map_err(|_| IoOrbitError::Other("object storage lock poisoned".into()))?
+            .entry(key.clone())
+            .or_insert((bytes, meta));
         Ok(())
     }
 
@@ -208,14 +335,18 @@ impl MegaObjectStorage for InMemoryObjectStorage {
 
     async fn signed_url(
         &self,
-        _key: &ObjectKey,
-        _method: Method,
+        key: &ObjectKey,
+        method: Method,
         _expires_in: std::time::Duration,
     ) -> OrbitResult<Option<String>> {
+        if method != Method::GET {
+            reject_receipt_mutation(key)?;
+        }
         Ok(None)
     }
 
     async fn delete(&self, key: &ObjectKey) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         let deleted = self
             .objects
             .lock()
@@ -230,6 +361,16 @@ impl MegaObjectStorage for InMemoryObjectStorage {
     }
 }
 
+fn reject_receipt_mutation(key: &ObjectKey) -> OrbitResult<()> {
+    if key.namespace == crate::orbit_api::object_storage::ObjectNamespace::ChunkMapReceipt {
+        Err(IoOrbitError::Other(
+            "chunk map receipts require immutable atomic creation".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl LogStorage for InMemoryObjectStorage {
     async fn append(
@@ -238,6 +379,7 @@ impl LogStorage for InMemoryObjectStorage {
         data: ObjectByteStream,
         mut meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         let bytes = Self::read_stream(data).await?;
         let mut objects = self
             .objects

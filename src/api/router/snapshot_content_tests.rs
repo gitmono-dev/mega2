@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -85,6 +85,9 @@ mod bounded_objects;
 #[path = "snapshot_chunks_bounded_tests.rs"]
 mod bounded_chunks;
 
+#[path = "snapshot_persisted_chunk_map_tests.rs"]
+mod persisted_chunk_maps;
+
 #[path = "snapshot_session_tests.rs"]
 mod durable_sessions;
 
@@ -100,6 +103,8 @@ mod generation_qualified_fixture;
 #[path = "snapshot_install_capability_fixture.rs"]
 mod install_capability_fixture;
 
+type ReceiptWriteHold = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
 #[derive(Default)]
 struct ReadCounts {
     whole: AtomicUsize,
@@ -107,6 +112,14 @@ struct ReadCounts {
     bytes: AtomicUsize,
     object_fault: std::sync::Mutex<Option<bounded_objects::StreamFault>>,
     chunk_faults: std::sync::Mutex<Vec<bounded_chunks::ChunkFault>>,
+    receipt_reads: AtomicUsize,
+    receipt_writes: AtomicUsize,
+    receipt_write_fail_after_create: AtomicBool,
+    receipt_read_failure: AtomicBool,
+    receipt_read_corruption: std::sync::Mutex<Option<Bytes>>,
+    receipt_read_meta_size: std::sync::atomic::AtomicI64,
+    receipt_read_late_error: AtomicBool,
+    receipt_write_holds: std::sync::Mutex<Option<ReceiptWriteHold>>,
 }
 
 impl ReadCounts {
@@ -114,6 +127,8 @@ impl ReadCounts {
         self.whole.store(0, Ordering::SeqCst);
         self.range.store(0, Ordering::SeqCst);
         self.bytes.store(0, Ordering::SeqCst);
+        self.receipt_reads.store(0, Ordering::SeqCst);
+        self.receipt_writes.store(0, Ordering::SeqCst);
     }
 
     fn assert(&self, whole: usize, bytes: usize) {
@@ -130,6 +145,36 @@ struct CountingStorage {
 
 #[async_trait::async_trait]
 impl MegaObjectStorage for CountingStorage {
+    async fn put_metadata_atomic_create(
+        &self,
+        key: &ObjectKey,
+        bytes: Bytes,
+        meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        self.inner
+            .inner
+            .put_metadata_atomic_create(key, bytes, meta)
+            .await?;
+        if key.namespace == ObjectNamespace::ChunkMapReceipt {
+            self.counts.receipt_writes.fetch_add(1, Ordering::SeqCst);
+            let holds = self.counts.receipt_write_holds.lock().unwrap().clone();
+            if let Some((entered, release)) = holds {
+                entered.notify_one();
+                release.notified().await;
+            }
+            if self
+                .counts
+                .receipt_write_fail_after_create
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(crate::orbit_api::error::IoOrbitError::Other(
+                    "injected post-create receipt failure".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn put_stream(
         &self,
         key: &ObjectKey,
@@ -140,6 +185,39 @@ impl MegaObjectStorage for CountingStorage {
     }
 
     async fn get_stream(&self, key: &ObjectKey) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
+        if key.namespace == ObjectNamespace::ChunkMapReceipt {
+            self.counts.receipt_reads.fetch_add(1, Ordering::SeqCst);
+            if self.counts.receipt_read_failure.load(Ordering::SeqCst) {
+                return Err(
+                    crate::orbit_api::error::IoOrbitError::object_store_not_found(
+                        key.default_sharding(),
+                    ),
+                );
+            }
+            let bad = self.counts.receipt_read_corruption.lock().unwrap().clone();
+            if let Some(bytes) = bad {
+                let declared = self.counts.receipt_read_meta_size.load(Ordering::SeqCst);
+                let size = if declared > 0 {
+                    declared
+                } else {
+                    bytes.len() as i64
+                };
+                let mut parts = vec![Ok(bytes)];
+                if self.counts.receipt_read_late_error.load(Ordering::SeqCst) {
+                    parts.push(Err(std::io::Error::other(
+                        "injected late receipt read error",
+                    )));
+                }
+                return Ok((
+                    Box::pin(futures::stream::iter(parts)),
+                    ObjectMeta {
+                        size,
+                        ..Default::default()
+                    },
+                ));
+            }
+            return self.inner.inner.get_stream(key).await;
+        }
         self.counts.whole.fetch_add(1, Ordering::SeqCst);
         let chunk_fault = self
             .counts
@@ -220,10 +298,21 @@ impl MegaObjectStorage for CountingStorage {
                 (Box::pin(stream) as ObjectByteStream, meta)
             }));
         }
-        self.inner
+        let result = self
+            .inner
             .inner
             .get_range_stream_exact(key, start, end)
-            .await
+            .await?;
+        Ok(result.map(|(stream, meta)| {
+            let counts = self.counts.clone();
+            let stream = stream.map(move |part| {
+                if let Ok(bytes) = &part {
+                    counts.bytes.fetch_add(bytes.len(), Ordering::SeqCst);
+                }
+                part
+            });
+            (Box::pin(stream) as ObjectByteStream, meta)
+        }))
     }
 
     async fn exists(&self, key: &ObjectKey) -> OrbitResult<bool> {
@@ -500,11 +589,16 @@ impl Fixture {
                 .save_object_from_raw(Bytes::copy_from_slice(raw))
                 .await
                 .unwrap();
-            project_items.push(item(
-                TreeItemMode::Blob,
-                ObjectHash::from_hex_for_kind(HashKind::Sha1, &oid).unwrap(),
-                name,
-            ));
+            let mut oid = ObjectHash::from_hex_for_kind(HashKind::Sha1, &oid).unwrap();
+            let mut mode = TreeItemMode::Blob;
+            let components: Vec<_> = name.split('/').collect();
+            for index in (1..components.len()).rev() {
+                let child = tree(vec![item(mode, oid, components[index])]);
+                oid = child.id;
+                mode = TreeItemMode::Tree;
+                extra_trees.push(child);
+            }
+            project_items.push(item(mode, oid, components[0]));
         }
         let project = tree(project_items);
         let old_tip = Commit::from_tree_id_with_kind(
@@ -814,7 +908,7 @@ async fn mst2_fixed_head_uses_verified_facts_without_body_reads_and_preserves_ra
 }
 
 #[tokio::test]
-async fn mst2_fixed_warm_map_leaf_and_chunk_aliases_skip_body_reads() {
+async fn mst2_fixed_warm_map_and_leaf_aliases_skip_body_reads_and_chunks_use_current_ranges() {
     let fixture = Fixture::new().await;
     let initial = fixture.map("/file").await;
     fixture.counts.assert(1, fixture.raw.len());
@@ -823,18 +917,6 @@ async fn mst2_fixed_warm_map_leaf_and_chunk_aliases_skip_body_reads() {
     assert_eq!(initial["map"]["chunk_count"], "2");
     let map_id = initial["map"]["map_id"].as_str().unwrap();
     fixture.counts.reset();
-    fixture
-        .state
-        .storage
-        .git_service
-        .obj_storage
-        .inner
-        .delete(&ObjectKey {
-            namespace: ObjectNamespace::Git,
-            key: fixture.oid.clone(),
-        })
-        .await
-        .unwrap();
     for path in ["/file", "/alias", "/executable", "/nested/file"] {
         let cached = fixture.map(path).await;
         assert_eq!(cached["path"], path);
@@ -902,8 +984,43 @@ async fn mst2_fixed_warm_map_leaf_and_chunk_aliases_skip_body_reads() {
                 <[u8; 32]>::from(Sha256::digest(body.as_bytes()))
             );
         }
-        fixture.counts.assert(0, 0);
+        assert_eq!(fixture.counts.whole.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.counts.range.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            fixture.counts.bytes.load(Ordering::SeqCst),
+            fixture.raw.len()
+        );
+        fixture.counts.reset();
     }
+    fixture
+        .state
+        .storage
+        .git_service
+        .obj_storage
+        .inner
+        .delete(&ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: fixture.oid.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(fixture.map("/alias").await["map"], initial["map"]);
+    fixture.counts.assert(0, 0);
+    error(
+        fixture
+            .send(
+                "POST",
+                "chunks",
+                Body::from(fixture.chunk_body("/alias", map_id, "0").to_string()),
+            )
+            .await,
+        503,
+        "OBJECT_UNAVAILABLE",
+        false,
+    )
+    .await;
+    assert_eq!(fixture.counts.whole.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.counts.range.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

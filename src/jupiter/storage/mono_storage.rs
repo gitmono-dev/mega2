@@ -1789,12 +1789,43 @@ impl MonoStorage {
         if oids.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows = mst2_verified_object::Entity::find()
-            .filter(mst2_verified_object::Column::StorageDomain.eq("git"))
-            .filter(mst2_verified_object::Column::ObjectKind.eq("blob"))
-            .filter(mst2_verified_object::Column::GitOid.is_in(oids))
-            .all(self.get_connection())
-            .await?;
+        let connection = self.get_connection();
+        let rows = if connection.get_database_backend() == sea_orm::DbBackend::Postgres {
+            use sea_orm::{DbBackend, FromQueryResult, Statement};
+            let scope = connection.query_one_raw(Statement::from_string(DbBackend::Postgres,
+                "SELECT n.nspname AS schema FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname='mst2_verified_object' AND c.relkind='r' WHERE n.nspname=pg_catalog.current_schema() AND n.nspname NOT LIKE 'pg_temp_%'"))
+                .await?.ok_or_else(|| MegaError::Other("actual verified blob relation is missing".into()))?;
+            let schema: String = scope.try_get("", "schema")?;
+            let relation = format!("\"{}\".mst2_verified_object", schema.replace('"', "\"\""));
+            let oids = serde_json::to_string(&oids)
+                .map_err(|error| MegaError::Other(error.to_string()))?;
+            let sql = format!(
+                "SELECT v.id,v.storage_domain,CASE WHEN pg_catalog.octet_length(v.git_oid) IN (40,64) THEN v.git_oid ELSE NULL END AS git_oid,v.object_kind,CASE WHEN pg_catalog.octet_length(v.raw_sha256)=32 THEN v.raw_sha256 ELSE NULL END AS raw_sha256,CASE WHEN v.size BETWEEN 0 AND {MST2_MAX_FILE_SIZE} THEN v.size ELSE NULL END AS size,CASE WHEN v.verification_version IN (1,{MST2_VERIFICATION_VERSION}) THEN v.verification_version ELSE NULL END AS verification_version,CASE WHEN v.state='VERIFIED' THEN v.state ELSE NULL END AS state,v.created_at FROM {relation} v WHERE v.storage_domain='git' AND v.object_kind='blob' AND v.git_oid IN (SELECT value FROM pg_catalog.jsonb_array_elements_text($1::jsonb))"
+            );
+            connection
+                .query_all_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    sql,
+                    [oids.into()],
+                ))
+                .await?
+                .iter()
+                .map(|row| {
+                    mst2_verified_object::Model::from_query_result(row, "").map_err(|_| {
+                        MegaError::ObjStorageInconsistent(
+                            "invalid bounded MST/2 verified blob record".into(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            mst2_verified_object::Entity::find()
+                .filter(mst2_verified_object::Column::StorageDomain.eq("git"))
+                .filter(mst2_verified_object::Column::ObjectKind.eq("blob"))
+                .filter(mst2_verified_object::Column::GitOid.is_in(oids))
+                .all(connection)
+                .await?
+        };
         for row in &rows {
             if row.state != "VERIFIED"
                 || ![1, MST2_VERIFICATION_VERSION].contains(&row.verification_version)

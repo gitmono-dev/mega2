@@ -214,6 +214,14 @@ async fn mst2_large_chunk_uses_current_oid_strict_range_faults_cancel_retry_and_
     fixture.counts.assert(1, size as usize);
     let map_id = map["map"]["map_id"].as_str().unwrap();
     fixture.counts.reset();
+    super::persisted_chunk_maps::assert_three_page_proofs_and_selected_sibling_faults(
+        &fixture, map_id, digest, &pattern,
+    )
+    .await;
+    // Each distinct OID earns its own full-stream receipt before map reuse.
+    assert_eq!(fixture.map("/other").await["map"], map["map"]);
+    fixture.counts.assert(1, size as usize);
+    fixture.counts.reset();
     // Equal content map sharing never carries the first source's OID.
     let body = request("/other", digest, map_id, 512);
     assert_chunk(
@@ -387,6 +395,26 @@ async fn mst2_chunk_batch_live_budget_and_invalid_later_path_reject_before_body_
         ],
     )
     .await;
+    let budget = crate::ceres::snapshot::content_budget::MemoryBudget::new(1024 * 1024);
+    let repository = crate::jupiter::storage::native_chunk_map::PostgresChunkMapRepository::new(
+        fixture
+            .state
+            .storage
+            .mono_storage()
+            .get_connection()
+            .clone(),
+    )
+    .await
+    .unwrap()
+    .with_test_budget(budget.clone());
+    assert!(
+        fixture
+            .state
+            .storage
+            .native_chunk_maps
+            .set(repository)
+            .is_ok()
+    );
     let mut items = Vec::new();
     for (index, path) in ["/file", "/one", "/two"].iter().enumerate() {
         let oid = oid_for(&fixture, path).await;
@@ -417,6 +445,7 @@ async fn mst2_chunk_batch_live_budget_and_invalid_later_path_reject_before_body_
     )
     .await;
     fixture.counts.assert(0, 0);
+    assert_eq!(budget.used(), 0);
     let fixture = Fixture::new().await;
     let mut body = fixture.chunk_body("/file", &format!("sha256:{}", hex_of(&[1; 32])), "0");
     let mut invalid = body["items"][0].clone();

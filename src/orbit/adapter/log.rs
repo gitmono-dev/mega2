@@ -8,6 +8,7 @@ impl LogStorage for ObjectStoreAdapter {
         data: ObjectByteStream,
         _meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        super::object::reject_receipt_mutation(key)?;
         key.validate()?;
         // Fast path for single writer/single thread (optimized here):
         // - No conditional writes, no retries, no cleanup (no concurrent write conflicts)
@@ -187,6 +188,7 @@ impl LogStorage for ObjectStoreAdapter {
         data: ObjectByteStream,
         _meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        super::object::reject_receipt_mutation(key)?;
         key.validate()?;
         // The local backend has no conditional-write (CAS) support, so this
         // method cannot be made safe under contention there (it would fall back
