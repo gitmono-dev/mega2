@@ -5,6 +5,7 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub page_id: Vec<u8>,
+    pub generation: Option<i64>,
     pub metadata_codec: i16,
     pub byte_size: i32,
     pub payload: Vec<u8>,
