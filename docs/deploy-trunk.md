@@ -152,13 +152,15 @@ docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml --profil
 opt-in case（需要切换 mega2 配置的 case）一律经宿主侧 helper 运行，helper 用 `trap` 保证无论成败都把 mega2 恢复为默认配置；切换后与恢复后都读取运行中 mega2 容器的 compose config hash 标签，分别与切换配置、默认配置的 hash 比对（[plan-20261001](plan/plan-20261001.md) FIX-BB-07）：
 
 ```bash
-scripts/bb_optin_run.sh <none|gc|local> <script> '<case>' target/tmp/<log>
+scripts/bb_optin_run.sh <none|gc|local|views> <script> '<case>' target/tmp/<log>
 scripts/bb_optin_run.sh --selftest local target/tmp/<log>   # 自测：桩命令退出 1
 ```
 
+`views` 模式叠加 `docker/docker-compose-storage-only.views.yml`，只接受 `libra_view_smoke.sh`；切栈前重建独立库 `mega2_hp25_views` 并清空 Redis 逻辑库 1。`--selftest views` 执行 reset、切栈、桩命令及默认栈恢复，不执行 prepare。
+
 - `scripts/bb_optin_run.sh` 退出码 0：case 通过，且 mega2 已恢复默认配置（log 含 `bb-optin: restored mega2 (config hash match)`）。
 - `scripts/bb_optin_run.sh` 退出码 1：case 失败，或切换后运行中 mega2 容器的 compose config hash 标签不是切换配置的 hash（case 未运行）；两种情况下 mega2 都已恢复默认配置。
-- `scripts/bb_optin_run.sh` 退出码 2：参数或前置错误（未知模式、env-file 缺失、另一个 helper 持有栈锁），未切栈。
+- `scripts/bb_optin_run.sh` 退出码 2：参数或前置错误（未知模式、env-file 缺失、脚本与模式不匹配、另一个 helper 持有栈锁），未切栈。
 - `scripts/bb_optin_run.sh` 退出码 3：恢复失败（运行中 mega2 的 config hash 不是默认配置的 hash，或 mega2 不健康），需人工执行 `docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml up -d --wait --force-recreate mega2`。
 
 ### 8.1 Compose 黑盒 Git 协议 smoke（`git` 客户端）
@@ -534,3 +536,22 @@ HTTP 服务即可从已提交水位继续。
 名额不足时，注册返回 429；读者访问返回 503 与 `Retry-After`。释放名额，或热调高 `max_filters`、`max_concurrent_cold_starts` 后，可以再次访问。预热期间访问同样返回 503 与 `Retry-After`，就绪后恢复宣告。[`views.enabled`](configuration.md) 为 `false` 时访问返回 404，不触发预热。
 
 `recycle-filter` 之后的视图历史与回收前相同；`rebuild-all` 之后的视图历史可能改变，需要公告。
+
+### 13.4 Libra 视图 smoke（opt-in）
+
+先用当前工作树重建 mega2 镜像并启动 `interop-smoke`，命令见 §8。三个 case 逐一运行；每次 helper 都重建独立库、切到 views 配置、准备视图状态，并在退出时恢复默认栈：
+
+```bash
+scripts/bb_optin_run.sh views libra_view_smoke.sh '<case>' target/tmp/hp25-<case>.log
+```
+
+`<case>` 分别取 `view_http_clone_fetch`、`view_unready`、`view_l0_mismatch`。setup 先 provision `/project/hp25-view-smoke`，克隆其初始提交，再用 `git mktree` 构造 `ok/`、`unready/` 与 `l0/` 的 tree 和根 tree，在初始提交之上推送。`l0/` 含不自洽的 `100664` 条目，属于[历史投影设计的 R2 限制](refactoring/history-projection.md)；它只写入独立库，避免破坏默认栈的根仓库 clone。先注册并回收 `hp25-unready`，再注册两个就绪视图使名额满额，确保未就绪访问稳定得到 503 / 75。
+
+SSH case 用 `LIBRA_SSH_COMMAND` 指向本次运行的包装脚本，脚本从隔离的 `known_hosts` 读取环回中继 host key，并保持 `StrictHostKeyChecking=yes`。在 `DEP-HP-04` 落地前，未就绪 SSH 用例只断言 `status 75`；L0 ERR 用例断言 `remote reported an error:` 前缀及重算的 tree id。
+
+views 栈与默认栈共用 RustFS bucket `mega2`；独立库与 Redis 逻辑库 1 可在 helper 没有运行时手工清理：
+
+```bash
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml exec -T postgres psql -U mega2 -d postgres -c 'DROP DATABASE IF EXISTS mega2_hp25_views WITH (FORCE)'
+docker compose -p mega2-trunk -f docker/docker-compose-storage-only.yml exec -T redis redis-cli -n 1 FLUSHDB
+```
