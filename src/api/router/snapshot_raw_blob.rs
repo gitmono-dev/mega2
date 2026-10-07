@@ -232,7 +232,7 @@ impl AsRef<[u8]> for RawBlobChunk {
 }
 
 impl RawBlobReader {
-    async fn validate(&self) -> Result<(), SnapshotError> {
+    async fn validate(&mut self) -> Result<(), SnapshotError> {
         revalidate_access(&self.state, &self.context, &self.headers).await
     }
 
