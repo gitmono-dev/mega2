@@ -354,14 +354,27 @@ impl ViewProjectionService {
         view_storage
             .write_projection_batch(txn, filter_pk, &segments, &written_outputs, projected_seq)
             .await?;
-        if stop.is_none() && last == tip {
-            view_storage
+        let outcome = if let Some(stop) = stop {
+            CatchUpOutcome::Stopped(stop)
+        } else if last == tip {
+            #[cfg(test)]
+            self.test_hooks
+                .terminal_checks
+                .fetch_add(1, Ordering::Relaxed);
+            if view_storage
                 .mark_ready_if_covered(txn, filter_pk, tip)
-                .await?;
-        }
+                .await?
+            {
+                CatchUpOutcome::Ready
+            } else {
+                CatchUpOutcome::MainNotCovered
+            }
+        } else {
+            CatchUpOutcome::Advanced
+        };
         #[cfg(test)]
         self.test_hooks.record_advanced_projected_seq(projected_seq);
-        Ok(stop.map_or(CatchUpOutcome::Advanced, CatchUpOutcome::Stopped))
+        Ok(outcome)
     }
 
     async fn prefetch_filter_outputs<C: ConnectionTrait>(
@@ -2815,7 +2828,11 @@ mod tests {
                     .catch_up_one_batch(filter_pk, &storage.config(), 1)
                     .await
                     .unwrap(),
-                CatchUpOutcome::Advanced
+                if expected_seq == 5 {
+                    CatchUpOutcome::Ready
+                } else {
+                    CatchUpOutcome::Advanced
+                }
             );
             let row = mega_view_filter::Entity::find_by_id(filter_pk)
                 .one(db)
@@ -3461,6 +3478,35 @@ mod tests {
         assert!(!captured.contains("hp11@example.test"));
         assert!(!captured.contains(":prefix=p"));
         assert!(!captured.contains(":[:/a:prefix=x,:/b:prefix=x]"));
+    }
+
+    #[tokio::test]
+    async fn final_batch_returns_ready_without_a_terminal_transaction() {
+        async fn count(one_batch: bool) -> usize {
+            let (_temp, _schema, storage, counter) = counted_storage_with_history(
+                vec![vec![("a/file".to_owned(), b"one".to_vec())]],
+                1000,
+            )
+            .await;
+            let filter_pk = insert_warming_filter(&storage, 1, ":/a").await;
+            let service = ViewProjectionService::new(storage.clone(), ViewMetrics::default());
+            counter.store(0, Ordering::Relaxed);
+            let outcome = if one_batch {
+                service
+                    .catch_up_one_batch(filter_pk, &storage.config(), 1000)
+                    .await
+            } else {
+                service.catch_up(filter_pk).await
+            };
+            assert_eq!(outcome.unwrap(), CatchUpOutcome::Ready);
+            assert_eq!(
+                service.test_hooks.terminal_checks.load(Ordering::Relaxed),
+                1
+            );
+            counter.load(Ordering::Relaxed)
+        }
+
+        assert_eq!(count(true).await, count(false).await);
     }
 
     #[tokio::test]

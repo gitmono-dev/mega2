@@ -12,6 +12,7 @@ use crate::{
 };
 
 const ROOT_CHAIN_SEGMENT_ROWS: usize = 10_000;
+const ROOT_CHAIN_SQL_CHUNK_ROWS: usize = 1_000;
 
 /// A self-contained expression readers can embed in their snapshot query.
 /// It preserves the ordered root-chain decision: an anchored scan row is
@@ -171,6 +172,31 @@ impl ViewStorage {
                     {
                         txn.commit().await?;
                         return Ok(self.finish_outcome(RootChainOutcome::CaughtUp));
+                    }
+                    if remaining.is_none()
+                        && root.parent_count == 1
+                        && let Some(tail) = tail.as_ref()
+                        && root.first_parent.as_deref() == Some(tail.commit_id.as_str())
+                    {
+                        let inserted = txn
+                            .execute_raw(Statement::from_sql_and_values(
+                                DbBackend::Postgres,
+                                "INSERT INTO mega_view_root_chain (seq, commit_id, tree_id) \
+                                 SELECT $1, $2, $3 WHERE EXISTS ( \
+                                     SELECT 1 FROM mega_commit WHERE commit_id = $4 \
+                                 ) ON CONFLICT DO NOTHING",
+                                [
+                                    Value::from(tail.seq + 1),
+                                    Value::from(root.commit_id.clone()),
+                                    Value::from(root.tree_id.clone()),
+                                    Value::from(tail.commit_id.clone()),
+                                ],
+                            ))
+                            .await?;
+                        if inserted.rows_affected() == 1 {
+                            txn.commit().await?;
+                            return Ok(self.finish_outcome(RootChainOutcome::CaughtUp));
+                        }
                     }
                     if exhausted(remaining) {
                         txn.rollback().await?;
@@ -471,19 +497,35 @@ async fn insert_scan_rows(
     first_pos: i64,
     rows: &[ScanRow],
 ) -> Result<(), MegaError> {
-    for (offset, row) in rows.iter().enumerate() {
-        txn.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO mega_view_root_chain_scan \
-             (pos, commit_id, tree_id, parent_count, first_parent) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-            [
-                Value::from(first_pos + offset as i64),
+    for (chunk_index, chunk) in rows.chunks(ROOT_CHAIN_SQL_CHUNK_ROWS).enumerate() {
+        let mut placeholders = Vec::with_capacity(chunk.len());
+        let mut values = Vec::with_capacity(chunk.len() * 5);
+        for (offset, row) in chunk.iter().enumerate() {
+            let parameter = offset * 5 + 1;
+            placeholders.push(format!(
+                "(${parameter}, ${}, ${}, ${}, ${})",
+                parameter + 1,
+                parameter + 2,
+                parameter + 3,
+                parameter + 4
+            ));
+            values.extend([
+                Value::from(first_pos + (chunk_index * ROOT_CHAIN_SQL_CHUNK_ROWS + offset) as i64),
                 Value::from(row.commit_id.clone()),
                 Value::from(row.tree_id.clone()),
                 Value::from(row.parent_count),
                 Value::from(row.first_parent.clone()),
-            ],
+            ]);
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            format!(
+                "INSERT INTO mega_view_root_chain_scan \
+                 (pos, commit_id, tree_id, parent_count, first_parent) \
+                 VALUES {} ON CONFLICT DO NOTHING",
+                placeholders.join(", ")
+            ),
+            values,
         ))
         .await?;
     }
@@ -529,17 +571,31 @@ async fn insert_segment(
     rows: &[RootChainRow],
 ) -> Result<Option<Discontinuity>, MegaError> {
     let mut inserted = 0;
-    for row in rows {
+    for chunk in rows.chunks(ROOT_CHAIN_SQL_CHUNK_ROWS) {
+        let mut placeholders = Vec::with_capacity(chunk.len());
+        let mut values = Vec::with_capacity(chunk.len() * 3);
+        for (index, row) in chunk.iter().enumerate() {
+            let parameter = index * 3 + 1;
+            placeholders.push(format!(
+                "(${parameter}, ${}, ${})",
+                parameter + 1,
+                parameter + 2
+            ));
+            values.extend([
+                Value::from(row.seq),
+                Value::from(row.commit_id.clone()),
+                Value::from(row.tree_id.clone()),
+            ]);
+        }
         let result = txn
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "INSERT INTO mega_view_root_chain (seq, commit_id, tree_id) \
-                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                [
-                    Value::from(row.seq),
-                    Value::from(row.commit_id.clone()),
-                    Value::from(row.tree_id.clone()),
-                ],
+                format!(
+                    "INSERT INTO mega_view_root_chain (seq, commit_id, tree_id) \
+                     VALUES {} ON CONFLICT DO NOTHING",
+                    placeholders.join(", ")
+                ),
+                values,
             ))
             .await?;
         inserted += result.rows_affected() as usize;
@@ -910,6 +966,149 @@ mod tests {
 
     async fn assert_root_chain_matches(db: &DatabaseConnection, commits: &[RootCommitFixture]) {
         assert_eq!(root_chain(db).await, expected_root_chain(commits));
+    }
+
+    #[tokio::test]
+    async fn cold_chain_statement_count_depends_on_batches() {
+        async fn count(commits: usize, batch_size: usize) -> usize {
+            let (_config, _schema, db, counter) = counted_empty().await;
+            let history = seed_linear_root_history(db.as_ref(), commits).await;
+            let storage = new_view_storage(db.clone());
+            counter.store(0, Ordering::Relaxed);
+            assert_eq!(
+                storage
+                    .extend_root_chain(None, batch_size, ViewLockMode::Try)
+                    .await
+                    .unwrap(),
+                RootChainOutcome::CaughtUp
+            );
+            let statements = counter.load(Ordering::Relaxed);
+            assert_root_chain_matches(db.as_ref(), &history).await;
+            statements
+        }
+
+        let one_batch_64 = count(64, 1000).await;
+        let one_batch_128 = count(128, 1000).await;
+        let two_batches_128 = count(128, 64).await;
+        assert_eq!(one_batch_64, one_batch_128);
+        assert!(one_batch_128 <= 29, "{one_batch_128}");
+        assert!(two_batches_128 >= one_batch_128);
+        assert!(two_batches_128 - one_batch_128 <= 15);
+    }
+
+    #[tokio::test]
+    async fn unbudgeted_single_append_uses_direct_chain_insert() {
+        let (_config, _schema, db, counter) = counted_empty().await;
+        let history = seed_linear_root_history(db.as_ref(), 6).await;
+        let storage = new_view_storage(db.clone());
+        assert_eq!(
+            storage
+                .extend_root_chain(None, 1000, ViewLockMode::Try)
+                .await
+                .unwrap(),
+            RootChainOutcome::CaughtUp
+        );
+        let next = seed_single_parent_root_commit_with_tree(
+            db.as_ref(),
+            HashKind::Sha1,
+            fixture_tree("direct-append"),
+            history.last().unwrap(),
+            "direct append",
+        )
+        .await;
+        assert!(cas_fixture_main(db.as_ref(), history.last().unwrap(), &next).await);
+        counter.store(0, Ordering::Relaxed);
+        assert_eq!(
+            storage
+                .extend_root_chain(None, 1000, ViewLockMode::Try)
+                .await
+                .unwrap(),
+            RootChainOutcome::CaughtUp
+        );
+        let statements = counter.load(Ordering::Relaxed);
+        assert!(statements <= 10, "{statements}");
+        assert!(scan_chain(db.as_ref()).await.is_empty());
+        let mut expected = history;
+        expected.push(next);
+        assert_root_chain_matches(db.as_ref(), &expected).await;
+    }
+
+    #[tokio::test]
+    async fn direct_append_conflict_keeps_scan_evidence() {
+        let (db, storage, history) = view_storage_with_history(6).await;
+        assert_eq!(
+            storage
+                .extend_root_chain(None, 1000, ViewLockMode::Try)
+                .await
+                .unwrap(),
+            RootChainOutcome::CaughtUp
+        );
+        let next = seed_single_parent_root_commit_with_tree(
+            &db,
+            HashKind::Sha1,
+            fixture_tree("direct-conflict"),
+            history.last().unwrap(),
+            "direct conflict",
+        )
+        .await;
+        assert!(cas_fixture_main(&db, history.last().unwrap(), &next).await);
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE mega_view_root_chain SET commit_id = $1 WHERE seq = 2",
+            [Value::from(next.commit.id.to_string())],
+        ))
+        .await
+        .unwrap();
+        let roots_before = root_chain(&db).await;
+        assert_eq!(
+            storage
+                .extend_root_chain(None, 1000, ViewLockMode::Try)
+                .await
+                .unwrap(),
+            RootChainOutcome::Discontinuous(DiscontinuityReason::RolledBack)
+        );
+        assert_eq!(root_chain(&db).await, roots_before);
+        assert_eq!(scan_chain(&db).await[0].1, next.commit.id.to_string());
+        assert!(storage.root_chain_halted().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn direct_append_missing_tail_commit_keeps_scan_evidence() {
+        let (db, storage, history) = view_storage_with_history(6).await;
+        assert_eq!(
+            storage
+                .extend_root_chain(None, 1000, ViewLockMode::Try)
+                .await
+                .unwrap(),
+            RootChainOutcome::CaughtUp
+        );
+        let next = seed_single_parent_root_commit_with_tree(
+            &db,
+            HashKind::Sha1,
+            fixture_tree("direct-missing-tail"),
+            history.last().unwrap(),
+            "direct missing tail",
+        )
+        .await;
+        assert!(cas_fixture_main(&db, history.last().unwrap(), &next).await);
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "DELETE FROM mega_commit WHERE commit_id = $1",
+            [Value::from(history.last().unwrap().commit.id.to_string())],
+        ))
+        .await
+        .unwrap();
+        let roots_before = root_chain(&db).await;
+        assert_eq!(
+            storage
+                .extend_root_chain(None, 1000, ViewLockMode::Try)
+                .await
+                .unwrap(),
+            RootChainOutcome::Discontinuous(DiscontinuityReason::MissingFirstParent)
+        );
+        assert_eq!(root_chain(&db).await, roots_before);
+        assert_eq!(scan_chain(&db).await[0].1, next.commit.id.to_string());
+        assert!(storage.root_chain_halted().await.unwrap());
     }
 
     async fn assert_scan_anchor_is_tail(db: &DatabaseConnection) {
