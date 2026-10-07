@@ -685,14 +685,17 @@ async fn mst2_persisted_meta_reader_holds_protection_until_all_route_bytes_are_o
                 }
             })
         };
-        let observer = fixture
-            .state
-            .storage
-            .mono_storage()
-            .get_connection()
-            .begin()
-            .await
-            .unwrap();
+        // The two service connections belong to the reader and competitor.
+        // Observe their lock wait without competing for either connection.
+        let mut observer_config = fixture.state.storage.config().database.clone();
+        assert_eq!(observer_config.max_connection, 2);
+        observer_config.max_connection = 1;
+        observer_config.min_connection = 0;
+        let observer_connection =
+            crate::jupiter::storage::init::database_connection(&observer_config)
+                .await
+                .unwrap();
+        let observer = observer_connection.begin().await.unwrap();
         tokio::select! {
             () = wait_retention_waiter(&observer) => {},
             outcome = &mut competing => {

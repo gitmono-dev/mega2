@@ -25,7 +25,7 @@ pub(crate) struct InstallFlight {
 impl InstallFlight {
     pub(crate) fn acquire(key: [u8; 32]) -> Result<Self, SnapshotError> {
         static REGISTRY: OnceLock<Arc<Mutex<Registry>>> = OnceLock::new();
-        Self::from_registry(REGISTRY.get_or_init(|| Arc::default()).clone(), key)
+        Self::from_registry(REGISTRY.get_or_init(Arc::default).clone(), key)
     }
 
     fn from_registry(registry: Arc<Mutex<Registry>>, key: [u8; 32]) -> Result<Self, SnapshotError> {
