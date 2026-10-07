@@ -91,6 +91,9 @@ mod generation_history_fixture;
 #[path = "snapshot_generation_qualified_fixture.rs"]
 mod generation_qualified_fixture;
 
+#[path = "snapshot_install_capability_fixture.rs"]
+mod install_capability_fixture;
+
 #[derive(Default)]
 struct ReadCounts {
     whole: AtomicUsize,
