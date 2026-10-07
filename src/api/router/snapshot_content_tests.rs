@@ -82,6 +82,9 @@ const TOKEN: &str = "mst2-fixed-content-test";
 #[path = "snapshot_session_tests.rs"]
 mod durable_sessions;
 
+#[path = "snapshot_generation_upgrade_tests.rs"]
+mod generation_upgrade;
+
 #[derive(Default)]
 struct ReadCounts {
     whole: AtomicUsize,

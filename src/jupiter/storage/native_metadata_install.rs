@@ -101,6 +101,7 @@ pub enum MetadataPrepareObservation {
 struct StoredPlan {
     record: mst2_metadata_prepare::Model,
     plan: MetadataInstallPlan,
+    prepare_pages: Vec<mst2_metadata_prepare_page::Model>,
 }
 
 impl StoredPlan {
@@ -511,6 +512,17 @@ impl PostgresMetadataInstallRepository {
     ) -> Result<PreparedMetadataReceipt, SnapshotError> {
         self.barrier(txn).await?;
         let stored = require_plan(txn, intent).await?;
+        self.finalize_stored_plan_in_txn(txn, intent, dag, stored)
+            .await
+    }
+
+    async fn finalize_stored_plan_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        intent: &MetadataPrepareIntent,
+        dag: &ValidatedMetadataDag,
+        stored: StoredPlan,
+    ) -> Result<PreparedMetadataReceipt, SnapshotError> {
         let expected: BTreeSet<_> = dag
             .payloads()
             .iter()
@@ -768,7 +780,7 @@ async fn load_plan<C: ConnectionTrait>(
         .await
         .map_err(internal)?;
     let mut coverage = BTreeSet::new();
-    for row in rows {
+    for row in &rows {
         let page: [u8; 32] = row
             .page_id
             .as_slice()
@@ -781,7 +793,11 @@ async fn load_plan<C: ConnectionTrait>(
             "stored metadata preparation coverage differs from its canonical plan",
         ));
     }
-    Ok(Some(StoredPlan { record, plan }))
+    Ok(Some(StoredPlan {
+        record,
+        plan,
+        prepare_pages: rows,
+    }))
 }
 
 async fn require_plan<C: ConnectionTrait>(
@@ -1033,6 +1049,11 @@ fn integrity(message: &str) -> SnapshotError {
 fn unavailable(message: &str) -> SnapshotError {
     SnapshotError::new(SnapshotErrorCode::ObjectUnavailable, message)
 }
+
+// Additive repository only. HTTP sessions continue using the existing installer
+// until session anchors and lease adoption bind the generation seal.
+#[path = "native_metadata_generations.rs"]
+pub mod generations;
 
 #[cfg(test)]
 #[path = "native_metadata_install_tests.rs"]
