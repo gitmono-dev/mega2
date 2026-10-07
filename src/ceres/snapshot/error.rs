@@ -18,6 +18,8 @@ pub enum SnapshotErrorCode {
     ScopeForbidden,
     ViewNotFound,
     SnapshotNotReady,
+    /// Verified fixed-object size/digest facts are not yet available.
+    MetadataNotReady,
     /// A bounded operation could not complete in time (spec 14 §5).
     TemporaryUnavailable,
     /// The fixed view no longer exists: spec 14 §5 SNAPSHOT_GONE (410).
@@ -51,6 +53,7 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::ScopeForbidden => "SCOPE_FORBIDDEN",
             SnapshotErrorCode::ViewNotFound => "VIEW_NOT_FOUND",
             SnapshotErrorCode::SnapshotNotReady => "SNAPSHOT_NOT_READY",
+            SnapshotErrorCode::MetadataNotReady => "METADATA_NOT_READY",
             SnapshotErrorCode::TemporaryUnavailable => "TEMPORARY_UNAVAILABLE",
             SnapshotErrorCode::SnapshotGone => "SNAPSHOT_GONE",
             SnapshotErrorCode::PathNotFound => "PATH_NOT_FOUND",
@@ -85,7 +88,9 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::ViewNotFound
             | SnapshotErrorCode::PathNotFound
             | SnapshotErrorCode::LeaseUnknown => 404,
-            SnapshotErrorCode::SnapshotNotReady | SnapshotErrorCode::TemporaryUnavailable => 503,
+            SnapshotErrorCode::SnapshotNotReady
+            | SnapshotErrorCode::MetadataNotReady
+            | SnapshotErrorCode::TemporaryUnavailable => 503,
             SnapshotErrorCode::ObjectUnavailable => 503,
             SnapshotErrorCode::NotDirectory
             | SnapshotErrorCode::Conflict

@@ -870,16 +870,51 @@ pub async fn resolve_abs<T: ApiHandler + ?Sized>(
     root_tree: &git_internal::internal::object::tree::Tree,
     abs_path: &str,
 ) -> Result<WalkOutcome, SnapshotError> {
+    Ok(
+        match resolve_abs_metadata(handler, root_tree, abs_path).await? {
+            MetadataWalkOutcome::FoundDir => WalkOutcome::FoundDir,
+            MetadataWalkOutcome::Absent => WalkOutcome::Absent,
+            MetadataWalkOutcome::NotDirectory { symlink } => WalkOutcome::NotDirectory { symlink },
+            MetadataWalkOutcome::FoundFile { fs_kind, oid } => {
+                let raw = fetch_raw_blob(handler, &oid).await?;
+                let mut h = Sha256::new();
+                h.update(&raw);
+                WalkOutcome::FoundFile {
+                    fs_kind,
+                    oid,
+                    size: raw.len() as u64,
+                    digest: h.finalize().into(),
+                    raw,
+                }
+            }
+        },
+    )
+}
+
+/// Fixed Git path metadata, without reading or hashing file content.
+#[derive(Debug)]
+pub(crate) enum MetadataWalkOutcome {
+    FoundDir,
+    FoundFile { fs_kind: FsKind, oid: String },
+    Absent,
+    NotDirectory { symlink: bool },
+}
+
+pub(crate) async fn resolve_abs_metadata<T: ApiHandler + ?Sized>(
+    handler: &T,
+    root_tree: &git_internal::internal::object::tree::Tree,
+    abs_path: &str,
+) -> Result<MetadataWalkOutcome, SnapshotError> {
     crate::ceres::snapshot::view::validate_scope_relative_path(abs_path)?;
     if abs_path == "/" {
-        return Ok(WalkOutcome::FoundDir);
+        return Ok(MetadataWalkOutcome::FoundDir);
     }
     let comps: Vec<&str> = abs_path[1..].split('/').collect();
-    let mut current = root_tree.clone();
+    let mut current = Cow::Borrowed(root_tree);
     for (i, comp) in comps.iter().enumerate() {
         let last = i == comps.len() - 1;
         let Some(item) = current.tree_items.iter().find(|x| x.name == *comp) else {
-            return Ok(WalkOutcome::Absent);
+            return Ok(MetadataWalkOutcome::Absent);
         };
         let Some(kind) = FsKind::from_git_mode(item.mode) else {
             return Err(SnapshotError::new(
@@ -890,33 +925,31 @@ pub async fn resolve_abs<T: ApiHandler + ?Sized>(
         let oid = item.id.to_string();
         if last {
             return match kind {
-                FsKind::Directory => Ok(WalkOutcome::FoundDir),
+                FsKind::Directory => Ok(MetadataWalkOutcome::FoundDir),
                 FsKind::Regular | FsKind::Executable | FsKind::Symlink => {
-                    let raw = fetch_raw_blob(handler, &oid).await?;
-                    let mut h = Sha256::new();
-                    h.update(&raw);
-                    let digest: [u8; 32] = h.finalize().into();
-                    Ok(WalkOutcome::FoundFile {
-                        fs_kind: kind,
-                        oid,
-                        size: raw.len() as u64,
-                        digest,
-                        raw,
-                    })
+                    Ok(MetadataWalkOutcome::FoundFile { fs_kind: kind, oid })
                 }
             };
         }
         if kind != FsKind::Directory {
-            return Ok(WalkOutcome::NotDirectory {
+            return Ok(MetadataWalkOutcome::NotDirectory {
                 symlink: kind == FsKind::Symlink,
             });
         }
-        current = handler.get_tree_by_hash(&oid).await.map_err(|e| {
+        let expected_oid = item.id;
+        let fetched = handler.get_tree_by_hash(&oid).await.map_err(|e| {
             SnapshotError::new(
                 SnapshotErrorCode::Internal,
                 format!("tree fetch failed for component '{comp}': {e}"),
             )
         })?;
+        if fetched.id != expected_oid {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "fetched fixed tree identity mismatch",
+            ));
+        }
+        current = Cow::Owned(fetched);
     }
     unreachable!("loop returns on the last component")
 }

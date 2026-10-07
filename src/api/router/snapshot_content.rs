@@ -17,7 +17,10 @@ use super::{abs_view_path, internal, mst2_error_response, request::Mst2Bytes, tr
 use crate::ceres::snapshot::{
     chunks::{ChunkProjection, get_or_project},
     error::{SnapshotError, SnapshotErrorCode},
-    pages::{WalkOutcome, base64_of, hex_of, resolve_abs},
+    pages::{
+        MetadataWalkOutcome, WalkOutcome, base64_of, fetch_raw_blob, hex_of, resolve_abs,
+        resolve_abs_metadata,
+    },
     resolver::FsKind,
     runtime::runtime,
     view::validate_scope_relative_path,
@@ -25,10 +28,128 @@ use crate::ceres::snapshot::{
 
 /// One file resolved at a fixed path with verified content.
 struct ResolvedFile {
-    fs_kind: FsKind,
     digest: [u8; 32],
     size: u64,
     raw: Vec<u8>,
+}
+
+struct ResolvedFileMetadata {
+    fs_kind: FsKind,
+    oid: String,
+    digest: [u8; 32],
+    size: u64,
+}
+
+#[allow(clippy::result_large_err)]
+async fn fixed_root_tree<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+    handler: &T,
+    oid: &str,
+) -> Result<git_internal::internal::object::tree::Tree, Response> {
+    let tree = handler.get_tree_by_hash(oid).await.map_err(internal)?;
+    if tree.id.to_string() != oid {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "fetched fixed root tree identity mismatch",
+        )));
+    }
+    Ok(tree)
+}
+
+#[allow(clippy::result_large_err)]
+async fn resolve_file_metadata<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+    handler: &T,
+    root_tree: &git_internal::internal::object::tree::Tree,
+    scope: &str,
+    path: &str,
+    expected_digest: Option<&str>,
+) -> Result<ResolvedFileMetadata, Response> {
+    validate_scope_relative_path(path).map_err(mst2_error_response)?;
+    let (fs_kind, oid) = match resolve_abs_metadata(handler, root_tree, &abs_view_path(scope, path))
+        .await
+        .map_err(mst2_error_response)?
+    {
+        MetadataWalkOutcome::FoundFile { fs_kind, oid } => (fs_kind, oid),
+        MetadataWalkOutcome::FoundDir => {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::NotDirectory,
+                format!("{path} is a directory"),
+            )));
+        }
+        MetadataWalkOutcome::Absent => {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::PathNotFound,
+                format!("{path} absent in the fixed view"),
+            )));
+        }
+        MetadataWalkOutcome::NotDirectory { symlink } => {
+            return Err(mst2_error_response(SnapshotError::new(
+                if symlink {
+                    SnapshotErrorCode::SymlinkTraversal
+                } else {
+                    SnapshotErrorCode::NotDirectory
+                },
+                format!("{path}: intermediate component is not a directory"),
+            )));
+        }
+    };
+    let storage = handler.get_context();
+    let mut verified = storage
+        .mono_storage()
+        .get_verified_blobs(vec![oid.clone()])
+        .await
+        .map_err(|error| {
+            let code = if matches!(
+                error,
+                crate::common::errors::MegaError::ObjStorageInconsistent(_)
+            ) {
+                SnapshotErrorCode::IntegrityError
+            } else {
+                SnapshotErrorCode::Internal
+            };
+            tracing::warn!(error = %error, "fixed content metadata lookup failed");
+            mst2_error_response(SnapshotError::new(
+                code,
+                "fixed content metadata lookup failed",
+            ))
+        })?;
+    let fact = verified.remove(&oid).ok_or_else(|| {
+        mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::MetadataNotReady,
+            "fixed object has no current verified size and digest fact",
+        ))
+    })?;
+    let digest: [u8; 32] = fact.raw_sha256.as_slice().try_into().map_err(|_| {
+        mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "invalid verified content digest",
+        ))
+    })?;
+    let size = u64::try_from(fact.size).map_err(|_| {
+        mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "invalid verified content size",
+        ))
+    })?;
+    if fs_kind == FsKind::Symlink && !(1..=4095).contains(&size) {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "verified symlink size is outside the fixed filesystem profile",
+        )));
+    }
+    if let Some(expected) = expected_digest
+        && expected != format!("sha256:{}", hex_of(&digest))
+    {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("{path}: content does not match expected_digest"),
+        )));
+    }
+    Ok(ResolvedFileMetadata {
+        fs_kind,
+        oid,
+        digest,
+        size,
+    })
 }
 
 pub(super) fn fs_kind_str(k: FsKind) -> &'static str {
@@ -57,11 +178,7 @@ async fn resolve_file<T: crate::ceres::api_service::ApiHandler + ?Sized>(
         .map_err(mst2_error_response)?
     {
         WalkOutcome::FoundFile {
-            fs_kind,
-            raw,
-            size,
-            digest,
-            ..
+            raw, size, digest, ..
         } => {
             if let Some(expected) = expected_digest
                 && expected != format!("sha256:{}", hex_of(&digest))
@@ -71,12 +188,7 @@ async fn resolve_file<T: crate::ceres::api_service::ApiHandler + ?Sized>(
                     format!("{path}: content does not match expected_digest"),
                 )));
             }
-            Ok(ResolvedFile {
-                fs_kind,
-                digest,
-                size,
-                raw,
-            })
+            Ok(ResolvedFile { digest, size, raw })
         }
         WalkOutcome::FoundDir => Err(mst2_error_response(SnapshotError::new(
             SnapshotErrorCode::NotDirectory,
@@ -128,11 +240,8 @@ pub(super) async fn blob_head(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = handler
-        .get_tree_by_hash(&ctx.root_tree_oid)
-        .await
-        .map_err(internal)?;
-    let f = resolve_file(
+    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
+    let f = resolve_file_metadata(
         handler.as_ref(),
         &root_tree,
         &ctx.built.descriptor.scope,
@@ -144,6 +253,7 @@ pub(super) async fn blob_head(
         .header("content-length", f.size.to_string())
         .header("etag", format!("\"sha256:{}\"", hex_of(&f.digest)))
         .header("cache-control", "private, no-cache, no-transform")
+        .header("vary", "Authorization, Accept")
         .header("x-mega-fs-kind", fs_kind_str(f.fs_kind))
         .header("x-mega-content-size", f.size.to_string())
         .body(axum::body::Body::empty())
@@ -201,10 +311,7 @@ pub(super) async fn objects(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = handler
-        .get_tree_by_hash(&ctx.root_tree_oid)
-        .await
-        .map_err(internal)?;
+    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
     let scope = ctx.built.descriptor.scope.clone();
     // Copied references: each per-item future borrows the shared walk state
     // without moving it (the stream is an FnMut over owned items).
@@ -317,23 +424,40 @@ async fn project_for<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     path: &str,
     expected_digest: Option<&str>,
 ) -> Result<std::sync::Arc<ChunkProjection>, Response> {
-    let f = resolve_file(handler, root_tree, scope, path, expected_digest).await?;
+    let f = resolve_file_metadata(handler, root_tree, scope, path, expected_digest).await?;
     // The first request for a digest builds the projection from the fixed
     // Git object; later requests slice the cached representation. A miss
     // rebuilds, never errors with "missing chunk".
     let digest = f.digest;
-    get_or_project(digest, || async move {
-        let raw = f.raw;
-        if raw.len() as u64 != f.size {
+    let size = f.size;
+    let projection = get_or_project(digest, || async move {
+        let raw = fetch_raw_blob(handler, &f.oid).await?;
+        if raw.len() as u64 != size {
             return Err(SnapshotError::new(
-                SnapshotErrorCode::Internal,
-                "resolved blob size disagrees with its length",
+                SnapshotErrorCode::IntegrityError,
+                "fixed blob length disagrees with its verified size fact",
             ));
         }
         Ok(raw)
     })
     .await
-    .map_err(mst2_error_response)
+    .map_err(|error| {
+        mst2_error_response(if error.code == SnapshotErrorCode::DigestMismatch {
+            SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "fixed blob digest disagrees with its verified fact",
+            )
+        } else {
+            error
+        })
+    })?;
+    if projection.map.file_size != size || projection.map.file_content_id != digest {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "cached projection disagrees with the fixed verified fact",
+        )));
+    }
+    Ok(projection)
 }
 
 #[allow(clippy::result_large_err)]
@@ -351,10 +475,7 @@ pub(super) async fn chunk_map(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = handler
-        .get_tree_by_hash(&ctx.root_tree_oid)
-        .await
-        .map_err(internal)?;
+    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
     let scope = ctx.built.descriptor.scope.clone();
     let proj = project_for(
         handler.as_ref(),
@@ -419,10 +540,7 @@ pub(super) async fn chunk_map_pages(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = handler
-        .get_tree_by_hash(&ctx.root_tree_oid)
-        .await
-        .map_err(internal)?;
+    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
     let scope = ctx.built.descriptor.scope.clone();
     let proj = project_for(
         handler.as_ref(),
@@ -528,10 +646,7 @@ pub(super) async fn chunks(
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
-    let root_tree = handler
-        .get_tree_by_hash(&ctx.root_tree_oid)
-        .await
-        .map_err(internal)?;
+    let root_tree = fixed_root_tree(handler.as_ref(), &ctx.root_tree_oid).await?;
     let scope = ctx.built.descriptor.scope.clone();
     let mut planned: Vec<Planned> = Vec::new();
     let mut units: Vec<(String, u64)> = Vec::new();
@@ -659,3 +774,7 @@ fn ensure(state: &crate::api::MonoApiServiceState) -> Result<(), Response> {
         )))
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_content_tests.rs"]
+mod tests;
