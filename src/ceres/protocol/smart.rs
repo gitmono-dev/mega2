@@ -974,7 +974,7 @@ pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<PktLine, ProtocolError> {
 
 #[cfg(test)]
 pub mod test {
-    use std::{process::Command, time::Duration};
+    use std::{path::PathBuf, process::Command, time::Duration};
 
     use bytes::{BufMut, Bytes, BytesMut};
     use futures::future;
@@ -984,15 +984,22 @@ pub mod test {
 
     use crate::{
         callisto::sea_orm_active_enums::RefTypeEnum,
-        ceres::protocol::{
-            Capability, ServiceType, SmartSession, TransportProtocol,
-            import_refs::{CommandType, RefCommand},
-            smart::{
-                PKT_LINE_END_MARKER, PktLine, add_pkt_line_string, advertised_capabilities,
-                read_until_white_space, try_read_pkt_line,
+        ceres::{
+            api_service::state::ProtocolApiState,
+            protocol::{
+                Capability, ServiceType, SmartSession, TransportProtocol,
+                import_refs::{CommandType, RefCommand},
+                smart::{
+                    PKT_LINE_END_MARKER, PktLine, add_pkt_line_string, advertised_capabilities,
+                    read_until_white_space, try_read_pkt_line,
+                },
             },
         },
-        common::{errors::ProtocolError, utils::MEGA_BRANCH_NAME},
+        common::{
+            errors::ProtocolError,
+            utils::{MEGA_BRANCH_NAME, ZERO_ID},
+        },
+        jupiter::storage::git_db_storage::fu18_support::{test_cache, wired_storage},
     };
 
     #[test]
@@ -1104,6 +1111,36 @@ pub mod test {
         )];
         let pkt_line_stream = mock.build_smart_reply(&ref_list, String::from("git-upload-pack"));
         assert_eq!(&pkt_line_stream[..], b"001e# service=git-upload-pack\n000000e87bdc783132575d5b3e78400ace9971970ff43a18 refs/heads/master\0report-status report-status-v2 thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative multi_ack_detailed no-done object-format=sha1\n0000")
+    }
+
+    #[tokio::test]
+    async fn v0_empty_repo_pseudo_ref_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let storage = wired_storage(temp.path()).await;
+        let state = ProtocolApiState {
+            storage: storage.clone(),
+            git_object_cache: test_cache().await,
+            entity_store: storage.entity_store(),
+        };
+        let session = SmartSession::new(
+            PathBuf::from("/project/hp16-missing"),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        );
+
+        let response = session.git_info_refs(&state).await.unwrap();
+        let mut expected = BytesMut::new();
+        add_pkt_line_string(&mut expected, "# service=git-upload-pack\n".to_owned());
+        expected.extend_from_slice(PKT_LINE_END_MARKER);
+        add_pkt_line_string(
+            &mut expected,
+            format!(
+                "{ZERO_ID} capabilities^{{}}\0{}\n",
+                advertised_capabilities(ServiceType::UploadPack, HashKind::Sha1)
+            ),
+        );
+        expected.extend_from_slice(PKT_LINE_END_MARKER);
+        assert_eq!(response, expected);
     }
 
     #[test]

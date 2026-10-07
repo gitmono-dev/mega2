@@ -9,6 +9,7 @@ use crate::{
         api_service::state::ProtocolApiState,
         protocol::{
             SmartSession,
+            import_refs::Refs,
             smart::{self, PktLine, add_pkt_line_string, try_read_pkt_line},
         },
     },
@@ -28,6 +29,54 @@ pub fn build_v2_capability_advertisement(hash_kind: HashKind) -> BytesMut {
         add_pkt_line_string(&mut buf, format!("{cap}\n"));
     }
     add_pkt_line_string(&mut buf, format!("object-format={}\n", hash_kind.as_str()));
+    buf.put(Bytes::from_static(smart::PKT_LINE_END_MARKER));
+    buf
+}
+
+fn encode_ls_refs_response(
+    head_hash: &str,
+    git_refs: &[Refs],
+    ref_prefixes: &[String],
+    symrefs: bool,
+    peel: bool,
+) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    if !is_protocol_zero_id(head_hash) {
+        if symrefs {
+            add_pkt_line_string(
+                &mut buf,
+                format!("{head_hash} HEAD symref-target:refs/heads/main\n"),
+            );
+        } else {
+            add_pkt_line_string(&mut buf, format!("{head_hash} HEAD\n"));
+        }
+    }
+
+    for git_ref in git_refs {
+        if !ref_prefixes.is_empty()
+            && !ref_prefixes
+                .iter()
+                .any(|prefix| git_ref.ref_name.starts_with(prefix))
+        {
+            continue;
+        }
+        if peel {
+            add_pkt_line_string(
+                &mut buf,
+                format!(
+                    "{} {} peeled:{}\n",
+                    git_ref.ref_hash, git_ref.ref_name, git_ref.ref_hash
+                ),
+            );
+        } else {
+            add_pkt_line_string(
+                &mut buf,
+                format!("{} {}\n", git_ref.ref_hash, git_ref.ref_name),
+            );
+        }
+    }
+
     buf.put(Bytes::from_static(smart::PKT_LINE_END_MARKER));
     buf
 }
@@ -67,53 +116,13 @@ pub async fn handle_v2_ls_refs(
     let (head_hash, git_refs) = repo_handler.refs_with_head_hash().await?;
     session.ensure_advertised_object_ids(&head_hash, &git_refs)?;
 
-    let mut buf = BytesMut::new();
-
-    if symrefs {
-        let head_ref = if is_protocol_zero_id(&head_hash) {
-            "capabilities^{}"
-        } else {
-            "HEAD"
-        };
-        add_pkt_line_string(
-            &mut buf,
-            format!("{head_hash} {head_ref} symref-target:refs/heads/main\n"),
-        );
-    } else {
-        let head_ref = if is_protocol_zero_id(&head_hash) {
-            "capabilities^{}"
-        } else {
-            "HEAD"
-        };
-        add_pkt_line_string(&mut buf, format!("{head_hash} {head_ref}\n"));
-    }
-
-    for git_ref in &git_refs {
-        if !ref_prefixes.is_empty()
-            && !ref_prefixes
-                .iter()
-                .any(|prefix| git_ref.ref_name.starts_with(prefix))
-        {
-            continue;
-        }
-        if peel {
-            add_pkt_line_string(
-                &mut buf,
-                format!(
-                    "{} {} peeled:{}\n",
-                    git_ref.ref_hash, git_ref.ref_name, git_ref.ref_hash
-                ),
-            );
-        } else {
-            add_pkt_line_string(
-                &mut buf,
-                format!("{} {}\n", git_ref.ref_hash, git_ref.ref_name),
-            );
-        }
-    }
-
-    buf.put(Bytes::from_static(smart::PKT_LINE_END_MARKER));
-    Ok(buf)
+    Ok(encode_ls_refs_response(
+        &head_hash,
+        &git_refs,
+        &ref_prefixes,
+        symrefs,
+        peel,
+    ))
 }
 
 /// Response of a protocol v2 `fetch` command.
@@ -398,7 +407,37 @@ pub fn is_v2_upload_pack_request(body: &mut Bytes) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::{
+        ceres::{
+            api_service::state::ProtocolApiState,
+            protocol::{ServiceType, TransportProtocol},
+        },
+        common::utils::ZERO_ID,
+        jupiter::storage::git_db_storage::fu18_support::{test_cache, wired_storage},
+    };
+
+    fn git_ref(name: &str, hash: &str, default_branch: bool) -> Refs {
+        Refs {
+            id: 0,
+            ref_name: name.to_owned(),
+            ref_hash: hash.to_owned(),
+            default_branch,
+        }
+    }
+
+    fn expected_pkt_lines(lines: &[String]) -> BytesMut {
+        let mut expected = BytesMut::new();
+        for line in lines {
+            add_pkt_line_string(&mut expected, line.clone());
+        }
+        expected.extend_from_slice(smart::PKT_LINE_END_MARKER);
+        expected
+    }
 
     #[test]
     fn v2_capability_advertisement_includes_expected_capabilities() {
@@ -448,6 +487,95 @@ mod tests {
 
         let err = parse_v2_command(&mut buf.freeze()).unwrap_err();
         assert!(err.to_string().contains("missing command"));
+    }
+
+    #[test]
+    fn ls_refs_zero_head_flush_only() {
+        let prefix = ["refs/heads/".to_owned()];
+        for (ref_prefixes, symrefs, peel) in [
+            (&[][..], false, false),
+            (&[][..], true, false),
+            (&[][..], true, true),
+            (&prefix[..], false, false),
+        ] {
+            let response = encode_ls_refs_response(ZERO_ID, &[], ref_prefixes, symrefs, peel);
+            assert_eq!(&response[..], smart::PKT_LINE_END_MARKER);
+        }
+    }
+
+    #[test]
+    fn ls_refs_zero_head_keeps_other_refs() {
+        let feature = "1111111111111111111111111111111111111111";
+        let tag = "2222222222222222222222222222222222222222";
+        let refs = vec![
+            git_ref("refs/heads/feature", feature, false),
+            git_ref("refs/tags/v1", tag, false),
+        ];
+
+        let response = encode_ls_refs_response(ZERO_ID, &refs, &[], false, false);
+        let expected = expected_pkt_lines(&[
+            format!("{feature} refs/heads/feature\n"),
+            format!("{tag} refs/tags/v1\n"),
+        ]);
+        assert_eq!(response, expected);
+
+        let prefixes = vec!["refs/heads/".to_owned()];
+        let response = encode_ls_refs_response(ZERO_ID, &refs, &prefixes, true, true);
+        let expected =
+            expected_pkt_lines(&[format!("{feature} refs/heads/feature peeled:{feature}\n")]);
+        assert_eq!(response, expected);
+    }
+
+    #[test]
+    fn ls_refs_nonzero_head_unchanged() {
+        let head = "3333333333333333333333333333333333333333";
+        let feature = "4444444444444444444444444444444444444444";
+        let refs = vec![
+            git_ref("refs/heads/main", head, true),
+            git_ref("refs/heads/feature", feature, false),
+        ];
+
+        let with_symrefs = encode_ls_refs_response(head, &refs, &[], true, true);
+        let expected_with_symrefs = expected_pkt_lines(&[
+            format!("{head} HEAD symref-target:refs/heads/main\n"),
+            format!("{head} refs/heads/main peeled:{head}\n"),
+            format!("{feature} refs/heads/feature peeled:{feature}\n"),
+        ]);
+        assert_eq!(with_symrefs, expected_with_symrefs);
+
+        let without_symrefs = encode_ls_refs_response(head, &refs, &[], false, false);
+        let expected_without_symrefs = expected_pkt_lines(&[
+            format!("{head} HEAD\n"),
+            format!("{head} refs/heads/main\n"),
+            format!("{feature} refs/heads/feature\n"),
+        ]);
+        assert_eq!(without_symrefs, expected_without_symrefs);
+    }
+
+    #[tokio::test]
+    async fn ls_refs_missing_monorepo_path_flush_only() {
+        let temp = TempDir::new().unwrap();
+        let storage = wired_storage(temp.path()).await;
+        let state = ProtocolApiState {
+            storage: storage.clone(),
+            git_object_cache: test_cache().await,
+            entity_store: storage.entity_store(),
+        };
+        let session = SmartSession::new(
+            PathBuf::from("/project/hp16-missing"),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        );
+
+        for mut request in [
+            Bytes::from_static(smart::PKT_LINE_END_MARKER),
+            Bytes::from_static(b"000csymrefs\n0000"),
+        ] {
+            let response = handle_v2_ls_refs(&session, &state, &mut request)
+                .await
+                .unwrap();
+            assert_eq!(&response[..], smart::PKT_LINE_END_MARKER);
+        }
     }
 
     #[test]
