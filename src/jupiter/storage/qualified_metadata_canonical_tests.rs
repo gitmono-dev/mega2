@@ -662,7 +662,7 @@ async fn late_raw_delta_membership_is_rejected_after_intent_commit() {
         .await
         .unwrap();
     writer
-        .install_pages(&donor_intent, &[donor_payload.clone()])
+        .install_pages(&donor_intent, std::slice::from_ref(&donor_payload))
         .await
         .unwrap();
     writer.finalize(&donor_intent).await.unwrap();
