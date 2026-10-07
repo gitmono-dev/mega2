@@ -1213,3 +1213,6 @@ async fn mst2_durable_http_warm_reads_renew_and_frame_delivery_reject_primary_sc
 
 #[path = "snapshot_lookup_metadata_tests.rs"]
 mod metadata_lookup;
+
+#[path = "snapshot_persisted_metadata_tests.rs"]
+mod persisted_metadata;
