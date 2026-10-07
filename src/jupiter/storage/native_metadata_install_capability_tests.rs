@@ -961,3 +961,6 @@ async fn install_capability_batch_fault_rolls_back_and_raw_writer_waits_before_r
     );
     install(&repository, &cap, &pages).await;
 }
+
+#[path = "native_metadata_install_missing_tests.rs"]
+mod missing;
