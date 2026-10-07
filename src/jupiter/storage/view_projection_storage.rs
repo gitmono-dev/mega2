@@ -16,7 +16,10 @@ use crate::{
         tree::FilterOutput,
     },
     common::{errors::MegaError, utils::MEGA_BRANCH_NAME},
-    jupiter::storage::{base_storage::StorageConnector, view_storage::ViewStorage},
+    jupiter::storage::{
+        base_storage::StorageConnector, view_root_chain::ROOT_CHAIN_HALTED_SQL,
+        view_storage::ViewStorage,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -42,7 +45,113 @@ impl From<mega_view_filter::Model> for ProjectionFilter {
     }
 }
 
+pub(crate) struct ViewReaderState {
+    pub(crate) ready_seq: Option<i64>,
+    pub(crate) projected_seq: i64,
+    pub(crate) halted: bool,
+    pub(crate) view_tip: Option<String>,
+}
+
+pub(crate) struct ViewWantState {
+    pub(crate) ready_seq: Option<i64>,
+    pub(crate) projected_seq: i64,
+    pub(crate) halted: bool,
+    pub(crate) wants: Vec<(String, Option<i64>)>,
+}
+
 impl ViewStorage {
+    pub(crate) async fn view_reader_state(
+        &self,
+        filter_pk: i64,
+    ) -> Result<Option<ViewReaderState>, MegaError> {
+        let row = self
+            .get_connection()
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                format!(
+                    "SELECT f.ready_seq, f.projected_seq, {ROOT_CHAIN_HALTED_SQL} AS halted, \
+                     (SELECT m.view_commit FROM mega_view_commit_map m \
+                      WHERE m.filter_pk = f.id AND m.seq_from <= f.projected_seq \
+                      ORDER BY m.seq_from DESC LIMIT 1) AS view_tip \
+                     FROM mega_view_filter f WHERE f.id = $1"
+                ),
+                [Value::from(filter_pk)],
+            ))
+            .await?;
+        row.map(|row| {
+            Ok(ViewReaderState {
+                ready_seq: row.try_get("", "ready_seq")?,
+                projected_seq: row.try_get("", "projected_seq")?,
+                halted: row.try_get("", "halted")?,
+                view_tip: row.try_get("", "view_tip")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub(crate) async fn view_want_state(
+        &self,
+        filter_pk: i64,
+        wants: &[String],
+    ) -> Result<Option<ViewWantState>, MegaError> {
+        let rows = self
+            .get_connection()
+            .query_all_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                format!(
+                    "WITH state AS MATERIALIZED ( \
+                         SELECT f.id, f.ready_seq, f.projected_seq, \
+                                {ROOT_CHAIN_HALTED_SQL} AS halted \
+                         FROM mega_view_filter f WHERE f.id = $1 \
+                     ) \
+                     SELECT state.ready_seq, state.projected_seq, state.halted, \
+                            wanted.oid, mapped.seq_from \
+                     FROM state \
+                     LEFT JOIN LATERAL unnest($2::text[]) WITH ORDINALITY \
+                         AS wanted(oid, position) ON TRUE \
+                     LEFT JOIN LATERAL ( \
+                         SELECT m.seq_from FROM mega_view_commit_map m \
+                         WHERE m.filter_pk = state.id AND m.view_commit = wanted.oid \
+                         ORDER BY m.seq_from LIMIT 1 \
+                     ) mapped ON TRUE \
+                     ORDER BY wanted.position"
+                ),
+                [Value::from(filter_pk), Value::from(wants.to_vec())],
+            ))
+            .await?;
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let mut result = ViewWantState {
+            ready_seq: first.try_get("", "ready_seq")?,
+            projected_seq: first.try_get("", "projected_seq")?,
+            halted: first.try_get("", "halted")?,
+            wants: Vec::with_capacity(wants.len()),
+        };
+        for row in rows {
+            let oid: Option<String> = row.try_get("", "oid")?;
+            if let Some(oid) = oid {
+                result.wants.push((oid, row.try_get("", "seq_from")?));
+            }
+        }
+        Ok(Some(result))
+    }
+
+    pub(crate) async fn view_commit_exists(&self, filter_pk: i64, hash: &str) -> bool {
+        self.get_connection()
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT EXISTS (SELECT 1 FROM mega_view_commit_map \
+                 WHERE filter_pk = $1 AND view_commit = $2) AS present",
+                [Value::from(filter_pk), Value::from(hash.to_owned())],
+            ))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| row.try_get("", "present").ok())
+            .unwrap_or(false)
+    }
+
     pub(crate) async fn warming_filter_count(&self) -> Result<u64, MegaError> {
         Ok(mega_view_filter::Entity::find()
             .filter(mega_view_filter::Column::WarmingSince.is_not_null())
@@ -257,4 +366,83 @@ where
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use sea_orm::ConnectionTrait;
+
+    use super::*;
+    use crate::jupiter::{
+        storage::{base_storage::BaseStorage, init::database_connection},
+        tests::test_db_config,
+    };
+
+    #[tokio::test]
+    async fn view_readers_single_statement() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db_config, _schema) = test_db_config(temp.path()).await;
+        let mut db = database_connection(&db_config).await.unwrap();
+        db.execute_unprepared(&format!(
+            "INSERT INTO mega_view_filter \
+             (id, filter_id, canonical_spec, algo_version, object_format, src_paths, \
+              push_enabled, projected_seq, ready_seq, created_at) \
+             VALUES (1, '{}', ':/repo', 1, 'sha1', '[]'::jsonb, false, 0, NULL, now())",
+            "a".repeat(64)
+        ))
+        .await
+        .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let callback_count = count.clone();
+        db.set_metric_callback(move |_| {
+            callback_count.fetch_add(1, Ordering::Relaxed);
+        });
+        let view = ViewStorage::new(BaseStorage::new(Arc::new(db)));
+
+        for ready in [false, true] {
+            if ready {
+                view.get_connection()
+                    .execute_unprepared("UPDATE mega_view_filter SET ready_seq = 0 WHERE id = 1")
+                    .await
+                    .unwrap();
+            }
+            count.store(0, Ordering::Relaxed);
+            let state = view.view_reader_state(1).await.unwrap().unwrap();
+            assert_eq!(state.ready_seq.is_some(), ready);
+            assert!(!state.halted);
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+        }
+
+        view.get_connection()
+            .execute_unprepared(&format!(
+                "INSERT INTO mega_view_root_chain (seq, commit_id, tree_id) \
+                 VALUES (1, '{}', '{}'); \
+                 INSERT INTO mega_view_root_chain_scan \
+                 (pos, commit_id, tree_id, parent_count, first_parent) \
+                 VALUES (1, '{}', '{}', 0, NULL)",
+                "a".repeat(40),
+                "b".repeat(40),
+                "c".repeat(40),
+                "d".repeat(40)
+            ))
+            .await
+            .unwrap();
+        count.store(0, Ordering::Relaxed);
+        let halted = view.view_reader_state(1).await.unwrap().unwrap();
+        assert!(halted.halted);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        for wanted in [vec!["e".repeat(40)], vec!["e".repeat(40); 100]] {
+            count.store(0, Ordering::Relaxed);
+            let state = view.view_want_state(1, &wanted).await.unwrap().unwrap();
+            assert_eq!(state.wants.len(), wanted.len());
+            assert!(state.halted);
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+        }
+    }
 }

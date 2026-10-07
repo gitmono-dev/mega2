@@ -45,6 +45,7 @@ pub mod monorepo;
 pub mod path_policy;
 pub mod push_chain;
 pub mod trunk_provenance;
+pub mod view_repo;
 
 #[async_trait]
 pub trait RepoHandler: Send + Sync + 'static {
