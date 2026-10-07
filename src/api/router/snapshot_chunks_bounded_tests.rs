@@ -450,10 +450,16 @@ async fn mst2_budgeted_chunk_body_preserves_per_frame_revocation_and_no_end() {
     assert_eq!(response.status(), 200);
     let mut data = response.into_body().into_data_stream();
     let first = data.next().await.unwrap().unwrap();
-    assert!(matches!(
-        parse_stream(&first).unwrap().as_slice(),
-        [Frame::Chunk(_)]
-    ));
+    let (frame, consumed) = mst2_codec::treeframe::parse_frame(&first).unwrap();
+    assert_eq!(consumed, first.len());
+    let Frame::Chunk(chunk) = frame else {
+        panic!("first DATA must contain exactly one CHUNK frame");
+    };
+    assert_eq!(format!("sha256:{}", hex_of(&chunk.map_id)), map_id);
+    assert_eq!(chunk.file_content_id, fixture.digest);
+    assert_eq!(chunk.chunk_index, 0);
+    assert_eq!(chunk.chunk_bytes, fixture.raw[..CHUNK_SIZE as usize]);
+    let received = first.to_vec();
     let revoked = fixture
         .app
         .clone()
@@ -470,4 +476,10 @@ async fn mst2_budgeted_chunk_body_preserves_per_frame_revocation_and_no_end() {
     assert_eq!(revoked.status(), 200);
     assert!(data.next().await.unwrap().is_err());
     assert!(data.next().await.is_none());
+    assert!(matches!(
+        parse_stream(&received),
+        Err(mst2_codec::CodecError::BadOrdering(
+            "stream missing END/ERROR frame"
+        ))
+    ));
 }
