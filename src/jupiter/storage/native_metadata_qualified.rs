@@ -115,6 +115,22 @@ impl GcRecord {
 }
 
 impl PostgresQualifiedMetadataRepository {
+    #[cfg(test)]
+    pub(crate) async fn registered_shadow(
+        connection: DatabaseConnection,
+        family: crate::jupiter::storage::qualified_metadata_family::VerifiedQualifiedNamespace,
+    ) -> Result<Self, SnapshotError> {
+        let mut inner = PostgresMetadataInstallRepository::new(connection).await?;
+        inner.qualified_family = Some(family);
+        Ok(Self {
+            inner: PostgresMetadataGenerationRepository {
+                inner,
+                graph_domain: "qualified-v1",
+            },
+        })
+    }
+
+    #[cfg(test)]
     pub async fn new(connection: DatabaseConnection) -> Result<Self, SnapshotError> {
         Ok(Self {
             inner: PostgresMetadataGenerationRepository {
@@ -635,8 +651,7 @@ pub(super) async fn allocate_lifetimes(
          n.state AS graph_state,n.metadata_codec AS graph_codec,n.bytes AS graph_bytes,
          b.page_id IS NOT NULL AS payload_present,b.generation AS payload_generation,b.metadata_codec AS payload_codec,b.byte_size AS payload_size,
          EXISTS(SELECT 1 FROM mst2_metadata_gc_op o WHERE o.page_id=l.page_id AND o.generation=l.generation) AS tombstone,
-         EXISTS(SELECT 1 FROM mst2_retention_node x WHERE x.node_id=l.node_id)
-           OR EXISTS(SELECT 1 FROM mst2_retention_gc_op x WHERE x.node_id=l.node_id) AS generic_graph
+         mst2_metadata_has_generic_overlap(l.page_id) AS generic_graph
          FROM jsonb_to_recordset($1::jsonb) p(id text,size integer)
          JOIN mst2_metadata_current c ON c.page_id=decode(p.id,'hex')
          JOIN mst2_metadata_lifetime l USING(page_id,generation)
@@ -740,18 +755,16 @@ pub(super) async fn check_lifetimes<C: ConnectionTrait>(
            OR ($3='COMMITTED' AND l.state<>'LIVE') OR (l.state='LIVE' AND n.page_id IS NULL)
            OR n.state<>'LIVE' OR n.metadata_codec<>$2 OR n.bytes<>m.expected_size
            OR EXISTS(SELECT 1 FROM mst2_metadata_gc_op o WHERE o.page_id=m.page_id AND o.generation=m.generation)
-           OR EXISTS(SELECT 1 FROM mst2_retention_node x WHERE x.node_id=l.node_id)
-           OR EXISTS(SELECT 1 FROM mst2_retention_gc_op x WHERE x.node_id=l.node_id)) LIMIT 1",
+           OR mst2_metadata_has_generic_overlap(l.page_id)) LIMIT 1",
         [stored.record.prepare_id.clone().into(),stored.record.metadata_codec.into(),stored.record.state.clone().into()],
     )).await.map_err(internal)?.is_some() { return Err(unavailable("fixed qualified incarnation is no longer installable")); }
     Ok(())
 }
 
-pub(super) async fn finalize_graph(
-    txn: &DatabaseTransaction,
+fn validate_fixed_observation(
     fixed: &FixedPlan,
     dag: &ValidatedMetadataDag,
-) -> Result<PreparedMetadataReceipt, SnapshotError> {
+) -> Result<(), SnapshotError> {
     let actual_pages: BTreeSet<_> = dag.payloads().iter().map(|p| (p.id, p.size)).collect();
     let actual_edges: BTreeSet<_> = dag
         .edges()
@@ -780,6 +793,92 @@ pub(super) async fn finalize_graph(
             "qualified DAG observation differs from immutable plan",
         ));
     }
+    Ok(())
+}
+
+pub(super) async fn finalize_canonical_graph(
+    txn: &DatabaseTransaction,
+    fixed: &FixedPlan,
+    dag: &ValidatedMetadataDag,
+) -> Result<PreparedMetadataReceipt, SnapshotError> {
+    validate_fixed_observation(fixed, dag)?;
+    if fixed.stored.record.state == "COMMITTED" {
+        verify_graph(txn, fixed).await?;
+        return fixed.stored.receipt();
+    }
+    let mut pending: BTreeMap<_, usize> = fixed.stored.plan.pages.keys().map(|p| (*p, 0)).collect();
+    let mut parents: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for &(parent, child) in &fixed.stored.plan.edges {
+        *pending
+            .get_mut(&parent)
+            .ok_or_else(|| integrity("canonical parent is outside its fixed plan"))? += 1;
+        parents.entry(child).or_default().push(parent);
+    }
+    let mut ready: BTreeSet<_> = pending
+        .iter()
+        .filter_map(|(p, count)| (*count == 0).then_some(*p))
+        .collect();
+    let mut ordered = Vec::with_capacity(pending.len());
+    while let Some(page) = ready.pop_first() {
+        ordered.push(json!({"page":hex::encode(page),"generation":fixed.bindings.0[&page].0}));
+        for parent in parents.get(&page).into_iter().flatten() {
+            let count = pending
+                .get_mut(parent)
+                .ok_or_else(|| integrity("canonical ancestor is outside its fixed plan"))?;
+            *count = count
+                .checked_sub(1)
+                .ok_or_else(|| integrity("canonical edge accounting underflow"))?;
+            if *count == 0 {
+                ready.insert(*parent);
+            }
+        }
+    }
+    if ordered.len() != pending.len() {
+        return Err(integrity("canonical certification order contains a cycle"));
+    }
+    let certified: i32 = txn
+        .query_one_raw(statement(
+            "SELECT mst2_metadata_certify_batch($1,$2::jsonb) AS certified",
+            [
+                fixed.intent.prepare_id().into(),
+                serde_json::to_string(&ordered).map_err(internal)?.into(),
+            ],
+        ))
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| integrity("canonical certification batch is missing"))?
+        .try_get("", "certified")
+        .map_err(internal)?;
+    if certified as usize != ordered.len() {
+        return Err(integrity(
+            "canonical certification did not cover its exact cold DAG",
+        ));
+    }
+    retain_existing_roots(txn, &fixed.intent).await?;
+    verify_graph(txn, fixed).await?;
+    let changed = txn
+        .execute_raw(statement(
+            "UPDATE mst2_metadata_prepare SET state='COMMITTED',committed_at=clock_timestamp()
+         WHERE prepare_id=$1 AND state='PREPARING' AND storage_seal=$2",
+            [
+                fixed.intent.prepare_id().into(),
+                fixed.intent.storage_seal.to_vec().into(),
+            ],
+        ))
+        .await
+        .map_err(internal)?;
+    if changed.rows_affected() != 1 {
+        return Err(integrity("canonical finalize lost its prepare CAS"));
+    }
+    fixed.stored.receipt()
+}
+
+pub(super) async fn finalize_graph(
+    txn: &DatabaseTransaction,
+    fixed: &FixedPlan,
+    dag: &ValidatedMetadataDag,
+) -> Result<PreparedMetadataReceipt, SnapshotError> {
+    validate_fixed_observation(fixed, dag)?;
     if fixed.stored.record.state == "COMMITTED" {
         verify_graph(txn, fixed).await?;
         return fixed.stored.receipt();

@@ -139,6 +139,7 @@ pub struct PostgresMetadataInstallRepository {
     connection: DatabaseConnection,
     barrier_timeout: Duration,
     storage_scope: PrimaryStorageScope,
+    qualified_family: Option<super::qualified_metadata_family::VerifiedQualifiedNamespace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +161,7 @@ impl PostgresMetadataInstallRepository {
             connection,
             barrier_timeout: Duration::from_secs(5),
             storage_scope,
+            qualified_family: None,
         })
     }
 
@@ -653,6 +655,9 @@ impl PostgresMetadataInstallRepository {
     async fn barrier(&self, txn: &DatabaseTransaction) -> Result<(), SnapshotError> {
         if txn.get_database_backend() != DbBackend::Postgres {
             return Err(internal("metadata installation requires PostgreSQL"));
+        }
+        if let Some(family) = &self.qualified_family {
+            family.enter(txn).await?;
         }
         if read_storage_scope(txn).await? != self.storage_scope {
             return Err(internal(

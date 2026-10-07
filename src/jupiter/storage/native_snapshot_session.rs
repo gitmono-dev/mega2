@@ -366,9 +366,11 @@ mod routes;
 #[path = "native_snapshot_metadata_routes.rs"]
 mod metadata_routes;
 
-pub(crate) use metadata_routes::MetadataRouteRequest;
 #[cfg(test)]
 pub(crate) use metadata_routes::with_metadata_read_barriers;
+pub(crate) use metadata_routes::{
+    MetadataRouteRequest, PersistedMetadataReadWork, PersistedMetadataRouteBatch,
+};
 
 const SESSION_SQL: &str = "SELECT s.snapshot_id,s.canonical_descriptor,s.commit_oid,s.root_tree_oid,
  (SELECT storage_uuid FROM mst2_metadata_storage_scope WHERE singleton=1) AS authority_storage_uuid,
@@ -665,7 +667,7 @@ fn forbidden() -> SnapshotError {
         "snapshot serving state or authorization epoch changed",
     )
 }
-fn install_error(error: MetadataInstallError) -> SnapshotError {
+pub(crate) fn install_error(error: MetadataInstallError) -> SnapshotError {
     match error {
         MetadataInstallError::Rejected(error) if error.code == SnapshotErrorCode::Internal => {
             tracing::error!(%error,"native metadata installation unavailable");
@@ -690,6 +692,44 @@ fn install_error(error: MetadataInstallError) -> SnapshotError {
 }
 
 impl super::Storage {
+    pub(crate) async fn snapshot_metadata_family(
+        &self,
+        identity: &str,
+        lease: bool,
+    ) -> Result<Option<super::qualified_metadata_family::SnapshotMetadataFamily>, SnapshotError>
+    {
+        use super::base_storage::StorageConnector;
+        super::qualified_metadata_family::select_snapshot_family(
+            self.mono_storage().get_connection(),
+            identity,
+            lease,
+        )
+        .await
+    }
+
+    pub(crate) async fn snapshot_metadata_routes(
+        &self,
+        context: &SnapshotContext,
+        requests: &[MetadataRouteRequest<'_>],
+    ) -> Result<PersistedMetadataRouteBatch, SnapshotError> {
+        if self
+            .snapshot_metadata_family(&context.lease_id, true)
+            .await?
+            == Some(super::qualified_metadata_family::SnapshotMetadataFamily::Rooted)
+        {
+            return self
+                .rooted_qualified_metadata_writer()
+                .await
+                .map_err(internal)?
+                .metadata_routes(context, requests)
+                .await;
+        }
+        self.snapshot_sessions()
+            .await
+            .metadata_routes(context, requests)
+            .await
+    }
+
     pub(crate) async fn snapshot_sessions(&self) -> &PostgresNativeSessionRepository {
         use super::base_storage::StorageConnector;
         self.native_snapshot_sessions
@@ -714,6 +754,16 @@ impl super::Storage {
             let instance = uuid::Uuid::parse_str(instance)
                 .map_err(|_| not_ready("invalid native instance"))?
                 .to_string();
+            if self.snapshot_metadata_family(lease, true).await?
+                == Some(super::qualified_metadata_family::SnapshotMetadataFamily::Rooted)
+            {
+                return self
+                    .rooted_qualified_metadata_writer()
+                    .await
+                    .map_err(internal)?
+                    .context(sid, lease, &instance)
+                    .await;
+            }
             self.snapshot_sessions()
                 .await
                 .context(sid, lease, &instance)
@@ -740,6 +790,16 @@ impl super::Storage {
             let instance = uuid::Uuid::parse_str(instance)
                 .map_err(|_| not_ready("invalid native instance"))?
                 .to_string();
+            if self.snapshot_metadata_family(lease, true).await?
+                == Some(super::qualified_metadata_family::SnapshotMetadataFamily::Rooted)
+            {
+                return self
+                    .rooted_qualified_metadata_writer()
+                    .await
+                    .map_err(internal)?
+                    .renew(lease, seconds, &instance)
+                    .await;
+            }
             self.snapshot_sessions()
                 .await
                 .renew(lease, seconds, &instance)
@@ -751,6 +811,16 @@ impl super::Storage {
 
     pub(crate) async fn snapshot_release(&self, lease: &str) -> Result<bool, SnapshotError> {
         if self.config().mst2.publication_enabled {
+            if self.snapshot_metadata_family(lease, true).await?
+                == Some(super::qualified_metadata_family::SnapshotMetadataFamily::Rooted)
+            {
+                return self
+                    .rooted_qualified_metadata_writer()
+                    .await
+                    .map_err(internal)?
+                    .release(lease)
+                    .await;
+            }
             self.snapshot_sessions().await.release(lease).await
         } else {
             Ok(crate::ceres::snapshot::runtime::runtime().release_lease(lease))

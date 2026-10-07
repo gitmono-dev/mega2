@@ -19,5 +19,7 @@ pub mod publication;
 pub mod resolver;
 pub mod retention;
 pub mod retention_dag;
+pub(crate) mod rooted_metadata_install;
+pub(crate) mod rooted_metadata_projection;
 pub mod runtime;
 pub mod view;

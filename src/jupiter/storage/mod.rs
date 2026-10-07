@@ -26,6 +26,7 @@ pub mod notification_storage;
 pub mod object_storage;
 pub mod oci_db_storage;
 pub mod push_queue_storage;
+pub(crate) mod qualified_metadata_family;
 pub mod stg_common;
 pub mod user_storage;
 pub mod vault_storage;
@@ -164,6 +165,12 @@ pub struct Storage {
         Arc<tokio::sync::OnceCell<native_chunk_map::PostgresChunkMapRepository>>,
     pub(crate) native_snapshot_sessions:
         Arc<tokio::sync::OnceCell<native_snapshot_session::PostgresNativeSessionRepository>>,
+    #[cfg(test)]
+    pub(crate) shadow_qualified_metadata:
+        Arc<tokio::sync::OnceCell<qualified_metadata_family::ShadowQualifiedMetadataWriter>>,
+    pub(crate) rooted_qualified_metadata: Arc<
+        tokio::sync::OnceCell<Arc<qualified_metadata_family::RootedQualifiedMetadataRepository>>,
+    >,
     pub(crate) projection_observation_sink:
         Option<Arc<crate::ceres::snapshot::projection_writer::ProjectionObservationSink>>,
     pub cl_service: CLService,
@@ -194,6 +201,46 @@ pub struct Storage {
 }
 
 impl Storage {
+    pub(crate) async fn rooted_qualified_metadata_writer(
+        &self,
+    ) -> Result<&qualified_metadata_family::RootedQualifiedMetadataRepository, MegaError> {
+        self.rooted_qualified_metadata
+            .get_or_try_init(|| async {
+                let repository = Arc::new(
+                    qualified_metadata_family::RootedQualifiedMetadataRepository::open(
+                        self.mono_storage().get_connection(),
+                        &self.config().database,
+                    )
+                    .await?,
+                );
+                repository
+                    .maintenance_tick(64)
+                    .await
+                    .map_err(|error| MegaError::Other(error.to_string()))?;
+                qualified_metadata_family::RootedQualifiedMetadataRepository::start_maintenance(
+                    &repository,
+                );
+                Ok::<_, MegaError>(repository)
+            })
+            .await
+            .map(Arc::as_ref)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn shadow_qualified_metadata_writer(
+        &self,
+    ) -> Result<&qualified_metadata_family::ShadowQualifiedMetadataWriter, MegaError> {
+        self.shadow_qualified_metadata
+            .get_or_try_init(|| async {
+                qualified_metadata_family::ShadowQualifiedMetadataWriter::open(
+                    self.mono_storage().get_connection(),
+                    &self.config().database,
+                )
+                .await
+            })
+            .await
+    }
+
     pub async fn new(
         config: Arc<Config>,
         object_store: MegaObjectStorageWrapper,
@@ -325,11 +372,14 @@ impl Storage {
         let storage_event_emitter =
             crate::jupiter::service::storage_event_emitter::StorageEventEmitter::from_config_disabled(&config);
 
-        Ok(Storage {
+        let storage = Storage {
             app_service: app_service.into(),
             native_projection_cache: Arc::default(),
             native_snapshot_sessions: Arc::default(),
             native_chunk_maps: Arc::default(),
+            #[cfg(test)]
+            shadow_qualified_metadata: Arc::default(),
+            rooted_qualified_metadata: Arc::default(),
             projection_observation_sink: None,
             config_handle,
             config,
@@ -349,7 +399,13 @@ impl Storage {
             view_runtime,
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
-        })
+        };
+        #[cfg(test)]
+        if init::generic_history_bootstrap_active() {
+            return Ok(storage);
+        }
+        storage.rooted_qualified_metadata_writer().await?;
+        Ok(storage)
     }
 
     pub fn config_handle(&self) -> ConfigHandle {
@@ -709,6 +765,9 @@ impl Storage {
             native_projection_cache: Arc::default(),
             native_snapshot_sessions: Arc::default(),
             native_chunk_maps: Arc::default(),
+            #[cfg(test)]
+            shadow_qualified_metadata: Arc::default(),
+            rooted_qualified_metadata: Arc::default(),
             projection_observation_sink: None,
             // app_service: AppService::mock(),
             cl_service: CLService::mock(),

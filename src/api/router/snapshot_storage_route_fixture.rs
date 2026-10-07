@@ -30,12 +30,19 @@ pub(super) async fn restore_pre_route_schema(db: &DatabaseConnection) {
     // The original contexts, leases, plans, payloads and protection stay intact.
     txn.execute_unprepared(
         "DO $$ DECLARE r record; functions text; BEGIN
+           IF EXISTS(SELECT 1 FROM mst2_metadata_namespace WHERE graph_domain='qualified-v1') THEN
+             RAISE EXCEPTION 'route upgrade fixture cannot tear down a provisioned qualified family';
+           END IF;
+           IF EXISTS(SELECT 1 FROM mst2_rooted_source_tree_revision) THEN
+             RAISE EXCEPTION 'route upgrade fixture cannot erase actual qualified source history';
+           END IF;
+           DROP FUNCTION mst2_metadata_has_generic_overlap(bytea);
            FOR r IN SELECT c.relname,t.tgname FROM pg_trigger t
              JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
              JOIN pg_proc p ON p.oid=t.tgfoid
              WHERE n.nspname=current_schema() AND NOT t.tgisinternal AND left(p.proname,11)='mst2_route_'
            LOOP EXECUTE format('DROP TRIGGER %I ON %I.%I',r.tgname,current_schema(),r.relname); END LOOP;
-           DROP TABLE mst2_lease_storage_route,mst2_generic_session_storage_binding,mst2_snapshot_storage_route,mst2_metadata_namespace;
+           DROP TABLE mst2_lease_storage_route,mst2_generic_session_storage_binding,mst2_snapshot_storage_route,mst2_metadata_namespace,mst2_qualified_family_policy,mst2_rooted_source_tree_revision;
            FOR r IN SELECT conname FROM pg_constraint
              WHERE conrelid='mst2_snapshot_context'::regclass AND contype='u'
                AND pg_get_constraintdef(oid)='UNIQUE (snapshot_id, prepare_id, metadata_root)'
@@ -46,7 +53,8 @@ pub(super) async fn restore_pre_route_schema(db: &DatabaseConnection) {
            IF functions IS NULL THEN RAISE EXCEPTION 'route upgrade fixture has no route functions'; END IF;
            EXECUTE 'DROP FUNCTION '||functions;
          END $$;
-         DELETE FROM seaql_migrations WHERE version='m20261007_000600_add_mst2_storage_routes'",
+         DELETE FROM seaql_migrations WHERE version IN (
+           'm20261007_000600_add_mst2_storage_routes','m20261008_000200_add_mst2_rooted_qualified_family')",
     )
     .await
     .unwrap();
