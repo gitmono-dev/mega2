@@ -4,6 +4,9 @@ use crate::jupiter::{
     storage::qualified_metadata_family::reader_previous_fixture::restore_retention,
 };
 
+#[path = "snapshot_descriptor_upgrade_tests.rs"]
+mod descriptor_wire;
+
 async fn retained_owners(fixture: &Fixture) -> Value {
     let txn = transaction(fixture).await;
     let value = txn.query_one_raw(Statement::from_string(DbBackend::Postgres,
@@ -135,10 +138,11 @@ async fn captured_cc90_interrupted_before_reader_migration_resumes_without_reade
     let owners = retained_owners(&fixture).await;
     core.execute_raw(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "DELETE FROM seaql_migrations WHERE version IN ($1,$2)",
+        "DELETE FROM seaql_migrations WHERE version IN ($1,$2,$3)",
         [
             "m20261008_000400_add_mst2_reader_retention".into(),
             "m20261008_000500_fix_mst2_native_runtime".into(),
+            "m20261008_000600_fix_mst2_descriptor_wire".into(),
         ],
     ))
     .await
@@ -148,9 +152,10 @@ async fn captured_cc90_interrupted_before_reader_migration_resumes_without_reade
     assert_eq!(retained_owners(&fixture).await, owners);
     let count: i64 = core.query_one_raw(Statement::from_string(DbBackend::Postgres,
         "SELECT count(*) FROM seaql_migrations WHERE version IN
-            ('m20261008_000400_add_mst2_reader_retention','m20261008_000500_fix_mst2_native_runtime')"))
+            ('m20261008_000400_add_mst2_reader_retention','m20261008_000500_fix_mst2_native_runtime',
+             'm20261008_000600_fix_mst2_descriptor_wire')"))
         .await.unwrap().unwrap().try_get_by_index(0).unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(count, 3);
     assert_old_sid_works(&fixture).await;
 }
 

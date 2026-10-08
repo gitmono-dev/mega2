@@ -66,6 +66,44 @@ jobs:
           docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git \
             up -d --build --wait postgres redis rustfs rustfs-init git-cli
 
+      - name: Verify necessary v3 publication and performance regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .env.test
+          export no_proxy="$NO_PROXY"
+          test_inventory="$(cargo test --lib -- --list)"
+          tests=(
+            api::router::snapshot_router::content::tests::rooted_metadata::descriptor_wire::rooted_postgres_descriptor_matches_codec_bytes_for_root_ascii_long_and_utf8_scopes
+            jupiter::migration::tests::import_repo_alias_rows_canonicalized
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::committed_metadata_requests_retire_owners_without_retiring_source_history
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::terminal_owner_survives_its_deferred_completion_and_prunes_in_a_later_transaction
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::reader_pruning_respects_the_64_owner_budget_with_a_committed_backlog
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::stale_actual_reader_cannot_read_or_finish_a_reissued_uuid
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::rolled_back_reader_issuance_is_unpublished_and_extreme_issuance_fails_closed
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::current_reader_retention_migration_verifies_fresh_family_without_rewriting_history
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::captured_previous_q_upgrade_preserves_old_sid_source_proofs_and_active_legacy_reader
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::captured_previous_core_without_q_upgrades_before_new_provisioning
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::captured_previous_tampered_q_rejects_upgrade_without_partial_issuance_schema
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::native_runtime::captured_cc90_upgrade_preserves_nonzero_reader_issuance_all_owners_oids_and_old_sid
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::native_runtime::captured_cc90_interrupted_before_reader_migration_resumes_without_reader_ddl
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::native_runtime::captured_cc90_qless_canonical_policy_upgrades_before_new_provisioning
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::native_runtime::captured_cc90_qless_exact_legacy_deparse_policy_upgrades_before_new_provisioning
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::native_runtime::captured_cc90_tampered_decoder_rejects_upgrade_without_rewriting_owners_or_policy
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::native_runtime::captured_cc90_qless_arbitrary_policy_shape_is_never_resigned
+            api::router::snapshot_router::content::tests::mst2_rooted_streamed_fact_persists_one_source_pass_and_reuses_warm_alias_facts
+            jupiter::storage::qualified_metadata_family::tests::canonical_tests::actual_rooted_cold_and_zero_delta_reuse_keep_one_canonical_graph
+            jupiter::storage::qualified_metadata_family::tests::canonical_tests::changed_ancestor_installs_only_delta_and_accepts_independently_attested_source_aliases
+            api::router::snapshot_router::content::tests::rooted_metadata::rooted_wide_directory_windows_and_lookup_survive_rebuild_with_valid_proofs
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::native_runtime::descriptor_wire::captured_87b_descriptor_upgrade_preserves_owners_oids_and_replays_missing_ledgers
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::native_runtime::descriptor_wire::captured_87b_qless_descriptor_upgrade_replays_missing_ledgers_before_provisioning
+            api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::upgrade::native_runtime::descriptor_wire::captured_87b_tampered_descriptor_rejects_without_resigning_history
+          )
+          for test_name in "${tests[@]}"; do
+            grep -Fqx "$test_name: test" <<< "$test_inventory"
+          done
+          cargo test --lib -- --exact --nocapture "${tests[@]}"
+
       - name: Run repository tests with test environment
         shell: bash
         run: |

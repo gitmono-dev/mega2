@@ -48,9 +48,9 @@ BEGIN
   END IF;
   instance_bytes:=decode(replace(instance,'-',''),'hex');
   view_digest:=sha256(convert_to('mega.mst2.namespaceview','UTF8')||decode('00','hex')||convert_to(commit_id,'UTF8'));
-  RETURN convert_to('MSD2','UTF8')||decode('00020001','hex')||instance_bytes||view_digest
-    ||decode(lpad(to_hex(octet_length(scope_bytes)),4,'0'),'hex')||scope_bytes
-    ||decode('0001000100000000','hex')||p.metadata_root;
+  RETURN convert_to('MSD2','UTF8')||decode('02000100','hex')||instance_bytes||view_digest
+    ||mst2_metadata_write_le(octet_length(scope_bytes),2)||scope_bytes
+    ||decode('0100010000000000','hex')||p.metadata_root;
 END $$;
 
 CREATE FUNCTION mst2_metadata_root_live(p bytea,g bigint,c bytea) RETURNS boolean
