@@ -78,6 +78,7 @@ impl VerifiedSourceChunkMap {
         handler: &T,
         source: ChunkMapSource,
         budget: &Arc<super::content_budget::MemoryBudget>,
+        admission: &crate::jupiter::storage::native_chunk_map::retention::ChunkMapInstall,
     ) -> Result<Self, SnapshotError> {
         let digest: [u8; 32] = source
             .fact
@@ -106,6 +107,7 @@ impl VerifiedSourceChunkMap {
                     })
             },
             budget,
+            admission,
         )
         .await?;
         Ok(Self { source, projection })

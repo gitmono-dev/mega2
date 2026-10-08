@@ -2,8 +2,8 @@
 //!
 //! The object writer is trusted like the verified-object writer. A database
 //! row, its checksum or a map's presence is never a full-source proof. Only
-//! the opaque full-stream verifier can install a source receipt. This initial
-//! store is append-only; bounded retention and collection remain separate work.
+//! the opaque full-stream verifier can install a source receipt. Persistent
+//! owners, reservations and physical generations bound its retention.
 
 use std::sync::Arc;
 
@@ -33,11 +33,17 @@ const DESCRIPTOR_CREDIT: usize = 32 * 1024;
 const PAGE_CREDIT: usize = 64 * 1024;
 const RECEIPT_DOMAIN: &[u8] = b"MST2-CHUNK-MAP-RECEIPT\0";
 
+pub(crate) mod retention;
+
+#[derive(Clone)]
 pub(crate) struct PostgresChunkMapRepository {
     connection: DatabaseConnection,
     primary_scope: Vec<u8>,
     budget: Arc<MemoryBudget>,
     schema: String,
+    receipt_observation: Arc<tokio::sync::Mutex<Option<Arc<retention::BackingObservation>>>>,
+    cancelled_installs: Arc<std::sync::Mutex<Vec<retention::CancelledInstall>>>,
+    admission_maintenance: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 pub(crate) struct PersistedChunkMap {
@@ -45,12 +51,33 @@ pub(crate) struct PersistedChunkMap {
     pub map_id: [u8; 32],
     source: ChunkMapSource,
     source_id: [u8; 32],
+    reader: retention::ChunkMapReader,
     _memory: MemoryLease,
 }
 
 impl PersistedChunkMap {
     pub(crate) fn source_id(&self) -> [u8; 32] {
         self.source_id
+    }
+
+    pub(crate) async fn ensure_live(&self) -> Result<(), SnapshotError> {
+        self.reader.ensure_live().await
+    }
+
+    pub(crate) async fn record_progress(&self) -> Result<(), SnapshotError> {
+        self.reader.record_progress().await
+    }
+
+    pub(crate) async fn await_backend<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> Result<F::Output, SnapshotError> {
+        self.reader.await_backend(future).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_check_next_owner_operation(&self) {
+        self.reader.test_check_next_owner_operation().await;
     }
 }
 
@@ -100,6 +127,9 @@ impl PostgresChunkMapRepository {
             primary_scope,
             budget: projection_budget().clone(),
             schema,
+            receipt_observation: Arc::default(),
+            cancelled_installs: Arc::default(),
+            admission_maintenance: Arc::default(),
         })
     }
 
@@ -108,27 +138,78 @@ impl PostgresChunkMapRepository {
         source: &ChunkMapSource,
         objects: &MegaObjectStorageWrapper,
     ) -> Result<Option<Arc<PersistedChunkMap>>, SnapshotError> {
+        for pass in 0..2 {
+            let (map, pending) = self.read_current(source, objects).await?;
+            if !pending {
+                return Ok(map);
+            }
+            if pass == 0 {
+                self.maintain(objects, 8).await?;
+            }
+        }
+        Err(SnapshotError::new(
+            SnapshotErrorCode::TemporaryUnavailable,
+            "previous source receipt deletion is still pending",
+        ))
+    }
+
+    async fn read_current(
+        &self,
+        source: &ChunkMapSource,
+        objects: &MegaObjectStorageWrapper,
+    ) -> Result<(Option<Arc<PersistedChunkMap>>, bool), SnapshotError> {
         let memory = self.budget.reserve(DESCRIPTOR_CREDIT)?;
         let txn = self.transaction().await?;
         let result = async {
             self.require_scope(&txn).await?;
             require_current_source(&txn, source, &self.schema).await?;
             let Some(row) = source_row(&txn, source, &self.schema).await? else {
-                return Ok(None);
+                let pending = self.require_missing_source_retired(&txn, source).await?;
+                return Ok((None, pending));
             };
             let (map, source_id) = self.validate_source_row(source, &row)?;
+            let generation_state: Option<String> =
+                row.try_get("", "generation_state").map_err(db_error)?;
+            if generation_state.as_deref() == Some("DELETING") {
+                // A legitimate retirement can still retain its source row
+                // until the physical delete completes. Replay it just like
+                // a missing retired row, after checking every source fact;
+                // damaged LIVE rows never enter this cold-rebuild path.
+                return Ok((None, true));
+            }
             let bytes = receipt(&self.primary_scope, source, &map)?;
-            read_receipt(objects, &receipt_key(source_id), &bytes).await?;
-            Ok(Some(Arc::new(PersistedChunkMap {
-                map_id: map.map_id(),
-                map,
-                source: source.clone(),
-                source_id,
-                _memory: memory,
-            })))
+            let reader = self.admit_reader(&txn, source, &row, &map).await?;
+            let key = ObjectKey {
+                namespace: ObjectNamespace::ChunkMapReceipt,
+                key: row.try_get("", "receipt_key").map_err(db_error)?,
+            };
+            Ok((
+                Some((
+                    Arc::new(PersistedChunkMap {
+                        map_id: map.map_id(),
+                        map,
+                        source: source.clone(),
+                        source_id,
+                        reader,
+                        _memory: memory,
+                    }),
+                    key,
+                    bytes,
+                )),
+                false,
+            ))
         }
         .await;
-        finish(txn, result).await
+        let (admitted, pending) = finish(txn, result).await?;
+        let Some((map, key, bytes)) = admitted else {
+            return Ok((None, pending));
+        };
+        // Admission is durable before I/O. No completion barrier or fact row
+        // lock is held while the independent backend receipt is consumed.
+        map.await_backend(read_receipt(objects, &key, &bytes))
+            .await??;
+        map.reader.validate_after_receipt().await?;
+        Ok((Some(map), false))
     }
 
     /// Publication accepts no caller-provided map or "verified" flag.
@@ -136,75 +217,96 @@ impl PostgresChunkMapRepository {
         &self,
         verified: VerifiedSourceChunkMap,
         objects: &MegaObjectStorageWrapper,
+        admission: &retention::ChunkMapInstall,
+    ) -> Result<(), SnapshotError> {
+        let result = self.install_reserved(verified, objects, admission).await;
+        if result.is_err() {
+            if let Err(error) = admission.retire().await {
+                tracing::warn!(
+                    ?error,
+                    "failed chunk-map installation will retire by database deadline"
+                );
+            } else if let Err(error) = self.collect_maps(64).await {
+                tracing::warn!(
+                    ?error,
+                    "retired partial chunk-map indexes await bounded collection replay"
+                );
+            }
+        }
+        result
+    }
+
+    async fn install_reserved(
+        &self,
+        verified: VerifiedSourceChunkMap,
+        objects: &MegaObjectStorageWrapper,
+        admission: &retention::ChunkMapInstall,
     ) -> Result<(), SnapshotError> {
         let source = verified.source();
         let map = verified.map();
-        // The verifier reserved index and bounded SQL parameter workspace
-        // before opening the body. It owns those credits through publication.
         let nodes = indexed_nodes(verified.leaf_hashes())?;
-        if nodes.last().map(|n| n.digest) != Some(map.pages_root) {
+        if nodes.last().map(|node| node.digest) != Some(map.pages_root) {
             return Err(integrity(
                 "verified chunk map index disagrees with canonical root",
             ));
         }
-        let source_bytes = source.canonical_bytes()?;
-        let source_id = source_id(&self.primary_scope, &source_bytes);
-        let bytes = receipt(&self.primary_scope, source, map)?;
-        let key = receipt_key(source_id);
+        let bytes = admission.prepare(&verified).await?;
+        let key = admission.key();
+        admission
+            .await_backend(objects.inner.put_metadata_atomic_create(
+                key,
+                Bytes::copy_from_slice(&bytes),
+                ObjectMeta {
+                    size: bytes.len() as i64,
+                    ..Default::default()
+                },
+            ))
+            .await?
+            .map_err(storage_error)?;
+        admission.acknowledge_create().await?;
+        admission
+            .await_backend(read_receipt(objects, key, &bytes))
+            .await??;
+        let observation = retention::inventory(self, objects).await?;
+        let map_generation = self
+            .stage_map_start(&verified, admission, &observation)
+            .await?;
+        for batch in verified.leaves().chunks(64) {
+            self.stage_map_batch(&verified, admission, map_generation, Some(batch), None)
+                .await?;
+        }
+        for batch in nodes.chunks(1024) {
+            self.stage_map_batch(&verified, admission, map_generation, None, Some(batch))
+                .await?;
+        }
+        self.compare_staged_map(&verified, &nodes, admission, map_generation)
+            .await?;
         let txn = self.transaction().await?;
-        let result = async {
+        let result=async {
             self.require_scope(&txn).await?;
-            require_current_source(&txn, source, &self.schema).await?;
-            if let Some(row) = source_row(&txn, source, &self.schema).await? {
-                let (stored, _) = self.validate_source_row(source, &row)?;
-                if stored != *map { return Err(integrity("immutable source map conflicts with reverified content")); }
-                read_receipt(objects, &key, &bytes).await?;
-                compare_complete_map(&txn, &verified, &nodes, &self.schema).await?;
-                return Ok(());
-            }
-            // The complete source pass happened before this atomic create.
-            // A lost DB commit leaves an orphan trusted receipt, never an
-            // admitted partial map; exact re-verification can replay it.
-            objects.inner.put_metadata_atomic_create(&key, Bytes::copy_from_slice(&bytes), ObjectMeta {
-                size: bytes.len() as i64, ..Default::default()
-            }).await.map_err(storage_error)?;
-            read_receipt(objects, &key, &bytes).await?;
-            txn.execute_raw(stmt(&self.schema, "INSERT INTO mst2_chunk_map(map_id,descriptor,page_count,pages_root) VALUES($1,$2,$3,$4) ON CONFLICT(map_id) DO NOTHING",
-                [map.map_id().to_vec().into(), map.encode().into(), (map.page_count as i32).into(), map.pages_root.to_vec().into()])).await.map_err(db_error)?;
-            // Existing indexes must be compared, never repaired or overwritten.
-            let present = txn.query_one_raw(stmt(&self.schema, "SELECT EXISTS(SELECT 1 FROM mst2_chunk_map_source WHERE map_id=$1) AS sealed", [map.map_id().to_vec().into()]))
-                .await.map_err(db_error)?.ok_or_else(|| integrity("chunk map seal observation is missing"))?
-                .try_get::<bool>("", "sealed").map_err(db_error)?;
-            if !present {
-                for batch in verified.leaves().chunks(64) {
-                    let encoded = encode_leaves(batch)?;
-                    txn.execute_raw(stmt(&self.schema, "INSERT INTO mst2_chunk_map_leaf(map_id,page_index,payload) SELECT $1,p.page_index,pg_catalog.decode(p.payload,'hex') FROM pg_catalog.jsonb_to_recordset($2::jsonb) AS p(page_index integer,payload text) ON CONFLICT(map_id,page_index) DO NOTHING",
-                        [map.map_id().to_vec().into(), encoded.into()])).await.map_err(db_error)?;
-                }
-                for batch in nodes.chunks(1024) {
-                    let encoded = encode_nodes(batch)?;
-                    txn.execute_raw(stmt(&self.schema, "INSERT INTO mst2_chunk_map_node(map_id,first_page,page_count,digest) SELECT $1,p.first_page,p.page_count,pg_catalog.decode(p.digest,'hex') FROM pg_catalog.jsonb_to_recordset($2::jsonb) AS p(first_page integer,page_count integer,digest text) ON CONFLICT(map_id,first_page,page_count) DO NOTHING",
-                        [map.map_id().to_vec().into(), encoded.into()])).await.map_err(db_error)?;
-                }
-            }
-            compare_complete_map(&txn, &verified, &nodes, &self.schema).await?;
-            let fact = source.fact();
-            txn.execute_raw(stmt(&self.schema, "INSERT INTO mst2_chunk_map_source(storage_domain,git_oid,object_kind,fact_id,source_id,source_bytes,primary_scope,map_id,receipt_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(storage_domain,git_oid,object_kind) DO NOTHING",
-                [fact.storage_domain.clone().into(), fact.git_oid.clone().into(), fact.object_kind.clone().into(), fact.id.into(),
-                 source_id.to_vec().into(), source_bytes.into(), self.primary_scope.clone().into(), map.map_id().to_vec().into(), Sha256::digest(&bytes).to_vec().into()])).await.map_err(db_error)?;
-            let row = source_row(&txn, source, &self.schema).await?.ok_or_else(|| integrity("installed source receipt is missing"))?;
-            let (stored, _) = self.validate_source_row(source, &row)?;
-            if stored != *map { return Err(integrity("concurrent source installation conflicts")); }
+            require_current_source(&txn,source,&self.schema).await?;
+            retention::map_barrier(&txn,map.map_id()).await?;
+            retention::barrier(&txn,&self.schema).await?;
+            retention::ensure_quotas(&txn,&self.schema,&observation,0,0,0,Some(admission.owner())).await?;
+            let admitted=txn.query_one_raw(stmt(&self.schema,"UPDATE mst2_chunk_receipt_generation SET state='LIVE',owner=NULL,deadline=NULL,reserved_pages=0,reserved_nodes=0,reserved_bytes=0,last_progress=pg_catalog.clock_timestamp() WHERE receipt_key=$1 AND generation=$2 AND owner=$3::uuid AND state='CREATING' AND deadline>pg_catalog.clock_timestamp() AND create_completed AND map_id=$4 AND map_generation=$5 AND receipt_bytes=$6 AND EXISTS(SELECT 1 FROM mst2_chunk_map_lifetime WHERE map_id=$4 AND generation=$5 AND state='LIVE') RETURNING generation",[key.key.clone().into(),admission.generation().into(),admission.owner().to_string().into(),map.map_id().to_vec().into(),map_generation.into(),bytes.clone().into()])).await.map_err(db_error)?;
+            if admitted.is_none() {return Err(SnapshotError::new(SnapshotErrorCode::LeaseExpired,"chunk-map publication lost its exact live install reservation"));}
+            let fact=source.fact();
+            let source_bytes=source.canonical_bytes()?;
+            let source_id=source_id(&self.primary_scope,&source_bytes);
+            txn.execute_raw(stmt(&self.schema,"INSERT INTO mst2_chunk_map_source(storage_domain,git_oid,object_kind,fact_id,source_id,source_bytes,primary_scope,map_id,receipt_digest,receipt_generation) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(storage_domain,git_oid,object_kind) DO NOTHING",[fact.storage_domain.clone().into(),fact.git_oid.clone().into(),fact.object_kind.clone().into(),fact.id.into(),source_id.to_vec().into(),source_bytes.into(),self.primary_scope.clone().into(),map.map_id().to_vec().into(),Sha256::digest(&bytes).to_vec().into(),admission.generation().into()])).await.map_err(db_error)?;
+            let row=source_row(&txn,source,&self.schema).await?.ok_or_else(||integrity("installed source receipt is missing"))?;
+            let (stored,_)=self.validate_source_row(source,&row)?;
+            if stored!=*map || row.try_get::<String>("","receipt_key").map_err(db_error)?!=key.key {return Err(integrity("concurrent source installation conflicts"));}
             Ok(())
         }.await;
         finish(txn, result).await
     }
-
     pub(crate) async fn selected_page(
         &self,
         map: &PersistedChunkMap,
         page_index: u64,
     ) -> Result<Arc<AuthenticatedChunkPage>, SnapshotError> {
+        map.ensure_live().await?;
         let intervals = proof_intervals(map.map.page_count, page_index)?;
         let memory = self.budget.reserve(PAGE_CREDIT)?;
         let txn = self.transaction().await?;
@@ -240,7 +342,10 @@ impl PostgresChunkMapRepository {
             tracing::debug!(target:"mst2::chunk_map", selected_leaf_bytes = bytes.len(), selected_sibling_rows = nodes.len(), page_count = map.map.page_count, "authenticated persisted chunk map selected page");
             Ok(Arc::new(AuthenticatedChunkPage { leaf, proof, _memory: memory }))
         }.await;
-        finish(txn, result).await
+        let page = finish(txn, result).await?;
+        map.ensure_live().await?;
+        map.record_progress().await?;
+        Ok(page)
     }
 
     async fn transaction(&self) -> Result<DatabaseTransaction, SnapshotError> {
@@ -412,7 +517,7 @@ async fn source_row<C: ConnectionTrait>(
     source: &ChunkMapSource,
     schema: &str,
 ) -> Result<Option<QueryResult>, SnapshotError> {
-    connection.query_one_raw(stmt(schema, "SELECT s.fact_id,CASE WHEN pg_catalog.octet_length(s.source_id)=32 THEN s.source_id ELSE NULL END AS source_id,CASE WHEN pg_catalog.octet_length(s.source_bytes)<=2048 THEN s.source_bytes ELSE NULL END AS source_bytes,CASE WHEN pg_catalog.octet_length(s.primary_scope)<=1024 THEN s.primary_scope ELSE NULL END AS primary_scope,CASE WHEN pg_catalog.octet_length(s.map_id)=32 THEN s.map_id ELSE NULL END AS map_id,CASE WHEN pg_catalog.octet_length(s.receipt_digest)=32 THEN s.receipt_digest ELSE NULL END AS receipt_digest,CASE WHEN pg_catalog.octet_length(m.descriptor)=100 THEN m.descriptor ELSE NULL END AS descriptor,m.page_count,CASE WHEN pg_catalog.octet_length(m.pages_root)=32 THEN m.pages_root ELSE NULL END AS pages_root FROM mst2_chunk_map_source s LEFT JOIN mst2_chunk_map m ON m.map_id=s.map_id WHERE s.storage_domain=$1 AND s.git_oid=$2 AND s.object_kind=$3",
+    connection.query_one_raw(stmt(schema, "SELECT s.fact_id,s.receipt_key,s.receipt_generation,g.state AS generation_state,l.state AS map_state,l.generation AS map_generation,CASE WHEN pg_catalog.octet_length(g.receipt_bytes)<=4096 THEN g.receipt_bytes ELSE NULL END AS generation_receipt_bytes,CASE WHEN pg_catalog.octet_length(s.source_id)=32 THEN s.source_id ELSE NULL END AS source_id,CASE WHEN pg_catalog.octet_length(s.source_bytes)<=2048 THEN s.source_bytes ELSE NULL END AS source_bytes,CASE WHEN pg_catalog.octet_length(s.primary_scope)<=1024 THEN s.primary_scope ELSE NULL END AS primary_scope,CASE WHEN pg_catalog.octet_length(s.map_id)=32 THEN s.map_id ELSE NULL END AS map_id,CASE WHEN pg_catalog.octet_length(s.receipt_digest)=32 THEN s.receipt_digest ELSE NULL END AS receipt_digest,CASE WHEN pg_catalog.octet_length(m.descriptor)=100 THEN m.descriptor ELSE NULL END AS descriptor,m.page_count,CASE WHEN pg_catalog.octet_length(m.pages_root)=32 THEN m.pages_root ELSE NULL END AS pages_root FROM mst2_chunk_map_source s LEFT JOIN mst2_chunk_map m ON m.map_id=s.map_id LEFT JOIN mst2_chunk_receipt_generation g ON g.receipt_key=s.receipt_key AND g.generation=s.receipt_generation AND g.map_id=s.map_id LEFT JOIN mst2_chunk_map_lifetime l ON l.map_id=s.map_id AND l.generation=g.map_generation WHERE s.storage_domain=$1 AND s.git_oid=$2 AND s.object_kind=$3",
         [source.fact().storage_domain.clone().into(), source.fact().git_oid.clone().into(), source.fact().object_kind.clone().into()])).await.map_err(db_error)
 }
 
@@ -445,13 +550,6 @@ fn receipt(
     bytes.extend_from_slice(&source);
     bytes.extend_from_slice(&map.encode());
     Ok(bytes)
-}
-
-fn receipt_key(source_id: [u8; 32]) -> ObjectKey {
-    ObjectKey {
-        namespace: ObjectNamespace::ChunkMapReceipt,
-        key: hex::encode(source_id),
-    }
 }
 
 async fn read_receipt(
@@ -505,46 +603,6 @@ fn encode_nodes(nodes: &[ChunkMapNode]) -> Result<String, SnapshotError> {
     serde_json::to_string(&nodes.iter().map(|n| json!({"first_page":n.start,"page_count":n.pages,"digest":hex::encode(n.digest)})).collect::<Vec<_>>()).map_err(db_error)
 }
 
-async fn compare_complete_map(
-    txn: &DatabaseTransaction,
-    verified: &VerifiedSourceChunkMap,
-    nodes: &[ChunkMapNode],
-    schema: &str,
-) -> Result<(), SnapshotError> {
-    let map = verified.map();
-    let row = txn.query_one_raw(stmt(schema, "SELECT CASE WHEN pg_catalog.octet_length(descriptor)=100 THEN descriptor ELSE NULL END AS descriptor,page_count,CASE WHEN pg_catalog.octet_length(pages_root)=32 THEN pages_root ELSE NULL END AS pages_root,(SELECT pg_catalog.count(*) FROM mst2_chunk_map_leaf WHERE map_id=$1) AS leaves,(SELECT pg_catalog.count(*) FROM mst2_chunk_map_node WHERE map_id=$1) AS nodes FROM mst2_chunk_map WHERE map_id=$1", [map.map_id().to_vec().into()]))
-        .await.map_err(db_error)?.ok_or_else(|| integrity("chunk map installation descriptor is missing"))?;
-    if bounded_bytes(&row, "descriptor")? != map.encode()
-        || row.try_get::<i32>("", "page_count").map_err(db_error)? as u64 != map.page_count
-        || bounded_bytes(&row, "pages_root")? != map.pages_root
-        || row.try_get::<i64>("", "leaves").map_err(db_error)? as u64 != map.page_count
-        || row.try_get::<i64>("", "nodes").map_err(db_error)? as usize != nodes.len()
-    {
-        return Err(integrity(
-            "chunk map installation has conflicting descriptor or incomplete coverage",
-        ));
-    }
-    for batch in verified.leaves().chunks(64) {
-        let bad = txn.query_one_raw(stmt(schema, "SELECT p.page_index FROM pg_catalog.jsonb_to_recordset($2::jsonb) AS p(page_index integer,payload text) LEFT JOIN mst2_chunk_map_leaf l ON l.map_id=$1 AND l.page_index=p.page_index WHERE l.payload IS DISTINCT FROM pg_catalog.decode(p.payload,'hex') LIMIT 1",
-            [map.map_id().to_vec().into(), encode_leaves(batch)?.into()])).await.map_err(db_error)?;
-        if bad.is_some() {
-            return Err(integrity(
-                "immutable stored chunk map leaf conflicts with verified source",
-            ));
-        }
-    }
-    for batch in nodes.chunks(1024) {
-        let bad = txn.query_one_raw(stmt(schema, "SELECT p.first_page FROM pg_catalog.jsonb_to_recordset($2::jsonb) AS p(first_page integer,page_count integer,digest text) LEFT JOIN mst2_chunk_map_node n ON n.map_id=$1 AND n.first_page=p.first_page AND n.page_count=p.page_count WHERE n.digest IS DISTINCT FROM pg_catalog.decode(p.digest,'hex') LIMIT 1",
-            [map.map_id().to_vec().into(), encode_nodes(batch)?.into()])).await.map_err(db_error)?;
-        if bad.is_some() {
-            return Err(integrity(
-                "immutable stored chunk map node conflicts with verified source",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn quoted(schema: &str) -> String {
     format!("\"{}\"", schema.replace('"', "\"\""))
 }
@@ -591,6 +649,11 @@ fn qualify_relations(schema: &str, sql: &str) -> String {
                 "mst2_chunk_map_source",
                 "mst2_chunk_map_leaf",
                 "mst2_chunk_map_node",
+                "mst2_chunk_receipt_generation",
+                "mst2_chunk_map_lifetime",
+                "mst2_chunk_reader",
+                "mst2_chunk_map_gc",
+                "mst2_chunk_retention_barrier",
             ]
             .contains(&&sql[start..cursor])
             {

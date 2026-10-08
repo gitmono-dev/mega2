@@ -17,6 +17,12 @@ pub enum IoOrbitError {
     #[error("write manifest precondition failed")]
     WriteManifestPreconditionFailed,
 
+    #[error("chunk-map retention is not supported by this storage backend")]
+    ChunkMapRetentionUnsupported,
+
+    #[error("chunk-map backing receipts exceed the fixed retention quota")]
+    ChunkMapRetentionCapacityExceeded,
+
     #[error("other error: {0}")]
     Other(String),
 }

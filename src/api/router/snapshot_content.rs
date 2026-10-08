@@ -19,7 +19,7 @@ use super::{
 };
 use crate::ceres::snapshot::{
     chunks::{ChunkMapSource, VerifiedSourceChunkMap, map_build_reservation_bytes},
-    content_budget::{BudgetedFrame, MemoryLease, reserve_range_work, reserve_response},
+    content_budget::{BudgetedFrame, MemoryLease, reserve_response},
     error::{SnapshotError, SnapshotErrorCode},
     pages::{MetadataWalkOutcome, base64_of, hex_of, resolve_abs_metadata},
     resolver::FsKind,
@@ -640,21 +640,29 @@ pub(super) async fn project_resolved<T: crate::ceres::api_service::ApiHandler + 
     {
         return Ok(map);
     }
-    let verified =
-        VerifiedSourceChunkMap::verify(handler, source.clone(), repository.memory_budget())
-            .await
-            .map_err(|error| {
-                mst2_error_response(if error.code == SnapshotErrorCode::DigestMismatch {
-                    SnapshotError::new(
-                        SnapshotErrorCode::IntegrityError,
-                        "fixed blob digest disagrees with its verified fact",
-                    )
-                } else {
-                    error
-                })
-            })?;
+    let admission = repository
+        .admit_install(&source, objects)
+        .await
+        .map_err(mst2_error_response)?;
+    let verified = VerifiedSourceChunkMap::verify(
+        handler,
+        source.clone(),
+        repository.memory_budget(),
+        &admission,
+    )
+    .await
+    .map_err(|error| {
+        mst2_error_response(if error.code == SnapshotErrorCode::DigestMismatch {
+            SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "fixed blob digest disagrees with its verified fact",
+            )
+        } else {
+            error
+        })
+    })?;
     repository
-        .install(verified, objects)
+        .install(verified, objects, &admission)
         .await
         .map_err(mst2_error_response)?;
     repository
@@ -712,7 +720,7 @@ pub(super) async fn chunk_map(
             "map_id": format!("sha256:{}", hex_of(&proj.map_id)),
         },
     });
-    guarded_map_json_response(&state, &ctx, &body, memory)
+    guarded_map_json_response(&state, &ctx, &body, memory, proj)
         .await
         .map_err(mst2_error_response)
 }
@@ -799,7 +807,7 @@ pub(super) async fn chunk_map_pages(
         "leaf_base64": base64_of(&leaf_bytes),
         "proof": proof_json,
     });
-    guarded_map_json_response(&state, &ctx, &body, memory)
+    guarded_map_json_response(&state, &ctx, &body, memory, proj)
         .await
         .map_err(mst2_error_response)
 }
@@ -856,6 +864,7 @@ async fn guarded_map_json_response(
     context: &crate::ceres::snapshot::runtime::SnapshotContext,
     value: &serde_json::Value,
     memory: MemoryLease,
+    map: std::sync::Arc<crate::jupiter::storage::native_chunk_map::PersistedChunkMap>,
 ) -> Result<Response, SnapshotError> {
     let bytes = map_json_bytes(value, memory)?;
     let headers = super::REQUEST_HEADERS.try_with(Clone::clone).map_err(|_| {
@@ -865,11 +874,17 @@ async fn guarded_map_json_response(
         )
     })?;
     super::revalidate_access(state, context, &headers).await?;
+    map.ensure_live().await?;
     let state = state.clone();
     let context = context.clone();
     let stream = futures::stream::once(async move {
         super::revalidate_access(&state, &context, &headers).await?;
-        Ok::<_, SnapshotError>(bytes)
+        map.ensure_live().await?;
+        map.record_progress().await?;
+        Ok::<_, SnapshotError>(bytes::Bytes::from_owner(RetainedChunkFrame {
+            bytes,
+            _maps: std::sync::Arc::new(vec![map]),
+        }))
     });
     Response::builder()
         .header("content-type", "application/json")
@@ -877,6 +892,43 @@ async fn guarded_map_json_response(
         .header("vary", "Authorization, Accept")
         .body(axum::body::Body::from_stream(stream))
         .map_err(|_| internal("chunk map JSON response build failed"))
+}
+
+struct RetainedChunkFrame {
+    bytes: bytes::Bytes,
+    _maps: std::sync::Arc<
+        Vec<std::sync::Arc<crate::jupiter::storage::native_chunk_map::PersistedChunkMap>>,
+    >,
+}
+impl AsRef<[u8]> for RetainedChunkFrame {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn retain_chunk_maps(
+    response: Response,
+    maps: Vec<std::sync::Arc<crate::jupiter::storage::native_chunk_map::PersistedChunkMap>>,
+) -> Response {
+    let maps = std::sync::Arc::new(maps);
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream().then(move |frame| {
+        let maps = maps.clone();
+        async move {
+            let bytes = frame.map_err(std::io::Error::other)?;
+            for map in maps.iter() {
+                map.ensure_live().await.map_err(std::io::Error::other)?;
+                if !bytes.is_empty() {
+                    map.record_progress().await.map_err(std::io::Error::other)?;
+                }
+            }
+            Ok::<_, std::io::Error>(bytes::Bytes::from_owner(RetainedChunkFrame {
+                bytes,
+                _maps: maps,
+            }))
+        }
+    });
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
 #[derive(Deserialize, Debug)]
@@ -898,6 +950,20 @@ struct ChunkItem {
 
 const CHUNKS_MAX_ITEMS: usize = 128;
 const CHUNKS_TOTAL_MAX: u64 = 128 * 1024 * 1024;
+
+pub(super) struct ChunksBudgets {
+    pub(super) response: std::sync::Arc<crate::ceres::snapshot::content_budget::MemoryBudget>,
+    pub(super) scratch: std::sync::Arc<crate::ceres::snapshot::content_budget::MemoryBudget>,
+}
+
+impl Default for ChunksBudgets {
+    fn default() -> Self {
+        Self {
+            response: crate::ceres::snapshot::content_budget::response_budget().clone(),
+            scratch: crate::ceres::snapshot::content_budget::range_budget().clone(),
+        }
+    }
+}
 
 struct Planned {
     projection: std::sync::Arc<crate::jupiter::storage::native_chunk_map::PersistedChunkMap>,
@@ -932,6 +998,10 @@ async fn read_chunk_range<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     planned: &Planned,
 ) -> Result<Vec<u8>, Response> {
     let projection = &planned.projection;
+    projection
+        .ensure_live()
+        .await
+        .map_err(mst2_error_response)?;
     let len = projection.map.chunk_len(planned.index).map_err(|error| {
         mst2_error_response(internal(format!("invalid admitted chunk: {error}")))
     })?;
@@ -942,9 +1012,10 @@ async fn read_chunk_range<T: crate::ceres::api_service::ApiHandler + ?Sized>(
     let end = start
         .checked_add(len)
         .ok_or_else(|| mst2_error_response(internal("chunk end overflow")))?;
-    let (mut input, meta) = handler
-        .get_raw_blob_range_stream_exact(&planned.oid, start, end)
+    let (mut input, meta) = projection
+        .await_backend(handler.get_raw_blob_range_stream_exact(&planned.oid, start, end))
         .await
+        .map_err(mst2_error_response)?
         .map_err(|error| mst2_error_response(content_read_error(error)))?
         .ok_or_else(|| {
             mst2_error_response(SnapshotError::new(
@@ -952,6 +1023,10 @@ async fn read_chunk_range<T: crate::ceres::api_service::ApiHandler + ?Sized>(
                 "fixed source does not support exact raw ranges",
             ))
         })?;
+    projection
+        .ensure_live()
+        .await
+        .map_err(mst2_error_response)?;
     if u64::try_from(meta.size).ok() != Some(projection.map.file_size) {
         return Err(mst2_error_response(SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
@@ -965,7 +1040,21 @@ async fn read_chunk_range<T: crate::ceres::api_service::ApiHandler + ?Sized>(
             "range allocation could not be admitted",
         ))
     })?;
-    while let Some(part) = input.next().await {
+    let mut empty_parts = 0usize;
+    loop {
+        projection
+            .ensure_live()
+            .await
+            .map_err(mst2_error_response)?;
+        let part = projection
+            .await_backend(input.next())
+            .await
+            .map_err(mst2_error_response)?;
+        projection
+            .ensure_live()
+            .await
+            .map_err(mst2_error_response)?;
+        let Some(part) = part else { break };
         let bytes = part.map_err(|error| {
             tracing::warn!(error = %error, "fixed-view range stream failed");
             mst2_error_response(SnapshotError::new(
@@ -980,10 +1069,34 @@ async fn read_chunk_range<T: crate::ceres::api_service::ApiHandler + ?Sized>(
             )));
         }
         raw.extend_from_slice(&bytes);
+        if !bytes.is_empty() {
+            projection
+                .record_progress()
+                .await
+                .map_err(mst2_error_response)?;
+        } else {
+            empty_parts += 1;
+            if empty_parts == 32 {
+                tokio::task::yield_now().await;
+                projection
+                    .ensure_live()
+                    .await
+                    .map_err(mst2_error_response)?;
+                empty_parts = 0;
+            }
+        }
     }
     planned
         .page
         .verify_chunk(&projection.map, planned.index, &raw)
+        .map_err(mst2_error_response)?;
+    projection
+        .ensure_live()
+        .await
+        .map_err(mst2_error_response)?;
+    projection
+        .record_progress()
+        .await
         .map_err(mst2_error_response)?;
     Ok(raw)
 }
@@ -991,8 +1104,18 @@ async fn read_chunk_range<T: crate::ceres::api_service::ApiHandler + ?Sized>(
 #[allow(clippy::result_large_err)]
 pub(super) async fn chunks(
     state: State<crate::api::MonoApiServiceState>,
+    path: AxumPath<String>,
+    body: Mst2Bytes,
+) -> Result<Response, Response> {
+    chunks_with_budgets(state, path, body, ChunksBudgets::default()).await
+}
+
+#[allow(clippy::result_large_err)]
+pub(super) async fn chunks_with_budgets(
+    state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     Mst2Bytes(body): Mst2Bytes,
+    budgets: ChunksBudgets,
 ) -> Result<Response, Response> {
     ensure(&state)?;
     let ctx = super::request_context(&state, &snapshot_id).map_err(mst2_error_response)?;
@@ -1090,7 +1213,10 @@ pub(super) async fn chunks(
         .ok()
         .and_then(|bytes| bytes.checked_add(req.items.len() * 1024 + 1024))
         .ok_or_else(|| mst2_error_response(internal("chunk response memory overflow")))?;
-    let response_memory = reserve_response(response_bytes).map_err(mst2_error_response)?;
+    let response_memory = budgets
+        .response
+        .reserve(response_bytes)
+        .map_err(mst2_error_response)?;
     let mut maps = std::collections::HashMap::new();
     let mut pages = std::collections::HashMap::new();
     for item in resolved {
@@ -1141,7 +1267,10 @@ pub(super) async fn chunks(
     let mut stream = FrameStream::new(1, encoding);
     let mut out: Vec<Vec<u8>> = Vec::new();
     for p in planned.iter() {
-        let _work_memory = reserve_range_work().map_err(mst2_error_response)?;
+        let _work_memory = budgets
+            .scratch
+            .reserve(crate::ceres::snapshot::content_budget::RANGE_WORK_BYTES)
+            .map_err(mst2_error_response)?;
         // The source is the current request's fixed OID, never a cached
         // handler/backend/credential from a different scope.
         let bytes = read_chunk_range(handler.as_ref(), p).await?;
@@ -1163,7 +1292,7 @@ pub(super) async fn chunks(
     );
     out.push(end);
 
-    guarded_treeframe_response_with_budget(
+    let response = guarded_treeframe_response_with_budget(
         &state,
         &ctx,
         &snapshot_id,
@@ -1171,7 +1300,8 @@ pub(super) async fn chunks(
         out,
         Some(response_memory),
     )
-    .map_err(mst2_error_response)
+    .map_err(mst2_error_response)?;
+    Ok(retain_chunk_maps(response, maps.into_values().collect()))
 }
 
 /// Strict decimal-string parse for unsigned counts (spec 04 §1: no leading

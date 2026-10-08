@@ -11,7 +11,7 @@ use crate::{
     ceres::snapshot::content_budget::{MemoryBudget, RANGE_WORK_BYTES},
 };
 
-fn budgeted_app(
+pub(super) fn budgeted_app(
     fixture: &Fixture,
     response_budget: &Arc<MemoryBudget>,
     scratch_budget: &Arc<MemoryBudget>,

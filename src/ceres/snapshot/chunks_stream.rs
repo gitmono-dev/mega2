@@ -63,6 +63,7 @@ async fn build_stream(
         input,
         lease,
         size <= STAGED_CAP_BYTES as u64,
+        None,
     )
     .await
 }
@@ -72,6 +73,7 @@ pub(super) async fn build_source_stream<F, Fut>(
     size: u64,
     open: F,
     budget: &Arc<super::super::content_budget::MemoryBudget>,
+    admission: &crate::jupiter::storage::native_chunk_map::retention::ChunkMapInstall,
 ) -> Result<ChunkProjection, SnapshotError>
 where
     F: FnOnce() -> Fut,
@@ -84,6 +86,7 @@ where
         open,
         budget,
         BUILDERS.get_or_init(|| Arc::new(Semaphore::new(MAX_BUILDERS))),
+        Some(admission),
     )
     .await
 }
@@ -94,6 +97,7 @@ async fn build_source_with_resources<F, Fut>(
     open: F,
     budget: &Arc<super::super::content_budget::MemoryBudget>,
     builders: &Arc<Semaphore>,
+    admission: Option<&crate::jupiter::storage::native_chunk_map::retention::ChunkMapInstall>,
 ) -> Result<ChunkProjection, SnapshotError>
 where
     F: FnOnce() -> Fut,
@@ -106,8 +110,15 @@ where
         )
     })?;
     let lease = budget.reserve(source_reservation_bytes(size)?)?;
-    let input = open().await?;
-    build_stream_with_inline(content_id, size, input, lease, false).await
+    let input = if let Some(admission) = admission {
+        admission.ensure_live().await?;
+        let result = admission.await_backend(open()).await?;
+        admission.ensure_live().await?;
+        result?
+    } else {
+        open().await?
+    };
+    build_stream_with_inline(content_id, size, input, lease, false, admission).await
 }
 
 pub(super) fn source_reservation_bytes(size: u64) -> Result<usize, SnapshotError> {
@@ -135,6 +146,7 @@ async fn build_stream_with_inline(
     mut input: ObjectByteStream,
     lease: MemoryLease,
     inline: bool,
+    admission: Option<&crate::jupiter::storage::native_chunk_map::retention::ChunkMapInstall>,
 ) -> Result<ChunkProjection, SnapshotError> {
     let chunk_count = size.div_ceil(CHUNK_SIZE as u64);
     let page_count = chunk_count.div_ceil(CHUNKS_PER_PAGE as u64);
@@ -161,7 +173,17 @@ async fn build_stream_with_inline(
     let mut chunk_bytes = 0usize;
     let mut digests = 0u64;
     let mut since_yield = 0usize;
-    while let Some(part) = input.next().await {
+    let mut empty_parts = 0usize;
+    loop {
+        let next = if let Some(admission) = admission {
+            admission.ensure_live().await?;
+            let next = admission.await_backend(input.next()).await?;
+            admission.ensure_live().await?;
+            next
+        } else {
+            input.next().await
+        };
+        let Some(part) = next else { break };
         let bytes = part.map_err(|error| {
             tracing::warn!(error = %error, "fixed-view chunk projection stream failed");
             SnapshotError::new(
@@ -185,6 +207,18 @@ async fn build_stream_with_inline(
             raw.extend_from_slice(&bytes);
         }
         received += bytes.len() as u64;
+        if let Some(admission) = admission {
+            if !bytes.is_empty() {
+                admission.record_progress(received).await?;
+            } else {
+                empty_parts += 1;
+                if empty_parts == 32 {
+                    tokio::task::yield_now().await;
+                    admission.ensure_live().await?;
+                    empty_parts = 0;
+                }
+            }
+        }
         let mut rest = bytes.as_ref();
         while !rest.is_empty() {
             let len = rest.len().min(CHUNK_SIZE as usize - chunk_bytes);

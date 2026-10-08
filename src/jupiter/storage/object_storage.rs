@@ -278,6 +278,56 @@ impl MegaObjectStorage for InMemoryObjectStorage {
         Ok((Self::stream_bytes(bytes), meta))
     }
 
+    async fn chunk_map_receipt_inventory(
+        &self,
+    ) -> OrbitResult<crate::orbit_api::object_storage::ChunkMapReceiptInventory> {
+        use crate::orbit_api::object_storage::{
+            ChunkMapReceiptInventory, MAX_CHUNK_MAP_RECEIPT_BYTES, MAX_CHUNK_MAP_RECEIPTS,
+            ObjectNamespace,
+        };
+        let objects = self
+            .objects
+            .lock()
+            .map_err(|_| IoOrbitError::Other("object storage lock poisoned".into()))?;
+        let mut inventory = ChunkMapReceiptInventory {
+            objects: Vec::new(),
+            bytes: 0,
+        };
+        for (key, (bytes, _)) in objects
+            .iter()
+            .filter(|(key, _)| key.namespace == ObjectNamespace::ChunkMapReceipt)
+        {
+            if inventory.objects.len() == MAX_CHUNK_MAP_RECEIPTS {
+                return Err(IoOrbitError::ChunkMapRetentionCapacityExceeded);
+            }
+            inventory.bytes = inventory
+                .bytes
+                .checked_add(bytes.len() as u64)
+                .filter(|bytes| *bytes <= MAX_CHUNK_MAP_RECEIPT_BYTES)
+                .ok_or(IoOrbitError::ChunkMapRetentionCapacityExceeded)?;
+            inventory.objects.push((key.clone(), bytes.len() as u64));
+        }
+        Ok(inventory)
+    }
+
+    async fn delete_chunk_map_receipt(
+        &self,
+        authority: &crate::orbit_api::object_storage::ChunkMapReceiptDeletion,
+    ) -> OrbitResult<bool> {
+        let mut objects = self
+            .objects
+            .lock()
+            .map_err(|_| IoOrbitError::Other("object storage lock poisoned".into()))?;
+        let Some((bytes, _)) = objects.get(authority.key()) else {
+            return Ok(false);
+        };
+        if bytes.as_ref() != authority.expected_bytes() {
+            return Err(IoOrbitError::Other("retired receipt body changed".into()));
+        }
+        objects.remove(authority.key());
+        Ok(true)
+    }
+
     async fn get_range_stream(
         &self,
         key: &ObjectKey,
