@@ -19,7 +19,7 @@ BEGIN
     RAISE EXCEPTION 'MTP2 output integer is out of range';
   END IF;
   result:=decode(repeat('00',w),'hex');
-  FOR i IN 0..w-1 LOOP result:=set_byte(result,i,mod(v,256)::integer); v:=trunc(v/256); END LOOP;
+  FOR i IN 0..w-1 LOOP result:=set_byte(result,i,mod(v,256)::integer); v:=div(v,256); END LOOP;
   RETURN result;
 END $$;
 
