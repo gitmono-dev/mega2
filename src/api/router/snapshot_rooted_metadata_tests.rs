@@ -10,6 +10,9 @@ use crate::jupiter::storage::qualified_metadata_family::{
 #[path = "snapshot_reader_retention_tests.rs"]
 mod reader_retention;
 
+#[path = "snapshot_descriptor_wire_tests.rs"]
+mod descriptor_wire;
+
 async fn q_schema(fixture: &Fixture) -> String {
     fixture
         .state

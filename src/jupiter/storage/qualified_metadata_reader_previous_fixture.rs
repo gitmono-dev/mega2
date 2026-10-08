@@ -259,9 +259,40 @@ pub(crate) async fn restore_retention(
     keep_q: bool,
     legacy_shape: bool,
 ) {
-    use crate::jupiter::migration::qualified_native_runtime_upgrade::{
-        RETENTION_IMPLEMENTATION, render_prior_family,
-    };
+    restore_reader_family(
+        core,
+        q_schema,
+        keep_q,
+        legacy_shape,
+        crate::jupiter::migration::qualified_native_runtime_upgrade::RETENTION_IMPLEMENTATION,
+    )
+    .await;
+}
+
+/// Restore the exact 87b runtime family without rebuilding any owned history.
+pub(crate) async fn restore_native_runtime(
+    core: &DatabaseConnection,
+    q_schema: &str,
+    keep_q: bool,
+) {
+    restore_reader_family(
+        core,
+        q_schema,
+        keep_q,
+        false,
+        crate::jupiter::migration::qualified_native_runtime_upgrade::NATIVE_RUNTIME_IMPLEMENTATION,
+    )
+    .await;
+}
+
+async fn restore_reader_family(
+    core: &DatabaseConnection,
+    q_schema: &str,
+    keep_q: bool,
+    legacy_shape: bool,
+    implementation: &str,
+) {
+    use crate::jupiter::migration::qualified_native_runtime_upgrade::render_prior_family;
 
     assert!(!legacy_shape || !keep_q);
     let txn = core.begin().await.unwrap();
@@ -290,7 +321,7 @@ pub(crate) async fn restore_retention(
         oid,
         &namespace,
         &storage,
-        RETENTION_IMPLEMENTATION,
+        implementation,
     )
     .unwrap();
     txn.execute_unprepared(&format!("SET LOCAL search_path={q},pg_catalog,pg_temp"))
@@ -298,6 +329,7 @@ pub(crate) async fn restore_retention(
         .unwrap();
     for name in [
         "mst2_metadata_decode_rooted_plan",
+        "mst2_metadata_descriptor",
         "mst2_metadata_dml_barrier",
         "mst2_metadata_gc_enabled",
     ] {
@@ -319,7 +351,7 @@ pub(crate) async fn restore_retention(
         &capture[a..z]
             .replacen("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1)
             .replace("$CORE_SCHEMA$", &c)
-            .replace("$IMPLEMENTATION_SHA$", RETENTION_IMPLEMENTATION),
+            .replace("$IMPLEMENTATION_SHA$", implementation),
     )
     .await
     .unwrap();
@@ -386,7 +418,7 @@ pub(crate) async fn restore_retention(
                 } else {
                     0
                 },
-                "Q-less cc90 fixture must have no history to discard: {name}"
+                "Q-less captured runtime fixture must have no history to discard: {name}"
             );
         }
         let water: i64 = txn
@@ -423,7 +455,7 @@ pub(crate) async fn restore_retention(
     txn.execute_unprepared(&format!("ALTER TABLE {c}.mst2_qualified_family_policy DISABLE TRIGGER mst2_route_family_policy_immutable")).await.unwrap();
     txn.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
         format!("UPDATE {c}.mst2_qualified_family_policy SET implementation_fingerprint=$1,expected_shape=$2,authority_catalog=$3 WHERE singleton=1"),
-        [hex::decode(RETENTION_IMPLEMENTATION).unwrap().into(), old_shape.into(), authority.clone().into()])).await.unwrap();
+        [hex::decode(implementation).unwrap().into(), old_shape.into(), authority.clone().into()])).await.unwrap();
     txn.execute_unprepared(&format!("ALTER TABLE {c}.mst2_qualified_family_policy ENABLE TRIGGER mst2_route_family_policy_immutable")).await.unwrap();
     if let Some(full) = &full {
         txn.execute_unprepared(&format!(
@@ -433,10 +465,10 @@ pub(crate) async fn restore_retention(
              ALTER TABLE {c}.mst2_metadata_namespace DISABLE TRIGGER mst2_route_immutable")).await.unwrap();
         txn.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
             format!("UPDATE {q}.mst2_metadata_family_identity SET implementation_fingerprint=$1 WHERE singleton=1"),
-            [hex::decode(RETENTION_IMPLEMENTATION).unwrap().into()])).await.unwrap();
+            [hex::decode(implementation).unwrap().into()])).await.unwrap();
         txn.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
             format!("UPDATE {c}.mst2_metadata_namespace SET implementation_fingerprint=$1,catalog_fingerprint=$2 WHERE namespace_uuid=$3::uuid"),
-            [hex::decode(RETENTION_IMPLEMENTATION).unwrap().into(), full.clone().into(), namespace.into()])).await.unwrap();
+            [hex::decode(implementation).unwrap().into(), full.clone().into(), namespace.into()])).await.unwrap();
         txn.execute_unprepared(&format!(
             "ALTER TABLE {q}.mst2_metadata_family_identity ENABLE TRIGGER mst2_00_family_barrier;
              ALTER TABLE {q}.mst2_metadata_family_identity ENABLE TRIGGER mst2_metadata_identity_immutable;

@@ -156,6 +156,7 @@ mod m20261008_000200_add_mst2_rooted_qualified_family;
 mod m20261008_000300_add_mst2_chunk_map_retention;
 mod m20261008_000400_add_mst2_reader_retention;
 mod m20261008_000500_fix_mst2_native_runtime;
+mod m20261008_000600_fix_mst2_descriptor_wire;
 pub(crate) mod qualified_native_runtime_upgrade;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
@@ -169,9 +170,15 @@ pub(crate) async fn test_upgrade_reader_retention(
     use sea_orm_migration::{MigrationTrait, SchemaManager};
 
     let txn = connection.begin().await?;
-    let result = m20261008_000400_add_mst2_reader_retention::Migration
-        .up(&SchemaManager::new(&txn))
-        .await;
+    let result = async {
+        m20261008_000400_add_mst2_reader_retention::Migration
+            .up(&SchemaManager::new(&txn))
+            .await?;
+        m20261008_000600_fix_mst2_descriptor_wire::Migration
+            .up(&SchemaManager::new(&txn))
+            .await
+    }
+    .await;
     match result {
         Ok(()) => txn.commit().await,
         Err(error) => {
@@ -189,9 +196,15 @@ pub(crate) async fn test_upgrade_native_runtime(
     use sea_orm_migration::{MigrationTrait, SchemaManager};
 
     let txn = connection.begin().await?;
-    let result = m20261008_000500_fix_mst2_native_runtime::Migration
-        .up(&SchemaManager::new(&txn))
-        .await;
+    let result = async {
+        m20261008_000500_fix_mst2_native_runtime::Migration
+            .up(&SchemaManager::new(&txn))
+            .await?;
+        m20261008_000600_fix_mst2_descriptor_wire::Migration
+            .up(&SchemaManager::new(&txn))
+            .await
+    }
+    .await;
     match result {
         Ok(()) => txn.commit().await,
         Err(error) => {
@@ -341,6 +354,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261008_000300_add_mst2_chunk_map_retention::Migration),
             Box::new(m20261008_000400_add_mst2_reader_retention::Migration),
             Box::new(m20261008_000500_fix_mst2_native_runtime::Migration),
+            Box::new(m20261008_000600_fix_mst2_descriptor_wire::Migration),
         ]
     }
 }
@@ -1250,61 +1264,33 @@ mod tests {
     #[tokio::test]
     async fn import_repo_alias_rows_canonicalized() {
         let names = migration_names();
+        let expected = [
+            "m20260923_000200_canonicalize_import_repo_paths",
+            "m20260925_000100_media_paging",
+            "m20261005_000100_add_mst2_publication_request_digest",
+            "m20261005_000200_add_mst2_native_head",
+            "m20261005_000100_add_mst2_retention_durability",
+            "m20261005_000200_harden_mst2_retention_graph",
+            "m20261005_000300_add_mst2_metadata_install",
+            VIEW_MIGRATION_NAME,
+            "m20261007_000100_add_mst2_snapshot_sessions",
+            "m20261007_000200_add_mst2_metadata_generations",
+            "m20261007_000300_add_mst2_metadata_lifetime_history",
+            "m20261007_000400_add_mst2_qualified_metadata_gc",
+            "m20261007_000500_add_mst2_install_capability",
+            "m20261007_000600_add_mst2_storage_routes",
+            "m20261008_000100_add_mst2_chunk_maps",
+            "m20261008_000200_add_mst2_rooted_qualified_family",
+            "m20261008_000300_add_mst2_chunk_map_retention",
+            "m20261008_000400_add_mst2_reader_retention",
+            "m20261008_000500_fix_mst2_native_runtime",
+            "m20261008_000600_fix_mst2_descriptor_wire",
+        ]
+        .map(str::to_owned);
         assert_eq!(
-            &names[names.len() - 18..names.len() - 9],
-            &[
-                "m20260923_000200_canonicalize_import_repo_paths".to_string(),
-                "m20260925_000100_media_paging".to_string(),
-                "m20261005_000100_add_mst2_publication_request_digest".to_string(),
-                "m20261005_000200_add_mst2_native_head".to_string(),
-                "m20261005_000100_add_mst2_retention_durability".to_string(),
-                "m20261005_000200_harden_mst2_retention_graph".to_string(),
-                "m20261005_000300_add_mst2_metadata_install".to_string(),
-                VIEW_MIGRATION_NAME.to_string(),
-                "m20261007_000100_add_mst2_snapshot_sessions".to_string(),
-            ],
-            "native retention, metadata installation and view tables follow media paging"
-        );
-        assert_eq!(
-            &names[names.len() - 9],
-            "m20261007_000200_add_mst2_metadata_generations"
-        );
-        assert_eq!(
-            &names[names.len() - 8],
-            "m20261007_000300_add_mst2_metadata_lifetime_history"
-        );
-        assert_eq!(
-            &names[names.len() - 7],
-            "m20261007_000400_add_mst2_qualified_metadata_gc"
-        );
-        assert_eq!(
-            &names[names.len() - 6],
-            "m20261007_000500_add_mst2_install_capability"
-        );
-        assert_eq!(
-            &names[names.len() - 5],
-            "m20261007_000600_add_mst2_storage_routes"
-        );
-        assert_eq!(
-            &names[names.len() - 5],
-            "m20261008_000100_add_mst2_chunk_maps"
-        );
-        assert_eq!(
-            &names[names.len() - 4],
-            "m20261008_000200_add_mst2_rooted_qualified_family"
-        );
-
-        assert_eq!(
-            &names[names.len() - 3],
-            "m20261008_000300_add_mst2_chunk_map_retention"
-        );
-        assert_eq!(
-            &names[names.len() - 2],
-            "m20261008_000400_add_mst2_reader_retention"
-        );
-        assert_eq!(
-            names.last().unwrap(),
-            "m20261008_000500_fix_mst2_native_runtime"
+            &names[names.len() - expected.len()..],
+            expected.as_slice(),
+            "the complete native migration suffix follows media paging in registered order"
         );
         let db = alias_db().await;
         insert_repo(&db, 1, "/third-party//a").await;

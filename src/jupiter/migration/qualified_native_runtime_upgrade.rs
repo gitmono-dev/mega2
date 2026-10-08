@@ -13,8 +13,11 @@ pub(crate) const PREVIOUS_IMPLEMENTATION: &str =
 
 pub(crate) const RETENTION_IMPLEMENTATION: &str =
     "900e7a340e7365c9f31995e070edbfe2076b870ec09fe89e4dc43e56f26b91ab";
+pub(crate) const NATIVE_RUNTIME_IMPLEMENTATION: &str =
+    "87b104e6b5593b1d6e5904a4e4be94e6ba0814dbb2c25dd8b38a0ea950d42307";
 const PREVIOUS_DECODER: &str = include_str!("m20261008_000500_previous_rooted_decoder.sql");
 const PREVIOUS_READERS: &str = include_str!("m20261008_000500_previous_reader_family.sql");
+const PREVIOUS_DESCRIPTOR: &str = include_str!("m20261008_000600_previous_descriptor.sql");
 
 fn rejected(message: &str) -> DbErr {
     DbErr::Custom(message.into())
@@ -157,21 +160,33 @@ pub(crate) fn render_prior_family(
     storage: &str,
     implementation: &str,
 ) -> Result<String, DbErr> {
-    if ![PREVIOUS_IMPLEMENTATION, RETENTION_IMPLEMENTATION].contains(&implementation) {
+    if ![
+        PREVIOUS_IMPLEMENTATION,
+        RETENTION_IMPLEMENTATION,
+        NATIVE_RUNTIME_IMPLEMENTATION,
+    ]
+    .contains(&implementation)
+    {
         return Err(rejected("native runtime template version is unsupported"));
     }
     let decoder = PREVIOUS_DECODER.replace("\r\n", "\n");
     let readers = PREVIOUS_READERS.replace("\r\n", "\n");
+    let descriptor = PREVIOUS_DESCRIPTOR.replace("\r\n", "\n");
     if hex::encode(Sha256::digest(decoder.as_bytes()))
         != "f14d024cfb821f9d6b7348ab9b69f48c09862ff7dd3fbb2b360b253f949e35a9"
         || hex::encode(Sha256::digest(readers.as_bytes()))
             != "ec9b422440da111e5e047e1a4c85a28a33053cf0e320a56ea944ebefeaa8ea37"
+        || hex::encode(Sha256::digest(descriptor.as_bytes()))
+            != "c833666fcb1b3c9fd0bf186e5ad732f5e8b9b9dbf4360ce8d93a0d91d17d5c1a"
     {
         return Err(rejected("native runtime historical source capture changed"));
     }
     let mut source =
         render_family(core, core_oid, q, q_oid, namespace, storage).replace("\r\n", "\n");
-    replace_function(&mut source, "mst2_metadata_decode_rooted_plan", &decoder)?;
+    replace_function(&mut source, "mst2_metadata_descriptor", &descriptor)?;
+    if implementation != NATIVE_RUNTIME_IMPLEMENTATION {
+        replace_function(&mut source, "mst2_metadata_decode_rooted_plan", &decoder)?;
+    }
     if implementation == PREVIOUS_IMPLEMENTATION {
         let start = source
             .find("CREATE TABLE mst2_metadata_reader_operation (")
@@ -305,6 +320,21 @@ pub(super) async fn upgrade(
     manager: &SchemaManager<'_>,
     allow_previous_readers: bool,
 ) -> Result<(), DbErr> {
+    upgrade_to(manager, allow_previous_readers, false).await
+}
+
+pub(super) async fn upgrade_descriptor(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    // Finish an interrupted reader/runtime upgrade before the independent
+    // descriptor repair, without replaying reader DDL on an admitted family.
+    upgrade(manager, true).await?;
+    upgrade_to(manager, false, true).await
+}
+
+async fn upgrade_to(
+    manager: &SchemaManager<'_>,
+    allow_previous_readers: bool,
+    repair_descriptor: bool,
+) -> Result<(), DbErr> {
     if manager.get_database_backend() != DbBackend::Postgres {
         return Err(rejected(
             "qualified reader retention requires primary PostgreSQL",
@@ -368,15 +398,24 @@ pub(super) async fn upgrade(
         format!("SELECT implementation_fingerprint,expected_shape,authority_catalog FROM {c}.mst2_qualified_family_policy WHERE singleton=1")))
         .await?.ok_or_else(|| rejected("reader migration trusted policy is missing"))?;
     let implementation: Vec<u8> = policy.try_get("", "implementation_fingerprint")?;
-    let current = implementation_fingerprint();
+    let compiled = implementation_fingerprint();
+    let runtime =
+        hex::decode(NATIVE_RUNTIME_IMPLEMENTATION).map_err(|error| rejected(&error.to_string()))?;
+    let current = if repair_descriptor {
+        compiled.clone()
+    } else {
+        runtime.clone()
+    };
     let previous =
         hex::decode(PREVIOUS_IMPLEMENTATION).map_err(|error| rejected(&error.to_string()))?;
     let retention =
         hex::decode(RETENTION_IMPLEMENTATION).map_err(|error| rejected(&error.to_string()))?;
-    if implementation != current
-        && implementation != retention
-        && !(allow_previous_readers && implementation == previous)
-    {
+    let supported = implementation == compiled
+        || implementation == runtime
+        || !repair_descriptor
+            && (implementation == retention
+                || allow_previous_readers && implementation == previous);
+    if !supported {
         return Err(rejected(
             "reader migration refuses an unsupported prior implementation",
         ));
@@ -468,7 +507,7 @@ pub(super) async fn upgrade(
             "native runtime migration prior policy shape is not trusted",
         ));
     }
-    if implementation == current {
+    if implementation == compiled || implementation == current {
         return Ok(());
     }
 
@@ -490,16 +529,34 @@ pub(super) async fn upgrade(
     if let Some(family) = &family {
         let q = identifier(&family.schema);
         connection.execute_unprepared(&format!("LOCK TABLE {q}.mst2_metadata_reader_operation,{q}.mst2_metadata_root_anchor IN ACCESS EXCLUSIVE MODE")).await?;
-        let rendered = render_family(
-            &core,
-            core_oid,
-            &family.schema,
-            family.oid,
-            &family.namespace,
-            &family.storage,
-        );
+        let rendered = if repair_descriptor {
+            render_family(
+                &core,
+                core_oid,
+                &family.schema,
+                family.oid,
+                &family.namespace,
+                &family.storage,
+            )
+        } else {
+            render_prior_family(
+                &core,
+                core_oid,
+                &family.schema,
+                family.oid,
+                &family.namespace,
+                &family.storage,
+                NATIVE_RUNTIME_IMPLEMENTATION,
+            )?
+        };
         let mut functions = String::new();
-        let replacements: &[&str] = if implementation == previous {
+        let replacements: &[&str] = if repair_descriptor {
+            &[
+                "mst2_metadata_descriptor",
+                "mst2_metadata_dml_barrier",
+                "mst2_metadata_gc_enabled",
+            ]
+        } else if implementation == previous {
             &[
                 "mst2_metadata_decode_rooted_plan",
                 "mst2_metadata_dml_barrier",
