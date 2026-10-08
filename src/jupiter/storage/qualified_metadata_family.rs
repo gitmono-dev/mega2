@@ -1,5 +1,7 @@
 //! Captured physical Q provisioning and the sealed rooted production repository.
 
+use std::sync::OnceLock;
+
 use mst2_codec::metapage::{HEADER_LEN, PAGE_MAX_BYTES};
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, IsolationLevel, Statement,
@@ -132,54 +134,60 @@ fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 pub(crate) fn implementation_fingerprint() -> Vec<u8> {
-    let mut hash = Sha256::new();
-    hash.update(b"mega.mst2.rooted-qualified-implementation.v1\0");
-    // Length-prefix every source component so source selection and proof
-    // revisions cannot change while retaining an accepted physical stamp.
-    for (name, bytes) in [
-        ("family", FAMILY.as_bytes()),
-        ("family-ddl", FAMILY_SQL.as_bytes()),
-        ("canonical-proof-revision-1", CANONICAL_SQL.as_bytes()),
-        ("indexed-source-read-revision-1", SOURCE_READ_SQL.as_bytes()),
-        ("captured-source-revision-1", SOURCE_REVISION_SQL.as_bytes()),
-        ("rooted-collector-revision-1", GC_SQL.as_bytes()),
-        (
-            "bounded-reader-lifecycle-revision-1",
-            READER_LIFECYCLE_SQL.as_bytes(),
-        ),
-        ("typed-certificate-revision-1", CERTIFICATES_SQL.as_bytes()),
-        (
-            "source-attestation-and-anchor-revision-1",
-            ANCHORS_SQL.as_bytes(),
-        ),
-        ("rooted-plan-and-bindings-revision-1", ROOTED_SQL.as_bytes()),
-        (
-            "rooted-session-and-reader-revision-1",
-            SERVING_SQL.as_bytes(),
-        ),
-        (
-            "rooted-physical-route-revision-1",
-            include_bytes!("../migration/m20261008_000200_rooted_routes.sql").as_slice(),
-        ),
-        (
-            "authority-catalog-selector",
-            include_bytes!("qualified_family_catalog.sql").as_slice(),
-        ),
-        (
-            "normalized-family-shape",
-            include_bytes!("qualified_family_shape.sql").as_slice(),
-        ),
-        (
-            "initial-core-registration",
-            include_bytes!("../migration/m20261008_000200_rooted_qualified_family.sql").as_slice(),
-        ),
-    ] {
-        hash.update((name.len() as u64).to_le_bytes());
-        hash.update(name.as_bytes());
-        hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(bytes);
-    }
-    hash.finalize().to_vec()
+    static FINGERPRINT: OnceLock<[u8; 32]> = OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            let mut hash = Sha256::new();
+            hash.update(b"mega.mst2.rooted-qualified-implementation.v1\0");
+            // Length-prefix every source component so source selection and proof
+            // revisions cannot change while retaining an accepted physical stamp.
+            for (name, bytes) in [
+                ("family", FAMILY.as_bytes()),
+                ("family-ddl", FAMILY_SQL.as_bytes()),
+                ("canonical-proof-revision-1", CANONICAL_SQL.as_bytes()),
+                ("indexed-source-read-revision-1", SOURCE_READ_SQL.as_bytes()),
+                ("captured-source-revision-1", SOURCE_REVISION_SQL.as_bytes()),
+                ("rooted-collector-revision-1", GC_SQL.as_bytes()),
+                (
+                    "bounded-reader-lifecycle-revision-1",
+                    READER_LIFECYCLE_SQL.as_bytes(),
+                ),
+                ("typed-certificate-revision-1", CERTIFICATES_SQL.as_bytes()),
+                (
+                    "source-attestation-and-anchor-revision-1",
+                    ANCHORS_SQL.as_bytes(),
+                ),
+                ("rooted-plan-and-bindings-revision-1", ROOTED_SQL.as_bytes()),
+                (
+                    "rooted-session-and-reader-revision-1",
+                    SERVING_SQL.as_bytes(),
+                ),
+                (
+                    "rooted-physical-route-revision-1",
+                    include_bytes!("../migration/m20261008_000200_rooted_routes.sql").as_slice(),
+                ),
+                (
+                    "authority-catalog-selector",
+                    include_bytes!("qualified_family_catalog.sql").as_slice(),
+                ),
+                (
+                    "normalized-family-shape",
+                    include_bytes!("qualified_family_shape.sql").as_slice(),
+                ),
+                (
+                    "initial-core-registration",
+                    include_bytes!("../migration/m20261008_000200_rooted_qualified_family.sql")
+                        .as_slice(),
+                ),
+            ] {
+                hash.update((name.len() as u64).to_le_bytes());
+                hash.update(name.as_bytes());
+                hash.update((bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            }
+            hash.finalize().into()
+        })
+        .to_vec()
 }
 pub(crate) fn render_family(
     core_schema: &str,
