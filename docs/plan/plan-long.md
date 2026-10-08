@@ -123,7 +123,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | PT-11 | Vault 安全工程收尾 | P2 | 实施中 | file 持久化 audit sink、可选 fail-closed、backup/restore、unseal share rekey 已交付；仍缺 KEK 轮换（无 RustyVault 原语）、异地/HTTP audit sink、外部托管 root recovery 与格式版本策略；**依赖形态**（vendored → crates.io `libvault` 0.3.0 + UN-31 只读模式集成层重建）已由 [`plan-20260820.md`](plan-20260820.md) 于 2026-08-21 交付，本 PT 安全收尾缺口不变 | `mega/vault/`（基线对照） | [`plan-20260820.md`](plan-20260820.md)（依赖形态；非 KEK/审计 sink） | 2026-08-21 |
 | PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已实现；**身份键迁移**已由 [`plan-20260812.md`](plan-20260812.md) UN-05 handoff 移交本 PT（DEP-04 outgoing，实际移交 **2026-08-17**；DEFER-UN-04 八项承接约束）；Mega #2145 账户审批、#2147 Cedar 管理及 #2165..#2169 的 identity/Cedar reviewer 域扩大全量 moon↔`apps/next-app` 对照范围；monoui `mega2` 分支 pin 须执行期确认；全量对照仍候选 | monoui `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW）；handoff [`plan-20260812.md`](plan-20260812.md) UN-05/DEP-04 | 2026-08-17 |
 | PT-13 | storage-only 统一推送密文（同一 `[[git.push_tokens]]` 用于 HTTP 与 SSH receive-pack） | P1 | 候选 | 查找与身份已统一：HTTP 写 / SSH 读共用 `lookup_push_token`。SSH **写**仍被 TP-20 关掉（`DEFER-SP-02`）。本方案在 `push_auth=token` 下显式打开 SSH receive-pack，不新开第二套凭据，也不把 `none` 的匿名写扩到 SSH | N/A（mega2 原生） | 前置事实 [`plan-20260905.md`](plan-20260905.md) TP-20、[`plan-20260908.md`](plan-20260908.md) SP-* / `DEFER-SP-02`；尚无承接日期计划 | 2026-09-16 |
-| PT-14 | trunk 历史只读投影视图 | P0 | 已排期 | 当前缺少根链、过滤器、ViewRepo 和注册准入；P0 按 [`plan-20261002.md`](plan-20261002.md) 执行。P1–P3 的 shallow、在线回收、非线性根链、视图写入与其他延后范围继续留在本轨道 | N/A（mega2 原生） | [`plan-20261002.md`](plan-20261002.md)（P0）；长期剩余见本节 | 2026-10-05 |
+| PT-14 | trunk 历史只读投影视图 | P0 | 实施中 | P0 已由 [`plan-20261002.md`](plan-20261002.md) 交付；长期剩余：DEFER-HP-01、DEFER-HP-02、DEFER-HP-03、DEFER-HP-04、DEFER-HP-05、DEFER-HP-06、DEFER-HP-07、DEFER-HP-08、DEFER-HP-09、DEFER-HP-10、DEFER-HP-11、DEFER-HP-12、DEFER-HP-13、DEFER-HP-14、DEFER-HP-19。Docker 远端结果独立由 DEFER-HP-20 承接 | N/A（mega2 原生） | [`plan-20261002.md`](plan-20261002.md)（P0）；P1 尚无承接日期计划 | 2026-10-08 |
 
 ## 工程安全基线
 
@@ -716,7 +716,7 @@ mega2 原生能力，Mega 证据为 `N/A`。P0 的设计契约见 [`../refactori
 
 ### 现状缺口
 
-`src/ceres/pack/materialize.rs` 只提供子路径首次物化后的历史，`src/ceres/` 没有过滤器代数与 ViewRepo；`src/jupiter/migration/`、`src/jupiter/service/` 和 `src/api/router/` 没有视图表、追赶和注册入口。`tests/integration_git_cli.rs`、`tests/integration_git_ssh.rs` 没有视图 URL 的真实客户端矩阵，尚不能证明完整前史或故障应答。
+P0 已交付过滤器代数（`src/ceres/view/filter/`）、ViewRepo（`src/ceres/pack/view_repo.rs`）、视图表（`src/jupiter/migration/m20261006_000100_add_view_tables.rs`）、追赶与 worker（`src/jupiter/service/view_projection_service.rs`、`src/jupiter/service/view_worker.rs`）及注册入口（`src/api/router/view_router.rs`）；`tests/integration_git_cli.rs`、`tests/integration_git_ssh.rs` 和 `tests/integration_views.rs` 覆盖真实客户端与故障应答。长期缺口见 PT-14 总览行所列 P1–P3 延后项；Docker 远端结果另由本计划 `DEFER-HP-20` 核对。
 
 ### 选定方案
 
@@ -736,7 +736,8 @@ mega2 原生能力，Mega 证据为 `N/A`。P0 的设计契约见 [`../refactori
 
 ### 审计证据、真实缺口与提升条件
 
-最小可验证切入点是纯计算过滤器与线性投影：用 Josh 正向用例和重建哈希先证明对象语义，再接数据库与协议。当前代码与测试缺口见上文，风险是根链分叉或缺对象被误当空视图，以及跨副本注册竞争；进入后续范围前须复核 P0 的故障恢复、性能证据和对现有 trunk 路径的回归。
+- **P0 交付证据**：[2026-10-08 收口计划](plan-20261002.md)记录 36 张任务卡、34 个独立版本，最后版本 `v0.42.25` 的 tag 与非草稿 GitHub Release；HP-24 基准与 HP-25 Libra smoke 均在计划中留证。
+- **真实缺口与提升条件**：P1 尚无承接日期计划；按总览行列明的 `DEFER-HP-*` 逐项立项。进入 P1 前复核真实使用、HP-24 基准、故障恢复与既有 trunk 路径回归。
 
 ### 依赖与顺序
 
@@ -795,7 +796,7 @@ PT-13 不进入 Mega 移植阶段。前置事实（HTTP token 写、SSH token �
 
 ### 持续轨道：trunk 历史只读投影视图
 
-PT-14 的 P0 已进入 [`plan-20261002.md`](plan-20261002.md)。持续跟踪该计划的验收与发布证据，并在 P0 收口后按真实使用和基准结果安排 P1–P3 的延后能力。
+PT-14 的 P0 已按 [`plan-20261002.md`](plan-20261002.md) 收口。下一动作是依据真实使用与 HP-24 基准结果为 P1 立项日期计划，再逐项审定 P2–P3 延后能力。
 
 ## 依赖图
 
@@ -910,7 +911,7 @@ flowchart TD
 | [`plan-20260916.md`](plan-20260916.md) | N/A（monorepo 路径 → GitHub 出站基础设施；非 Mega PT） | **已完成（2026-09-20）** | 24 张活动卡 `done`/`complete`；Q1–Q8 全 go。执行链路移交 [`plan-20260920.md`](plan-20260920.md)。`DEP-02` 已关闭（模板改回 Libra）。 |
 | [`plan-20260920.md`](plan-20260920.md) | N/A（出站同步执行；承接 60916 `DEP-01`） | **新建（0 实现）** | OX-01..05 `pending`：worker / reported pack / operator / `vault_create_once`。不改直播 ACK。 |
 | [`plan-20260923.md`](plan-20260923.md) | N/A（首次使用路径策略与 ImportRepo 生命周期；非 Mega PT，不新增 PT 编号） | **已完成**（FU-01..FU-23 全部 done/complete，收口 v0.40.12 / `4bf6cc2`；「计划完成门」于 2026-09-26 在 v0.40.13 最终树补跑通过） | GitHub issues #25–#29：#25/#29 路径策略与开通（`root_dirs` / `import_dir` 形状校验、路径策略错误域、首推策略、`mega2 path provision`）；#28 合成 commit 签名头与帧；#26 ImportRepo 增量推送（ref CAS、只写 ref 的更新、存量别名路径规范化）；#27 ImportRepo 清理（台账、原子 detach、元数据清扫、写路径存活栅栏、`POST /api/v1/import-repo/remove`、运维 CLI `mega2 import-repo remove`）。长期剩余见该计划 `DEFER-FU-*`（无对象 GC、SIGTERM 等信号、类型化可重试错误、无分支存量挂载等）。 |
-| [`plan-20261002.md`](plan-20261002.md) | PT-14（trunk 历史只读投影 P0） | **执行中** | 35 张任务卡按依赖实施；P1–P3 留在 PT-14 长期轨道，验收以本计划的完成判据为准。 |
+| [`plan-20261002.md`](plan-20261002.md) | PT-14（trunk 历史只读投影 P0） | **已完成** | 36 张任务卡已完成；34 个独立版本均有 tag 与非草稿 GitHub Release；六张卡的历史 Docker D 组绿灯保留，其余 29 张发布卡依 `EX-HP-01` 延期，Docker 发布不作为本计划完成证据；P1–P3 留在 PT-14。 |
 
 ## 已替代 / 不采纳 / 已实现摘要
 
