@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     callisto::{
-        authz_notify_outbox, mega_refs, push_queue, queue_control,
+        authz_notify_outbox, push_queue, queue_control,
         sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
     },
     common::{errors::MegaError, utils::MEGA_BRANCH_NAME},
@@ -101,6 +101,7 @@ pub struct MonoWriteLockHolder {
 #[derive(Clone)]
 pub struct PushQueueStorage {
     base: BaseStorage,
+    native_publication_enabled: bool,
 }
 
 impl Deref for PushQueueStorage {
@@ -123,7 +124,15 @@ pub struct EnqueueParams<'a> {
 
 impl PushQueueStorage {
     pub fn new(base: BaseStorage) -> Self {
-        Self { base }
+        Self {
+            base,
+            native_publication_enabled: false,
+        }
+    }
+
+    pub(crate) fn with_native_publication(mut self, enabled: bool) -> Self {
+        self.native_publication_enabled = enabled;
+        self
     }
 
     /// B1: lock `queue_control`, conditional INSERT, classify on zero rows.
@@ -241,8 +250,9 @@ impl PushQueueStorage {
                     });
                 }
                 // operation_states race: winner already committed — classify by read.
+                let replay_txn = self.get_connection().begin().await?;
                 if let Some(existing) = push_queue::Entity::find()
-                    .filter(push_queue::Column::Kind.eq(kind))
+                    .filter(push_queue::Column::Kind.eq(kind.clone()))
                     .filter(push_queue::Column::Path.eq(path))
                     .filter(push_queue::Column::OperationId.eq(operation_id))
                     .filter(push_queue::Column::Status.is_in([
@@ -250,9 +260,23 @@ impl PushQueueStorage {
                         PushQueueStatusEnum::Running,
                         PushQueueStatusEnum::Done,
                     ]))
-                    .one(self.get_connection())
+                    .one(&replay_txn)
                     .await?
                 {
+                    if matches!(&kind, PushQueueKindEnum::Push | PushQueueKindEnum::Merge) {
+                        let mut candidate = existing.clone();
+                        candidate.old_id = old_id.to_owned();
+                        candidate.new_id = new_id.to_owned();
+                        candidate.requester = requester.map(str::to_owned);
+                        candidate.payload = payload.clone();
+                        crate::jupiter::storage::mono_storage::MonoStorage {
+                            base: self.base.clone(),
+                        }
+                        .validate_queue_publication_replay_in_txn(&replay_txn, &candidate)
+                        .await
+                        .map_err(|error| MegaError::Other(error.to_string()))?;
+                    }
+                    replay_txn.commit().await?;
                     return match existing.status {
                         PushQueueStatusEnum::Done => Ok(EnqueueOutcome::Replay {
                             id: existing.id,
@@ -264,6 +288,7 @@ impl PushQueueStorage {
                         _ => unreachable!("filter restricts status"),
                     };
                 }
+                replay_txn.rollback().await?;
                 return Err(MegaError::Other(format!(
                     "unique conflict without classifiable row: {msg}"
                 )));
@@ -283,6 +308,29 @@ impl PushQueueStorage {
                 Some(outcome) => {
                     match &outcome {
                         EnqueueOutcome::Adopted { .. } | EnqueueOutcome::Replay { .. } => {
+                            if matches!(&kind, PushQueueKindEnum::Push | PushQueueKindEnum::Merge) {
+                                let id = match &outcome {
+                                    EnqueueOutcome::Adopted { id }
+                                    | EnqueueOutcome::Replay { id, .. } => *id,
+                                    _ => unreachable!("adopt or replay"),
+                                };
+                                let mut candidate = push_queue::Entity::find_by_id(id)
+                                    .one(&txn)
+                                    .await?
+                                    .ok_or_else(|| {
+                                        MegaError::Other("queue replay row missing".into())
+                                    })?;
+                                candidate.old_id = old_id.to_owned();
+                                candidate.new_id = new_id.to_owned();
+                                candidate.requester = requester.map(str::to_owned);
+                                candidate.payload = payload.clone();
+                                crate::jupiter::storage::mono_storage::MonoStorage {
+                                    base: self.base.clone(),
+                                }
+                                .validate_queue_publication_replay_in_txn(&txn, &candidate)
+                                .await
+                                .map_err(|error| MegaError::Other(error.to_string()))?;
+                            }
                             txn.commit().await?;
                         }
                         EnqueueOutcome::Rejected { .. } => {
@@ -722,66 +770,63 @@ impl PushQueueStorage {
             return Ok(ClaimOutcome::HardStopped);
         }
 
-        let claimed = txn
-            .execute_raw(Statement::from_sql_and_values(
+        // One statement snapshot supplies both the successful claim and its
+        // root/publication token. Updating the same queue row twice in a
+        // data-modifying CTE is deliberately avoided.
+        let sql = format!(
+            r#"
+            WITH {native_ctes}, claimed AS (
+              UPDATE push_queue q
+                 SET status = 'Running'::push_queue_status_enum,
+                     started_at = now(), heartbeat_at = now(), updated_at = now(),
+                     expected_commit_hash = observation.root_commit,
+                     expected_tree_hash = observation.root_tree,
+                     expected_native_sequence = observation.sequence,
+                     expected_native_epoch = observation.writer_epoch,
+                     expected_native_certificate = observation.certificate_receipt_id
+                FROM native_observation observation
+               WHERE q.id = $2 AND q.status = 'Queued'::push_queue_status_enum
+                 AND (SELECT NOT hard_stopped FROM queue_control WHERE id = 1)
+                 AND NOT EXISTS (SELECT 1 FROM push_queue WHERE status = 'Running'::push_queue_status_enum)
+                 AND q.id = (SELECT min(id) FROM push_queue WHERE status = 'Queued'::push_queue_status_enum)
+              RETURNING q.id
+            )
+            SELECT observation.* FROM native_observation observation
+              CROSS JOIN claimed
+        "#,
+            native_ctes = super::native_publication_storage::NATIVE_OBSERVATION_CTES
+                .replace("h.namespace = '/'", "h.namespace = '/' AND $3")
+        );
+        let observations = txn
+            .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                r#"
-                UPDATE push_queue
-                   SET status = 'Running'::push_queue_status_enum,
-                       started_at = now(),
-                       heartbeat_at = now(),
-                       updated_at = now()
-                 WHERE id = $1
-                   AND status = 'Queued'::push_queue_status_enum
-                   AND (SELECT NOT hard_stopped FROM queue_control WHERE id = 1)
-                   AND NOT EXISTS (
-                        SELECT 1 FROM push_queue
-                         WHERE status = 'Running'::push_queue_status_enum
-                   )
-                   AND id = (
-                        SELECT min(id) FROM push_queue
-                         WHERE status = 'Queued'::push_queue_status_enum
-                   )
-                "#,
-                [Value::from(id)],
+                sql,
+                [
+                    MEGA_BRANCH_NAME.into(),
+                    id.into(),
+                    self.native_publication_enabled.into(),
+                ],
             ))
             .await?;
-
-        if claimed.rows_affected() == 0 {
+        if observations.is_empty() {
             txn.rollback().await?;
             return Ok(ClaimOutcome::Missed);
         }
-
-        // Snapshot root AFTER the claim UPDATE succeeds (still in this txn).
-        // Ordering matters:
-        // - Before UPDATE: a legitimate predecessor B3 can commit Done + new
-        //   root in the gap → stale expected_* → false QueueBypassDetected.
-        // - FOR SHARE before UPDATE: blocks admissions while a writer holds
-        //   the root row exclusively (stalls past wait_timeout).
-        // - After UPDATE: NOT EXISTS(Running) already held, so no legitimate
-        //   B3 can still be writing; plain SELECT needs no row lock.
-        let root = mega_refs::Entity::find()
-            .filter(mega_refs::Column::Path.eq("/"))
-            .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME.to_owned()))
-            .one(&txn)
-            .await?;
-        let (commit, tree) = match root {
-            Some(r) => (Some(r.ref_commit_hash), Some(r.ref_tree_hash)),
-            None => (None, None),
-        };
-
-        txn.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
-            UPDATE push_queue
-               SET expected_commit_hash = $2,
-                   expected_tree_hash = $3,
-                   updated_at = now()
-             WHERE id = $1
-            "#,
-            [Value::from(id), Value::from(commit), Value::from(tree)],
-        ))
-        .await?;
+        if observations.len() != 1 {
+            return Err(MegaError::Other(
+                "ambiguous native claim observation".into(),
+            ));
+        }
+        if self.native_publication_enabled {
+            let observation =
+                super::native_publication_storage::decode_native_observation(&observations[0])
+                    .map_err(|error| MegaError::Other(error.to_string()))?;
+            if observation.head.is_none() {
+                return Err(MegaError::Other(
+                    "native publication is not initialized".into(),
+                ));
+            }
+        }
 
         txn.commit().await?;
         Ok(ClaimOutcome::Claimed)
@@ -899,6 +944,9 @@ impl PushQueueStorage {
                        started_at = NULL,
                        expected_commit_hash = NULL,
                        expected_tree_hash = NULL,
+                       expected_native_sequence = NULL,
+                       expected_native_epoch = NULL,
+                       expected_native_certificate = NULL,
                        heartbeat_at = now(),
                        updated_at = now()
                  WHERE id = $1
@@ -985,6 +1033,9 @@ impl PushQueueStorage {
                        started_at = NULL,
                        expected_commit_hash = NULL,
                        expected_tree_hash = NULL,
+                       expected_native_sequence = NULL,
+                       expected_native_epoch = NULL,
+                       expected_native_certificate = NULL,
                        pending_action = NULL,
                        heartbeat_at = now(),
                        updated_at = now()
@@ -1363,9 +1414,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::jupiter::{
-        migration::apply_migrations, storage::base_storage::StorageConnector,
-        tests::test_db_connection,
+    use crate::{
+        callisto::mega_refs,
+        jupiter::{
+            migration::apply_migrations, storage::base_storage::StorageConnector,
+            tests::test_db_connection,
+        },
     };
 
     async fn storage() -> (tempfile::TempDir, PushQueueStorage) {

@@ -42,6 +42,9 @@ pub struct Model {
     pub expected_commit_hash: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub expected_tree_hash: Option<String>,
+    pub expected_native_sequence: Option<i64>,
+    pub expected_native_epoch: Option<i64>,
+    pub expected_native_certificate: Option<i64>,
     pub pending_action: Option<PushQueuePendingEnum>,
     pub enqueued_at: DateTimeWithTimeZone,
     pub started_at: Option<DateTimeWithTimeZone>,

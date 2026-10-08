@@ -1,25 +1,135 @@
-//! On-the-fly, range-readable chunk projection for one file (spec 07).
-//!
-//! Persistent segment/locator storage is T04/T12 work; this identity slice
-//! builds the MCM2 map and MCL2 leaves from a fixed view's verified blob and
-//! stages the raw bytes in a bounded in-process cache, so a CHUNK request
-//! slices its range out of an already-verified representation rather than
-//! reconstructing the whole Git object per chunk (spec 07 §8).
-//!
-//! The cache is an optimization, never the authority: every projected file
-//! is re-hashed against the `content_id` the fixed view advertised, and a
-//! cache miss simply rebuilds from Git. Entries are addressed by content
-//! digest, never by request path.
+//! Cold full-stream chunk-map verifier. Actual content callers use immutable
+//! source receipts and selected persisted pages, never a digest-only cache.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Mutex, OnceLock},
-};
+use std::sync::Arc;
 
 use mst2_codec::chunkmap::{CHUNK_SIZE, CHUNKS_PER_PAGE, ChunkLeaf, ChunkMap};
 use sha2::{Digest, Sha256};
 
+use super::content_budget::MemoryLease;
 use crate::ceres::snapshot::error::{SnapshotError, SnapshotErrorCode};
+
+#[path = "chunks_stream.rs"]
+mod streaming;
+
+/// Full-stream admission for one exact source, independent of the digest cache.
+/// This opaque value is the only production input to durable map installation.
+pub(crate) struct VerifiedSourceChunkMap {
+    source: ChunkMapSource,
+    projection: ChunkProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChunkMapSource {
+    fact: crate::callisto::mst2_verified_object::Model,
+}
+
+impl ChunkMapSource {
+    pub(crate) fn from_fact(
+        fact: crate::callisto::mst2_verified_object::Model,
+        oid: &str,
+    ) -> Result<Self, SnapshotError> {
+        if fact.id <= 0
+            || fact.storage_domain != "git"
+            || fact.object_kind != "blob"
+            || fact.git_oid != oid
+            || ![40, 64].contains(&oid.len())
+            || !oid
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || fact.state != "VERIFIED"
+            || fact.verification_version
+                != crate::jupiter::storage::mono_storage::MST2_VERIFICATION_VERSION
+            || fact.raw_sha256.len() != 32
+            || fact.size <= 0
+            || fact.size as u64 > 8 * 1024 * 1024 * 1024 * 1024
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "invalid exact chunk map source fact",
+            ));
+        }
+        Ok(Self { fact })
+    }
+
+    pub(crate) fn fact(&self) -> &crate::callisto::mst2_verified_object::Model {
+        &self.fact
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, SnapshotError> {
+        let f = &self.fact;
+        serde_json::to_vec(&(
+            f.id,
+            &f.storage_domain,
+            &f.git_oid,
+            &f.object_kind,
+            &f.raw_sha256,
+            f.size,
+            f.verification_version,
+            &f.state,
+            f.created_at,
+        ))
+        .map_err(|_| internal("chunk map source encoding failed"))
+    }
+}
+
+impl VerifiedSourceChunkMap {
+    pub(crate) async fn verify<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+        handler: &T,
+        source: ChunkMapSource,
+        budget: &Arc<super::content_budget::MemoryBudget>,
+        admission: &crate::jupiter::storage::native_chunk_map::retention::ChunkMapInstall,
+    ) -> Result<Self, SnapshotError> {
+        let digest: [u8; 32] = source
+            .fact
+            .raw_sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| internal("chunk map source digest shape changed"))?;
+        let projection = streaming::build_source_stream(
+            digest,
+            source.fact.size as u64,
+            || async {
+                handler
+                    .get_raw_blob_stream_by_hash(&source.fact.git_oid)
+                    .await
+                    .map_err(|error| {
+                        let code = match error {
+                            crate::common::errors::MegaError::ObjStorageNotFound(_) => {
+                                SnapshotErrorCode::ObjectUnavailable
+                            }
+                            crate::common::errors::MegaError::ObjStorageInconsistent(_) => {
+                                SnapshotErrorCode::IntegrityError
+                            }
+                            _ => SnapshotErrorCode::Internal,
+                        };
+                        SnapshotError::new(code, "exact chunk map source could not be read")
+                    })
+            },
+            budget,
+            admission,
+        )
+        .await?;
+        Ok(Self { source, projection })
+    }
+
+    pub(crate) fn source(&self) -> &ChunkMapSource {
+        &self.source
+    }
+    pub(crate) fn map(&self) -> &ChunkMap {
+        &self.projection.map
+    }
+    pub(crate) fn leaves(&self) -> &[ChunkLeaf] {
+        &self.projection.leaves
+    }
+    pub(crate) fn leaf_hashes(&self) -> &[[u8; 32]] {
+        &self.projection.leaf_hashes
+    }
+}
+
+pub(crate) fn map_build_reservation_bytes(size: u64) -> Result<usize, SnapshotError> {
+    streaming::reserved_map_bytes(size)
+}
 
 /// One file's verified range-readable projection.
 pub struct ChunkProjection {
@@ -27,13 +137,15 @@ pub struct ChunkProjection {
     pub map_id: [u8; 32],
     leaves: Vec<ChunkLeaf>,
     leaf_hashes: Vec<[u8; 32]>,
-    /// Full verified content. Indexed by fixed 1 MiB chunk boundaries.
+    /// Empty for range-only projections; empty files have no projection.
     raw: Vec<u8>,
+    memory: Option<MemoryLease>,
 }
 
 impl ChunkProjection {
     /// Build from bytes that the caller already resolved at a fixed path.
     /// `content_id` is the digest the fixed view advertises.
+    #[cfg(test)]
     pub fn build(content_id: [u8; 32], raw: Vec<u8>) -> Result<Self, SnapshotError> {
         let mut hasher = Sha256::new();
         hasher.update(&raw);
@@ -95,14 +207,61 @@ impl ChunkProjection {
             leaves,
             leaf_hashes,
             raw,
+            memory: None,
         })
     }
 
+    #[cfg(test)]
+    pub fn has_inline_bytes(&self) -> bool {
+        !self.raw.is_empty()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.memory
+            .as_ref()
+            .map_or_else(|| self.allocated_bytes(), |lease| lease.bytes)
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.raw.capacity()
+            + self.leaves.capacity() * std::mem::size_of::<ChunkLeaf>()
+            + self.leaf_hashes.capacity() * 32
+            + self
+                .leaves
+                .iter()
+                .map(|leaf| leaf.chunk_sha256.capacity() * 32)
+                .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    pub fn verify_chunk(&self, index: u64, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let want_len = self.map.chunk_len(index).map_err(codec_err)?;
+        if bytes.len() as u64 != want_len {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "range length disagrees with the verified chunk map",
+            ));
+        }
+        let page = (index / CHUNKS_PER_PAGE as u64) as usize;
+        let slot = (index % CHUNKS_PER_PAGE as u64) as usize;
+        let got: [u8; 32] = Sha256::digest(bytes).into();
+        if got != self.leaves[page].chunk_sha256[slot] {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "range digest disagrees with the verified chunk map",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn page_count(&self) -> u64 {
         self.map.page_count
     }
 
     /// One MCL2 leaf plus its bottom-up proof toward `pages_root`.
+    #[cfg(test)]
     pub fn leaf_and_proof(
         &self,
         page_index: u64,
@@ -124,6 +283,7 @@ impl ChunkProjection {
 
     /// Raw bytes of chunk `index`, length-checked against the map (spec 07
     /// §4: full 1 MiB chunks except the positive-length remainder).
+    #[cfg(test)]
     pub fn chunk_bytes(&self, index: u64) -> Result<&[u8], SnapshotError> {
         let want_len = self.map.chunk_len(index).map_err(codec_err)?;
         let start = (index as usize)
@@ -165,78 +325,6 @@ fn codec_err(e: mst2_codec::CodecError) -> SnapshotError {
 }
 fn internal(m: &str) -> SnapshotError {
     SnapshotError::new(SnapshotErrorCode::Internal, m)
-}
-
-/// Bounded process-wide cache of verified projections. Eviction is pure
-/// memory reclaim; the projection is reproducible from Git, so an evicted
-/// entry is rebuilt, never an error to the client.
-static STAGED: OnceLock<Mutex<ProjectionCache>> = OnceLock::new();
-
-/// 512 MiB cap for staged file bytes in this identity slice. The real
-/// persistent RAW_OBJECT locator layout replaces this (spec 10 §4).
-const STAGED_CAP_BYTES: usize = 512 * 1024 * 1024;
-
-struct ProjectionCache {
-    entries: HashMap<[u8; 32], std::sync::Arc<ChunkProjection>>,
-    /// Insertion/last-used order for FIFO reclaim.
-    order: VecDeque<[u8; 32]>,
-    total_bytes: usize,
-}
-
-impl ProjectionCache {
-    fn new() -> Self {
-        ProjectionCache {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-            total_bytes: 0,
-        }
-    }
-
-    fn get(&mut self, id: [u8; 32]) -> Option<std::sync::Arc<ChunkProjection>> {
-        self.entries.get(&id).cloned()
-    }
-
-    fn put(&mut self, proj: std::sync::Arc<ChunkProjection>) {
-        let id = proj.map.file_content_id;
-        if self.entries.contains_key(&id) {
-            return;
-        }
-        // Reclaim oldest entries until the new one fits. A file larger than
-        // the cap alone is not cached (rebuild per request) but still
-        // served correctly.
-        while self.total_bytes + proj.raw.len() > STAGED_CAP_BYTES
-            && let Some(victim) = self.order.pop_front()
-        {
-            if let Some(v) = self.entries.remove(&victim) {
-                self.total_bytes = self.total_bytes.saturating_sub(v.raw.len());
-            }
-        }
-        if proj.raw.len() <= STAGED_CAP_BYTES {
-            self.total_bytes += proj.raw.len();
-            self.order.push_back(id);
-            self.entries.insert(id, proj);
-        }
-    }
-}
-
-/// Return the cached projection, or build one via `load` (which must resolve
-/// the file in the fixed view and return its verified bytes).
-pub async fn get_or_project<F, Fut>(
-    content_id: [u8; 32],
-    load: F,
-) -> Result<std::sync::Arc<ChunkProjection>, SnapshotError>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
-{
-    let cache = STAGED.get_or_init(|| Mutex::new(ProjectionCache::new()));
-    if let Some(p) = cache.lock().unwrap().get(content_id) {
-        return Ok(p);
-    }
-    let raw = load().await?;
-    let proj = std::sync::Arc::new(ChunkProjection::build(content_id, raw)?);
-    cache.lock().unwrap().put(proj.clone());
-    Ok(proj)
 }
 
 #[cfg(test)]

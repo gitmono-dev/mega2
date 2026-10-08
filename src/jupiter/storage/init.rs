@@ -10,6 +10,21 @@ use crate::{
     jupiter::migration::{apply_migrations, ensure_queue_control_seed},
 };
 
+#[cfg(test)]
+tokio::task_local! {
+    static GENERIC_HISTORY_BOOTSTRAP: ();
+}
+
+#[cfg(test)]
+pub(crate) async fn with_generic_history_bootstrap<F: std::future::Future>(future: F) -> F::Output {
+    GENERIC_HISTORY_BOOTSTRAP.scope((), future).await
+}
+
+#[cfg(test)]
+pub(super) fn generic_history_bootstrap_active() -> bool {
+    GENERIC_HISTORY_BOOTSTRAP.try_with(|_| ()).is_ok()
+}
+
 /// Create a PostgreSQL database connection.
 ///
 /// After a successful connection, applies any pending database migrations and
@@ -25,6 +40,11 @@ pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnect
     let conn = postgres_connection(db_config).await?;
     apply_migrations(&conn, false).await?;
     ensure_queue_control_seed(&conn).await?;
+    #[cfg(test)]
+    if generic_history_bootstrap_active() {
+        return Ok(conn);
+    }
+    super::qualified_metadata_family::provision_or_verify_rooted_qualified_family(&conn).await?;
 
     Ok(conn)
 }

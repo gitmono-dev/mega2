@@ -957,6 +957,9 @@ impl Default for LFSSshConfig {
 /// MST/2 snapshot feature flags (default off; spec 00 §6 rollout).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Mst2Config {
+    /// Startup-only typed projection diagnostics, independent of log.level.
+    #[serde(default)]
+    pub projection_observation_enabled: bool,
     /// Master switch for the `/api/v2/snapshots` surface.
     #[serde(default)]
     pub enabled: bool,

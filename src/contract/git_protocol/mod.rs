@@ -954,6 +954,7 @@ mod tests {
             .unwrap();
             let bytes = Arc::new(Mutex::new(Vec::new()));
             let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
                 .with_writer(Writer(bytes.clone()))
                 .finish();
             let guard = tracing::subscriber::set_default(subscriber);

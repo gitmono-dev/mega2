@@ -122,6 +122,8 @@ pub enum ObjectNamespace {
     Media,
     /// Agent Capture objects (`docs/refactoring/agent-capture.md`).
     Agent,
+    /// Immutable receipts minted by the full-stream chunk-map verifier.
+    ChunkMapReceipt,
 }
 
 impl ObjectNamespace {
@@ -135,6 +137,7 @@ impl ObjectNamespace {
             ObjectNamespace::Oci => "oci",
             ObjectNamespace::Media => "media",
             ObjectNamespace::Agent => "agent",
+            ObjectNamespace::ChunkMapReceipt => "chunk-map-receipt",
         }
     }
 }
@@ -165,8 +168,65 @@ pub struct ObjectMeta {
 /// - The stream must be fully consumed by the caller.
 pub type ObjectByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
+pub(crate) const OBJECT_STREAM_ITEM_BYTES: usize = 8 * 1024 * 1024;
+
+/// Split visible items without copying or prebuilding a fragment list. Bytes
+/// retain their original owner; this does not bound backend backing buffers.
+pub(crate) fn fragment_object_stream(input: ObjectByteStream) -> ObjectByteStream {
+    Box::pin(futures::stream::unfold(
+        (input, Bytes::new()),
+        |(mut input, pending)| async move {
+            let next = if pending.is_empty() {
+                input.next().await?
+            } else {
+                Ok(pending)
+            };
+            match next {
+                Ok(mut bytes) => {
+                    let part = bytes.split_to(bytes.len().min(OBJECT_STREAM_ITEM_BYTES));
+                    Some((Ok(part), (input, bytes)))
+                }
+                Err(error) => Some((Err(error), (input, Bytes::new()))),
+            }
+        },
+    ))
+}
+
 /// Upper bound for [`MegaObjectStorage::put_metadata_atomic`] (ADR-MF-05).
 pub const MAX_METADATA_ATOMIC_BYTES: usize = 1024 * 1024;
+
+pub const MAX_CHUNK_MAP_RECEIPTS: usize = 16_384;
+pub const MAX_CHUNK_MAP_RECEIPT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Actual backing objects, including uncommitted and late-created receipts.
+/// A complete inventory is returned only while both fixed quotas hold.
+pub struct ChunkMapReceiptInventory {
+    pub objects: Vec<(ObjectKey, u64)>,
+    pub bytes: u64,
+}
+
+/// Sealed by the primary retention repository after claiming one exact
+/// retired generation and independently reading its immutable backend body.
+/// Ordinary object callers cannot construct a receipt deletion authority.
+pub struct ChunkMapReceiptDeletion {
+    claim: crate::jupiter::storage::native_chunk_map::retention::VerifiedReceiptDeletionClaim,
+}
+
+impl ChunkMapReceiptDeletion {
+    pub(crate) fn from_claim(
+        claim: crate::jupiter::storage::native_chunk_map::retention::VerifiedReceiptDeletionClaim,
+    ) -> Self {
+        Self { claim }
+    }
+
+    pub(crate) fn key(&self) -> &ObjectKey {
+        self.claim.key()
+    }
+
+    pub(crate) fn expected_bytes(&self) -> &[u8] {
+        self.claim.expected_bytes()
+    }
+}
 
 /// A streaming source of multiple objects.
 ///
@@ -193,6 +253,13 @@ pub trait MegaObjectStorage: Send + Sync {
 
     /// Whether presigned GET/PUT URLs can be generated (e.g. S3/GCS). Local disk returns `false`.
     fn supports_presigned_urls(&self) -> bool {
+        false
+    }
+
+    /// Complete receipt inventory and sealed deletion are available without
+    /// uncounted retained versions. This is a static backend contract, not an
+    /// I/O health or quota check; cold requests still perform real admission.
+    fn supports_chunk_map_retention(&self) -> bool {
         false
     }
 
@@ -260,6 +327,37 @@ pub trait MegaObjectStorage: Send + Sync {
         ))
     }
 
+    /// Create a complete <=1 MiB immutable metadata object. An existing key
+    /// must retain its original bytes. The caller must read and compare the
+    /// existing object before treating an idempotent replay as success.
+    async fn put_metadata_atomic_create(
+        &self,
+        _key: &ObjectKey,
+        _bytes: Bytes,
+        _meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        Err(IoOrbitError::Other(
+            "immutable atomic metadata creation is not supported by this storage backend"
+                .to_string(),
+        ))
+    }
+
+    /// Enumerate the real receipt namespace with fixed count/byte bounds.
+    /// Unsupported stores fail before a cold source body can be opened.
+    async fn chunk_map_receipt_inventory(&self) -> OrbitResult<ChunkMapReceiptInventory> {
+        Err(IoOrbitError::ChunkMapRetentionUnsupported)
+    }
+
+    /// Delete only the independently checked body of a sealed retired
+    /// physical generation. The key is never reused by a later installation.
+    /// Missing is idempotent; transport/authentication errors remain errors.
+    async fn delete_chunk_map_receipt(
+        &self,
+        _authority: &ChunkMapReceiptDeletion,
+    ) -> OrbitResult<bool> {
+        Err(IoOrbitError::ChunkMapRetentionUnsupported)
+    }
+
     /// Retrieve a single object from the storage backend.
     ///
     /// # Returns
@@ -305,6 +403,20 @@ pub trait MegaObjectStorage: Send + Sync {
         start: u64,
         end: Option<u64>,
     ) -> OrbitResult<(ObjectByteStream, ObjectMeta)>;
+
+    /// Exact raw byte range, with no full-download fallback. `None` means
+    /// unsupported and must be returned without source I/O. Implementations
+    /// must validate the backend's actual start/end before exposing the stream;
+    /// metadata describes the complete object. Consumers still verify EOF,
+    /// length and content hashes. This does not promise bounded producer RSS.
+    async fn get_range_stream_exact(
+        &self,
+        _key: &ObjectKey,
+        _start: u64,
+        _end: u64,
+    ) -> OrbitResult<Option<(ObjectByteStream, ObjectMeta)>> {
+        Ok(None)
+    }
 
     /// Check whether an object exists.
     async fn exists(&self, key: &ObjectKey) -> OrbitResult<bool>;
@@ -513,6 +625,7 @@ mod tests {
             ObjectNamespace::Oci,
             ObjectNamespace::Media,
             ObjectNamespace::Agent,
+            ObjectNamespace::ChunkMapReceipt,
         ] {
             let key = ObjectKey {
                 namespace: ns,
@@ -536,6 +649,10 @@ mod tests {
         assert_eq!(ObjectNamespace::Oci.to_string(), "oci");
         assert_eq!(ObjectNamespace::Media.to_string(), "media");
         assert_eq!(ObjectNamespace::Agent.to_string(), "agent");
+        assert_eq!(
+            ObjectNamespace::ChunkMapReceipt.to_string(),
+            "chunk-map-receipt"
+        );
     }
 
     #[test]
@@ -589,6 +706,80 @@ mod tests {
     }
 
     struct UnsupportedBoundedStore;
+
+    struct SharedStreamOwner {
+        bytes: Vec<u8>,
+        drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for SharedStreamOwner {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for SharedStreamOwner {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_source_is_lazy_zero_copy_and_keeps_original_owner_until_last_clone() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let input_polls = Arc::new(AtomicUsize::new(0));
+        let bytes = Bytes::from_owner(SharedStreamOwner {
+            bytes: vec![0xa5; 2 * OBJECT_STREAM_ITEM_BYTES + 17],
+            drops: drops.clone(),
+        });
+        let pointer = bytes.as_ptr();
+        let polls = input_polls.clone();
+        let input =
+            futures::stream::iter([Ok(bytes), Err(std::io::Error::other("late backend error"))])
+                .inspect(move |_| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                });
+        let mut fragmented = fragment_object_stream(Box::pin(input));
+        assert_eq!(input_polls.load(Ordering::SeqCst), 0);
+        let first = fragmented.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), OBJECT_STREAM_ITEM_BYTES);
+        assert_eq!(first.as_ptr(), pointer);
+        let transport = first.clone();
+        drop(first);
+        let second = fragmented.next().await.unwrap().unwrap();
+        assert_eq!(second.len(), OBJECT_STREAM_ITEM_BYTES);
+        assert_eq!(
+            second.as_ptr() as usize,
+            pointer as usize + OBJECT_STREAM_ITEM_BYTES
+        );
+        drop(second);
+        let tail = fragmented.next().await.unwrap().unwrap();
+        assert_eq!(tail.as_ref(), &[0xa5; 17]);
+        drop(tail);
+        assert_eq!(input_polls.load(Ordering::SeqCst), 1);
+        assert!(fragmented.next().await.unwrap().is_err());
+        assert_eq!(input_polls.load(Ordering::SeqCst), 2);
+        assert!(fragmented.next().await.is_none());
+        drop(fragmented);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(transport);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn default_backend_does_not_advertise_or_infer_chunk_retention() {
+        let backend = UnsupportedBoundedStore;
+        assert!(!backend.supports_chunk_map_retention());
+        assert!(matches!(
+            backend.chunk_map_receipt_inventory().await,
+            Err(IoOrbitError::ChunkMapRetentionUnsupported)
+        ));
+    }
 
     #[async_trait::async_trait]
     impl MegaObjectStorage for UnsupportedBoundedStore {
@@ -680,6 +871,24 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("atomic metadata put is not supported")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_range_default_is_unsupported_without_calling_fallback() {
+        let store = UnsupportedBoundedStore;
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: "abcdef".to_string(),
+        };
+        // Its general range getter returns an error; the new default must
+        // return typed absence without invoking that method or full get.
+        assert!(
+            store
+                .get_range_stream_exact(&key, 1, 2)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

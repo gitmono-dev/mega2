@@ -60,6 +60,13 @@ mod un25_freeze;
 pub trait ApiHandler: Send + Sync {
     fn get_context(&self) -> Storage;
 
+    /// Only native monorepo trees use the native snapshot memoization domain.
+    /// Import and custom handlers remain uncached unless they implement their
+    /// own source identity and verification contract.
+    fn native_snapshot_projection(&self) -> bool {
+        false
+    }
+
     fn object_cache(&self) -> &GitObjectCache;
 
     fn strip_relative(&self, path: &Path) -> Result<PathBuf, MegaError>;
@@ -168,6 +175,64 @@ pub trait ApiHandler: Send + Sync {
                 let e = storage.classify_blob_objstorage_not_found(hash, e).await;
                 Err(e)
             }
+        }
+    }
+
+    async fn get_raw_blob_stream_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<crate::orbit_api::object_storage::ObjectByteStream, MegaError> {
+        let storage = self.get_context();
+        match storage.git_service.get_object_stream(hash).await {
+            Ok(stream) => Ok(stream),
+            Err(error) => Err(storage
+                .classify_blob_objstorage_not_found(hash, error)
+                .await),
+        }
+    }
+
+    /// Raw whole-file stream with the physical object's complete size.
+    async fn get_raw_blob_stream_with_meta(
+        &self,
+        hash: &str,
+    ) -> Result<
+        (
+            crate::orbit_api::object_storage::ObjectByteStream,
+            crate::orbit_api::object_storage::ObjectMeta,
+        ),
+        MegaError,
+    > {
+        let storage = self.get_context();
+        match storage.git_service.get_object_stream_with_meta(hash).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(storage
+                .classify_blob_objstorage_not_found(hash, error)
+                .await),
+        }
+    }
+
+    async fn get_raw_blob_range_stream_exact(
+        &self,
+        hash: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<
+        Option<(
+            crate::orbit_api::object_storage::ObjectByteStream,
+            crate::orbit_api::object_storage::ObjectMeta,
+        )>,
+        MegaError,
+    > {
+        let storage = self.get_context();
+        match storage
+            .git_service
+            .get_object_range_stream_exact(hash, start, end)
+            .await
+        {
+            Ok(range) => Ok(range),
+            Err(error) => Err(storage
+                .classify_blob_objstorage_not_found(hash, error)
+                .await),
         }
     }
 

@@ -385,8 +385,16 @@ mod tests_raw {
         .unwrap()
         .clone();
 
+        let issuance_started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         // issue cert
         let resp = test_write_api(core, "pki/issue/tls/test", true, Some(issue_data)).await;
+        let issuance_completed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         assert!(resp.is_ok());
         let resp_body = resp.unwrap();
         assert!(resp_body.is_some());
@@ -429,15 +437,10 @@ mod tests_raw {
         let ttl_compare = cert.not_after().compare(&expiration_time);
         assert!(ttl_compare.is_ok());
         assert_eq!(ttl_compare.unwrap(), std::cmp::Ordering::Equal);
-        let now_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let expiration_ttl = cert_data["expiration"].as_u64().unwrap();
-        let ttl = expiration_ttl - now_timestamp;
         let expect_ttl = 10 * 24 * 60 * 60;
-        assert!(ttl <= expect_ttl);
-        assert!((ttl + 10) > expect_ttl);
+        assert!(expiration_ttl >= issuance_started + expect_ttl);
+        assert!(expiration_ttl <= issuance_completed + expect_ttl);
 
         let authority_key_id = cert.authority_key_id();
         assert!(authority_key_id.is_some());

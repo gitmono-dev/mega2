@@ -139,10 +139,80 @@ mod m20260921_000100_fix_git_tag_unique;
 mod m20260923_000100_import_repo_cleanups;
 mod m20260923_000200_canonicalize_import_repo_paths;
 mod m20260925_000100_media_paging;
+mod m20261005_000100_add_mst2_publication_request_digest;
+mod m20261005_000100_add_mst2_retention_durability;
+mod m20261005_000200_add_mst2_native_head;
+mod m20261005_000200_harden_mst2_retention_graph;
+mod m20261005_000300_add_mst2_metadata_install;
 mod m20261006_000100_add_view_tables;
+mod m20261007_000100_add_mst2_snapshot_sessions;
+mod m20261007_000200_add_mst2_metadata_generations;
+mod m20261007_000300_add_mst2_metadata_lifetime_history;
+mod m20261007_000400_add_mst2_qualified_metadata_gc;
+mod m20261007_000500_add_mst2_install_capability;
+mod m20261007_000600_add_mst2_storage_routes;
+mod m20261008_000100_add_mst2_chunk_maps;
+mod m20261008_000200_add_mst2_rooted_qualified_family;
+mod m20261008_000300_add_mst2_chunk_map_retention;
+mod m20261008_000400_add_mst2_reader_retention;
+mod m20261008_000500_fix_mst2_native_runtime;
+mod m20261008_000600_fix_mst2_descriptor_wire;
+pub(crate) mod qualified_native_runtime_upgrade;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
+
+#[cfg(test)]
+pub(crate) async fn test_upgrade_reader_retention(
+    connection: &sea_orm::DatabaseConnection,
+) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::TransactionTrait;
+    use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+    let txn = connection.begin().await?;
+    let result = async {
+        m20261008_000400_add_mst2_reader_retention::Migration
+            .up(&SchemaManager::new(&txn))
+            .await?;
+        m20261008_000600_fix_mst2_descriptor_wire::Migration
+            .up(&SchemaManager::new(&txn))
+            .await
+    }
+    .await;
+    match result {
+        Ok(()) => txn.commit().await,
+        Err(error) => {
+            txn.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn test_upgrade_native_runtime(
+    connection: &sea_orm::DatabaseConnection,
+) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::TransactionTrait;
+    use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+    let txn = connection.begin().await?;
+    let result = async {
+        m20261008_000500_fix_mst2_native_runtime::Migration
+            .up(&SchemaManager::new(&txn))
+            .await?;
+        m20261008_000600_fix_mst2_descriptor_wire::Migration
+            .up(&SchemaManager::new(&txn))
+            .await
+    }
+    .await;
+    match result {
+        Ok(()) => txn.commit().await,
+        Err(error) => {
+            txn.rollback().await?;
+            Err(error)
+        }
+    }
+}
 
 /// Primary key `BIGINT` (not DB auto-increment); the application assigns `id` (e.g. `idgenerator::IdInstance::next_id`).
 fn pk_bigint<T: IntoIden>(name: T) -> ColumnDef {
@@ -267,7 +337,24 @@ impl MigratorTrait for Migrator {
             Box::new(m20260923_000100_import_repo_cleanups::Migration),
             Box::new(m20260923_000200_canonicalize_import_repo_paths::Migration),
             Box::new(m20260925_000100_media_paging::Migration),
+            Box::new(m20261005_000100_add_mst2_publication_request_digest::Migration),
+            Box::new(m20261005_000200_add_mst2_native_head::Migration),
+            Box::new(m20261005_000100_add_mst2_retention_durability::Migration),
+            Box::new(m20261005_000200_harden_mst2_retention_graph::Migration),
+            Box::new(m20261005_000300_add_mst2_metadata_install::Migration),
             Box::new(m20261006_000100_add_view_tables::Migration),
+            Box::new(m20261007_000100_add_mst2_snapshot_sessions::Migration),
+            Box::new(m20261007_000200_add_mst2_metadata_generations::Migration),
+            Box::new(m20261007_000300_add_mst2_metadata_lifetime_history::Migration),
+            Box::new(m20261007_000400_add_mst2_qualified_metadata_gc::Migration),
+            Box::new(m20261007_000500_add_mst2_install_capability::Migration),
+            Box::new(m20261007_000600_add_mst2_storage_routes::Migration),
+            Box::new(m20261008_000100_add_mst2_chunk_maps::Migration),
+            Box::new(m20261008_000200_add_mst2_rooted_qualified_family::Migration),
+            Box::new(m20261008_000300_add_mst2_chunk_map_retention::Migration),
+            Box::new(m20261008_000400_add_mst2_reader_retention::Migration),
+            Box::new(m20261008_000500_fix_mst2_native_runtime::Migration),
+            Box::new(m20261008_000600_fix_mst2_descriptor_wire::Migration),
         ]
     }
 }
@@ -1177,16 +1264,34 @@ mod tests {
     #[tokio::test]
     async fn import_repo_alias_rows_canonicalized() {
         let names = migration_names();
+        let expected = [
+            "m20260923_000200_canonicalize_import_repo_paths",
+            "m20260925_000100_media_paging",
+            "m20261005_000100_add_mst2_publication_request_digest",
+            "m20261005_000200_add_mst2_native_head",
+            "m20261005_000100_add_mst2_retention_durability",
+            "m20261005_000200_harden_mst2_retention_graph",
+            "m20261005_000300_add_mst2_metadata_install",
+            VIEW_MIGRATION_NAME,
+            "m20261007_000100_add_mst2_snapshot_sessions",
+            "m20261007_000200_add_mst2_metadata_generations",
+            "m20261007_000300_add_mst2_metadata_lifetime_history",
+            "m20261007_000400_add_mst2_qualified_metadata_gc",
+            "m20261007_000500_add_mst2_install_capability",
+            "m20261007_000600_add_mst2_storage_routes",
+            "m20261008_000100_add_mst2_chunk_maps",
+            "m20261008_000200_add_mst2_rooted_qualified_family",
+            "m20261008_000300_add_mst2_chunk_map_retention",
+            "m20261008_000400_add_mst2_reader_retention",
+            "m20261008_000500_fix_mst2_native_runtime",
+            "m20261008_000600_fix_mst2_descriptor_wire",
+        ]
+        .map(str::to_owned);
         assert_eq!(
-            &names[names.len() - 3..],
-            &[
-                "m20260923_000200_canonicalize_import_repo_paths".to_string(),
-                "m20260925_000100_media_paging".to_string(),
-                VIEW_MIGRATION_NAME.to_string(),
-            ],
-            "view tables are registered last"
+            &names[names.len() - expected.len()..],
+            expected.as_slice(),
+            "the complete native migration suffix follows media paging in registered order"
         );
-
         let db = alias_db().await;
         insert_repo(&db, 1, "/third-party//a").await;
         insert_repo(&db, 2, "/third-party/b/").await;

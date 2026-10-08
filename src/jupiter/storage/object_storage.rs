@@ -35,6 +35,155 @@ pub async fn build_object_storage(
         })
 }
 
+#[cfg(test)]
+mod exact_range_tests {
+    use super::*;
+    use crate::orbit_api::object_storage::ObjectNamespace;
+
+    #[tokio::test]
+    async fn memory_exact_range_has_no_clipped_or_empty_success() {
+        let storage = mock_object_storage();
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: "abcdef1234567890".to_string(),
+        };
+        storage
+            .inner
+            .put_stream(
+                &key,
+                Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"abcdef"))])),
+                ObjectMeta {
+                    size: 6,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (mut stream, meta) = storage
+            .inner
+            .get_range_stream_exact(&key, 2, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.size, 6);
+        assert_eq!(stream.next().await.unwrap().unwrap(), b"cde".as_slice());
+        assert!(stream.next().await.is_none());
+        for (start, end) in [(5, 7), (6, 7), (4, 4), (u64::MAX, u64::MAX)] {
+            assert!(
+                storage
+                    .inner
+                    .get_range_stream_exact(&key, start, end)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_chunk_receipts_reject_all_mutation_routes() {
+        let storage = mock_object_storage();
+        super::assert_immutable_chunk_receipt_contract(storage.inner.as_ref()).await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_immutable_chunk_receipt_contract(
+    storage: &dyn crate::orbit_api::factory::MegaObjectStorageWithLog,
+) {
+    let key = ObjectKey {
+        namespace: crate::orbit_api::object_storage::ObjectNamespace::ChunkMapReceipt,
+        key: "a".repeat(64),
+    };
+    let first = Bytes::from_static(b"trusted immutable receipt");
+    storage
+        .put_metadata_atomic_create(&key, first.clone(), ObjectMeta::default())
+        .await
+        .unwrap();
+    storage
+        .put_metadata_atomic_create(
+            &key,
+            Bytes::from_static(b"conflicting replay"),
+            ObjectMeta::default(),
+        )
+        .await
+        .unwrap();
+    let input = || {
+        Box::pin(futures::stream::iter([Ok(Bytes::from_static(
+            b"overwrite",
+        ))])) as ObjectByteStream
+    };
+    assert!(
+        storage
+            .put_stream(&key, input(), ObjectMeta::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .put_stream_bounded(&key, input(), ObjectMeta::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .put_metadata_atomic(
+                &key,
+                Bytes::from_static(b"overwrite"),
+                ObjectMeta::default()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .put_metadata_atomic_create(
+                &key,
+                Bytes::from(vec![
+                    0;
+                    crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES
+                        + 1
+                ]),
+                ObjectMeta::default()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .append(&key, input(), ObjectMeta::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .append_concurrently(&key, input(), ObjectMeta::default())
+            .await
+            .is_err()
+    );
+    assert!(storage.delete(&key).await.is_err());
+    for method in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH] {
+        assert!(
+            storage
+                .signed_url(&key, method, std::time::Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        storage
+            .signed_url(&key, Method::GET, std::time::Duration::from_secs(60))
+            .await
+            .is_ok()
+    );
+    let (mut stream, meta) = storage.get_stream(&key).await.unwrap();
+    assert_eq!(meta.size, first.len() as i64);
+    let mut observed = Vec::new();
+    while let Some(part) = stream.next().await {
+        observed.extend_from_slice(&part.unwrap());
+    }
+    assert_eq!(observed, first.as_ref());
+}
+
 #[derive(Default)]
 struct InMemoryObjectStorage {
     objects: Mutex<HashMap<ObjectKey, (Bytes, ObjectMeta)>>,
@@ -50,7 +199,9 @@ impl InMemoryObjectStorage {
     }
 
     fn stream_bytes(bytes: Bytes) -> ObjectByteStream {
-        Box::pin(futures::stream::once(async move { Ok(bytes) }))
+        crate::orbit_api::object_storage::fragment_object_stream(Box::pin(futures::stream::once(
+            async move { Ok(bytes) },
+        )))
     }
 }
 
@@ -60,12 +211,17 @@ pub fn mock_object_storage() -> MegaObjectStorageWrapper {
 
 #[async_trait::async_trait]
 impl MegaObjectStorage for InMemoryObjectStorage {
+    fn supports_chunk_map_retention(&self) -> bool {
+        true
+    }
+
     async fn put_stream(
         &self,
         key: &ObjectKey,
         data: ObjectByteStream,
         mut meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         let bytes = Self::read_stream(data).await?;
         meta.size = bytes.len() as i64;
         self.objects
@@ -81,6 +237,7 @@ impl MegaObjectStorage for InMemoryObjectStorage {
         bytes: Bytes,
         mut meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         use crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES;
         if bytes.len() > MAX_METADATA_ATOMIC_BYTES {
             return Err(IoOrbitError::Other(format!(
@@ -95,6 +252,27 @@ impl MegaObjectStorage for InMemoryObjectStorage {
         Ok(())
     }
 
+    async fn put_metadata_atomic_create(
+        &self,
+        key: &ObjectKey,
+        bytes: Bytes,
+        mut meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        if bytes.len() > crate::orbit_api::object_storage::MAX_METADATA_ATOMIC_BYTES {
+            return Err(IoOrbitError::Other(
+                "immutable atomic metadata exceeds its byte limit".into(),
+            ));
+        }
+        key.validate()?;
+        meta.size = bytes.len() as i64;
+        self.objects
+            .lock()
+            .map_err(|_| IoOrbitError::Other("object storage lock poisoned".into()))?
+            .entry(key.clone())
+            .or_insert((bytes, meta));
+        Ok(())
+    }
+
     async fn get_stream(&self, key: &ObjectKey) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
         let (bytes, meta) = self
             .objects
@@ -104,6 +282,56 @@ impl MegaObjectStorage for InMemoryObjectStorage {
             .cloned()
             .ok_or_else(|| IoOrbitError::object_store_not_found(key.default_sharding()))?;
         Ok((Self::stream_bytes(bytes), meta))
+    }
+
+    async fn chunk_map_receipt_inventory(
+        &self,
+    ) -> OrbitResult<crate::orbit_api::object_storage::ChunkMapReceiptInventory> {
+        use crate::orbit_api::object_storage::{
+            ChunkMapReceiptInventory, MAX_CHUNK_MAP_RECEIPT_BYTES, MAX_CHUNK_MAP_RECEIPTS,
+            ObjectNamespace,
+        };
+        let objects = self
+            .objects
+            .lock()
+            .map_err(|_| IoOrbitError::Other("object storage lock poisoned".into()))?;
+        let mut inventory = ChunkMapReceiptInventory {
+            objects: Vec::new(),
+            bytes: 0,
+        };
+        for (key, (bytes, _)) in objects
+            .iter()
+            .filter(|(key, _)| key.namespace == ObjectNamespace::ChunkMapReceipt)
+        {
+            if inventory.objects.len() == MAX_CHUNK_MAP_RECEIPTS {
+                return Err(IoOrbitError::ChunkMapRetentionCapacityExceeded);
+            }
+            inventory.bytes = inventory
+                .bytes
+                .checked_add(bytes.len() as u64)
+                .filter(|bytes| *bytes <= MAX_CHUNK_MAP_RECEIPT_BYTES)
+                .ok_or(IoOrbitError::ChunkMapRetentionCapacityExceeded)?;
+            inventory.objects.push((key.clone(), bytes.len() as u64));
+        }
+        Ok(inventory)
+    }
+
+    async fn delete_chunk_map_receipt(
+        &self,
+        authority: &crate::orbit_api::object_storage::ChunkMapReceiptDeletion,
+    ) -> OrbitResult<bool> {
+        let mut objects = self
+            .objects
+            .lock()
+            .map_err(|_| IoOrbitError::Other("object storage lock poisoned".into()))?;
+        let Some((bytes, _)) = objects.get(authority.key()) else {
+            return Ok(false);
+        };
+        if bytes.as_ref() != authority.expected_bytes() {
+            return Err(IoOrbitError::Other("retired receipt body changed".into()));
+        }
+        objects.remove(authority.key());
+        Ok(true)
     }
 
     async fn get_range_stream(
@@ -127,6 +355,32 @@ impl MegaObjectStorage for InMemoryObjectStorage {
         Ok((Self::stream_bytes(bytes.slice(start..end)), meta))
     }
 
+    async fn get_range_stream_exact(
+        &self,
+        key: &ObjectKey,
+        start: u64,
+        end: u64,
+    ) -> OrbitResult<Option<(ObjectByteStream, ObjectMeta)>> {
+        let (bytes, meta) = self
+            .objects
+            .lock()
+            .map_err(|_| IoOrbitError::Other("object storage lock poisoned".to_string()))?
+            .get(key)
+            .cloned()
+            .ok_or_else(|| IoOrbitError::object_store_not_found(key.default_sharding()))?;
+        let start =
+            usize::try_from(start).map_err(|_| IoOrbitError::object_store("range overflow"))?;
+        let end = usize::try_from(end).map_err(|_| IoOrbitError::object_store("range overflow"))?;
+        if start >= end || end > bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "exact object range is outside stored bytes",
+            )
+            .into());
+        }
+        Ok(Some((Self::stream_bytes(bytes.slice(start..end)), meta)))
+    }
+
     async fn exists(&self, key: &ObjectKey) -> OrbitResult<bool> {
         Ok(self
             .objects
@@ -137,14 +391,18 @@ impl MegaObjectStorage for InMemoryObjectStorage {
 
     async fn signed_url(
         &self,
-        _key: &ObjectKey,
-        _method: Method,
+        key: &ObjectKey,
+        method: Method,
         _expires_in: std::time::Duration,
     ) -> OrbitResult<Option<String>> {
+        if method != Method::GET {
+            reject_receipt_mutation(key)?;
+        }
         Ok(None)
     }
 
     async fn delete(&self, key: &ObjectKey) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         let deleted = self
             .objects
             .lock()
@@ -159,6 +417,16 @@ impl MegaObjectStorage for InMemoryObjectStorage {
     }
 }
 
+fn reject_receipt_mutation(key: &ObjectKey) -> OrbitResult<()> {
+    if key.namespace == crate::orbit_api::object_storage::ObjectNamespace::ChunkMapReceipt {
+        Err(IoOrbitError::Other(
+            "chunk map receipts require immutable atomic creation".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl LogStorage for InMemoryObjectStorage {
     async fn append(
@@ -167,6 +435,7 @@ impl LogStorage for InMemoryObjectStorage {
         data: ObjectByteStream,
         mut meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        reject_receipt_mutation(key)?;
         let bytes = Self::read_stream(data).await?;
         let mut objects = self
             .objects

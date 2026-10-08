@@ -1,0 +1,19 @@
+//! MST/2 retention graph edges (spec 10 §6).
+
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
+#[sea_orm(table_name = "mst2_retention_edge")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = true)]
+    pub id: i64,
+    pub parent_id: String,
+    pub child_id: String,
+    pub created_at: Option<DateTimeWithTimeZone>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}

@@ -16,10 +16,17 @@ pub mod issue_storage;
 pub mod lfs_db_storage;
 pub mod media_paging_storage;
 pub mod mono_storage;
+pub(crate) mod mst2_publication_storage;
+pub mod mst2_retention;
+pub(crate) mod native_chunk_map;
+pub mod native_metadata_install;
+pub(crate) mod native_publication_storage;
+pub(crate) mod native_snapshot_session;
 pub mod notification_storage;
 pub mod object_storage;
 pub mod oci_db_storage;
 pub mod push_queue_storage;
+pub(crate) mod qualified_metadata_family;
 pub mod stg_common;
 pub mod user_storage;
 pub mod vault_storage;
@@ -151,6 +158,21 @@ impl AppService {
 #[derive(Clone)]
 pub struct Storage {
     pub(crate) app_service: Arc<AppService>,
+    /// Derived native projection memoization, scoped to this storage assembly.
+    /// Clones share it; independent databases/backends never share entries.
+    pub(crate) native_projection_cache: Arc<crate::ceres::snapshot::pages::NativeProjectionCache>,
+    pub(crate) native_chunk_maps:
+        Arc<tokio::sync::OnceCell<native_chunk_map::PostgresChunkMapRepository>>,
+    pub(crate) native_snapshot_sessions:
+        Arc<tokio::sync::OnceCell<native_snapshot_session::PostgresNativeSessionRepository>>,
+    #[cfg(test)]
+    pub(crate) shadow_qualified_metadata:
+        Arc<tokio::sync::OnceCell<qualified_metadata_family::ShadowQualifiedMetadataWriter>>,
+    pub(crate) rooted_qualified_metadata: Arc<
+        tokio::sync::OnceCell<Arc<qualified_metadata_family::RootedQualifiedMetadataRepository>>,
+    >,
+    pub(crate) projection_observation_sink:
+        Option<Arc<crate::ceres::snapshot::projection_writer::ProjectionObservationSink>>,
     pub cl_service: CLService,
     pub push_queue_service: PushQueueService,
     pub artifact_service: ArtifactService,
@@ -179,6 +201,46 @@ pub struct Storage {
 }
 
 impl Storage {
+    pub(crate) async fn rooted_qualified_metadata_writer(
+        &self,
+    ) -> Result<&qualified_metadata_family::RootedQualifiedMetadataRepository, MegaError> {
+        self.rooted_qualified_metadata
+            .get_or_try_init(|| async {
+                let repository = Arc::new(
+                    qualified_metadata_family::RootedQualifiedMetadataRepository::open(
+                        self.mono_storage().get_connection(),
+                        &self.config().database,
+                    )
+                    .await?,
+                );
+                repository
+                    .maintenance_tick(64)
+                    .await
+                    .map_err(|error| MegaError::Other(error.to_string()))?;
+                qualified_metadata_family::RootedQualifiedMetadataRepository::start_maintenance(
+                    &repository,
+                );
+                Ok::<_, MegaError>(repository)
+            })
+            .await
+            .map(Arc::as_ref)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn shadow_qualified_metadata_writer(
+        &self,
+    ) -> Result<&qualified_metadata_family::ShadowQualifiedMetadataWriter, MegaError> {
+        self.shadow_qualified_metadata
+            .get_or_try_init(|| async {
+                qualified_metadata_family::ShadowQualifiedMetadataWriter::open(
+                    self.mono_storage().get_connection(),
+                    &self.config().database,
+                )
+                .await
+            })
+            .await
+    }
+
     pub async fn new(
         config: Arc<Config>,
         object_store: MegaObjectStorageWrapper,
@@ -224,7 +286,8 @@ impl Storage {
         };
 
         let commit_binding_storage = CommitBindingStorage { base: base.clone() };
-        let push_queue_storage = PushQueueStorage::new(base.clone());
+        let push_queue_storage = PushQueueStorage::new(base.clone())
+            .with_native_publication(config.mst2.publication_enabled);
         let buck_storage = BuckStorage { base: base.clone() };
 
         let bots_storage = BotsStorage { base: base.clone() };
@@ -291,7 +354,8 @@ impl Storage {
         let push_queue_service =
             PushQueueService::new(base.clone(), config.monorepo.push_policy.clone())
                 .with_view_signal(view_runtime.signal())
-                .with_max_push_commits(config.monorepo.max_push_commits);
+                .with_max_push_commits(config.monorepo.max_push_commits)
+                .with_native_publication(config.mst2.publication_enabled);
         let artifact_service = ArtifactService::new(base.clone(), object_store.clone());
         let buck_service = BuckService::new(
             base.clone(),
@@ -308,8 +372,15 @@ impl Storage {
         let storage_event_emitter =
             crate::jupiter::service::storage_event_emitter::StorageEventEmitter::from_config_disabled(&config);
 
-        Ok(Storage {
+        let storage = Storage {
             app_service: app_service.into(),
+            native_projection_cache: Arc::default(),
+            native_snapshot_sessions: Arc::default(),
+            native_chunk_maps: Arc::default(),
+            #[cfg(test)]
+            shadow_qualified_metadata: Arc::default(),
+            rooted_qualified_metadata: Arc::default(),
+            projection_observation_sink: None,
             config_handle,
             config,
             cl_service: CLService::new(base.clone()),
@@ -328,7 +399,13 @@ impl Storage {
             view_runtime,
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
-        })
+        };
+        #[cfg(test)]
+        if init::generic_history_bootstrap_active() {
+            return Ok(storage);
+        }
+        storage.rooted_qualified_metadata_writer().await?;
+        Ok(storage)
     }
 
     pub fn config_handle(&self) -> ConfigHandle {
@@ -685,6 +762,13 @@ impl Storage {
 
         Storage {
             app_service,
+            native_projection_cache: Arc::default(),
+            native_snapshot_sessions: Arc::default(),
+            native_chunk_maps: Arc::default(),
+            #[cfg(test)]
+            shadow_qualified_metadata: Arc::default(),
+            rooted_qualified_metadata: Arc::default(),
+            projection_observation_sink: None,
             // app_service: AppService::mock(),
             cl_service: CLService::mock(),
             push_queue_service: PushQueueService::new(

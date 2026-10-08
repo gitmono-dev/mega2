@@ -380,6 +380,35 @@ fn spawn_view_worker_task(
     spawn_view_worker_with_round(storage, token, production_round())
 }
 
+fn spawn_chunk_map_retention_task(
+    storage: Storage,
+    token: CancellationToken,
+    available: bool,
+) -> Option<JoinHandle<()>> {
+    if !available {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _=token.cancelled()=>break,
+                _=interval.tick()=>{
+                    // Cancellation drops the real maintenance future. Claims
+                    // are durable, so interrupted backend operations replay.
+                    tokio::select! {
+                        _=token.cancelled()=>break,
+                        result=async {
+                            storage.chunk_maps().await?.maintain(&storage.git_service.obj_storage,64).await
+                        }=>if let Err(error)=result {tracing::warn!(?error,"bounded chunk-map retention tick failed");}
+                    }
+                }
+            }
+        }
+    }))
+}
+
 /// Returns a future that completes when the cancellation token is triggered.
 async fn shutdown_signal(token: CancellationToken) {
     token.cancelled().await;
@@ -450,6 +479,46 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     // TP-15 / 4.1 ②③⑥: open CLs, last_policy vs non-terminal rows, watermark reset.
     ctx.storage.prepare_push_policy_startup().await?;
     ctx.storage.check_view_reserved_startup().await?;
+    let chunk_map_retention_available = if ctx.storage.config().mst2.enabled {
+        // Detect the actual backend capability. Unsupported CHUNK retention
+        // must not disable other snapshot objects or generic HTTP serving.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ctx.storage
+                .git_service
+                .obj_storage
+                .inner
+                .chunk_map_receipt_inventory(),
+        )
+        .await
+        {
+            Ok(Err(crate::orbit_api::error::IoOrbitError::ChunkMapRetentionUnsupported)) => {
+                tracing::info!(
+                    "CHUNK cold admission and maintenance unavailable for this backing store; other snapshot routes remain available"
+                );
+                false
+            }
+            _ => {
+                let result = async {
+                    ctx.storage
+                        .chunk_maps()
+                        .await?
+                        .maintain(&ctx.storage.git_service.obj_storage, 64)
+                        .await
+                }
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(
+                        ?error,
+                        "initial CHUNK retention check failed; cold admission remains fail closed"
+                    );
+                }
+                true
+            }
+        }
+    } else {
+        false
+    };
 
     // First-build the shared authorization snapshot before the listener binds
     // (UN-02). `off` is a no-op; a failed first build fails startup.
@@ -479,6 +548,11 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
         spawn_artifact_gc_task(shutdown_context.clone(), shutdown_token.clone())?;
     let view_worker_handle =
         spawn_view_worker_task(shutdown_context.storage.clone(), shutdown_token.clone())?;
+    let chunk_map_retention_handle = spawn_chunk_map_retention_task(
+        shutdown_context.storage.clone(),
+        shutdown_token.clone(),
+        chunk_map_retention_available,
+    );
     let notification_shutdown = shutdown_context.notification_shutdown.clone();
     let server_token = shutdown_token.clone();
 
@@ -541,7 +615,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
         },
     };
 
-    let (cleanup_result, artifact_gc_result, view_worker_result) = tokio::join!(
+    let (cleanup_result, artifact_gc_result, view_worker_result, chunk_map_retention_result) = tokio::join!(
         async {
             if let Some(handle) = cleanup_handle {
                 match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
@@ -612,11 +686,34 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
             } else {
                 Ok(())
             }
+        },
+        async {
+            if let Some(mut handle) = chunk_map_retention_handle {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), &mut handle).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => {
+                        tracing::error!(%error,"chunk-map retention task panicked");
+                        Err(())
+                    }
+                    Err(_) => {
+                        handle.abort();
+                        let _ = handle.await;
+                        tracing::error!(
+                            "chunk-map retention task exceeded shutdown deadline and was aborted"
+                        );
+                        Err(())
+                    }
+                }
+            } else {
+                Ok(())
+            }
         }
     );
 
-    let shutdown_failed =
-        cleanup_result.is_err() || artifact_gc_result.is_err() || view_worker_result.is_err();
+    let shutdown_failed = cleanup_result.is_err()
+        || artifact_gc_result.is_err()
+        || view_worker_result.is_err()
+        || chunk_map_retention_result.is_err();
     match (shutdown_failed, &server_result) {
         (false, Ok(())) => {
             tracing::info!("Graceful shutdown completed successfully");

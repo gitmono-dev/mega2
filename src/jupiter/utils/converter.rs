@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap, str::FromStr};
 
 use git_internal::{
     hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
@@ -663,6 +663,21 @@ pub struct MegaModelConverter {
     pub refs: mega_refs::ActiveModel,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BootstrapCommitTime(u32);
+
+impl FromStr for BootstrapCommitTime {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || "commit time must be Unix seconds in 0..=4294967295".to_string();
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        value.parse::<u32>().map(Self).map_err(|_| invalid())
+    }
+}
+
 struct InitializationHashKindGuard {
     previous: HashKind,
 }
@@ -725,11 +740,32 @@ impl MegaModelConverter {
     }
 
     pub fn init(mono_config: &MonoConfig) -> Result<Self, MegaError> {
+        Self::init_with_commit_time(mono_config, None)
+    }
+
+    pub(crate) fn init_with_commit_time(
+        mono_config: &MonoConfig,
+        commit_time: Option<BootstrapCommitTime>,
+    ) -> Result<Self, MegaError> {
         let hash_kind = mono_config.object_hash_kind()?;
 
-        Ok(with_initialization_hash_kind(hash_kind, || {
+        with_initialization_hash_kind(hash_kind, || {
             let (tree_maps, blob_maps, root_tree) = init_trees(mono_config);
-            let commit = Commit::from_tree_id(root_tree.id, vec![], "\nInit Mega Directory");
+            let commit = match commit_time {
+                Some(BootstrapCommitTime(seconds)) => Commit::new_with_kind(
+                    hash_kind,
+                    Signature::from_data(
+                        format!("author mega <admin@mega.org> {seconds} +0800").into_bytes(),
+                    )?,
+                    Signature::from_data(
+                        format!("committer mega <admin@mega.org> {seconds} +0800").into_bytes(),
+                    )?,
+                    root_tree.id,
+                    vec![],
+                    "\nInit Mega Directory",
+                )?,
+                None => Commit::from_tree_id(root_tree.id, vec![], "\nInit Mega Directory"),
+            };
 
             let mega_ref = mega_refs::Model {
                 id: generate_id(),
@@ -753,8 +789,8 @@ impl MegaModelConverter {
                 refs: mega_ref.into(),
             };
             converter.traverse_from_root();
-            converter
-        }))
+            Ok(converter)
+        })
     }
 }
 
