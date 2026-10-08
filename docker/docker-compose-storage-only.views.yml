@@ -1,0 +1,9 @@
+# Opt-in view smoke stack. Compose with docker-compose-storage-only.yml.
+services:
+  mega2:
+    environment:
+      MEGA_VIEWS__ENABLED: "true"
+      MEGA_VIEWS__MAX_FILTERS: "2"
+      MEGA_DATABASE__DB_URL: postgres://mega2:mega2_storage_password@postgres:5432/mega2_hp25_views
+      MEGA_REDIS__URL: redis://redis:6379/1
+      MEGA_BASE_DIR: /tmp/mega2-hp25-views

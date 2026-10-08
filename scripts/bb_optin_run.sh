@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
-# Host-side helper that runs one opt-in smoke case of plan-20261001 on a
-# temporarily switched mega2 and always restores the default stack
+# Host-side helper that runs one opt-in smoke case on a temporarily switched
+# mega2 and always restores the default stack
 # (ADR-BB-06).
 #
 # Usage:
-#   scripts/bb_optin_run.sh <none|gc|local> <script> <case> <log>
-#   scripts/bb_optin_run.sh --selftest <none|gc|local> <log>
+#   scripts/bb_optin_run.sh <none|gc|local|views> <script> <case> <log>
+#   scripts/bb_optin_run.sh --selftest <none|gc|local|views> <log>
 #
 # Modes (mega2 is recreated with --force-recreate):
 #   none   overlay docker/docker-compose-storage-only.auth-none.yml (push_auth=none)
 #   gc     --env-file config/compose.env.storage-only.artifacts-gc
 #   local  --env-file config/compose.env.storage-only.local (local object storage)
+#   views overlay docker/docker-compose-storage-only.views.yml (isolated views stack)
 #
 # The case runs inside the `interop-smoke` service with its opt-in switch set
-# (MEGA2_SMOKE_AUTH_NONE / MEGA2_SMOKE_ARTIFACTS_GC / MEGA2_SMOKE_LOCAL_STORAGE)
+# (MEGA2_SMOKE_AUTH_NONE / MEGA2_SMOKE_ARTIFACTS_GC /
+# MEGA2_SMOKE_LOCAL_STORAGE / MEGA2_SMOKE_VIEWS)
 # and its output is tee'd to <log>. After the switch, and again after an
 # EXIT trap recreates mega2 with the default configuration, the helper reads
 # the compose config-hash label of the running mega2 container: it must equal
 # the switched configuration's hash before the case runs, and the default
 # configuration's hash (recorded before the switch) after restoration.
 #
-# <script> must be one of the three plan-20261001 smoke entrypoints, and a
+# <script> must be an allowed smoke entrypoint for its mode, and a
 # zero exit is only accepted when the log holds `PASS: <case>`.
 #
 # --selftest runs a stub instead of a smoke script: it prints
@@ -82,9 +84,13 @@ case "$mode" in
         switched_args=(--env-file "$CONFIG_DIR/compose.env.storage-only.local")
         switch_var=MEGA2_SMOKE_LOCAL_STORAGE
         ;;
+    views)
+        switched_args=(-f docker/docker-compose-storage-only.views.yml)
+        switch_var=MEGA2_SMOKE_VIEWS
+        ;;
     *)
         echo "bb-optin: unknown mode '$mode'; nothing switched" >&2
-        echo "usage: $0 <none|gc|local> <script> <case> <log> | --selftest <mode> <log>" >&2
+        echo "usage: $0 <none|gc|local|views> <script> <case> <log> | --selftest <mode> <log>" >&2
         exit 2
         ;;
 esac
@@ -102,12 +108,17 @@ if [ "$selftest" -eq 0 ]; then
         exit 2
     fi
     case "$script" in
-        oci_client_smoke_storage_only.sh|artifacts_smoke_storage_only.sh|libra_smoke_storage_only.sh) ;;
+        oci_client_smoke_storage_only.sh|artifacts_smoke_storage_only.sh|libra_smoke_storage_only.sh|libra_view_smoke.sh) ;;
         *)
-            echo "bb-optin: '$script' is not a plan-20261001 smoke entrypoint; nothing switched" >&2
+            echo "bb-optin: '$script' is not an allowed smoke entrypoint; nothing switched" >&2
             exit 2
             ;;
     esac
+    if { [ "$mode" = views ] && [ "$script" != libra_view_smoke.sh ]; } \
+        || { [ "$mode" != views ] && [ "$script" = libra_view_smoke.sh ]; }; then
+        echo "bb-optin: script '$script' does not match mode '$mode'; nothing switched" >&2
+        exit 2
+    fi
     if [ ! -f "scripts/$script" ]; then
         echo "bb-optin: scripts/$script not found; nothing switched" >&2
         exit 2
@@ -126,6 +137,7 @@ umask 077
 : > "$log"
 chmod 600 "$log"
 say() { echo "$*" | tee -a "$log"; }
+start_seconds=$SECONDS
 
 config_hash() {
     "$@" config --hash mega2 | awk '{print $2}'
@@ -155,6 +167,9 @@ restore() {
     if [ "$FAULT" = "unhealthy" ]; then up_rc=99; fi
     if [ "$FAULT" = "hash" ]; then after="fault-injected"; fi
     rmdir "$LOCK_DIR"
+    if [ "$mode" = views ]; then
+        say "bb-optin: views elapsed $((SECONDS - start_seconds))s"
+    fi
     if [ "$up_rc" -eq 0 ] && [ "$after" = "$default_hash" ]; then
         say "bb-optin: restored mega2 (config hash match)"
         exit "$rc"
@@ -163,6 +178,13 @@ restore() {
     exit 3
 }
 trap restore EXIT
+
+if [ "$mode" = views ]; then
+    if ! scripts/libra_view_smoke_setup.sh reset >> "$log" 2>&1; then
+        say "bb-optin: views setup reset failed"
+        exit 1
+    fi
+fi
 
 if [ "$SWITCH_FAULT" != "stale" ]; then
     "${COMPOSE[@]}" "${switched_args[@]}" up -d --wait --no-deps --force-recreate mega2 >> "$log" 2>&1
@@ -178,6 +200,13 @@ if [ "$running" != "$switched_hash" ]; then
     exit 1
 fi
 say "bb-optin: switched config hash $default_hash != $running"
+
+if [ "$mode" = views ] && [ "$selftest" -eq 0 ]; then
+    if ! scripts/libra_view_smoke_setup.sh prepare >> "$log" 2>&1; then
+        say "bb-optin: views setup prepare failed"
+        exit 1
+    fi
+fi
 
 set +e
 if [ "$selftest" -eq 1 ]; then
