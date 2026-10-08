@@ -6,6 +6,10 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         matches!(&self.store, BackendStore::S3(_) | BackendStore::Gcs(_))
     }
 
+    fn supports_chunk_map_retention(&self) -> bool {
+        matches!(&self.store, BackendStore::Local(_))
+    }
+
     async fn put_stream(
         &self,
         key: &ObjectKey,
@@ -101,7 +105,10 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         let meta = build_object_meta(&res.meta);
         let stream = res.into_stream().map_err(std::io::Error::other);
 
-        Ok((Box::pin(stream), meta))
+        Ok((
+            crate::orbit_api::object_storage::fragment_object_stream(Box::pin(stream)),
+            meta,
+        ))
     }
 
     async fn chunk_map_receipt_inventory(
@@ -112,7 +119,7 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         };
         // object_store 0.14 cannot inventory/delete retained cloud versions.
         // A current-object listing is not a physical backing-byte quota.
-        if !matches!(&self.store, BackendStore::Local(_)) {
+        if !self.supports_chunk_map_retention() {
             return Err(IoOrbitError::ChunkMapRetentionUnsupported);
         }
         let prefix = object_store::path::Path::from("chunk-map-receipt");
@@ -161,7 +168,7 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         &self,
         authority: &crate::orbit_api::object_storage::ChunkMapReceiptDeletion,
     ) -> OrbitResult<bool> {
-        if !matches!(&self.store, BackendStore::Local(_)) {
+        if !self.supports_chunk_map_retention() {
             return Err(IoOrbitError::ChunkMapRetentionUnsupported);
         }
         let key = authority.key();
@@ -340,6 +347,91 @@ pub(super) fn reject_receipt_mutation(key: &ObjectKey) -> OrbitResult<()> {
 #[cfg(test)]
 mod exact_range_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn backend_chunk_retention_capabilities_match_cold_admission_without_cloud_io() {
+        let s3 = object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name("capabilities-test")
+            .with_region("us-east-1")
+            .with_access_key_id("fixture-access")
+            .with_secret_access_key("fixture-secret")
+            .with_skip_signature(true)
+            .build()
+            .unwrap();
+        let gcs = object_store::gcp::GoogleCloudStorageBuilder::new()
+            .with_bucket_name("capabilities-test")
+            .with_credentials(Arc::new(object_store::StaticCredentialProvider::new(
+                object_store::gcp::GcpCredential {
+                    bearer: "fixture-bearer".into(),
+                },
+            )))
+            .with_skip_signature(true)
+            .build()
+            .unwrap();
+        for store in [
+            BackendStore::S3(Arc::new(s3)),
+            BackendStore::Gcs(Arc::new(gcs)),
+        ] {
+            let backend = crate::orbit_api::factory::MegaObjectStorageWrapper::new(Arc::new(
+                ObjectStoreAdapter {
+                    store,
+                    upload_strategy: UploadStrategy::SinglePut,
+                    presign_store: None,
+                },
+            ));
+            assert!(!backend.supports_chunk_map_retention());
+            assert!(matches!(
+                backend.inner.chunk_map_receipt_inventory().await,
+                Err(IoOrbitError::ChunkMapRetentionUnsupported)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_whole_stream_keeps_large_file_size_and_digest_with_bounded_fragments() {
+        use sha2::{Digest, Sha256};
+
+        let directory = tempfile::tempdir().unwrap();
+        let adapter = ObjectStoreAdapter {
+            store: BackendStore::Local(Arc::new(
+                LocalFileSystem::new_with_prefix(directory.path()).unwrap(),
+            )),
+            upload_strategy: UploadStrategy::SinglePut,
+            presign_store: None,
+        };
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: "ab".repeat(20),
+        };
+        let raw = Bytes::from(vec![
+            0xff;
+            crate::orbit_api::object_storage::OBJECT_STREAM_ITEM_BYTES
+                + 113
+        ]);
+        let expected: [u8; 32] = Sha256::digest(&raw).into();
+        let size = raw.len();
+        adapter
+            .put_stream(
+                &key,
+                Box::pin(stream::iter([Ok(raw)])),
+                ObjectMeta::default(),
+            )
+            .await
+            .unwrap();
+        let (mut input, meta) = adapter.get_stream(&key).await.unwrap();
+        assert_eq!(meta.size, size as i64);
+        assert!(adapter.supports_chunk_map_retention());
+        let mut received = 0;
+        let mut hashed = Sha256::new();
+        while let Some(part) = input.next().await {
+            let part = part.unwrap();
+            assert!(part.len() <= crate::orbit_api::object_storage::OBJECT_STREAM_ITEM_BYTES);
+            received += part.len();
+            hashed.update(&part);
+        }
+        assert_eq!(received, size);
+        assert_eq!(<[u8; 32]>::from(hashed.finalize()), expected);
+    }
 
     #[tokio::test]
     async fn local_chunk_receipts_reject_all_mutation_routes() {

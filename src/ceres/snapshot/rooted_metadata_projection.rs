@@ -4,9 +4,12 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use git_internal::{hash::ObjectHash, internal::object::tree::Tree};
 use mst2_codec::{
     descriptor::{
@@ -19,6 +22,7 @@ use sea_orm::ActiveValue::Set;
 use sha2::{Digest, Sha256};
 
 use super::{
+    content_budget::{MemoryBudget, RANGE_WORK_BYTES, projection_budget},
     error::{SnapshotError, SnapshotErrorCode},
     metadata_install::MetadataInstallIdentity,
     projection_observation::NATIVE_PROJECTION_REVISION,
@@ -31,7 +35,11 @@ use crate::{
     ceres::api_service::ApiHandler,
     common::errors::MegaError,
     jupiter::storage::{Storage, mono_storage::MST2_VERIFICATION_VERSION},
+    orbit_api::object_storage::{ObjectByteStream, ObjectMeta},
 };
+
+const MAX_VERIFIED_FILE_BYTES: u64 = 8_796_093_022_208;
+const SOURCE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub(crate) trait RootedReuseLookup: Send + Sync {
@@ -732,28 +740,12 @@ async fn project_directory<T: ApiHandler + ?Sized, R: RootedReuseLookup + ?Sized
                 let fact = if let Some(fact) = state.blob_facts.get(&raw_oid).copied() {
                     fact
                 } else {
-                    state.work.blob_fetches += 1;
-                    let raw = super::pages::fetch_raw_blob(handler, &raw_oid).await?;
-                    state.work.raw_bytes_fetched = state
-                        .work
-                        .raw_bytes_fetched
-                        .checked_add(raw.len() as u64)
-                        .ok_or_else(budget_limit)?;
-                    let size = u64::try_from(raw.len())
-                        .map_err(|_| integrity("raw file size is not representable"))?;
-                    if size > 8_796_093_022_208 {
-                        return Err(integrity(
-                            "raw file exceeds the native verified-object size profile",
-                        ));
-                    }
-                    let digest: [u8; 32] = Sha256::digest(&raw).into();
-                    state.work.raw_bytes_hashed = state
-                        .work
-                        .raw_bytes_hashed
-                        .checked_add(size)
-                        .ok_or_else(budget_limit)?;
-                    drop(raw);
-                    let fact = BlobFact { size, digest };
+                    let fact = stream_blob_fact_with_resources(
+                        || handler.get_raw_blob_stream_with_meta(&raw_oid),
+                        projection_budget(),
+                        &mut state.work,
+                    )
+                    .await?;
                     state.blob_facts.insert(raw_oid.clone(), fact);
                     pending_facts.push((raw_oid.clone(), fact));
                     if pending_facts.len() == 64 {
@@ -795,12 +787,107 @@ async fn project_directory<T: ApiHandler + ?Sized, R: RootedReuseLookup + ?Sized
     Ok(summary)
 }
 
+async fn stream_blob_fact_with_resources<F, Fut>(
+    open: F,
+    budget: &Arc<MemoryBudget>,
+    work: &mut RootedProjectionWork,
+) -> Result<BlobFact, SnapshotError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(ObjectByteStream, ObjectMeta), MegaError>>,
+{
+    // Credit bounds consumer-visible processing, not the backend's backing
+    // allocation or work surviving cancellation. No source bytes accumulate.
+    let _lease = budget.reserve(RANGE_WORK_BYTES)?;
+    work.blob_fetches = work.blob_fetches.checked_add(1).ok_or_else(budget_limit)?;
+    let (mut input, meta) = tokio::time::timeout(SOURCE_PROGRESS_TIMEOUT, open())
+        .await
+        .map_err(|_| source_progress_timeout())?
+        .map_err(source_error)?;
+    let size = u64::try_from(meta.size)
+        .ok()
+        .filter(|size| *size <= MAX_VERIFIED_FILE_BYTES)
+        .ok_or_else(|| integrity("raw file exceeds the native verified-object size profile"))?;
+    let mut digest = Sha256::new();
+    let mut received = 0u64;
+    let mut since_yield = 0usize;
+    let mut empty_parts = 0usize;
+    let mut progress_deadline = tokio::time::Instant::now() + SOURCE_PROGRESS_TIMEOUT;
+    loop {
+        if tokio::time::Instant::now() >= progress_deadline {
+            return Err(source_progress_timeout());
+        }
+        let part = tokio::time::timeout_at(progress_deadline, input.next())
+            .await
+            .map_err(|_| source_progress_timeout())?;
+        let Some(part) = part else { break };
+        let bytes = part.map_err(|error| {
+            tracing::warn!(error = %error, "rooted metadata raw source stream failed");
+            SnapshotError::new(
+                SnapshotErrorCode::ObjectUnavailable,
+                "raw source stream failed",
+            )
+        })?;
+        if bytes.len() as u64 > size - received {
+            return Err(integrity(
+                "raw source length disagrees with its physical size",
+            ));
+        }
+        if bytes.len() > RANGE_WORK_BYTES {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::TemporaryUnavailable,
+                "raw source producer item exceeds the consumer processing limit",
+            ));
+        }
+        digest.update(&bytes);
+        received += bytes.len() as u64;
+        since_yield += bytes.len();
+        if bytes.is_empty() {
+            empty_parts += 1;
+        } else {
+            empty_parts = 0;
+            progress_deadline = tokio::time::Instant::now() + SOURCE_PROGRESS_TIMEOUT;
+        }
+        if since_yield >= RANGE_WORK_BYTES || empty_parts == 32 {
+            tokio::task::yield_now().await;
+            since_yield = 0;
+            empty_parts = 0;
+        }
+    }
+    if received != size {
+        return Err(integrity(
+            "raw source length disagrees with its physical size",
+        ));
+    }
+    let fetched = work
+        .raw_bytes_fetched
+        .checked_add(size)
+        .ok_or_else(budget_limit)?;
+    let hashed = work
+        .raw_bytes_hashed
+        .checked_add(size)
+        .ok_or_else(budget_limit)?;
+    work.raw_bytes_fetched = fetched;
+    work.raw_bytes_hashed = hashed;
+    Ok(BlobFact {
+        size,
+        digest: digest.finalize().into(),
+    })
+}
+
+fn source_progress_timeout() -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::TemporaryUnavailable,
+        "rooted metadata raw source made no progress",
+    )
+}
+
 fn verified_fact(
     fact: &crate::callisto::mst2_verified_object::Model,
 ) -> Result<BlobFact, SnapshotError> {
     if fact.state != "VERIFIED"
         || fact.verification_version != MST2_VERIFICATION_VERSION
-        || !(0..=8_796_093_022_208).contains(&fact.size)
+        || !(0..=MAX_VERIFIED_FILE_BYTES as i64).contains(&fact.size)
     {
         return Err(integrity(
             "native projection received an invalid current verified blob fact",
@@ -894,10 +981,292 @@ fn path_limit() -> SnapshotError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
     use git_internal::hash::HashKind;
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     use super::*;
+
+    struct FactInput {
+        parts: VecDeque<std::io::Result<Bytes>>,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        hold_eof: Option<Arc<Notify>>,
+    }
+
+    impl futures::Stream for FactInput {
+        type Item = std::io::Result<Bytes>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let input = self.get_mut();
+            input.polls.fetch_add(1, Ordering::SeqCst);
+            if let Some(part) = input.parts.pop_front() {
+                Poll::Ready(Some(part))
+            } else if let Some(entered) = &input.hold_eof {
+                entered.notify_one();
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    impl Drop for FactInput {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn fact_input(
+        parts: Vec<std::io::Result<Bytes>>,
+        hold_eof: Option<Arc<Notify>>,
+    ) -> (ObjectByteStream, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        (
+            Box::pin(FactInput {
+                parts: parts.into(),
+                polls: polls.clone(),
+                drops: drops.clone(),
+                hold_eof,
+            }),
+            polls,
+            drops,
+        )
+    }
+
+    #[tokio::test]
+    async fn streamed_cold_fact_keeps_large_memory_source_and_empty_raw_costs_exact() {
+        use crate::orbit_api::object_storage::{ObjectKey, ObjectNamespace};
+
+        for size in [0, RANGE_WORK_BYTES + 113] {
+            let backend = crate::jupiter::storage::object_storage::mock_object_storage();
+            let key = ObjectKey {
+                namespace: ObjectNamespace::Git,
+                key: "ab".repeat(20),
+            };
+            let mut raw = vec![0xff; size];
+            if !raw.is_empty() {
+                raw[..11].copy_from_slice(b"blob 3\0abc\0");
+            }
+            let expected: [u8; 32] = Sha256::digest(&raw).into();
+            backend
+                .inner
+                .put_stream(
+                    &key,
+                    Box::pin(futures::stream::iter([Ok(Bytes::from(raw))])),
+                    ObjectMeta::default(),
+                )
+                .await
+                .unwrap();
+            let budget = MemoryBudget::new(RANGE_WORK_BYTES);
+            let opens = AtomicUsize::new(0);
+            let mut work = RootedProjectionWork::default();
+            let fact = stream_blob_fact_with_resources(
+                || async {
+                    opens.fetch_add(1, Ordering::SeqCst);
+                    backend
+                        .inner
+                        .get_stream(&key)
+                        .await
+                        .map_err(MegaError::from)
+                },
+                &budget,
+                &mut work,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fact,
+                BlobFact {
+                    size: size as u64,
+                    digest: expected
+                }
+            );
+            assert_eq!(opens.load(Ordering::SeqCst), 1);
+            assert_eq!(work.blob_fetches, 1);
+            assert_eq!(work.raw_bytes_fetched, size as u64);
+            assert_eq!(work.raw_bytes_hashed, size as u64);
+            assert_eq!(work.verified_blob_persistence_batches, 0);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_cold_fact_rejects_physical_mismatch_and_late_error_before_fact_return() {
+        let raw = Bytes::from_static(b"raw");
+        for (size, parts, code, polls_expected) in [
+            (
+                -1,
+                vec![Ok(raw.clone())],
+                SnapshotErrorCode::IntegrityError,
+                0,
+            ),
+            (
+                MAX_VERIFIED_FILE_BYTES as i64 + 1,
+                vec![Ok(raw.clone())],
+                SnapshotErrorCode::IntegrityError,
+                0,
+            ),
+            (
+                MAX_VERIFIED_FILE_BYTES as i64,
+                vec![],
+                SnapshotErrorCode::IntegrityError,
+                1,
+            ),
+            (
+                RANGE_WORK_BYTES as i64 + 1,
+                vec![Ok(Bytes::from(vec![7; RANGE_WORK_BYTES + 1]))],
+                SnapshotErrorCode::TemporaryUnavailable,
+                1,
+            ),
+            (
+                2,
+                vec![Ok(raw.clone())],
+                SnapshotErrorCode::IntegrityError,
+                1,
+            ),
+            (
+                4,
+                vec![Ok(raw.clone())],
+                SnapshotErrorCode::IntegrityError,
+                2,
+            ),
+            (
+                3,
+                vec![Ok(raw.clone()), Ok(Bytes::from_static(b"x"))],
+                SnapshotErrorCode::IntegrityError,
+                2,
+            ),
+            (
+                3,
+                vec![Ok(raw), Err(std::io::Error::other("late source error"))],
+                SnapshotErrorCode::ObjectUnavailable,
+                2,
+            ),
+            (
+                0,
+                vec![Err(std::io::Error::other("empty source error"))],
+                SnapshotErrorCode::ObjectUnavailable,
+                1,
+            ),
+        ] {
+            let (input, polls, drops) = fact_input(parts, None);
+            let budget = MemoryBudget::new(RANGE_WORK_BYTES);
+            let mut work = RootedProjectionWork::default();
+            let error = stream_blob_fact_with_resources(
+                || async move {
+                    Ok((
+                        input,
+                        ObjectMeta {
+                            size,
+                            ..Default::default()
+                        },
+                    ))
+                },
+                &budget,
+                &mut work,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(polls.load(Ordering::SeqCst), polls_expected);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(work.blob_fetches, 1);
+            assert_eq!(work.raw_bytes_fetched, 0);
+            assert_eq!(work.raw_bytes_hashed, 0);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_cold_fact_cancellation_at_exact_size_drops_source_and_refunds_credit() {
+        let entered = Arc::new(Notify::new());
+        let (input, polls, drops) =
+            fact_input(vec![Ok(Bytes::from_static(b"raw"))], Some(entered.clone()));
+        let budget = MemoryBudget::new(RANGE_WORK_BYTES);
+        let task_budget = budget.clone();
+        let task = tokio::spawn(async move {
+            let mut work = RootedProjectionWork::default();
+            stream_blob_fact_with_resources(
+                || async move {
+                    Ok((
+                        input,
+                        ObjectMeta {
+                            size: 3,
+                            ..Default::default()
+                        },
+                    ))
+                },
+                &task_budget,
+                &mut work,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(budget.used(), RANGE_WORK_BYTES);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn streamed_cold_fact_reserves_fixed_credit_before_open_and_preserves_open_errors() {
+        let budget = MemoryBudget::new(RANGE_WORK_BYTES);
+        let occupied = budget.reserve(RANGE_WORK_BYTES).unwrap();
+        let mut work = RootedProjectionWork::default();
+        let opens = AtomicUsize::new(0);
+        let error = stream_blob_fact_with_resources(
+            || async {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Err(MegaError::Other("unexpected open".into()))
+            },
+            &budget,
+            &mut work,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, SnapshotErrorCode::TemporaryUnavailable);
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(work, RootedProjectionWork::default());
+        drop(occupied);
+        for (error, code) in [
+            (
+                MegaError::ObjStorageNotFound("missing".into()),
+                SnapshotErrorCode::ObjectUnavailable,
+            ),
+            (
+                MegaError::ObjStorageInconsistent("inconsistent".into()),
+                SnapshotErrorCode::IntegrityError,
+            ),
+            (
+                MegaError::Other("transport".into()),
+                SnapshotErrorCode::Internal,
+            ),
+        ] {
+            let mut work = RootedProjectionWork::default();
+            let got = stream_blob_fact_with_resources(|| async { Err(error) }, &budget, &mut work)
+                .await
+                .unwrap_err();
+            assert_eq!(got.code, code);
+            assert_eq!(work.blob_fetches, 1);
+            assert_eq!(work.raw_bytes_fetched, 0);
+            assert_eq!(work.raw_bytes_hashed, 0);
+            assert_eq!(budget.used(), 0);
+        }
+    }
 
     fn state() -> ProjectionState {
         ProjectionState::new(MetadataInstallIdentity {

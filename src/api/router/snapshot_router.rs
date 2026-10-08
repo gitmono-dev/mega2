@@ -35,6 +35,7 @@ use crate::{
         runtime::{now_unix, runtime},
         view::{SnapshotView, validate_scope_relative_path},
     },
+    orbit_api::factory::MegaObjectStorageWrapper,
 };
 
 pub fn routers(api_state: MonoApiServiceState) -> Router<MonoApiServiceState> {
@@ -534,11 +535,14 @@ fn internal<E: std::fmt::Display>(e: E) -> SnapshotError {
     SnapshotError::new(SnapshotErrorCode::Internal, e.to_string())
 }
 
-async fn capabilities() -> Json<serde_json::Value> {
-    // Keep this document on the canonical discovery contract consumed by the
-    // v3 reader.  The full delivery path serves the complete metadata/object
-    // closure, so advertising `full_hydration` as false would make a typed
-    // resolve reject before it reaches this router.
+async fn capabilities(State(state): State<MonoApiServiceState>) -> Json<serde_json::Value> {
+    capabilities_document(&state.storage.git_service.obj_storage)
+}
+
+fn capabilities_document(backend: &MegaObjectStorageWrapper) -> Json<serde_json::Value> {
+    // Full delivery must work from a cold source, including receipt admission.
+    // Existing warm receipts do not establish this backend-wide contract.
+    let full_delivery = backend.supports_chunk_map_retention();
     Json(json!({
         "protocol_versions": [2],
         "metadata_codecs": [1],
@@ -548,10 +552,10 @@ async fn capabilities() -> Json<serde_json::Value> {
             "directory": true,
             "lookup": true,
             "metadata_pages": true,
-            "raw_blob": true,
+            "raw_blob": full_delivery,
             "small_objects": true,
-            "chunk_reads": true,
-            "full_hydration": true,
+            "chunk_reads": full_delivery,
+            "full_hydration": full_delivery,
             "region_hints": false,
             "offline_export": false,
         },
@@ -1640,9 +1644,10 @@ async fn metadata_pages(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn capabilities_advertise_the_canonical_full_delivery_contract() {
-        let Json(value) = capabilities().await;
+    #[test]
+    fn capabilities_advertise_the_canonical_full_delivery_contract() {
+        let backend = crate::jupiter::storage::object_storage::mock_object_storage();
+        let Json(value) = capabilities_document(&backend);
         assert_eq!(
             value,
             json!({

@@ -131,6 +131,22 @@ async fn await_read_open_hold(hold: Option<ReadOpenHold>) {
         release.notified().await;
     }
 }
+
+struct NoRootedReuse;
+
+#[async_trait::async_trait]
+impl crate::ceres::snapshot::rooted_metadata_projection::RootedReuseLookup for NoRootedReuse {
+    async fn lookup_reuse(
+        &self,
+        _tree_oid: &str,
+        _identity: &crate::ceres::snapshot::metadata_install::MetadataInstallIdentity,
+    ) -> Result<
+        Option<crate::ceres::snapshot::rooted_metadata_projection::CertifiedReusableDirectory>,
+        crate::ceres::snapshot::error::SnapshotError,
+    > {
+        Ok(None)
+    }
+}
 #[path = "snapshot_rooted_metadata_tests.rs"]
 mod rooted_metadata;
 
@@ -184,6 +200,14 @@ struct CountingStorage {
 
 #[async_trait::async_trait]
 impl MegaObjectStorage for CountingStorage {
+    fn supports_chunk_map_retention(&self) -> bool {
+        !self
+            .counts
+            .receipt_retention_unsupported
+            .load(Ordering::SeqCst)
+            && self.inner.inner.supports_chunk_map_retention()
+    }
+
     async fn chunk_map_receipt_inventory(
         &self,
     ) -> OrbitResult<crate::orbit_api::object_storage::ChunkMapReceiptInventory> {
@@ -1016,6 +1040,242 @@ async fn error(response: Response, status: u16, code: &str, retryable: bool) {
     assert_eq!(value["error"]["code"], code);
     assert_eq!(value["error"]["retryable"], retryable);
     assert_eq!(value["error"]["request_id"], request_id);
+}
+
+#[tokio::test]
+async fn mst2_rooted_streamed_fact_persists_one_source_pass_and_reuses_warm_alias_facts() {
+    use crate::ceres::snapshot::rooted_metadata_projection::prepare_rooted_native_metadata;
+
+    let fixture = Fixture::new().await;
+    let handler = MonoApiService::from(&fixture.state);
+    let mut raw = vec![0xff; crate::orbit_api::object_storage::OBJECT_STREAM_ITEM_BYTES + 113];
+    let prefix = format!("blob 3\0abc\0{}", uuid::Uuid::new_v4());
+    raw[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    let oid = fixture
+        .state
+        .storage
+        .git_service
+        .save_object_from_raw(Bytes::copy_from_slice(&raw))
+        .await
+        .unwrap();
+    let source = ObjectHash::from_hex_for_kind(HashKind::Sha1, &oid).unwrap();
+    let root = tree(vec![
+        item(TreeItemMode::Blob, source, "alias"),
+        item(TreeItemMode::Blob, source, "file"),
+    ]);
+    let mono = fixture.state.storage.mono_storage();
+    assert!(
+        mono.get_verified_blobs(vec![oid.clone()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    fixture.counts.reset();
+    let first = prepare_rooted_native_metadata(&handler, &root, "/", &NoRootedReuse)
+        .await
+        .unwrap();
+    fixture.counts.assert(1, raw.len());
+    assert_eq!(first.work.blob_fetches, 1);
+    assert_eq!(first.work.raw_bytes_fetched, raw.len() as u64);
+    assert_eq!(first.work.raw_bytes_hashed, raw.len() as u64);
+    assert_eq!(first.work.verified_blob_persistence_batches, 1);
+    let stored = mono.get_verified_blobs(vec![oid.clone()]).await.unwrap();
+    assert_eq!(stored[&oid].size, raw.len() as i64);
+    assert_eq!(stored[&oid].raw_sha256, Sha256::digest(&raw).to_vec());
+    fixture.counts.reset();
+    let warm = prepare_rooted_native_metadata(&handler, &root, "/", &NoRootedReuse)
+        .await
+        .unwrap();
+    fixture.counts.assert(0, 0);
+    assert_eq!(warm.plan.identity, first.plan.identity);
+    assert_eq!(warm.plan.root, first.plan.root);
+    assert_eq!(warm.work.blob_fetches, 0);
+    assert_eq!(warm.work.raw_bytes_fetched, 0);
+    assert_eq!(warm.work.raw_bytes_hashed, 0);
+    assert_eq!(warm.work.verified_blob_persistence_batches, 0);
+    raw.push(b'2');
+    let next_oid = fixture
+        .state
+        .storage
+        .git_service
+        .save_object_from_raw(Bytes::copy_from_slice(&raw))
+        .await
+        .unwrap();
+    let next_source = ObjectHash::from_hex_for_kind(HashKind::Sha1, &next_oid).unwrap();
+    let next_root = tree(vec![
+        item(TreeItemMode::Blob, source, "alias"),
+        item(TreeItemMode::Blob, next_source, "file"),
+    ]);
+    fixture.counts.reset();
+    let next = prepare_rooted_native_metadata(&handler, &next_root, "/", &NoRootedReuse)
+        .await
+        .unwrap();
+    fixture.counts.assert(1, raw.len());
+    assert_ne!(
+        next.plan.identity.tagged_root_tree_oid,
+        first.plan.identity.tagged_root_tree_oid
+    );
+    assert_ne!(next.plan.root, first.plan.root);
+    assert_eq!(next.work.blob_fetches, 1);
+    assert_eq!(next.work.raw_bytes_fetched, raw.len() as u64);
+    assert_eq!(next.work.raw_bytes_hashed, raw.len() as u64);
+    assert_eq!(next.work.verified_blob_persistence_batches, 1);
+    assert_eq!(next.work.verified_blob_facts_loaded, 2);
+}
+
+#[tokio::test]
+async fn mst2_rooted_streamed_fact_never_persists_truncated_or_late_failed_sources() {
+    use crate::ceres::snapshot::rooted_metadata_projection::prepare_rooted_native_metadata;
+
+    let fixture = Fixture::new().await;
+    let handler = MonoApiService::from(&fixture.state);
+    for late_error in [false, true] {
+        let raw = Bytes::from(format!("raw\0{}", uuid::Uuid::new_v4()));
+        let oid = fixture
+            .state
+            .storage
+            .git_service
+            .save_object_from_raw(raw.clone())
+            .await
+            .unwrap();
+        let source = ObjectHash::from_hex_for_kind(HashKind::Sha1, &oid).unwrap();
+        let root = tree(vec![item(TreeItemMode::Blob, source, "file")]);
+        *fixture.counts.object_fault.lock().unwrap() = Some(bounded_objects::StreamFault {
+            oid: oid.clone(),
+            kind: if late_error {
+                bounded_objects::FaultKind::LateError(raw.clone())
+            } else {
+                bounded_objects::FaultKind::Parts(vec![raw.slice(..raw.len() - 1)])
+            },
+        });
+        fixture.counts.reset();
+        let error = prepare_rooted_native_metadata(&handler, &root, "/", &NoRootedReuse)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            if late_error {
+                SnapshotErrorCode::ObjectUnavailable
+            } else {
+                SnapshotErrorCode::IntegrityError
+            }
+        );
+        fixture
+            .counts
+            .assert(1, raw.len() - usize::from(!late_error));
+        assert!(
+            fixture
+                .state
+                .storage
+                .mono_storage()
+                .get_verified_blobs(vec![oid])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn mst2_capabilities_use_actual_backend_without_inventory_and_preserve_metadata_and_objects()
+{
+    let fixture = Fixture::new().await;
+    let inventory_before = fixture
+        .counts
+        .receipt_inventory_calls
+        .load(Ordering::SeqCst);
+    let get_capabilities = || async {
+        success_json(
+            fixture
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v2/snapshots/capabilities")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await
+    };
+    let supported = get_capabilities().await;
+    for feature in ["raw_blob", "small_objects", "chunk_reads", "full_hydration"] {
+        assert_eq!(supported["features"][feature], true);
+    }
+    fixture
+        .counts
+        .receipt_retention_unsupported
+        .store(true, Ordering::SeqCst);
+    let mut unsupported = supported.clone();
+    for feature in ["raw_blob", "chunk_reads", "full_hydration"] {
+        unsupported["features"][feature] = json!(false);
+    }
+    for _ in 0..3 {
+        assert_eq!(get_capabilities().await, unsupported);
+    }
+    fixture.counts.assert(0, 0);
+    assert_eq!(
+        fixture
+            .counts
+            .receipt_inventory_calls
+            .load(Ordering::SeqCst),
+        inventory_before
+    );
+    assert_eq!(fixture.counts.receipt_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.counts.receipt_writes.load(Ordering::SeqCst), 0);
+    let head = fixture.send("HEAD", "blob?path=/file", Body::empty()).await;
+    assert_eq!(head.status(), 200);
+    assert_eq!(
+        head.headers()["content-length"],
+        fixture.raw.len().to_string()
+    );
+    assert_eq!(
+        head.headers()["etag"],
+        format!("\"{}\"", fixture.digest_string())
+    );
+    assert!(to_bytes(head.into_body(), 1024).await.unwrap().is_empty());
+    success_json(fixture.send("GET", "directory?path=/", Body::empty()).await).await;
+    fixture.counts.assert(0, 0);
+    for path in ["blob?path=/file", "chunk-map?path=/file"] {
+        error(
+            fixture.send("GET", path, Body::empty()).await,
+            503,
+            "TEMPORARY_UNAVAILABLE",
+            true,
+        )
+        .await;
+    }
+    fixture.counts.assert(0, 0);
+    assert_eq!(fixture.counts.receipt_writes.load(Ordering::SeqCst), 0);
+    let link_digest = digest(b"file");
+    let request = json!({"items":[{"path":"/link", "expected_digest":format!("sha256:{}", hex_of(&link_digest))}], "encoding":"identity"}).to_string();
+    let response = fixture
+        .send("POST", "objects", Body::from(request.clone()))
+        .await;
+    assert_eq!(response.status(), 200);
+    let wire = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    let frames = parse_stream(&wire).unwrap();
+    let [Frame::Object(object), Frame::End(end)] = frames.as_slice() else {
+        panic!("expected OBJECT and terminal END");
+    };
+    assert_eq!(object.objects, vec![(link_digest, b"file".to_vec())]);
+    assert_eq!(end.request_item_count, 1);
+    assert_eq!(end.logical_bytes, 4);
+    assert_eq!(
+        end.request_body_sha256,
+        <[u8; 32]>::from(Sha256::digest(request.as_bytes()))
+    );
+    fixture.counts.assert(1, 4);
+    fixture
+        .counts
+        .receipt_retention_unsupported
+        .store(false, Ordering::SeqCst);
+    assert_eq!(get_capabilities().await, supported);
+    fixture.counts.assert(1, 4);
 }
 
 #[tokio::test]
