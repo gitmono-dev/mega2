@@ -7,6 +7,9 @@ use crate::jupiter::{
     },
 };
 
+#[path = "snapshot_native_runtime_upgrade_tests.rs"]
+mod native_runtime;
+
 async fn permanent_rows(fixture: &Fixture) -> Value {
     let txn = transaction(fixture).await;
     let rows=txn.query_one_raw(Statement::from_string(DbBackend::Postgres,

@@ -671,6 +671,8 @@ pub(crate) fn install_error(error: MetadataInstallError) -> SnapshotError {
     match error {
         MetadataInstallError::Rejected(error) if error.code == SnapshotErrorCode::Internal => {
             tracing::error!(%error,"native metadata installation unavailable");
+            #[cfg(test)]
+            eprintln!("MST2 test native metadata installation rejected: {error}");
             SnapshotError::new(
                 SnapshotErrorCode::TemporaryUnavailable,
                 "native metadata installation unavailable",
