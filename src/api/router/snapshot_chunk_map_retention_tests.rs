@@ -115,7 +115,8 @@ async fn shared_map_survives_other_source_retirement_while_actual_reader_is_live
             .await;
     let original = fixture.map("/file").await;
     let other = oid_for(&fixture, "/other").await;
-    let db = fixture.state.storage.mono_storage().get_connection();
+    let mono = fixture.state.storage.mono_storage();
+    let db = mono.get_connection();
     // This G fixture isolates independent source receipts without changing a
     // Q-certified file tuple. Two exact facts consume the same actual raw
     // bytes independently; map sharing never admits the second source.
@@ -193,7 +194,8 @@ async fn pending_receipt_is_replayed_before_another_aged_live_victim() {
     .await;
     fixture.map("/file").await;
     let other = fixture.map("/other").await;
-    let db = fixture.state.storage.mono_storage().get_connection();
+    let mono = fixture.state.storage.mono_storage();
+    let db = mono.get_connection();
     wait_count(db, "mst2_chunk_reader", 0).await;
     age_unowned_candidates(db).await;
     db.execute_raw(statement(
@@ -220,7 +222,8 @@ async fn pending_receipt_is_replayed_before_another_aged_live_victim() {
 async fn actual_http_replays_a_retiring_source_row_before_rebuilding_its_next_generation() {
     let fixture = Fixture::new().await;
     let original = fixture.map("/file").await;
-    let db = fixture.state.storage.mono_storage().get_connection();
+    let mono = fixture.state.storage.mono_storage();
+    let db = mono.get_connection();
     wait_count(db, "mst2_chunk_reader", 0).await;
     let old_key: String = db
         .query_one_raw(statement(
@@ -273,7 +276,8 @@ async fn actual_warm_body_owner_cancels_never_returning_open_and_next_without_ba
             let complete_without_eof = stage == 2;
             let fixture = Fixture::new().await;
             let map = fixture.map("/file").await;
-            let db = fixture.state.storage.mono_storage().get_connection();
+            let mono = fixture.state.storage.mono_storage();
+            let db = mono.get_connection();
             wait_count(db, "mst2_chunk_reader", 0).await;
             fixture.counts.reset();
             let entered = Arc::new(Notify::new());
@@ -415,7 +419,8 @@ async fn actual_cold_builder_uses_remaining_database_deadline_for_open_and_next_
             .admit_install(&source, &fixture.state.storage.git_service.obj_storage)
             .await
             .unwrap();
-        let db = fixture.state.storage.mono_storage().get_connection();
+        let mono = fixture.state.storage.mono_storage();
+        let db = mono.get_connection();
         db.execute_unprepared("UPDATE mst2_chunk_receipt_generation SET deadline=pg_catalog.clock_timestamp()+interval '3 seconds' WHERE state='RESERVED'").await.unwrap();
         admission.test_check_next_owner_operation().await;
         fixture.counts.reset();
@@ -512,12 +517,16 @@ async fn actual_receipt_create_and_read_waits_cancel_without_backend_release_or_
                 Some((entered.clone(), release.clone(), drops.clone()));
             drops
         };
-        let mut task =
-            tokio::spawn(async move { repository.install(verified, &objects, &admission).await });
+        let task_storage = fixture.state.storage.clone();
+        let mut task = tokio::spawn(async move {
+            let repository = task_storage.chunk_maps().await.unwrap();
+            repository.install(verified, &objects, &admission).await
+        });
         timeout(Duration::from_secs(10), entered.notified())
             .await
             .unwrap();
-        let db = fixture.state.storage.mono_storage().get_connection();
+        let mono = fixture.state.storage.mono_storage();
+        let db = mono.get_connection();
         assert_eq!(fixture.counts.receipt_writes.load(Ordering::SeqCst), 1);
         if creating {
             db.execute_unprepared("UPDATE mst2_chunk_receipt_generation SET deadline=pg_catalog.clock_timestamp()+interval '20 milliseconds' WHERE state='CREATING'").await.unwrap();
@@ -569,7 +578,8 @@ async fn held_raw_and_exact_range_do_not_resume_after_actual_reader_expiry() {
     for raw_route in [true, false] {
         let fixture = Fixture::new().await;
         let map = fixture.map("/file").await;
-        let db = fixture.state.storage.mono_storage().get_connection();
+        let mono = fixture.state.storage.mono_storage();
+        let db = mono.get_connection();
         wait_count(db, "mst2_chunk_reader", 0).await;
         fixture.counts.reset();
         let entered = Arc::new(Notify::new());
@@ -643,7 +653,8 @@ async fn production_q_bootstrap_after_retention_preserves_catalog_and_reconstruc
     };
 
     let fixture = Fixture::new_with_pg_config(true).await;
-    let db = fixture.state.storage.mono_storage().get_connection();
+    let mono = fixture.state.storage.mono_storage();
+    let db = mono.get_connection();
     let namespace = provision_or_verify_rooted_qualified_family(db)
         .await
         .unwrap();
@@ -891,7 +902,8 @@ async fn completion_during_real_inventory_keeps_backing_credit_after_pending_ins
         })),
     };
     fixture.app = router(&fixture.state);
-    let db = fixture.state.storage.mono_storage().get_connection();
+    let mono = fixture.state.storage.mono_storage();
+    let db = mono.get_connection();
     let create_entered = Arc::new(Notify::new());
     let create_release = Arc::new(Notify::new());
     *fixture.counts.receipt_late_create_holds.lock().unwrap() =
@@ -972,7 +984,8 @@ async fn json_chunk_and_raw_last_transport_clones_block_actual_collection() {
         let fixture = Fixture::new().await;
         let map = fixture.map("/file").await;
         let repository = fixture.state.storage.chunk_maps().await.unwrap();
-        let db = fixture.state.storage.mono_storage().get_connection();
+        let mono = fixture.state.storage.mono_storage();
+        let db = mono.get_connection();
         wait_count(db, "mst2_chunk_reader", 0).await;
         fixture.counts.reset();
         let response_budget = MemoryBudget::new(CHUNK_SIZE as usize + 2048);
@@ -1070,7 +1083,8 @@ async fn json_chunk_and_raw_last_transport_clones_block_actual_collection() {
 async fn expired_reader_arc_cannot_resurrect_or_authenticate_a_page() {
     let fixture = Fixture::new().await;
     fixture.map("/file").await;
-    let db = fixture.state.storage.mono_storage().get_connection();
+    let mono = fixture.state.storage.mono_storage();
+    let db = mono.get_connection();
     wait_count(db, "mst2_chunk_reader", 0).await;
     let repository = fixture.state.storage.chunk_maps().await.unwrap();
     let source = ChunkMapSource::from_fact(fixture.fact().await, &fixture.oid).unwrap();
@@ -1160,7 +1174,8 @@ async fn expired_reader_arc_cannot_resurrect_or_authenticate_a_page() {
 #[tokio::test]
 async fn late_cancelled_create_is_reserved_and_old_key_replay_preserves_new_generation() {
     let fixture = Fixture::new().await;
-    let db = fixture.state.storage.mono_storage().get_connection();
+    let mono = fixture.state.storage.mono_storage();
+    let db = mono.get_connection();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     *fixture.counts.receipt_late_create_holds.lock().unwrap() =
@@ -1336,7 +1351,8 @@ async fn actual_backing_quota_and_unsupported_capability_reject_before_source_op
         }
         counts.assert(0, 0);
         assert_eq!(counts.receipt_writes.load(Ordering::SeqCst), 0);
-        let db = fixture.state.storage.mono_storage().get_connection();
+        let mono = fixture.state.storage.mono_storage();
+        let db = mono.get_connection();
         assert_eq!(count(db, "mst2_chunk_receipt_generation").await, 0);
         assert_eq!(count(db, "mst2_chunk_map").await, 0);
     }
@@ -1378,7 +1394,8 @@ async fn empty_source_fragment_after_deadline_does_not_renew_install_or_publish(
     timeout(Duration::from_secs(10), entered.notified())
         .await
         .unwrap();
-    let db = fixture.state.storage.mono_storage().get_connection();
+    let mono = fixture.state.storage.mono_storage();
+    let db = mono.get_connection();
     db.execute_unprepared("UPDATE mst2_chunk_receipt_generation SET deadline=pg_catalog.clock_timestamp()+interval '20 milliseconds' WHERE state='RESERVED'").await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     admission.test_check_next_owner_operation().await;
