@@ -153,6 +153,7 @@ mod m20261007_000500_add_mst2_install_capability;
 mod m20261007_000600_add_mst2_storage_routes;
 mod m20261008_000100_add_mst2_chunk_maps;
 mod m20261008_000200_add_mst2_rooted_qualified_family;
+mod m20261008_000300_add_mst2_chunk_map_retention;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -294,6 +295,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261007_000600_add_mst2_storage_routes::Migration),
             Box::new(m20261008_000100_add_mst2_chunk_maps::Migration),
             Box::new(m20261008_000200_add_mst2_rooted_qualified_family::Migration),
+            Box::new(m20261008_000300_add_mst2_chunk_map_retention::Migration),
         ]
     }
 }
@@ -1204,7 +1206,7 @@ mod tests {
     async fn import_repo_alias_rows_canonicalized() {
         let names = migration_names();
         assert_eq!(
-            &names[names.len() - 16..names.len() - 7],
+            &names[names.len() - 17..names.len() - 8],
             &[
                 "m20260923_000200_canonicalize_import_repo_paths".to_string(),
                 "m20260925_000100_media_paging".to_string(),
@@ -1219,34 +1221,38 @@ mod tests {
             "native retention, metadata installation and view tables follow media paging"
         );
         assert_eq!(
-            &names[names.len() - 7],
+            &names[names.len() - 8],
             "m20261007_000200_add_mst2_metadata_generations"
         );
         assert_eq!(
-            &names[names.len() - 6],
+            &names[names.len() - 7],
             "m20261007_000300_add_mst2_metadata_lifetime_history"
         );
         assert_eq!(
-            &names[names.len() - 5],
+            &names[names.len() - 6],
             "m20261007_000400_add_mst2_qualified_metadata_gc"
         );
         assert_eq!(
-            &names[names.len() - 4],
+            &names[names.len() - 5],
             "m20261007_000500_add_mst2_install_capability"
         );
         assert_eq!(
-            &names[names.len() - 3],
+            &names[names.len() - 4],
             "m20261007_000600_add_mst2_storage_routes"
         );
         assert_eq!(
-            &names[names.len() - 2],
+            &names[names.len() - 3],
             "m20261008_000100_add_mst2_chunk_maps"
         );
         assert_eq!(
-            names.last().unwrap(),
+            &names[names.len() - 2],
             "m20261008_000200_add_mst2_rooted_qualified_family"
         );
 
+        assert_eq!(
+            names.last().unwrap(),
+            "m20261008_000300_add_mst2_chunk_map_retention"
+        );
         let db = alias_db().await;
         insert_repo(&db, 1, "/third-party//a").await;
         insert_repo(&db, 2, "/third-party/b/").await;

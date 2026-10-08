@@ -832,7 +832,7 @@ pub(super) async fn assert_three_page_proofs_and_selected_sibling_faults(
             .await
             .unwrap();
         } else {
-            db.execute_raw(statement("UPDATE mst2_chunk_map_node SET digest=$2 WHERE map_id=$1 AND first_page=2 AND page_count=1", [id.clone().into(), vec![9; 32].into()])).await.unwrap();
+            db.execute_raw(statement("UPDATE mst2_chunk_map_node SET digest=$2 WHERE map_id=$1 AND first_page=2 AND page_count=1", [id.clone().into(), vec![9u8; 32].into()])).await.unwrap();
         }
         db.execute_unprepared("ALTER TABLE mst2_chunk_map_node ENABLE TRIGGER USER")
             .await
@@ -1160,7 +1160,7 @@ async fn ordinary_incomplete_source_dml_cannot_commit_an_admitted_partial_map() 
     ))
     .await
     .unwrap();
-    txn.execute_raw(statement("INSERT INTO mst2_chunk_map_source(storage_domain,git_oid,object_kind,fact_id,source_id,source_bytes,primary_scope,map_id,receipt_digest) VALUES('git',$1,'blob',$2,$3,$4,$5,$6,$7)", [fixture.oid.clone().into(), source.fact().id.into(), repository.source_identity(&source).unwrap().to_vec().into(), source.canonical_bytes().unwrap().into(), scope.to_vec().into(), map.map_id.to_vec().into(), vec![9;32].into()])).await.unwrap();
+    txn.execute_raw(statement("INSERT INTO mst2_chunk_map_source(storage_domain,git_oid,object_kind,fact_id,source_id,source_bytes,primary_scope,map_id,receipt_digest) VALUES('git',$1,'blob',$2,$3,$4,$5,$6,$7)", [fixture.oid.clone().into(), source.fact().id.into(), repository.source_identity(&source).unwrap().to_vec().into(), source.canonical_bytes().unwrap().into(), scope.to_vec().into(), map.map_id.to_vec().into(), vec![9u8;32].into()])).await.unwrap();
     assert!(txn.commit().await.is_err());
     for table in [
         "mst2_chunk_map",

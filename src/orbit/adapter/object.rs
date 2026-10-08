@@ -104,6 +104,111 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         Ok((Box::pin(stream), meta))
     }
 
+    async fn chunk_map_receipt_inventory(
+        &self,
+    ) -> OrbitResult<crate::orbit_api::object_storage::ChunkMapReceiptInventory> {
+        use crate::orbit_api::object_storage::{
+            ChunkMapReceiptInventory, MAX_CHUNK_MAP_RECEIPT_BYTES, MAX_CHUNK_MAP_RECEIPTS,
+        };
+        // object_store 0.14 cannot inventory/delete retained cloud versions.
+        // A current-object listing is not a physical backing-byte quota.
+        if !matches!(&self.store, BackendStore::Local(_)) {
+            return Err(IoOrbitError::ChunkMapRetentionUnsupported);
+        }
+        let prefix = object_store::path::Path::from("chunk-map-receipt");
+        let mut listing = self.to_store().list(Some(&prefix));
+        let mut inventory = ChunkMapReceiptInventory {
+            objects: Vec::new(),
+            bytes: 0,
+        };
+        while let Some(entry) = listing.next().await {
+            let meta = entry.map_err(IoOrbitError::from)?;
+            if inventory.objects.len() == MAX_CHUNK_MAP_RECEIPTS {
+                return Err(IoOrbitError::ChunkMapRetentionCapacityExceeded);
+            }
+            inventory.bytes = inventory
+                .bytes
+                .checked_add(meta.size)
+                .filter(|bytes| *bytes <= MAX_CHUNK_MAP_RECEIPT_BYTES)
+                .ok_or(IoOrbitError::ChunkMapRetentionCapacityExceeded)?;
+            let location = meta.location.as_ref();
+            let parts: Vec<_> = location.split('/').collect();
+            if parts.len() != 5
+                || parts[0] != "chunk-map-receipt"
+                || parts[1..4].iter().any(|part| part.len() != 2)
+                || parts[4].len() > 128
+            {
+                return Err(IoOrbitError::Other(
+                    "invalid physical chunk-map receipt path".into(),
+                ));
+            }
+            let key = ObjectKey {
+                namespace: ObjectNamespace::ChunkMapReceipt,
+                key: parts[1..].concat(),
+            };
+            key.validate()?;
+            if key.default_sharding() != location {
+                return Err(IoOrbitError::Other(
+                    "noncanonical physical chunk-map receipt path".into(),
+                ));
+            }
+            inventory.objects.push((key, meta.size));
+        }
+        Ok(inventory)
+    }
+
+    async fn delete_chunk_map_receipt(
+        &self,
+        authority: &crate::orbit_api::object_storage::ChunkMapReceiptDeletion,
+    ) -> OrbitResult<bool> {
+        if !matches!(&self.store, BackendStore::Local(_)) {
+            return Err(IoOrbitError::ChunkMapRetentionUnsupported);
+        }
+        let key = authority.key();
+        if key.namespace != ObjectNamespace::ChunkMapReceipt {
+            return Err(IoOrbitError::Other(
+                "invalid sealed receipt namespace".into(),
+            ));
+        }
+        let (mut stream, meta) = match self.get_stream(key).await {
+            Ok(object) => object,
+            Err(error) if error.is_not_found() => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let expected = authority.expected_bytes();
+        if meta.size != expected.len() as i64 {
+            return Err(IoOrbitError::Other(
+                "retired receipt body size changed".into(),
+            ));
+        }
+        let mut offset: usize = 0;
+        while let Some(part) = stream.next().await {
+            let bytes = part?;
+            let end = offset
+                .checked_add(bytes.len())
+                .filter(|end| *end <= expected.len())
+                .ok_or_else(|| {
+                    IoOrbitError::Other("retired receipt body exceeds its exact profile".into())
+                })?;
+            if expected[offset..end] != bytes[..] {
+                return Err(IoOrbitError::Other("retired receipt body changed".into()));
+            }
+            offset = end;
+        }
+        if offset != expected.len() {
+            return Err(IoOrbitError::Other(
+                "retired receipt body is truncated".into(),
+            ));
+        }
+        // Physical generation keys are never reused. A late create can only
+        // restore this same retired body; persistent history will reconcile it.
+        match self.to_store().delete(&Self::checked_path(key)?).await {
+            Ok(()) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(IoOrbitError::from(error)),
+        }
+    }
+
     async fn get_range_stream(
         &self,
         key: &ObjectKey,

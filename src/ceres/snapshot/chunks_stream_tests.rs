@@ -34,6 +34,7 @@ async fn exact_source_builder_admits_all_install_workspace_before_open_and_cance
         },
         &budget,
         &builders,
+        None,
     )
     .await
     .err()
@@ -52,7 +53,8 @@ async fn exact_source_builder_admits_all_install_workspace_before_open_and_cance
                 Ok(stream(vec![Ok(raw.clone())]))
             },
             &budget,
-            &builders
+            &builders,
+            None
         )
         .await
         .err()
@@ -88,6 +90,7 @@ async fn exact_source_builder_admits_all_install_workspace_before_open_and_cance
             },
             &task_budget,
             &task_builders,
+            None,
         )
         .await
     });
@@ -110,6 +113,7 @@ async fn exact_source_builder_admits_all_install_workspace_before_open_and_cance
         },
         &budget,
         &builders,
+        None,
     )
     .await
     .unwrap();

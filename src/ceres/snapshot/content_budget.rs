@@ -89,10 +89,6 @@ pub(crate) fn response_budget() -> &'static Arc<MemoryBudget> {
     BUDGET.get_or_init(|| MemoryBudget::new(RESPONSE_LIVE_BYTES))
 }
 
-pub(crate) fn reserve_range_work() -> Result<MemoryLease, SnapshotError> {
-    range_budget().reserve(RANGE_WORK_BYTES)
-}
-
 pub(crate) fn range_budget() -> &'static Arc<MemoryBudget> {
     static BUDGET: OnceLock<Arc<MemoryBudget>> = OnceLock::new();
     BUDGET.get_or_init(|| MemoryBudget::new(RANGE_SCRATCH_BYTES))

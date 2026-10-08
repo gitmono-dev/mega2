@@ -171,6 +171,39 @@ pub type ObjectByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Err
 /// Upper bound for [`MegaObjectStorage::put_metadata_atomic`] (ADR-MF-05).
 pub const MAX_METADATA_ATOMIC_BYTES: usize = 1024 * 1024;
 
+pub const MAX_CHUNK_MAP_RECEIPTS: usize = 16_384;
+pub const MAX_CHUNK_MAP_RECEIPT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Actual backing objects, including uncommitted and late-created receipts.
+/// A complete inventory is returned only while both fixed quotas hold.
+pub struct ChunkMapReceiptInventory {
+    pub objects: Vec<(ObjectKey, u64)>,
+    pub bytes: u64,
+}
+
+/// Sealed by the primary retention repository after claiming one exact
+/// retired generation and independently reading its immutable backend body.
+/// Ordinary object callers cannot construct a receipt deletion authority.
+pub struct ChunkMapReceiptDeletion {
+    claim: crate::jupiter::storage::native_chunk_map::retention::VerifiedReceiptDeletionClaim,
+}
+
+impl ChunkMapReceiptDeletion {
+    pub(crate) fn from_claim(
+        claim: crate::jupiter::storage::native_chunk_map::retention::VerifiedReceiptDeletionClaim,
+    ) -> Self {
+        Self { claim }
+    }
+
+    pub(crate) fn key(&self) -> &ObjectKey {
+        self.claim.key()
+    }
+
+    pub(crate) fn expected_bytes(&self) -> &[u8] {
+        self.claim.expected_bytes()
+    }
+}
+
 /// A streaming source of multiple objects.
 ///
 /// Each item yields:
@@ -276,6 +309,22 @@ pub trait MegaObjectStorage: Send + Sync {
             "immutable atomic metadata creation is not supported by this storage backend"
                 .to_string(),
         ))
+    }
+
+    /// Enumerate the real receipt namespace with fixed count/byte bounds.
+    /// Unsupported stores fail before a cold source body can be opened.
+    async fn chunk_map_receipt_inventory(&self) -> OrbitResult<ChunkMapReceiptInventory> {
+        Err(IoOrbitError::ChunkMapRetentionUnsupported)
+    }
+
+    /// Delete only the independently checked body of a sealed retired
+    /// physical generation. The key is never reused by a later installation.
+    /// Missing is idempotent; transport/authentication errors remain errors.
+    async fn delete_chunk_map_receipt(
+        &self,
+        _authority: &ChunkMapReceiptDeletion,
+    ) -> OrbitResult<bool> {
+        Err(IoOrbitError::ChunkMapRetentionUnsupported)
     }
 
     /// Retrieve a single object from the storage backend.

@@ -133,10 +133,20 @@ pub(super) async fn blob_with_budgets(
     } else {
         None
     };
-    let (input, meta) = handler
-        .get_raw_blob_stream_with_meta(&file.oid)
-        .await
-        .map_err(|error| mst2_error_response(content::content_read_error(error)))?;
+    if let Some(map) = map.as_ref() {
+        map.ensure_live().await.map_err(mst2_error_response)?;
+    }
+    let open = handler.get_raw_blob_stream_with_meta(&file.oid);
+    let opened = if let Some(map) = map.as_ref() {
+        map.await_backend(open).await.map_err(mst2_error_response)?
+    } else {
+        open.await
+    };
+    let (input, meta) =
+        opened.map_err(|error| mst2_error_response(content::content_read_error(error)))?;
+    if let Some(map) = map.as_ref() {
+        map.ensure_live().await.map_err(mst2_error_response)?;
+    }
     if u64::try_from(meta.size).ok() != Some(file.size) {
         return Err(mst2_error_response(integrity(
             "raw source physical size disagrees with its fixed verified fact",
@@ -231,7 +241,11 @@ impl AsRef<[u8]> for RawBlobChunk {
 
 impl RawBlobReader {
     async fn validate(&mut self) -> Result<(), SnapshotError> {
-        revalidate_access(&self.state, &self.context, &self.headers).await
+        revalidate_access(&self.state, &self.context, &self.headers).await?;
+        if let Some(map) = self.map.as_ref() {
+            map.ensure_live().await?;
+        }
+        Ok(())
     }
 
     async fn next_chunk(&mut self) -> Result<Option<Bytes>, SnapshotError> {
@@ -327,6 +341,9 @@ impl RawBlobReader {
             }
         }
         self.validate().await?;
+        if let Some(map) = self.map.as_ref() {
+            map.record_progress().await?;
+        }
         if raw.capacity() > credit.bytes {
             return Err(integrity("raw chunk allocation exceeds its owned credit"));
         }
@@ -342,19 +359,30 @@ impl RawBlobReader {
     }
 
     async fn poll_source(&mut self) -> Result<Option<Bytes>, SnapshotError> {
+        self.validate().await?;
         let input = self
             .input
             .as_mut()
             .ok_or_else(|| integrity("raw source stream was already closed"))?;
-        let result = input.next().await;
+        let result = if let Some(map) = self.map.as_ref() {
+            map.await_backend(input.next()).await?
+        } else {
+            input.next().await
+        };
         self.validate().await?;
-        result.transpose().map_err(|error| {
+        let part = result.transpose().map_err(|error| {
             tracing::warn!(%error, "fixed-view raw stream failed");
             SnapshotError::new(
                 SnapshotErrorCode::ObjectUnavailable,
                 "fixed-view raw stream failed",
             )
-        })
+        })?;
+        if part.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+            if let Some(map) = self.map.as_ref() {
+                map.record_progress().await?;
+            }
+        }
+        Ok(part)
     }
 
     async fn require_eof(&mut self) -> Result<(), SnapshotError> {

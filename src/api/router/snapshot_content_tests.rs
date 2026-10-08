@@ -88,6 +88,9 @@ mod bounded_chunks;
 #[path = "snapshot_persisted_chunk_map_tests.rs"]
 mod persisted_chunk_maps;
 
+#[path = "snapshot_chunk_map_retention_tests.rs"]
+mod chunk_map_retention;
+
 #[path = "snapshot_raw_blob_tests.rs"]
 mod raw_blob;
 
@@ -107,6 +110,27 @@ mod generation_qualified_fixture;
 mod install_capability_fixture;
 
 type ReceiptWriteHold = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+type ReadOpenHold = (
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    Arc<AtomicUsize>,
+);
+
+struct ReadOpenDrop(Arc<AtomicUsize>);
+
+impl Drop for ReadOpenDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+async fn await_read_open_hold(hold: Option<ReadOpenHold>) {
+    if let Some((entered, release, drops)) = hold {
+        let _owner = ReadOpenDrop(drops);
+        entered.notify_one();
+        release.notified().await;
+    }
+}
 #[path = "snapshot_rooted_metadata_tests.rs"]
 mod rooted_metadata;
 
@@ -126,6 +150,15 @@ struct ReadCounts {
     receipt_read_meta_size: std::sync::atomic::AtomicI64,
     receipt_read_late_error: AtomicBool,
     receipt_write_holds: std::sync::Mutex<Option<ReceiptWriteHold>>,
+    receipt_write_wait_drops: Arc<AtomicUsize>,
+    receipt_late_create_holds: std::sync::Mutex<Option<ReceiptWriteHold>>,
+    receipt_inventory_holds: std::sync::Mutex<Option<ReceiptWriteHold>>,
+    receipt_inventory_calls: AtomicUsize,
+    receipt_retention_unsupported: AtomicBool,
+    receipt_deletes: AtomicUsize,
+    whole_open_holds: std::sync::Mutex<Option<ReadOpenHold>>,
+    range_open_holds: std::sync::Mutex<Option<ReadOpenHold>>,
+    receipt_open_holds: std::sync::Mutex<Option<ReadOpenHold>>,
 }
 
 impl ReadCounts {
@@ -151,12 +184,71 @@ struct CountingStorage {
 
 #[async_trait::async_trait]
 impl MegaObjectStorage for CountingStorage {
+    async fn chunk_map_receipt_inventory(
+        &self,
+    ) -> OrbitResult<crate::orbit_api::object_storage::ChunkMapReceiptInventory> {
+        self.counts
+            .receipt_inventory_calls
+            .fetch_add(1, Ordering::SeqCst);
+        if self
+            .counts
+            .receipt_retention_unsupported
+            .load(Ordering::SeqCst)
+        {
+            return Err(crate::orbit_api::error::IoOrbitError::ChunkMapRetentionUnsupported);
+        }
+        let inventory = self.inner.inner.chunk_map_receipt_inventory().await?;
+        let holds = self.counts.receipt_inventory_holds.lock().unwrap().clone();
+        if let Some((entered, release)) = holds {
+            entered.notify_one();
+            release.notified().await;
+        }
+        Ok(inventory)
+    }
+
+    async fn delete_chunk_map_receipt(
+        &self,
+        authority: &crate::orbit_api::object_storage::ChunkMapReceiptDeletion,
+    ) -> OrbitResult<bool> {
+        let deleted = self.inner.inner.delete_chunk_map_receipt(authority).await?;
+        if deleted {
+            self.counts.receipt_deletes.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(deleted)
+    }
+
     async fn put_metadata_atomic_create(
         &self,
         key: &ObjectKey,
         bytes: Bytes,
         meta: ObjectMeta,
     ) -> OrbitResult<()> {
+        let late = if key.namespace == ObjectNamespace::ChunkMapReceipt {
+            self.counts
+                .receipt_late_create_holds
+                .lock()
+                .unwrap()
+                .clone()
+        } else {
+            None
+        };
+        if let Some((entered, release)) = late {
+            let inner = self.inner.clone();
+            let key = key.clone();
+            let counts = self.counts.clone();
+            return tokio::spawn(async move {
+                entered.notify_one();
+                release.notified().await;
+                inner
+                    .inner
+                    .put_metadata_atomic_create(&key, bytes, meta)
+                    .await?;
+                counts.receipt_writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
         self.inner
             .inner
             .put_metadata_atomic_create(key, bytes, meta)
@@ -165,6 +257,7 @@ impl MegaObjectStorage for CountingStorage {
             self.counts.receipt_writes.fetch_add(1, Ordering::SeqCst);
             let holds = self.counts.receipt_write_holds.lock().unwrap().clone();
             if let Some((entered, release)) = holds {
+                let _hold = ReadOpenDrop(self.counts.receipt_write_wait_drops.clone());
                 entered.notify_one();
                 release.notified().await;
             }
@@ -193,6 +286,8 @@ impl MegaObjectStorage for CountingStorage {
     async fn get_stream(&self, key: &ObjectKey) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
         if key.namespace == ObjectNamespace::ChunkMapReceipt {
             self.counts.receipt_reads.fetch_add(1, Ordering::SeqCst);
+            let holds = self.counts.receipt_open_holds.lock().unwrap().clone();
+            await_read_open_hold(holds).await;
             if self.counts.receipt_read_failure.load(Ordering::SeqCst) {
                 return Err(
                     crate::orbit_api::error::IoOrbitError::object_store_not_found(
@@ -225,6 +320,8 @@ impl MegaObjectStorage for CountingStorage {
             return self.inner.inner.get_stream(key).await;
         }
         self.counts.whole.fetch_add(1, Ordering::SeqCst);
+        let holds = self.counts.whole_open_holds.lock().unwrap().clone();
+        await_read_open_hold(holds).await;
         let chunk_fault = self
             .counts
             .chunk_faults
@@ -286,6 +383,8 @@ impl MegaObjectStorage for CountingStorage {
         end: u64,
     ) -> OrbitResult<Option<(ObjectByteStream, ObjectMeta)>> {
         self.counts.range.fetch_add(1, Ordering::SeqCst);
+        let holds = self.counts.range_open_holds.lock().unwrap().clone();
+        await_read_open_hold(holds).await;
         let fault = self
             .counts
             .chunk_faults
@@ -312,7 +411,12 @@ impl MegaObjectStorage for CountingStorage {
             .inner
             .get_range_stream_exact(key, start, end)
             .await?;
+        let fault = self.counts.object_fault.lock().unwrap().clone();
         Ok(result.map(|(stream, meta)| {
+            let stream = match fault {
+                Some(fault) if fault.oid == key.key => fault.stream(),
+                _ => stream,
+            };
             let counts = self.counts.clone();
             let stream = stream.map(move |part| {
                 if let Ok(bytes) = &part {
