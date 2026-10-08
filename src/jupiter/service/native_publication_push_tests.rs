@@ -8,14 +8,36 @@ use crate::jupiter::utils::converter::FromMegaModel;
 
 const NATIVE_INSTANCE: &str = "6ab219b0-4275-45ba-9d7b-7b0b633018cd";
 
-async fn native_fixture() -> (tempfile::TempDir, crate::jupiter::storage::Storage, git_internal::internal::object::commit::Commit, String) {
+async fn native_fixture() -> (
+    tempfile::TempDir,
+    crate::jupiter::storage::Storage,
+    git_internal::internal::object::commit::Commit,
+    String,
+) {
     let temp = tempfile::tempdir().unwrap();
     let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
     config.monorepo.push_policy = PushPolicy::Trunk;
     config.mst2.enabled = true;
     config.mst2.publication_enabled = true;
     config.mst2.instance_uuid = Some(NATIVE_INSTANCE.to_owned());
-    let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+    let (database, schema) = crate::jupiter::tests::test_db_config(temp.path()).await;
+    config.database = database;
+    let mut connection = crate::jupiter::storage::init::database_connection(&config.database)
+        .await
+        .unwrap();
+    connection.set_metric_callback(move |_| {
+        let _held_by_the_connection = &schema;
+    });
+    let mut storage = crate::jupiter::storage::Storage::new_with_connection(
+        Arc::new(config),
+        Arc::new(connection),
+        crate::jupiter::storage::object_storage::mock_object_storage(),
+    )
+    .await
+    .unwrap();
+    storage.push_queue_service = storage
+        .push_queue_service
+        .with_timeouts(Duration::from_secs(30), Duration::from_millis(20));
     let storage = crate::jupiter::tests::with_test_vault(storage, temp.path()).await;
     let name = format!("native-{}", uuid::Uuid::new_v4().simple());
     use git_internal::internal::object::{

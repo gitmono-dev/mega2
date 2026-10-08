@@ -15,7 +15,6 @@ use crate::{
     ceres::view::filter::parse_for_registration,
     config::testing::isolated_config,
     jupiter::{
-        migration::apply_migrations,
         service::{
             view_metrics::ViewMetrics,
             view_projection_service::{CatchUpOutcome, ViewProjectionService},
@@ -23,6 +22,7 @@ use crate::{
         storage::{
             Storage,
             git_db_storage::fu18_support::single_connection,
+            init::database_connection,
             object_storage::mock_object_storage,
             view_root_chain::RootChainOutcome,
             view_storage::ViewLockMode,
@@ -31,7 +31,7 @@ use crate::{
                 seed_unrelated_root_history,
             },
         },
-        tests::test_db_connection,
+        tests::{TestSchemaGuard, test_db_config},
     },
 };
 
@@ -58,6 +58,7 @@ struct OpsFixture {
     filter_a: i64,
     filter_b: i64,
     filter_a_id: String,
+    _schema: TestSchemaGuard,
 }
 
 fn fixed_time() -> chrono::NaiveDateTime {
@@ -222,9 +223,10 @@ async fn insert_warming_filter(
 
 async fn ops_fixture() -> OpsFixture {
     let temp = tempfile::tempdir().unwrap();
-    let db = test_db_connection(temp.path()).await;
-    apply_migrations(&db, true).await.unwrap();
-    let config = isolated_config(temp.path().join("config"));
+    let (database, schema) = test_db_config(temp.path()).await;
+    let mut config = isolated_config(temp.path().join("config"));
+    config.database = database;
+    let db = database_connection(&config.database).await.unwrap();
     let storage = Storage::new_with_connection(
         Arc::new(config),
         Arc::new(db.clone()),
@@ -406,6 +408,7 @@ async fn ops_fixture() -> OpsFixture {
         filter_a: filter_a.id,
         filter_b: filter_b.id,
         filter_a_id: filter_a.filter_id,
+        _schema: schema,
     }
 }
 
