@@ -189,18 +189,45 @@ async fn terminal_owner_survives_its_deferred_completion_and_prunes_in_a_later_t
 #[tokio::test]
 async fn reader_pruning_respects_the_64_owner_budget_with_a_committed_backlog() {
     let fixture = Fixture::new_with_pg_config(true).await;
+    let initial = q_count(
+        &fixture,
+        "SELECT high_water FROM {q}.mst2_metadata_reader_issuance",
+    )
+    .await;
     let txn = transaction(&fixture).await;
-    let mut tickets = Vec::new();
+    // Complete each owner before admitting the next. Their terminal transaction
+    // fence retains the entire backlog until its deferred checks have committed.
     for _ in 0..65 {
-        tickets.push(admission(&txn, &fixture).await);
-    }
-    txn.commit().await.unwrap();
-    let txn = transaction(&fixture).await;
-    for ticket in &tickets {
-        finish(&txn, ticket).await;
+        let ticket = admission(&txn, &fixture).await;
+        finish(&txn, &ticket).await;
     }
     assert_eq!(prune(&txn, 64).await, 0);
     txn.commit().await.unwrap();
+    assert_eq!(
+        q_count(
+            &fixture,
+            "SELECT count(*) FROM {q}.mst2_metadata_reader_operation WHERE state='FINISHED'"
+        )
+        .await,
+        65
+    );
+    assert_eq!(
+        q_count(
+            &fixture,
+            "SELECT count(*) FROM {q}.mst2_metadata_reader_operation WHERE state='ACTIVE'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(q_count(&fixture,"SELECT count(*) FROM {q}.mst2_metadata_root_anchor WHERE anchor_kind IN ('REQUEST','READER')").await,0);
+    assert_eq!(
+        q_count(
+            &fixture,
+            "SELECT high_water FROM {q}.mst2_metadata_reader_issuance"
+        )
+        .await,
+        initial + 65
+    );
     let txn = transaction(&fixture).await;
     assert_eq!(prune(&txn, 64).await, 64);
     txn.commit().await.unwrap();
