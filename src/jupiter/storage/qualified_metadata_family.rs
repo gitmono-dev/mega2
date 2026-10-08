@@ -32,10 +32,14 @@ const SOURCE_REVISION_SQL: &str = include_str!("qualified_source_revision.sql");
 const ROOTED_SQL: &str = include_str!("qualified_metadata_rooted.sql");
 const SERVING_SQL: &str = include_str!("qualified_metadata_serving.sql");
 const GC_SQL: &str = include_str!("qualified_metadata_gc.sql");
+const READER_LIFECYCLE_SQL: &str = include_str!("qualified_metadata_reader_lifecycle.sql");
 
 #[path = "qualified_metadata_rooted.rs"]
 mod rooted;
 pub(crate) use rooted::{RootedLookupStatus, RootedQualifiedMetadataRepository};
+#[cfg(test)]
+#[path = "qualified_metadata_reader_previous_fixture.rs"]
+pub(crate) mod reader_previous_fixture;
 #[cfg(test)]
 pub(crate) use rooted::{
     RootedPrepareIntent, with_rooted_reader_barriers, with_rooted_source_fact_barriers,
@@ -139,6 +143,10 @@ pub(crate) fn implementation_fingerprint() -> Vec<u8> {
         ("indexed-source-read-revision-1", SOURCE_READ_SQL.as_bytes()),
         ("captured-source-revision-1", SOURCE_REVISION_SQL.as_bytes()),
         ("rooted-collector-revision-1", GC_SQL.as_bytes()),
+        (
+            "bounded-reader-lifecycle-revision-1",
+            READER_LIFECYCLE_SQL.as_bytes(),
+        ),
         ("typed-certificate-revision-1", CERTIFICATES_SQL.as_bytes()),
         (
             "source-attestation-and-anchor-revision-1",
@@ -189,6 +197,7 @@ pub(crate) fn render_family(
         .replace("$ROOTED_SQL$", ROOTED_SQL)
         .replace("$SERVING_SQL$", SERVING_SQL)
         .replace("$GC_SQL$", GC_SQL)
+        .replace("$READER_LIFECYCLE_SQL$", READER_LIFECYCLE_SQL)
         .replace("$CORE_SCHEMA$", &identifier(core_schema))
         .replace("$CORE_LITERAL$", &literal(core_schema))
         .replace("$Q_SCHEMA$", &identifier(q_schema))

@@ -299,8 +299,8 @@ DO $$ DECLARE name text; BEGIN
   END LOOP;
 END $$;
 
--- Append-only identity and replay evidence remains bounded independently of
--- resident payloads. The admission check reads actual stored rows, never hints.
+-- Permanent identity evidence and bounded reader owners have independent
+-- resident quotas. Admission reads actual stored rows, never hints.
 CREATE FUNCTION mst2_metadata_history_capacity_guard() RETURNS trigger LANGUAGE plpgsql VOLATILE
 SET search_path=$Q_SCHEMA$,pg_catalog,pg_temp AS $$
 DECLARE actual bigint; bytes bigint; row_limit integer; size_expression text;
@@ -529,23 +529,23 @@ BEGIN
   examined:=0; readers_expired:=0; leases_expired:=0; prepares_aborted:=0; handovers_retired:=0; orphans_retired:=0;
   now_unix:=floor(extract(epoch FROM clock_timestamp()))::bigint;
   FOR item IN SELECT * FROM (
-      (SELECT 'READER'::text AS kind,operation_id::text AS owner,lease_id,hard_deadline_unix AS deadline
+      (SELECT 'READER'::text AS kind,operation_id::text AS owner,lease_id,hard_deadline_unix AS deadline,reader_issuance
         FROM mst2_metadata_reader_operation WHERE state='ACTIVE' AND hard_deadline_unix<=now_unix
         ORDER BY hard_deadline_unix,operation_id LIMIT bound)
       UNION ALL
-      (SELECT 'LEASE'::text,lease_id,lease_id,expires_at_unix FROM mst2_qualified_lease_binding
+      (SELECT 'LEASE'::text,lease_id,lease_id,expires_at_unix,NULL::bigint FROM mst2_qualified_lease_binding
         WHERE state='ACTIVE' AND expires_at_unix<=now_unix ORDER BY expires_at_unix,lease_id LIMIT bound)
       UNION ALL
-      (SELECT 'PREPARE'::text,prepare_id,NULL::text,floor(extract(epoch FROM orphan_expires_at))::bigint
+      (SELECT 'PREPARE'::text,prepare_id,NULL::text,floor(extract(epoch FROM orphan_expires_at))::bigint,NULL::bigint
         FROM mst2_metadata_prepare WHERE (state='PREPARING' OR state='COMMITTED' AND coverage_retired_at IS NULL)
           AND orphan_expires_at<=clock_timestamp() ORDER BY orphan_expires_at,prepare_id LIMIT bound)
     ) expired ORDER BY deadline,kind,owner LIMIT bound LOOP
     examined:=examined+1;
     IF item.kind='READER' THEN
-      UPDATE mst2_metadata_reader_operation SET state='EXPIRED' WHERE operation_id=item.owner::uuid AND state='ACTIVE';
+      UPDATE mst2_metadata_reader_operation SET state='EXPIRED' WHERE operation_id=item.owner::uuid AND reader_issuance=item.reader_issuance AND state='ACTIVE';
       IF NOT FOUND THEN RAISE EXCEPTION 'qualified expired reader changed behind its mutation barrier'; END IF;
       readers_expired:=readers_expired+1;
-      DELETE FROM mst2_metadata_root_anchor WHERE reader_operation_id=item.owner::uuid AND anchor_kind IN ('REQUEST','READER');
+      DELETE FROM mst2_metadata_root_anchor WHERE reader_operation_id=item.owner::uuid AND reader_issuance=item.reader_issuance AND anchor_kind IN ('REQUEST','READER');
       PERFORM mst2_metadata_cleanup_lease(item.lease_id);
     ELSIF item.kind='LEASE' THEN
       UPDATE mst2_qualified_lease_binding SET state='EXPIRED',lease_epoch=lease_epoch+1 WHERE lease_id=item.owner AND state='ACTIVE';

@@ -7,6 +7,9 @@ use crate::jupiter::storage::qualified_metadata_family::{
     with_rooted_source_temporary_shadow,
 };
 
+#[path = "snapshot_reader_retention_tests.rs"]
+mod reader_retention;
+
 async fn q_schema(fixture: &Fixture) -> String {
     fixture
         .state

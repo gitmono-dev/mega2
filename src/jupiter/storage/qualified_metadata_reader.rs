@@ -119,9 +119,15 @@ pub(crate) struct RootedLookupBatch {
     pub results: Vec<RootedLookupStatus>,
     pub proof_pages: Vec<([u8; 32], Vec<u8>)>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReaderIdentity {
+    operation_id: uuid::Uuid,
+    issuance: i64,
+}
+
 struct Reader<'a> {
     txn: &'a DatabaseTransaction,
-    operation: uuid::Uuid,
+    operation: ReaderIdentity,
     bindings: HashMap<[u8; 32], Binding>,
     cache: HashMap<[u8; 32], StoredPage>,
     work: PersistedMetadataReadWork,
@@ -284,7 +290,7 @@ impl RootedQualifiedMetadataRepository {
     async fn admit_reader(
         &self,
         pinned: &SnapshotContext,
-    ) -> Result<(uuid::Uuid, Binding, uuid::Uuid), SnapshotError> {
+    ) -> Result<(ReaderIdentity, Binding, uuid::Uuid), SnapshotError> {
         let txn = self.transaction().await?;
         let admitted = async {
             let row = self
@@ -312,7 +318,7 @@ impl RootedQualifiedMetadataRepository {
             }
             let reader = txn
                 .query_one_raw(sql(
-                    "SELECT operation_id::text,root_generation,certificate_digest
+                    "SELECT operation_id::text,reader_issuance,root_generation,certificate_digest
                 FROM mst2_metadata_begin_reader($1,$2,$3)",
                     [
                         pinned.built.snapshot_id.clone().into(),
@@ -324,12 +330,15 @@ impl RootedQualifiedMetadataRepository {
                 .map_err(database_error)?
                 .ok_or_else(|| unavailable("qualified reader admission returned no owned root"))?;
             Ok((
-                uuid::Uuid::parse_str(
-                    &reader
-                        .try_get::<String>("", "operation_id")
-                        .map_err(internal)?,
-                )
-                .map_err(internal)?,
+                ReaderIdentity {
+                    operation_id: uuid::Uuid::parse_str(
+                        &reader
+                            .try_get::<String>("", "operation_id")
+                            .map_err(internal)?,
+                    )
+                    .map_err(internal)?,
+                    issuance: reader.try_get("", "reader_issuance").map_err(internal)?,
+                },
                 Binding {
                     generation: reader.try_get("", "root_generation").map_err(internal)?,
                     certificate: digest_column(&reader, "certificate_digest")?,
@@ -349,7 +358,7 @@ impl RootedQualifiedMetadataRepository {
 
     async fn finish_reader<T>(
         &self,
-        operation: uuid::Uuid,
+        operation: ReaderIdentity,
         result: Result<T, SnapshotError>,
     ) -> Result<T, SnapshotError> {
         let cleanup = self.transaction().await;
@@ -357,8 +366,11 @@ impl RootedQualifiedMetadataRepository {
             Ok(txn) => {
                 let finished = txn
                     .execute_raw(sql(
-                        "SELECT mst2_metadata_finish_reader($1::uuid)",
-                        [operation.to_string().into()],
+                        "SELECT mst2_metadata_finish_reader($1::uuid,$2::bigint)",
+                        [
+                            operation.operation_id.to_string().into(),
+                            operation.issuance.into(),
+                        ],
                     ))
                     .await
                     .map_err(internal)
@@ -381,7 +393,7 @@ impl RootedQualifiedMetadataRepository {
         &self,
         pinned: &SnapshotContext,
         requests: &[MetadataRouteRequest<'_>],
-        operation: uuid::Uuid,
+        operation: ReaderIdentity,
         binding: Binding,
         source: uuid::Uuid,
     ) -> Result<PersistedMetadataRouteBatch, SnapshotError> {
@@ -424,7 +436,7 @@ impl RootedQualifiedMetadataRepository {
 impl Reader<'_> {
     fn new(
         txn: &DatabaseTransaction,
-        operation: uuid::Uuid,
+        operation: ReaderIdentity,
         root: [u8; 32],
         binding: Binding,
         source: uuid::Uuid,
@@ -456,8 +468,8 @@ impl Reader<'_> {
             .iter()
             .map(|entry| hex::encode(&entry.name))
             .collect();
-        let rows = self.txn.query_all_raw(sql("SELECT * FROM mst2_metadata_read_source_entries($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb)",
-            [self.operation.to_string().into(), source.to_string().into(), directory.to_vec().into(),
+        let rows = self.txn.query_all_raw(sql("SELECT * FROM mst2_metadata_read_source_entries($1::uuid,$2::bigint,$3::uuid,$4,$5,$6,$7::jsonb)",
+            [self.operation.operation_id.to_string().into(), self.operation.issuance.into(), source.to_string().into(), directory.to_vec().into(),
                 binding.generation.into(), binding.certificate.to_vec().into(),json!(names).into()])).await.map_err(database_error)?;
         #[cfg(test)]
         if entries.iter().any(|entry| !entry.is_dir())
@@ -712,7 +724,8 @@ impl Reader<'_> {
                     id.to_vec().into(),
                     binding.generation.into(),
                     binding.certificate.to_vec().into(),
-                    self.operation.to_string().into(),
+                    self.operation.operation_id.to_string().into(),
+                    self.operation.issuance.into(),
                 ],
             ))
             .await
@@ -947,9 +960,9 @@ const PAGE_SQL:&str="SELECT body.payload,body.byte_size,proof.canonical_proof->'
  AND octet_length(body.payload)=proof.byte_size AND NOT EXISTS(SELECT 1 FROM mst2_metadata_gc_op gc
    WHERE gc.page_id=proof.page_id AND gc.generation=proof.generation)
  AND EXISTS(SELECT 1 FROM mst2_metadata_reader_operation reader JOIN mst2_metadata_root_anchor anchor
-   ON anchor.reader_operation_id=reader.operation_id AND anchor.anchor_kind='READER'
+   ON anchor.reader_operation_id=reader.operation_id AND anchor.reader_issuance=reader.reader_issuance AND anchor.anchor_kind='READER'
      AND anchor.root_page=reader.root_page AND anchor.root_generation=reader.root_generation
-   WHERE reader.operation_id=$4::uuid AND reader.state='ACTIVE'
+   WHERE reader.operation_id=$4::uuid AND reader.reader_issuance=$5::bigint AND reader.state='ACTIVE'
      AND reader.hard_deadline_unix>floor(extract(epoch FROM clock_timestamp()))::bigint)
  AND (SELECT count(*) FROM mst2_metadata_verified_ref ref WHERE ref.parent_page=proof.page_id
    AND ref.parent_generation=proof.generation)=jsonb_array_length(proof.canonical_proof->'references')
