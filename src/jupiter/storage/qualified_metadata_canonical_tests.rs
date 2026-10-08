@@ -32,6 +32,51 @@ fn files(names: impl IntoIterator<Item = String>) -> Vec<Entry> {
 #[tokio::test]
 async fn database_canonical_builder_matches_pinned_codec_at_split_and_name_boundaries() {
     let (_config, _core, _namespace, q, _guard) = fixture().await;
+    for (width, value) in [
+        (2i32, 0u64),
+        (2, 255),
+        (2, 256),
+        (2, u16::MAX as u64),
+        (4, u32::MAX as u64),
+        (8, (1u64 << 53) + 1),
+        (8, (1u64 << 56) - 1),
+        (8, i64::MAX as u64),
+        (8, (1u64 << 63) + 1),
+        (8, u64::MAX - 1),
+        (8, u64::MAX),
+    ] {
+        let row = q.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT mst2_metadata_write_le($1::numeric,$2) AS encoded,mst2_metadata_read_le(mst2_metadata_write_le($1::numeric,$2),0,$2)::text AS decoded",
+            [value.to_string().into(), width.into()],
+        )).await.unwrap().unwrap();
+        assert_eq!(
+            row.try_get::<Vec<u8>>("", "encoded").unwrap(),
+            value.to_le_bytes()[..width as usize]
+        );
+        assert_eq!(
+            row.try_get::<String>("", "decoded").unwrap(),
+            value.to_string()
+        );
+    }
+    for (value, width) in [
+        ("-1", 8i32),
+        ("0.5", 8),
+        ("65536", 2),
+        ("4294967296", 4),
+        ("18446744073709551616", 8),
+        ("1", 1),
+    ] {
+        assert!(
+            q.query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT mst2_metadata_write_le($1::numeric,$2)",
+                [value.into(), width.into()],
+            ))
+            .await
+            .is_err()
+        );
+    }
     let terminal_names =
         std::iter::once("a".to_owned()).chain((0..129).map(|index| format!("a{index:03}")));
     let cases = [
@@ -438,6 +483,7 @@ pub(super) async fn seeded_rooted_plan(
 async fn actual_rooted_cold_and_zero_delta_reuse_keep_one_canonical_graph() {
     let (config, core, _namespace, q, _guard) = fixture().await;
     let (cold, payload) = seeded_rooted_plan(&core, 'a', "file", 1).await;
+    let expected_payload = payload.bytes.clone();
     let writer = RootedQualifiedMetadataRepository::open(&core, &config)
         .await
         .unwrap();
@@ -506,6 +552,48 @@ async fn actual_rooted_cold_and_zero_delta_reuse_keep_one_canonical_graph() {
         1
     );
     assert_eq!(count(&q,"SELECT count(*) FROM mst2_metadata_prepare WHERE plan_kind='ROOTED' AND state='COMMITTED' AND node_count=0").await,1);
+    for (operation, plan, delta_count, reused_count) in [
+        ("actual-rooted-cold", &cold, 1usize, 0usize),
+        ("actual-zero-delta-root", &warm, 0usize, 1usize),
+    ] {
+        let row = q.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT canonical_plan,mst2_metadata_decode_rooted_plan(canonical_plan) AS decoded FROM mst2_metadata_prepare WHERE operation_id=$1 AND state='COMMITTED'",
+            [operation.into()],
+        )).await.unwrap().unwrap();
+        assert_eq!(
+            row.try_get::<Vec<u8>>("", "canonical_plan").unwrap(),
+            plan.encode().unwrap()
+        );
+        let decoded: Value = row.try_get("", "decoded").unwrap();
+        assert_eq!(decoded["root"], hex::encode(cold.root));
+        assert_eq!(decoded["delta"].as_array().unwrap().len(), delta_count);
+        assert_eq!(decoded["reused"].as_array().unwrap().len(), reused_count);
+        assert_eq!(decoded["source_roots"].as_array().unwrap().len(), 1);
+        let member = if delta_count == 1 {
+            &decoded["delta"][0]
+        } else {
+            &decoded["reused"][0]
+        };
+        assert_eq!(member["page"], hex::encode(cold.root));
+    }
+    let resident = q
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT generation,payload FROM mst2_metadata_payload WHERE page_id=$1",
+            [cold.root.to_vec().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        resident.try_get::<Vec<u8>>("", "payload").unwrap(),
+        expected_payload
+    );
+    assert_eq!(
+        resident.try_get::<i64>("", "generation").unwrap(),
+        intent.root_generation()
+    );
     let error = q
         .execute_unprepared("DELETE FROM mst2_metadata_root_anchor WHERE anchor_kind='REUSE'")
         .await

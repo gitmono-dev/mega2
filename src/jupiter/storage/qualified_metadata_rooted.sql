@@ -105,7 +105,7 @@ BEGIN
   IF cursor_pos<>octet_length(b) THEN RAISE EXCEPTION 'rooted preparation has trailing bytes'; END IF;
   SELECT coalesce(jsonb_object_agg(value->>'page',true),'{}'::jsonb) INTO delta_index FROM unnest(delta_rows) d(value);
   SELECT coalesce(jsonb_object_agg(value->>'page',true),'{}'::jsonb) INTO node_index FROM (
-    SELECT value FROM unnest(delta_rows) UNION ALL SELECT value FROM unnest(reuse_rows)) nodes;
+    SELECT d.value FROM unnest(delta_rows) d(value) UNION ALL SELECT r.value FROM unnest(reuse_rows) r(value)) nodes;
   IF coalesce(array_length(delta_rows,1),0)+coalesce(array_length(reuse_rows,1),0)=0
     OR EXISTS(SELECT 1 FROM unnest(reuse_rows) r(value) WHERE delta_index ? (r.value->>'page'))
     OR NOT node_index ? encode(root,'hex')
@@ -120,7 +120,7 @@ BEGIN
       GROUP BY value->>'parent') grouped;
   IF EXISTS(WITH RECURSIVE reached(page) AS (SELECT encode(root,'hex') UNION
       SELECT child FROM reached r CROSS JOIN LATERAL jsonb_array_elements_text(adjacency->r.page) children(child))
-    SELECT 1 FROM (SELECT value FROM unnest(delta_rows) UNION ALL SELECT value FROM unnest(reuse_rows)) nodes
+    SELECT 1 FROM (SELECT d.value FROM unnest(delta_rows) d(value) UNION ALL SELECT r.value FROM unnest(reuse_rows) r(value)) nodes
       WHERE NOT EXISTS(SELECT 1 FROM reached r WHERE r.page=nodes.value->>'page')) THEN
     RAISE EXCEPTION 'rooted plan includes members outside its bounded delta and boundary closure';
   END IF;
