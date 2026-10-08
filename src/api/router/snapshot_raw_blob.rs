@@ -377,10 +377,10 @@ impl RawBlobReader {
                 "fixed-view raw stream failed",
             )
         })?;
-        if part.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
-            if let Some(map) = self.map.as_ref() {
-                map.record_progress().await?;
-            }
+        if part.as_ref().is_some_and(|bytes| !bytes.is_empty())
+            && let Some(map) = self.map.as_ref()
+        {
+            map.record_progress().await?;
         }
         Ok(part)
     }

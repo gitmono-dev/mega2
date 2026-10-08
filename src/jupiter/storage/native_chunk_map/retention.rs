@@ -409,14 +409,14 @@ impl ChunkMapInstall {
 
 impl Drop for ChunkMapInstall {
     fn drop(&mut self) {
-        if let Ok(mut cancelled) = self.repository.cancelled_installs.lock() {
-            if cancelled.len() < 64 {
-                cancelled.push(CancelledInstall {
-                    owner: self.owner,
-                    key: self.key.key.clone(),
-                    generation: self.generation,
-                });
-            }
+        if let Ok(mut cancelled) = self.repository.cancelled_installs.lock()
+            && cancelled.len() < 64
+        {
+            cancelled.push(CancelledInstall {
+                owner: self.owner,
+                key: self.key.key.clone(),
+                generation: self.generation,
+            });
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
