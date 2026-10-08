@@ -679,7 +679,7 @@ impl Fixture {
         config.mst2.auth_token = Some(TOKEN.to_string());
         let backend = build_object_storage(&config.object_storage).await.unwrap();
         let counts = Arc::new(ReadCounts::default());
-        let (mut storage, schema) = if rebuildable {
+        let (mut storage, schema) = if rebuildable || !generic_history {
             let (database, schema) = test_db_config(temp.path()).await;
             config.database = database;
             let assembly = async {
