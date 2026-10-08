@@ -266,14 +266,32 @@ async fn stale_actual_reader_cannot_read_or_finish_a_reissued_uuid() {
         ),
     );
     let app = fixture.app.clone();
-    let pending = tokio::spawn(with_rooted_reader_barriers(
+    let mut pending = tokio::spawn(with_rooted_reader_barriers(
         admitted.clone(),
         resume.clone(),
         async move { app.oneshot(request).await.unwrap() },
     ));
-    tokio::time::timeout(Duration::from_secs(4), admitted.wait())
-        .await
-        .unwrap();
+    // Admission includes a database lock wait of up to five seconds and a
+    // committed owner. Observe an early HTTP failure as well as the barrier.
+    let admission = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            _ = admitted.wait() => {}
+            response = &mut pending => {
+                let response = response.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+                panic!(
+                    "reader request ended before its admission barrier: {status}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        }
+    })
+    .await;
+    if let Err(error) = admission {
+        pending.abort();
+        panic!("reader admission barrier timed out: {error}");
+    }
     let txn = transaction(&fixture).await;
     let owner=txn.query_one_raw(Statement::from_string(DbBackend::Postgres,
         "SELECT operation_id::text,reader_issuance,to_jsonb(r) AS owner FROM mst2_metadata_reader_operation r WHERE state='ACTIVE'"))
@@ -333,7 +351,7 @@ async fn stale_actual_reader_cannot_read_or_finish_a_reissued_uuid() {
         [old.0.clone().into(),next.into(),source_id.into(),source_root.into(),source_generation.into(),source_certificate.into()])).await.unwrap().is_empty());
     txn.commit().await.unwrap();
     resume.wait().await;
-    let response = tokio::time::timeout(Duration::from_secs(4), pending)
+    let response = tokio::time::timeout(Duration::from_secs(30), pending)
         .await
         .unwrap()
         .unwrap();

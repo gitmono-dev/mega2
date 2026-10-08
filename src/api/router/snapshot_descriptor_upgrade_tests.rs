@@ -85,7 +85,20 @@ async fn captured_87b_descriptor_upgrade_preserves_owners_oids_and_replays_missi
     )
     .await
     .unwrap();
+    let reader = core.begin().await.unwrap();
+    let registrations = reader
+        .query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT (SELECT count(*) FROM mst2_metadata_namespace) AS namespaces,
+                    (SELECT count(*) FROM mst2_qualified_family_policy) AS policies",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(registrations.try_get::<i64>("", "namespaces").unwrap(), 2);
+    assert_eq!(registrations.try_get::<i64>("", "policies").unwrap(), 1);
     apply_migrations(core, false).await.unwrap();
+    reader.rollback().await.unwrap();
     assert_upgrade_ledgers(core).await;
     assert_eq!(descriptor_matches_stored(&fixture).await, 1);
     assert_eq!(policy(core).await, stamp);

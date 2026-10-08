@@ -391,8 +391,11 @@ async fn upgrade_to(
             ))
             .await?;
     }
+    // Route admission reads these immutable registrations before waiting for
+    // mono. Exclude concurrent writers and DDL while allowing those reads to
+    // complete without a relation-lock/mono-lock cycle.
     connection.execute_unprepared(&format!(
-        "LOCK TABLE {c}.mst2_metadata_namespace,{c}.mst2_qualified_family_policy IN ACCESS EXCLUSIVE MODE"
+        "LOCK TABLE {c}.mst2_metadata_namespace,{c}.mst2_qualified_family_policy IN SHARE ROW EXCLUSIVE MODE"
     )).await?;
     let policy=connection.query_one_raw(Statement::from_string(DbBackend::Postgres,
         format!("SELECT implementation_fingerprint,expected_shape,authority_catalog FROM {c}.mst2_qualified_family_policy WHERE singleton=1")))
