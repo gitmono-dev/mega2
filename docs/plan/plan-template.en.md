@@ -4,7 +4,7 @@ This is the English edition of `docs/plan/plan-template.md` for contributors. Ne
 
 The Chinese file remains the in-repo operational original. If the two texts ever diverge on a gate or field, follow the Chinese file and open an Issue to sync this copy.
 
-**Template version:** `v2.1` (effective 2026-09-16). After every version bump, create a matching `v<version>` tag and publish a GitHub Release with a human-written release note. The rest of the structure is unchanged from `v2`.
+**Template version:** `v2.2` (effective 2026-10-08). The v2.1 tag and human-written GitHub Release requirements remain; v2.2 adds a named ER-04 D-gate deferral.
 
 Product name is **mega2**. The Cargo package and binaries are `mega2` / `mega2_core`. mega2 inherits from the same organization's [Mega](https://github.com/web3infra-foundation/mega) project. Mega is the transplant source and contract baseline, not a competitor.
 
@@ -201,14 +201,14 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
    - `Acceptance`: empty | `locally-accepted` | `remote-pending` | `complete`.
      - `locally-accepted` = applicable A + B passed; C coverage not yet obtained. Do **not** report done.
      - `remote-pending` = A/B passed and C coverage obtained (including one green three-gate run whose tree contains this card's final change), but applicable or inherited D is not green. Do **not** report done.
-     - `complete` = A + B passed, C coverage obtained, and applicable or inherited D is green (or D is `N/A`).
-     - Only path: A/B pass → `locally-accepted` → ER-05 review PASS → obtain C → (`complete` if no D; else `remote-pending` → D green → `complete`).
+     - `complete` = A + B passed, C coverage obtained, and applicable or inherited D is green or deferred through the named `EX-*` rule below (or D is `N/A`).
+     - Only path: A/B pass → `locally-accepted` → ER-05 review PASS → obtain C → (`complete` if no D; else `remote-pending` → D green or named `EX-*` deferral → `complete`). A deferral approved after C coverage may move a card from `remote-pending` to `complete`; do not rewrite its historical intermediate state as a green run.
    - `Lifecycle=done` requires `Acceptance=complete`. `blocked` must return to `in-progress` before `done`. Plan completion requires every non-deferred card `done`.
 
    **Who runs C:**
    - Independent release cards and family release-point / `release` cards run the full C set.
    - `family child` cards do not bump, do not build release artifacts, and do not push. They **inherit** C (and D) from the family's unique release point, whose three-gate run must include the child's final tree.
-   - `no-release` cards (`docs` / `audit` / `spike` / `handoff`) inherit C and D from the carrier release point named on the card. That ID must not be empty.
+   - `no-release` cards (`docs` / `audit` / `spike` / `handoff`) inherit C and D from the carrier release point named on the card. That ID must not be empty. A named D deferral must explicitly cover both the card and its carrier.
    - There is **no** path that replaces the three gates with a zero-hit guard.
 
    **A — focused surface gates** (one row per production surface you actually changed):
@@ -243,7 +243,7 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
 
    **C / D boundary:** C ends at a verified branch push. Everything a remote pipeline produces after that is D. Each D item records workflow file, job name, trigger event and ref, whether `paths:` matches this card, and the predicate.
 
-   **D — remote post-push:** only when CI semantics cannot be reproduced locally (for example `paths:`-filtered jobs on `push` to `main`, secret-existence checks). If this card's paths hit no workflow filter, D is `N/A`. D does not block `locally-accepted` or ER-05. D failure is roll-forward only (new commit / new version), never revert of an already-pushed commit.
+   **D — remote post-push:** only when CI semantics cannot be reproduced locally (for example `paths:`-filtered jobs on `push` to `main`, secret-existence checks). If this card's paths hit no workflow filter, D is `N/A`. D does not block `locally-accepted` or ER-05. D green or a named, allowlisted deferral is required for `complete`; a deferred result is never recorded as green. D failure is roll-forward only (new commit / new version), never revert of an already-pushed commit.
 
 5. **ER-05 Review loop:** After implementation and local acceptance, review. Fix findings and re-run acceptance until review says `PASS`. P0/P1 must close. "Residual risk accepted" cannot replace `PASS` except for P2 with a named owner in writing.
 
@@ -410,13 +410,14 @@ After this section declares defaults, cards may omit fields that take the defaul
 | `<ID>` | `<Rollback mode>` | `<forward-only: existing down is empty>` |
 | `<ID>` | `<Docs and compatibility impact>` | `<dev docs only>` |
 
-**Rule waivers (`EX-*`, named approval).** Only these three rules may be waived. `G-01`, `G-02`, `G-05`–`G-11` are **never** waivable.
+**Rule waivers (`EX-*`, named approval).** Only these four rules may be waived. `G-01`, `G-02`, `G-05`–`G-11` are **never** waivable.
 
 | Waivable | Allowed reasons |
 |---|---|
 | G-03 item cap | Checklist products (docs / audit / index) truly need more items, with a file list |
 | G-04 size cap (`L-exception`) | Mechanical: repo-wide rename, bulk delete, format |
 | ER-07 signing | Named repo-policy exception (sign-off-only) |
+| ER-04 D completion evidence | Remote CI minutes exhausted or external runner unavailable; require named approval by the user or a maintainer, never self-approval by the publisher, workflow/job/ref scope per card, and a `DEFER-*` debt item with restart condition. Only D may be deferred: A/B/C, local three gates, ER-05 review (plus independent review where required), commit, tag, and human-written GitHub Release remain mandatory. Later remote failure requires an ER-10 forward fix |
 
 | Exception ID | Task (or `ALL/<scope>`) | Waived rule | Reason and compensation | Approver | Review round | Evidence | Expires |
 |---|---|---|---|---|---|---|---|
@@ -424,7 +425,7 @@ After this section declares defaults, cards may omit fields that take the defaul
 
 #### Granularity audit table
 
-Fill after the plan is written and after every normative edit. Any failing column blocks start. Over-limit `AC` / `VER` / `scope` must carry `@EX-ID` or `L-exception:EX-n` that exists in the waiver table, names this card (or `ALL/<scope>`), matches the exceeded rule, uses an allowlisted reason, and is still in date.
+Fill after the plan is written and after every normative edit. Any failing column blocks start. Over-limit `AC` / `VER` / `scope` must carry `@EX-ID` or `L-exception:EX-n` that exists in the waiver table, names this card (or `ALL/<scope>`), matches the exceeded rule, uses an allowlisted reason, and is still in date. D deferrals must also cover each card in the waiver table and be recorded in its `C/D coverage from`; they do not count as G-03/G-04 granularity exceptions.
 
 | Task | type | axis | recovery | complete | self-contained | AC | VER | landing / prod-files | scope | deps | writeset | release | split-from | exception |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -588,7 +589,7 @@ Result is only `PASS` or `FAIL`. `FAIL` must list P0/P1 and close them next roun
 The plan is complete only when all of the following hold:
 
 - [ ] Every card satisfies `G-*`: no unregistered L exception, no XL card, no fragment cards, no unregistered merged release, I-set conflicts resolved; granularity audit table filled.
-- [ ] Every non-deferred card has met acceptance **and** `Lifecycle=done` **and** `Acceptance=complete` (ER-04). `remote-pending` cards must first get green D. `blocked` cards must unblock or become `DEFER-*`.
+- [ ] Every non-deferred card has met acceptance **and** `Lifecycle=done` **and** `Acceptance=complete` (ER-04). `remote-pending` cards must first get green D or a named, allowlisted `EX-*` deferral with registered `DEFER-*` debt. `blocked` cards must unblock or become `DEFER-*`.
 - [ ] Every card's Verification commands have been run and recorded.
 - [ ] **Plan completion gates:** `cargo +nightly fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `source .env.test && cargo test --all` all green; `cargo build` and `cargo build --tests` 0 errors / 0 warnings; no new crate-level `#[allow(...)]`.
 - [ ] Required docs / config / error contract / test-matrix updates are done.

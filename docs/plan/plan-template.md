@@ -2,7 +2,7 @@
 
 本文是 `docs/plan/` 下新建计划的标准模板。新计划应复制本文件结构，替换 `<...>` 占位符，并删除不适用的说明性文字；强制章节不得删除，不适用时写 `N/A` 和原因。英文贡献者使用 [`plan-template.en.md`](plan-template.en.md)；两份冲突时以本文为准。
 
-**模板版本:** `v2.1`（2026-09-16 起生效；版本 bump 后必须创建同名 `v<version>` tag、发布人工编写的 GitHub Release note。其余结构与 `v2` 相同。）
+**模板版本:** `v2.2`（2026-10-08 起生效；保留 v2.1 的 tag 与人工 Release 要求，新增 ER-04 D 组的具名延期规则。）
 
 ### 模板版本与迁移政策
 
@@ -192,15 +192,15 @@
    - `Acceptance`（验收状态）：空 | `locally-accepted` | `remote-pending`（仅当本卡有适用的 D 组远端后置门）| `complete`。与 `AGENTS.md` 的完成契约对齐 —— 任何改动只有三门全绿才算 done，因此：
      - `locally-accepted` = 本卡适用的 **A 组 + B 组**门已过，但本卡的 **C 组覆盖**（自行执行或从承接卡继承，见下）尚未取得。此状态下**不得**对外报告「完成 / done」。
      - `remote-pending` = A/B 已过且 C 组覆盖已取得（含一次三门全绿的运行，其被测树状态包含本卡最终变更），但本卡适用或继承的 **D 组**远端后置门尚未全绿。此状态同样**不得**报告完成。
-     - `complete` = 本卡的 **A + B** 已过、**C 组覆盖**已取得、且适用或继承的 **D 组**已全绿。无 D 时 C 覆盖到手即可 `complete`；有 D（含继承的 D）时必须先经 `remote-pending`。
-     - 唯一状态转移路径：A/B 通过 → `locally-accepted` → ER-05 review PASS → 取得 C 组覆盖 →（无 D：`complete`；有 D：`remote-pending` → D 全绿 → `complete`）。
+     - `complete` = 本卡的 **A + B** 已过、**C 组覆盖**已取得、且适用或继承的 **D 组**已全绿或按本模板 `EX-*` 规则具名延期。无 D 时 C 覆盖到手即可 `complete`；有 D 时按以下路径处理。
+     - 唯一状态转移路径：A/B 通过 → `locally-accepted` → ER-05 review PASS → 取得 C 组覆盖 →（无 D：`complete`；有 D：`remote-pending` → D 全绿或具名 `EX-*` 延期 → `complete`）。已在 C 覆盖之后才批准的延期可从 `remote-pending` 转入 `complete`；延期前已按事实登记的中间状态不得伪造为绿灯。
    - 两者独立取值：`blocked` 卡的 `Acceptance` 可以已是 `locally-accepted` 甚至 `complete`（例如变更已被三门覆盖，但仍卡在外部前置）。`Lifecycle=done` 必须以 `Acceptance=complete` 为前提；`blocked` 必须先回到 `in-progress` 并完成剩余动作才能进入 `done`，**不允许**从 `blocked` 直接标 `done`。计划完成门另要求所有非延后任务都到 `done`（见「完成判据」）。`Granularity` 里的 `complete=yes` 是 G-02 的结构完整性判据，与本字段无关，不可混用。
 
    **C 组覆盖与执行归属（每张非延后卡都必须取得 C 覆盖，但不都自己执行）:**
    - **独立发布卡（`Release boundary = independent`）与发布点卡（`release` / `family release point`）**：自行执行完整 C 组门。
    - **`family child`**：不 bump、不构建发布产物、不推送，**继承**其家族唯一发布点的 C 覆盖——前提是该发布点的三门运行其被测树状态包含本子卡的最终变更；同时继承该发布点适用的 D 组。
    - **`no-release` 卡（`docs` / `audit` / `spike` / `handoff`）**：**继承**任务卡显式声明的承载发布点（或计划收口点）的 C 覆盖与其 D 组；该承载点必须在卡内写明 ID，不得留空。
-   - 继承 D 组的卡同样要经过 `remote-pending`，直到被继承的 D 组证据全绿。
+   - 继承 D 组的卡同样按上述路径处理；具名延期必须明确覆盖本卡及承载发布点。
    - **不存在「用零命中守卫替代三门」的通道**——零命中守卫只用于证明这类卡未改代码，不改变其在取得 C 覆盖前仍是 `locally-accepted` 的事实。
 
    门分四组，全部适用者累加：**A 表面 focused 门**（按实际改动的表面，每个表面唯一命中一行，命中几行加几行）+ **B 类型门**（按 `Task type` 取一行）+ **C 发布收口门**（由会推送的卡执行，其覆盖可被 `family child` / `no-release` 卡继承）+ **D 远端后置门**（只在存在不可本地复现的 CI 语义时适用）。A/B/C 是本地可完成的门；D 只能在推送之后取得证据，因此**不阻塞** `locally-accepted` 与 ER-05 的 review 顺序。
@@ -262,7 +262,7 @@
    - `claude-review.yml` **不由 push 触发**（只响应 issue/PR 评论与 review 事件），因此直推 `main` 的卡不得把它登记为 D 组项；只有走 PR 流程的卡才可能命中。
    - 若本卡改动不命中任何 `paths:` 过滤器，D 组写 `N/A` 并说明「改动路径不在两个 workflow 的 paths 列表内」，不得虚构一个远端门。
    - D 组**不属于**本地验收，不阻塞 `locally-accepted`，也不改变 ER-05「先本地验收再 review」与 C 组「review 通过后才提交推送」的顺序。
-   - 只有当适用的 D 组门也全绿，该卡的 `Acceptance` 才能到 `complete`；此前停在中间态 `remote-pending`。
+   - 适用的 D 组门全绿或按下文白名单具名延期后，该卡的 `Acceptance` 才能到 `complete`；此前停在中间态 `remote-pending`。延期只调整计划验收口径，不把未运行或未成功的 workflow 记为成功。
    - D 组失败一律**前滚修复**（新提交 / 新版本），不得回退已推送提交；修复卡按 ER-10 的越界规则处理。
 
    「完成判据」的计划级门是最后一次总检查，不替代每张会推送的卡各自跑过的发布收口门。
@@ -458,13 +458,14 @@
 | `<ID>` | `<Rollback mode>` | `<forward-only：既有迁移 down 为空实现，只能前滚 + 校验>` |
 | `<ID>` | `<Docs and compatibility impact>` | `<仅开发文档，无用户可见命令或配置变化>` |
 
-**规则 waiver（`EX-*`，需具名审批）**：可豁免的规则是**白名单**，只有下表三项；`G-01`、`G-02`、`G-05`、`G-06`、`G-07`、`G-08`、`G-09`、`G-10`、`G-11` **永不可豁免**（它们是可 review、可恢复、可并发的前提）。
+**规则 waiver（`EX-*`，需具名审批）**：可豁免的规则是**白名单**，只有下表四项；`G-01`、`G-02`、`G-05`、`G-06`、`G-07`、`G-08`、`G-09`、`G-10`、`G-11` **永不可豁免**（它们是可 review、可恢复、可并发的前提）。
 
 | 可豁免项 | 允许的理由范围 |
 |---|---|
 | G-03 条目上限 | 清单型产物（文档 / 审计 / 索引）确实需要超过本类上限，且已写明产物文件清单 |
 | G-04 规模上限（`L-exception`） | 不可拆的机械变更：全仓重命名、批量删除、格式化 |
 | ER-07 签名要求 | 仓库策略层面的具名豁免（sign-off-only） |
+| ER-04 D 组完成证据 | 远端 CI 配额耗尽或外部运行能力不可用；须由用户或维护者具名批准，发布者不得自批；逐卡标明适用的 workflow/job/ref，登记 `DEFER-*` 债务与重启条件。只延期 D，不豁免 A/B/C、本地三门、ER-05 review（适用独立复核的卡另审）、提交、tag 或人工 GitHub Release；远端后续失败按 ER-10 前滚处理 |
 
 | 例外 ID | 任务（或 `ALL/<作用域>`） | 豁免项 | 理由与补偿措施 | Approver | Review round | 证据 | 有效期 |
 |---|---|---|---|---|---|---|---|
@@ -473,7 +474,7 @@
 
 #### 任务卡粒度审计表
 
-计划成稿与每次规范性修订后填一次，逐卡汇总各卡 `Granularity` 行，便于机械核对与脚本校验。判定规则：任一列不达标即不得开工；`AC` / `VER` / `scope` 列超限时必须带 `@EX-ID` 或 `L-exception:EX-n`，且该 `EX-*` 必须同时满足：存在于 waiver 表、`任务` 列等于引用它的卡（或显式写 `ALL/<作用域>` 的计划级豁免）、`豁免项` 等于被超限的那条规则、理由落在白名单、且仍在有效期内。任一条不满足仍判为不达标。
+计划成稿与每次规范性修订后填一次，逐卡汇总各卡 `Granularity` 行，便于机械核对与脚本校验。判定规则：任一列不达标即不得开工；`AC` / `VER` / `scope` 列超限时必须带 `@EX-ID` 或 `L-exception:EX-n`，且该 `EX-*` 必须同时满足：存在于 waiver 表、`任务` 列等于引用它的卡（或显式写 `ALL/<作用域>` 的计划级豁免）、`豁免项` 等于被超限的那条规则、理由落在白名单、且仍在有效期内。D 组延期也须在 waiver 表逐卡覆盖，并在各卡的 `C/D coverage from` 记录适用的 `EX-*`；不把 D 延期算作 G-03/G-04 的粒度例外。任一条不满足仍判为不达标。
 
 | 任务 | type | axis | recovery | complete | self-contained | AC | VER | landing / prod-files | scope | deps | writeset | release | split-from | exception |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -637,7 +638,7 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 计划只有在以下条件全部满足后才能标记完成：
 
 - [ ] 所有任务卡满足粒度规则 `G-*`：无未登记的 L 例外、无 XL 卡、无碎片卡、无未登记的合并发布例外、实现写集冲突均已消解；「任务卡粒度审计表」已填齐。
-- [ ] 所有非延后任务的 acceptance criteria 已满足，且 `Lifecycle=done` **且** `Acceptance=complete`（ER-04）。任何停在 `remote-pending` 的卡都必须先取得其 D 组远端后置门的绿色证据。任何仍为 `blocked` 的任务都必须先解除阻塞（`blocked` → `in-progress` → 完成剩余动作 → `done`）或按 `DEFER-*` 正式延后，不得带着 `blocked` 通过完成门。
+- [ ] 所有非延后任务的 acceptance criteria 已满足，且 `Lifecycle=done` **且** `Acceptance=complete`（ER-04）。任何停在 `remote-pending` 的卡都必须先取得 D 组绿灯，或完成白名单内具名 `EX-*` 延期及 `DEFER-*` 债务登记。任何仍为 `blocked` 的任务都必须先解除阻塞（`blocked` → `in-progress` → 完成剩余动作 → `done`）或按 `DEFER-*` 正式延后，不得带着 `blocked` 通过完成门。
 - [ ] 所有任务的 Verification 命令已运行并记录结果。
 - [ ] **计划完成门（区别于每卡 focused gate）**：`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all` 全绿，且 `cargo build`、`cargo build --tests` 均 0 错误 0 警告（`AGENTS.md` 强制）；不得新增 crate 级 `#[allow(...)]`。
 - [ ] 必要的 docs/配置/错误契约/测试矩阵更新已完成。
