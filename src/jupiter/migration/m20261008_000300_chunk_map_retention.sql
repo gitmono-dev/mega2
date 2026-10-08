@@ -152,7 +152,7 @@ BEGIN
   IF TG_OP='DELETE' OR TG_OP='TRUNCATE' THEN
     RAISE EXCEPTION 'chunk receipt generations and collection history are retained';
   END IF;
-  IF mst2_chunk_retention_bytes()+CASE WHEN NEW.state IN ('DELETING','APPLIED') THEN 262144 ELSE 1048576 END>536870912 THEN
+  IF mst2_chunk_retention_bytes()+(CASE WHEN NEW.state IN ('DELETING','APPLIED') THEN 262144 ELSE 1048576 END)>536870912 THEN
     RAISE EXCEPTION 'chunk receipt mutation lacks actual durable byte headroom';
   END IF;
   IF TG_OP='UPDATE' AND (NEW.receipt_key IS DISTINCT FROM OLD.receipt_key OR NEW.source_id IS DISTINCT FROM OLD.source_id
@@ -244,7 +244,7 @@ BEGIN
     IF NOT permitted THEN RAISE EXCEPTION 'map lifetime deletion lacks exact reader-free collection claim'; END IF;
     RETURN OLD;
   END IF;
-  IF mst2_chunk_retention_bytes()+CASE WHEN NEW.state='DELETING' THEN 262144 ELSE 1048576 END>536870912 THEN
+  IF mst2_chunk_retention_bytes()+(CASE WHEN NEW.state='DELETING' THEN 262144 ELSE 1048576 END)>536870912 THEN
     RAISE EXCEPTION 'chunk map lifetime mutation lacks actual durable byte headroom';
   END IF;
   IF TG_OP='UPDATE' AND (NEW.map_id IS DISTINCT FROM OLD.map_id OR NEW.generation IS DISTINCT FROM OLD.generation
