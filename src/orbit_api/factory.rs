@@ -135,6 +135,10 @@ impl MegaObjectStorageWrapper {
     pub fn supports_presigned_urls(&self) -> bool {
         MegaObjectStorage::supports_presigned_urls(&*self.inner)
     }
+
+    pub fn supports_chunk_map_retention(&self) -> bool {
+        MegaObjectStorage::supports_chunk_map_retention(&*self.inner)
+    }
 }
 
 #[cfg(test)]

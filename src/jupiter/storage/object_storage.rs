@@ -199,7 +199,9 @@ impl InMemoryObjectStorage {
     }
 
     fn stream_bytes(bytes: Bytes) -> ObjectByteStream {
-        Box::pin(futures::stream::once(async move { Ok(bytes) }))
+        crate::orbit_api::object_storage::fragment_object_stream(Box::pin(futures::stream::once(
+            async move { Ok(bytes) },
+        )))
     }
 }
 
@@ -209,6 +211,10 @@ pub fn mock_object_storage() -> MegaObjectStorageWrapper {
 
 #[async_trait::async_trait]
 impl MegaObjectStorage for InMemoryObjectStorage {
+    fn supports_chunk_map_retention(&self) -> bool {
+        true
+    }
+
     async fn put_stream(
         &self,
         key: &ObjectKey,

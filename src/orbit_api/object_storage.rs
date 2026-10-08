@@ -168,6 +168,30 @@ pub struct ObjectMeta {
 /// - The stream must be fully consumed by the caller.
 pub type ObjectByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
+pub(crate) const OBJECT_STREAM_ITEM_BYTES: usize = 8 * 1024 * 1024;
+
+/// Split visible items without copying or prebuilding a fragment list. Bytes
+/// retain their original owner; this does not bound backend backing buffers.
+pub(crate) fn fragment_object_stream(input: ObjectByteStream) -> ObjectByteStream {
+    Box::pin(futures::stream::unfold(
+        (input, Bytes::new()),
+        |(mut input, pending)| async move {
+            let next = if pending.is_empty() {
+                input.next().await?
+            } else {
+                Ok(pending)
+            };
+            match next {
+                Ok(mut bytes) => {
+                    let part = bytes.split_to(bytes.len().min(OBJECT_STREAM_ITEM_BYTES));
+                    Some((Ok(part), (input, bytes)))
+                }
+                Err(error) => Some((Err(error), (input, Bytes::new()))),
+            }
+        },
+    ))
+}
+
 /// Upper bound for [`MegaObjectStorage::put_metadata_atomic`] (ADR-MF-05).
 pub const MAX_METADATA_ATOMIC_BYTES: usize = 1024 * 1024;
 
@@ -229,6 +253,13 @@ pub trait MegaObjectStorage: Send + Sync {
 
     /// Whether presigned GET/PUT URLs can be generated (e.g. S3/GCS). Local disk returns `false`.
     fn supports_presigned_urls(&self) -> bool {
+        false
+    }
+
+    /// Complete receipt inventory and sealed deletion are available without
+    /// uncounted retained versions. This is a static backend contract, not an
+    /// I/O health or quota check; cold requests still perform real admission.
+    fn supports_chunk_map_retention(&self) -> bool {
         false
     }
 
@@ -675,6 +706,80 @@ mod tests {
     }
 
     struct UnsupportedBoundedStore;
+
+    struct SharedStreamOwner {
+        bytes: Vec<u8>,
+        drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for SharedStreamOwner {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for SharedStreamOwner {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_source_is_lazy_zero_copy_and_keeps_original_owner_until_last_clone() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let input_polls = Arc::new(AtomicUsize::new(0));
+        let bytes = Bytes::from_owner(SharedStreamOwner {
+            bytes: vec![0xa5; 2 * OBJECT_STREAM_ITEM_BYTES + 17],
+            drops: drops.clone(),
+        });
+        let pointer = bytes.as_ptr();
+        let polls = input_polls.clone();
+        let input =
+            futures::stream::iter([Ok(bytes), Err(std::io::Error::other("late backend error"))])
+                .inspect(move |_| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                });
+        let mut fragmented = fragment_object_stream(Box::pin(input));
+        assert_eq!(input_polls.load(Ordering::SeqCst), 0);
+        let first = fragmented.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), OBJECT_STREAM_ITEM_BYTES);
+        assert_eq!(first.as_ptr(), pointer);
+        let transport = first.clone();
+        drop(first);
+        let second = fragmented.next().await.unwrap().unwrap();
+        assert_eq!(second.len(), OBJECT_STREAM_ITEM_BYTES);
+        assert_eq!(
+            second.as_ptr() as usize,
+            pointer as usize + OBJECT_STREAM_ITEM_BYTES
+        );
+        drop(second);
+        let tail = fragmented.next().await.unwrap().unwrap();
+        assert_eq!(tail.as_ref(), &[0xa5; 17]);
+        drop(tail);
+        assert_eq!(input_polls.load(Ordering::SeqCst), 1);
+        assert!(fragmented.next().await.unwrap().is_err());
+        assert_eq!(input_polls.load(Ordering::SeqCst), 2);
+        assert!(fragmented.next().await.is_none());
+        drop(fragmented);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(transport);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn default_backend_does_not_advertise_or_infer_chunk_retention() {
+        let backend = UnsupportedBoundedStore;
+        assert!(!backend.supports_chunk_map_retention());
+        assert!(matches!(
+            backend.chunk_map_receipt_inventory().await,
+            Err(IoOrbitError::ChunkMapRetentionUnsupported)
+        ));
+    }
 
     #[async_trait::async_trait]
     impl MegaObjectStorage for UnsupportedBoundedStore {
