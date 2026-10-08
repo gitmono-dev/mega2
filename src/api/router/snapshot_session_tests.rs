@@ -1293,11 +1293,12 @@ async fn mst2_durable_http_warm_reads_renew_and_frame_delivery_reject_primary_sc
         .try_get_by_index(0)
         .unwrap();
     overwrite_primary_scope_for_test(db, uuid::Uuid::new_v4().to_string()).await;
+    // Family selection rejects physical authority drift as INTEGRITY_ERROR.
     error(
         fixture.send("GET", "descriptor", Body::empty()).await,
-        500,
-        "INTERNAL",
-        true,
+        502,
+        "INTEGRITY_ERROR",
+        false,
     )
     .await;
     error(
@@ -1314,9 +1315,9 @@ async fn mst2_durable_http_warm_reads_renew_and_frame_delivery_reject_primary_sc
             )
             .await
             .unwrap(),
-        500,
-        "INTERNAL",
-        true,
+        502,
+        "INTEGRITY_ERROR",
+        false,
     )
     .await;
     assert!(

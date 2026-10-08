@@ -244,9 +244,9 @@ async fn un30_building_the_read_facade_writes_no_sidebar() {
             .await
             .expect("writable connection"),
     );
-    let config = Arc::new(crate::config::testing::isolated_config(
-        temp.path().join("config"),
-    ));
+    let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+    config.database = db_config.clone();
+    let config = Arc::new(config);
 
     assert!(
         !sidebar_table_exists(&writable).await,
