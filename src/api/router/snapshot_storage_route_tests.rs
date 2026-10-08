@@ -483,11 +483,19 @@ async fn mst2_generic_storage_routes_raw_lease_derives_atomically_and_half_rows_
          SELECT (jsonb_populate_record(NULL::mst2_lease_storage_route,
            to_jsonb(r)||jsonb_build_object('lease_id','{lease}'))).* FROM mst2_lease_storage_route r",
     )).await;
-    rejected(db,
+    let txn = db.begin().await.unwrap();
+    let error = txn.execute_unprepared(
         "INSERT INTO mst2_metadata_namespace SELECT (jsonb_populate_record(NULL::mst2_metadata_namespace,
          to_jsonb(n)||jsonb_build_object('namespace_uuid','00000000-0000-4000-8000-000000000001',
            'graph_domain','qualified-v1'))).* FROM mst2_metadata_namespace n",
-    ).await;
+    ).await.expect_err("unadmitted qualified namespace must be rejected before commit");
+    assert!(
+        error.to_string().contains(
+            "qualified namespace registration has no exact admitted rooted family scope and lock set"
+        ),
+        "wrong qualified namespace rejection: {error}"
+    );
+    txn.rollback().await.unwrap();
     assert_eq!(routes(db).await, original);
     assert_eq!(sources(db).await, source);
 }
