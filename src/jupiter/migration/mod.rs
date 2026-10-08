@@ -155,6 +155,8 @@ mod m20261008_000100_add_mst2_chunk_maps;
 mod m20261008_000200_add_mst2_rooted_qualified_family;
 mod m20261008_000300_add_mst2_chunk_map_retention;
 mod m20261008_000400_add_mst2_reader_retention;
+mod m20261008_000500_fix_mst2_native_runtime;
+pub(crate) mod qualified_native_runtime_upgrade;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -168,6 +170,26 @@ pub(crate) async fn test_upgrade_reader_retention(
 
     let txn = connection.begin().await?;
     let result = m20261008_000400_add_mst2_reader_retention::Migration
+        .up(&SchemaManager::new(&txn))
+        .await;
+    match result {
+        Ok(()) => txn.commit().await,
+        Err(error) => {
+            txn.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn test_upgrade_native_runtime(
+    connection: &sea_orm::DatabaseConnection,
+) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::TransactionTrait;
+    use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+    let txn = connection.begin().await?;
+    let result = m20261008_000500_fix_mst2_native_runtime::Migration
         .up(&SchemaManager::new(&txn))
         .await;
     match result {
@@ -318,6 +340,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261008_000200_add_mst2_rooted_qualified_family::Migration),
             Box::new(m20261008_000300_add_mst2_chunk_map_retention::Migration),
             Box::new(m20261008_000400_add_mst2_reader_retention::Migration),
+            Box::new(m20261008_000500_fix_mst2_native_runtime::Migration),
         ]
     }
 }
@@ -1263,21 +1286,25 @@ mod tests {
             "m20261007_000600_add_mst2_storage_routes"
         );
         assert_eq!(
-            &names[names.len() - 4],
+            &names[names.len() - 5],
             "m20261008_000100_add_mst2_chunk_maps"
         );
         assert_eq!(
-            &names[names.len() - 3],
+            &names[names.len() - 4],
             "m20261008_000200_add_mst2_rooted_qualified_family"
         );
 
         assert_eq!(
-            &names[names.len() - 2],
+            &names[names.len() - 3],
             "m20261008_000300_add_mst2_chunk_map_retention"
         );
         assert_eq!(
-            names.last().unwrap(),
+            &names[names.len() - 2],
             "m20261008_000400_add_mst2_reader_retention"
+        );
+        assert_eq!(
+            names.last().unwrap(),
+            "m20261008_000500_fix_mst2_native_runtime"
         );
         let db = alias_db().await;
         insert_repo(&db, 1, "/third-party//a").await;

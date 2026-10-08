@@ -115,11 +115,11 @@ BEGIN
     OR NOT EXISTS(SELECT 1 FROM unnest(source_rows) s(value) WHERE value->>'page'=encode(root,'hex')) THEN
     RAISE EXCEPTION 'rooted plan has overlap or an unbound graph/source endpoint';
   END IF;
-  SELECT coalesce(jsonb_object_agg(parent,children),'{}'::jsonb) INTO adjacency FROM (
+  SELECT coalesce(jsonb_object_agg(grouped.parent,grouped.children),'{}'::jsonb) INTO adjacency FROM (
     SELECT value->>'parent' AS parent,jsonb_agg(value->>'child') AS children FROM unnest(edge_rows) e(value)
       GROUP BY value->>'parent') grouped;
   IF EXISTS(WITH RECURSIVE reached(page) AS (SELECT encode(root,'hex') UNION
-      SELECT child FROM reached r CROSS JOIN LATERAL jsonb_array_elements_text(adjacency->r.page) children(child))
+      SELECT children.child FROM reached r CROSS JOIN LATERAL jsonb_array_elements_text(adjacency->r.page) children(child))
     SELECT 1 FROM (SELECT d.value FROM unnest(delta_rows) d(value) UNION ALL SELECT r.value FROM unnest(reuse_rows) r(value)) nodes
       WHERE NOT EXISTS(SELECT 1 FROM reached r WHERE r.page=nodes.value->>'page')) THEN
     RAISE EXCEPTION 'rooted plan includes members outside its bounded delta and boundary closure';

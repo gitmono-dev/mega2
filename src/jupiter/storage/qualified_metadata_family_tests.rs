@@ -136,7 +136,7 @@ async fn physical_q_shadow_writer_is_distinct_and_restart_reuses_its_exact_catal
         count(&q, "SELECT count(*) FROM mst2_qualified_lease_binding").await,
         0
     );
-    assert_eq!(count(&q,"SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace=(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname=current_schema()) AND relkind='r'").await,22);
+    assert_eq!(count(&q,"SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace=(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname=current_schema()) AND relkind='r'").await,23);
     assert_eq!(count(&q,"SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace=(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname=current_schema()) AND relname IN ('mst2_retention_node','mst2_retention_edge','mst2_snapshot_context','mst2_snapshot_lease','mega_refs','git_repo','seaql_migrations')").await,0);
     let q_scope = q
         .query_one_raw(Statement::from_string(

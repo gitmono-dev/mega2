@@ -1,4 +1,4 @@
--- Captured exactly from c1ff280281440891e732ecfaed4732ee59c41a90; test-only.
+-- Captured exactly from c1ff280281440891e732ecfaed4732ee59c41a90; migration verification only.
 -- READER DDL BEGIN
 CREATE TABLE mst2_metadata_reader_operation (
   operation_id uuid PRIMARY KEY,lease_id text NOT NULL REFERENCES mst2_qualified_lease_binding(lease_id),
