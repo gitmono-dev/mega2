@@ -47,16 +47,16 @@
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |---|---|---|
-| Subdir / Prefix / Exclude / Compose / Nop / Empty、规范化与 filter_id | 仅草案 | `src/ceres/` 尚无视图过滤器模块；组合相交必须在注册时拒绝。 |
-| 视图元数据与对象表（§3.1–§3.5） | 未实现 | `src/callisto/` 与 `src/jupiter/migration/` 尚无 `mega_view_*` 表。 |
-| 线性投影与 view_tip（§4.1–§4.5） | 未实现 | `src/jupiter/service/` 尚无根链追赶；缺对象不能视作空路径。 |
-| ViewRepo upload-pack（v0 / v2） | 未实现 | `src/ceres/pack/` 尚无 ViewRepo；能力宣告必须符合实现。 |
-| `/.filter/` 与 `/.view/` URL、保留名及写拒绝 | 未实现 | `src/contract/git_protocol/path.rs` 尚未分派视图路径。 |
-| want 归属校验 | 未实现 | `src/ceres/protocol/` 尚无视图 commit_map 闸门。 |
-| 后台追赶、补偿、视图锁与根链锁 | 未实现 | `src/jupiter/service/` 尚无视图 worker；锁序影响并发正确性。 |
-| 注册 API、上限与回收态重新预热 | 未实现 | `src/api/router/` 尚无视图注册接口；准入须跨副本原子化。 |
-| `[views]` 配置 | 未实现 | `src/config/model.rs` 尚无 `ViewsConfig`；加载白名单需同步。 |
-| sha1 限定 | 仅草案 | `src/config/validate.rs` 尚无视图启用时的 hash kind 启动门。 |
+| Subdir / Prefix / Exclude / Compose / Nop / Empty、规范化与 filter_id | 已实现 | `src/ceres/view/filter/` 已实现过滤器解析、规范化与语义；注册时拒绝无效组合。 |
+| 视图元数据与对象表（§3.1–§3.5） | 已实现 | `src/jupiter/migration/m20261006_000100_add_view_tables.rs` 与 `src/callisto/mega_view_filter.rs` 已实现视图表。 |
+| 线性投影与 view_tip（§4.1–§4.5） | 已实现 | `src/jupiter/service/view_projection_service.rs` 与 `src/jupiter/storage/view_root_chain.rs` 已实现根链追赶；缺对象按契约报错。 |
+| ViewRepo upload-pack（v0 / v2） | 已实现 | `src/ceres/pack/view_repo.rs` 与 `tests/integration_views.rs` 已覆盖只读打包与协议行为。 |
+| `/.filter/` 与 `/.view/` URL、保留名及写拒绝 | 已实现 | `src/contract/git_protocol/path.rs` 分类视图路径；`src/server/http_server.rs` 与 `src/contract/git_protocol/ssh.rs` 拒绝视图写请求。 |
+| want 归属校验 | 已实现 | `src/ceres/pack/view_repo.rs` 已校验 want 属于本视图的提交映射。 |
+| 后台追赶、补偿、视图锁与根链锁 | 已实现 | `src/jupiter/service/view_worker.rs` 与 `src/jupiter/storage/view_root_chain.rs` 已实现补偿与锁序。 |
+| 注册 API、上限与回收态重新预热 | 已实现 | `src/api/router/view_router.rs` 与 `src/jupiter/storage/view_admission.rs` 已实现跨副本准入。 |
+| `[views]` 配置 | 已实现 | `src/config/model.rs` 与 `src/config/validate.rs` 已实现配置和约束。 |
+| sha1 限定 | 已实现 | `src/config/validate.rs` 已实现视图启用时 trunk 与 sha1 的启动校验。 |
 
 ## 硬约束与不可违反的原则
 
