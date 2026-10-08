@@ -68,7 +68,7 @@ END $$;
 CREATE CONSTRAINT TRIGGER mst2_metadata_source_entries_complete AFTER INSERT ON mst2_metadata_source_root_attestation
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION mst2_metadata_source_entries_complete();
 
-CREATE FUNCTION mst2_metadata_read_source_entries(op uuid,source_id uuid,p bytea,g bigint,c bytea,names jsonb)
+CREATE FUNCTION mst2_metadata_read_source_entries(op uuid,issuance bigint,source_id uuid,p bytea,g bigint,c bytea,names jsonb)
 RETURNS TABLE(name bytea,git_oid text,kind smallint,byte_size bigint,content_digest bytea,child_root bytea,
   child_generation bigint,child_certificate_digest bytea,child_attestation_id uuid,fact_state text)
 LANGUAGE plpgsql VOLATILE SET search_path=$Q_SCHEMA$,pg_catalog,pg_temp AS $$
@@ -89,9 +89,9 @@ BEGIN
   SELECT mst2_metadata_native_profile(session.prepare_id) INTO profile
     FROM mst2_metadata_reader_operation reader JOIN mst2_qualified_session_incarnation session
       ON session.snapshot_id=reader.snapshot_id AND session.session_incarnation=reader.session_incarnation
-    WHERE reader.operation_id=op AND reader.state='ACTIVE'
+    WHERE reader.operation_id=op AND reader.reader_issuance=issuance AND reader.state='ACTIVE'
       AND reader.hard_deadline_unix>floor(extract(epoch FROM clock_timestamp()))::bigint
-      AND EXISTS(SELECT 1 FROM mst2_metadata_root_anchor anchor WHERE anchor.reader_operation_id=reader.operation_id
+      AND EXISTS(SELECT 1 FROM mst2_metadata_root_anchor anchor WHERE anchor.reader_operation_id=reader.operation_id AND anchor.reader_issuance=reader.reader_issuance
         AND anchor.anchor_kind='READER' AND anchor.root_page=reader.root_page AND anchor.root_generation=reader.root_generation);
   IF NOT FOUND OR profile IS DISTINCT FROM a.source_profile
     OR NOT mst2_metadata_root_live(a.root_page,a.root_generation,a.root_certificate_digest) THEN

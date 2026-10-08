@@ -473,7 +473,7 @@ DO $$ DECLARE t text; BEGIN
     'mst2_metadata_prepare_page','mst2_metadata_graph_node','mst2_metadata_graph_edge','mst2_metadata_graph_root',
     'mst2_metadata_gc_op','mst2_qualified_session_incarnation','mst2_qualified_lease_binding',
     'mst2_metadata_page_certificate','mst2_metadata_verified_ref','mst2_metadata_source_root_attestation',
-    'mst2_metadata_prepare_reuse_root','mst2_metadata_reuse_index','mst2_metadata_reader_operation','mst2_metadata_root_anchor',
+    'mst2_metadata_prepare_reuse_root','mst2_metadata_reuse_index','mst2_metadata_reader_operation','mst2_metadata_reader_issuance','mst2_metadata_root_anchor',
     'mst2_metadata_source_entry_reference','mst2_metadata_scope_source_reference'] LOOP
     EXECUTE format('CREATE TRIGGER mst2_00_family_barrier BEFORE INSERT OR UPDATE OR DELETE ON %I FOR EACH STATEMENT EXECUTE FUNCTION mst2_metadata_dml_barrier()',t);
     EXECUTE format('CREATE TRIGGER mst2_metadata_truncate_guard BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION mst2_metadata_immutable()',t);

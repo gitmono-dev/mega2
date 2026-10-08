@@ -263,30 +263,7 @@ END $$;
 CREATE TRIGGER mst2_metadata_lease_guard BEFORE INSERT OR UPDATE OR DELETE ON mst2_qualified_lease_binding
   FOR EACH ROW EXECUTE FUNCTION mst2_metadata_lease_guard();
 
-CREATE FUNCTION mst2_metadata_reader_guard() RETURNS trigger LANGUAGE plpgsql VOLATILE
-SET search_path=$Q_SCHEMA$,pg_catalog,pg_temp AS $$
-DECLARE l mst2_qualified_lease_binding%ROWTYPE; now_unix bigint:=floor(extract(epoch FROM clock_timestamp()))::bigint;
-BEGIN
-  IF TG_OP='DELETE' THEN RAISE EXCEPTION 'qualified reader operation history is immutable'; END IF;
-  IF TG_OP='UPDATE' THEN
-    IF (to_jsonb(NEW)-'state') IS DISTINCT FROM (to_jsonb(OLD)-'state')
-      OR OLD.state<>'ACTIVE' AND NEW.state<>OLD.state OR NEW.state NOT IN ('ACTIVE','FINISHED','EXPIRED')
-      OR NEW.state='EXPIRED' AND OLD.hard_deadline_unix>now_unix THEN
-      RAISE EXCEPTION 'qualified reader identity cannot change or be prematurely expired'; END IF;
-    RETURN NEW;
-  END IF;
-  SELECT * INTO l FROM mst2_qualified_lease_binding WHERE lease_id=NEW.lease_id AND state='ACTIVE' AND expires_at_unix>now_unix;
-  IF NOT FOUND OR NEW.state<>'ACTIVE' OR substr(NEW.operation_id::text,15,1)<>'4'
-    OR substr(NEW.operation_id::text,20,1) NOT IN ('8','9','a','b')
-    OR ROW(NEW.snapshot_id,NEW.session_incarnation,NEW.root_page,NEW.root_generation,NEW.lease_epoch) IS DISTINCT FROM
-      ROW(l.snapshot_id,l.session_incarnation,l.metadata_root,l.root_generation,l.lease_epoch)
-    OR NEW.hard_deadline_unix<=now_unix OR NEW.hard_deadline_unix>least(l.expires_at_unix,now_unix+60)
-    OR NOT mst2_metadata_incarnation_proof(l.snapshot_id,l.session_incarnation,true) THEN
-    RAISE EXCEPTION 'qualified reader lacks its exact active lease and bounded deadline'; END IF;
-  RETURN NEW;
-END $$;
-CREATE TRIGGER mst2_metadata_reader_guard BEFORE INSERT OR UPDATE OR DELETE ON mst2_metadata_reader_operation
-  FOR EACH ROW EXECUTE FUNCTION mst2_metadata_reader_guard();
+$READER_LIFECYCLE_SQL$
 
 CREATE FUNCTION mst2_metadata_serving_complete() RETURNS trigger LANGUAGE plpgsql VOLATILE
 SET search_path=$Q_SCHEMA$,pg_catalog,pg_temp AS $$
@@ -318,9 +295,9 @@ BEGIN
         AND EXISTS(SELECT 1 FROM mst2_metadata_root_anchor a WHERE a.anchor_kind='LEASE' AND a.lease_id=l.lease_id) THEN
       RAISE EXCEPTION 'qualified lease cannot commit without its exact final route and owned protection'; END IF;
   ELSE
-    SELECT * INTO STRICT r FROM mst2_metadata_reader_operation WHERE operation_id=NEW.operation_id;
+    SELECT * INTO STRICT r FROM mst2_metadata_reader_operation WHERE operation_id=NEW.operation_id AND reader_issuance=NEW.reader_issuance;
     IF r.state='ACTIVE' AND (r.hard_deadline_unix<=floor(extract(epoch FROM clock_timestamp()))::bigint
-      OR (SELECT count(*) FROM mst2_metadata_root_anchor a WHERE a.reader_operation_id=r.operation_id
+      OR (SELECT count(*) FROM mst2_metadata_root_anchor a WHERE a.reader_operation_id=r.operation_id AND a.reader_issuance=r.reader_issuance
         AND a.anchor_kind IN ('REQUEST','READER') AND a.owner_key=r.operation_id::text
         AND a.lease_id=r.lease_id AND a.snapshot_id=r.snapshot_id AND a.session_incarnation=r.session_incarnation
         AND a.root_page=r.root_page AND a.root_generation=r.root_generation)<>2)
@@ -488,17 +465,17 @@ BEGIN
   PERFORM $CORE_SCHEMA$.mst2_route_enter($CORE_LITERAL$);
   now_unix:=floor(extract(epoch FROM clock_timestamp()))::bigint;
   FOR item IN SELECT * FROM (
-      (SELECT 'READER'::text AS kind,operation_id::text AS owner,lease_id,hard_deadline_unix AS deadline
+      (SELECT 'READER'::text AS kind,operation_id::text AS owner,lease_id,hard_deadline_unix AS deadline,reader_issuance
         FROM mst2_metadata_reader_operation WHERE state='ACTIVE' AND hard_deadline_unix<=now_unix
         ORDER BY hard_deadline_unix,operation_id LIMIT bound)
       UNION ALL
-      (SELECT 'LEASE'::text,lease_id,lease_id,expires_at_unix
+      (SELECT 'LEASE'::text,lease_id,lease_id,expires_at_unix,NULL::bigint
         FROM mst2_qualified_lease_binding WHERE state='ACTIVE' AND expires_at_unix<=now_unix
         ORDER BY expires_at_unix,lease_id LIMIT bound)
     ) expired ORDER BY deadline,kind,owner LIMIT bound LOOP
     IF item.kind='READER' THEN
-      UPDATE mst2_metadata_reader_operation SET state='EXPIRED' WHERE operation_id=item.owner::uuid AND state='ACTIVE';
-      DELETE FROM mst2_metadata_root_anchor WHERE reader_operation_id=item.owner::uuid AND anchor_kind IN ('REQUEST','READER');
+      UPDATE mst2_metadata_reader_operation SET state='EXPIRED' WHERE operation_id=item.owner::uuid AND reader_issuance=item.reader_issuance AND state='ACTIVE';
+      DELETE FROM mst2_metadata_root_anchor WHERE reader_operation_id=item.owner::uuid AND reader_issuance=item.reader_issuance AND anchor_kind IN ('REQUEST','READER');
     ELSE
       UPDATE mst2_qualified_lease_binding SET state='EXPIRED',lease_epoch=lease_epoch+1 WHERE lease_id=item.owner AND state='ACTIVE';
     END IF;
@@ -541,39 +518,6 @@ BEGIN
   IF changed THEN UPDATE mst2_qualified_lease_binding SET state='RELEASED',lease_epoch=lease_epoch+1 WHERE lease_id=lid; END IF;
   PERFORM mst2_metadata_cleanup_lease(lid);
   RETURN changed;
-END $$;
-
-CREATE FUNCTION mst2_metadata_begin_reader(sid text,lid text,instance text)
-RETURNS TABLE(operation_id uuid,root_generation bigint,certificate_digest bytea) LANGUAGE plpgsql VOLATILE
-SET search_path=$Q_SCHEMA$,pg_catalog,pg_temp AS $$
-DECLARE l mst2_qualified_lease_binding%ROWTYPE; s record; op uuid:=gen_random_uuid(); deadline bigint; kind text;
-BEGIN
-  PERFORM $CORE_SCHEMA$.mst2_route_enter($CORE_LITERAL$);
-  PERFORM mst2_metadata_cleanup_expired(64);
-  SELECT * INTO s FROM mst2_metadata_session_row(sid,lid,instance);
-  IF NOT FOUND THEN RETURN; END IF;
-  SELECT * INTO STRICT l FROM mst2_qualified_lease_binding WHERE lease_id=lid;
-  deadline:=least(l.expires_at_unix,floor(extract(epoch FROM clock_timestamp()))::bigint+60);
-  INSERT INTO mst2_metadata_reader_operation(operation_id,lease_id,snapshot_id,session_incarnation,root_page,root_generation,
-    lease_epoch,hard_deadline_unix,state) VALUES(op,lid,sid,l.session_incarnation,l.metadata_root,l.root_generation,l.lease_epoch,deadline,'ACTIVE');
-  FOREACH kind IN ARRAY ARRAY['REQUEST','READER'] LOOP
-    INSERT INTO mst2_metadata_root_anchor(anchor_id,anchor_kind,owner_key,root_page,root_generation,root_certificate_digest,
-      snapshot_id,session_incarnation,lease_id,reader_operation_id) VALUES(gen_random_uuid(),kind,op::text,
-        l.metadata_root,l.root_generation,s.certificate_digest,sid,l.session_incarnation,lid,op);
-  END LOOP;
-  RETURN QUERY SELECT op,l.root_generation,s.certificate_digest::bytea;
-END $$;
-
-CREATE FUNCTION mst2_metadata_finish_reader(op uuid) RETURNS void LANGUAGE plpgsql VOLATILE
-SET search_path=$Q_SCHEMA$,pg_catalog,pg_temp AS $$
-DECLARE r mst2_metadata_reader_operation%ROWTYPE;
-BEGIN
-  PERFORM $CORE_SCHEMA$.mst2_route_enter($CORE_LITERAL$);
-  SELECT * INTO r FROM mst2_metadata_reader_operation WHERE operation_id=op;
-  IF NOT FOUND THEN RETURN; END IF;
-  IF r.state='ACTIVE' THEN UPDATE mst2_metadata_reader_operation SET state='FINISHED' WHERE operation_id=op; END IF;
-  DELETE FROM mst2_metadata_root_anchor WHERE reader_operation_id=op AND anchor_kind IN ('REQUEST','READER');
-  PERFORM mst2_metadata_cleanup_lease(r.lease_id);
 END $$;
 
 DROP TRIGGER mst2_01_family_closed ON mst2_qualified_session_incarnation;

@@ -46,8 +46,16 @@ CREATE TABLE mst2_metadata_reader_operation (
   snapshot_id text NOT NULL,session_incarnation uuid NOT NULL,root_page bytea NOT NULL,root_generation bigint NOT NULL,
   lease_epoch bigint NOT NULL CHECK(lease_epoch>0),hard_deadline_unix bigint NOT NULL,
   state text NOT NULL CHECK(state IN ('ACTIVE','FINISHED','EXPIRED')),
+  reader_issuance bigint NOT NULL CHECK(reader_issuance>=0),terminal_xid bigint,
+  CONSTRAINT mst2_metadata_reader_identity UNIQUE(operation_id,reader_issuance),
+  CONSTRAINT mst2_metadata_reader_terminal_state CHECK((state='ACTIVE')=(terminal_xid IS NULL)),
   FOREIGN KEY(snapshot_id,session_incarnation) REFERENCES mst2_qualified_session_incarnation(snapshot_id,session_incarnation)
 );
+CREATE TABLE mst2_metadata_reader_issuance (
+  singleton smallint PRIMARY KEY CHECK(singleton=1),high_water bigint NOT NULL CHECK(high_water>=0)
+);
+INSERT INTO mst2_metadata_reader_issuance VALUES(1,0);
+CREATE INDEX mst2_metadata_reader_terminal ON mst2_metadata_reader_operation(terminal_xid,operation_id) WHERE state IN ('FINISHED','EXPIRED');
 CREATE INDEX mst2_metadata_reader_active_lease ON mst2_metadata_reader_operation(lease_id,state,operation_id);
 CREATE INDEX mst2_metadata_reader_active_deadline ON mst2_metadata_reader_operation(hard_deadline_unix,operation_id) WHERE state='ACTIVE';
 CREATE TABLE mst2_metadata_root_anchor (
@@ -56,13 +64,17 @@ CREATE TABLE mst2_metadata_root_anchor (
   root_page bytea NOT NULL,root_generation bigint NOT NULL,root_certificate_digest bytea NOT NULL,
   prepare_id text REFERENCES mst2_metadata_prepare(prepare_id),
   snapshot_id text,session_incarnation uuid,lease_id text REFERENCES mst2_qualified_lease_binding(lease_id),
-  reader_operation_id uuid REFERENCES mst2_metadata_reader_operation(operation_id),
+  reader_operation_id uuid,reader_issuance bigint,
+  CONSTRAINT mst2_metadata_root_anchor_reader_identity FOREIGN KEY(reader_operation_id,reader_issuance) REFERENCES mst2_metadata_reader_operation(operation_id,reader_issuance) MATCH FULL,
+  CONSTRAINT mst2_metadata_root_anchor_reader_kind CHECK((anchor_kind IN ('REQUEST','READER'))=(reader_operation_id IS NOT NULL)),
+  CONSTRAINT mst2_metadata_root_anchor_reader_fields CHECK((reader_operation_id IS NULL)=(reader_issuance IS NULL)),
   UNIQUE(anchor_kind,owner_key,root_page,root_generation),
   FOREIGN KEY(root_page,root_generation) REFERENCES mst2_metadata_graph_node(page_id,generation),
   FOREIGN KEY(root_page,root_generation,root_certificate_digest)
     REFERENCES mst2_metadata_page_certificate(page_id,generation,certificate_digest),
   FOREIGN KEY(snapshot_id,session_incarnation) REFERENCES mst2_qualified_session_incarnation(snapshot_id,session_incarnation)
 );
+CREATE INDEX mst2_metadata_root_anchor_reader ON mst2_metadata_root_anchor(reader_operation_id,reader_issuance) WHERE reader_operation_id IS NOT NULL;
 CREATE INDEX mst2_metadata_root_anchor_page ON mst2_metadata_root_anchor(root_page,root_generation,anchor_kind,owner_key);
 CREATE INDEX mst2_metadata_root_anchor_prepare ON mst2_metadata_root_anchor(prepare_id,anchor_kind,anchor_id);
 CREATE INDEX mst2_metadata_root_anchor_lease ON mst2_metadata_root_anchor(lease_id,anchor_kind,anchor_id);
@@ -327,7 +339,7 @@ BEGIN
         RAISE EXCEPTION 'lease root still has its active lease or readers';
       END IF;
     ELSE
-      IF NOT EXISTS(SELECT 1 FROM mst2_metadata_reader_operation r WHERE r.operation_id=OLD.reader_operation_id
+      IF NOT EXISTS(SELECT 1 FROM mst2_metadata_reader_operation r WHERE r.operation_id=OLD.reader_operation_id AND r.reader_issuance=OLD.reader_issuance
         AND (r.state='FINISHED' OR r.state='EXPIRED' AND r.hard_deadline_unix<=floor(extract(epoch FROM clock_timestamp()))::bigint)) THEN
         RAISE EXCEPTION 'reader root still has an active operation';
       END IF;
@@ -376,7 +388,7 @@ BEGIN
   ELSE
     IF NEW.owner_key IS DISTINCT FROM NEW.reader_operation_id::text OR NEW.prepare_id IS NOT NULL
       OR NOT EXISTS(SELECT 1 FROM mst2_metadata_reader_operation r JOIN mst2_qualified_lease_binding l USING(lease_id)
-        WHERE r.operation_id=NEW.reader_operation_id AND r.lease_id=NEW.lease_id AND r.snapshot_id=NEW.snapshot_id
+        WHERE r.operation_id=NEW.reader_operation_id AND r.reader_issuance=NEW.reader_issuance AND r.lease_id=NEW.lease_id AND r.snapshot_id=NEW.snapshot_id
           AND r.session_incarnation=NEW.session_incarnation AND r.root_page=NEW.root_page AND r.root_generation=NEW.root_generation
           AND r.state='ACTIVE' AND l.state='ACTIVE' AND l.lease_epoch=r.lease_epoch
           AND r.hard_deadline_unix<=l.expires_at_unix AND r.hard_deadline_unix>floor(extract(epoch FROM clock_timestamp()))::bigint) THEN
