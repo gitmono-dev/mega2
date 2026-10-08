@@ -190,7 +190,8 @@ second inactivity bound so a cancelled or stalled handshake cannot leak
 a background task or socket.
 
 Loopback evidence is `tests/integration_github_sync.rs`
-(`ssh_connect_authenticates`). Production GitHub is `DEFER-GS-08`.
+(`ssh_connect_authenticates`). Production GitHub live is covered by
+plan-20260920 **OX-06** (was `DEFER-GS-08`, now in-scope; layer A′).
 
 ## receive-pack 协议与能力协商
 
@@ -205,7 +206,8 @@ NUL-terminated first ref line.
 error that names `report-status` and writes no command or pack bytes.
 
 Loopback evidence is `loopback_advertise`. Command construction and pack
-write are GS-24. Production GitHub is `DEFER-GS-08`.
+write are GS-24. Production GitHub live is covered by
+plan-20260920 **OX-06** (was `DEFER-GS-08`, now in-scope; layer A′).
 
 ## 请求构造与降级
 
@@ -1106,7 +1108,19 @@ is publisher-layer only.
 
 Postgres / Redis from `.env.test`, in-process vault, fixture SSH host
 keys. **No** GitHub token. All receive-pack tests are loopback
-(`DEFER-GS-08`).
+(`DEFER-GS-08` → **现由 plan-20260920 OX-06 承接 live 验收**).
+
+### 层 A′ — live 验收（plan-20260920 OX-06；测试侧，可选）
+
+Real-GitHub **one-shot** acceptance using `MEGA_TEST_GITHUB_TOKEN`
+(PAT) + `MEGA_TEST_GITHUB_NAMESPACE` (e.g. `genedna`). It performs at
+least one real receive-pack push to `namespace/repo`, verifies GS-15
+`ok` (or records a readable `ng` diagnostic), and checks the remote
+`main` tip advanced. The PAT is **test-side only** — it may create/
+verify a temporary `namespace/mega2-gs-<runid>` repo and does **not**
+enter the product read/write path (ADR-GS-03). When either env var is
+unset, OX-06 is recorded `not-run / env-not-set` and does **not**
+fail-close the loopback cards (OX-01..OX-05).
 
 ### 层 B — 本仓发版（仅 `Version increment=patch` 卡）
 
@@ -1121,7 +1135,12 @@ of the push worker is `plan-20260920`. Tests must not require layer C.
 ## 上线检查清单
 
 Operator checklist before the first **real** GitHub push
-(`plan-20260920`). Not a 60916 test gate.
+(`plan-20260920`). Not a 60916 test gate. Before this list, run the
+plan-20260920 **OX-06** live acceptance (层 A′) as an automated smoke:
+with `MEGA_TEST_GITHUB_TOKEN` + `MEGA_TEST_GITHUB_NAMESPACE` set, it
+performs a real receive-pack push and verifies the remote `main` tip
+advanced — catching branch-protection / credential problems early
+without a human.
 
 1. Use a **dedicated GitHub machine account**, not a human account.
    A human token/key would couple personal access to every binding
