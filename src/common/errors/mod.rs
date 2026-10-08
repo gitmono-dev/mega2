@@ -184,6 +184,12 @@ impl From<IoOrbitError> for MegaError {
             IoOrbitError::WriteManifestPreconditionFailed => {
                 MegaError::Other("write manifest precondition failed".to_string())
             }
+            error @ IoOrbitError::ChunkMapRetentionUnsupported => {
+                MegaError::ObjStorage(error.to_string())
+            }
+            error @ IoOrbitError::ChunkMapRetentionCapacityExceeded => {
+                MegaError::ObjStorage(error.to_string())
+            }
             IoOrbitError::Other(e) => MegaError::Other(e),
         }
     }
