@@ -1,0 +1,31 @@
+{
+  "round": "R26-Claude",
+  "plan_path": "docs/plan/plan-20260920.md",
+  "plan_sha256": "5fcb4eb19f4edbc712401f06c68fa38795f2e8540cd78c7672ba91ae17e30722",
+  "literal_verdict": "VERDICT: PASS",
+  "claude_code_version": "2.1.288",
+  "reviewed_at_utc": "2026-10-09 19:09:44 UTC",
+  "report_path": "claude-review.md",
+  "report_sha256": "24198980cb247cf93e0b9e97e0969a45c9d6e6e81916c182b4f490aa4c35fe9e",
+  "prompt_path": "review-prompt.txt",
+  "prompt_sha256": "2da1443f66608fc9951fb694125ee04fa79a5bfbd912e71ed69649b089d8de5f",
+  "snapshot_manifest_path": "snapshot-files.sha256",
+  "snapshot_manifest_sha256": "5b8c809898ad19b12b365ef446a5c7316bb87ee792738fa462115cfae751594f",
+  "snapshot_path": "/tmp/mega2-plan-audit-r26-5fcb-3TBUOa",
+  "snapshot_project_files": 912,
+  "snapshot_credential_exclusions": [
+    ".libra",
+    "/.env.test"
+  ],
+  "tool_allowlist": [
+    "Read",
+    "Glob",
+    "Grep"
+  ],
+  "blocking_findings": 0,
+  "non_blocking_p3_count": 6,
+  "reviewer_report_notes": [
+    "Claude reported first two read-only Bash calls despite requested Read/Glob/Grep; it reports no writes and used Read/Glob/Grep afterward.",
+    "Review snapshot did not include VCS metadata; checkpoint ancestry/signature was verified separately in the execution/original worktrees."
+  ]
+}

@@ -1,0 +1,5 @@
+.env.test
+.env.test.example
+scripts/authz_kill_switch.sh
+src/config/redaction.rs
+tests/integration_website_auth.rs

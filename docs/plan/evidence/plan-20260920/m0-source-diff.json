@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "capture_phase": "pre-R27-amendment re-derivation from the original M0 checkpoint source range",
+  "base_commit": "ea0d3d5d2efe9d722c3f4defc8d7347503e2df47",
+  "checkpoint_commit": "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+  "clone_head": "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+  "source_test_workflow_paths": [
+    {
+      "status": "M",
+      "path": ".github/workflows/docker.yml",
+      "owners": [
+        "FIX-OX-08",
+        "FIX-OX-11",
+        "FIX-OX-01"
+      ]
+    },
+    {
+      "status": "M",
+      "path": "src/api/router/snapshot_chunk_map_retention_tests.rs",
+      "owners": [
+        "FIX-OX-07",
+        "FIX-OX-10"
+      ]
+    },
+    {
+      "status": "M",
+      "path": "src/api/router/snapshot_chunks_bounded_tests.rs",
+      "owners": [
+        "FIX-OX-02"
+      ]
+    },
+    {
+      "status": "M",
+      "path": "src/api/router/snapshot_content_tests.rs",
+      "owners": [
+        "FIX-OX-02",
+        "FIX-OX-05",
+        "FIX-OX-06",
+        "FIX-OX-09"
+      ]
+    },
+    {
+      "status": "M",
+      "path": "src/api/router/snapshot_lookup_metadata_tests.rs",
+      "owners": [
+        "FIX-OX-06"
+      ]
+    },
+    {
+      "status": "M",
+      "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+      "owners": [
+        "FIX-OX-05",
+        "FIX-OX-09"
+      ]
+    },
+    {
+      "status": "M",
+      "path": "src/api/router/snapshot_rooted_metadata_tests.rs",
+      "owners": [
+        "FIX-OX-14"
+      ]
+    }
+  ],
+  "all_checkpoint_paths_name_status_sha256": "7931ad74ceb11daf6369cec1be75397f9f10029cae7237f7a9e5c401233e74a7",
+  "all_checkpoint_path_count": 16,
+  "source_hunk_command": [
+    "libra",
+    "diff",
+    "--no-color",
+    "--no-textconv",
+    "--no-ext-diff",
+    "--unified=0",
+    "--old",
+    "ea0d3d5d2efe9d722c3f4defc8d7347503e2df47",
+    "--new",
+    "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+    "--",
+    ".github/workflows/docker.yml",
+    "src/api/router/snapshot_chunk_map_retention_tests.rs",
+    "src/api/router/snapshot_chunks_bounded_tests.rs",
+    "src/api/router/snapshot_content_tests.rs",
+    "src/api/router/snapshot_lookup_metadata_tests.rs",
+    "src/api/router/snapshot_objects_bounded_tests.rs",
+    "src/api/router/snapshot_rooted_metadata_tests.rs"
+  ],
+  "source_hunk_exit_code": 0,
+  "source_hunk_sha256": "523463a369f411930a2f7bbe4fbeea26928aa2388edba442df371c46778aff0e",
+  "source_hunk_bytes": 21662,
+  "source_hunk_path_count": 7,
+  "working_tree_note": "The hash is commit-to-commit (base..checkpoint) and excludes working-tree edits; original checkpoint remains the sole source for these hunks."
+}

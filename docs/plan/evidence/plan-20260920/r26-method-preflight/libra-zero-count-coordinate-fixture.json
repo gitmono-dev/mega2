@@ -1,0 +1,79 @@
+{
+  "schema": "libra-zero-count-coordinate-fixture/v1",
+  "root": "/var/folders/m3/g2z7k9gj19x50d85gyv2kpf40000gn/T/libra-zero-count-r26-ktmq7v13",
+  "cases": [
+    {
+      "case": "delete-start",
+      "argv": [
+        "libra",
+        "diff",
+        "--unified=0",
+        "--no-color",
+        "--no-pager",
+        "--",
+        "f"
+      ],
+      "exit": 0,
+      "stdout": "diff --git a/f b/f\nindex de98044..9ddeb5c 100644\n--- a/f\n+++ b/f\n@@ -1,1 +0,0 @@\n-a\n",
+      "stderr": "",
+      "stdout_sha256": "2e19a06c43453ce36d16d6f6467a36224ff33235ce5373acbe54bf1e098eae5f",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_hunk": "@@ -1,1 +0,0 @@"
+    },
+    {
+      "case": "delete-middle",
+      "argv": [
+        "libra",
+        "diff",
+        "--unified=0",
+        "--no-color",
+        "--no-pager",
+        "--",
+        "f"
+      ],
+      "exit": 0,
+      "stdout": "diff --git a/f b/f\nindex de98044..0f7bc76 100644\n--- a/f\n+++ b/f\n@@ -2,1 +1,0 @@\n-b\n",
+      "stderr": "",
+      "stdout_sha256": "8eca142af8529308cf930b4a817c058b550f38c40ce4f189abc9eaec7d5ae067",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_hunk": "@@ -2,1 +1,0 @@"
+    },
+    {
+      "case": "delete-end",
+      "argv": [
+        "libra",
+        "diff",
+        "--unified=0",
+        "--no-color",
+        "--no-pager",
+        "--",
+        "f"
+      ],
+      "exit": 0,
+      "stdout": "diff --git a/f b/f\nindex de98044..422c2b7 100644\n--- a/f\n+++ b/f\n@@ -3,1 +2,0 @@\n-c\n",
+      "stderr": "",
+      "stdout_sha256": "9031bd3d436c8d6f4a1eb4c46c38bdf60cbe6af61282a08ea825627008e7c2c2",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_hunk": "@@ -3,1 +2,0 @@"
+    },
+    {
+      "case": "insert-start",
+      "argv": [
+        "libra",
+        "diff",
+        "--unified=0",
+        "--no-color",
+        "--no-pager",
+        "--",
+        "f"
+      ],
+      "exit": 0,
+      "stdout": "diff --git a/f b/f\nindex 9ddeb5c..de98044 100644\n--- a/f\n+++ b/f\n@@ -0,0 +1,1 @@\n+a\n",
+      "stderr": "",
+      "stdout_sha256": "c8219f0deaf119d8ca8398f2f823e3f5dbd45d910e7f8dff0c8413336c66a9fd",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_hunk": "@@ -0,0 +1,1 @@"
+    }
+  ],
+  "result": "PASS"
+}
