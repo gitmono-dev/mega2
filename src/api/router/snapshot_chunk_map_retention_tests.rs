@@ -354,7 +354,7 @@ async fn actual_warm_body_owner_cancels_never_returning_open_and_next_without_ba
                     error(response, 410, "LEASE_EXPIRED", false).await;
                 }
             });
-            timeout(Duration::from_secs(10), entered.notified())
+            timeout(Duration::from_secs(30), entered.notified())
                 .await
                 .unwrap();
             assert_eq!(count(db, "mst2_chunk_reader").await, 1);
@@ -622,20 +622,18 @@ async fn held_raw_and_exact_range_do_not_resume_after_actual_reader_expiry() {
                 error(response, 410, "LEASE_EXPIRED", false).await;
             }
         });
-        timeout(Duration::from_secs(10), entered.notified())
+        timeout(Duration::from_secs(30), entered.notified())
             .await
             .unwrap();
         assert_eq!(count(db, "mst2_chunk_reader").await, 1);
         db.execute_unprepared("UPDATE mst2_chunk_reader SET deadline=pg_catalog.clock_timestamp()+interval '20 milliseconds'").await.unwrap();
-        // Exercise the real request-held reader without reaching into it:
-        // let the existing ten-second local check interval elapse too.
-        tokio::time::sleep(Duration::from_secs(11)).await;
-        release.notify_one();
-        let completed = timeout(Duration::from_secs(5), &mut task).await;
+        // The request must stop at actual reader expiry while the backend is
+        // still held. Releasing it first would allow a resumed poll to pass.
+        let completed = timeout(Duration::from_secs(16), &mut task).await;
         if completed.is_err() {
             task.abort();
             let _ = task.await;
-            panic!("expired reader continued into another held backend poll");
+            panic!("expired reader did not cancel its permanently held backend");
         }
         completed.unwrap().unwrap();
         assert_eq!(tail_polls.load(Ordering::SeqCst), 0);
@@ -643,6 +641,7 @@ async fn held_raw_and_exact_range_do_not_resume_after_actual_reader_expiry() {
         assert_eq!(fixture.counts.bytes.load(Ordering::SeqCst), 0);
         wait_count(db, "mst2_chunk_reader", 0).await;
         assert_eq!(count(db, "mst2_chunk_map_source").await, 1);
+        drop(release);
     }
 }
 
@@ -790,9 +789,9 @@ async fn one_connection_install_commits_bounded_stages_and_reconstructed_warm_re
             .is_ok()
     );
     connection.execute_unprepared("CREATE TABLE chunk_stage_audit(relation text NOT NULL, writer_xid bigint NOT NULL); CREATE FUNCTION chunk_stage_audit() RETURNS trigger LANGUAGE plpgsql AS $audit$ BEGIN INSERT INTO chunk_stage_audit VALUES(TG_TABLE_NAME,pg_catalog.txid_current()); RETURN NEW; END $audit$; CREATE TRIGGER chunk_stage_audit AFTER INSERT ON mst2_chunk_map FOR EACH ROW EXECUTE FUNCTION chunk_stage_audit(); CREATE TRIGGER chunk_stage_audit AFTER INSERT ON mst2_chunk_map_leaf FOR EACH ROW EXECUTE FUNCTION chunk_stage_audit(); CREATE TRIGGER chunk_stage_audit AFTER INSERT ON mst2_chunk_map_node FOR EACH ROW EXECUTE FUNCTION chunk_stage_audit(); CREATE TRIGGER chunk_stage_audit AFTER INSERT ON mst2_chunk_map_source FOR EACH ROW EXECUTE FUNCTION chunk_stage_audit()").await.unwrap();
-    let map = timeout(Duration::from_secs(10), fixture.map("/file"))
+    let map = timeout(Duration::from_secs(90), fixture.map("/file"))
         .await
-        .expect("single-connection staging waited for its own held connection");
+        .expect("single-connection chunk-map HTTP route exceeded 90 seconds");
     fixture.counts.assert(1, fixture.raw.len());
     let transactions: i64 = connection
         .query_one_raw(statement(

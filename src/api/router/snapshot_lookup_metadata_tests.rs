@@ -236,7 +236,7 @@ async fn mst2_durable_http_lookup_symlink_facts_outside_profile_fail_without_bod
 }
 
 #[tokio::test]
-async fn mst2_durable_http_lookup_verified_fact_database_failure_is_typed_without_body_reads() {
+async fn mst2_durable_http_lookup_verified_fact_catalog_drift_fails_closed_without_body_reads() {
     let fixture = Fixture::new_with_pg_config(true).await;
     let mono = fixture.state.storage.mono_storage();
     mono.get_connection()
@@ -249,9 +249,9 @@ async fn mst2_durable_http_lookup_verified_fact_database_failure_is_typed_withou
         fixture
             .send("POST", "lookup", lookup_body(&["/file"]))
             .await,
-        500,
-        "INTERNAL",
-        true,
+        502,
+        "INTEGRITY_ERROR",
+        false,
     )
     .await;
     fixture.counts.assert(0, 0);

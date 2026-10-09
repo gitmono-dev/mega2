@@ -534,6 +534,19 @@ struct Fixture {
     _schema: Option<TestSchemaGuard>,
 }
 
+struct InitialFact {
+    path: &'static str,
+    size: u64,
+    digest: [u8; 32],
+}
+
+#[derive(Default)]
+struct FixtureOptions {
+    initial_facts: Vec<InitialFact>,
+    initial_chunk_faults: Vec<(&'static str, bounded_chunks::ChunkFault)>,
+    lease_seconds: Option<u64>,
+}
+
 fn tree(items: Vec<TreeItem>) -> Tree {
     crate::ceres::view::tree_source::build_tree(HashKind::Sha1, items).unwrap()
 }
@@ -544,6 +557,13 @@ fn item(mode: TreeItemMode, oid: ObjectHash, name: &str) -> TreeItem {
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+async fn fixture_source_oid(handler: &MonoApiService, project: &Tree, path: &str) -> String {
+    match resolve_abs_metadata(handler, project, path).await.unwrap() {
+        MetadataWalkOutcome::FoundFile { oid, .. } => oid,
+        other => panic!("initial fixture fact path did not resolve: {path}: {other:?}"),
+    }
 }
 
 async fn publish_native_push(
@@ -669,6 +689,32 @@ impl Fixture {
         objects: &[(String, Vec<u8>)],
         generic_history: bool,
         publication_enabled: bool,
+    ) -> Self {
+        Self::new_in_publication_mode_with_options(
+            rebuildable,
+            directory_count,
+            objects,
+            generic_history,
+            publication_enabled,
+            FixtureOptions::default(),
+        )
+        .await
+    }
+
+    async fn new_rooted_with_options(
+        objects: &[(String, Vec<u8>)],
+        options: FixtureOptions,
+    ) -> Self {
+        Self::new_in_publication_mode_with_options(false, 0, objects, false, true, options).await
+    }
+
+    async fn new_in_publication_mode_with_options(
+        rebuildable: bool,
+        directory_count: usize,
+        objects: &[(String, Vec<u8>)],
+        generic_history: bool,
+        publication_enabled: bool,
+        options: FixtureOptions,
     ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let mut config = isolated_config(temp.path().join("config"));
@@ -815,7 +861,7 @@ impl Fixture {
         )
         .unwrap();
         let mono = storage.mono_storage();
-        let mut trees = vec![empty_dir, nested, project, root.clone()];
+        let mut trees = vec![empty_dir, nested, project.clone(), root.clone()];
         trees.extend(extra_trees);
         mono.save_mega_trees(trees, commit.id, None).await.unwrap();
         mono.save_mega_commits(vec![commit.clone(), old_tip.clone(), new_tip.clone()], None)
@@ -873,6 +919,43 @@ impl Fixture {
             }),
             listen_addr: "127.0.0.1:0".to_string(),
         };
+        let handler = MonoApiService::from(&state);
+        for (path, mut fault) in options.initial_chunk_faults {
+            fault.oid = fixture_source_oid(&handler, &project, path).await;
+            counts.chunk_faults.lock().unwrap().push(fault);
+        }
+        for fact in options.initial_facts {
+            let oid = fixture_source_oid(&handler, &project, fact.path).await;
+            let db = mono.get_connection();
+            let current = mst2_verified_object::Entity::find()
+                .filter(mst2_verified_object::Column::StorageDomain.eq("git"))
+                .filter(mst2_verified_object::Column::ObjectKind.eq("blob"))
+                .filter(mst2_verified_object::Column::GitOid.eq(&oid))
+                .one(db)
+                .await
+                .unwrap();
+            if let Some(current) = current {
+                let mut current = current.into_active_model();
+                current.size = Set(i64::try_from(fact.size).unwrap());
+                current.raw_sha256 = Set(fact.digest.to_vec());
+                current.update(db).await.unwrap();
+            } else {
+                mst2_verified_object::Entity::insert(mst2_verified_object::ActiveModel {
+                    id: sea_orm::ActiveValue::NotSet,
+                    storage_domain: Set("git".into()),
+                    git_oid: Set(oid),
+                    object_kind: Set("blob".into()),
+                    raw_sha256: Set(fact.digest.to_vec()),
+                    size: Set(i64::try_from(fact.size).unwrap()),
+                    verification_version: Set(MST2_VERIFICATION_VERSION),
+                    state: Set("VERIFIED".into()),
+                    created_at: Set(chrono::Utc::now().fixed_offset()),
+                })
+                .exec(db)
+                .await
+                .unwrap();
+            }
+        }
         let routes = if generic_history {
             crate::api::router::snapshot_router::generic_history_routers(state.clone())
         } else {
@@ -888,7 +971,7 @@ impl Fixture {
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({"target":{"kind":"latest"},"scope":"/project"}).to_string(),
+                        json!({"target":{"kind":"latest"},"scope":"/project","lease_seconds":options.lease_seconds.unwrap_or(600)}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1028,7 +1111,7 @@ async fn success_json(response: Response) -> Value {
 }
 
 async fn error(response: Response, status: u16, code: &str, retryable: bool) {
-    assert_eq!(response.status().as_u16(), status);
+    let actual_status = response.status().as_u16();
     assert_eq!(response.headers()["content-type"], "application/json");
     let request_id = response.headers()["x-request-id"]
         .to_str()
@@ -1037,6 +1120,11 @@ async fn error(response: Response, status: u16, code: &str, retryable: bool) {
     assert!(!request_id.is_empty());
     let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        actual_status, status,
+        "error code: {}, message: {}",
+        value["error"]["code"], value["error"]["message"]
+    );
     assert_eq!(value["error"]["code"], code);
     assert_eq!(value["error"]["retryable"], retryable);
     assert_eq!(value["error"]["request_id"], request_id);
@@ -1667,7 +1755,7 @@ async fn mst2_fixed_invalid_facts_and_cached_size_conflict_fail_before_body_read
 }
 
 #[tokio::test]
-async fn mst2_fixed_verified_fact_db_error_is_not_missing_metadata_or_empty_content() {
+async fn mst2_fixed_verified_fact_catalog_drift_fails_closed_without_body_read() {
     let fixture = Fixture::new().await;
     let mono = fixture.state.storage.mono_storage();
     mono.get_connection()
@@ -1680,9 +1768,9 @@ async fn mst2_fixed_verified_fact_db_error_is_not_missing_metadata_or_empty_cont
         fixture
             .send("GET", "chunk-map?path=/file", Body::empty())
             .await,
-        500,
-        "INTERNAL",
-        true,
+        502,
+        "INTEGRITY_ERROR",
+        false,
     )
     .await;
     fixture.counts.assert(0, 0);

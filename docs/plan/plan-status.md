@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-10-08 16:10:37 UTC（模板 `v2.2`：ER-04 D 组具名延期白名单）。本文件首次建档自 [`docs/plan/README.md`](README.md) 的「文件列表」与各 `plan-*.md` 的「计划状态」行汇总；**结论：29 份日期计划中 28 份已完成/已收口/已落地，唯一仍未实现的是 [`plan-20260920.md`](plan-20260920.md)（monorepo→GitHub 出站同步，OX-01..OX-05 全部 `pending`；2026-10-08 起 `DEFER-GS-08` 已纳入本计划为 OX-06 live 卡）**。建档时同步修复三处 README 数据落差：`plan-20260913` README 行由「新建（设计稿，0 实现）」改为已完成；[`plan-20260919.md`](plan-20260919.md) 与 [`plan-20260921.md`](plan-20260921.md) 补登进 README「文件列表」。**数据落差已于 2026-10-08 全部关闭**：`plan-20260911` 的「完成判据」10 项、各卡 AC/Verification 子项共 300 项已据此勾选（`[x]`），`fmt`/`clippy` 绿。详见「四·零·数据落差」。
+> **当前快照：** 2026-10-09 17:35:18 UTC（计划模板 `v2.4`）。本文件首次建档自 [`docs/plan/README.md`](README.md) 的「文件列表」与各 `plan-*.md` 的「计划状态」行汇总；**结论：31 份日期计划中 30 份已完成/已收口/已落地，唯一仍未实现的是 [`plan-20260920.md`](plan-20260920.md)**。该计划目前处于 M0 Claude Code 复审阶段：R24 Claude Code 对计划 SHA `8109d374ee3420414542bd1d7a09f4302050a5000027c8e242186b76020089c6` 返回 literal `VERDICT: PASS`；审查报告列有 3 项 non-blocking P3。306 张卡仍 pending，M0 本地签名 checkpoint 与 clean clone 验证完成前不开始任务卡。计划登记 306 张卡且全部 `Lifecycle=pending / Acceptance=空`，无卡片已开工。M0 未通过前不开始实施；`DEFER-GS-08` 的两项 live 验收分别由 OX-24 与 OX-06 承接，缺凭证、`not-run` 或 `env-not-set` 均不构成完成。建档时同步修复的 README 数据落差与 `plan-20260911` 完成判据仍保持已关闭。
 
 ---
 
@@ -46,7 +46,7 @@
 | [`plan-20260917.md`](plan-20260917.md) | storage-only 目录变更与标签 HTTP 补全 | **已完成** | LB-01..LB-07 全部 `done/complete`（LB-02→v0.10.41、LB-03→v0.10.42、LB-04→v0.10.43、LB-05→v0.10.44）；`DEFER-LB-01..11` 承接情况见计划正文 |
 | [`plan-20260918.md`](plan-20260918.md) | 文件删移与 Tag 契约跟进 | **已完成** | FT-01..FT-09 全部 `done/complete`（FT-02/03→v0.10.45/v0.10.46，FT-04→v0.11.0，FT-05→v0.11.1，FT-06→v0.11.2，FT-07→v0.11.3）；关闭 60917 `DEFER-LB-01/02/03` 与 `DEFER-LB-11` 隔离面 |
 | [`plan-20260919.md`](plan-20260919.md) | mega2 通知出站与协作 UI 拆除 | **已收口** | RM-01..RM-04 全部落地；crate 停在 `0.38.1`；跳过 Codex/Claude 双评（配额耗尽）；README「文件列表」本行已补登 |
-| [`plan-20260920.md`](plan-20260920.md) | monorepo 路径 → GitHub 出站同步执行 | **新建（设计稿，0 实现）** | 承接 60916 `DEP-01`：出站 worker / 游标 / reported pack / operator 表面 / `vault_create_once`。**OX-01..OX-05 全部 `pending`**；不停直播 clone/fetch ACK。**2026-10-08：`DEFER-GS-08` 纳入本计划为 OX-06（live GitHub 验收，用 `MEGA_TEST_GITHUB_TOKEN`/`NAMESPACE`）**。**本仓唯一未实现的日期计划** |
+| [`plan-20260920.md`](plan-20260920.md) | monorepo 路径 → GitHub 出站同步执行 | **M0 计划审查中，未开工** | 306 张卡全部 `pending / Acceptance=空`；R24 Claude Code 对计划 SHA `8109d374ee34…020089c6` 返回 literal `PASS`，报告记录 3 项 non-blocking P3。全部 306 张卡仍为 `pending / Acceptance=空`；先完成包含全部 WIP 与 review evidence 的本地签名 checkpoint、签名核验及 clean clone，再开始 FIX-OX-08。PASS 后先做全部 WIP checkpoint 与干净副本核验；仅 OX-284 在计划末尾 bump 一个 patch 并发布。**本仓唯一未实现的日期计划**
 | [`plan-20260921.md`](plan-20260921.md) | Artifacts API 挂载 storage-only | **已落地** | AR-01（storage-only 挂载 + 写鉴权门控）、AR-02（进程级黑盒）、AR-03（README 收口 + 门禁）均已实现；fmt/clippy/test 全绿。README「文件列表」本行已补登 |
 | [`plan-20260923.md`](plan-20260923.md) | 首次使用路径策略与 ImportRepo 生命周期修复 | **已完成** | FU-01..FU-23 与 FU-04A 全部 `done/complete`（v0.38.22..v0.40.12）；收口发布 **v0.40.12** / `4bf6cc2`；「计划完成门」v0.40.13 补跑通过（macOS `ld` 链接提示视为平台噪音）；完成判据 10/10 勾选 |
 | [`plan-20261001.md`](plan-20261001.md) | storage-only 形态 OCI / Artifacts / Libra 客户端黑盒 smoke | **已完成** | BB-01..BB-92（77 张非延后任务卡）全部 `done/complete`；默认栈 OCI 12/12、Artifacts 14/14、Libra 24/24 逐案 PASS；`interop-smoke`、共享 runner、opt-in helper 与产品修复已交付；`DEFER-DR-06` 已关闭；最后发布 `v0.41.72`，Docker job `111617454080` success；完成判据 11/11 勾选 |
@@ -57,11 +57,11 @@
 
 ## 二、未启动的计划与卡
 
-唯一列入本节的计划为 `plan-20260920`（本仓唯一未实现的日期计划）。其余 28 份日期计划均已达终态。
+唯一列入本节的计划为 `plan-20260920`（本仓唯一未实现的日期计划）。其余 30 份日期计划均已达终态。
 
 | 计划 | 全部待执行卡 | 开工前置条件 |
 |---|---|---|
-| [`plan-20260920.md`](plan-20260920.md) | OX-01（outbox / 游标 / worker）、OX-02（incremental_pack_reported 与预算）、OX-03（operator 授权表面）、OX-04（vault_create_once 栅栏）、OX-06（live GitHub 验收，`DEFER-GS-08` 纳入）、OX-05（契约与索引收口） | `DEP-OX-01`（incoming）：`plan-20260916` GS-10 `Acceptance=complete`（已满足，五章节已落盘）；`DEP-01` 已完成交接。执行窗口：OX-04 → OX-02 → OX-01 → OX-03 → OX-06 → OX-05 |
+| [`plan-20260920.md`](plan-20260920.md) | 306 张卡（完整依赖顺序见计划「实施顺序」；均 `pending`） | `DEP-OX-01` 已满足，`DEP-01` 已交接；M0 开工门尚未通过。R24 对 plan SHA `8109d374ee34…020089c6` 返回 literal PASS；三项 non-blocking P3 见报告。全部当前未提交文件与 review evidence 将作为本地 checkpoint 提交，不 push；随后先验证 Signed-off-by/gpgsig 并完成 clean clone，才开始 FIX-OX-08。live OX-24/OX-06 各自必须实测；OX-284 是唯一末尾 patch 发布点
 
 ---
 
@@ -85,7 +85,7 @@ AC-00..AC-22 等全部 `Lifecycle=done / Acceptance=complete`（每卡字段逐�
 
 ## 四、当前执行指针（next action）
 
-- **本仓当前唯一未开工日期计划：** [`plan-20260920.md`](plan-20260920.md)（monorepo→GitHub 出站同步）。`DEP-OX-01` 已满足（60916 GS-10 已 `Acceptance=complete`），具备开工前置，下一步实施 OX-04 → OX-02 → OX-01 → OX-03 → OX-06 → OX-05。
+- **本仓当前唯一未开工日期计划：** [`plan-20260920.md`](plan-20260920.md)。`DEP-OX-01` 已满足，但 M0 计划门尚未通过；R24 Claude Code 对计划 SHA `8109d374ee3420414542bd1d7a09f4302050a5000027c8e242186b76020089c6` 返回 literal PASS；3 项 non-blocking P3 见报告。M0 checkpoint 含全部当前未提交文件与 review evidence，将只本地提交、不 push；签名核验和 clean clone 完成后才开始 FIX-OX-08。当前 306 张卡均 pending。
 - **已收口但残留延后项的计划：** `plan-20260913`（`DEFER-MF-01`）、`plan-20260912`（`DEFER-WH-01..04`）、`plan-20260824`（`DEFER-ORB-01..04`）、`plan-20260902`（`DEFER-DR-01..06`，其中 `DEFER-DR-06` 已由 plan-20261001 关闭）、`plan-20260907`（`DEFER-B3-01..03`、`DEFER-B3-LFS-01`）、`plan-20260916`（`DEFER-GS-01..09`）等，见「五、延后决策或实施项」。
 - **待修复数据落差：** 无（`plan-20260911` 完成判据与各卡子项已勾选；`plan-20260913` 与 `plan-20260919` / `plan-20260921` 的 README 落差已在本文件建档时同步修复）。
 
@@ -124,7 +124,7 @@ AC-00..AC-22 等全部 `Lifecycle=done / Acceptance=complete`（每卡字段逐�
 
 ### 5.2 具体承接与在途 DEFER（重要项）
 
-- ~~`DEFER-GS-08`（真实 GitHub live）~~：**已纳入 `plan-20260920` 为 OX-06**（live GitHub 验收，用 `MEGA_TEST_GITHUB_TOKEN`/`NAMESPACE`），由该计划关闭；live 门只收在 OX-06，缺 token 时按 `env-not-set` 记退。
+- `DEFER-GS-08`（真实 GitHub live）：已纳入 `plan-20260920` 的 OX-24（独立新仓首推）与 OX-06（新仓同 run 首推+增推）两项 live 门；任一卡仅在正向协议结果、人工清理、原 case 复核及证据归档完成后关闭。缺凭证或 `not-run` / `env-not-set` 不得记完成。
 - `DEFER-GS-02`（入站同步）：独立日期计划。
 - `DEFER-MF-01`（plan-20260913）：FastCDC interop 范围外项，受 Libra `DEP-FL-*` 约束。
 - `DEFER-TP-05` / `DEFER-TP-01..05`（plan-20260905）：trunk 直推范围外项。
@@ -138,7 +138,7 @@ AC-00..AC-22 等全部 `Lifecycle=done / Acceptance=complete`（每卡字段逐�
 | DEP-ID | 类型 | 内容 | 现状 |
 |---|---|---|---|
 | DEP-OX-01 | 跨计划前置（incoming） | `plan-20260920` 依赖 `plan-20260916` GS-10 `Acceptance=complete`（五章节落盘） | 已满足（60916 已收口）；`plan-20260920` 尚未开工 |
-| DEP-OX-02 | 环境前置（incoming） | `plan-20260920` OX-06 需要 `MEGA_TEST_GITHUB_TOKEN` + `MEGA_TEST_GITHUB_NAMESPACE`（`.env.test` 已赋值） | 已赋值；缺省时 OX-06 按 `env-not-set` 记退 |
+| DEP-OX-02 | 环境前置（incoming） | `plan-20260920` OX-24/OX-06 的 runner token、namespace kind/name、`MEGA_TEST_GITHUB_EXPECTED_OPERATOR_LOGIN` 与具名操作员独立权限 | `.env.test` 变量存在性曾被核验，权限与当日可用性仍须 live 卡开工前复核；值不进入本台账 | 缺凭证只阻塞相应 live 卡，不阻塞无关本地卡；`env-not-set` 不能通过 live 或计划完成门 |
 | DEP-01（60916→60920） | 跨计划移交（outgoing） | 60916 交付出站同步基础设施与五域冻结 | 已交接；60920 整体承接 |
 | DEP-02 | 跨计划移交 | 修改 `docs/plan/plan-template.md`（GC-12 / ER-07 改回 Libra） | 已关闭（60916 收口时） |
 | DEP-MF-01（60913） | 跨计划前置 | mega2 FastCDC 真 interop 依赖 Libra FL-04 | 已满足（两条真实 interop 已执行通过，pin `8c870c4` / VER 2/2） |
@@ -158,4 +158,4 @@ AC-00..AC-22 等全部 `Lifecycle=done / Acceptance=complete`（每卡字段逐�
 
 日期计划：`plan-20260727`、`plan-20260731`、`plan-20260802`、`plan-20260803`、`plan-20260812`、`plan-20260820`、`plan-20260824`、`plan-20260826`、`plan-20260827`、`plan-20260901`、`plan-20260902`、`plan-20260903`、`plan-20260904`、`plan-20260905`、`plan-20260906`、`plan-20260907`、`plan-20260908`、`plan-20260909`、`plan-20260910`、`plan-20260911`、`plan-20260912`、`plan-20260913`、`plan-20260916`、`plan-20260917`、`plan-20260918`、`plan-20260919`、`plan-20260921`、`plan-20260923`、`plan-20261001`、`plan-20261002`。
 
-> 说明：本清单含全部已达终态的日期计划。唯一未完成者为 [`plan-20260920.md`](plan-20260920.md)（OX-01..OX-06 `pending`；`DEFER-GS-08` 已于 2026-10-08 纳入该计划为 OX-06）。`plan-20260913`、`plan-20260919`、`plan-20260921` 于本文件建档时已补登/同步进 README「文件列表」。
+> 说明：本清单含全部已达终态的日期计划。唯一未完成者为 [`plan-20260920.md`](plan-20260920.md)：306 张卡目前全部 `pending`，M0 尚待 Claude Code 对新冻结 SHA 返回 literal `VERDICT: PASS`；`DEFER-GS-08` 由 OX-24 与 OX-06 两项 live 卡承接。`plan-20260913`、`plan-20260919`、`plan-20260921` 于本文件建档时已补登/同步进 README「文件列表」。

@@ -4,7 +4,7 @@ This is the English edition of `docs/plan/plan-template.md` for contributors. Ne
 
 The Chinese file remains the in-repo operational original. If the two texts ever diverge on a gate or field, follow the Chinese file and open an Issue to sync this copy.
 
-**Template version:** `v2.2` (effective 2026-10-08). The v2.1 tag and human-written GitHub Release requirements remain; v2.2 adds a named ER-04 D-gate deferral.
+**Template version:** `v2.4` (effective 2026-10-09). The v2.3 live-workflow D-gate mapping remains; v2.4 adds G-12 for a user-directed, predeclared plan-wide single release at the final release point.
 
 Product name is **mega2**. The Cargo package and binaries are `mega2` / `mega2_core`. mega2 inherits from the same organization's [Mega](https://github.com/web3infra-foundation/mega) project. Mega is the transplant source and contract baseline, not a competitor.
 
@@ -21,7 +21,7 @@ Product name is **mega2**. The Cargo package and binaries are `mega2` / `mega2_c
 - Long-lived capabilities belong only in `plan-long.md` (`PT-*` and `SB-*`). Dated plans may link those IDs. Do not copy the long-term roadmap into a second task table.
 - Every plan's fact baseline is the current checkout: source, tests, config, and docs. Older plans, screenshots, and meeting notes are clues only. Mega's pinned revision is the transplant baseline; Mega's historical prose is not proof of what mega2 already does.
 - Every task card must be executable by one Agent alone: clear scope, clear dependencies, concrete file landings, pass/fail acceptance, and copy-paste verification commands.
-- Every card must satisfy all `G-*` granularity rules: one independently recoverable behavior axis, item and size limits, one release slice per card by default. Ungranular cards must be split or merged before work starts.
+- Every card must satisfy all `G-*` granularity rules: one independently recoverable behavior axis, item and size limits, one release slice per card by default. A named user's explicit plan-wide single-release instruction uses a registered G-12 group. Ungranular cards must be split or merged before work starts.
 - Plans that touch public commands, config keys, DB schema, HTTP APIs, error types, storage formats, the Git protocol, migrations, authz, or security boundaries must include tests, docs, rollback, and compatibility handling.
 - If you cite Mega or another external repo (Libra, upstream orbit, …), pin a revision, file path, and check date. Do not treat a floating `main` as a spec.
 - New or changed entity / storage / migration work must update `src/callisto/`, `src/jupiter/storage/`, and `src/jupiter/migration/` (including the `migrations()` list in `src/jupiter/migration/mod.rs`) and add matching integration tests.
@@ -52,9 +52,10 @@ Terms (use these; do not invent synonyms):
 
 - **Behavior axis:** one independently recoverable change with self-contained external semantics. "LFS batch auth" is one axis; "LFS content addressing" is another.
 - **Landing:** one enumerable code or doc ownership domain: a **concrete directory** (`src/jupiter/storage/`, `src/api/router/`) or a **same-topic doc set** (`docs/refactoring/config.md`). Repo root, `src/`, `tests/`, and `docs/` are **not** one landing.
-- **Write set:** files that will change, in three classes (G-10): **implementation write set I** (per card; decides concurrency), **release write set R** (per card; version face + `Cargo.lock`; today the version face is only `Cargo.toml` `version`; see ER-08; not used to group implementation concurrency, but serialized under I–R / R–R once a release window opens), **coordination write set C** (plan-level release order and windows; not a card field; "no concurrent multi-Agent release" is ER-12).
-- **Release slice:** one independent review + acceptance + version + commit + push.
+- **Write set:** files that will change, in three classes (G-10): **implementation write set I** (per card; decides concurrency), **release write set R** (per card; version face + `Cargo.lock` for an actual versioned release, or `N/A` for an ER-08 terminal evidence-only close-out; today the version face is only `Cargo.toml` `version`; not used to group implementation concurrency, but serialized under I–R / R–R once a release window opens), **coordination write set C** (plan-level release order and windows; not a card field; "no concurrent multi-Agent release" is ER-12).
+- **Release slice:** normally one independent review + acceptance + version + commit + push; the ER-08 terminal evidence-only `release` card keeps review, applicable gates, commit, and push without a new version.
 - **Family cards:** a set of child cards that share one unique release point (G-08).
+- **Plan-wide single-release group:** after a named user's explicit instruction, a `REL-*` registration names every affected card, one final `release` point, and the no-push window. Members each pass local acceptance and review and make precise local commits; they inherit final-tree C/D coverage from that point (G-12).
 - **Rollback mode:** exactly one of `revert` / `forward-only` / `compensating` / `immutable-release` (G-01). Irreversible work uses the last three; do not demand "one revert undoes it".
 
 ## Title
@@ -174,7 +175,7 @@ These apply to every task in the plan. Cards do not repeat them. Breaking any it
 - **GC-09 Concurrency and resource lifetime:** DB pools, redis connections, file handles, async queues, and temp dirs must have release / recovery semantics. Tests must not depend on unisolated globals (env-mutating tests use `src/config/testing.rs` `env_lock` / `EnvVarGuard`).
 - **GC-10 Performance budget:** HTTP hot paths, DB queries, object I/O, Git protocol work, and background jobs must not introduce unbounded scans, unbounded memory, or N+1 DB/network calls. Write data size and assertions when it matters.
 - **GC-11 No production panics:** Production paths do not add bare `unwrap()` / `expect()` / `panic!()`. Return `MegaResult`, `anyhow::Context`, or a domain error with an actionable message.
-- **GC-12 Precise commits:** Stage only related paths. Do not `commit -a`. If you find unrelated dirty state, leave it and report it. Do not clean, reset, or fold it into the commit. Follow the VCS named in `AGENTS.md` and `.cursor/rules/task-card-release.mdc` (this repo uses **Libra** / `.libra`, not `git`).
+- **GC-12 Precise commits:** Stage only related paths. Do not `commit -a`. If you find unrelated dirty state, leave it and report it. Do not clean, reset, or fold it into the commit. Follow the Libra workflow in `AGENTS.md` "Task card release" and ER-07 below (this repo uses `.libra`, not `git`).
 
 ## Execution requirements (mandatory)
 
@@ -190,7 +191,7 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
 
 3. **ER-03 Granularity gate:** Before start, walk `G-*` and the card's `Granularity` summary. If scope has grown (new axis, AC/Verification over limit, scope rose to L, write set overlaps an in-flight card), edit the plan and split first. Do not silently expand during implementation.
 
-4. **ER-04 Per-card acceptance gates:** Gates are **A focused surface gates** (by what actually changed) + **B type gates** (by `Task type`) + **C release close-out** (required for every non-deferred card; who runs them is below) + **D remote post-push gates** (only when CI semantics cannot be reproduced locally). **All applicable rows stack.** All must pass.
+4. **ER-04 Per-card acceptance gates:** Gates are **A focused surface gates** (by what actually changed) + **B type gates** (by `Task type`) + **C release close-out** (required for every non-deferred card; who runs them is below) + **D remote result gates** (only when CI semantics cannot be reproduced locally). **All applicable rows stack.** All must pass.
 
    Authoritative submit contract is `AGENTS.md` "Required Checks Before Submitting Code Changes": `cargo +nightly fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `source .env.test && cargo test --all`. This template must not weaken those. `AGENTS.md` also requires `cargo build` and `cargo build --tests` with 0 errors and 0 warnings. Card-specific focused tests are **additional**, not a substitute.
 
@@ -201,14 +202,14 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
    - `Acceptance`: empty | `locally-accepted` | `remote-pending` | `complete`.
      - `locally-accepted` = applicable A + B passed; C coverage not yet obtained. Do **not** report done.
      - `remote-pending` = A/B passed and C coverage obtained (including one green three-gate run whose tree contains this card's final change), but applicable or inherited D is not green. Do **not** report done.
-     - `complete` = A + B passed, C coverage obtained, and applicable or inherited D is green or deferred through the named `EX-*` rule below (or D is `N/A`).
-     - Only path: A/B pass → `locally-accepted` → ER-05 review PASS → obtain C → (`complete` if no D; else `remote-pending` → D green or named `EX-*` deferral → `complete`). A deferral approved after C coverage may move a card from `remote-pending` to `complete`; do not rewrite its historical intermediate state as a green run.
+     - `complete` = A + B passed, C coverage obtained, and applicable or inherited D is green or deferred through the named `EX-*` rule below (or D is `N/A`). G-12's Docker D is an exception to deferral: it must actually succeed.
+     - Only path: A/B pass → `locally-accepted` → ER-05 review PASS → obtain C → (`complete` if no D; else `remote-pending` → D green or named `EX-*` deferral → `complete`). A deferral approved after C coverage may move a card from `remote-pending` to `complete`; do not rewrite its historical intermediate state as a green run. G-12 members remain at most `locally-accepted` until the final point supplies C, and cannot be `done/complete` until its required Docker D succeeds.
    - `Lifecycle=done` requires `Acceptance=complete`. `blocked` must return to `in-progress` before `done`. Plan completion requires every non-deferred card `done`.
 
    **Who runs C:**
-   - Independent release cards and family release-point / `release` cards run the full C set.
-   - `family child` cards do not bump, do not build release artifacts, and do not push. They **inherit** C (and D) from the family's unique release point, whose three-gate run must include the child's final tree.
-   - `no-release` cards (`docs` / `audit` / `spike` / `handoff`) inherit C and D from the carrier release point named on the card. That ID must not be empty. A named D deferral must explicitly cover both the card and its carrier.
+   - Independent cards and G-08 / G-12 versioned `release` points run the full C set.
+   - `family child` and G-12 `plan release child` cards each obtain A/B, ER-05 `PASS`, and a precise local commit. They do not bump, build release artifacts, push a branch or tag, or create a GitHub Release. They **inherit** C and applicable D from their named unique release point, whose final-tree three-gate run must contain all of each child's final changes. G-12 children remain at most `locally-accepted` until the final point supplies C/D.
+   - `no-release` cards (`docs` / `audit` / `spike` / `handoff`) inherit C and D from the carrier release or close-out point named on the card. That ID must not be empty. Under G-12, pre-release no-release artifacts and local commits must be in the versioned point's tested tree; these cards remain locally accepted until it supplies C and the Docker D succeeds, and cannot provide an intermediate push. Strictly post-D evidence-only `docs` / `audit` cards remain `no-release` outside the pre-release `REL-*` group and name the ER-08 terminal evidence-only close-out as their C/D carrier. They cannot retroactively claim coverage by the pre-D tested tree or add product behavior. A named D deferral outside G-12 must explicitly cover both the card and its carrier.
    - There is **no** path that replaces the three gates with a zero-hit guard.
 
    **A — focused surface gates** (one row per production surface you actually changed):
@@ -223,10 +224,12 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
    | HTTP / OpenAPI (`src/api/**`, `src/server/http_server.rs`) | `cargo test -p mega2 --lib 'api::'` + sanitized `/api/openapi.json` from a running server |
    | `src/callisto/**`, `src/jupiter/migration/**` | `migrations()` registration assert + `apply_migrations(&db, true)`; empty `down` ⇒ `Rollback mode = forward-only` |
    | `config/config.toml`, `src/config/**` | `cargo run -p mega2 -- --config config/config.toml config validate`, plus init / `--deny-warnings` / profile / bad-config / no-secret-leak as the change requires |
-   | Git protocol / LFS | Local equivalent of `scripts/git_protocol_smoke.sh`; read current `.github/workflows/git-protocol-smoke.yml` for prelude. Default `config.toml` points at 5432/6379, not the test stack — `source .env.test` or export `MEGA_DATABASE__DB_URL` / `MEGA_REDIS__URL` / `MEGA_BASE_DIR`. Push / tag / LFS need a seeded access token in the URL. LFS evidence requires `MEGA2_GIT_SMOKE_PUSH=1 MEGA2_GIT_SMOKE_LFS=1` and the line `PASS: HTTP LFS push and clone` |
+   | Git protocol / LFS | Local equivalent of `scripts/git_protocol_smoke.sh`; check the current script, service config, and `docker/docker-compose.test.yml` for its prelude; read a workflow job only if it actually runs this matrix. Default `config.toml` points at 5432/6379, not the test stack — `source .env.test` or export `MEGA_DATABASE__DB_URL` / `MEGA_REDIS__URL` / `MEGA_BASE_DIR`. Push / tag / LFS need a seeded access token in the URL. LFS evidence requires `MEGA2_GIT_SMOKE_PUSH=1 MEGA2_GIT_SMOKE_LFS=1` and the line `PASS: HTTP LFS push and clone` |
    | Cedar (`src/contract/policy/**`) | Matching tests + an explicit assert of whether this card changed permit-all / empty `EntityStore` |
    | Repo config and CI (`Cargo.toml` non-version lines, `rustfmt.toml`, compose, `scripts/**`, `.github/workflows/**`) | Local equivalent of the affected job, extracted from the workflow file; non-local bits go to D |
    | Docs / index only | No A gate; B structure-and-link gate only |
+
+   For repo config and CI, read the affected workflow's complete `jobs:` entries, including `on`, `permissions`, `if`, `env`, `run`, `uses`, and `with`. Copy locally reproducible commands into A with their environment and prelude. A local checkout stands in for `actions/checkout`; GitHub runner credentials, remote builds, and registry publication require an actual triggered workflow result in D. Do not keep a fixed workflow-to-command snapshot.
 
    This repo is a **single package** `mega2` (lib `mega2_core`, bins `mega2` and `migrate_local_to_s3`). `-p mega2` is equivalent to omitting it today; still write it so commands stay portable. Focused gates must use `--lib` or `--test <target>`.
 
@@ -234,24 +237,35 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
 
    | Task type | Type gate |
    |---|---|
-   | `implementation` / `migration` / `removal` | No extra type gate (A + C complete acceptance; family children run A + fmt/clippy and inherit C) |
+   | `implementation` / `migration` / `removal` | No extra type gate (A + C complete acceptance; family and G-12 children run their applicable A/B, fmt/clippy, and inherit final-point C). Do not skip a focused test because full C will run later |
    | `docs` / `audit` / `handoff` | Structure and links: product files exist, sections complete, internal links and `file:line` anchors resolve, new `docs/*.md` paths exist, status shows no out-of-scope edits. These types stay no-code / no-config. If code or config is required, reclassify per ER-03 |
    | `spike` | Artifact exists, go/no-go decided, follow-up cards registered; allowlist diff: every change is inside `Deliverables`; zero production-surface edits |
-   | `release` | Aggregate guards for new tests this group introduced + release note / compatibility evidence |
+   | `release` | Versioned release point: aggregate guards for the group's new tests + release note / compatibility evidence. Terminal evidence-only close-out: verify existing version's D evidence, plan status, doc links, and compatibility record; do not create a new version's release note |
 
-   **C — release close-out** (order is mandatory), run by cards that push: ① ER-08 version-face parity precheck → ② bump `Cargo.toml` `version` per `Version increment` and let the toolchain refresh `Cargo.lock` → ③ three `AGENTS.md` gates on the **bumped** tree → ④ `cargo build` and `cargo build --tests` clean; add `cargo build --release -p mega2` if you need a binary → ⑤ `libra add <relevant paths>` and `libra commit -m` → ⑥ `libra push origin main` and confirm the remote ref moved → ⑦ for every actual version bump, create an annotated matching tag on that commit with `libra tag -m "v<version>: <summary>" v<version>` and push it with `libra push origin refs/tags/v<version>` → ⑧ analyze the final diff, write a standard release note manually, and run `gh release create v<version> -R gitmono-dev/mega2 --title "v<version>" --notes-file <release-notes-file>`. The release note must include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations. Do not use `--generate-notes` or any other generated content. Cards with `Version increment=N/A` do not create tags or releases.
+   **C — release close-out** (order is mandatory), run by cards that push: ① ER-08 version-face parity precheck → ② when `Version increment` is not `N/A`, bump `Cargo.toml` `version` accordingly and let the toolchain refresh `Cargo.lock` → ③ three `AGENTS.md` gates on the **final** tree (after bump when applicable) → ④ `cargo build` and `cargo build --tests` clean; add `cargo build --release -p mega2` if you need a binary → ⑤ `libra add <relevant paths>` and `libra commit -s -m` → ⑥ `libra push origin main` and confirm the remote ref moved → ⑦ for every actual version bump, create an annotated matching tag on that commit with `libra tag -m "v<version>: <summary>" v<version>` and push it with `libra push origin refs/tags/v<version>` → ⑧ analyze the final diff, write a standard release note manually, and run `gh release create v<version> -R gitmono-dev/mega2 --title "v<version>" --notes-file <release-notes-file>`. The release note must include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations. Do not use `--generate-notes` or any other generated content. Cards with `Version increment=N/A` do not create tags or releases. For G-12, the unique versioned point runs C after every pre-release member's A/B, review, and local commit is complete; step ③ covers their whole final tree, and steps ⑥–⑧ make the group's sole versioned branch-tip push, matching tag push, and manual GitHub Release.
 
-   **C / D boundary:** C ends at a verified branch push. Everything a remote pipeline produces after that is D. Each D item records workflow file, job name, trigger event and ref, whether `paths:` matches this card, and the predicate.
+   A **terminal evidence-only `release` close-out card** that meets ER-08 sets `Version increment=N/A` and `Release write set=N/A`. C steps ② (version edit), ⑦ (tag), and ⑧ (human-written GitHub Release) do not apply; version-face check ①, the three gates on the final tree ③, builds ④, precise commit ⑤, and branch push ⑥ still apply, with ER-05 review `PASS` before C. Map D by the actual event/ref/path/job; this card's lack of a tag does not waive earlier independent code cards' or family release points' versioned releases and D gates. In G-12 it can run only after the sole versioned point's actual Docker D success. Its later docs/status branch push records post-D evidence; it creates no second version, tag, or GitHub Release and cannot substitute for the versioned point.
 
-   **D — remote post-push:** only when CI semantics cannot be reproduced locally (for example `paths:`-filtered jobs on `push` to `main`, secret-existence checks). If this card's paths hit no workflow filter, D is `N/A`. D does not block `locally-accepted` or ER-05. D green or a named, allowlisted deferral is required for `complete`; a deferred result is never recorded as green. D failure is roll-forward only (new commit / new version), never revert of an already-pushed commit.
+   **C / D boundary:** C includes the verified branch push, the matching tag push when applicable, and the human-written GitHub Release. Remote workflow results triggered by branch, tag, PR, or manual events belong to D, even if a run overlaps the last C steps. Each D item records the workflow file, job name, actual event and ref, the commit at that ref, applicability of `paths:` / `paths-ignore:` and job `if` (record "no filter" when both are absent), and the success predicate.
+
+   **D — remote result gate:** Read each live workflow's `on` event, branch/tag/ref and `paths:` / `paths-ignore:` conditions, plus job `if`, then map them to the card's actual PR, manual dispatch, and branch/tag pushes. **Neither `paths:` nor `paths-ignore:` means no path filter**; file type alone cannot make D `N/A`. Record D=`N/A` only when the actual event/ref triggers no applicable job, with the reason.
+
+   | Actual event and ref (checked 2026-10-09; re-read at execution) | Workflow / job | Path scope and D predicate |
+   |---|---|---|
+   | `pull_request` (record PR and run ref/commit) | `.github/workflows/repository-gates.yml` / `linux` | No path filter; require a successful run when the PR flow actually triggers the job |
+   | Explicit `workflow_dispatch` (record selected ref/commit) | `.github/workflows/repository-gates.yml` / `linux` | No path filter; register only a run that was actually dispatched, not a merely available manual trigger |
+   | `push` to `main` | No matching workflow/job currently | A branch push alone yields no D success; D=`N/A` if no other remote job was actually triggered |
+   | `push` of a version tag matching `v*.*.*` or `v*` (record `refs/tags/v<version>` and its release commit) | `.github/workflows/docker.yml` / `docker` | No path filter; each version-tag push requires a successful remote job, including Docker registry build and push, even for a docs-only change |
+
+   This table records only the checked state; recompute from the live workflow event/ref/path/job conditions whenever they change. D evidence must identify the actual run for this card or its carrier release point. A PR run cannot stand in for the tag's Docker registry gate, and a branch push cannot stand in for an untriggered PR or tag run. D does not block `locally-accepted` or ER-05. D green or a named, allowlisted deferral is required for `complete`, except G-12's version-tag Docker D must be green; a deferred result is never recorded as green. D failure is roll-forward only (new commit / new version), never revert of an already-pushed commit.
 
 5. **ER-05 Review loop:** After implementation and local acceptance, review. Fix findings and re-run acceptance until review says `PASS`. P0/P1 must close. "Residual risk accepted" cannot replace `PASS` except for P2 with a named owner in writing.
 
 6. **ER-06 Docs and compatibility:** Public-behavior cards sync user docs, developer docs, `config/config.toml` samples, the error contract, runtime OpenAPI evidence, and the test matrix.
 
-7. **ER-07 Commit workflow:** Follow `AGENTS.md` and the task-card release rule. Stage related paths only, commit with a scoped message, push the agreed branch. Do not `--force`. If local and remote have diverged, stop and report. After commit, verify the signature / sign-off convention this repo actually uses (do not invent a second convention in the card).
+7. **ER-07 Commit workflow:** Follow `AGENTS.md` "Task card release" and ER-04/ER-08 in this template. Stage related paths only and commit with `libra commit -s -m` and a scoped message. Push the agreed branch at the card's release point; G-08 and G-12 children commit locally without pushing until their unique point. Do not `--force`. If local and remote have diverged, stop and report. After commit, verify the signature / sign-off convention this repo actually uses (do not invent a second convention in the card).
 
-8. **ER-08 Version and release:** The version source of truth is root `Cargo.toml` `version`. After the single-package inline there is **one** version face. On start day, re-count version-face files (`rg -n '^version' Cargo.toml` and `rg -l '^\[package\]' --glob '**/Cargo.toml'`). `Version increment`: `patch` (default) | `minor` | `major` | `N/A`. Breaking public-surface or schema/protocol changes must be `minor` or `major`. After every actual version bump, create and push the matching annotated `v<version>` tag and create a matching GitHub Release with a manually written standard release note. The note must be based on the final diff and include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations; `--generate-notes` is prohibited. Family children and `docs` / `audit` / `spike` / `handoff` cards are `N/A` and do not create tags or releases. Cargo commands use `-p mega2`.
+8. **ER-08 Version and release:** The version source of truth is root `Cargo.toml` `version`. After the single-package inline there is **one** version face. On start day, re-count version-face files (`rg -n '^version' Cargo.toml` and `rg -l '^\[package\]' --glob '**/Cargo.toml'`). `Version increment`: `patch` (default) | `minor` | `major` | `N/A`. Breaking public-surface or schema/protocol changes must be `minor` or `major`. After every actual version bump, create and push the matching annotated `v<version>` tag and create a matching GitHub Release with a manually written standard release note. The note must be based on the final diff and include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations; `--generate-notes` is prohibited. Family children, G-12 `plan release child` cards, and `docs` / `audit` / `spike` / `handoff` cards use `N/A` and do not create tags or releases. A family or G-12 code child inherits its named versioned point; no-release cards name their concrete versioned point or terminal evidence-only carrier. G-12 is allowed only when the whole plan's compatibility audit proves a patch release is sufficient. If a member needs `minor` or `major`, keep the plan blocked until the compatibility design is fixed or the user makes a new version decision; a single-patch instruction does not waive compatibility. A **terminal evidence-only `release` card** may also use `Version increment=N/A` and `Release write set=N/A` only after the existing versions' D results, with an implementation write set limited to evidence, plan status, and index docs and no new product behavior. It cannot be a family or G-12 release point or replace the version bump, tag, GitHub Release, or D gate of an independently released `implementation` / `migration` / `removal` card or a versioned release point. Cargo commands use `-p mega2`.
 
 9. **ER-09 Push failure:** Non-fast-forward: pull/merge, re-accept, then push. Auth, permission, network, or server failures are not blind-retried; record the reason and wait for the next fix/release window.
 
@@ -259,7 +273,7 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
 
 11. **ER-11 Evidence hygiene:** Acceptance evidence must not store secrets, API keys, tokens, PII, unsanitized transcripts, private absolute paths, or raw tool payloads. Public test passwords (`mega2_test_password`, `smtp-test-password`, RustFS `rustfs` / `rustfs_secret`) are still redacted in records.
 
-12. **ER-12 Concurrency vs serial release:** Concurrent work is allowed only in implementation and review, and only when `Implementation write set`s are disjoint (G-10). **Release is always serial and has one publisher:** bump, build, commit, push, and D tracking. Only one card may be in "bumped but not yet pushed" at a time. Do not invent an unverified document lease as a repo lock.
+12. **ER-12 Concurrency vs serial release:** Concurrent work is allowed only in implementation and review, and only when `Implementation write set`s are disjoint (G-10). **Release is always serial and has one publisher:** bump, build, release-point commit, push, and D tracking. Child cards can make their required precise local commits during implementation. Only one card may be in "bumped but not yet pushed" at a time. A G-12 group opens one versioned publication window after all pre-release members' local acceptance, reviews, and commits; no member may publish an intermediate branch tip, tag, or Release. An ER-08 terminal evidence-only branch push may follow the Docker D success without creating another versioned release. Do not invent an unverified document lease as a repo lock.
 
 13. **ER-13 Tests must not leak shared state:** When adding or changing tests, every shared side effect a case creates must be cleaned up before the case ends — above all table creation / seeding / migrations written directly into the shared test PostgreSQL **`public` schema** (i.e. anything not going through `test_db_connection`, which gives each case its own schema), as well as shared Redis, shared object-storage buckets, and fixed-path directories.
     - Background: test connections use a `search_path` that includes `public` (`src/jupiter/tests.rs::database_url_with_search_path`), so any table left in `public` is visible to other cases' unqualified lookups (e.g. `to_regclass`) and causes mass fixture failures on later runs (measured 2026-09-21: 84 stale tables in `public` broke 14 unrelated cases).
@@ -285,11 +299,11 @@ Every dependency outside this plan (other dated plans, external services, human 
 
 ### Release groups and concurrency windows
 
-Default: each card is its own release (G-07). Fill this table only for merged releases or explicit concurrency/serial windows. Registered items must be cited from the card `Release boundary`.
+Default: each card is its own release (G-07). Register an inseparable G-08 family or a user-directed G-12 plan-wide single release here before further member work or any publication; code children and the versioned point cite the `REL-*` ID in `Release boundary`, while no-release carriers name the point in `C/D coverage from`. A G-12 row quotes the named user's directive and date, enumerates the pre-release code and no-release carriers, identifies the unique final patch `release` point, and specifies the no-push window, recovery order, and final-tree C/D coverage. Any post-D ER-08 terminal evidence-only close-out is outside that release group.
 
 | ID | Members | Unique release point | Window rule | Failure rollback order | Why |
 |---|---|---|---|---|---|
-| REL-01 | `<TASK-ID list>` | `<TASK-ID>` | `<e.g. no-push window: children commit locally only>` | `<reverse-deps revert local commits and re-run ER-04>` | `<why this cannot be independent slices>` |
+| REL-01 | `<TASK-ID list or explicit G-12 pre-release scope>` | `<unique versioned release TASK-ID>` | `<children commit locally; no version bump, branch/tag push, or GitHub Release; no interleaved release slice>` | `<before push, reverse dependencies; after push, ER-10 forward fix>` | `<G-08 inseparability or G-12 named user directive and date>` |
 
 **Concurrency statement:** `<groups whose I sets are disjoint / fully serial>` (G-10)
 
@@ -352,18 +366,24 @@ Granularity is the first quality bar. A card that is too large cannot be reviewe
   - Over `M` is L: split by default. Mechanical repo-wide rename/delete/format may take `L-exception:EX-<n>` with a named waiver. `XL` is never a start state. Counting `src/` or repo root as "one landing" is inflation.
 - **G-05 Agent-executable alone:** `Current evidence` has checkable `file:line` anchors. `Acceptance criteria` are self-contained. `Verification` is copy-paste commands. `Dependencies` cite `DEP-*` or task IDs only. No "see above" or "same as the last card". Shared conventions become a GC or an ADR.
 - **G-06 Closed acyclic deps:** In-plan edges use task IDs. Cross-plan and external prelude must be `DEP-*` first. "Wait for Phase N" is a split error. Implementation-order edges and each card's `Dependencies` must match; if they differ, the order section wins and the card is fixed on the spot.
-- **G-07 Release-slice alignment:** Default one card = one release slice. `implementation` / `migration` / `removal` take a full slice. `docs` / `audit` / `spike` / `handoff` are `no-release` and say which commit lands them. `release` cards are the release point. Merged releases are exceptions and must be `REL-*` before start.
+- **G-07 Release-slice alignment:** Default one card = one release slice. `implementation` / `migration` / `removal` take a full slice unless they are predeclared G-08 or G-12 children. `docs` / `audit` / `spike` / `handoff` are `no-release` and say which commit lands them. A `release` card responsible for a version is the release point. The ER-08 terminal evidence-only `release` card submits existing D evidence and docs without serving as a versioned release point. Multi-card releases are allowed only under G-08 (inseparable family) or G-12 (named user-directed whole-plan single release), with a `REL-*` row before further member work. Register and review the dated plan first; revise and bump this template first if normative rules change. A scratch note cannot merge slices.
 - **G-08 Family cards:** When a public-surface delete or a schema+reader pair cannot ship as independent slices, split into children that each review and each pass applicable ER-04 gates and each commit locally, sharing one `release` card as the unique release point. Children: `family child`. Point: `family release point`. Register the no-push window as `REL-*`.
 - **G-09 Split protocol:** The original number stays on the main axis. New children append new numbers. Old card says "split out `<ID>`". New card says "split from `<ID>`". Sync order, DEP, REL, traceability, test matrix, milestones, risks, and one revision-history row.
 - **G-10 Write sets and concurrency:**
   - **I** — code, tests, docs that carry this card's behavior.
-  - **R** — `Cargo.toml` `version` + `Cargo.lock` (or `N/A` for family child / no-release).
+  - **R** — `Cargo.toml` `version` + `Cargo.lock` for an actual versioned release. Use `N/A` for family child / G-12 plan release child / no-release cards and for an ER-08 terminal evidence-only `release` card, which still runs applicable C steps and pushes its evidence/docs without editing the version face.
   - **C** — plan-level release order (ER-12). Not a card field.
   - I–I overlap → no concurrent work (no waiver): add an order edge or merge into one integration card.
   - I–R overlap → the open release window write-locks R files.
   - R–R overlap → serialized by ER-12, not a concurrency ban.
   - Concurrency is judged on `Implementation write set`, not `Files likely touched`.
-- **G-11 Task type:** `implementation` (default) | `migration` (usually `forward-only`) | `removal` (usually a family) | `spike` (no production code; time-box S ≤ 0.5 person-day, M ≤ 2) | `audit` / `docs` (product-file or person-day caps) | `release` | `handoff` (`no-release`; incoming/outgoing in the DEP table).
+- **G-11 Task type:** `implementation` (default) | `migration` (usually `forward-only`) | `removal` (usually a family) | `spike` (no production code; time-box S ≤ 0.5 person-day, M ≤ 2) | `audit` / `docs` (product-file or person-day caps) | `release` (normally a versioned point; only an ER-08 terminal evidence close-out may omit a new version, and it adds no product behavior) | `handoff` (`no-release`; incoming/outgoing in the DEP table).
+- **G-12 User-directed whole-plan single patch release:** Only a named user's explicit instruction for this plan may move its versioned publication to one final patch release. The G-07 per-card default and G-08 inseparable-family rule continue to govern other plans.
+  - Before further member work or any publication under this boundary, register a `REL-*` row with the user's exact instruction and date, every pre-release code child and no-release carrier, the unique final versioned `Task type=release` point, the full no-push window, recovery order, and final-tree C/D coverage. The dependency DAG must place the point after all pre-release members. Record the normative change in revision history and obtain plan review `PASS`. If the directive arrives after some local work, record the boundary change and recheck those edits for A/B, review, precise local commits, and absence of publication; missing gates cannot be accepted retroactively. New or split cards require an updated row and G-09 synchronization before work resumes.
+  - Every `implementation` / `migration` / `removal` child retains its own G-01–G-06 and G-09–G-11 checks, ER-04 A/B focused and type gates, ER-05 `PASS`, and a precise **local** `libra commit -s`. Set `Release boundary=plan release child of REL-<n>`, `Version increment=N/A`, `Release write set=N/A`, and `C/D coverage from=<unique point ID>`. Its reviewed, locally accepted output may feed dependent local cards; do not claim remote availability. No child may edit the version face, build release artifacts, push the plan's branch or version tag, create a GitHub Release, or trigger the versioned Docker publication. A temporary push to a real private test repository is allowed only when a focused test requires it and its cleanup contract applies; it is not a versioned publication.
+  - Pre-release `docs` / `audit` / `spike` / `handoff` cards remain `no-release`, name the same point in `C/D coverage from`, and put their reviewed, locally accepted artifacts and precise local commits into that point's tested tree. Strictly post-D evidence-only `docs` / `audit` cards are outside the pre-release `REL-*` group; they remain `no-release`, name the post-D ER-08 terminal evidence-only `release` close-out as their C/D carrier, and cannot retroactively claim inclusion in the pre-D tested tree or introduce product behavior. That close-out may make a later docs/status branch push only after the sole versioned point's Docker D succeeds and never creates another version, tag, or GitHub Release.
+  - Before the unique `plan release point of REL-<n>` executes, every pre-release member must have its A/B, review, and local commit evidence and a compatibility audit proving patch is sufficient. The point alone bumps patch once and executes full ER-04 C on the final tree containing every member's work, including the three gates after the bump, clean builds, precise commit, the group's sole versioned branch-tip push, matching annotated tag push, and one manually written GitHub Release. Its actual version-tag Docker D must succeed; the generic `EX-*` D deferral does not apply to this gate. Members inherit C/D from that point and cannot be `done/complete` before Docker succeeds.
+  - No focused test, full three-gate check, build, review, ER-13 test cleanup, or compatibility gate is waived. If any member needs `minor` / `major`, must be remotely published before the final point, or the final tree's C/D fails, block the group and revise the plan or repair forward under ER-03/ER-10. Before publication, recover local commits in reverse dependency order; after publication, use ER-10 forward repair. No other release slice may be inserted into the no-push window.
 
 #### Recommended split dimensions
 
@@ -389,7 +409,8 @@ Granularity is the first quality bar. A card that is too large cannot be reviewe
 | Dangling dependency | "Phase N done" or free-text external prelude | Converge to task IDs / `DEP-*` (G-06) |
 | Fake rollback | already pushed or migrated, still "one revert" | Choose `forward-only` / `compensating` / `immutable-release` |
 | Concurrent collision | two independent cards share I | Order edge or merge (G-10, no waiver) |
-| Drive-by merge | several cards released as one from a scratch note | Register `REL-*` or split back (G-07/G-08) |
+| Drive-by merge | several cards released as one from a scratch note | Register an eligible G-08 or G-12 `REL-*` before start, or split back into independent releases |
+| Early plan-wide publication | a G-12 member bumps, pushes, tags, creates a Release, or marks `done` before final Docker D | Block the group and record the actual remote state; use ER-10 forward recovery for any push and re-review the release boundary. A false `done` returns to the factual acceptance state |
 
 #### Field defaults and exceptions
 
@@ -410,14 +431,14 @@ After this section declares defaults, cards may omit fields that take the defaul
 | `<ID>` | `<Rollback mode>` | `<forward-only: existing down is empty>` |
 | `<ID>` | `<Docs and compatibility impact>` | `<dev docs only>` |
 
-**Rule waivers (`EX-*`, named approval).** Only these four rules may be waived. `G-01`, `G-02`, `G-05`–`G-11` are **never** waivable.
+**Rule waivers (`EX-*`, named approval).** Only these four rules may be waived. `G-01`, `G-02`, `G-05`–`G-12` are **never** waivable; G-12 is a predeclared release-boundary rule, not an `EX-*` waiver of the other granularity rules.
 
 | Waivable | Allowed reasons |
 |---|---|
 | G-03 item cap | Checklist products (docs / audit / index) truly need more items, with a file list |
 | G-04 size cap (`L-exception`) | Mechanical: repo-wide rename, bulk delete, format |
 | ER-07 signing | Named repo-policy exception (sign-off-only) |
-| ER-04 D completion evidence | Remote CI minutes exhausted or external runner unavailable; require named approval by the user or a maintainer, never self-approval by the publisher, workflow/job/ref scope per card, and a `DEFER-*` debt item with restart condition. Only D may be deferred: A/B/C, local three gates, ER-05 review (plus independent review where required), commit, tag, and human-written GitHub Release remain mandatory. Later remote failure requires an ER-10 forward fix |
+| ER-04 D completion evidence | Remote CI minutes exhausted or external runner unavailable; require named approval by the user or a maintainer, never self-approval by the publisher, workflow/job/ref scope per card, and a `DEFER-*` debt item with restart condition. Only D may be deferred: A/B/C, local three gates, ER-05 review (plus independent review where required), commit, tag, and human-written GitHub Release remain mandatory. A G-12 group's required version-tag Docker success cannot be deferred under the user's single-release instruction. Later remote failure requires an ER-10 forward fix |
 
 | Exception ID | Task (or `ALL/<scope>`) | Waived rule | Reason and compensation | Approver | Review round | Evidence | Expires |
 |---|---|---|---|---|---|---|---|
@@ -429,7 +450,7 @@ Fill after the plan is written and after every normative edit. Any failing colum
 
 | Task | type | axis | recovery | complete | self-contained | AC | VER | landing / prod-files | scope | deps | writeset | release | split-from | exception |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `<ID>` | `<Task type>` | `<axis>` | `<recovery>` | `<yes>` | `<yes>` | `<n/cap[@EX-ID]>` | `<n/cap[@EX-ID]>` | `<n>/<n>` | `<S/M/L-exception:EX-n>` | `<TASK-ID/DEP-ID/none>` | `<no-overlap/serialized-on ID>` | `<independent/REL-n child/REL-n point/no-release>` | `<ID/N/A>` | `<EX-ID/N/A>` |
+| `<ID>` | `<Task type>` | `<axis>` | `<recovery>` | `<yes>` | `<yes>` | `<n/cap[@EX-ID]>` | `<n/cap[@EX-ID]>` | `<n>/<n>` | `<S/M/L-exception:EX-n>` | `<TASK-ID/DEP-ID/none>` | `<no-overlap/serialized-on ID>` | `<independent/REL-n family child/REL-n family point/REL-n plan child/REL-n plan point/no-release>` | `<ID/N/A>` | `<EX-ID/N/A>` |
 
 #### Verification judgment
 
@@ -486,7 +507,7 @@ fi
 
 **Implementation write set:** `<files or dirs that carry this card. Concurrency is judged only here.>` (G-10)
 
-**Release write set:** `<Inherited (= Cargo.toml version + Cargo.lock) / N/A>` 
+**Release write set:** `<Inherited (= Cargo.toml version + Cargo.lock) / N/A (family child / plan release child / no-release / ER-08 terminal evidence-only release)>`
 
 **Files likely touched:** `<src/...>, <tests/...>, <config/...>, <docs/...>` (estimate)
 
@@ -502,15 +523,15 @@ fi
 
 **Estimated scope:** `<S / M / L-exception:EX-<n>>` (G-04)
 
-**Version increment:** `<patch | minor | major | N/A>` (ER-08)
+**Version increment:** `<patch | minor | major | N/A (only for ER-08-eligible cards, including G-12 plan release child and terminal evidence-only release)>` (ER-08; G-12 final point is `patch`)
 
-**Release boundary:** `<independent | family child of REL-<n> (k/n) | family release point of REL-<n> | no-release>` (G-07)
+**Release boundary:** `<independent (also for terminal evidence-only release) | family child of REL-<n> (k/n) | family release point of REL-<n> | plan release child of REL-<n> | plan release point of REL-<n> | no-release>` (G-07/G-08/G-12; merged releases require a predeclared `REL-*` row)
 
-**C/D coverage from:** `<self | <TASK-ID>>` (ER-04; family child and no-release must name an ID)
+**C/D coverage from:** `<self | <TASK-ID>>` (ER-04; family child and G-12 plan release child name their concrete versioned point; pre-release no-release names that point, while strictly post-D evidence-only `docs` / `audit` names its ER-08 terminal close-out carrier)
 
-**Granularity:** `type=<Task type>; axis=<single axis>; recovery=<one recovery action and coherent post-state>; complete=<yes>; self-contained=<yes>; AC=<n>/<cap>[@EX-ID]; VER=<n>/<cap>[@EX-ID]; landing=<n>; prod-files=<n>; scope=<S|M|L-exception:EX-n>; deps=<none|TASK-ID,…|DEP-ID,…>; writeset=<no-overlap|serialized-on TASK-ID>; release=<independent|REL-n child|REL-n point|no-release>; split-from=<TASK-ID|N/A>; exception=<EX-ID[,…]|N/A>`
+**Granularity:** `type=<Task type>; axis=<single axis>; recovery=<one recovery action and coherent post-state>; complete=<yes>; self-contained=<yes>; AC=<n>/<cap>[@EX-ID]; VER=<n>/<cap>[@EX-ID]; landing=<n>; prod-files=<n>; scope=<S|M|L-exception:EX-n>; deps=<none|TASK-ID,…|DEP-ID,…>; writeset=<no-overlap|serialized-on TASK-ID>; release=<independent|REL-n family child|REL-n family point|REL-n plan child|REL-n plan point|no-release>; split-from=<TASK-ID|N/A>; exception=<EX-ID[,…]|N/A>`
 
-Mapping: `type`→G-11, `axis`/`recovery`→G-01, `complete`→G-02, `AC`/`VER`→G-03 (caps 8 / 12 / 20 by type; ER-04 does not count), `landing`/`prod-files`/`scope`→G-04, `self-contained`→G-05, `deps`→G-06, `release`→G-07/G-08, `split-from`→G-09, `writeset`→G-10, `exception`→registered `EX-*`. If you cannot fill this line, the card is not split cleanly.
+Mapping: `type`→G-11, `axis`/`recovery`→G-01, `complete`→G-02, `AC`/`VER`→G-03 (caps 8 / 12 / 20 by type; ER-04 does not count), `landing`/`prod-files`/`scope`→G-04, `self-contained`→G-05, `deps`→G-06, `release`→G-07/G-08/G-12, `split-from`→G-09, `writeset`→G-10, `exception`→registered `EX-*`. If you cannot fill this line, the card is not split cleanly.
 
 ## Test matrix
 
@@ -588,13 +609,13 @@ Result is only `PASS` or `FAIL`. `FAIL` must list P0/P1 and close them next roun
 
 The plan is complete only when all of the following hold:
 
-- [ ] Every card satisfies `G-*`: no unregistered L exception, no XL card, no fragment cards, no unregistered merged release, I-set conflicts resolved; granularity audit table filled.
+- [ ] Every card satisfies `G-*`: no unregistered L exception, no XL card, no fragment cards, no unregistered merged release, I-set conflicts resolved; granularity audit table filled. A G-12 plan has a dated named-user directive, complete `REL-*` membership, and one final patch release point.
 - [ ] Every non-deferred card has met acceptance **and** `Lifecycle=done` **and** `Acceptance=complete` (ER-04). `remote-pending` cards must first get green D or a named, allowlisted `EX-*` deferral with registered `DEFER-*` debt. `blocked` cards must unblock or become `DEFER-*`.
 - [ ] Every card's Verification commands have been run and recorded.
 - [ ] **Plan completion gates:** `cargo +nightly fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `source .env.test && cargo test --all` all green; `cargo build` and `cargo build --tests` 0 errors / 0 warnings; no new crate-level `#[allow(...)]`.
 - [ ] Required docs / config / error contract / test-matrix updates are done.
 - [ ] Required migration, rollback, and failure-recovery checks are done; each card's `Rollback mode` was actually proven or recorded as unprovable.
 - [ ] Final review is `PASS`; all P0/P1 closed; only named P2 residual risk remains.
-- [ ] Every actual version bump has a consistent version face, build / commit / push evidence, a pushed matching `v<version>` tag, and a matching GitHub Release created through `gh` with a manually written standard release note; no generated notes were used.
+- [ ] Every actual version bump has a consistent version face, build / commit / push evidence, a pushed matching `v<version>` tag, and a matching GitHub Release created through `gh` with a manually written standard release note; no generated notes were used. For G-12, exactly one patch bump and one versioned branch-tip/tag/Release publication cover all pre-release locally committed members, and the actual version-tag Docker D run succeeded before any member became `done/complete`. A later ER-08 evidence-only docs/status branch push has no version increment, tag, or GitHub Release.
 - [ ] Revision history records every post-draft normative change (G-09).
 - [ ] Related `plan-long.md` PT/SB status or dated-plan index is synced, or `N/A`.

@@ -124,6 +124,8 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已实现；**身份键迁移**已由 [`plan-20260812.md`](plan-20260812.md) UN-05 handoff 移交本 PT（DEP-04 outgoing，实际移交 **2026-08-17**；DEFER-UN-04 八项承接约束）；Mega #2145 账户审批、#2147 Cedar 管理及 #2165..#2169 的 identity/Cedar reviewer 域扩大全量 moon↔`apps/next-app` 对照范围；monoui `mega2` 分支 pin 须执行期确认；全量对照仍候选 | monoui `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW）；handoff [`plan-20260812.md`](plan-20260812.md) UN-05/DEP-04 | 2026-08-17 |
 | PT-13 | storage-only 统一推送密文（同一 `[[git.push_tokens]]` 用于 HTTP 与 SSH receive-pack） | P1 | 候选 | 查找与身份已统一：HTTP 写 / SSH 读共用 `lookup_push_token`。SSH **写**仍被 TP-20 关掉（`DEFER-SP-02`）。本方案在 `push_auth=token` 下显式打开 SSH receive-pack，不新开第二套凭据，也不把 `none` 的匿名写扩到 SSH | N/A（mega2 原生） | 前置事实 [`plan-20260905.md`](plan-20260905.md) TP-20、[`plan-20260908.md`](plan-20260908.md) SP-* / `DEFER-SP-02`；尚无承接日期计划 | 2026-09-16 |
 | PT-14 | trunk 历史只读投影视图 | P0 | 实施中 | P0 已由 [`plan-20261002.md`](plan-20261002.md) 交付；长期剩余：DEFER-HP-01、DEFER-HP-02、DEFER-HP-03、DEFER-HP-04、DEFER-HP-05、DEFER-HP-06、DEFER-HP-07、DEFER-HP-08、DEFER-HP-09、DEFER-HP-10、DEFER-HP-11、DEFER-HP-12、DEFER-HP-13、DEFER-HP-14、DEFER-HP-19。Docker 远端结果独立由 DEFER-HP-20 承接 | N/A（mega2 原生） | [`plan-20261002.md`](plan-20261002.md)（P0）；P1 尚无承接日期计划 | 2026-10-08 |
+| PT-15 | `v0.42.25` Docker 镜像按原提交精确补发 | P1 | 已验证（待排期） | 历史 Docker run 失败，版本镜像缺失；只补不可变的 `v0.42.25` / `0.42.25` 标签，不改 `latest`、不把旧 run 写成成功。接收 [`plan-20260920.md`](plan-20260920.md) 的 `DEFER-OX-02`；与 PT-14 的全部历史 D 结果债务 `DEFER-HP-20` 分开核对 | N/A（mega2 原生发布债务） | [`plan-20260920.md`](plan-20260920.md)（outgoing `DEFER-OX-02`；本计划仅验证新 tag 的 D 门）；补发执行尚无日期计划 | 2026-10-09 |
+| PT-16 | 外部 AI operator 实际接收与执行 | P1 | 候选（待指定目标） | 本仓只交付 Q7 status 拉取 / 具名命令接口及 fake-client 回环；真实 AI 目标的身份、接收、决策、执行与审计仍无证据。接收 [`plan-20260920.md`](plan-20260920.md) 的 `DEFER-OX-03` | N/A（mega2 原生集成） | [`plan-20260920.md`](plan-20260920.md)（outgoing `DEFER-OX-03`；OX-56/53 本地交接）；外部集成尚无日期计划 | 2026-10-09 |
 
 ## 工程安全基线
 
@@ -743,6 +745,48 @@ P0 已交付过滤器代数（`src/ceres/view/filter/`）、ViewRepo（`src/cere
 
 依赖已交付的 trunk 根写入与协议分层；Libra smoke 消费 [`plan-20261001.md`](plan-20261001.md) 的 harness。P0 按日期计划的依赖图实施，P1–P3 在 P0 有运行证据后另立计划。
 
+## PT-15：`v0.42.25` Docker 镜像按原提交精确补发
+
+mega2 原生发布债务，Mega 证据为 `N/A`。**接收登记日期：2026-10-09**；来源为 [`plan-20260920.md`](plan-20260920.md) 的 `DEFER-OX-02`，接收 owner 角色为 **mega2 发布维护者**。登记接收只明确长期归属，不表示旧镜像已补发，也不解除源计划对 open 债务的审计。
+
+### 现状缺口与边界
+
+`v0.42.25` 有 Git tag 与非草稿 GitHub Release；2026-10-09 核对的 [Docker run `37704534619`](https://github.com/gitmono-dev/mega2/actions/runs/37704534619) 为失败，Docker Hub 尚无该版本镜像。该 run 的 `headSha` 为 `4b645af3035f8186f0ffdab3e39754667959afe0`；远端 `refs/tags/v0.42.25` 是注解标签对象，执行时必须重新解析 `v0.42.25^{}` 并与源提交和 Release 对照。[`plan-20260920.md`](plan-20260920.md) 的 FIX-OX-01 和后续 OX 卡验证**新 tag** 的 Docker D 门，不补旧版本，也不改变旧 run 的结论。PT-14 的 `DEFER-HP-20` 涵盖更多历史版本的远端结果，不能因本 PT 补一个镜像而整体关闭。
+
+### 重启条件与最小切入点
+
+- 发布维护者持有可核验的旧 tag、注解标签到提交的解析记录、Docker Hub 发布权限，以及只操作精确版本标签的独立补发流程；先确认目标标签不存在或已有 digest 可安全核对，遇到来源冲突即停止。
+- 另立发布日期计划，pin `v0.42.25^{}` 的提交 SHA，从该提交树分别构建 `linux/amd64`、`linux/arm64`，记录构建 run、每架构 digest 与最终 manifest。补发流程不能由旧 tag 重跑时顺带更新 `latest`、minor channel 或其它可变标签，也不能重写 Git tag。
+
+### 本计划之外的完成判据
+
+两个版本标签 `genedna/mega2:v0.42.25` 与 `genedna/mega2:0.42.25` 解析到同一双架构 manifest，其 amd64/arm64 构建均可追溯到**同一个已核对的旧源提交**；`latest` 和其它可变标签在补发前后 digest 不变。新补发记录和 Release 注记分别链接旧失败 run、新构建/推送 run、源 SHA 与 manifest digest，并明确旧 run 仍为失败。只有这些远端证据齐备，接收方才可关闭 `DEFER-OX-02`；本 PT 不把补发计作任何 OX 卡的新 tag D 成功。
+
+### 无人承接时的回落
+
+若发布维护者未立项或发布权限不可用，`DEFER-OX-02` 保持 open；[`plan-20260920.md`](plan-20260920.md) 维护者在每次后续 release 审核中继续标注旧镜像缺口，PT-15 保持待排期。不得以新的 `latest` 镜像、一次本地 build 或旧失败 run 冒充补发完成。
+
+## PT-16：外部 AI operator 实际接收与执行
+
+mega2 原生外部集成，Mega 证据为 `N/A`。**接收登记日期：2026-10-09**；来源为 [`plan-20260920.md`](plan-20260920.md) 的 `DEFER-OX-03`，接收 owner 角色为 **mega2 AI 集成维护者**。登记接收只确定后续验证归属，真实目标尚未选定，也无外部执行证据。
+
+### 现状缺口与边界
+
+当前日期计划的 Q7 交付边界是具名 operator token、脱敏 `GET /api/v1/github-sync/bindings/{id}/status`、带 expected tips 的 `cursor-reset` / 独立 scope 的 `force` 命令，以及 OX-56/53 的 fake-client 本地回环。状态中的 remote tip 是附 `observed_at` 的最近观察值，不是实时 GitHub 保证；系统不会把 AI 文本、GitHub 侧 merge 或 `storage_events` best-effort 通知视作自动解 park。外部 AI 目标的选型、真实拉取、决策与命令执行不在 OX 卡的验收内。
+
+### 重启条件与最小切入点
+
+- 指定真实 AI 目标、运行 owner、专用具名身份与最小 operator scope，确认带外 GitHub 分歧处理的责任方及审计留存位置；缺任一项不开始真实命令验证。
+- 在独立测试 binding 上先由目标拉取 Q7 status，理解 `parked` 原因、`observed_at` 与 CAS generation；经责任方在 GitHub 带外对齐后，目标再带 expected local/remote tips 调用安全的 `cursor-reset`。`force` 必须是另行授权的显式决定，不能由模型文本或状态轮询自动触发。
+
+### 本计划之外的完成判据
+
+后续日期计划记录真实目标的脱敏身份与读取时间、status 内容的关联 ID、分歧处置决定、带 expected tips 的一次成功命令及命令审计记录；同时证明旧 tips 返回 409、缺少命令或 force scope 返回 403，且没有凭据、原始 pack 或敏感 URL 泄露。目标运行日志与 mega2 状态转换可按 binding/generation 对照，确认结果来自真实目标而非 OX-53 fake client。证据齐备后接收方方可关闭 `DEFER-OX-03`；本地接口或回环通过本身只证明日期计划的边界。
+
+### 无人承接时的回落
+
+若无真实目标或具名维护者接手，`DEFER-OX-03` 保持 open，源计划维护者继续维持 Q7 接口和 fake-client 的已验证边界，禁止写“AI 已收到/已执行”。分歧仍按人工 operator 流程处理，绝不因外部集成空缺自动 force 或放宽鉴权。
+
 ---
 
 ## 实施顺序
@@ -798,6 +842,10 @@ PT-13 不进入 Mega 移植阶段。前置事实（HTTP token 写、SSH token �
 
 PT-14 的 P0 已按 [`plan-20261002.md`](plan-20261002.md) 收口。下一动作是依据真实使用与 HP-24 基准结果为 P1 立项日期计划，再逐项审定 P2–P3 延后能力。
 
+### 持续轨道：旧版本 Docker 补发与外部 AI operator
+
+PT-15 仅在精确旧源提交、版本标签隔离流程和发布权限齐备后另立补发计划；PT-16 仅在真实 AI 目标、具名身份与带外处理 owner 落定后另立集成验证计划。两项接收登记均不减少 [`plan-20260920.md`](plan-20260920.md) 对**新版本 Docker D 门**及 Q7 本地接口/fake-client 的完成义务。
+
 ## 依赖图
 
 ```mermaid
@@ -816,6 +864,8 @@ flowchart TD
     PT12[PT-12 前端与账户一致性]
     PT13[PT-13 storage-only 统一推送密文]
     PT14[PT-14 trunk 历史只读投影]
+    PT15[PT-15 v0.42.25 Docker 精确补发]
+    PT16[PT-16 外部 AI operator 实际执行]
 
     PT01 --> PT04
     PT01 --> PT06
@@ -834,6 +884,8 @@ flowchart TD
     PT11 --> PT09
     PT13
     PT14
+    PT15
+    PT16
 ```
 
 ## 跨功能验收门禁
@@ -909,7 +961,7 @@ flowchart TD
 | [`plan-20260918.md`](plan-20260918.md) | N/A（文件删移与 Tag 契约跟进；非 Mega PT，不新增 PT 编号） | **已完成**（FT-01..FT-09 全部 done/complete；FT-02 → v0.10.45、FT-03 → v0.10.46、FT-04 → v0.11.0、FT-05 → v0.11.1、FT-06 → v0.11.2、FT-07 → v0.11.3；FT-04 起每次 bump 均有同名 tag 与手写 GitHub Release。FT-02/03 各自 tag 的 docker job 因 #13 `mst2-codec` path-dep 红，前滚 FIX 由 v0.11.0 job `35258572677` 证明） | 既有 `POST /api/v1/delete-entry` / `POST /api/v1/move-entry` 扩 `is_directory`（默认 true=目录；`false`=Blob/BlobExecutable）；`GET /api/v1/tags/list` 为唯一 list（必填 `page`/`per_page`/`path`，POST 405，`per_page=0`→400）；`GET|DELETE /api/v1/tags/{name}?path=` 与 `mega_tag.path` 迁移，查找键 `(path, name)`；契约页「Libra pin」重钉 v0.11.3。关闭 60917 `DEFER-LB-01/02/03` 与 `DEFER-LB-11` 隔离面（覆写 DEFER-LB-02 双方法窗口为 GET-only）。不覆盖：tag `target` commit 归属（DEFER-FT-02 / DEFER-LB-11 剩余面）、空目录-only 删除（DEFER-LB-04）、`search_tree_for_update` 类型化 400（DEFER-LB-07）、README 产品写列表（DEFER-LB-08）、SQL `/` 边界（DEFER-LB-09）、读 tree 与落地窗口（DEFER-LB-10）、blob/LFS/Media GC（DEFER-FT-01）、Libra 客户端（DEP-FT-01 outgoing） |
 | [`plan-20260919.md`](plan-20260919.md) | PT-09 / SB-02（出站拆除切片） | **已完成**（RM-01..RM-04；末卡文档；crate 停在 `0.38.1` / `eaaa59c`） | 本仓出站只留 `[notification.webhook]`（外加无关的 `[storage_events]`）。拆除 website-mail / Slack / in-app inbox / locale / 协作 UI（评论改删与 emoji、评审、labels/assignees、CLA）。不实现 PT-09 剩余的 build 触发器 / 次渠道 retry / 多实例矩阵。不改 website frontend。 |
 | [`plan-20260916.md`](plan-20260916.md) | N/A（monorepo 路径 → GitHub 出站基础设施；非 Mega PT） | **已完成（2026-09-20）** | 24 张活动卡 `done`/`complete`；Q1–Q8 全 go。执行链路移交 [`plan-20260920.md`](plan-20260920.md)。`DEP-02` 已关闭（模板改回 Libra）。 |
-| [`plan-20260920.md`](plan-20260920.md) | N/A（出站同步执行；承接 60916 `DEP-01`） | **新建（0 实现）** | OX-01..05 `pending`：worker / reported pack / operator / `vault_create_once`。不改直播 ACK。 |
+| [`plan-20260920.md`](plan-20260920.md) | N/A（出站同步执行；承接 60916 `DEP-01`）；outgoing `DEFER-OX-02` → PT-15、`DEFER-OX-03` → PT-16 | **设计修订中，任务验收未完成** | OX 任务交付 outbox/worker/reported pack、Q7 operator 接口与 fake-client、GitHub live 门及新 tag 的 Docker D 证据；旧 `v0.42.25` 镜像精确补发和外部 AI 实际执行由 PT-15/16 独立接收，均保持 open。不改直播 ACK。 |
 | [`plan-20260923.md`](plan-20260923.md) | N/A（首次使用路径策略与 ImportRepo 生命周期；非 Mega PT，不新增 PT 编号） | **已完成**（FU-01..FU-23 全部 done/complete，收口 v0.40.12 / `4bf6cc2`；「计划完成门」于 2026-09-26 在 v0.40.13 最终树补跑通过） | GitHub issues #25–#29：#25/#29 路径策略与开通（`root_dirs` / `import_dir` 形状校验、路径策略错误域、首推策略、`mega2 path provision`）；#28 合成 commit 签名头与帧；#26 ImportRepo 增量推送（ref CAS、只写 ref 的更新、存量别名路径规范化）；#27 ImportRepo 清理（台账、原子 detach、元数据清扫、写路径存活栅栏、`POST /api/v1/import-repo/remove`、运维 CLI `mega2 import-repo remove`）。长期剩余见该计划 `DEFER-FU-*`（无对象 GC、SIGTERM 等信号、类型化可重试错误、无分支存量挂载等）。 |
 | [`plan-20261002.md`](plan-20261002.md) | PT-14（trunk 历史只读投影 P0） | **已完成** | 36 张任务卡已完成；34 个独立版本均有 tag 与非草稿 GitHub Release；六张卡的历史 Docker D 组绿灯保留，其余 29 张发布卡依 `EX-HP-01` 延期，Docker 发布不作为本计划完成证据；P1–P3 留在 PT-14。 |
 

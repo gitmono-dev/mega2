@@ -536,7 +536,7 @@ async fn actual_q_body_callers_recheck_only_returned_current_file_facts() {
         fixture.send("GET", "blob?path=/file", Body::empty()).await,
         503,
         "METADATA_NOT_READY",
-        false,
+        true,
     )
     .await;
     fixture.counts.assert(0, 0);

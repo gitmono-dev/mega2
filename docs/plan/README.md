@@ -18,8 +18,8 @@
 
 | 文件 | 类型 | 状态 |
 |---|---|---|
-| `plan-template.md` | 模板（中文规范原文） | v2.2（2026-10-08；ER-04 D 组具名延期白名单） |
-| `plan-template.en.md` | 模板（English contributor edition） | v2.2；与中文原文同结构，冲突以中文为准 |
+| `plan-template.md` | 模板（中文规范原文） | v2.4（2026-10-09；保留现场 workflow D 组判定与具名延期白名单；G-12 允许用户明确指定的计划级单次末尾发布） |
+| `plan-template.en.md` | 模板（English contributor edition） | v2.4；与中文原文同结构，冲突以中文为准 |
 | `plan-long.md` | 长期能力 | 当前（2026-07-27 首版 Mega 移植路线图；2026-09-16 起含 mega2 原生 **PT-13** 统一推送密文） |
 | `plan-20260727.md` | 日期计划 | 已完成（承接 PT-01 集成测试基建） |
 | `plan-20260731.md` | 日期计划 | 已完成（Website 用户系统接入 + chat/notes 整栈退场 + next-app compose 同栈 IT + 本仓邮件退场改接 website；AU-* / RM-* / ITW-* / MN-* / DOC-01 / REL-01）。**DEP-06 已由 `plan-20260802.md` 关闭** |
@@ -45,7 +45,7 @@
 | [`plan-20260913.md`](plan-20260913.md) | 日期计划 | **已完成**（mega2 FastCDC Media 效果对齐：MF-00..MF-08 全部 `done/complete`；MF-06 发布 `v0.40.10`，MF-05 真 interop 发布 `v0.40.14` / `5bc365a`；用户授权跳过双 review；`DEFER-MF-01` 延后）。与 `../../../libra` 的 `plan-20260913.md` 为**对偶双仓计划**，共享表与 C-01..C-08 逐字一致；跨仓 DAG `MF-06 → FL-06 → FL-03 → FL-04 → MF-05 → FL-05`，`DEP-MF-01` 已满足（两条真实 interop 已执行通过，pin `8c870c4` / VER 2/2） |
 | [`plan-20260916.md`](plan-20260916.md) | 日期计划 | **已完成（2026-09-20）**（24 张活动卡全部 `done`/`complete`；五张 spike 全 go；执行链路移交 [`plan-20260920.md`](plan-20260920.md)。`DEP-02` 已关闭：模板 GC-12 / ER-07 改回 Libra） |
 | [`plan-20260919.md`](plan-20260919.md) | 日期计划 | **已收口**（mega2 通知出站与协作 UI 拆除：RM-01..RM-04 全部落地；crate 停在 `0.38.1`；跳过 Codex/Claude 双评（配额耗尽））。本行由 `plan-status.md` 建档补登 |
-| [`plan-20260920.md`](plan-20260920.md) | 日期计划 | **新建（设计稿，0 实现）**（承接 60916 `DEP-01`：出站 worker / 游标 / reported pack / operator 表面 / `vault_create_once`。OX-01..OX-05 全部 `pending`。不改直播 clone/fetch ACK）。**2026-10-08 起 `DEFER-GS-08` 已纳入本计划为 OX-06（live GitHub 验收，用 `MEGA_TEST_GITHUB_TOKEN`/`MEGA_TEST_GITHUB_NAMESPACE`）**。**本仓唯一未实现的日期计划** |
+| [`plan-20260920.md`](plan-20260920.md) | 日期计划 | **M0 计划复审中，任务尚未开工**（306 张卡均 `pending`；最新 Claude Code R24 审计对计划 SHA `8109d374ee3420414542bd1d7a09f4302050a5000027c8e242186b76020089c6` 返回 literal `VERDICT: PASS`；报告记录 3 项 non-blocking P3 后续修订。306 张卡仍 pending，先完成 M0 本地签名 checkpoint 与 clean clone，再开 FIX-OX-08；唯一末尾发布者仍为 OX-284；承接 60916 `DEP-01` 与 `DEFER-GS-08`：出站 worker / 游标 / reported pack / operator 表面 / `vault_create_once`，以及 OX-24 独立新仓首推、OX-06 新仓同 run 双推与清理两项 live 验收；不改直播 clone/fetch ACK）。按用户 2026-10-09 指令启用 G-12：前驱卡只做本地验收、审查和精确提交，唯一 OX-284 在计划末尾递增并发布一个 patch；其 tag 的 Docker D 必须实际成功。任务状态与卡号以计划正文为准。 |
 | [`plan-20260921.md`](plan-20260921.md) | 日期计划 | **已落地**（Artifacts API 挂载 storage-only：AR-01 storage-only 挂载 + 写鉴权门控、AR-02 进程级黑盒、AR-03 README 收口 + 门禁均已实现；fmt/clippy/test 全绿）。本行由 `plan-status.md` 建档补登 |
 | [`plan-20260923.md`](plan-20260923.md) | 日期计划 | **已完成**（GitHub issues #25–#29：首次使用路径策略与开通、ImportRepo 增量推送与清理、合成 commit 签名头与帧；FU-01..FU-23 全部 done/complete，收口 **v0.40.12** / `4bf6cc2`，D 组绿（其中 v0.40.10 属 `plan-20260913`）；「计划完成门」于 2026-09-26 在 v0.40.13 最终树补跑通过（macOS `ld` 链接提示按用户决定视为平台噪音）；计划评审 Codex R22 PASS） |
 | [`plan-20260917.md`](plan-20260917.md) | 日期计划 | **已完成**（补全 Libra `mega2 browser` 所需产品 HTTP。**LB-01..LB-07 全部 done/complete**：契约页（LB-01）、`POST /api/v1/delete-entry`（LB-02，v0.10.41）、`POST /api/v1/move-entry`（LB-03，v0.10.42）、storage-only 挂 `tag_router` + trunk 写鉴权（LB-04，v0.10.43）、compose 黑盒 case（LB-05，v0.10.44）、契约页「Libra pin」节（LB-06）、索引登记（LB-07）。不改 `GET /tree` / `POST /create-entry` 字段；不把 list tags 改成 GET；get/delete 无 path 选择器（handler 固定以 `/` 分发，服务层按 tag 名全局查找）；README 产品写列表由用户维护（DEFER-LB-08）） |

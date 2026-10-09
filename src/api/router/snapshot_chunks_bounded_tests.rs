@@ -133,21 +133,6 @@ async fn oid_for(fixture: &Fixture, path: &str) -> String {
     }
 }
 
-async fn set_fact(fixture: &Fixture, oid: &str, size: u64, digest: [u8; 32]) {
-    let storage = fixture.state.storage.mono_storage();
-    let db = storage.get_connection();
-    let fact = mst2_verified_object::Entity::find()
-        .filter(mst2_verified_object::Column::GitOid.eq(oid))
-        .one(db)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut fact = fact.into_active_model();
-    fact.size = Set(size as i64);
-    fact.raw_sha256 = Set(digest.to_vec());
-    fact.update(db).await.unwrap();
-}
-
 fn request(path: &str, digest: [u8; 32], map_id: &str, index: u64) -> Value {
     json!({"items":[{"path":path,"expected_digest":format!("sha256:{}",hex_of(&digest)),"map_id":map_id,"chunk_index":index.to_string()}],"encoding":"identity"})
 }
@@ -174,12 +159,6 @@ async fn assert_chunk(response: Response, body: &Value, raw: &[u8], index: u64) 
 
 #[tokio::test]
 async fn mst2_large_chunk_uses_current_oid_strict_range_faults_cancel_retry_and_lease() {
-    let fixture = Fixture::new_with_pg_config_directories_and_objects(
-        false,
-        0,
-        &[("other".to_string(), vec![19; 4096])],
-    )
-    .await;
     let mut pattern = vec![51; CHUNK_SIZE as usize];
     let seed = uuid::Uuid::new_v4();
     pattern[..16].copy_from_slice(seed.as_bytes());
@@ -191,23 +170,43 @@ async fn mst2_large_chunk_uses_current_oid_strict_range_faults_cancel_retry_and_
     }
     hash.update(&pattern[..7]);
     let digest: [u8; 32] = hash.finalize().into();
-    let other = oid_for(&fixture, "/other").await;
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-    for oid in [&fixture.oid, &other] {
-        set_fact(&fixture, oid, size, digest).await;
-        fixture
-            .counts
-            .chunk_faults
-            .lock()
-            .unwrap()
-            .push(ChunkFault {
-                oid: oid.clone(),
-                size,
-                pattern: pattern.clone(),
-                mode: RangeMode::Good,
-                requests: requests.clone(),
-            });
-    }
+    let mut fixture = Fixture::new_rooted_with_options(
+        &[("other".to_string(), vec![19; 4096])],
+        FixtureOptions {
+            initial_facts: vec![
+                InitialFact {
+                    path: "/file",
+                    size,
+                    digest,
+                },
+                InitialFact {
+                    path: "/other",
+                    size,
+                    digest,
+                },
+            ],
+            initial_chunk_faults: ["/file", "/other"]
+                .into_iter()
+                .map(|path| {
+                    (
+                        path,
+                        ChunkFault {
+                            oid: String::new(),
+                            size,
+                            pattern: pattern.clone(),
+                            mode: RangeMode::Good,
+                            requests: requests.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        },
+    )
+    .await;
+    fixture.digest = digest;
+    let other = oid_for(&fixture, "/other").await;
     fixture.counts.reset();
     let map = fixture.map("/file").await;
     assert_eq!(map["map"]["file_size"], size.to_string());
@@ -386,13 +385,52 @@ async fn mst2_large_chunk_uses_current_oid_strict_range_faults_cancel_retry_and_
 
 #[tokio::test]
 async fn mst2_chunk_batch_live_budget_and_invalid_later_path_reject_before_body_io() {
-    let fixture = Fixture::new_with_pg_config_directories_and_objects(
-        false,
-        0,
+    let size = 512 * CHUNK_SIZE as u64;
+    let sources: Vec<_> = ["/file", "/one", "/two"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let pattern = Bytes::from(vec![index as u8 + 11; CHUNK_SIZE as usize]);
+            let mut hash = Sha256::new();
+            for _ in 0..512 {
+                hash.update(&pattern);
+            }
+            let digest = hash.finalize().into();
+            (path, pattern, digest)
+        })
+        .collect();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fixture = Fixture::new_rooted_with_options(
         &[
             ("one".to_string(), vec![11; 4096]),
             ("two".to_string(), vec![12; 4096]),
         ],
+        FixtureOptions {
+            initial_facts: sources
+                .iter()
+                .map(|(path, _, digest)| InitialFact {
+                    path,
+                    size,
+                    digest: *digest,
+                })
+                .collect(),
+            initial_chunk_faults: sources
+                .iter()
+                .map(|(path, pattern, _)| {
+                    (
+                        *path,
+                        ChunkFault {
+                            oid: String::new(),
+                            size,
+                            pattern: pattern.clone(),
+                            mode: RangeMode::Good,
+                            requests: requests.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        },
     )
     .await;
     let budget = crate::ceres::snapshot::content_budget::MemoryBudget::new(1024 * 1024);
@@ -416,14 +454,11 @@ async fn mst2_chunk_batch_live_budget_and_invalid_later_path_reject_before_body_
             .is_ok()
     );
     let mut items = Vec::new();
-    for (index, path) in ["/file", "/one", "/two"].iter().enumerate() {
-        let oid = oid_for(&fixture, path).await;
-        let digest = [index as u8 + 1; 32];
-        set_fact(&fixture, &oid, 512 * CHUNK_SIZE as u64, digest).await;
+    for (index, (path, _, digest)) in sources.iter().enumerate() {
         items.push(
             request(
                 path,
-                digest,
+                *digest,
                 &format!("sha256:{}", hex_of(&[index as u8 + 1; 32])),
                 0,
             )["items"][0]

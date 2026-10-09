@@ -316,7 +316,14 @@ async fn every_alias_is_admitted_and_exact_oid_body_is_loaded_once() {
     let objects: Vec<_> = (0..128)
         .map(|i| (format!("alias-{i:03}"), raw.clone()))
         .collect();
-    let fixture = fixture(&objects).await;
+    let fixture = Fixture::new_rooted_with_options(
+        &objects,
+        FixtureOptions {
+            lease_seconds: Some(3600),
+            ..Default::default()
+        },
+    )
+    .await;
     let request = request_bytes(&objects);
     assert_objects(
         fixture
@@ -345,24 +352,19 @@ async fn every_alias_is_admitted_and_exact_oid_body_is_loaded_once() {
 #[tokio::test]
 async fn conflicting_sizes_reject_before_io_and_distinct_oids_still_verify_each_body() {
     let objects = files(2, 8192);
-    let fixture = fixture(&objects).await;
-    let oid = object_oid(&fixture, "/object-001").await;
-    let db = fixture
-        .state
-        .storage
-        .mono_storage()
-        .get_connection()
-        .clone();
-    let fact = mst2_verified_object::Entity::find()
-        .filter(mst2_verified_object::Column::GitOid.eq(oid))
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut fact = fact.into_active_model();
-    fact.raw_sha256 = Set(digest(&objects[0].1).to_vec());
-    fact.size = Set(8193);
-    let fact = fact.update(&db).await.unwrap();
+    let expected_digest = digest(&objects[0].1);
+    let fixture = Fixture::new_rooted_with_options(
+        &objects,
+        FixtureOptions {
+            initial_facts: vec![InitialFact {
+                path: "/object-001",
+                size: 8193,
+                digest: expected_digest,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
     let request = json!({"items":[
         {"path":"/object-000","expected_digest":format!("sha256:{}", hex_of(&digest(&objects[0].1)))},
         {"path":"/object-001","expected_digest":format!("sha256:{}", hex_of(&digest(&objects[0].1)))},
@@ -377,9 +379,18 @@ async fn conflicting_sizes_reject_before_io_and_distinct_oids_still_verify_each_
     )
     .await;
     fixture.counts.assert(0, 0);
-    let mut fact = fact.into_active_model();
-    fact.size = Set(8192);
-    fact.update(&db).await.unwrap();
+    let fixture = Fixture::new_rooted_with_options(
+        &objects,
+        FixtureOptions {
+            initial_facts: vec![InitialFact {
+                path: "/object-001",
+                size: 8192,
+                digest: expected_digest,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
     error(
         fixture
             .send("POST", "objects", Body::from(request.to_string()))

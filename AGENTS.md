@@ -274,18 +274,58 @@ edits and again on agent `stop` when a reload was requested.
 
 ## Task card release (plan-20260905 and other `docs/plan/` cards)
 
-When a plan task card is complete (`Lifecycle=done`, dual review PASS), do
-**not** wait for the user to ask: bump version, commit that card only, and
-push. VCS is Libra (no `git`).
+By default, when an independent plan task card or a release point passes its
+A/B local acceptance gates and the required review says `PASS`, proceed
+through C release close-out without waiting for another request. Do not mark
+any card `Lifecycle=done` before its C coverage and all applicable D remote
+gates are resolved. VCS is Libra (no `git`).
 
-1. Bump `Cargo.toml` `version` by the card’s `Version increment` (default
-   **patch +1**) and refresh `Cargo.lock` for `mega2`.
-2. `libra add` + `libra commit -m` for **that card only**.
-3. `libra push origin main`. Never `--force`. If the branch has diverged from
-   origin, stop and report.
-4. Start the next card only after this card’s commit and push succeed.
+1. Check version-face parity. For a card with an actual version increment,
+   bump `Cargo.toml` `version` by its `Version increment` (default **patch +1**)
+   and let the toolchain refresh `Cargo.lock` for `mega2`.
+2. On the final tree (after bump when applicable), run all three gates under
+   _Required Checks Before Submitting Code Changes_, plus `cargo build` and
+   `cargo build --tests` with 0 errors and 0 warnings.
+3. `libra add <related paths>` and `libra commit -s -m "<scope>: <summary>"`
+   for that card only; verify the sign-off as required by ER-07.
+4. `libra push origin main` and verify the remote branch ref. Never `--force`.
+   If the branch has diverged from origin, stop and report.
+5. For every actual version bump, create and push the matching annotated
+   `v<version>` tag, then create its GitHub Release from a manually written
+   release note. These actions are part of C.
+6. Determine D from the live workflow event, ref, path filters, and job
+   conditions. Record the actual remote result, or the named ER-04 deferral;
+   then set `Acceptance=complete` and `Lifecycle=done`. While an applicable D
+   result is outstanding, use `Acceptance=remote-pending` and do not report
+   the card complete. Start the next release card only after this card's C
+   actions finish; release remains serial.
 
-See `.cursor/rules/task-card-release.mdc`.
+Family children and no-release cards inherit C/D coverage from the carrier
+named in the card. See [`docs/plan/plan-template.md`](docs/plan/plan-template.md)
+ER-04, ER-07, ER-08, and G-12 for the full gates, deferral rule, and release
+order.
+
+For the explicitly declared G-12 plan-wide release group in
+[`plan-20260920.md`](docs/plan/plan-20260920.md), each child completes its A/B
+gates, required review, and precise local Libra commit. Until the group's
+unique final `release` point, no child bumps the version, pushes the branch or
+tag, or creates a GitHub Release. At that point, check version parity, bump
+the patch version exactly once, run the full C checks on the final combined
+tree after the bump, push the branch and matching annotated tag, create the
+manually written GitHub Release, and resolve the applicable D gates. Children
+inherit that final point's C/D coverage and become `done/complete` only after
+the coverage is obtained. The unique final tag's Docker D must actually
+succeed; a named ER-04 D deferral does not complete this plan.
+
+A terminal evidence-only `release` card may set `Version increment=N/A` and
+`Release write set=N/A` only under ER-08: it adds no product behavior and
+cannot replace an independently released code card's, family release point's,
+or G-12 plan-wide group's versioned release. It skips the version edit, tag,
+and GitHub Release while retaining review, the three gates, builds, precise
+commit, push, and actual D-gate mapping. In the G-12 group above, an optional
+terminal evidence-only closeout may push evidence, plan-status, and index docs
+only after the unique patch release point's Docker D succeeds, without another
+version bump, tag, or GitHub Release.
 
 ## Boundaries
 
