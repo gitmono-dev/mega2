@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "round": 1,
+  "reviewed_plan_sha256": "c28381c8b6da806e133c77245379767f63d899301bd7f1929815f6de9d1381d4",
+  "review_snapshot_path": "../snapshot/",
+  "review_snapshot_file_count": 51,
+  "review_snapshot_manifest_sha256": "4d56ee1a32faa993b60d02f6f4bbed599289b09d2fc30b7128075e6309b64f6c",
+  "claude_code_version": "2.1.288",
+  "review_command": "claude --print --permission-mode plan --permission-prompts none --tools Read,Glob,Grep",
+  "allowed_tools": [
+    "Read",
+    "Glob",
+    "Grep"
+  ],
+  "exit_code": 0,
+  "literal_verdict": "VERDICT: PASS",
+  "findings": {
+    "P0": 0,
+    "P1": 0,
+    "P2": 0,
+    "P3": 3
+  },
+  "report_path": "claude-review.md",
+  "report_sha256": "795a9fb985300cfe9c286f02397acd151404556d0fbc0222f116e4b408e984af",
+  "credentials_excluded": true
+}

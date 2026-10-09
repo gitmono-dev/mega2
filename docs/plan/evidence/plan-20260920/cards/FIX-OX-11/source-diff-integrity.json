@@ -1,0 +1,96 @@
+{
+  "base_commit": "ea0d3d5d2efe9d722c3f4defc8d7347503e2df47",
+  "checkpoint_commit": "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+  "current_head": "346fe3c221b1f66636f8da6c151c0964b2a24800",
+  "plan_sha256": "c28381c8b6da806e133c77245379767f63d899301bd7f1929815f6de9d1381d4",
+  "paths": [
+    ".github/workflows/docker.yml",
+    "src/api/router/snapshot_chunk_map_retention_tests.rs",
+    "src/api/router/snapshot_chunks_bounded_tests.rs",
+    "src/api/router/snapshot_content_tests.rs",
+    "src/api/router/snapshot_lookup_metadata_tests.rs",
+    "src/api/router/snapshot_objects_bounded_tests.rs",
+    "src/api/router/snapshot_rooted_metadata_tests.rs"
+  ],
+  "diffs": [
+    {
+      "name": "source-u0.diff",
+      "command": [
+        "libra",
+        "diff",
+        "--no-color",
+        "--no-textconv",
+        "--no-ext-diff",
+        "--unified=0",
+        "--old",
+        "ea0d3d5d2efe9d722c3f4defc8d7347503e2df47",
+        "--new",
+        "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+        "--",
+        ".github/workflows/docker.yml",
+        "src/api/router/snapshot_chunk_map_retention_tests.rs",
+        "src/api/router/snapshot_chunks_bounded_tests.rs",
+        "src/api/router/snapshot_content_tests.rs",
+        "src/api/router/snapshot_lookup_metadata_tests.rs",
+        "src/api/router/snapshot_objects_bounded_tests.rs",
+        "src/api/router/snapshot_rooted_metadata_tests.rs"
+      ],
+      "exit_code": 0,
+      "bytes": 21662,
+      "sha256": "523463a369f411930a2f7bbe4fbeea26928aa2388edba442df371c46778aff0e",
+      "changed_line_count": 510,
+      "changed_line_projection_sha256": "62f7b30d3934293bfe088ba0aae1e1e71a48fbeed3099755a6ad5e44846b1432"
+    },
+    {
+      "name": "source-u3.diff",
+      "command": [
+        "libra",
+        "diff",
+        "--no-color",
+        "--no-textconv",
+        "--no-ext-diff",
+        "--unified=3",
+        "--old",
+        "ea0d3d5d2efe9d722c3f4defc8d7347503e2df47",
+        "--new",
+        "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+        "--",
+        ".github/workflows/docker.yml",
+        "src/api/router/snapshot_chunk_map_retention_tests.rs",
+        "src/api/router/snapshot_chunks_bounded_tests.rs",
+        "src/api/router/snapshot_content_tests.rs",
+        "src/api/router/snapshot_lookup_metadata_tests.rs",
+        "src/api/router/snapshot_objects_bounded_tests.rs",
+        "src/api/router/snapshot_rooted_metadata_tests.rs"
+      ],
+      "exit_code": 0,
+      "bytes": 28796,
+      "sha256": "12b556c9d6fb2914143f64b7b27bf8da0837cb08e86b2cb00246bfb50faca9e1",
+      "changed_line_count": 510,
+      "changed_line_projection_sha256": "62f7b30d3934293bfe088ba0aae1e1e71a48fbeed3099755a6ad5e44846b1432"
+    }
+  ],
+  "post_checkpoint_source_name_only": {
+    "command": [
+      "libra",
+      "diff",
+      "--name-only",
+      "--old",
+      "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+      "--new",
+      "346fe3c221b1f66636f8da6c151c0964b2a24800",
+      "--",
+      ".github/workflows/docker.yml",
+      "src/api/router/snapshot_chunk_map_retention_tests.rs",
+      "src/api/router/snapshot_chunks_bounded_tests.rs",
+      "src/api/router/snapshot_content_tests.rs",
+      "src/api/router/snapshot_lookup_metadata_tests.rs",
+      "src/api/router/snapshot_objects_bounded_tests.rs",
+      "src/api/router/snapshot_rooted_metadata_tests.rs"
+    ],
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "empty": true
+  }
+}

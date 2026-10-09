@@ -1,0 +1,29 @@
+{
+  "plan_sha256": "c28381c8b6da806e133c77245379767f63d899301bd7f1929815f6de9d1381d4",
+  "results": [
+    {
+      "name": "VER-1",
+      "command": "python3 -c 'from pathlib import Path; import re; s=Path(\".github/workflows/docker.yml\").read_text(); rows=set(re.findall(r\"- platform: (linux/(?:amd64|arm64))\\n\\s+runner: (\\S+)\\n\\s+arch: (\\S+)\\n\\s+slug: (\\S+)\",s)); checks={\"matrix_rows\":rows=={(\"linux/amd64\",\"ubuntu-24.04\",\"X64\",\"amd64\"),(\"linux/arm64\",\"ubuntu-24.04-arm\",\"ARM64\",\"arm64\")}, \"platform_template\":s.count(\"platforms: \"+\"$\"+\"{{ matrix.platform }}\")==1, \"digest_push\":s.count(\"push-by-digest=true\")==1, \"digest_format\":bool(re.search(r\"\\[\\[ .*sha256:\\[0-9a-f\\]\\{64\\}\",s)), \"artifact_name\":s.count(\"name: digests-\"+\"$\"+\"{{ matrix.slug }}\")==1, \"missing_artifact_error\":\"if-no-files-found: error\" in s, \"provenance\":s.count(\"provenance: true\")==1, \"labels_step\":\"name: Extract image labels\" in s, \"latest_disabled\":\"flavor: latest=false\" in s}; print(checks); assert all(checks.values())'",
+      "exit_code": 0,
+      "stdout": "{'matrix_rows': True, 'platform_template': True, 'digest_push': True, 'digest_format': True, 'artifact_name': True, 'missing_artifact_error': True, 'provenance': True, 'labels_step': True, 'latest_disabled': True}\n",
+      "stderr": "",
+      "assertion_count": 9,
+      "all_assertions_pass": true,
+      "copy": "B-apply",
+      "docker_sha256": "c3b97f4709e1912b07b40f47a955e908908b217145e960e75232c1e1afab0eae",
+      "working_tree_head": "346fe3c221b1f66636f8da6c151c0964b2a24800"
+    },
+    {
+      "name": "VER-2",
+      "command": "actionlint -version && actionlint .github/workflows/docker.yml",
+      "exit_code": 0,
+      "stdout": "1.7.12\ninstalled by building from source\nbuilt with go1.26.1 compiler for darwin/arm64\n",
+      "stderr": "",
+      "original_file_checked": true,
+      "copy": "B-apply",
+      "docker_sha256": "c3b97f4709e1912b07b40f47a955e908908b217145e960e75232c1e1afab0eae",
+      "working_tree_head": "346fe3c221b1f66636f8da6c151c0964b2a24800"
+    }
+  ],
+  "all_plan_verifications_pass": true
+}

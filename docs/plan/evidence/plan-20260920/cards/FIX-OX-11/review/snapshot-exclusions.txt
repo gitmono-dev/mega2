@@ -1,0 +1,5 @@
+.env.test
+credential-bearing environment files
+VCS metadata (.libra)
+SSH keys or signing material
+other task-card source/test worktree files

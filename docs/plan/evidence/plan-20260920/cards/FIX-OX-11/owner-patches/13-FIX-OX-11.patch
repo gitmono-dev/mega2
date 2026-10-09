@@ -1,0 +1,5 @@
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -46,2 +79,0 @@
+-          push: true
+-          tags: ${{ steps.meta.outputs.tags }}

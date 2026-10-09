@@ -1,0 +1,4 @@
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -33,1 +69,0 @@
+-            type=semver,pattern={{major}}.{{minor}}
