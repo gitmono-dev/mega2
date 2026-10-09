@@ -1,0 +1,6 @@
+
+running 1 test
+test api::router::snapshot_router::content::tests::bounded_chunks::mst2_chunk_batch_live_budget_and_invalid_later_path_reject_before_body_io ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2463 filtered out; finished in 71.47s
+

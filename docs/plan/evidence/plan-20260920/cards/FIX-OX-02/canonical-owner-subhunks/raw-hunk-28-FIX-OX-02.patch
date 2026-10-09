@@ -1,0 +1,5 @@
+--- a/src/api/router/snapshot_chunks_bounded_tests.rs
++++ b/src/api/router/snapshot_chunks_bounded_tests.rs
+@@ -426,1 +461,1 @@
+-                digest,
++                *digest,

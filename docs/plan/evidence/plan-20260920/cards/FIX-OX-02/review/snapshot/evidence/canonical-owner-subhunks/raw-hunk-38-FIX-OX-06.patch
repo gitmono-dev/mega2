@@ -1,0 +1,9 @@
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -1683,3 +1771,3 @@
+-        500,
+-        "INTERNAL",
+-        true,
++        502,
++        "INTEGRITY_ERROR",
++        false,

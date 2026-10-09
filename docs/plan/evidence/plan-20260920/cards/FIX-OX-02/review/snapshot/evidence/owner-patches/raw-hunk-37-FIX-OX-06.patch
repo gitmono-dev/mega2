@@ -1,0 +1,5 @@
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -1670,1 +1758,1 @@
+-async fn mst2_fixed_verified_fact_db_error_is_not_missing_metadata_or_empty_content() {
++async fn mst2_fixed_verified_fact_catalog_drift_fails_closed_without_body_read() {

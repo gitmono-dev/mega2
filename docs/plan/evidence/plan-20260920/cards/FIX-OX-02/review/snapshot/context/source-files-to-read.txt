@@ -1,0 +1,3 @@
+src/api/router/snapshot_chunks_bounded_tests.rs  sha256=9e7b808e2a225cc6f2f641949b16c82aadf092845cee32f937e15690169039f1  bytes=18367
+src/api/router/snapshot_content_tests.rs  sha256=5be3636414df8443bcbf5e037e791c6050cfb183ce05d42b25fc9b9bf1805a0f  bytes=73827
+src/api/router/snapshot_objects_bounded_tests.rs  sha256=db314f628e9c2b1bb4e2dd788b6ba931072ed2c819eab810caadcc31898e4e70  bytes=21976

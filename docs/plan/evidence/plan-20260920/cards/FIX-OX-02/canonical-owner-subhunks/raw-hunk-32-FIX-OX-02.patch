@@ -1,0 +1,5 @@
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -818,1 +864,1 @@
+-        let mut trees = vec![empty_dir, nested, project, root.clone()];
++        let mut trees = vec![empty_dir, nested, project.clone(), root.clone()];

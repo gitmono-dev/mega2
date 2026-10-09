@@ -1,0 +1,53 @@
+{
+  "baseline": "full A removes unaccepted consumers of FIX-OX-02 shared scaffold so target tests compile",
+  "results": [
+    {
+      "owner_ordinal": 47,
+      "owner": "FIX-OX-09",
+      "phase": "dry-run",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_objects_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "owner_ordinal": 46,
+      "owner": "FIX-OX-09",
+      "phase": "dry-run",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_objects_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "owner_ordinal": 45,
+      "owner": "FIX-OX-05",
+      "phase": "dry-run",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_objects_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "owner_ordinal": 47,
+      "owner": "FIX-OX-09",
+      "phase": "apply",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_objects_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "owner_ordinal": 46,
+      "owner": "FIX-OX-09",
+      "phase": "apply",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_objects_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "owner_ordinal": 45,
+      "owner": "FIX-OX-05",
+      "phase": "apply",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_objects_bounded_tests.rs'\n",
+      "stderr": ""
+    }
+  ]
+}

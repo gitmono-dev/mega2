@@ -1,0 +1,5 @@
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -914,1 +896,1 @@
+-            storage,
++            storage: storage.clone(),

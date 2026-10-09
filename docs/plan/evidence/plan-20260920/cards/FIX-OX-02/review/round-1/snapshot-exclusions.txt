@@ -1,0 +1,1 @@
+Excluded from the immutable review snapshot: .env.test and other environment files; build targets and VCS metadata; prior review snapshot (rebuilt because it was stale and contained a credential-shaped template example).

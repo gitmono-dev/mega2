@@ -1,0 +1,72 @@
+{
+  "head": "30ade799cba59ed45b67504cbe68f20b68b81f92",
+  "removed_ordinals": [
+    28,
+    27,
+    26,
+    25,
+    24,
+    23,
+    22,
+    21
+  ],
+  "retained": "shared fixture scaffold and all other checkpoint hunks",
+  "results": [
+    {
+      "ordinal": 28,
+      "command": "patch -C -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/28-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "ordinal": 27,
+      "command": "patch -C -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/27-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "ordinal": 26,
+      "command": "patch -C -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/26-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "ordinal": 25,
+      "command": "patch -C -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/25-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "ordinal": 24,
+      "command": "patch -C -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/24-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "ordinal": 23,
+      "command": "patch -C -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/23-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "ordinal": 22,
+      "command": "patch -C -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/22-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "ordinal": 21,
+      "command": "patch -C -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/21-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    }
+  ]
+}

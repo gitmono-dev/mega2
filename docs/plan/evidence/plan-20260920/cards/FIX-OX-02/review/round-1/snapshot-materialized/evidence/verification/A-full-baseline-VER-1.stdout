@@ -1,0 +1,20 @@
+
+running 1 test
+test api::router::snapshot_router::content::tests::bounded_chunks::mst2_large_chunk_uses_current_oid_strict_range_faults_cancel_retry_and_lease ... FAILED
+
+failures:
+
+---- api::router::snapshot_router::content::tests::bounded_chunks::mst2_large_chunk_uses_current_oid_strict_range_faults_cancel_retry_and_lease stdout ----
+
+thread 'api::router::snapshot_router::content::tests::bounded_chunks::mst2_large_chunk_uses_current_oid_strict_range_faults_cancel_retry_and_lease' (35287063) panicked at src/api/router/snapshot_content_tests.rs:1026:5:
+assertion `left == right` failed: {"error":{"code":"INTEGRITY_ERROR","message":"selected fixed file has invalid or different current verified object metadata","request_id":"cec7125c-6ee2-4ffd-bec7-efb0714af2d1","retryable":false}}
+  left: 502
+ right: 200
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    api::router::snapshot_router::content::tests::bounded_chunks::mst2_large_chunk_uses_current_oid_strict_range_faults_cancel_retry_and_lease
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2463 filtered out; finished in 31.30s
+

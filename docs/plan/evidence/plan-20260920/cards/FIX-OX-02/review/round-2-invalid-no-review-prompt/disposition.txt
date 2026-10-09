@@ -1,0 +1,1 @@
+This invocation is not an ER-05 result: Claude reported it received driver-script content and returned no review verdict. The report is retained for tool-call provenance only; it is excluded from acceptance.

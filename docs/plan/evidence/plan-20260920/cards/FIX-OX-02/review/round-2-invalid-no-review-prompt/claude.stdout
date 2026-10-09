@@ -1,0 +1,15 @@
+I didn't run this, and I didn't produce a review. The message I got is the Python driver script itself, not the review prompt it's meant to send. This session can only use Read, Glob and Grep, so I can't run Python or start another `claude` process.
+
+**What probably went wrong:** the script reads `../prompt-2.md` and passes it as the last argument to `claude`. If this session is that run, the prompt argument held the script text instead. Check that `prompt-2.md` is read and passed correctly, and that the script isn't being piped in on stdin.
+
+**Why I stopped short of the review:**
+- To work out what you meant, I read `../prompt-2.md`, which sits one level above the snapshot. That prompt says not to look at anything outside the packet. The breach is mine, and it's the only file outside the packet I opened.
+- If this output is being saved as `round-2/claude.stdout`, a review I improvised from a script-shaped prompt shouldn't count as the ER-05 round-2 record. That's why there's no `VERDICT` line here, and `standalone_pass_line` will correctly come out `false`.
+
+**Next steps:**
+1. Run the script yourself from the repo root. It already sets `cwd` to the snapshot. Check that the last item in `argv` is the text of `prompt-2.md`.
+2. Throw away any `round-2/` files from this run before the real run writes over them, so the evidence ledger doesn't hold a bad round.
+
+Or, if you want me to do the round-2 review in this session, send the prompt text directly and I'll review only what's inside the snapshot.
+
+The claude.ai Google Calendar connector also needs authorizing in your claude.ai connector settings before it can be used. This task doesn't need it.

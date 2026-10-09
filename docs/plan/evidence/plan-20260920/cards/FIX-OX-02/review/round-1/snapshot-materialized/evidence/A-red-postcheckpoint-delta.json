@@ -1,0 +1,14 @@
+{
+  "worktree": "A-red",
+  "dry_run": {
+    "exit": 0,
+    "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+    "stderr": ""
+  },
+  "apply": {
+    "exit": 0,
+    "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+    "stderr": ""
+  },
+  "retained": "shared fixture scaffold and new fact-before-publication ordering; only bounded-chunk fixture hunks remain reversed"
+}

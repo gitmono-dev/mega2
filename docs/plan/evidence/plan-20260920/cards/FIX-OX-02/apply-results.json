@@ -1,0 +1,203 @@
+{
+  "base_head": "30ade799cba59ed45b67504cbe68f20b68b81f92",
+  "variants": [
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 38,
+      "owner": "FIX-OX-06",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-38-FIX-OX-06.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 37,
+      "owner": "FIX-OX-06",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-37-FIX-OX-06.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 36,
+      "owner": "FIX-OX-06",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-36-FIX-OX-06.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 35,
+      "owner": "FIX-OX-06",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-35-FIX-OX-06.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 34,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-34-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 33,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-33-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 32,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-32-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 31,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-31-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 30,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-30-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 29,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-29-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 28,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-28-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 27,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-27-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 26,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-26-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 25,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-25-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 24,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-24-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 23,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-23-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 22,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-22-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "A",
+      "raw_checkpoint_hunk": 21,
+      "owner": "FIX-OX-02",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-21-FIX-OX-02.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_chunks_bounded_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "B",
+      "raw_checkpoint_hunk": 38,
+      "owner": "FIX-OX-06",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-38-FIX-OX-06.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "B",
+      "raw_checkpoint_hunk": 37,
+      "owner": "FIX-OX-06",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-37-FIX-OX-06.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "B",
+      "raw_checkpoint_hunk": 36,
+      "owner": "FIX-OX-06",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-36-FIX-OX-06.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    },
+    {
+      "variant": "B",
+      "raw_checkpoint_hunk": 35,
+      "owner": "FIX-OX-06",
+      "command": "patch -R -F0 -p1 < ./docs/plan/evidence/plan-20260920/cards/FIX-OX-02/owner-patches/raw-hunk-35-FIX-OX-06.patch",
+      "exit": 0,
+      "stdout": "patching file 'src/api/router/snapshot_content_tests.rs'\n",
+      "stderr": ""
+    }
+  ]
+}

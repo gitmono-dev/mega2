@@ -1,0 +1,10 @@
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -548,0 +562,7 @@
++async fn fixture_source_oid(handler: &MonoApiService, project: &Tree, path: &str) -> String {
++    match resolve_abs_metadata(handler, project, path).await.unwrap() {
++        MetadataWalkOutcome::FoundFile { oid, .. } => oid,
++        other => panic!("initial fixture fact path did not resolve: {path}: {other:?}"),
++    }
++}
++

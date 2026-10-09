@@ -1,0 +1,11 @@
+{
+  "tool": "Claude Code",
+  "version": "2.1.288",
+  "command": "claude --print --permission-mode plan --permission-prompts none --tools Read,Glob,Grep (prompt supplied via stdin)",
+  "exit": 0,
+  "elapsed_seconds": 245.16,
+  "snapshot_manifest_sha256": "661e70220dd5c1fad0eb9cd4c616def12ca27d057f63cf5a63ee816871680060",
+  "report_sha256": "12cb53a51f35088a482fe26826184b67b7fd4f97e7248ecc47dd89fae38bc785",
+  "standalone_pass_line": true,
+  "credentials_or_paths_redacted": false
+}

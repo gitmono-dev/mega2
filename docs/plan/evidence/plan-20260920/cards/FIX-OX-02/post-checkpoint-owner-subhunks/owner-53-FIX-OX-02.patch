@@ -1,0 +1,7 @@
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -964,0 +965,4 @@
++        let mut resolve_request = json!({"target":{"kind":"latest"},"scope":"/project"});
++        if let Some(lease_seconds) = options.lease_seconds {
++            resolve_request["lease_seconds"] = json!(lease_seconds);
++        }

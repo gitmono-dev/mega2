@@ -1,0 +1,54 @@
+--- a/src/api/router/snapshot_chunks_bounded_tests.rs
++++ b/src/api/router/snapshot_chunks_bounded_tests.rs
+@@ -196,15 +174,36 @@
+-    for oid in [&fixture.oid, &other] {
+-        set_fact(&fixture, oid, size, digest).await;
+-        fixture
+-            .counts
+-            .chunk_faults
+-            .lock()
+-            .unwrap()
+-            .push(ChunkFault {
+-                oid: oid.clone(),
+-                size,
+-                pattern: pattern.clone(),
+-                mode: RangeMode::Good,
+-                requests: requests.clone(),
+-            });
+-    }
++    let mut fixture = Fixture::new_rooted_with_options(
++        &[("other".to_string(), vec![19; 4096])],
++        FixtureOptions {
++            initial_facts: vec![
++                InitialFact {
++                    path: "/file",
++                    size,
++                    digest,
++                },
++                InitialFact {
++                    path: "/other",
++                    size,
++                    digest,
++                },
++            ],
++            initial_chunk_faults: ["/file", "/other"]
++                .into_iter()
++                .map(|path| {
++                    (
++                        path,
++                        ChunkFault {
++                            oid: String::new(),
++                            size,
++                            pattern: pattern.clone(),
++                            mode: RangeMode::Good,
++                            requests: requests.clone(),
++                        },
++                    )
++                })
++                .collect(),
++            ..Default::default()
++        },
++    )
++    .await;
++    fixture.digest = digest;
++    let other = oid_for(&fixture, "/other").await;

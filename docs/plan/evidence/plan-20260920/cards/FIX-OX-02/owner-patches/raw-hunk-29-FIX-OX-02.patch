@@ -1,0 +1,16 @@
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -536,0 +537,13 @@
++struct InitialFact {
++    path: &'static str,
++    size: u64,
++    digest: [u8; 32],
++}
++
++#[derive(Default)]
++struct FixtureOptions {
++    initial_facts: Vec<InitialFact>,
++    initial_chunk_faults: Vec<(&'static str, bounded_chunks::ChunkFault)>,
++    lease_seconds: Option<u64>,
++}
++

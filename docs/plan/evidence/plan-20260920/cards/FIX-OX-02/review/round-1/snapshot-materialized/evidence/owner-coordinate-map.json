@@ -1,0 +1,171 @@
+{
+  "mapping_basis": "The checkpoint-wide source-u0 raw hunk ordinals map to owner edit-block ordinals with +4 because Docker raw hunk 13 is split into five owner blocks; the exact split is recorded in FIX-OX-08/owner-hunk-manifest.json. Post-checkpoint ordinals 49-52 are the four zero-context hunks in post-checkpoint-source.diff.",
+  "entries": [
+    {
+      "checkpoint_raw_hunk": 21,
+      "owner_ordinal": 25,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_chunks_bounded_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 22,
+      "owner_ordinal": 26,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_chunks_bounded_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 23,
+      "owner_ordinal": 27,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_chunks_bounded_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 24,
+      "owner_ordinal": 28,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_chunks_bounded_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 25,
+      "owner_ordinal": 29,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_chunks_bounded_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 26,
+      "owner_ordinal": 30,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_chunks_bounded_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 27,
+      "owner_ordinal": 31,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_chunks_bounded_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 28,
+      "owner_ordinal": 32,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_chunks_bounded_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 29,
+      "owner_ordinal": 33,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 30,
+      "owner_ordinal": 34,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 31,
+      "owner_ordinal": 35,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 32,
+      "owner_ordinal": 36,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 33,
+      "owner_ordinal": 37,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 34,
+      "owner_ordinal": 38,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 35,
+      "owner_ordinal": 39,
+      "owner": "FIX-OX-06",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 36,
+      "owner_ordinal": 40,
+      "owner": "FIX-OX-06",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 37,
+      "owner_ordinal": 41,
+      "owner": "FIX-OX-06",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": 38,
+      "owner_ordinal": 42,
+      "owner": "FIX-OX-06",
+      "path": "src/api/router/snapshot_content_tests.rs"
+    },
+    {
+      "checkpoint_raw_hunk": null,
+      "owner_ordinal": 49,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs",
+      "post_checkpoint_hunk": 1
+    },
+    {
+      "checkpoint_raw_hunk": null,
+      "owner_ordinal": 50,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs",
+      "post_checkpoint_hunk": 2
+    },
+    {
+      "checkpoint_raw_hunk": null,
+      "owner_ordinal": 51,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs",
+      "post_checkpoint_hunk": 3
+    },
+    {
+      "checkpoint_raw_hunk": null,
+      "owner_ordinal": 52,
+      "owner": "FIX-OX-02",
+      "path": "src/api/router/snapshot_content_tests.rs",
+      "post_checkpoint_hunk": 4
+    }
+  ],
+  "owner_patch_application": "Apple patch 2.0-12u11: preserve canonical hunks; for reverse application only, increment +new_start by one exactly when new_count is zero.",
+  "downstream_consumer_masks_for_full_A_baseline": [
+    {
+      "raw_checkpoint_hunk": 41,
+      "owner_ordinal": 45,
+      "owner": "FIX-OX-05",
+      "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+      "hunk": "@@ -319,1 +319,8 @@",
+      "canonical_sha256": "9487b0eaa0172a988eb7dc7d7b6212875e76b145527c3a7fdb033f9903091e15",
+      "application_sha256": "9487b0eaa0172a988eb7dc7d7b6212875e76b145527c3a7fdb033f9903091e15"
+    },
+    {
+      "raw_checkpoint_hunk": 42,
+      "owner_ordinal": 46,
+      "owner": "FIX-OX-09",
+      "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+      "hunk": "@@ -348,18 +355,13 @@",
+      "canonical_sha256": "b0d4e98ad0b8e7501072ca348fff94e1922c076e55e555dc0c18ff045798a375",
+      "application_sha256": "b0d4e98ad0b8e7501072ca348fff94e1922c076e55e555dc0c18ff045798a375"
+    },
+    {
+      "raw_checkpoint_hunk": 43,
+      "owner_ordinal": 47,
+      "owner": "FIX-OX-09",
+      "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+      "hunk": "@@ -380,3 +382,12 @@",
+      "canonical_sha256": "18391a5e06108058783f0743d1846166ebc84a720952be028e180d31d16774ee",
+      "application_sha256": "18391a5e06108058783f0743d1846166ebc84a720952be028e180d31d16774ee"
+    }
+  ]
+}

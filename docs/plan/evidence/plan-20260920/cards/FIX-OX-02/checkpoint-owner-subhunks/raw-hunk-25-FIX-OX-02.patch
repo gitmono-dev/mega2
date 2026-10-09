@@ -1,0 +1,22 @@
+--- a/src/api/router/snapshot_chunks_bounded_tests.rs
++++ b/src/api/router/snapshot_chunks_bounded_tests.rs
+@@ -389,3 +388,16 @@
+-    let fixture = Fixture::new_with_pg_config_directories_and_objects(
+-        false,
+-        0,
++    let size = 512 * CHUNK_SIZE as u64;
++    let sources: Vec<_> = ["/file", "/one", "/two"]
++        .into_iter()
++        .enumerate()
++        .map(|(index, path)| {
++            let pattern = Bytes::from(vec![index as u8 + 11; CHUNK_SIZE as usize]);
++            let mut hash = Sha256::new();
++            for _ in 0..512 {
++                hash.update(&pattern);
++            }
++            let digest = hash.finalize().into();
++            (path, pattern, digest)
++        })
++        .collect();
++    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
++    let fixture = Fixture::new_rooted_with_options(

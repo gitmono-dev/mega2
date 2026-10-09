@@ -1,0 +1,8 @@
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -1039,0 +1123,5 @@
++    assert_eq!(
++        actual_status, status,
++        "error code: {}, message: {}",
++        value["error"]["code"], value["error"]["message"]
++    );

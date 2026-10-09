@@ -1,0 +1,8 @@
+--- a/src/api/router/snapshot_chunks_bounded_tests.rs
++++ b/src/api/router/snapshot_chunks_bounded_tests.rs
+@@ -419,4 +457,1 @@
+-    for (index, path) in ["/file", "/one", "/two"].iter().enumerate() {
+-        let oid = oid_for(&fixture, path).await;
+-        let digest = [index as u8 + 1; 32];
+-        set_fact(&fixture, &oid, 512 * CHUNK_SIZE as u64, digest).await;
++    for (index, (path, _, digest)) in sources.iter().enumerate() {

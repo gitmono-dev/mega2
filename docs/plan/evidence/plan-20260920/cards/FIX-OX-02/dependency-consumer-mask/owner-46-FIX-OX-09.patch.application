@@ -1,0 +1,34 @@
+--- a/src/api/router/snapshot_objects_bounded_tests.rs
++++ b/src/api/router/snapshot_objects_bounded_tests.rs
+@@ -348,18 +355,13 @@
+-    let fixture = fixture(&objects).await;
+-    let oid = object_oid(&fixture, "/object-001").await;
+-    let db = fixture
+-        .state
+-        .storage
+-        .mono_storage()
+-        .get_connection()
+-        .clone();
+-    let fact = mst2_verified_object::Entity::find()
+-        .filter(mst2_verified_object::Column::GitOid.eq(oid))
+-        .one(&db)
+-        .await
+-        .unwrap()
+-        .unwrap();
+-    let mut fact = fact.into_active_model();
+-    fact.raw_sha256 = Set(digest(&objects[0].1).to_vec());
+-    fact.size = Set(8193);
+-    let fact = fact.update(&db).await.unwrap();
++    let expected_digest = digest(&objects[0].1);
++    let fixture = Fixture::new_rooted_with_options(
++        &objects,
++        FixtureOptions {
++            initial_facts: vec![InitialFact {
++                path: "/object-001",
++                size: 8193,
++                digest: expected_digest,
++            }],
++            ..Default::default()
++        },
++    )
++    .await;

@@ -1,0 +1,4 @@
+--- a/src/api/router/snapshot_chunks_bounded_tests.rs
++++ b/src/api/router/snapshot_chunks_bounded_tests.rs
+@@ -194,1 +173,0 @@
+-    let other = oid_for(&fixture, "/other").await;

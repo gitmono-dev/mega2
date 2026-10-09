@@ -1,0 +1,7 @@
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -923,4 +904,0 @@
+-        for (path, mut fault) in options.initial_chunk_faults {
+-            fault.oid = fixture_source_oid(&handler, &project, path).await;
+-            counts.chunk_faults.lock().unwrap().push(fault);
+-        }
