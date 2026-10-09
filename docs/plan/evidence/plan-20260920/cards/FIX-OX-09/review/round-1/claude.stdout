@@ -1,0 +1,45 @@
+I reviewed the packet, but couldn't fully do the integrity check you asked for. With only read-only file tools here I had no way to hash files, so I did not recompute any SHA-256 values or byte sizes, including the manifest's own hash (`14546d4d…`). The verdict covers the code and the captured outputs only. Before you rely on it, recompute the hashes, for example with `shasum -a 256`.
+
+What I could check without hashing:
+- **File count:** the manifest lists 31 payload files, and the snapshot holds 31 files plus the manifest.
+- **Candidate source:** the hash `verification-results.json` records for the candidate source (`ffd55289…`) and for `source-u0.diff` (`06fccf65…`) match the manifest entries.
+- **Redactions:** the five redacted stderr hashes in `redactions.json` match the manifest.
+- **Exit files:** `B.exit` and `NIGHTLY-FMT.exit` contain `0`. The `A-consumer-masked` exit file contains `101`, and the three superseded attempts carry the same hash as that `101` file.
+- **Diff vs source:** the new side of `source-u0.diff` matches the copied candidate file at lines 352–424.
+
+## Findings by criterion
+
+- **AC-1: met.** The test uses `Fixture::new_rooted_with_options`. The shared fixture writes the seeded facts into the verified-object table before it publishes and resolves the snapshot (`snapshot_content_tests.rs:905-936`, then 937-982). Publication is enabled, so requests take the rooted lease path (`snapshot_content.rs:107`).
+
+- **AC-2: met as the card is written.** `/object-001` is seeded with size 8193 and the first object's digest. Its real body is 8192 bytes with a different digest. The request's expected digest for item 1 is set to the first object's digest, so the per-item digest check passes (`snapshot_content.rs:270`). The final run returns 502 `INTEGRITY_ERROR` with zero body reads (`counts.assert(0, 0)`).
+  - **Where the 502 comes from:** it must be the "same digest, conflicting sizes" check at `snapshot_content.rs:496-501`.
+    - The other pre-body 502 check, at `:187`, compares against rooted entries built from the seeded facts. The excluded size-only run shows this: it read 2 bodies, so it was not rejected at `:187`.
+    - The "same OID, conflicting facts" check at `:513` does not apply, because the two OIDs differ.
+  - **This is not a size-only proof.** The seeded digest is also deliberately wrong, and that is how the conflict gets caught before any body is read. The card asks for a size that disagrees with the body and a pre-body 502; both hold.
+  - **Minor:** the `error()` helper does not check the message text, so the test does not tell the `:187` and `:497` branches apart on its own. That is a P3 note, not a blocker.
+
+- **AC-3: met.** A second fixture is seeded with correct facts for `/object-001` (its real digest, size 8192). The 200 response passes `assert_objects`: two distinct objects, END counts and the request-digest header all check out. Reads are 2 bodies and 16384 bytes, and `read_object` re-hashes each body (`:355`).
+
+- **AC-4: met.** With correct facts restored and an all-zero expected digest on item 1, the request returns 409 `EXPECTED_DIGEST_MISMATCH` with zero reads. It is rejected at the metadata stage (`:270`).
+
+- **AC-5: met.** Both fixtures use `..Default::default()`. The diff does not touch `snapshot_content_tests.rs`, where the shared constructor lives.
+
+- **AC-6: met.** Only the named test file is changed; production logic is untouched.
+
+- **VER-1: met.** `B` ran the exact card command and exited 0, with 1 passed and 2463 filtered out. `B.stderr` shows only the linker message and no rustc warnings.
+
+- **Red baseline:** the masked run removes the fact seeding at the parent and fails with 409 instead of 502, exit 101. That shows the test depends on the seeded facts.
+
+- **Diagnostic exclusions:** all four (A-before, B-attempt-1, size-only, wrong-digest-count) are correctly excluded, and their reasons match their captured outputs.
+
+## Other notes
+
+- **P2 – write set:** the only proof that one file changed is a diff limited to that path; there is no whole-tree status. The diff is consistent with the claim, but `libra show --stat` on the card's commit should be checked to confirm it touches only `src/api/router/snapshot_objects_bounded_tests.rs`.
+- **P2 – gates:** clippy, the full `cargo test --all`, and `cargo build`/`build --tests` were not run here. Under the release rules for this plan, those full checks belong to OX-284's final release step. Nothing in the diff looks likely to trip clippy, since every new binding is used.
+- **Release:** no version bump, push, tag or GitHub Release was done. The packet's version is still `v0.42.25`, consistent with deferring all of that to OX-284. I have not assumed or added any release completion.
+
+No P0 or P1 issues found.
+
+Separately, the claude.ai Google Calendar connector needs authorization in your claude.ai connector settings; it wasn't used in this review and won't be available until you authorize it.
+
+VERDICT: PASS

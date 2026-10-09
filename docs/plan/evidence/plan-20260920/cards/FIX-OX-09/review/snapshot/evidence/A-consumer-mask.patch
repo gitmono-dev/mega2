@@ -1,0 +1,34 @@
+--- current
++++ FIX-OX-09-A-consumer-masked
+@@ -355,14 +355,7 @@
+     let expected_digest = digest(&objects[0].1);
+     let fixture = Fixture::new_rooted_with_options(
+         &objects,
+-        FixtureOptions {
+-            initial_facts: vec![InitialFact {
+-                path: "/object-001",
+-                size: 8193,
+-                digest: expected_digest,
+-            }],
+-            ..Default::default()
+-        },
++        FixtureOptions::default(),
+     )
+     .await;
+     let request = json!({"items":[
+@@ -381,14 +374,7 @@
+     fixture.counts.assert(0, 0);
+     let fixture = Fixture::new_rooted_with_options(
+         &objects,
+-        FixtureOptions {
+-            initial_facts: vec![InitialFact {
+-                path: "/object-001",
+-                size: 8192,
+-                digest: expected_digest,
+-            }],
+-            ..Default::default()
+-        },
++        FixtureOptions::default(),
+     )
+     .await;
+     error(

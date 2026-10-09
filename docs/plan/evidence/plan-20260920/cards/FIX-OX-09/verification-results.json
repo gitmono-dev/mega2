@@ -1,0 +1,101 @@
+{
+  "card": "FIX-OX-09",
+  "head_before_card_commit": "711b6d6b7d671f80842c0fa861d5f2b26c30ef82",
+  "plan_sha256": "46d83eb6cf655ddbb96f80f960878c825691954e91b8c6f1515032768dbd9d74",
+  "source_parent_sha256": "db314f628e9c2b1bb4e2dd788b6ba931072ed2c819eab810caadcc31898e4e70",
+  "source_candidate_sha256": "ffd55289399ab38081b0384ace69754c6d9937603b74570bc7af08fb9cbd7955",
+  "source_diff": "source-u0.diff",
+  "source_diff_sha256": "06fccf65701cb50f54e28ca9983323a1152c7fb703b93234324b83c0d9848866",
+  "checks": [
+    {
+      "id": "A-consumer-masked",
+      "command": "source .env.test && cargo test -p mega2 --lib conflicting_sizes_reject_before_io_and_distinct_oids_still_verify_each_body -- --test-threads=1",
+      "variant": "At parent HEAD, mask both FIX-OX-09 InitialFact consumer blocks while keeping the assertions; expected red.",
+      "exit": 101,
+      "stdout": "verification/A-consumer-masked.stdout",
+      "stderr": "verification/A-consumer-masked.stderr",
+      "exit_file": "verification/A-consumer-masked.exit",
+      "meaning": "Expected red: without the FIX-OX-09 fact seed the request returns 409, so the intended shared-digest size-conflict 502 is not established."
+    },
+    {
+      "id": "B-final-VER-1",
+      "command": "source .env.test && cargo test -p mega2 --lib conflicting_sizes_reject_before_io_and_distinct_oids_still_verify_each_body -- --test-threads=1",
+      "variant": "Candidate diff on parent HEAD.",
+      "exit": 0,
+      "stdout": "verification/B.stdout",
+      "stderr": "verification/B.stderr",
+      "exit_file": "verification/B.exit",
+      "elapsed_seconds": 94.64,
+      "summary": "1 passed; 0 failed; 2463 filtered; 74.91s",
+      "meaning": "Final candidate passes shared-digest conflicting-size rejection before body reads, correct distinct-OID success, and wrong expected digest rejection."
+    },
+    {
+      "id": "NIGHTLY-FMT",
+      "command": "cargo +nightly fmt --all --check",
+      "exit": 0,
+      "stdout": "verification/NIGHTLY-FMT.stdout",
+      "stderr": "verification/NIGHTLY-FMT.stderr",
+      "exit_file": "verification/NIGHTLY-FMT.exit"
+    },
+    {
+      "id": "DIFF-CHECK",
+      "command": "libra diff HEAD --check -- src/api/router/snapshot_objects_bounded_tests.rs",
+      "exit": 0,
+      "meaning": "Candidate source diff has no whitespace errors."
+    }
+  ],
+  "excluded_diagnostics": [
+    {
+      "id": "A-current-precard",
+      "exit": 0,
+      "files": [
+        "verification/A-before.stdout",
+        "verification/A-before.stderr",
+        "verification/A-before.exit"
+      ],
+      "reason": "Passes only the previously unaccepted fixture WIP and lacks the new positive dual-OID coverage; not a red baseline."
+    },
+    {
+      "id": "B-attempt-1",
+      "exit": 101,
+      "files": [
+        "verification/B-attempt-1.stdout",
+        "verification/B-attempt-1.stderr",
+        "verification/B-attempt-1.exit"
+      ],
+      "reason": "Early candidate asserted zero body reads for wrong expected digest; actual behavior read both bodies. Superseded by final candidate with a separate corrected-fact request that rejects the wrong digest before body reads."
+    },
+    {
+      "id": "B-size-only-attempt",
+      "exit": 101,
+      "files": [
+        "verification/B-size-only-attempt.stdout",
+        "verification/B-size-only-attempt.stderr",
+        "verification/B-size-only-attempt.exit"
+      ],
+      "reason": "A size-only altered fact returns 502 only after reading both bodies; this variant does not exercise the shared-digest conflicting-size preflight required by the named card. Kept as a diagnostic."
+    },
+    {
+      "id": "B-wrong-digest-count-attempt",
+      "exit": 101,
+      "files": [
+        "verification/B-wrong-digest-count-attempt.stdout",
+        "verification/B-wrong-digest-count-attempt.stderr",
+        "verification/B-wrong-digest-count-attempt.exit"
+      ],
+      "reason": "Candidate returned 409 before body reads; the trial expected two reads. Superseded by the corrected zero-read assertion."
+    }
+  ],
+  "fixture_scope_note": "The pre-body 502 uses two different OIDs whose seeded verified facts share the same digest but disagree on size; the intentionally conflicting second fact also differs from its raw body digest. A separate size-only trial read both bodies before returning 502 and is excluded. The final B also includes an all-correct positive dual-OID response and a wrong expected digest 409 case.",
+  "redactions": "redactions.json",
+  "review": {
+    "reviewer": "Claude Code 2.1.288",
+    "verdict": "PASS",
+    "literal_verdict_line": "VERDICT: PASS",
+    "report": "review/round-1/claude.stdout",
+    "report_sha256": "fc23a3bc69db78bd8852bf1f9e25eb65b9cff9283f9ce4f19fbe1442e60781e1",
+    "exit": 0,
+    "snapshot_manifest_sha256": "14546d4d8e36841eb6ea37cab9fc3dfc1a0ac9d6e7af0a7285130bd4549839df",
+    "prompt_sha256": "fed5e8ec5bc8286b04846f90a0810b20e2481331ef46cee7ed95e05bc08fdc5e"
+  }
+}

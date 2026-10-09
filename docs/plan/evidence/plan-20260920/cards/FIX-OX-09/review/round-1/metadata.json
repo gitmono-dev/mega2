@@ -1,0 +1,15 @@
+{
+  "tool": "Claude Code",
+  "command": "claude --print --permission-mode plan --permission-prompts none --tools Read,Glob,Grep (prompt supplied via stdin)",
+  "exit": 0,
+  "elapsed_seconds": 104.98,
+  "snapshot_manifest_sha256": "14546d4d8e36841eb6ea37cab9fc3dfc1a0ac9d6e7af0a7285130bd4549839df",
+  "prompt_sha256": "fed5e8ec5bc8286b04846f90a0810b20e2481331ef46cee7ed95e05bc08fdc5e",
+  "report_sha256": "fc23a3bc69db78bd8852bf1f9e25eb65b9cff9283f9ce4f19fbe1442e60781e1",
+  "standalone_verdict_lines": [
+    "VERDICT: PASS"
+  ],
+  "read_only_profile": "plan mode; Read, Glob, Grep only",
+  "stored_prompt_sha256": "510b3a70e05de169c857d6bda09742eed0c7732ad4332469d9a501e935177169",
+  "submitted_prompt_path_redacted_in_archive": true
+}
