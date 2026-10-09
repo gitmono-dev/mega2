@@ -1,0 +1,11 @@
+--- original
++++ syntax-only
+@@ -104,7 +104,6 @@
+     runs-on: ubuntu-24.04
+     concurrency:
+       group: mega2-docker-publish
+-      queue: max
+     steps:
+       - name: Require both native builds
+         env:
+

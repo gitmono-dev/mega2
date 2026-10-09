@@ -1,0 +1,13 @@
+{
+  "workflow_sha256": "3a97771720765b30856b312667a2adc617282393457554d97ccfe883c7948712",
+  "bash_version": "GNU bash, version 3.2.57(1)-release (arm64-apple-darwin26)",
+  "digest_files": [
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ],
+  "exit_code": 0,
+  "stdout": "true\n",
+  "stderr": "",
+  "docker_log": "buildx imagetools create --tag example/mega2:v1.2.3 --tag example/mega2:1.2.3 example/mega2@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb example/mega2@sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\nbuildx imagetools inspect --raw example/mega2:v1.2.3\n",
+  "result": "non-hex digest was accepted and forwarded to docker buildx imagetools create"
+}

@@ -1,0 +1,139 @@
+{
+  "base_commit": "ea0d3d5d2efe9d722c3f4defc8d7347503e2df47",
+  "checkpoint_commit": "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+  "current_head": "a5ba8febeaa90bcc97411d278f596753a05f1b8a",
+  "plan_sha256_at_review_start": "46d83eb6cf655ddbb96f80f960878c825691954e91b8c6f1515032768dbd9d74",
+  "source_test_workflow_paths": [
+    ".github/workflows/docker.yml",
+    "src/api/router/snapshot_chunk_map_retention_tests.rs",
+    "src/api/router/snapshot_chunks_bounded_tests.rs",
+    "src/api/router/snapshot_content_tests.rs",
+    "src/api/router/snapshot_lookup_metadata_tests.rs",
+    "src/api/router/snapshot_objects_bounded_tests.rs",
+    "src/api/router/snapshot_rooted_metadata_tests.rs"
+  ],
+  "base_to_checkpoint_diff": {
+    "unified0_file": "source-u0.diff",
+    "sha256": "12b556c9d6fb2914143f64b7b27bf8da0837cb08e86b2cb00246bfb50faca9e1",
+    "bytes": 28796,
+    "changed_line_count": 510,
+    "changed_line_projection_sha256": "62f7b30d3934293bfe088ba0aae1e1e71a48fbeed3099755a6ad5e44846b1432",
+    "unified3_file": "source-u3.diff",
+    "unified0_exit_code": 0,
+    "unified3_exit_code": 0
+  },
+  "accepted_predecessors": [
+    {
+      "card": "FIX-OX-08",
+      "commit": "346fe3c221b1f66636f8da6c151c0964b2a24800"
+    },
+    {
+      "card": "FIX-OX-11",
+      "commit": "a5ba8febeaa90bcc97411d278f596753a05f1b8a"
+    }
+  ],
+  "accepted_predecessor_source_line_delta": {
+    "command": [
+      "libra",
+      "diff",
+      "--no-color",
+      "--no-textconv",
+      "--no-ext-diff",
+      "--unified=0",
+      "--old",
+      "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+      "--new",
+      "a5ba8febeaa90bcc97411d278f596753a05f1b8a",
+      "--",
+      ".github/workflows/docker.yml",
+      "src/api/router/snapshot_chunk_map_retention_tests.rs",
+      "src/api/router/snapshot_chunks_bounded_tests.rs",
+      "src/api/router/snapshot_content_tests.rs",
+      "src/api/router/snapshot_lookup_metadata_tests.rs",
+      "src/api/router/snapshot_objects_bounded_tests.rs",
+      "src/api/router/snapshot_rooted_metadata_tests.rs"
+    ],
+    "exit_code": 0,
+    "stdout_file": "predecessor-source-diff.diff",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_file": "predecessor-source-diff.stderr",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "empty": true,
+    "mapping": "identity from checkpoint coordinates to current accepted HEAD"
+  },
+  "card_candidate_correction": {
+    "owner": "FIX-OX-01",
+    "current_head": "a5ba8febeaa90bcc97411d278f596753a05f1b8a",
+    "diff_file": "source-after-checkpoint.diff",
+    "diff_sha256": "d855646746e32a4abf076bde9906dc486032f72049a2586883c7c4a5667b924e",
+    "exit_file": "source-after-checkpoint.exit",
+    "change": "Replace bare [[ digest =~ sha256 ]] with explicit if/then error and exit 1. The one removed and four added lines all belong to the FIX-OX-01 manifest hunk.",
+    "candidate_workflow_sha256": "ecc44850a0ae3d0b8106739b6d7616fab35210d72fe5f954d15694dbca0a1dcb"
+  },
+  "base_workflow_sha256": "5f5af6405e95bbc961cce6aaeb231561c2ed933ceac9f02ff9138592e027472b",
+  "checkpoint_and_accepted_head_workflow_sha256": "3a97771720765b30856b312667a2adc617282393457554d97ccfe883c7948712",
+  "current_candidate_source_test_workflow_sha256": {
+    ".github/workflows/docker.yml": "ecc44850a0ae3d0b8106739b6d7616fab35210d72fe5f954d15694dbca0a1dcb",
+    "src/api/router/snapshot_chunk_map_retention_tests.rs": "35a1f8ea466c9a37e4eda59ca7c29ad9dcf0581cc0aedfdc1a89af64b888f0a3",
+    "src/api/router/snapshot_chunks_bounded_tests.rs": "9e7b808e2a225cc6f2f641949b16c82aadf092845cee32f937e15690169039f1",
+    "src/api/router/snapshot_content_tests.rs": "2208483ba7cb2cf599376d8f711dd0593aecdd0476906e90dd4e9badc5925a05",
+    "src/api/router/snapshot_lookup_metadata_tests.rs": "340eb8b00a8987551de664e9341e18972be4f6b430a0ca9a9d4b650144f3d108",
+    "src/api/router/snapshot_objects_bounded_tests.rs": "db314f628e9c2b1bb4e2dd788b6ba931072ed2c819eab810caadcc31898e4e70",
+    "src/api/router/snapshot_rooted_metadata_tests.rs": "c72f37a703babe0e92a0ff9556a86033925b671912d667fb87b56f8051700337"
+  },
+  "checkpoint_owner_hunks": [
+    {
+      "ordinal": 4,
+      "owner": "FIX-OX-01",
+      "base_old_start": 14,
+      "base_old_count": 0,
+      "checkpoint_new_start": 32,
+      "checkpoint_new_count": 10,
+      "patch_sha256": "dc132264105d9e2d0199a138343bc32b185d8158900e586f742fdea1bb70ddd2"
+    },
+    {
+      "ordinal": 17,
+      "owner": "FIX-OX-01",
+      "base_old_start": 50,
+      "base_old_count": 0,
+      "checkpoint_new_start": 101,
+      "checkpoint_new_count": 121,
+      "checkpoint_patch_sha256": "6dbdf5d4baa78dc392465f695f64d14162e097de9dca2366ac6b9849fe7a3163"
+    }
+  ],
+  "current_candidate_owner_hunks": [
+    {
+      "ordinal": 4,
+      "owner": "FIX-OX-01",
+      "base_old_start": 14,
+      "base_old_count": 0,
+      "mapped_current_new_start": 32,
+      "mapped_current_new_count": 10,
+      "application_new_start": 32,
+      "application_patch_sha256": "dc132264105d9e2d0199a138343bc32b185d8158900e586f742fdea1bb70ddd2",
+      "patch_path": "owner-patches/04-FIX-OX-01.patch"
+    },
+    {
+      "ordinal": 17,
+      "owner": "FIX-OX-01",
+      "base_old_start": 50,
+      "base_old_count": 0,
+      "mapped_current_new_start": 101,
+      "mapped_current_new_count": 124,
+      "application_new_start": 101,
+      "application_patch_sha256": "1baf38f25783b3f98c1c4494df53a1443e0f8fe1c215e3a138c59a00e972d902",
+      "patch_path": "owner-patches/17-FIX-OX-01.patch",
+      "checkpoint_count": 121,
+      "card_correction_folded_into_owner_block": true,
+      "checkpoint_patch_path": "checkpoint-owner-subhunks/17-FIX-OX-01.patch"
+    }
+  ],
+  "coordinate_transform": "none; insertion hunk new_count is nonzero; accepted predecessor source diff is empty",
+  "A_reverse_order": [
+    17,
+    4
+  ],
+  "A_expected_sha256": "c3b97f4709e1912b07b40f47a955e908908b217145e960e75232c1e1afab0eae",
+  "B_reverse_order": [],
+  "B_expected_sha256": "ecc44850a0ae3d0b8106739b6d7616fab35210d72fe5f954d15694dbca0a1dcb"
+}

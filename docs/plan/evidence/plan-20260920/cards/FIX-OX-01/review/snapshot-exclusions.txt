@@ -1,0 +1,1 @@
+Excluded from review snapshot: .env.test, .libra internals, local credential/config files, and all files outside the explicit plan/workflow/card evidence bundle.

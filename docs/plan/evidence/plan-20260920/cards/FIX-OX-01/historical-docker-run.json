@@ -1,0 +1,45 @@
+{
+  "tag": "v0.42.25",
+  "tag_ref_object": {
+    "sha": "b2ff118de8045843db0caddd6f2bf4dab48bcec6",
+    "type": "tag",
+    "url": "https://api.github.com/repos/gitmono-dev/mega2/git/tags/b2ff118de8045843db0caddd6f2bf4dab48bcec6"
+  },
+  "tag_object_sha": "b2ff118de8045843db0caddd6f2bf4dab48bcec6",
+  "tag_message": "v0.42.25: HP-25 Libra view URL smoke",
+  "tag_target": {
+    "sha": "4b645af3035f8186f0ffdab3e39754667959afe0",
+    "type": "commit",
+    "url": "https://api.github.com/repos/gitmono-dev/mega2/git/commits/4b645af3035f8186f0ffdab3e39754667959afe0"
+  },
+  "workflow_run": {
+    "databaseId": 37704534619,
+    "displayTitle": "v0.42.25: HP-25 Libra view URL smoke",
+    "event": "push",
+    "headBranch": "v0.42.25",
+    "headSha": "4b645af3035f8186f0ffdab3e39754667959afe0",
+    "status": "completed",
+    "conclusion": "failure",
+    "createdAt": "2026-10-07T23:50:43Z",
+    "url": "https://github.com/gitmono-dev/mega2/actions/runs/37704534619"
+  },
+  "docker_job": {
+    "name": "docker",
+    "status": "completed",
+    "conclusion": "failure",
+    "startedAt": "2026-10-07T23:50:47Z",
+    "completedAt": "2026-10-07T23:51:13Z",
+    "url": "https://github.com/gitmono-dev/mega2/actions/runs/37704534619/job/113075641864"
+  },
+  "failed_step": {
+    "name": "Build and push",
+    "number": 6,
+    "status": "completed",
+    "conclusion": "failure",
+    "startedAt": "2026-10-07T23:50:59Z",
+    "completedAt": "2026-10-07T23:51:07Z"
+  },
+  "failure_reason": "Buildx reported the prepaid Docker Build Cloud build-minute limit of 1200 reached.",
+  "source_workflow_excerpt_file": "historical-v0.42.25-workflow-excerpt.txt",
+  "failed_run_log_excerpt_file": "historical-v0.42.25-failure-excerpt.txt"
+}

@@ -1,0 +1,155 @@
+{
+  "source_workflow_sha256": "ecc44850a0ae3d0b8106739b6d7616fab35210d72fe5f954d15694dbca0a1dcb",
+  "channel_script_sha256": "ee58ae9102200286fef8a33b47c709d902733c4319933899b22be821638a60a5",
+  "publish_script_sha256": "00a670792f61997cdf9e9f94aa78223726b6bd4c57da1478ec525bc21127dbad",
+  "channel_cases": [
+    {
+      "case": "older_patch_not_minor_or_global_latest",
+      "ref_name": "v1.2.3",
+      "expected": {
+        "latest": "false",
+        "minor_latest": "false",
+        "minor_tag": "1.2"
+      },
+      "actual": {
+        "latest": "false",
+        "minor_latest": "false",
+        "minor_tag": "1.2"
+      },
+      "exit_code": 0,
+      "stdout": "latest=false\nminor_latest=false\nminor_tag=1.2\n",
+      "stderr": ""
+    },
+    {
+      "case": "current_minor_latest_only",
+      "ref_name": "v1.2.4",
+      "expected": {
+        "latest": "false",
+        "minor_latest": "true",
+        "minor_tag": "1.2"
+      },
+      "actual": {
+        "latest": "false",
+        "minor_latest": "true",
+        "minor_tag": "1.2"
+      },
+      "exit_code": 0,
+      "stdout": "latest=false\nminor_latest=true\nminor_tag=1.2\n",
+      "stderr": ""
+    },
+    {
+      "case": "global_latest_and_minor_latest",
+      "ref_name": "v2.0.0",
+      "expected": {
+        "latest": "true",
+        "minor_latest": "true",
+        "minor_tag": "2.0"
+      },
+      "actual": {
+        "latest": "true",
+        "minor_latest": "true",
+        "minor_tag": "2.0"
+      },
+      "exit_code": 0,
+      "stdout": "latest=true\nminor_latest=true\nminor_tag=2.0\n",
+      "stderr": ""
+    },
+    {
+      "case": "current_tag_missing_from_fetched_tag_set",
+      "ref_name": "v1.2.5",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Current release tag was not fetched\n",
+      "expected_nonzero": true
+    }
+  ],
+  "publish_cases": [
+    {
+      "case": "exactly_two_valid_digests",
+      "digest_files": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "exit_code": 0,
+      "stdout": "true\n",
+      "stderr": "",
+      "docker_log": "buildx imagetools create --tag example/mega2:v1.2.3 --tag example/mega2:1.2.3 example/mega2@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa example/mega2@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nbuildx imagetools inspect --raw example/mega2:v1.2.3\n"
+    },
+    {
+      "case": "zero_digests",
+      "digest_files": [],
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Expected exactly two architecture digests\n",
+      "docker_log": ""
+    },
+    {
+      "case": "one_digest",
+      "digest_files": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Expected exactly two architecture digests\n",
+      "docker_log": ""
+    },
+    {
+      "case": "three_digests",
+      "digest_files": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      ],
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Expected exactly two architecture digests\n",
+      "docker_log": ""
+    },
+    {
+      "case": "malformed_digest",
+      "digest_files": [
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Invalid sha256 digest filename\n",
+      "docker_log": ""
+    },
+    {
+      "case": "short_digest",
+      "digest_files": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Invalid sha256 digest filename\n",
+      "docker_log": ""
+    },
+    {
+      "case": "uppercase_digest",
+      "digest_files": [
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Invalid sha256 digest filename\n",
+      "docker_log": ""
+    },
+    {
+      "case": "wrong_manifest_architectures",
+      "digest_files": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "exit_code": 1,
+      "stdout": "false\n",
+      "stderr": "",
+      "docker_log": "buildx imagetools create --tag example/mega2:v1.2.3 --tag example/mega2:1.2.3 example/mega2@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa example/mega2@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nbuildx imagetools inspect --raw example/mega2:v1.2.3\n"
+    }
+  ],
+  "credentials_used": false,
+  "docker_network_or_registry_used": false
+}

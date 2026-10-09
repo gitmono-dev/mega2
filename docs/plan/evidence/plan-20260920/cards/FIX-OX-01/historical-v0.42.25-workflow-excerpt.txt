@@ -1,0 +1,4 @@
+38:          driver: cloud
+39:          endpoint: "genedna/mono"
+41:      - name: Build and push
+47:          tags: ${{ steps.meta.outputs.tags }}

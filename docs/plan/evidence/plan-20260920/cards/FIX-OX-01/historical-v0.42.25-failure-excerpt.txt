@@ -1,0 +1,11 @@
+docker	UNKNOWN STEP	2026-10-07T23:50:56.2127367Z   driver: cloud
+docker	UNKNOWN STEP	2026-10-07T23:50:59.4045672Z Endpoint:         cloud://genedna/mono_linux-amd64
+docker	UNKNOWN STEP	2026-10-07T23:50:59.4054064Z Endpoint:         cloud://genedna/mono_linux-arm64
+docker	UNKNOWN STEP	2026-10-07T23:50:59.9429985Z       "endpoint": "cloud://genedna/mono_linux-amd64",
+docker	UNKNOWN STEP	2026-10-07T23:50:59.9442637Z       "endpoint": "cloud://genedna/mono_linux-arm64",
+docker	UNKNOWN STEP	2026-10-07T23:51:01.0149136Z       "endpoint": "cloud://genedna/mono_linux-amd64",
+docker	UNKNOWN STEP	2026-10-07T23:51:01.0162164Z       "endpoint": "cloud://genedna/mono_linux-arm64",
+docker	UNKNOWN STEP	2026-10-07T23:51:01.5800560Z 2026/10/07 23:51:01 http2: server: error reading preface from client localhost:0: grpchijack: conn read recvmsg: rpc error: code = ResourceExhausted desc = rpc error: code = ResourceExhausted desc = session cannot start: prepaid build minutes limit of 1200 reached
+docker	UNKNOWN STEP	2026-10-07T23:51:01.5832791Z 2026/10/07 23:51:01 http2: server: error reading preface from client localhost:0: grpchijack: conn read recvmsg: rpc error: code = ResourceExhausted desc = rpc error: code = ResourceExhausted desc = session cannot start: prepaid build minutes limit of 1200 reached
+docker	UNKNOWN STEP	2026-10-07T23:51:06.8062831Z ERROR: failed to build: failed to solve: build cannot proceed prepaid build minutes limit of 1200 reached
+docker	UNKNOWN STEP	2026-10-07T23:51:07.3568856Z ##[error]buildx failed with: ERROR: failed to build: failed to solve: build cannot proceed prepaid build minutes limit of 1200 reached

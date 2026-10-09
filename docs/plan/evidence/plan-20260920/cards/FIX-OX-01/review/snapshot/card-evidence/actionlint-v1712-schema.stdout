@@ -1,0 +1,4 @@
+.github/workflows/docker.yml:107:7: unexpected key "queue" for "concurrency" section. expected one of "cancel-in-progress", "group" [syntax-check]
+    |
+107 |       queue: max
+    |       ^~~~~~
