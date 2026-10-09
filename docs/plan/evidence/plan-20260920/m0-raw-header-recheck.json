@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "verified_at_utc": "2026-10-09 19:44:58 UTC",
+  "verifier_path": "docs/plan/evidence/plan-20260920/verify-raw-commit-headers.py",
+  "verifier_sha256": "adaa5bb031c582111521ec0c7cb268059465eb59e996bfe7f66eb2ba63ea8c38",
+  "checks": [
+    {
+      "commit_sha": "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+      "exit_code": 0,
+      "stdout": "commit_sha=81f2e5ce1b26177f0b0956504b17129c8a5e2cec Signed-off-by-matches-committer=true gpgsig=true"
+    },
+    {
+      "commit_sha": "9a6d705364cad0f501e3f081e524b7225059001d",
+      "exit_code": 0,
+      "stdout": "commit_sha=9a6d705364cad0f501e3f081e524b7225059001d Signed-off-by-matches-committer=true gpgsig=true"
+    }
+  ],
+  "scope": "Raw gpgsig-header presence and final Signed-off-by trailer email match; no cryptographic signature verification."
+}

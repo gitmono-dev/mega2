@@ -1,0 +1,9 @@
+Read-only independent Claude Code review for Mega2 plan-20260920.
+
+Target file: docs/plan/plan-20260920.md
+Expected SHA-256: ff3c36e9c66522171053ec692385b8eea029c66da4e6142856e7d9bfdfbc1ddf
+The calling process verified that hash before starting. This snapshot deliberately excludes VCS metadata, environment files, and three high-sensitivity candidate source/test files flagged by the local credential scan. Use only Read, Glob, and Grep. Do not use Bash, edit files, change task state, or execute any task card.
+
+Review the whole plan for internal consistency and executable M0 gating, especially the closure of all six R27 non-blocking P3 findings: amendment source/test/workflow delta and hunk-level owner gate; all-current-uncommitted-path commit scope while only the target card advances lifecycle; status synchronization after PASS; checkpoint-inclusive FIX-OX-04 baseline wording; raw Signed-off-by trailer identity check and the explicit no-cryptographic-verification claim. Also check all 306 cards remain pending; dependencies, ordering and owner mapping are closed; FIX-OX-08 handles Apple's zero-count reverse hunk semantics and exact-byte A/B; prior R24/R25/R26 findings remain closed; amendment recovery and local signature checks are executable; and no version bump, push, tag, release or versioned Docker publication occurs before final OX-284's single patch bump/release.
+
+Do not require a Codex isolated audit. The user's current gate is Claude Code PASS only. Report P0/P1/P2/P3 findings with exact section/card references and concise remediations. Return literal VERDICT: PASS only if there are no blocking P0/P1/P2 issues; otherwise return VERDICT: FAIL. End the response with exactly one standalone line: VERDICT: PASS or VERDICT: FAIL.
