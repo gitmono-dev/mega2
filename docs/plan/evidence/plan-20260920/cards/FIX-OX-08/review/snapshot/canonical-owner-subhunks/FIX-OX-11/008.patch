@@ -1,0 +1,5 @@
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -30,1 +67,0 @@
+-            type=raw,value=latest

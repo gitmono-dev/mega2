@@ -1,0 +1,7 @@
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -37,3 +72,0 @@
+-        with:
+-          driver: cloud
+-          endpoint: "genedna/mono"

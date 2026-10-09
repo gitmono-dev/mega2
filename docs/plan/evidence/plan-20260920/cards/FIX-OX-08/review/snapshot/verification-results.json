@@ -1,0 +1,41 @@
+{
+  "copy": "B-apply",
+  "scope": "FIX-OX-08-only state after reversing FIX-OX-11 and FIX-OX-01",
+  "results": [
+    {
+      "name": "VER-1",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "-c",
+        "from pathlib import Path; import re; s=Path(\".github/workflows/docker.yml\").read_text(); rows=re.findall(r\"(?m)^\\s+- platform: ([^\\n]+)\\n\\s+runner: ([^\\n]+)\",s); assert rows==[(\"linux/amd64\",\"ubuntu-24.04\"),(\"linux/arm64\",\"ubuntu-24.04-arm\")],rows; assert \"runs-on: ${{ matrix.runner }}\" in s; assert \"EXPECTED_ARCH: ${{ matrix.arch }}\" in s; assert \"test \\\"$RUNNER_ARCH\\\" = \\\"$EXPECTED_ARCH\\\"\" in s; assert \"platforms: ${{ matrix.platform }}\" in s; assert \"genedna/mono\" not in s; assert \"REGISTRY_IMAGE: ${{ vars.DOCKER_USER }}/mega2\" in s"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "VER-2",
+      "command": [
+        "sh",
+        "-c",
+        "actionlint -version && actionlint .github/workflows/docker.yml"
+      ],
+      "exit_code": 0,
+      "stdout": "1.7.12\ninstalled by building from source\nbuilt with go1.26.1 compiler for darwin/arm64\n",
+      "stderr": ""
+    },
+    {
+      "name": "VER-3",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "-c",
+        "from pathlib import Path; import re; s=Path(\".github/workflows/docker.yml\").read_text(); m=re.search(r\"(?ms)^      - name: Free space for the Rust build\\n        run: \\|\\n((?:          [^\\n]*\\n)+)\",s); assert m, \"free-space step missing\"; assert [x[10:] for x in m.group(1).splitlines()]==[\"sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell\",\"df -h /\"]; assert s.index(\"- name: Free space for the Rust build\") < s.index(\"- name: Checkout\")"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "all_plan_verifications_pass": true,
+  "tooling_attempt_note": "An earlier manually assembled VER-3 command over-escaped the regex literal and failed before checking the file. The exact verification was then run successfully as recorded in VER-3-final.*."
+}

@@ -1,0 +1,6 @@
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -49,1 +81,1 @@
+-          outputs: type=registry
++          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true

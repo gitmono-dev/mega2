@@ -1,0 +1,5 @@
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -47,0 +79,1 @@
++          platforms: ${{ matrix.platform }}

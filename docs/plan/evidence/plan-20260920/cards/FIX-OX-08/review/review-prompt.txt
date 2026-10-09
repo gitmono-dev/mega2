@@ -1,0 +1,11 @@
+Read-only independent Claude Code ER-05 review for plan-20260920 card FIX-OX-08.
+
+The M0 plan gate passed Claude review at plan SHA ff3c36e9c66522171053ec692385b8eea029c66da4e6142856e7d9bfdfbc1ddf. The user requires Claude Code PASS only; do not require a Codex audit.
+
+Review the exact FIX-OX-08 owner changes to `.github/workflows/docker.yml` against `comparison/base-docker.yml`, `comparison/checkpoint-docker.yml`, the FIX-OX-08 card text in `plan-card-context.md`, and the per-line owner manifest. The root `.github/workflows/docker.yml` is the B-apply owner-only state: FIX-OX-08 hunks are retained while FIX-OX-11 and FIX-OX-01 hunks are reversed. This is intentionally not the final combined workflow; do not attribute later digest/artifact/manifest owner changes to FIX-OX-08.
+
+Audit the 17 canonical owner sub-hunks and corresponding Apple application patches, including exact line ownership, zero-context coordinates, Apple `new_count=0` `new_start+1` transformation, reverse sort order, no offset/fuzz/reject output, exact-byte canonical full replay, A/B dry-runs and actual application results, and the expected A/B file hashes. Confirm the other six checkpoint source/test paths stayed byte-identical. Check AC-1..AC-7 and VER-1..VER-3 from the plan, including actionlint and the exact free-space allowlist/order. The review package also includes the R26 Apple patch semantic and Libra coordinate fixtures.
+
+The A/B expected outcomes are: A removes all 08/11/01 owners and must equal the base Docker file SHA; B removes 11/01 and must equal the independently reconstructed FIX-OX-08-only file SHA. Only local card acceptance is in scope. Do not recommend a push, tag, version bump, Release, or Docker publication; OX-284 is the unique final patch release gate.
+
+Use only Read, Glob and Grep. Do not use Bash, edit files, execute commands, alter status, or perform any task card. Report P0/P1/P2/P3 findings with precise references and fixes. Return literal `VERDICT: PASS` only if there are no blocking P0/P1/P2 issues. End with exactly one standalone line `VERDICT: PASS` or `VERDICT: FAIL`.

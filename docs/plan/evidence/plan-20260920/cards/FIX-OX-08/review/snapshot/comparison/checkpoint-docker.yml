@@ -1,0 +1,221 @@
+name: docker-build-push
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGISTRY_IMAGE: ${{ vars.DOCKER_USER }}/mega2
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: X64
+            slug: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: ARM64
+            slug: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Validate stable release tag
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$REF_NAME" =~ ^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]]; then
+            echo "Docker publication requires a stable v<major>.<minor>.<patch> tag" >&2
+            exit 1
+          fi
+
+      - name: Check native runner architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: test "$RUNNER_ARCH" = "$EXPECTED_ARCH"
+
+      - name: Free space for the Rust build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Extract image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+
+      - name: Export digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.slug }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker:
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: mega2-docker-publish
+      queue: max
+    steps:
+      - name: Require both native builds
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: test "$BUILD_RESULT" = success
+
+      - name: Checkout tags for channel guard
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide mutable tags
+        id: channels
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import re
+          import subprocess
+
+          def version(tag):
+              match = re.fullmatch(r"v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)", tag)
+              return tuple(map(int, match.groups())) if match else None
+
+          current = version(os.environ["REF_NAME"])
+          if current is None:
+              raise SystemExit("Docker publication requires a stable v<major>.<minor>.<patch> tag")
+          tags = subprocess.check_output(["git", "tag", "--list", "v*"], text=True).splitlines()
+          versions = [parsed for tag in tags if (parsed := version(tag)) is not None]
+          if current is not None and os.environ["REF_NAME"] not in tags:
+              raise SystemExit("Current release tag was not fetched")
+          latest = current is not None and current == max(versions)
+          minor_versions = [item for item in versions if current is not None and item[:2] == current[:2]]
+          minor_latest = current is not None and current == max(minor_versions)
+          print(f"latest={str(latest).lower()}")
+          print(f"minor_latest={str(minor_latest).lower()}")
+          print(f"minor_tag={current[0]}.{current[1]}" if current is not None else "minor_tag=")
+          PY
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Extract image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ steps.channels.outputs.minor_latest }}
+            type=raw,value=latest,enable=${{ steps.channels.outputs.latest }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Publish multi-platform manifest
+        shell: bash
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          REF_NAME: ${{ github.ref_name }}
+          MINOR_TAG: ${{ steps.channels.outputs.minor_tag }}
+          PUBLISH_MINOR: ${{ steps.channels.outputs.minor_latest }}
+          PUBLISH_LATEST: ${{ steps.channels.outputs.latest }}
+        run: |
+          shopt -s nullglob
+          digest_files=("$RUNNER_TEMP"/digests/*)
+          if (( ${#digest_files[@]} != 2 )); then
+            echo "Expected exactly two architecture digests" >&2
+            exit 1
+          fi
+
+          sources=()
+          for file in "${digest_files[@]}"; do
+            digest="${file##*/}"
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+            sources+=("$REGISTRY_IMAGE@sha256:$digest")
+          done
+
+          immutable_tags=()
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            if [[ "$tag" != "$REGISTRY_IMAGE:latest" && "$tag" != "$REGISTRY_IMAGE:$MINOR_TAG" ]]; then
+              immutable_tags+=(--tag "$tag")
+            fi
+          done <<< "$META_TAGS"
+          if (( ${#immutable_tags[@]} == 0 )); then
+            echo "No immutable version tags were generated" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create "${immutable_tags[@]}" "${sources[@]}"
+          docker buildx imagetools inspect --raw "$REGISTRY_IMAGE:$REF_NAME" |
+            jq -e '[.manifests[] | select(.platform.os == "linux") | .platform.architecture] | sort == ["amd64", "arm64"]'
+
+          if [[ "$PUBLISH_MINOR" == true ]]; then
+            docker buildx imagetools create --tag "$REGISTRY_IMAGE:$MINOR_TAG" "$REGISTRY_IMAGE:$REF_NAME"
+          fi
+          if [[ "$PUBLISH_LATEST" == true ]]; then
+            docker buildx imagetools create --tag "$REGISTRY_IMAGE:latest" "$REGISTRY_IMAGE:$REF_NAME"
+          fi

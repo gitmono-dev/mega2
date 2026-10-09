@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "archived_at_utc": "2026-10-09 20:21:58 UTC",
+  "reviewed_plan_sha256": "ff3c36e9c66522171053ec692385b8eea029c66da4e6142856e7d9bfdfbc1ddf",
+  "review_snapshot_path": "snapshot/",
+  "review_snapshot_file_count": 234,
+  "review_snapshot_manifest_sha256": "0d8fbe7ef5b90a88ca219dfe528731b1e687d19195bfefaeb665979f7f43062c",
+  "claude_code_version": "2.1.288",
+  "review_command": "claude --print --permission-mode plan --permission-prompts none --tools Read,Glob,Grep",
+  "allowed_tools": [
+    "Read",
+    "Glob",
+    "Grep"
+  ],
+  "exit_code": 0,
+  "literal_verdict": "VERDICT: PASS",
+  "findings": {
+    "P0": 0,
+    "P1": 0,
+    "P2": 0,
+    "P3": 6
+  },
+  "report_path": "claude-review.md",
+  "report_sha256": "ee68033cbc0578815baf22ad4142ccf21c730c485a6fca49dfad9a8dc7b4481e",
+  "p3_closure_path": "../R28-P3-closure.md",
+  "credentials_excluded": true,
+  "note": "The report is the original Claude Code output recovered from this task history; its reviewed snapshot and manifest are preserved byte-for-byte."
+}
