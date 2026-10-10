@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-10-10 08:32:34 UTC",
+  "plan_sha256": "9d77fdd00b291fabbf960c41cca35025e5b81d3c9fbb35d75d63d3e3a4bdf75e",
+  "checkpoint_commit": "81f2e5ce1b26177f0b0956504b17129c8a5e2cec",
+  "base_commit": "ea0d3d5d2efe9d722c3f4defc8d7347503e2df47",
+  "origin_fetch": "libra fetch origin main; already up to date",
+  "post_fetch_origin_main": "ea0d3d5d2efe9d722c3f4defc8d7347503e2df47",
+  "r32_amendment_commit": "4ee151795cd44c2301f20ea1135c1e128083b1de",
+  "r32_amendment_parent": "c10776d9e84d2301e953d673fe0e0c70dad1fb1a",
+  "current_head_after_FIX_OX_04_commit": "8780d0c579564eade9dda6b4831991e21b2f2dfd",
+  "clean_worktree_status": "## main...origin/main [ahead 11]\n?? docs/plan/evidence/plan-20260920/m0-source-diff-post-amendment.delta.diff",
+  "base_to_checkpoint_source_hunk_sha256": "523463a369f411930a2f7bbe4fbeea26928aa2388edba442df371c46778aff0e",
+  "base_to_checkpoint_expected_hunk_sha256": "523463a369f411930a2f7bbe4fbeea26928aa2388edba442df371c46778aff0e",
+  "checkpoint_to_r32_source_delta": {
+    "exit": 0,
+    "path_count": 3,
+    "paths": [
+      ".github/workflows/docker.yml",
+      "src/api/router/snapshot_content_tests.rs",
+      "src/api/router/snapshot_objects_bounded_tests.rs"
+    ],
+    "raw_diff": "m0-source-diff-post-amendment.delta.diff",
+    "raw_diff_sha256": "d68f73a666c98070d1659d2c71e2fc87d098fb3ddeaeb69be54230efb2209cf8",
+    "raw_diff_bytes": 5476,
+    "hunk_count": 15,
+    "hunks": [
+      {
+        "path": ".github/workflows/docker.yml",
+        "header": "@@ -196,1 +196,4 @@",
+        "hunk_sha256": "0c6e5443643cb3e20e1c3521ca72b50cae6571894d1d8887e20402c651708d1f",
+        "added_lines": 4,
+        "deleted_lines": 1,
+        "owner": "FIX-OX-01",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-01/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_content_tests.rs",
+        "header": "@@ -894,18 +893,0 @@",
+        "hunk_sha256": "891942df5e29d4678123b2500a0f43fdee3332b51a837c7365e5dd233f60cdee",
+        "added_lines": 0,
+        "deleted_lines": 18,
+        "owner": "FIX-OX-02",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-02/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_content_tests.rs",
+        "header": "@@ -914,1 +896,1 @@",
+        "hunk_sha256": "ee36157197dffc48d5c1159764085defeccbd10ea5c2e21288d0320bde52ad58",
+        "added_lines": 1,
+        "deleted_lines": 1,
+        "owner": "FIX-OX-02",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-02/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_content_tests.rs",
+        "header": "@@ -923,4 +904,0 @@",
+        "hunk_sha256": "c35e73919bd739bf0989cf05dd8d8e0a88909b2a3fac5bacbe9f4935d0845199",
+        "added_lines": 0,
+        "deleted_lines": 4,
+        "owner": "FIX-OX-02",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-02/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_content_tests.rs",
+        "header": "@@ -958,0 +937,22 @@",
+        "hunk_sha256": "b5bffb337729073587244b4e4e86ba74932555798f8341f3b3047eb2472e3fbb",
+        "added_lines": 22,
+        "deleted_lines": 0,
+        "owner": "FIX-OX-02",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-02/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_content_tests.rs",
+        "header": "@@ -964,0 +965,4 @@",
+        "hunk_sha256": "64b38dc565e5a6f01fd202282459bd62c2874cf34627bba63371000af239648c",
+        "added_lines": 4,
+        "deleted_lines": 0,
+        "owner": "FIX-OX-02",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-02/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_content_tests.rs",
+        "header": "@@ -973,3 +977,1 @@",
+        "hunk_sha256": "7d8688730cceb3f1f830248a9d69dfd009163e6c861528b413acb1eec404f3fa",
+        "added_lines": 1,
+        "deleted_lines": 3,
+        "owner": "FIX-OX-02",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-02/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+        "header": "@@ -355,1 +355,7 @@",
+        "hunk_sha256": "83f2c93e1a9af3c2c62174a5428d90e708127ccdf4670270664e96600e58d675",
+        "added_lines": 7,
+        "deleted_lines": 1,
+        "owner": "FIX-OX-09",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-09/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+        "header": "@@ -362,1 +368,1 @@",
+        "hunk_sha256": "a04008a8da883886345284bb56b59ee35a254fd47cbcf84c911bfb23b1c4f8b3",
+        "added_lines": 1,
+        "deleted_lines": 1,
+        "owner": "FIX-OX-09",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-09/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+        "header": "@@ -368,4 +373,0 @@",
+        "hunk_sha256": "c3a4ff435808bd515c3346efe87fc2db0876113d42f1f2b6d9939fcbbd804299",
+        "added_lines": 0,
+        "deleted_lines": 4,
+        "owner": "FIX-OX-09",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-09/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+        "header": "@@ -374,1 +376,1 @@",
+        "hunk_sha256": "9a90796cda1567a0e3022b77b761daffe0fe8f5fcff2bf9a6f3c581fde27166f",
+        "added_lines": 1,
+        "deleted_lines": 1,
+        "owner": "FIX-OX-09",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-09/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+        "header": "@@ -388,1 +390,1 @@",
+        "hunk_sha256": "05efeb486ea0cbca8970ea28e71fff8be795b742ea7ef7e01a2fa454024a2791",
+        "added_lines": 1,
+        "deleted_lines": 1,
+        "owner": "FIX-OX-09",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-09/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+        "header": "@@ -393,0 +396,14 @@",
+        "hunk_sha256": "e79916b2c65115979e0e6bca4e202c8b3e669c1fc8e89dc83c7f7341fda7f2ac",
+        "added_lines": 14,
+        "deleted_lines": 0,
+        "owner": "FIX-OX-09",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-09/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+        "header": "@@ -396,1 +412,5 @@",
+        "hunk_sha256": "5834a589b816b5fce5503727c0c9223b9e9ae78ccca05d8198d108b36ffcdf7e",
+        "added_lines": 5,
+        "deleted_lines": 1,
+        "owner": "FIX-OX-09",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-09/README.md"
+      },
+      {
+        "path": "src/api/router/snapshot_objects_bounded_tests.rs",
+        "header": "@@ -403,1 +423,1 @@",
+        "hunk_sha256": "1100c1a4ac1a8db4edd43588dba3503c4f7d7925670b71b5299fa9fac553194f",
+        "added_lines": 1,
+        "deleted_lines": 1,
+        "owner": "FIX-OX-09",
+        "owner_state": "locally-accepted",
+        "owner_evidence": "cards/FIX-OX-09/README.md"
+      }
+    ],
+    "mapping_result": "Every +/- line in each zero-context hunk is assigned to the single accepted card owner listed; no path or hunk is unowned."
+  },
+  "c107_to_r32_amendment_source_test_workflow_changed_paths": [],
+  "r32_amendment_to_current_FIX_OX_04_commit_source_test_workflow_changed_paths": [],
+  "result": "PASS_WITH_PRIOR_ACCEPTED_OWNER_DELTAS",
+  "scope_note": "The three checkpoint-to-amendment paths are prior accepted card deltas (FIX-OX-01, FIX-OX-02, FIX-OX-09), not changes introduced by the R32 plan amendment. The direct c107-to-R32 amendment source/test/workflow delta is empty. The original base-to-checkpoint source hunk SHA is unchanged.",
+  "base_to_checkpoint_recheck_exit": 0,
+  "base_to_checkpoint_source_hunk_bytes": 21662,
+  "clean_worktree_status_after_fetch_before_delta_artifact": "## main...origin/main [ahead 11]",
+  "working_tree_status_after_delta_artifact_capture": "## main...origin/main [ahead 11]\n?? docs/plan/evidence/plan-20260920/m0-source-diff-post-R32.json\n?? docs/plan/evidence/plan-20260920/m0-source-diff-post-amendment.delta.diff"
+}

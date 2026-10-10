@@ -1,0 +1,126 @@
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+index 6cce142..ee3bf94 100644
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -196,1 +196,4 @@
+-            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
++            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
++              echo "Invalid sha256 digest filename" >&2
++              exit 1
++            fi
+diff --git a/src/api/router/snapshot_content_tests.rs b/src/api/router/snapshot_content_tests.rs
+index 2c417e0..05beaa2 100644
+--- a/src/api/router/snapshot_content_tests.rs
++++ b/src/api/router/snapshot_content_tests.rs
+@@ -894,18 +893,0 @@
+-        if publication_enabled {
+-            mono.initialize_native_publication(
+-                storage.config().mst2.instance_uuid.as_deref().unwrap(),
+-            )
+-            .await
+-            .unwrap();
+-            publish_native_push(&storage, "/project", old_tip.id, &new_tip).await;
+-            let head = mono
+-                .read_native_publication_head(
+-                    storage.config().mst2.instance_uuid.as_deref().unwrap(),
+-                )
+-                .await
+-                .unwrap();
+-            assert_eq!(head.token.sequence, 1);
+-            assert!(head.token.certificate.is_some());
+-            assert_eq!(head.root.commit, commit.id.to_string());
+-            assert_eq!(head.root.tree, root.id.to_string());
+-        }
+@@ -914,1 +896,1 @@
+-            storage,
++            storage: storage.clone(),
+@@ -923,4 +904,0 @@
+-        for (path, mut fault) in options.initial_chunk_faults {
+-            fault.oid = fixture_source_oid(&handler, &project, path).await;
+-            counts.chunk_faults.lock().unwrap().push(fault);
+-        }
+@@ -958,0 +937,22 @@
++        if publication_enabled {
++            mono.initialize_native_publication(
++                storage.config().mst2.instance_uuid.as_deref().unwrap(),
++            )
++            .await
++            .unwrap();
++            publish_native_push(&storage, "/project", old_tip.id, &new_tip).await;
++            let head = mono
++                .read_native_publication_head(
++                    storage.config().mst2.instance_uuid.as_deref().unwrap(),
++                )
++                .await
++                .unwrap();
++            assert_eq!(head.token.sequence, 1);
++            assert!(head.token.certificate.is_some());
++            assert_eq!(head.root.commit, commit.id.to_string());
++            assert_eq!(head.root.tree, root.id.to_string());
++        }
++        for (path, mut fault) in options.initial_chunk_faults {
++            fault.oid = fixture_source_oid(&handler, &project, path).await;
++            counts.chunk_faults.lock().unwrap().push(fault);
++        }
+@@ -964,0 +965,4 @@
++        let mut resolve_request = json!({"target":{"kind":"latest"},"scope":"/project"});
++        if let Some(lease_seconds) = options.lease_seconds {
++            resolve_request["lease_seconds"] = json!(lease_seconds);
++        }
+@@ -973,3 +977,1 @@
+-                    .body(Body::from(
+-                        json!({"target":{"kind":"latest"},"scope":"/project","lease_seconds":options.lease_seconds.unwrap_or(600)}).to_string(),
+-                    ))
++                    .body(Body::from(resolve_request.to_string()))
+diff --git a/src/api/router/snapshot_objects_bounded_tests.rs b/src/api/router/snapshot_objects_bounded_tests.rs
+index 86551ed..d1350b5 100644
+--- a/src/api/router/snapshot_objects_bounded_tests.rs
++++ b/src/api/router/snapshot_objects_bounded_tests.rs
+@@ -355,1 +355,7 @@
+-    let expected_digest = digest(&objects[0].1);
++    let first_digest = digest(&objects[0].1);
++    let second_digest = digest(&objects[1].1);
++    let request = request_bytes(&objects);
++    let mut conflicting_request: Value = serde_json::from_slice(&request).unwrap();
++    conflicting_request["items"][1]["expected_digest"] =
++        json!(format!("sha256:{}", hex_of(&first_digest)));
++    let conflicting_request = serde_json::to_vec(&conflicting_request).unwrap();
+@@ -362,1 +368,1 @@
+-                digest: expected_digest,
++                digest: first_digest,
+@@ -368,4 +373,0 @@
+-    let request = json!({"items":[
+-        {"path":"/object-000","expected_digest":format!("sha256:{}", hex_of(&digest(&objects[0].1)))},
+-        {"path":"/object-001","expected_digest":format!("sha256:{}", hex_of(&digest(&objects[0].1)))},
+-    ]});
+@@ -374,1 +376,1 @@
+-            .send("POST", "objects", Body::from(request.to_string()))
++            .send("POST", "objects", Body::from(conflicting_request))
+@@ -388,1 +390,1 @@
+-                digest: expected_digest,
++                digest: second_digest,
+@@ -393,0 +396,14 @@
++    assert_objects(
++        fixture
++            .send("POST", "objects", Body::from(request.clone()))
++            .await,
++        &request,
++        &objects,
++    )
++    .await;
++    fixture.counts.assert(2, 16384);
++
++    let mut wrong_expected_digest: Value = serde_json::from_slice(&request).unwrap();
++    wrong_expected_digest["items"][1]["expected_digest"] =
++        json!(format!("sha256:{}", "00".repeat(32)));
++    fixture.counts.reset();
+@@ -396,1 +412,5 @@
+-            .send("POST", "objects", Body::from(request.to_string()))
++            .send(
++                "POST",
++                "objects",
++                Body::from(wrong_expected_digest.to_string()),
++            )
+@@ -403,1 +423,1 @@
+-    fixture.counts.assert(2, 16384);
++    fixture.counts.assert(0, 0);
