@@ -98,14 +98,7 @@ async fn release_lease(fixture: &Fixture) {
 
 #[tokio::test]
 async fn cold_raw_get_earns_source_proof_then_serves_one_current_stream_with_exact_headers() {
-    let fixture = Fixture::new_rooted_with_options(
-        &[],
-        FixtureOptions {
-            lease_seconds: Some(3600),
-            ..Default::default()
-        },
-    )
-    .await;
+    let fixture = Fixture::new().await;
     let response = fixture.send("GET", "blob?path=/file", Body::empty()).await;
     assert_eq!(response.status(), 200);
     assert_eq!(
@@ -196,14 +189,7 @@ async fn raw_memory_pressure_rejects_before_cold_proof_or_delivery_source_io() {
 
 #[tokio::test]
 async fn raw_missing_or_forged_receipt_and_real_stored_corruption_fail_without_rebuilding() {
-    let fixture = Fixture::new_rooted_with_options(
-        &[],
-        FixtureOptions {
-            lease_seconds: Some(3600),
-            ..Default::default()
-        },
-    )
-    .await;
+    let fixture = Fixture::new().await;
     fixture.map("/file").await;
     for missing in [true, false] {
         fixture.counts.reset();

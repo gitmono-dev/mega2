@@ -1,0 +1,23 @@
+{
+  "card": "FIX-OX-12",
+  "base_commit": "1b9a2547b53a6c8e7a567ed0694321254c126810",
+  "source_path": "src/api/router/snapshot_raw_blob_tests.rs",
+  "a_source": {
+    "path": "verification/A-source.rs",
+    "sha256": "7def8e48e8d631bffd1466b55b9e64f44dcc00d43e64109588984db690f10f66"
+  },
+  "b_source": {
+    "path": "verification/B-source.rs",
+    "sha256": "600d9ae359dd7315fc68ae671c9ff460ac84d3e6798a12e89f7bafd3e1711072"
+  },
+  "diff": {
+    "path": "verification/A-B-source.diff",
+    "sha256": "5bf08a694c082c1300bae2048fc5be36319469002026c245da540438ed937fcb",
+    "hunk_count": 2,
+    "scope": "Only the two targeted test fixture constructors set lease_seconds to 3600; all test assertions remain unchanged."
+  },
+  "tests": [
+    "cold_raw_get_earns_source_proof_then_serves_one_current_stream_with_exact_headers",
+    "raw_missing_or_forged_receipt_and_real_stored_corruption_fail_without_rebuilding"
+  ]
+}

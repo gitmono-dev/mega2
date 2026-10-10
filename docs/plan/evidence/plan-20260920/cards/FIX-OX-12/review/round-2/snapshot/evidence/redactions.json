@@ -1,0 +1,13 @@
+{
+  "policy": "ER-11",
+  "redactions": [
+    {
+      "file": "verification/B-VER-1.stderr",
+      "reason": "Local execution checkout path in cargo compiler output",
+      "replacement": "[REDACTED_EXECUTION_PATH]",
+      "occurrences": 1,
+      "original_sha256": "519f6fcc5ff91e1bdee73b7b98f985b6d31bd2800fe83087cdfadb94fa622d2e",
+      "sanitized_sha256": "8709333c2dabd9522bc8ab21f47593cb1d1b0ebca0c492bffa8d4d61335fb6d6"
+    }
+  ]
+}
