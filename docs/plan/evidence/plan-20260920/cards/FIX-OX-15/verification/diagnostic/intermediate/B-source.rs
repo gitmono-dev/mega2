@@ -472,12 +472,7 @@ async fn wait_owners(
         }
     })
     .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "actual HTTP callers did not reach the same-source install gate: expected {owners} owners, observed {}",
-            flight.test_owner_count()
-        )
-    });
+    .expect("actual HTTP callers did not reach the same-source install gate");
 }
 
 fn held_leader(fixture: &Fixture) -> (Arc<Notify>, Arc<Notify>, tokio::task::JoinHandle<Response>) {
@@ -492,7 +487,7 @@ fn held_leader(fixture: &Fixture) -> (Arc<Notify>, Arc<Notify>, tokio::task::Joi
 
 #[tokio::test]
 async fn same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt() {
-    let fixture = Fixture::new_without_publication().await;
+    let fixture = Fixture::new().await;
     let budget = MemoryBudget::new(8 * 1024 * 1024);
     let repository = PostgresChunkMapRepository::new(
         fixture

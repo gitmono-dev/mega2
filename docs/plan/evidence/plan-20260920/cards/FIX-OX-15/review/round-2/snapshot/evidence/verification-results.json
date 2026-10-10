@@ -1,0 +1,77 @@
+{
+  "card": "FIX-OX-15",
+  "runs": [
+    {
+      "id": "A-VER-1",
+      "variant": "A",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt -- --test-threads=1",
+      "exit_code": 101,
+      "exit_path": "verification/A-VER-1.exit",
+      "stdout_path": "verification/A-VER-1.stdout",
+      "stdout_sha256": "065524c08ca541c382322d1573c40eab67d70fddf627c3773846d23da4f7f08a",
+      "stderr_path": "verification/A-VER-1.stderr",
+      "stderr_sha256": "a42ad68e7148fb3d49e736f359b3e0bc3bb0ca400fecd74f5a35dbf9022c7e41",
+      "result": "baseline failure: the same-source install-gate owner timeout"
+    },
+    {
+      "id": "B-final-VER-1",
+      "variant": "B",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt -- --test-threads=1",
+      "exit_code": 0,
+      "exit_path": "verification/B-final-VER-1.exit",
+      "stdout_path": "verification/B-final-VER-1.stdout",
+      "stdout_sha256": "5b79278d698771b603efcfc3a1dcd8a296ab2a4d614d0ec8e9f1cc1a6232f101",
+      "stderr_path": "verification/B-final-VER-1.stderr",
+      "stderr_sha256": "2e7290a82898d5daadeb9f650b0ab9d0b95ea63a104a840b242bfed0ad00c60a",
+      "result": "passed: 1 passed; 0 failed; 2463 filtered out; 11.34 seconds"
+    }
+  ],
+  "format_check": {
+    "command": "cargo +nightly fmt --all --check",
+    "exit_code": 0,
+    "exit_path": "verification/fmt-final.exit",
+    "stdout_path": "verification/fmt-final.stdout",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_path": "verification/fmt-final.stderr",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "result": "passed"
+  },
+  "clippy_check": {
+    "command": "cargo clippy --all-targets --all-features -- -D warnings",
+    "exit_code": 0,
+    "exit_path": "verification/clippy-final.exit",
+    "stdout_path": "verification/clippy-final.stdout",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_path": "verification/clippy-final.stderr",
+    "stderr_sha256": "ca2f250f1fa3411fda4cb82630647d7d0e37273fa2dccd6bf5eec0236859ba1c",
+    "result": "passed with warnings denied"
+  },
+  "required_repository_checks": {
+    "source .env.test && cargo test --all": {
+      "state": "running",
+      "stdout_path": "verification/cargo-test-all.stdout",
+      "stderr_path": "verification/cargo-test-all.stderr",
+      "exit_path": "verification/cargo-test-all.exit",
+      "observed_failures_before_completion": true
+    },
+    "cargo build": {
+      "state": "not run"
+    },
+    "cargo build --tests": {
+      "state": "not run"
+    }
+  },
+  "runtime_note": "Cargo test stderr contains the macOS linker warning __eh_frame section too large; the existing plan assigns final C build warnings to OX-284.",
+  "diagnostic_runs": [
+    {
+      "id": "B-publication-enabled-VER-1",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt -- --test-threads=1",
+      "exit_code": 101,
+      "stdout_path": "verification/diagnostic/published-fixture-attempt/B-publication-enabled-VER-1.stdout",
+      "stderr_path": "verification/diagnostic/published-fixture-attempt/B-publication-enabled-VER-1.stderr",
+      "result": "repository and 8 MiB budget installed; receipt-write gate reached; seven concurrent callers timed out before route entry; PostgreSQL mst2_route_enter advisory-lock wait is evidenced in J-debug.stdout; assigned to FIX-OX-18",
+      "stdout_sha256": "69aa215a647686f50a335da8861bdf4b9370e249ee6068e5c1418fb789e1c135",
+      "stderr_sha256": "23abf6ca84f37a51ef024edc0cc2de2876b5510f5fc71ec6714685329748be31"
+    }
+  ]
+}

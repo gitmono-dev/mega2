@@ -1,0 +1,140 @@
+{
+  "card": "FIX-OX-15",
+  "files": [
+    {
+      "path": "verification/B-final-VER-1.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "aea6baba9b24909b382137e6d411def1158e96e6fa2c934b3710b0b7109f8f97",
+      "sanitized_sha256": "2e7290a82898d5daadeb9f650b0ab9d0b95ea63a104a840b242bfed0ad00c60a"
+    },
+    {
+      "path": "verification/clippy-final.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "30f17700a70fb39aab9dd96d7f97de802ac84610564b52a6d22077e06c656d6c",
+      "sanitized_sha256": "ca2f250f1fa3411fda4cb82630647d7d0e37273fa2dccd6bf5eec0236859ba1c"
+    },
+    {
+      "path": "verification/diagnostic/launcher-wrapper/A-login-shell.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "81b9d5e91c7bb3a73506e3445e4fb1369b60b4578ad4965bd9ecbce3a8b8f96b",
+      "sanitized_sha256": "496752a1739301d790961a9e49284f769f5897fe4ecab279aa721458d3af6669"
+    },
+    {
+      "path": "verification/diagnostic/published-fixture-attempt/B-publication-enabled-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "523491836c97efad7b2438cc1842b5ac71deaa9cda51f1067b35f8925b5dd225",
+      "sanitized_sha256": "65b5f9c1d23fbb458d7121467ea38d3bb8ec906f65fdd8aec035fcbbf0f358cc"
+    },
+    {
+      "path": "verification/diagnostic/published-fixture-attempt/B-publication-enabled-VER-1.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "049efa0c4876f3bac733b9c5e285929496f221c75fd3c6a21093e9595e1bac63",
+      "sanitized_sha256": "23abf6ca84f37a51ef024edc0cc2de2876b5510f5fc71ec6714685329748be31"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/C-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "4eed28b43d79e5bdb8932cb92c5e585b60b233b5dc0621b592f2fd4ace8d8480",
+      "sanitized_sha256": "80d9447ab6eb87d7aac373cc055a4ba8ff24cb113074df648f0890dc7d2205a5"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/D-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "0eebcb6d402fd2c68e750e9713526a4c05af4305027807ba3552df89fb977492",
+      "sanitized_sha256": "89117ee53802a4f1eba2df645b5bc0867c85617abf2328d12ed2caa9d98a1c82"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/E-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "8d1a88c67c51b1e0a83a0f57b46372fa86a4f8260f08fa91ce5fcac9fed3e8d6",
+      "sanitized_sha256": "afe707728192b9e471a8131c88a17dbb74b32613f381e46713982de9ff0f6054"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/F-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "0bcb4ef6ab0c44dea6f713e5cff326b289c9efc462119f75da2506d7d87e2ed0",
+      "sanitized_sha256": "463cafebb70fe1c6945b89d3c2a16d8ea123bf388c73ec34de327b9f0eb2b4e8"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/G-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "588f4963021c315fcaed282d4da689c2f083219255e5b4d0459d85d223a4c130",
+      "sanitized_sha256": "895a359b762c44fdaa662ab44d7058cb132c50048d0774e474a1bd427d7e0f32"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/H-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "7f9c1c9ca197d012b56efd7bc3960d003de24a99b69c36f48207dbd0bf166f37",
+      "sanitized_sha256": "c2dc3bf79cb504cc42a7810a472cd09022a65fb32eba35f58333a6b5a411972e"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/I-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "b415ea6d504c150eaea47c4f54ae35000db67a3e67ea045dbba46896141f00bf",
+      "sanitized_sha256": "cdc2c47584a9200b390ead7b466fdc9ce94fb578a0c6ee13186b0961097fa70b"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/I2-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "2ef4dffd114a7782529cfa000aa3fa6a89dc79cb7f11c7979d486ed1f2390583",
+      "sanitized_sha256": "1e8e05d570db91d2c4d525f3c17f032035bab9f7d7894ec3798fe255395a30ee"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/J-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "b79680074f3797ce3d58dcfe2777b72bcbcffecb672042ea23c326abb520db96",
+      "sanitized_sha256": "aa3045dfd4de704325c5a35f3d6294b9b14477aaed42e07a9c40350456cd53aa"
+    },
+    {
+      "path": "verification/diagnostic/route-lock-investigation/K-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "85ed4e216ac7095a23629ae108337924b3ede18406602fef6dd69262d64475e9",
+      "sanitized_sha256": "d150ec4b7df7782e6f4b189e92b3830de6b911586f56d6753d545235a6061e78"
+    }
+  ]
+}

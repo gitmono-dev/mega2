@@ -492,7 +492,7 @@ fn held_leader(fixture: &Fixture) -> (Arc<Notify>, Arc<Notify>, tokio::task::Joi
 
 #[tokio::test]
 async fn same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt() {
-    let fixture = Fixture::new_without_publication().await;
+    let fixture = Fixture::new_with_database_connections(16).await;
     let budget = MemoryBudget::new(8 * 1024 * 1024);
     let repository = PostgresChunkMapRepository::new(
         fixture
@@ -541,7 +541,55 @@ async fn same_source_cold_actual_http_callers_share_one_full_pass_and_each_reche
     let other_app = router(&other_state);
     let request = fixture.request("GET", "chunk-map?path=/file", Body::empty());
     let rejected = tokio::spawn(async move { other_app.oneshot(request).await.unwrap() });
-    wait_owners(&flight, 9).await; // Leader, seven callers and this observer.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    eprintln!(
+        "FIX-OX-15 diagnostic: owners={}, whole={}, receipt_reads={}, receipt_writes={}, same_finished={:?}, other_finished={}",
+        flight.test_owner_count(),
+        fixture.counts.whole.load(Ordering::SeqCst),
+        fixture.counts.receipt_reads.load(Ordering::SeqCst),
+        fixture.counts.receipt_writes.load(Ordering::SeqCst),
+        joined.iter().map(tokio::task::JoinHandle::is_finished).collect::<Vec<_>>(),
+        rejected.is_finished(),
+    );
+    let reached_callers = timeout(Duration::from_secs(10), async {
+        loop {
+            if flight.test_owner_count() == 9 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    eprintln!(
+        "FIX-OX-15 timeout diagnostic: reached_callers={reached_callers}, owners={}, whole={}, receipt_reads={}, receipt_writes={}, same_finished={:?}, other_finished={}",
+        flight.test_owner_count(),
+        fixture.counts.whole.load(Ordering::SeqCst),
+        fixture.counts.receipt_reads.load(Ordering::SeqCst),
+        fixture.counts.receipt_writes.load(Ordering::SeqCst),
+        joined.iter().map(tokio::task::JoinHandle::is_finished).collect::<Vec<_>>(),
+        rejected.is_finished(),
+    );
+    if !reached_callers {
+        let config = fixture.state.storage.config();
+        let probe = crate::jupiter::storage::init::postgres_connection(&config.database)
+            .await
+            .unwrap();
+        let activity = probe
+            .query_all_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT pid::text || '|' || COALESCE(application_name,'') || '|' || COALESCE(state,'') || '|' || COALESCE(wait_event_type,'') || '|' || COALESCE(wait_event,'') || '|' || pg_catalog.pg_blocking_pids(pid)::text || '|' || left(query,240) AS activity FROM pg_catalog.pg_stat_activity WHERE datname=pg_catalog.current_database() AND pid<>pg_catalog.pg_backend_pid() ORDER BY pid".to_owned(),
+            ))
+            .await
+            .unwrap();
+        for row in activity {
+            eprintln!(
+                "FIX-OX-15 pg activity {}",
+                row.try_get::<String>("", "activity").unwrap()
+            );
+        }
+    }
+    assert!(reached_callers, "same-source callers never reached install gate");
     fixture.counts.assert(1, fixture.raw.len());
     release.notify_one();
     let expected = success_json(leader.await.unwrap()).await;

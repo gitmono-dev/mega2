@@ -1,0 +1,6 @@
+{
+  "snapshot_manifest_path": "snapshot/snapshot-manifest.json",
+  "snapshot_manifest_sha256": "3852b4129b353dfd92968a485be7146bd8c6de124be88ab1d2b1c2dd484a9669",
+  "payload_file_count": 30,
+  "issues": []
+}

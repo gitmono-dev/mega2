@@ -492,7 +492,7 @@ fn held_leader(fixture: &Fixture) -> (Arc<Notify>, Arc<Notify>, tokio::task::Joi
 
 #[tokio::test]
 async fn same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt() {
-    let fixture = Fixture::new_without_publication().await;
+    let fixture = Fixture::new().await;
     let budget = MemoryBudget::new(8 * 1024 * 1024);
     let repository = PostgresChunkMapRepository::new(
         fixture
@@ -541,6 +541,16 @@ async fn same_source_cold_actual_http_callers_share_one_full_pass_and_each_reche
     let other_app = router(&other_state);
     let request = fixture.request("GET", "chunk-map?path=/file", Body::empty());
     let rejected = tokio::spawn(async move { other_app.oneshot(request).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    eprintln!(
+        "FIX-OX-15 diagnostic: owners={}, whole={}, receipt_reads={}, receipt_writes={}, same_finished={:?}, other_finished={}",
+        flight.test_owner_count(),
+        fixture.counts.whole.load(Ordering::SeqCst),
+        fixture.counts.receipt_reads.load(Ordering::SeqCst),
+        fixture.counts.receipt_writes.load(Ordering::SeqCst),
+        joined.iter().map(tokio::task::JoinHandle::is_finished).collect::<Vec<_>>(),
+        rejected.is_finished(),
+    );
     wait_owners(&flight, 9).await; // Leader, seven callers and this observer.
     fixture.counts.assert(1, fixture.raw.len());
     release.notify_one();

@@ -1,0 +1,20 @@
+
+running 1 test
+test api::router::snapshot_router::content::tests::persisted_chunk_maps::same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt ... FAILED
+
+failures:
+
+---- api::router::snapshot_router::content::tests::persisted_chunk_maps::same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt stdout ----
+FIX-OX-15 diagnostic: owners=2, whole=1, receipt_reads=0, receipt_writes=1, same_finished=[false, false, false, false, false, false], other_finished=false
+FIX-OX-15 timeout diagnostic: reached_callers=false, owners=2, whole=1, receipt_reads=0, receipt_writes=1, same_finished=[false, false, false, false, false, false], other_finished=false
+
+thread 'api::router::snapshot_router::content::tests::persisted_chunk_maps::same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt' (40349585) panicked at src/api/router/snapshot_persisted_chunk_map_tests.rs:573:5:
+same-source callers never reached install gate
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    api::router::snapshot_router::content::tests::persisted_chunk_maps::same_source_cold_actual_http_callers_share_one_full_pass_and_each_recheck_their_receipt
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2463 filtered out; finished in 35.88s
+

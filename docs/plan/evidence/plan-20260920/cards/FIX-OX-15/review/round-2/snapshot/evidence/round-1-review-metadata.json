@@ -1,0 +1,33 @@
+{
+  "card": "FIX-OX-15",
+  "round": 1,
+  "reviewer": "Claude Code",
+  "mode": "read-only",
+  "exit_code": 0,
+  "verdict": "FAIL",
+  "prompt_sha256": "226f8e7814fe13851d1139313cfeb1451cb14003c00a1a04db327835a48c6659",
+  "snapshot_manifest_sha256": "3852b4129b353dfd92968a485be7146bd8c6de124be88ab1d2b1c2dd484a9669",
+  "report_sha256": "dd657d22b53fdcaeb6ebd354d4058a730453f237c880320a02812cff1fadd38f",
+  "findings": [
+    {
+      "severity": "P1",
+      "status": "blocking, evidence gap",
+      "summary": "No current status and base-versus-worktree hashes for temporarily instrumented production source files; also no proof the publication-disabled fixture helper exists in base."
+    },
+    {
+      "severity": "P2",
+      "status": "non-blocking, follow-up required",
+      "summary": "Published-fixture attempt reached receipt-write hold but seven callers stalled on rooted metadata route admission; assign investigation to FIX-OX-18."
+    },
+    {
+      "severity": "P2",
+      "status": "non-blocking for local commit; before push/final C",
+      "summary": "Repository-wide gates were unfinished; record completed test failures and attribution and run cargo build plus cargo build --tests."
+    },
+    {
+      "severity": "P3",
+      "status": "evidence cleanup",
+      "summary": "A/B hunk count, diagnostic filenames, task-card excerpt, and plan write-set provenance needed alignment."
+    }
+  ]
+}

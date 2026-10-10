@@ -1,0 +1,2 @@
+682:     async fn new_without_publication() -> Self {
+1439:     let fixture = Fixture::new_without_publication().await;

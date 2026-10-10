@@ -1,0 +1,45 @@
+Round-2 review of FIX-OX-15, read-only against the inline packet with manifest SHA `e3dede49…`. The round-1 P1 is closed, the two P2 items are correctly carried as non-blocking follow-ups, and the P3 cleanups are done. No new P0 or P1.
+
+## Resolution of prior findings
+
+**1. P1 restoration proof: closed.**
+- `verification/source-restoration/worktree-status.stdout` line 1 shows `main...origin/main [ahead 16]`. Every entry is `??` under the card's evidence directory except the last two lines, which are unstaged ` M` for `docs/plan/plan-status.md` and the planned test file. No staged entries exist, so nothing is hidden from the diff.
+- `verification/source-restoration/tracked-source-diff.stdout` is the raw `libra diff -- src` output and contains exactly the two hunks of `code/A-B-source.diff`. The diff-stat file reports one file, 28 insertions, 2 deletions, which matches a hand count of the hunks.
+- `verification/source-restoration-check.json` records base and current SHA-256 for every production file that has a diagnostic snapshot: `snapshot_content.rs`, `snapshot_router.rs`, `qualified_metadata_reader.rs`, and the fixture helper file `snapshot_content_tests.rs`. All four match the base. This covers the sources of the `eprintln!` lines seen in `evidence/J-debug.stdout`. The test-helper base hash `5be36364…` equals the current hash, and `verification/base-fixture-helper.txt` shows the helper defined at line 682 and used at line 1439 in that file.
+- Plan hash `24f1be3f…` equals the candidate in the `plan-status.md` header, and the plan-file diff is empty with exit 0.
+- Only the planned test source changes under `src/`. The ledger and evidence changes are execution records.
+
+**2. P2 route contention: adequate as a tracked follow-up, with one caveat (non-blocking).**
+- The scope is honest. The final diff touches no production file, the test still drives the real router and a live `PostgresChunkMapRepository`, and both `evidence/README.md` and the audit record in `plan-status.md` section 四 state both causes and that the contention is unattributed.
+- Caveat: `context/follow-up-card-FIX-OX-18.md` is frozen and does not name FIX-OX-15, `mst2_route_enter`, or the seven concurrent publication-enabled callers. Its ACs and VERs are satisfiable by three focused runs of four other tests. If FIX-OX-18 closes on those alone, the contention seen in `evidence/J-debug.stdout` goes uninvestigated. Record in the FIX-OX-18 execution ledger that its scope must include a publication-enabled rerun of this test. The J-debug output also shows one same-source caller finishing before reaching the gate with zero receipt reads, and its response status was not captured. That is useful input for FIX-OX-18.
+
+**3. P2 repository-wide gates: separation accurately stated (non-blocking).**
+- `evidence/verification-results.json` lists `cargo test --all` as running with failures observed, and both builds as not run. Neither the README nor the ledger calls any of them passed.
+- The README commits to recording the completed failure names, attribution, and both build results before push. The ledger says the same gates must be resolved at OX-284 final C but omits the "before push" obligation. Add that phrase to the ledger when the results are recorded.
+
+**4. P3 evidence fixes: done.**
+- `code/A-B-source.diff` has two hunks, headers at lines 3 and 17. `ab-manifest.json` and the README both describe two hunks and label them.
+- The intermediate run is now `evidence/B-publication-enabled-VER-1.*` with the same digests as round-1's `B-VER-1.*`, so it was renamed, not regenerated.
+- `context/task-card.md` starts at the FIX-OX-15 heading.
+- The round-1 report SHA `dd657d22…` in the ledger matches the snapshot manifest entry for `evidence/round-1-review.md`.
+
+## Fresh checks
+
+- **AC-1 proven.** Budget and repository installed and `set(...).is_ok()` asserted before `held_leader`, roughly `code/B-...tests.rs` lines 495 to 516. Budget use above 4 MiB is asserted after the hold is entered.
+- **AC-2 proven.** Observer and all seven callers spawn only after `entered.notified()` completes.
+- **AC-3 proven.** Owner count 9, one whole read and one receipt write before and after release, each caller's map equals the leader's, eight receipt reads, owners drain to 1.
+- **AC-4 proven.** The other-storage caller returns 502 `INTEGRITY_ERROR` with one receipt read and zero whole reads.
+- A and B-final use the exact VER-1 command. Exits are 101 and 0, and the exit-file digests are the correct hashes of `101\n`, `0\n`, and `1\n`. fmt and clippy run the exact AGENTS.md commands with exit 0.
+- Sanitized stderr digests agree across `redactions.json`, `verification-results.json`, and the manifest. No secrets or absolute paths appear.
+- Both B runs compile `mega2 v0.42.25`. No version bump, tag, or release.
+- `context/user-execution-instructions.md` matches the README and ledger: push allowed after review plus commit, bump and tag and release only at OX-284.
+
+## Remaining P3 items, all non-blocking
+
+- `source-restoration-check.json` records exit codes but not the commands for `source-diff-check` and for producing `base-fixture-helper.txt`.
+- `verification/diagnostic/intermediate/B-source.rs` is not mapped to a source path in the restoration JSON.
+- `plan-status.md` still repeats the FIX-OX-13/14/15 sentences in the header and sections 一, 二, 三, 四, 六, and 七. The 计划一览 row for plan-20260920 has a stray fifth table cell, and the section 四 bullet ends with an unclosed parenthesis.
+- The user's push override is recorded in evidence and the ledger but not in the frozen plan's revision history. This is consistent with the frozen-card policy applied to prior cards.
+- The card's `Lifecycle / Acceptance` fields remain `pending` and empty in the frozen plan. Live state lives in the ledger, consistent with prior accepted cards.
+
+VERDICT: PASS
