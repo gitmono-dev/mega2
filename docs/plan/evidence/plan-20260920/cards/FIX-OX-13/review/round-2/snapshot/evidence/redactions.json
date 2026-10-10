@@ -1,0 +1,21 @@
+{
+  "policy": "ER-11",
+  "redactions": [
+    {
+      "file": "verification/B-VER-1.stderr",
+      "reason": "Absolute local execution checkout path in Cargo compiler output",
+      "replacement": "[REDACTED_EXECUTION_PATH]",
+      "occurrences": 1,
+      "original_sha256": "c200db5dc1bbecc67fc3f5fa24b2d4f436ea907cb853286d29da0fd37f3658a3",
+      "sanitized_sha256": "508268005b01ce02c9899523612ed7839263e00150549a67b4b2f5ae7a1bbde4"
+    },
+    {
+      "file": "verification/CLIPPY.stderr",
+      "reason": "Absolute local execution checkout path in compiler output",
+      "replacement": "[REDACTED_EXECUTION_PATH]",
+      "occurrences": 1,
+      "original_sha256": "74b73344e424a3597fdb49e689d6ba67c988c793b30a3e65f4e65fbba696a085",
+      "sanitized_sha256": "90926b93c024d388d56b92a086d4658047f3f529d6882168d16368fd706b3ba3"
+    }
+  ]
+}

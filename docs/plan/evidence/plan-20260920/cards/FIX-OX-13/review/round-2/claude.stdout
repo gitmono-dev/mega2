@@ -1,0 +1,55 @@
+# FIX-OX-13 ER-05 review, round 2
+
+**Result: PASS.** The missing clippy result that failed round 1 is now in the packet: the command exited 0 with no warnings. Everything else checks out, and I found no P0, P1 or P2 issues.
+
+I used only the snapshot, edited no repository files, and ran no tests. The only file I wrote is the plan-mode notes file outside the repository (`~/.claude/plans/fix-ox-13-er-05-review-generic-ember.md`).
+
+## Snapshot integrity
+- `snapshot-manifest.json` hashes to `d7c78ab5…8e58897`, as stated in the request.
+- All 44 payload SHA-256 values match. No files are missing or unlisted.
+- The four `code/*.rs` files are byte-identical to the copies in `evidence/verification/`.
+- `context/round-1-review.md` hashes to `df5d41b9…717b`, which matches `README.md:26`.
+
+## Round-1 P1-1 (missing clippy): closed
+- `CLIPPY.exit` is `0` and `CLIPPY.stdout` is empty.
+- `CLIPPY.stderr` has 687 lines and contains no `warning:` or `error` lines. It ends with `Checking mega2 v0.42.25 ([REDACTED_EXECUTION_PATH])` and `Finished`.
+- The command in `verification-results.json` (`clippy_check`) is exactly `cargo clippy --all-targets --all-features -- -D warnings`, and the stdout, stderr and exit hashes in that entry all match the files.
+- The redaction is recorded in `redactions.json`, and its sanitized hash `90926b93…` matches the file. `README.md:19` reports the result.
+
+## 1. Diff scope and meaning: OK
+- Running `diff -u` again on the A and B copies reproduces `A-B-source.diff` exactly (SHA `2ab82242…`, both diff exits 1).
+- There are three hunks, one per projection:
+  - `B-qualified_metadata_gc_tests.rs:89-93`
+  - `B-qualified_metadata_source_revision_tests.rs:261`
+  - `B-qualified_metadata_source_revision_tests.rs:279`
+- Each projection becomes `CASE WHEN <bool> THEN 1::bigint ELSE 0::bigint END`. This is valid PostgreSQL and returns BIGINT.
+- The `assert_eq!(…, 1)` checks are unchanged, so true still passes, and false or NULL (now mapped to 0) still fails.
+- Only the two `*_tests.rs` files change. No production SQL, schema or function return type is touched.
+
+## 2. A and B runs: OK
+- **A runs:** all three exit 101. Each `A-VER-n.stdout:10` shows code `42846`, `cannot cast type boolean to bigint`.
+  - The error positions are 34 for VER-1 and 129 for VER-2 and VER-3, which match the original `::bigint` locations.
+  - `base-source-check.json` shows both A copies match base commit `7c15d36f…`; its own hash `9fc974b3…` matches the manifests.
+- **B runs:** all three exit 0, each with `1 passed; 0 failed; 2463 filtered out` at `B-VER-n.stdout:5`.
+- **Format check:** `FMT.exit` is 0, and stdout and stderr are both empty.
+- The run commands match the card's VER-1 to VER-3 word for word.
+
+## 3. README wording and round-1 notes: OK
+- **Wording (round-1 P3-3):** `README.md:3` now says "A/B gates support `locally-accepted`; ER-05 PASS is still required before continuing". This follows the template order at `plan-template.md:197` (A/B pass → `locally-accepted` → ER-05).
+- **Reused A test executable (round-1 P3-1):** disclosed in `README.md:9` and `base-source-check.json` (`a_runs_note`), with source equality to the base commit now recorded.
+- **Linker warning (round-1 P3-2):** the `__eh_frame section too large` warning appears in all six test stderr files and is disclosed in `README.md:20`. The final C build gate remains with OX-284.
+
+## 4. Consistency, redaction and secrets: OK
+- Exit codes, harness times and hashes agree across `ab-manifest.json`, `verification-results.json`, `redactions.json` and the raw files.
+- Outside `context/`, a scan found no `/Users`, `/Volumes`, `/private`, `/home` or `/tmp` paths, and no credential-like strings. The only hits are inside `context/`, in the round-1 review's search note and the task card's citation of the source log.
+
+## 5. G-12 release boundary: OK
+- The build output shows `mega2 v0.42.25`, and the card's `Version increment` and `Release write set` are both `N/A`.
+- No version bump, push, tag or Release is recorded. OX-284 is still the only release point (`README.md:30`).
+
+## Findings
+- **P0 / P1 / P2:** none.
+- **P3-1 (new, non-blocking):** the clippy result is not tied to a specific source tree. `verification-results.json` (`clippy_check`) records no B source hash or run timestamp. The B tree is the only plausible input, and OX-284's final C runs clippy again, so this does not block.
+- **P3-2 (carried forward, non-blocking):** OX-284's final C must still resolve the macOS linker warning against the 0-warning build rule in AGENTS.md.
+
+VERDICT: PASS

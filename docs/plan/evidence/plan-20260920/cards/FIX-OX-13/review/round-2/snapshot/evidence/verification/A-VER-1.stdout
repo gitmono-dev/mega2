@@ -1,0 +1,18 @@
+
+running 1 test
+test jupiter::storage::qualified_metadata_family::tests::gc_tests::admitted_orphan_gc_preserves_replay_identity_and_advances_exact_generation ... FAILED
+
+failures:
+
+---- jupiter::storage::qualified_metadata_family::tests::gc_tests::admitted_orphan_gc_preserves_replay_identity_and_advances_exact_generation stdout ----
+
+thread 'jupiter::storage::qualified_metadata_family::tests::gc_tests::admitted_orphan_gc_preserves_replay_identity_and_advances_exact_generation' (40137967) panicked at src/jupiter/storage/qualified_metadata_family_tests.rs:68:10:
+called `Result::unwrap()` on an `Err` value: Query(SqlxError(Database(PgDatabaseError { severity: Error, code: "42846", message: "cannot cast type boolean to bigint", detail: None, hint: None, position: Some(Original(34)), where: None, schema: None, table: None, column: None, data_type: None, constraint: None, file: Some("parse_expr.c"), line: Some(2782), routine: Some("transformTypeCast") })))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    jupiter::storage::qualified_metadata_family::tests::gc_tests::admitted_orphan_gc_preserves_replay_identity_and_advances_exact_generation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2463 filtered out; finished in 10.94s
+

@@ -1,0 +1,24 @@
+{
+  "card": "FIX-OX-13",
+  "round": 2,
+  "reviewer": "Claude Code",
+  "mode": "read-only",
+  "completed_at": "2026-10-10T11:36:42Z",
+  "exit_code": 0,
+  "verdict": "PASS",
+  "prompt_sha256": "dfaae35a5161edeea3e203c7501b6bf7e0f7656ccb2405e633fef3d5bc958060",
+  "snapshot_manifest_sha256": "d7c78ab582c303ab235c495f90af8d85ad5e23f0310c5bc91ba92e0f24e58897",
+  "report_sha256": "341d679cbd57e5c9e217e4f65f55b5f991e078d490d850e094fa89ac82c15fe0",
+  "findings": [
+    {
+      "severity": "P3",
+      "status": "non-blocking; carry to OX-284",
+      "summary": "The clippy result is not bound to an exact source hash or run time; OX-284 final C will rerun clippy."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking; carry to OX-284",
+      "summary": "The macOS linker warning must be resolved against the zero-warning build rule in OX-284 final C."
+    }
+  ]
+}

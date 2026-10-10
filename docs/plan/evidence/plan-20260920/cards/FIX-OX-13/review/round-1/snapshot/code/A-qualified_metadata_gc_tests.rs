@@ -86,11 +86,7 @@ async fn admitted_orphan_gc_preserves_replay_identity_and_advances_exact_generat
         .unwrap();
     let first = write_rooted(&writer, "gc-generation-one", &plan, payload.clone()).await;
     assert_eq!(
-        count(
-            &q,
-            "SELECT CASE WHEN mst2_metadata_gc_enabled() THEN 1::bigint ELSE 0::bigint END",
-        )
-        .await,
+        count(&q, "SELECT mst2_metadata_gc_enabled()::bigint").await,
         1
     );
     assert!(

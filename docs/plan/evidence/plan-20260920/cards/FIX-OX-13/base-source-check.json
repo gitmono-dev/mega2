@@ -1,0 +1,23 @@
+{
+  "card": "FIX-OX-13",
+  "base_commit": "7c15d36f287060756610b56adb1b893dd0d57ca7",
+  "checks": [
+    {
+      "source_path": "src/jupiter/storage/qualified_metadata_gc_tests.rs",
+      "libra_show_command": "libra show 7c15d36f287060756610b56adb1b893dd0d57ca7:src/jupiter/storage/qualified_metadata_gc_tests.rs",
+      "a_copy_path": "verification/A-qualified_metadata_gc_tests.rs",
+      "base_sha256": "b0d9d32c3098c94acbe222c4fbe906a2c94f56635f08bca71497a454966ccad3",
+      "a_copy_sha256": "b0d9d32c3098c94acbe222c4fbe906a2c94f56635f08bca71497a454966ccad3",
+      "match": true
+    },
+    {
+      "source_path": "src/jupiter/storage/qualified_metadata_source_revision_tests.rs",
+      "libra_show_command": "libra show 7c15d36f287060756610b56adb1b893dd0d57ca7:src/jupiter/storage/qualified_metadata_source_revision_tests.rs",
+      "a_copy_path": "verification/A-qualified_metadata_source_revision_tests.rs",
+      "base_sha256": "ee192d5ed7f5a4f4cbda088f55c4c09d25735d735464d209f4ca8c2b3e031e6c",
+      "a_copy_sha256": "ee192d5ed7f5a4f4cbda088f55c4c09d25735d735464d209f4ca8c2b3e031e6c",
+      "match": true
+    }
+  ],
+  "a_runs_note": "All A tests ran before candidate source edits at the recorded base HEAD. Cargo reused an existing test executable, so A stderr has no fresh compile line; the A source files independently match the base commit. OX-284 final C includes full build gates."
+}

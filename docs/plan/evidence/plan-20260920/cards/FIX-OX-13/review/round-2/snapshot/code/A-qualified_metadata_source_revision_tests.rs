@@ -258,7 +258,7 @@ async fn current_source_revision_uses_captured_core_relations_under_temp_shadow(
     q.execute_unprepared("CREATE TEMP TABLE mega_tree(id bigint,tree_id text,sub_trees bytea);
         CREATE TEMP TABLE mst2_rooted_source_tree_revision(tree_id text,tree_row_id bigint,revision uuid,body_digest bytea,valid boolean)")
         .await.unwrap();
-    assert_eq!(count(&q,&format!("SELECT CASE WHEN {}.mst2_route_source_tree_matches(split_part(tagged_tree_oid,':',2),source_revision,source_body_digest) THEN 1::bigint ELSE 0::bigint END
+    assert_eq!(count(&q,&format!("SELECT {}.mst2_route_source_tree_matches(split_part(tagged_tree_oid,':',2),source_revision,source_body_digest)::bigint
         FROM mst2_metadata_source_root_attestation",identifier(&namespace.core_schema))).await,1);
 }
 
@@ -276,7 +276,7 @@ async fn current_source_revision_share_fence_orders_real_source_update_after_rea
     writer.install_pages(&intent, &[payload]).await.unwrap();
     writer.finalize(&intent).await.unwrap();
     let read = q.begin().await.unwrap();
-    assert_eq!(count(&read,&format!("SELECT CASE WHEN {}.mst2_route_source_tree_matches(split_part(tagged_tree_oid,':',2),source_revision,source_body_digest) THEN 1::bigint ELSE 0::bigint END
+    assert_eq!(count(&read,&format!("SELECT {}.mst2_route_source_tree_matches(split_part(tagged_tree_oid,':',2),source_revision,source_body_digest)::bigint
         FROM mst2_metadata_source_root_attestation",identifier(&namespace.core_schema))).await,1);
     let core_writer = core.clone();
     let (ready, received) = tokio::sync::oneshot::channel();

@@ -1,0 +1,35 @@
+--- docs/plan/evidence/plan-20260920/cards/FIX-OX-13/verification/A-qualified_metadata_gc_tests.rs	2026-10-10 19:16:39
++++ docs/plan/evidence/plan-20260920/cards/FIX-OX-13/verification/B-qualified_metadata_gc_tests.rs	2026-10-10 19:18:35
+@@ -86,7 +86,11 @@
+         .unwrap();
+     let first = write_rooted(&writer, "gc-generation-one", &plan, payload.clone()).await;
+     assert_eq!(
+-        count(&q, "SELECT mst2_metadata_gc_enabled()::bigint").await,
++        count(
++            &q,
++            "SELECT CASE WHEN mst2_metadata_gc_enabled() THEN 1::bigint ELSE 0::bigint END",
++        )
++        .await,
+         1
+     );
+     assert!(
+--- docs/plan/evidence/plan-20260920/cards/FIX-OX-13/verification/A-qualified_metadata_source_revision_tests.rs	2026-10-10 19:16:39
++++ docs/plan/evidence/plan-20260920/cards/FIX-OX-13/verification/B-qualified_metadata_source_revision_tests.rs	2026-10-10 19:18:35
+@@ -258,7 +258,7 @@
+     q.execute_unprepared("CREATE TEMP TABLE mega_tree(id bigint,tree_id text,sub_trees bytea);
+         CREATE TEMP TABLE mst2_rooted_source_tree_revision(tree_id text,tree_row_id bigint,revision uuid,body_digest bytea,valid boolean)")
+         .await.unwrap();
+-    assert_eq!(count(&q,&format!("SELECT {}.mst2_route_source_tree_matches(split_part(tagged_tree_oid,':',2),source_revision,source_body_digest)::bigint
++    assert_eq!(count(&q,&format!("SELECT CASE WHEN {}.mst2_route_source_tree_matches(split_part(tagged_tree_oid,':',2),source_revision,source_body_digest) THEN 1::bigint ELSE 0::bigint END
+         FROM mst2_metadata_source_root_attestation",identifier(&namespace.core_schema))).await,1);
+ }
+ 
+@@ -276,7 +276,7 @@
+     writer.install_pages(&intent, &[payload]).await.unwrap();
+     writer.finalize(&intent).await.unwrap();
+     let read = q.begin().await.unwrap();
+-    assert_eq!(count(&read,&format!("SELECT {}.mst2_route_source_tree_matches(split_part(tagged_tree_oid,':',2),source_revision,source_body_digest)::bigint
++    assert_eq!(count(&read,&format!("SELECT CASE WHEN {}.mst2_route_source_tree_matches(split_part(tagged_tree_oid,':',2),source_revision,source_body_digest) THEN 1::bigint ELSE 0::bigint END
+         FROM mst2_metadata_source_root_attestation",identifier(&namespace.core_schema))).await,1);
+     let core_writer = core.clone();
+     let (ready, received) = tokio::sync::oneshot::channel();
