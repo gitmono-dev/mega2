@@ -1,0 +1,6 @@
+
+running 1 test
+test api::router::snapshot_router::content::tests::rooted_metadata::actual_q_body_callers_recheck_only_returned_current_file_facts ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2463 filtered out; finished in 34.18s
+

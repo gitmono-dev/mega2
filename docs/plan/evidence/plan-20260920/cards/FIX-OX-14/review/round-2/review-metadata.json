@@ -1,0 +1,34 @@
+{
+  "card": "FIX-OX-14",
+  "round": 2,
+  "reviewer": "Claude Code",
+  "mode": "read-only",
+  "completed_at": "2026-10-10T11:55:19Z",
+  "exit_code": 0,
+  "verdict": "PASS",
+  "prompt_sha256": "3f8804a774048ae7801011cc98e978639783d1e835e04cdcd5d074089896183d",
+  "snapshot_manifest_sha256": "44702415226db5f8299f07d4a8b384071c42d0cbaefde5fec0279b80f506a517",
+  "report_sha256": "e7c193c3658bc30ec6e0e6b4a88f5c187cdcdf6591dd530c23145af536572f2e",
+  "findings": [
+    {
+      "severity": "P3",
+      "status": "non-blocking evidence-label note",
+      "summary": "production-mapping-check.json excerpt_sha256 covers the 25 source lines, not the provenance header; clarify the field name if this evidence is revised."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking evidence-provenance note",
+      "summary": "ab-manifest.json preserves diff bytes and exit code but omits the exact command that produced them."
+    },
+    {
+      "severity": "P3",
+      "status": "carry to OX-284 final C",
+      "summary": "macOS linker warning __eh_frame section too large remains open for final C build disposition."
+    }
+  ],
+  "round_1_resolutions": [
+    "Frozen task-card Current evidence is identified as a checkpoint observation.",
+    "The authoritative plan-status ledger records in-progress / locally-accepted without modifying frozen plan design text.",
+    "Raw libra show stdout/stderr/exit and exact source/excerpt provenance are retained."
+  ]
+}

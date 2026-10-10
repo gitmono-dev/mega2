@@ -1,0 +1,23 @@
+{
+  "card": "FIX-OX-14",
+  "base_commit": "ac7acfdba08a427bc295be71ec5f2f465a515e32",
+  "b_source_check": {
+    "command": "libra show ac7acfdba08a427bc295be71ec5f2f465a515e32:src/api/router/snapshot_rooted_metadata_tests.rs",
+    "sha256": "c72f37a703babe0e92a0ff9556a86033925b671912d667fb87b56f8051700337",
+    "b_copy_sha256": "c72f37a703babe0e92a0ff9556a86033925b671912d667fb87b56f8051700337",
+    "match": true
+  },
+  "a_variant": "A is the exact B source with only the FIX-OX-14-owned retryable expectation changed from true to false; the hunk is identified in plan-20260920.md owner table.",
+  "current_source_note": "The owned test hunk was already present in the checkpoint tree; this card performs card-specific A/B acceptance and review without changing production behavior.",
+  "capture": {
+    "command": "libra show ac7acfdba08a427bc295be71ec5f2f465a515e32:src/api/router/snapshot_rooted_metadata_tests.rs",
+    "exit_code": 0,
+    "stdout_path": "verification/base-source.stdout",
+    "stdout_sha256": "c72f37a703babe0e92a0ff9556a86033925b671912d667fb87b56f8051700337",
+    "stderr_path": "verification/base-source.stderr",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "exit_path": "verification/base-source.exit",
+    "exit_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+  },
+  "captured_output_matches_b_source": true
+}

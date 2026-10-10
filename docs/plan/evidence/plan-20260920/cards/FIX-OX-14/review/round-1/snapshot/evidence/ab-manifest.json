@@ -1,0 +1,24 @@
+{
+  "card": "FIX-OX-14",
+  "base_commit": "ac7acfdba08a427bc295be71ec5f2f465a515e32",
+  "source_path": "src/api/router/snapshot_rooted_metadata_tests.rs",
+  "a_source": {
+    "path": "verification/A-source.rs",
+    "sha256": "97dfbaeed68aaf976fd886d8ca15eb8298b473a1803281bfef72743197e52c07",
+    "variant_note": "Only the target retryable expectation is reversed from true to false."
+  },
+  "b_source": {
+    "path": "verification/B-source.rs",
+    "sha256": "c72f37a703babe0e92a0ff9556a86033925b671912d667fb87b56f8051700337",
+    "variant_note": "Current checkpoint source with retryable expectation true."
+  },
+  "diff": {
+    "path": "verification/A-B-source.diff",
+    "sha256": "56e978573ba6e39bc93aa3007079bb42cf4a0df2a69851d139f6cf2007ce0c66",
+    "hunk_count": 1,
+    "scope": "One test-only boolean expectation hunk; no production source changes."
+  },
+  "diff_exit_path": "verification/A-B-source.diff.exit",
+  "diff_exit_code": 1,
+  "owner_mapping": "FIX-OX-14; plan-20260920.md checkpoint source owner table"
+}

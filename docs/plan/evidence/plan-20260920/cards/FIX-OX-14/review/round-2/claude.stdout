@@ -1,0 +1,34 @@
+I did a read-only review of FIX-OX-14 round 2, using only the 38-file snapshot. I changed nothing and ran no tests. The packet passes: I found no P0, P1 or P2 issues, and two minor, non-blocking P3 notes.
+
+**Integrity.** The SHA-256 of `snapshot-manifest.json` is `44702415…a506a517`, as stated. I recomputed the hash and size of all 38 files and every one matches. There are no files outside the manifest apart from the manifest itself. The copies of the A and B test sources in `code/` and `evidence/verification/` are byte-identical to each other. `base-source.stdout` is byte-identical to `B-source.rs`.
+
+## Checks
+
+1. **P3-1 is resolved.** `context/task-card.md:5` still carries the 35.93s "Current evidence" from the frozen checkpoint. `evidence/README.md` now says plainly that this is a frozen checkpoint observation that predates this card's own runs. The card's own timings are in `verification-results.json`: A took 32.27s and B took 34.18s, both read from the raw stdout.
+2. **P3-2 follows the plan's rule.** The task card keeps its frozen default fields (`pending` / empty, `task-card.md:4`). That is what the plan says should happen (`plan-execution-policy.md`, plan-20260920.md:5 and :79): status lives in `plan-status.md`. The ledger (`context/current-status-row.md`, rows [49], [60], [64], [88] and [161]) records FIX-OX-14 as `in-progress / locally-accepted`, with A/B passed and ER-05 round 1 a literal PASS. The ledger count of 10 locally-accepted cards out of 307 is consistent across those rows. The packet shows no change to the task-plan design text.
+3. **P3-3 is still open and correctly assigned.** `A-VER-1.stderr:2` and `B-VER-1.stderr:2` still show the `__eh_frame section too large` linker warning. The README hands it to OX-284's final C build gate and does not claim it is fixed.
+4. **P3-4 is closed.**
+   - The `libra show` captures for the base test source and the production mapping each have raw stdout, stderr (empty) and exit (0).
+   - The base test-source capture hash `c72f37a7…` equals the B source.
+   - The production-mapping capture hash `d6491306…` matches `source_sha256`.
+   - Lines 497–521 of the capture are byte-identical to the body of `context/production-mapping.rs`, and their hash is `df78b663…` as recorded.
+   - The base commit `ac7acfdb…` is the same in all three files.
+5. **A/B, format and clippy all hold up.**
+   - **Diff:** a real `diff` of A against B shows exactly one change at line 539 (`false` → `true`), matching `A-B-source.diff` (exit 1, one hunk).
+   - **A run:** exit 101, failing with `left: Bool(true) right: false`, which is the expected failure.
+   - **B run:** exit 0, `1 passed; 0 failed; 2463 filtered out`.
+   - **Commands:** both runs used exactly the card's VER-1 command.
+   - **What the test checks** (B lines 524–544): HEAD `/empty` returns 200 with content size 0, and GET returns 503 `METADATA_NOT_READY` with `retryable=true`. `counts.assert(0, 0)` confirms no body is read. This meets AC-1 and AC-2.
+   - **Format:** exit 0, with empty stdout and stderr.
+   - **Clippy:** exit 0, with hashes bound to the B source and base commit.
+   - **Redactions:** the three hashes after redaction match the manifest.
+   - **Round 1:** the report hash `71838c3a…` matches its metadata.
+   - **Secrets and paths:** I found no secrets or tokens, and no absolute local paths. The only paths are the `[REDACTED_EXECUTION_PATH]` placeholders and repo-relative paths.
+6. **The release rule for the plan-wide group (G-12) holds.** The card has `Version increment=N/A` and `Release write set=N/A`, and the build still reports `mega2 v0.42.25`. The README and the ledger both say there has been no push, version bump, tag or release, and that OX-284 is the only release point.
+
+## Findings
+
+- **P3-A** (`evidence/production-mapping-check.json:11`): `excerpt_sha256` (`df78b663…`) is the hash of the 25 source lines only, without the 4-line provenance header in the excerpt file. The whole excerpt file hashes to `8c1b7d30…`. Nothing says which one the field means. The values are correct; it is only a labelling gap.
+- **P3-B** (`evidence/ab-manifest.json`): the command that produced the A/B diff is not recorded. Only its output and exit code are. The diff itself checks out.
+
+VERDICT: PASS

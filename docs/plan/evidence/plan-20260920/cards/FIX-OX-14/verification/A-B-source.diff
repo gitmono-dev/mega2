@@ -1,0 +1,11 @@
+--- docs/plan/evidence/plan-20260920/cards/FIX-OX-14/verification/A-source.rs	2026-10-10 19:41:55
++++ docs/plan/evidence/plan-20260920/cards/FIX-OX-14/verification/B-source.rs	2026-10-10 19:41:55
+@@ -536,7 +536,7 @@
+         fixture.send("GET", "blob?path=/file", Body::empty()).await,
+         503,
+         "METADATA_NOT_READY",
+-        false,
++        true,
+     )
+     .await;
+     fixture.counts.assert(0, 0);
