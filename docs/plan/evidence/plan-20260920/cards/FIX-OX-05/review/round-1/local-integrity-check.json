@@ -1,0 +1,9 @@
+{
+  "performed_by": "execution agent before Claude Code review",
+  "snapshot_manifest_sha256": "2b4bc329015b20f94a3413c9b14ee3ca3b3098a6e0ee4b14a8ae40028cad0cdd",
+  "payload_file_count": 31,
+  "hash_or_size_mismatches": [],
+  "candidate_copy_sha256": "ffd55289399ab38081b0384ace69754c6d9937603b74570bc7af08fb9cbd7955",
+  "current_worktree_source_sha256": "ffd55289399ab38081b0384ace69754c6d9937603b74570bc7af08fb9cbd7955",
+  "candidate_copy_matches_current_worktree": true
+}

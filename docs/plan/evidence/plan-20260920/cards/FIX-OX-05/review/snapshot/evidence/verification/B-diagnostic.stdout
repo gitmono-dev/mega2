@@ -1,0 +1,6 @@
+
+running 1 test
+test api::router::snapshot_router::content::tests::bounded_objects::every_alias_is_admitted_and_exact_oid_body_is_loaded_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2463 filtered out; finished in 771.23s
+

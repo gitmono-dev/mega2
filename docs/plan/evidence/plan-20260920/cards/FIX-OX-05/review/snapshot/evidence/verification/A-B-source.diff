@@ -1,0 +1,18 @@
+--- A/src/api/router/snapshot_objects_bounded_tests.rs
++++ B/src/api/router/snapshot_objects_bounded_tests.rs
+@@ -316,7 +316,14 @@
+     let objects: Vec<_> = (0..128)
+         .map(|i| (format!("alias-{i:03}"), raw.clone()))
+         .collect();
+-    let fixture = fixture(&objects).await;
++    let fixture = Fixture::new_rooted_with_options(
++        &objects,
++        FixtureOptions {
++            lease_seconds: Some(3600),
++            ..Default::default()
++        },
++    )
++    .await;
+     let request = request_bytes(&objects);
+     assert_objects(
+         fixture

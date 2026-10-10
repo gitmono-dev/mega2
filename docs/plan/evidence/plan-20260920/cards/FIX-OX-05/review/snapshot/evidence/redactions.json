@@ -1,0 +1,33 @@
+{
+  "policy": "ER-11: redact the temporary execution-tree root from compiler stderr; all other bytes unchanged",
+  "files": [
+    {
+      "file": "A.stderr",
+      "replacement": "[REDACTED_EXECUTION_PATH]",
+      "occurrences": 1,
+      "original_sha256": "c661d0fb9963c001c67cba8ceca55a5b0af1d6d7d895e2287b5c92a8a71034a5",
+      "redacted_sha256": "0e3bbd6b0e4552cfe443e1f4142d2895120d87db7172eef86682963a3da94a74"
+    },
+    {
+      "file": "B.stderr",
+      "replacement": "[REDACTED_EXECUTION_PATH]",
+      "occurrences": 1,
+      "original_sha256": "13a3f539caa8ac0e11397ca7faee3b2ca364794a5c02c1fc7a126cb25267c2e3",
+      "redacted_sha256": "3099071f5e5cf464c2a820e744c07adc1708b4b82df92a45d02daeaf7afa464e"
+    },
+    {
+      "file": "B-diagnostic.stderr",
+      "replacement": "[REDACTED_EXECUTION_PATH]",
+      "occurrences": 1,
+      "original_sha256": "a9dce64ee48a36cff3cb85a6eac3a8656bd30ca01284428cab0c3033d7105c03",
+      "redacted_sha256": "2c866781dea288376d237b16d0755cf8d80d29e8c191be661e1553a9cd271f10"
+    },
+    {
+      "file": "B-final.stderr",
+      "replacement": "[REDACTED_EXECUTION_PATH]",
+      "occurrences": 1,
+      "original_sha256": "2417a6fe3b4b059a6934329ed68c52a696073e3876b39c603b4839d9ad0bb4e2",
+      "redacted_sha256": "7611af218945e17e283b1e915efe201e7da1a83b1aef840473dc7bf29b74812e"
+    }
+  ]
+}

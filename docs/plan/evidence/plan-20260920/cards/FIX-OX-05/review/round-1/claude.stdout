@@ -1,0 +1,34 @@
+# ER-05 review: FIX-OX-05 (alias lease covers a slow rooted read)
+
+This was a read-only review. I edited nothing and did not write the plan file. The `ExitPlanMode`/`AskUserQuestion` tools are not available in this session, so I'm returning the review directly. I did not recompute the manifest SHA-256s myself; I relied on the execution agent's check for those.
+
+## AC-1: supported
+- **Lease is set before resolve:** the candidate test (`candidate-source.rs:314-350`) now builds its fixture with `Fixture::new_rooted_with_options(&objects, FixtureOptions { lease_seconds: Some(3600), .. })`. In the repo's shared scaffold, that option is written into the resolve request (`src/api/router/snapshot_content_tests.rs:966-967`) before the call to `/api/v2/snapshots/resolve`.
+- **Same fixture as A apart from the lease:** A's old `fixture()` and B's `new_rooted_with_options` both end up calling `new_in_publication_mode_with_options(false, 0, objects, false, true, …)`. A passes `FixtureOptions::default()` (lines 686-709), so the lease is the only difference.
+- **Nothing was cut to shorten the run:** all 128 `alias-NNN` entries are still there, and `assert_objects` still checks 200, the request-digest header, every frame, de-duplicated bodies, the END counts, logical bytes and the body SHA. `counts.assert(1, raw.len())` is also kept.
+
+## AC-2: supported
+- **409 assertion kept:** the second request still corrupts item 127's digest and asserts `409 EXPECTED_DIGEST_MISMATCH` with `counts.assert(0, 0)`.
+- **Focused test passes:** the final uninstrumented B run exited 0 with `1 passed; 0 failed; 2463 filtered out; finished in 775.63s`.
+- **A fails as expected:** A exited 101 after 654.71s with 503 `OBJECT_UNAVAILABLE` ("qualified certified page or reader ownership is unavailable") where 409 was expected. That fits a 600s lease running out before the second request.
+
+## A/B scope: clean
+- `A-B-source.diff` is a single hunk (−1/+8) in `snapshot_objects_bounded_tests.rs`. That matches the 7-line offset between A and the candidate around line 623 vs 630.
+- The A patch only changed that one file.
+- The shared `FixtureOptions` / `new_rooted_with_options` scaffold already existed (owned by FIX-OX-02).
+- Production routing (`snapshot_router.rs`) is unchanged; its default lease is still 600.
+
+## Findings
+- **P2: unexplained intermittent failure on the candidate.**
+  - The first uninstrumented B run failed on the **first** request (503 vs 200, `snapshot_objects_bounded_tests.rs:208`) after 462.78s. Under the 3600s lease that can't be a lease expiry, so this card's change neither explains nor addresses it.
+  - The evidence reports this honestly and does not count it as acceptance. Two later B runs passed: the diagnostic-only rerun at 771.23s and the final uninstrumented run at 775.63s.
+  - The card's ACs are still met. The risk is 1 failure in 3 B runs. FIX-OX-06's `error()` helper diagnostics will not cover the plain `assert_eq!(response.status(), 200)` in `assert_objects`.
+  - **Recommendation:** add a tracked follow-up, or a note in FIX-OX-06 or the release card, to capture the response body and classify this 503 before the OX-284 full-suite C gate. Not blocking for this card.
+- **P3: linker warning in the test logs.** B-final.stderr contains `linker_messages` (`__eh_frame section too large`). It comes from the toolchain/linker, not this diff, and it is not this card's gate. It is worth knowing about for the inherited 0-warning build checks at OX-284.
+- **Redaction (ER-11): OK.**
+  - Every stderr path is replaced with `[REDACTED_EXECUTION_PATH]`, and `redactions.json` records the original and redacted hashes for each file.
+  - No `/Users`, `/Volumes`, `/tmp` or `/var/folders` paths remain in the packet or the committed evidence.
+  - The only "token"/"password" hits are source identifiers and a crate name, not secrets.
+- **Release boundary: OK.** The card sets Version increment to `N/A`, and its README and JSON make no claim of a version bump, push, tag, Docker image or release. OX-284 is named as the only release point. I have not inferred any C/D completion. The card correctly stays `locally-accepted`, not `done`.
+
+VERDICT: PASS

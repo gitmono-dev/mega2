@@ -1,0 +1,26 @@
+{
+  "card": "FIX-OX-05",
+  "round": 1,
+  "reviewer": "Claude Code",
+  "mode": "read-only",
+  "started_at": "2026-10-10T09:52:51Z",
+  "completed_at": "2026-10-10T09:53:54Z",
+  "exit_code": 0,
+  "verdict": "PASS",
+  "prompt_sha256": "c69b01bb507b92d6143029e175019455c16a889b1c7209c7fbab7187137cbab1",
+  "snapshot_manifest_sha256": "2b4bc329015b20f94a3413c9b14ee3ca3b3098a6e0ee4b14a8ae40028cad0cdd",
+  "report_path": "claude.stdout",
+  "report_sha256": "e667133ca04f649e881b0c04c2299ab89262c7a15a5c512e18e71daddf71a512",
+  "findings": [
+    {
+      "severity": "P2",
+      "status": "non-blocking",
+      "summary": "One of three B runs failed on its first request with an unclassified 503; capture its response body and classify the failure before OX-284 final-tree C. FIX-OX-06 helper diagnostics do not cover assert_objects' direct status assertion."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking",
+      "summary": "B-final stderr contains a toolchain linker warning (__eh_frame section too large), outside this card's gate and relevant to inherited OX-284 build checks."
+    }
+  ]
+}
