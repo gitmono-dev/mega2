@@ -1,0 +1,22 @@
+{
+  "review_id": "R32",
+  "reviewer": "Claude Code 2.1.288",
+  "target": "docs/plan/plan-20260920.md",
+  "target_sha256": "9d77fdd00b291fabbf960c41cca35025e5b81d3c9fbb35d75d63d3e3a4bdf75e",
+  "snapshot_file_count": 937,
+  "snapshot_manifest_sha256": "9669d19f48e5f2f7016a6f6ca4b7e989c1dc799ef2f9bd7d2bcc5be2e9e52903",
+  "invocation": "claude -p --permission-mode plan --permission-prompts none --tools Read Glob Grep --output-format text --no-session-persistence <prompt-argument>",
+  "exit_code": 0,
+  "verdict": "PASS",
+  "blocking_findings": 0,
+  "nonblocking_p3_count": 7,
+  "reviewed_at_utc": "2026-10-10T08:08:02Z",
+  "files": {
+    "claude-review.md": "bac983620409d28e4c1ad777f7ff7175fcabe265f054f2ca1588f7f9357588d7",
+    "claude-exit-code.txt": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+    "claude.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "review-prompt.txt": "51d1cad1165ec141df213e7bdb42f1e1fc1c263e3df56ccdc2958b3e2394a9df",
+    "snapshot-files.sha256": "9669d19f48e5f2f7016a6f6ca4b7e989c1dc799ef2f9bd7d2bcc5be2e9e52903",
+    "snapshot-exclusions.txt": "5ed74563b3381be860a02ba5f71439401b85e45a279cb9a6f9cf26883e9f188c"
+  }
+}

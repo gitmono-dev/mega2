@@ -1,0 +1,30 @@
+{
+  "round": "R29-Claude",
+  "plan_path": "docs/plan/plan-20260920.md",
+  "plan_sha256": "dc035b53fc7921b5ebfab9e249332a0a951823d8fd9955b2eb10d46ecd76f560",
+  "literal_verdict": "VERDICT: FAIL",
+  "claude_code_version": "2.1.288",
+  "reviewed_at_utc": "2026-10-10 07:02:06 UTC",
+  "report_path": "claude-review.md",
+  "report_sha256": "187bb694a28930005a9e2c3f555b363d94364f180f7dea38f8c2225f9141cd7d",
+  "prompt_path": "review-prompt.txt",
+  "prompt_sha256": "f63f0a8dd7a3e85c1e3df6ee99059433fc3ae6010d6f676afaf55d0395669713",
+  "snapshot_manifest_path": "snapshot-files.sha256",
+  "snapshot_manifest_sha256": "acbea172e980515c048481b54cc17537fe7f9fb34fac1da9180586610b936860",
+  "snapshot_project_files": 921,
+  "tool_allowlist": [
+    "Read",
+    "Glob",
+    "Grep"
+  ],
+  "claude_exit_code": 0,
+  "blocking_findings": {
+    "P1": 1,
+    "P2": 2
+  },
+  "non_blocking_p3_count": 5,
+  "reviewer_report_notes": [
+    "Read-only review; no task card execution or edits.",
+    "The caller supplied and verified the expected plan and 921-file snapshot hashes; Claude did not compute SHA-256 itself."
+  ]
+}

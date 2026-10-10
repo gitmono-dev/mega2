@@ -1,0 +1,23 @@
+Read-only independent Claude Code review for Mega2 plan-20260920, R30.
+
+The source snapshot is this working directory. Read only files present in the snapshot. Use only Read, Glob, and Grep. Do not run Bash, edit files, change task state, or execute any task card.
+
+Target: docs/plan/plan-20260920.md
+Expected SHA-256: 6eab19b43d89c11e1aa04042461df762fdf45652a6438214a619129b96aaae73
+Snapshot manifest: /tmp/mega2-plan-r30-inputs/snapshot-files.sha256
+Expected snapshot manifest SHA-256: 8890c9bc96f4a877a3ed3d349f379a87d626deef7c9eb143a8e24074760cb596
+Allowlisted snapshot file count: 925. Credentials and VCS metadata are excluded.
+
+The user requires Claude Code literal PASS as the only plan gate; no Codex isolated audit is required. Do not infer a pass from R28: R28 passed only SHA ff3c36e9c66522171053ec692385b8eea029c66da4e6142856e7d9bfdfbc1ddf. R29 reviewed SHA dc035b53fc7921b5ebfab9e249332a0a951823d8fd9955b2eb10d46ecd76f560 and returned literal FAIL (1 P1, 2 P2, 5 P3).
+
+Review the whole current plan and every task card, especially whether R29 findings are fully closed:
+1. P1: FIX-OX-23 is a separate test-only 3600s fixture-lease diagnostic after FIX-OX-18 and before FIX-OX-19. Check its three result branches: reproduced anchor-mismatch 500 permits FIX-OX-19; 96-request pass blocks FIX-OX-19/21 and requires plan revision; any other failure stays blocked and adds a reviewed root-cause card. Confirm FIX-OX-19 no longer owns the lease change, has at most 8 ACs, and cannot start before root reproduction.
+2. P2: exact R28/R29 review rows, historical plan SHA c28381c8b6da806e133c77245379767f63d899301bd7f1929815f6de9d1381d4 and SHA 46d83eb6cf655ddbb96f80f960878c825691954e91b8c6f1515032768dbd9d74 chronology, accepted-card ledger wording, FIX-OX-04 execution state, and the required post-PASS README/plan-status synchronization. Verify the plan does not claim R28 passed newer bytes.
+3. P2: FIX-OX-18 repeatability: VER-2 source-mutation, VER-3 reader-release-race, VER-4 stale-reader each require three consecutive focused passes; AC-5/6 are separate predicates; FIX-OX-03 VER-3 covers full serial order-dependent reproduction.
+4. P3: FIX-OX-19 write set points to the actual retention test file; FIX-OX-17 current focused evidence and empty-delta acceptance; FIX-OX-12 focused checkpoint timings; checkpoint hunk ownership labels FIX-OX-12 as a distinct future consumer rather than a current scaffold consumer.
+
+Independently check all 307 cards and unique IDs, dependencies/DAG and complete serial order, Granularity row coverage/counts, REL-OX-01's 304 members and excluded final OX-284/OX-283/OX-20, test/trace matrices, M1 readiness, exact card write sets, and all release/version gates. The user's release instruction is unchanged: one patch bump and release only at the final OX-284; no earlier version bump, push, tag, Release, or versioned Docker publish.
+
+The new FIX-OX-23 focused command names the exact Rust test path `api::router::snapshot_router::content::tests::rooted_metadata::reader_retention::committed_metadata_requests_retire_owners_without_retiring_source_history`; a non-executing cargo `-- --exact --list` check returned exactly one test. Treat this only as command-name evidence, not a test pass.
+
+Report P0/P1/P2/P3 findings with exact section/card references and concise remediations. Return literal VERDICT: PASS only if no blocking P0/P1/P2 issues remain. End with exactly one standalone line: VERDICT: PASS or VERDICT: FAIL.

@@ -1,0 +1,40 @@
+Read-only independent Claude Code review for Mega2 plan-20260920, R31.
+
+The frozen source snapshot is the current working directory. Read only files present in the snapshot. Use only Read, Glob, and Grep. Do not run Bash, edit files, change task state, or execute any task card.
+
+Target: docs/plan/plan-20260920.md
+Expected SHA-256: 7ba76ae3016793ba775cbbdd4468e8617c9bba76f4da2c9712b33e114a53e09e
+Snapshot manifest: /tmp/mega2-plan-r31-inputs/snapshot-files.sha256
+Expected snapshot manifest SHA-256: 5c47faf1aab53b532d3f0d3b11c0e470745320bb9152cb713083ca0666ea9ef9
+Allowlisted snapshot file count: 930. The snapshot carries the 925-file R30 input allowlist with current bytes, plus all five archived R30 evidence files. Credentials and VCS metadata are excluded.
+
+The user requires Claude Code literal PASS as the sole plan gate; no Codex isolated audit is required. R28 passed only SHA ff3c36e9c66522171053ec692385b8eea029c66da4e6142856e7d9bfdfbc1ddf. R29 reviewed SHA dc035b53fc7921b5ebfab9e249332a0a951823d8fd9955b2eb10d46ecd76f560 and returned literal FAIL (P1=1, P2=2, P3=5). R30 reviewed SHA 6eab19b43d89c11e1aa04042461df762fdf45652a6438214a619129b96aaae73 and returned literal FAIL (P1=1, P2=2, P3=9); read its complete archived report and verify the repairs against the current plan, not against revision-history claims.
+
+Review the whole current plan and all 307 task cards. Specifically verify that all R29/R30 findings are closed:
+
+R30 P1:
+- FIX-OX-23 is a member of OX-304 batch 05; OX-304 is 20/20 ACs and includes branch-aware evidence for FIX-OX-23; the full REL-OX-01 membership and ledger counts are internally consistent (304 release members, 302 ledger members after excluding final OX-284/OX-283/OX-20 as specified).
+
+R30 P2:
+- FIX-OX-23's anchor-mismatch 500 branch has one precise expected-failure exception to focused-test success and batch exit-code gates; its allowed process/test outcomes, HTTP 500, PostgreSQL anchor mismatch, and active-lease evidence are coherent. The 96-lookup pass branch requires all assertions to pass and blocks downstream fixes when no root cause reproduces; any other failure remains blocked and requires reviewed diagnosis. No unrelated test failure is excused.
+- The ff3c36e9 → c28381c8 → 46d83eb6 plan-SHA/history chronology and M0 authorization are exact. R28 PASS remains bound only to ff3c36e9; c283/46d83 are only the documented post-A/B/review acceptance-state and evidence writebacks for FIX-OX-08 and FIX-OX-11. Later accepted cards have their own per-card gates. R31 PASS must not retroactively certify those five cards or their changed acceptance definitions.
+- FIX-OX-08/11 card definitions keep Lifecycle/Acceptance at defaults; actual states and evidence are in plan-status/evidence.
+
+R30 P3:
+- FIX-OX-19 granularity serialization label is correct.
+- FIX-OX-12's shared fixture scaffold relationship is accurate.
+- FIX-OX-03 indexes include FIX-OX-23.
+- Risk register includes FIX-OX-23 with the right test-only scope.
+- R29 and R30 revision-history rows are structurally in the revision table and correctly report the historical findings.
+- FIX-OX-23 AC-4 and Description conditions match.
+- FIX-OX-18 VER-1 requires three consecutive focused passes.
+- FIX-OX-19 VER-1 includes the exact module filter and -- --exact --test-threads=1.
+- README and plan-status have accurate counts and candidate SHA wording.
+
+Also close all R29 issues: separate FIX-OX-23 lease diagnosis from the production anchor fix; FIX-OX-19 write set points to the actual retention test file and its ACs fit G-03; FIX-OX-18's reader barrier is deterministic with repeated race/mutation/stale-reader runs and separate AC predicates; FIX-OX-17 evidence is current with explicit empty-delta acceptance; FIX-OX-12 focused checkpoint timings are recorded; R28/R29 plan-SHA rows, accepted-card status, FIX-OX-04 execution state, and index synchronization are precise.
+
+Independently check all 307 unique task IDs, dependency resolution and acyclicity, the complete serial implementation order, Granularity row coverage/counts, REL-OX-01's 304 unique members and exact exclusions, OX-371/OX-383's 302-member ledger counts, all task-card lifecycle defaults, evidence/test/trace matrices, M1 readiness, card write sets, and the plan's completion/release gates. Confirm that local test listing is not described as a test pass and no task-card execution is authorized before this R31 literal PASS.
+
+The user's release instruction is unchanged: perform one patch version bump and release only at final OX-284; no earlier version bump, push, tag, GitHub Release, or versioned Docker publish.
+
+Report P0/P1/P2/P3 findings with exact section/card references, concrete evidence, and concise remediations. Return literal VERDICT: PASS only if no blocking P0/P1/P2 issue remains. End with exactly one standalone line: VERDICT: PASS or VERDICT: FAIL.
