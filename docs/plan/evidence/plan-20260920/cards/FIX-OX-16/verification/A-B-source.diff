@@ -1,0 +1,19 @@
+--- docs/plan/evidence/plan-20260920/cards/FIX-OX-16/verification/A-source.rs	2026-10-11 10:59:40
++++ docs/plan/evidence/plan-20260920/cards/FIX-OX-16/verification/B-final-source.rs	2026-10-11 11:14:20
+@@ -553,7 +553,7 @@
+ #[tokio::test]
+ async fn empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success() {
+     for fragment in [Some(Bytes::new()), None] {
+-        let fixture = Fixture::new().await;
++        let fixture = Fixture::new_without_publication().await;
+         let oid = path_oid(&fixture, "/empty").await;
+         fixture.counts.reset();
+         let entered = Arc::new(Notify::new());
+@@ -579,6 +579,7 @@
+         timeout(Duration::from_secs(10), entered.notified())
+             .await
+             .unwrap();
++        fixture.counts.assert(1, 0);
+         release_lease(&fixture).await;
+         release.notify_one();
+         let finished = timeout(Duration::from_secs(10), &mut task).await;

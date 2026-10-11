@@ -579,7 +579,6 @@ async fn empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_
         timeout(Duration::from_secs(10), entered.notified())
             .await
             .unwrap();
-        fixture.counts.assert(1, 0);
         release_lease(&fixture).await;
         release.notify_one();
         let finished = timeout(Duration::from_secs(10), &mut task).await;
@@ -803,4 +802,125 @@ async fn empty_raw_source_requires_physical_zero_exact_eof_and_current_empty_dig
     assert!(to_bytes(response.into_body(), 1).await.unwrap().is_empty());
     fixture.counts.assert(1, 0);
     assert_eq!(fixture.counts.receipt_writes.load(Ordering::SeqCst), 0);
+}
+
+async fn diagnostic_dump_pg(fixture: &Fixture) {
+    use crate::jupiter::storage::base_storage::StorageConnector;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let mono = fixture.state.storage.mono_storage();
+    let rows = mono
+        .get_connection()
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pid, state, wait_event_type, wait_event, pg_blocking_pids(pid) AS blockers, left(query, 160) AS q FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() ORDER BY pid".to_string(),
+        ))
+        .await
+        .unwrap();
+    for row in rows {
+        eprintln!(
+            "DIAG pg pid={:?} state={:?} wait_type={:?} wait={:?} blockers={:?} q={:?}",
+            row.try_get::<i32>("", "pid").unwrap(),
+            row.try_get::<Option<String>>("", "state").unwrap(),
+            row.try_get::<Option<String>>("", "wait_event_type").unwrap(),
+            row.try_get::<Option<String>>("", "wait_event").unwrap(),
+            row.try_get::<Vec<i32>>("", "blockers").unwrap(),
+            row.try_get::<Option<String>>("", "q").unwrap(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn zz_diagnostic_entered_latency() {
+    let fixture = Fixture::new().await;
+    let oid = path_oid(&fixture, "/empty").await;
+    fixture.counts.reset();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let tail_polls = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    *fixture.counts.object_fault.lock().unwrap() = Some(bounded_objects::StreamFault {
+        oid,
+        kind: bounded_objects::FaultKind::HeldFragment {
+            prefix: Bytes::new(),
+            fragment: Some(Bytes::new()),
+            entered: entered.clone(),
+            release: release.clone(),
+            tail_polls: tail_polls.clone(),
+            drops: drops.clone(),
+        },
+    });
+    let response_budget = MemoryBudget::new(CHUNK_SIZE as usize);
+    let scratch_budget = MemoryBudget::new(RANGE_WORK_BYTES);
+    let app = budgeted_app(&fixture, &response_budget, &scratch_budget);
+    let request = fixture.request("GET", "blob?path=/empty", Body::empty());
+    let spawned = tokio::spawn(async move { app.oneshot(request).await });
+    let started = std::time::Instant::now();
+    let mut entered_hit = false;
+    let mut dumped = false;
+    while started.elapsed() < Duration::from_secs(300) {
+        tokio::select! {
+            _ = entered.notified() => { entered_hit = true; break; }
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+        if !dumped && started.elapsed() >= Duration::from_secs(4) {
+            dumped = true;
+            diagnostic_dump_pg(&fixture).await;
+        }
+    }
+    eprintln!(
+        "DIAG entered={entered_hit} entered_after_ms={} whole={} bytes={} receipt_reads={} receipt_writes={}",
+        started.elapsed().as_millis(),
+        fixture.counts.whole.load(Ordering::SeqCst),
+        fixture.counts.bytes.load(Ordering::SeqCst),
+        fixture.counts.receipt_reads.load(Ordering::SeqCst),
+        fixture.counts.receipt_writes.load(Ordering::SeqCst),
+    );
+    diagnostic_dump_pg(&fixture).await;
+    release_lease(&fixture).await;
+    release.notify_one();
+    let status = match timeout(Duration::from_secs(60), spawned).await {
+        Ok(Ok(Ok(response))) => format!("{} {}", response.status().as_u16(), response.status()),
+        other => format!("unexpected {other:?}"),
+    };
+    eprintln!(
+        "DIAG final status={status} tail={} drops={} response_used={} scratch_used={}",
+        tail_polls.load(Ordering::SeqCst),
+        drops.load(Ordering::SeqCst),
+        response_budget.used(),
+        scratch_budget.used(),
+    );
+}
+
+#[tokio::test]
+async fn zz_diagnostic_plain_get_timing() {
+    let fixture = Fixture::new().await;
+    fixture.counts.reset();
+    for index in 0..4 {
+        let started = std::time::Instant::now();
+        let response = fixture.send("GET", "blob?path=/empty", Body::empty()).await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        eprintln!(
+            "DIAG publication-enabled plain index={index} status={status} len={} ms={}",
+            bytes.len(),
+            started.elapsed().as_millis(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn zz_diagnostic_plain_get_timing_without_publication() {
+    let fixture = Fixture::new_without_publication().await;
+    fixture.counts.reset();
+    for index in 0..2 {
+        let started = std::time::Instant::now();
+        let response = fixture.send("GET", "blob?path=/empty", Body::empty()).await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        eprintln!(
+            "DIAG publication-disabled plain index={index} status={status} len={} ms={}",
+            bytes.len(),
+            started.elapsed().as_millis(),
+        );
+    }
 }

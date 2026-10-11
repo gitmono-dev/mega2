@@ -1,0 +1,115 @@
+{
+  "card": "FIX-OX-16",
+  "runs": [
+    {
+      "id": "A-VER-1",
+      "variant": "A",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success -- --test-threads=1",
+      "exit_code": 101,
+      "exit_path": "verification/A-VER-1.exit",
+      "stdout_path": "verification/A-VER-1.stdout",
+      "stdout_sha256": "e459953f2a030acf9ca2d64357d34c0e97737555daa4b47cf2c7ce8d18bd4411",
+      "stderr_path": "verification/A-VER-1.stderr",
+      "stderr_sha256": "0deb03bbee8f1d68b26b593b341c1cb65556d77c6c155e5c422ece9414448fac",
+      "result": "baseline failure: exited 101 at src/api/router/snapshot_raw_blob_tests.rs:581; timeout(Duration::from_secs(10), entered.notified()) returned Elapsed(()) in 33.39 s"
+    },
+    {
+      "id": "B-final-VER-1",
+      "variant": "B",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success -- --test-threads=1",
+      "exit_code": 0,
+      "exit_path": "verification/B-final-VER-1.exit",
+      "stdout_path": "verification/B-final-VER-1.stdout",
+      "stdout_sha256": "b99d3020a4b169e8d023a52a76f09509c9023518b5d4fd0f74225e46010b0ab8",
+      "stderr_path": "verification/B-final-VER-1.stderr",
+      "stderr_sha256": "f7867273c700c8be8592ad3f5bac399c5bddddeb60959cbde87754f88bb6658a",
+      "result": "passed: 1 passed; 0 failed; 2463 filtered out; 19.42 seconds"
+    }
+  ],
+  "format_check": {
+    "command": "cargo +nightly fmt --all --check",
+    "exit_code": 0,
+    "exit_path": "verification/fmt-final.exit",
+    "stdout_path": "verification/fmt-final.stdout",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_path": "verification/fmt-final.stderr",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "result": "passed"
+  },
+  "clippy_check": {
+    "command": "cargo clippy --all-targets --all-features -- -D warnings",
+    "exit_code": 0,
+    "exit_path": "verification/clippy-final.exit",
+    "stdout_path": "verification/clippy-final.stdout",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_path": "verification/clippy-final.stderr",
+    "stderr_sha256": "3f61e11ffbab03f836d30fc195acf9886fb213a34531d4abaa637adfb0c9c22e",
+    "result": "passed with warnings denied"
+  },
+  "required_repository_checks": {
+    "cargo build": {
+      "state": "passed_with_warning",
+      "exit_code": 0,
+      "exit_path": "verification/cargo-build.exit",
+      "stdout_path": "verification/cargo-build.stdout",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_path": "verification/cargo-build.stderr",
+      "stderr_sha256": "7c3423a2118fdd2c4b3f9b500610f34a76ae55461c4904565bcb51bdb1f8458f",
+      "result": "passed; macOS linker warning __eh_frame section too large is pre-existing and assigned to OX-284 final C, consistent with the earlier cards"
+    },
+    "cargo build --tests": {
+      "state": "passed_with_warning",
+      "exit_code": 0,
+      "exit_path": "verification/cargo-build-tests.exit",
+      "stdout_path": "verification/cargo-build-tests.stdout",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_path": "verification/cargo-build-tests.stderr",
+      "stderr_sha256": "f70a7a2bf496837a9a0710cac5c393358b261c2dca8a2f2b325e425889e79b08",
+      "result": "passed; macOS linker warning __eh_frame section too large is pre-existing and assigned to OX-284 final C"
+    },
+    "source .env.test && cargo test --all": {
+      "state": "not_run_for_this_card",
+      "reason": "The repository-wide suite is the OX-284 final C gate. FIX-OX-15 recorded the current tree-wide result (exit 101 with attributed failures) and assigned the final green to OX-284; this card does not re-run it."
+    }
+  },
+  "diagnostic_runs": [
+    {
+      "id": "diagnostic-root-cause",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib zz_diagnostic -- --test-threads=1 --nocapture",
+      "exit_code": 0,
+      "exit_path": "verification/diagnostic/diagnostic-run.exit",
+      "stdout_path": "verification/diagnostic/diagnostic-run.stdout",
+      "stdout_sha256": "588ffbfbc153d57a41e5ef6d11c2221a7bf097630c9124b9465b3938c3e1b208",
+      "stderr_path": "verification/diagnostic/diagnostic-run.stderr",
+      "stderr_sha256": "2761d3ed99ed9b641d0bd2d27bee8faa6bdc1e751e465bdd22638e159bbbcbbc",
+      "source_path": "verification/diagnostic/diagnostic-source.rs",
+      "source_sha256": "5811098145a5c75a9172e7e0d2574408c1561b8c64bff85e008ac1a62e2232a2",
+      "result": "entered=true entered_after_ms=12909 whole=1 bytes=0; then status=410 Gone tail=0 drops=1 response_used=0 scratch_used=0; publication-enabled plain GETs 15028/15502/15853/15560 ms; publication-disabled plain GETs 5/5 ms; pg_stat_activity showed no blocker and no lock wait for the in-flight request while it executed the qualified-family catalog query"
+    }
+  ],
+  "source_restoration_check": {
+    "path": "verification/source-restoration-check.json",
+    "sha256": "80412f66c065e851e234d57b19aac55b690d565e683bf875e42cc5e04d800041"
+  },
+  "runtime_note": "The card-level focus command passes on the final tree. The repository-wide cargo test --all gate remains owned by OX-284 final C, consistent with the accepted FIX-OX-15 separation. cargo build and cargo build --tests both exited 0 with the pre-existing macOS linker __eh_frame warning.",
+  "review": {
+    "reviewer": "Claude Code",
+    "round": 2,
+    "verdict": "PENDING",
+    "report_path": "review/round-2/claude.stdout",
+    "report_sha256": null
+  },
+  "review_history": [
+    {
+      "round": 1,
+      "verdict": "FAIL",
+      "report_path": "review/round-1/claude.stdout",
+      "report_sha256": "786dcc2fec7d6b210ad833902f78177f3f1a9b0398dcc644e1ea794fea5d8ecd",
+      "snapshot_manifest_sha256": "a9830cf3ec1f70c2c22cf617d7c9b87a84752dada55f83c22cd5ee92d90ae7ce",
+      "blocking_findings": [
+        "P1-1 README figures/paths not in the archived run"
+      ],
+      "resolutions": "Recorded in README 'Review record' and in the FIX-OX-16 ledger section of docs/plan/plan-status.md."
+    }
+  ]
+}

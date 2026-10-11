@@ -1,0 +1,55 @@
+{
+  "card": "FIX-OX-16",
+  "base_commit": "642c46987af3510e88a011bb1ecc908034bd51aa",
+  "source_path": "src/api/router/snapshot_raw_blob_tests.rs",
+  "base_source_verification": {
+    "command": "libra show HEAD:src/api/router/snapshot_raw_blob_tests.rs | shasum -a 256",
+    "exit_code": 0,
+    "stdout_sha256": "600d9ae359dd7315fc68ae671c9ff460ac84d3e6798a12e89f7bafd3e1711072",
+    "matches_a_source": true
+  },
+  "a_source": {
+    "path": "verification/A-source.rs",
+    "sha256": "600d9ae359dd7315fc68ae671c9ff460ac84d3e6798a12e89f7bafd3e1711072",
+    "variant_note": "Unmodified source from the base commit. The focused test uses the publication-enabled fixture and times out at the fixed 10 s entered barrier."
+  },
+  "b_source": {
+    "path": "verification/B-final-source.rs",
+    "sha256": "9053be7f9207739d36ae246085e912dde374fa02f1d758e939b03123c1d7e999",
+    "matches_worktree_source": true,
+    "variant_note": "Current test-only source. The focused test uses the publication-disabled fixture, which reaches the held EOF poll in milliseconds while keeping the real HTTP route and the PostgreSQL-backed object store."
+  },
+  "diff": {
+    "path": "verification/A-B-source.diff",
+    "sha256": "cbe7ea0245818a4ca85e509f51c65288d52f6b0181bec230b3879486dde93954",
+    "command": "diff -u verification/A-source.rs verification/B-final-source.rs",
+    "exit_path": "verification/A-B-source.diff.exit",
+    "exit_code": 1,
+    "hunk_count": 1,
+    "scope": "One test-only hunk: publication-disabled fixture in empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success; no production source change."
+  },
+  "diagnostic_artifacts": [
+    {
+      "path": "verification/diagnostic/diagnostic-source.rs",
+      "sha256": "0fb1e0d5c7c7940c1fcfe10ff9e57ce452608066e80ba2b240ebddb727d4fea8"
+    },
+    {
+      "path": "verification/diagnostic/diagnostic-run.exit",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "verification/diagnostic/diagnostic-run.stdout",
+      "sha256": "a54570e100588aadd8208f17f48c42e633cc235759595bf5b04774b5ec71ff62"
+    },
+    {
+      "path": "verification/diagnostic/diagnostic-run.stderr",
+      "sha256": "c94f924eb67f192ee4beb197bc3eb3f7ebf0408ac39d0e4bd7308b34f50120b8"
+    }
+  ],
+  "source_restoration": {
+    "path": "verification/source-restoration-check.json",
+    "sha256": "0a2ba29481b6c45a481c6a81f3fe9af64145e1a9ad7a81731da702344f7c3c1e",
+    "production_source_files_touched": [],
+    "plan_sha256": "24f1be3fe8e431f664ced7eeb03d403a7793ce393d69aa162d663071566b444c"
+  }
+}

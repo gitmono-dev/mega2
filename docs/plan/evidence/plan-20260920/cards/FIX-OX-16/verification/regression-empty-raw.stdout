@@ -1,0 +1,8 @@
+
+running 3 tests
+test api::router::snapshot_router::content::tests::raw_blob::empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success ... ok
+test api::router::snapshot_router::content::tests::raw_blob::empty_raw_source_requires_physical_zero_exact_eof_and_current_empty_digest ... ok
+test ceres::snapshot::rooted_metadata_projection::tests::streamed_cold_fact_keeps_large_memory_source_and_empty_raw_costs_exact ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2461 filtered out; finished in 85.57s
+

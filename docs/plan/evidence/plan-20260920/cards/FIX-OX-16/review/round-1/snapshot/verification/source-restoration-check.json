@@ -1,0 +1,34 @@
+{
+  "card": "FIX-OX-16",
+  "base_commit": "642c46987af3510e88a011bb1ecc908034bd51aa",
+  "source_path": "src/api/router/snapshot_raw_blob_tests.rs",
+  "base_blob_sha256": "600d9ae359dd7315fc68ae671c9ff460ac84d3e6798a12e89f7bafd3e1711072",
+  "a_source_sha256": "600d9ae359dd7315fc68ae671c9ff460ac84d3e6798a12e89f7bafd3e1711072",
+  "a_source_matches_base_blob": true,
+  "b_source_sha256": "9053be7f9207739d36ae246085e912dde374fa02f1d758e939b03123c1d7e999",
+  "worktree_source_sha256_after_diagnostics": "9053be7f9207739d36ae246085e912dde374fa02f1d758e939b03123c1d7e999",
+  "b_source_matches_worktree": true,
+  "diagnostic_source": {
+    "path": "verification/diagnostic/diagnostic-source.rs",
+    "sha256": "0fb1e0d5c7c7940c1fcfe10ff9e57ce452608066e80ba2b240ebddb727d4fea8",
+    "note": "Temporary copy of the final source with three diagnostic tests appended for the root-cause investigation. The diagnostic source is preserved only as an artifact; it is not part of the final tree, and the worktree source was restored byte-exactly afterwards."
+  },
+  "production_source_files_touched": [],
+  "tracked_source_diff": {
+    "path": "verification/source-restoration/tracked-source-diff.stdout",
+    "command": "libra diff -- src",
+    "exit_code": 0,
+    "scope": "One test-only hunk in src/api/router/snapshot_raw_blob_tests.rs; no production file appears."
+  },
+  "tracked_source_diff_stat": {
+    "path": "verification/source-restoration/tracked-source-diff-stat.stdout",
+    "result": "src/api/router/snapshot_raw_blob_tests.rs | 2 +- (1 insertion, 1 deletion)"
+  },
+  "plan_file_diff": {
+    "path": "verification/source-restoration/plan-file-diff.stdout",
+    "command": "libra diff -- docs/plan/plan-20260920.md",
+    "exit_code": 0,
+    "bytes": 0,
+    "plan_sha256": "24f1be3fe8e431f664ced7eeb03d403a7793ce393d69aa162d663071566b444c"
+  }
+}

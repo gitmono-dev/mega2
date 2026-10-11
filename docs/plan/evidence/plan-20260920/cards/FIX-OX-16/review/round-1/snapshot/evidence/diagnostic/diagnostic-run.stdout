@@ -1,0 +1,8 @@
+
+running 3 tests
+test api::router::snapshot_router::content::tests::raw_blob::zz_diagnostic_entered_latency ... ok
+test api::router::snapshot_router::content::tests::raw_blob::zz_diagnostic_plain_get_timing ... ok
+test api::router::snapshot_router::content::tests::raw_blob::zz_diagnostic_plain_get_timing_without_publication ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2464 filtered out; finished in 128.81s
+

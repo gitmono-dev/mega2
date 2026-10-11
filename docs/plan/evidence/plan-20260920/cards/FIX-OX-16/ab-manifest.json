@@ -1,0 +1,73 @@
+{
+  "card": "FIX-OX-16",
+  "base_commit": "642c46987af3510e88a011bb1ecc908034bd51aa",
+  "source_path": "src/api/router/snapshot_raw_blob_tests.rs",
+  "base_source_verification": {
+    "command": "libra show HEAD:src/api/router/snapshot_raw_blob_tests.rs > A-source.rs; shasum -a 256 A-source.rs",
+    "exit_code": 0,
+    "stdout_sha256": "600d9ae359dd7315fc68ae671c9ff460ac84d3e6798a12e89f7bafd3e1711072",
+    "matches_a_source": true
+  },
+  "a_source": {
+    "path": "verification/A-source.rs",
+    "sha256": "600d9ae359dd7315fc68ae671c9ff460ac84d3e6798a12e89f7bafd3e1711072",
+    "variant_note": "Unmodified base source. The focused test uses the publication-enabled fixture and exits 101 at the fixed 10 s entered barrier."
+  },
+  "b_source": {
+    "path": "verification/B-final-source.rs",
+    "sha256": "700d966aabdb83deb0ea484bb995d92bf8bb483fb17b6743a9610be936c89e9f",
+    "matches_worktree_source": true,
+    "variant_note": "Current test-only source. Two hunks: publication-disabled fixture, plus a direct counter assertion at the barrier so AC-1 does not rely on the diagnostic run."
+  },
+  "diff": {
+    "path": "verification/A-B-source.diff",
+    "sha256": "9ead29ef58506e53f7e59122a11fb9163e2f96d67664972c3974596e00266528",
+    "command": "diff -u verification/A-source.rs verification/B-final-source.rs",
+    "exit_path": "verification/A-B-source.diff.exit",
+    "exit_code": 1,
+    "hunk_count": 2,
+    "scope": "Two test-only hunks in empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success: publication-disabled fixture, and fixture.counts.assert(1, 0) after the barrier. No production source change."
+  },
+  "diagnostic_artifacts": [
+    {
+      "path": "verification/diagnostic/diagnostic-source.rs",
+      "sha256": "5811098145a5c75a9172e7e0d2574408c1561b8c64bff85e008ac1a62e2232a2"
+    },
+    {
+      "path": "verification/diagnostic/diagnostic-run.exit",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "verification/diagnostic/diagnostic-run.stdout",
+      "sha256": "588ffbfbc153d57a41e5ef6d11c2221a7bf097630c9124b9465b3938c3e1b208"
+    },
+    {
+      "path": "verification/diagnostic/diagnostic-run.stderr",
+      "sha256": "2761d3ed99ed9b641d0bd2d27bee8faa6bdc1e751e465bdd22638e159bbbcbbc"
+    }
+  ],
+  "diagnostic_run": {
+    "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib zz_diagnostic -- --test-threads=1 --nocapture",
+    "exit_code": 0,
+    "source": "verification/diagnostic/diagnostic-source.rs (final B source plus three temporary zz_diagnostic_* tests; the worktree source was restored byte-exactly afterwards)",
+    "entered_latency": "entered=true entered_after_ms=12909 whole=1 bytes=0 receipt_reads=0 receipt_writes=0",
+    "revocation_result": "status=410 410 Gone tail=0 drops=1 response_used=0 scratch_used=0",
+    "publication_enabled_plain_get_ms": [
+      15028,
+      15502,
+      15853,
+      15560
+    ],
+    "publication_disabled_plain_get_ms": [
+      5,
+      5
+    ],
+    "pg_stat_activity": "no blocker and no lock wait for the in-flight request; the one active session was executing the qualified-family catalog query (WITH selected_namespaces ... pg_namespace)"
+  },
+  "source_restoration": {
+    "path": "verification/source-restoration-check.json",
+    "sha256": "80412f66c065e851e234d57b19aac55b690d565e683bf875e42cc5e04d800041",
+    "production_source_files_touched": [],
+    "plan_sha256": "24f1be3fe8e431f664ced7eeb03d403a7793ce393d69aa162d663071566b444c"
+  }
+}

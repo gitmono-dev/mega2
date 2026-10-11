@@ -1,0 +1,18 @@
+
+running 1 test
+test api::router::snapshot_router::content::tests::raw_blob::empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success ... FAILED
+
+failures:
+
+---- api::router::snapshot_router::content::tests::raw_blob::empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success stdout ----
+
+thread 'api::router::snapshot_router::content::tests::raw_blob::empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success' (41233733) panicked at src/api/router/snapshot_raw_blob_tests.rs:581:14:
+called `Result::unwrap()` on an `Err` value: Elapsed(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    api::router::snapshot_router::content::tests::raw_blob::empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_success
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2463 filtered out; finished in 33.39s
+

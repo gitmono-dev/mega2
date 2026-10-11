@@ -1,0 +1,48 @@
+{
+  "card": "FIX-OX-16",
+  "round": 1,
+  "reviewer": "Claude Code",
+  "mode": "read-only",
+  "exit_code": 0,
+  "verdict": "FAIL",
+  "prompt_sha256": "7c9cd5d0fd8901fb6853bcb8079ab2626d2e7cc7fe4069b7e651a932343eab6c",
+  "snapshot_manifest_sha256": "a9830cf3ec1f70c2c22cf617d7c9b87a84752dada55f83c22cd5ee92d90ae7ce",
+  "report_sha256": "786dcc2fec7d6b210ad833902f78177f3f1a9b0398dcc644e1ea794fea5d8ecd",
+  "findings": [
+    {
+      "severity": "P1",
+      "status": "blocking, fixed in round 2",
+      "summary": "P1-1: the README cited diagnostic measurements and sub-paths that are not in the archived diagnostic run; the evidence package contradicted itself."
+    },
+    {
+      "severity": "P2",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P2-1: the FIX-OX-18 handoff was not durable, the committed test loses publication-enabled coverage, and the README did not explain why the fixture was switched instead of lengthening the barrier."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P3-1: AC-1 leant on the diagnostic proxy; B now asserts fixture.counts.assert(1, 0) at the barrier."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P3-2: redactions.json recorded post-sanitization bytes as originals for three files; originals are now reconstructed before the substitution."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P3-3: worktree-status.stdout predated the final evidence set; recaptured after the evidence set was final."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking, assigned to FIX-OX-18",
+      "summary": "P3-4: the ~15 s latency may be environmental (catalog query cost grows with the number of schemas); FIX-OX-18 must check before calling it a production characteristic."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking, retained",
+      "summary": "P3-5: the macOS __eh_frame linker warning is pre-existing and stays assigned to OX-284 final C."
+    }
+  ]
+}

@@ -579,7 +579,6 @@ async fn empty_raw_post_await_revocation_fails_before_another_eof_poll_or_empty_
         timeout(Duration::from_secs(10), entered.notified())
             .await
             .unwrap();
-        fixture.counts.assert(1, 0);
         release_lease(&fixture).await;
         release.notify_one();
         let finished = timeout(Duration::from_secs(10), &mut task).await;
