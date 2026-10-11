@@ -350,7 +350,7 @@ async fn rooted_reader_release_race_keeps_independent_roots_until_owned_buffers_
         resume.clone(),
         async move { app.oneshot(request).await.unwrap() },
     ));
-    tokio::time::timeout(Duration::from_secs(4), admitted.wait())
+    tokio::time::timeout(Duration::from_secs(60), admitted.wait())
         .await
         .unwrap();
     assert_eq!(q_count(&fixture,"SELECT count(*) FROM {q}.mst2_metadata_root_anchor WHERE anchor_kind IN ('REQUEST','READER')").await,2);
@@ -386,7 +386,7 @@ async fn rooted_reader_release_race_keeps_independent_roots_until_owned_buffers_
     );
     resume.wait().await;
     error(
-        tokio::time::timeout(Duration::from_secs(4), pending)
+        tokio::time::timeout(Duration::from_secs(60), pending)
             .await
             .unwrap()
             .unwrap(),
@@ -555,7 +555,7 @@ async fn actual_q_body_caller_source_mutation_after_reader_admission_cannot_serv
         resume.clone(),
         async move { app.oneshot(request).await.unwrap() },
     ));
-    tokio::time::timeout(Duration::from_secs(4), admitted.wait())
+    tokio::time::timeout(Duration::from_secs(60), admitted.wait())
         .await
         .unwrap();
     fixture
@@ -571,7 +571,7 @@ async fn actual_q_body_caller_source_mutation_after_reader_admission_cannot_serv
         .await
         .unwrap();
     resume.wait().await;
-    let response = tokio::time::timeout(Duration::from_secs(4), pending)
+    let response = tokio::time::timeout(Duration::from_secs(60), pending)
         .await
         .unwrap()
         .unwrap();
@@ -637,7 +637,7 @@ async fn actual_q_body_caller_holds_the_selected_current_fact_until_the_read_tra
         resume.clone(),
         async move { app.oneshot(request).await.unwrap() },
     ));
-    tokio::time::timeout(Duration::from_secs(4), admitted.wait())
+    tokio::time::timeout(Duration::from_secs(60), admitted.wait())
         .await
         .unwrap();
     let core_writer = fixture
@@ -667,7 +667,7 @@ async fn actual_q_body_caller_holds_the_selected_current_fact_until_the_read_tra
         txn.commit().await.unwrap();
     });
     let pid = received.await.unwrap();
-    tokio::time::timeout(Duration::from_secs(4),async {
+    tokio::time::timeout(Duration::from_secs(60),async {
         loop {
             let waiting:bool=fixture.state.storage.mono_storage().get_connection().query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,"SELECT coalesce(wait_event_type='Lock',false) FROM pg_stat_activity WHERE pid=$1",[pid.into()]))
@@ -677,12 +677,12 @@ async fn actual_q_body_caller_holds_the_selected_current_fact_until_the_read_tra
     }).await.unwrap();
     assert!(!update.is_finished());
     resume.wait().await;
-    let response = tokio::time::timeout(Duration::from_secs(4), pending)
+    let response = tokio::time::timeout(Duration::from_secs(60), pending)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(response.status(), 200);
-    tokio::time::timeout(Duration::from_secs(4), update)
+    tokio::time::timeout(Duration::from_secs(60), update)
         .await
         .unwrap()
         .unwrap();

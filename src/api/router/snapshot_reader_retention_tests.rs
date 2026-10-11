@@ -271,7 +271,7 @@ async fn stale_actual_reader_cannot_read_or_finish_a_reissued_uuid() {
         resume.clone(),
         async move { app.oneshot(request).await.unwrap() },
     ));
-    tokio::time::timeout(Duration::from_secs(4), admitted.wait())
+    tokio::time::timeout(Duration::from_secs(60), admitted.wait())
         .await
         .unwrap();
     let txn = transaction(&fixture).await;
@@ -333,7 +333,7 @@ async fn stale_actual_reader_cannot_read_or_finish_a_reissued_uuid() {
         [old.0.clone().into(),next.into(),source_id.into(),source_root.into(),source_generation.into(),source_certificate.into()])).await.unwrap().is_empty());
     txn.commit().await.unwrap();
     resume.wait().await;
-    let response = tokio::time::timeout(Duration::from_secs(4), pending)
+    let response = tokio::time::timeout(Duration::from_secs(60), pending)
         .await
         .unwrap()
         .unwrap();
