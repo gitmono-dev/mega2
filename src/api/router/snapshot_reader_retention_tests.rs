@@ -54,7 +54,20 @@ async fn prune(txn: &DatabaseTransaction, maximum: i32) -> i64 {
 
 #[tokio::test]
 async fn committed_metadata_requests_retire_owners_without_retiring_source_history() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    // FIX-OX-23: test-only diagnostic headroom (explicit 3600 s lease) for this call site; the shared
+    // fixture constructor and production files stay untouched.
+    let fixture = Fixture::new_in_publication_mode_with_options(
+        true,
+        0,
+        &[],
+        false,
+        true,
+        super::super::FixtureOptions {
+            lease_seconds: Some(3600),
+            ..super::super::FixtureOptions::default()
+        },
+    )
+    .await;
     let initial = q_count(
         &fixture,
         "SELECT high_water FROM {q}.mst2_metadata_reader_issuance",
