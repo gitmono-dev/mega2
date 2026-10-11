@@ -1,0 +1,216 @@
+{
+  "card": "FIX-OX-17",
+  "delivery_mode": "reproduced failure -> test-side barrier fix (card's 'any failure' branch)",
+  "runs": [
+    {
+      "id": "A-run1",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib raw_post_await_revocation_rejects_fragments_and_eof_before_another_backend_poll -- --test-threads=1",
+      "exit_code": 0,
+      "exit_path": "verification/A-run1.exit",
+      "stdout_path": "verification/A-run1.stdout",
+      "stdout_sha256": "3bbed7d6a345b03b1bc7c2138ae981e55edfb57c4ea3384589646dddffa3b509",
+      "stderr_path": "verification/A-run1.stderr",
+      "stderr_sha256": "b4fda2e1f9e499b378287f8db619e4427fb173fc0560538a88267fd47be1a6da",
+      "seconds": "208.77"
+    },
+    {
+      "id": "A-run2",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib raw_post_await_revocation_rejects_fragments_and_eof_before_another_backend_poll -- --test-threads=1",
+      "exit_code": 101,
+      "exit_path": "verification/A-run2.exit",
+      "stdout_path": "verification/A-run2.stdout",
+      "stdout_sha256": "f343167feeae46e24eeb67c5a688df6cab974f639891e6180d14c4a16ee4d11c",
+      "stderr_path": "verification/A-run2.stderr",
+      "stderr_sha256": "a42ad68e7148fb3d49e736f359b3e0bc3bb0ca400fecd74f5a35dbf9022c7e41",
+      "seconds": "208.72"
+    },
+    {
+      "id": "A-run3",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib raw_post_await_revocation_rejects_fragments_and_eof_before_another_backend_poll -- --test-threads=1",
+      "exit_code": 101,
+      "exit_path": "verification/A-run3.exit",
+      "stdout_path": "verification/A-run3.stdout",
+      "stdout_sha256": "ee62b2f24dd5807163b895e46a6121fb46fabe3288b78f3e745f9a2247159f7d",
+      "stderr_path": "verification/A-run3.stderr",
+      "stderr_sha256": "a42ad68e7148fb3d49e736f359b3e0bc3bb0ca400fecd74f5a35dbf9022c7e41",
+      "seconds": "152.97"
+    },
+    {
+      "id": "VER-1-run1",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib raw_post_await_revocation_rejects_fragments_and_eof_before_another_backend_poll -- --test-threads=1",
+      "exit_code": 0,
+      "exit_path": "verification/VER-1-run1.exit",
+      "stdout_path": "verification/VER-1-run1.stdout",
+      "stdout_sha256": "a2fbbc2382b55548a0b9b5aa292cbac881345ec83c707a06346941a8615d1b33",
+      "stderr_path": "verification/VER-1-run1.stderr",
+      "stderr_sha256": "dba6b2f21cb0bad8df29a2683333849079b44893c63ea1c1f08ac8d6274aeb91",
+      "seconds": "210.66"
+    },
+    {
+      "id": "VER-1-run2",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib raw_post_await_revocation_rejects_fragments_and_eof_before_another_backend_poll -- --test-threads=1",
+      "exit_code": 0,
+      "exit_path": "verification/VER-1-run2.exit",
+      "stdout_path": "verification/VER-1-run2.stdout",
+      "stdout_sha256": "b85e86f9e997e32c77cc3823ba865862e72e78932e07df11ac3c0c8fb4be8ca8",
+      "stderr_path": "verification/VER-1-run2.stderr",
+      "stderr_sha256": "582bd92729c5864c2d117d03db10cea329c2039107d9e28af0e339ad5e5b3c36",
+      "seconds": "204.86"
+    },
+    {
+      "id": "VER-1-run3",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib raw_post_await_revocation_rejects_fragments_and_eof_before_another_backend_poll -- --test-threads=1",
+      "exit_code": 0,
+      "exit_path": "verification/VER-1-run3.exit",
+      "stdout_path": "verification/VER-1-run3.stdout",
+      "stdout_sha256": "c8cad949eb85d172015445fbf49fcaba7104387db3c3bf058c13c1b9dd7f0424",
+      "stderr_path": "verification/VER-1-run3.stderr",
+      "stderr_sha256": "582bd92729c5864c2d117d03db10cea329c2039107d9e28af0e339ad5e5b3c36",
+      "seconds": "214.48"
+    }
+  ],
+  "format_check": {
+    "command": "cargo +nightly fmt --all --check",
+    "exit_code": 0,
+    "exit_path": "verification/fmt-final.exit",
+    "stdout_path": "verification/fmt-final.stdout",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_path": "verification/fmt-final.stderr",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "result": "passed"
+  },
+  "clippy_check": {
+    "command": "cargo clippy --all-targets --all-features -- -D warnings",
+    "exit_code": 0,
+    "exit_path": "verification/clippy-final.exit",
+    "stdout_path": "verification/clippy-final.stdout",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_path": "verification/clippy-final.stderr",
+    "stderr_sha256": "50b52a83b2c9defa445d66ad214861adfb7ef0b9204548c00228ecc4f17fccbe",
+    "result": "passed with warnings denied"
+  },
+  "required_repository_checks": {
+    "cargo build": {
+      "state": "passed_with_warning",
+      "exit_code": 0,
+      "exit_path": "verification/cargo-build.exit",
+      "stdout_path": "verification/cargo-build.stdout",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_path": "verification/cargo-build.stderr",
+      "stderr_sha256": "eaf526d2a87985d60cc0edfa3bfeecdebdf476b0df447028c1e7ae28eeef5d47",
+      "result": "passed; the pre-existing macOS linker __eh_frame warning is assigned to OX-284 final C"
+    },
+    "cargo build --tests": {
+      "state": "passed_with_warning",
+      "exit_code": 0,
+      "exit_path": "verification/cargo-build-tests.exit",
+      "stdout_path": "verification/cargo-build-tests.stdout",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_path": "verification/cargo-build-tests.stderr",
+      "stderr_sha256": "ad1c895440c272042a128ac215e975d8798c2a66caec588ae4650b313a588f76",
+      "result": "passed; the pre-existing macOS linker __eh_frame warning is assigned to OX-284 final C"
+    },
+    "source .env.test && cargo test --all": {
+      "state": "not_run_for_this_card",
+      "reason": "The repository-wide suite is the OX-284 final C gate."
+    }
+  },
+  "diagnostic_runs": [
+    {
+      "id": "timing-measurement",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib zz_diagnostic_fragmented_timing -- --test-threads=1 --nocapture",
+      "exit_code": 0,
+      "exit_path": "verification/diagnostic/diagnostic-run.exit",
+      "stdout_path": "verification/diagnostic/diagnostic-run.stdout",
+      "stdout_sha256": "a2e7cacb5ea592c388a9d47c2177492ad9c6526102165beac3955f0912261f94",
+      "stderr_path": "verification/diagnostic/diagnostic-run.stderr",
+      "stderr_sha256": "fb6c75f664bda0e99277e6507650c645000c4110e6e1d47df85a1a2d4fee91de",
+      "source_path": "verification/diagnostic/diagnostic-source.rs",
+      "source_sha256": "97dd31c14667a1ae5d39ea5e2a23a351fa8ae33730073a70655cc2babe563658",
+      "result": "barrier_wait_ms = 6200/6141/9448/8817 of 10000 ms; all four cases enter the held poll and revoke correctly"
+    },
+    {
+      "id": "short-barrier-probe",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib zz_diagnostic_fragmented_barrier_margin -- --test-threads=1 --nocapture",
+      "exit_code": 0,
+      "exit_path": "verification/diagnostic/short-barrier-probe.exit",
+      "stdout_path": "verification/diagnostic/short-barrier-probe.stdout",
+      "stdout_sha256": "e03c1636e08e25aa174e3a53db724cd1a258bd25de2eefbff2741412fb6dd44a",
+      "stderr_path": "verification/diagnostic/short-barrier-probe.stderr",
+      "stderr_sha256": "22a49dca51809ac0dd7be029579fabcd0edea817371f3bf61a458253d3db0ab1",
+      "source_path": "verification/diagnostic/short-barrier-probe-source.rs",
+      "source_sha256": "3d672c7c6e675311ed1f34365079230839e55bc2067d8670b95a5f8152193c99",
+      "result": "cases 0 and 2: entered_within_5s=false, entered_within_60s=true"
+    }
+  ],
+  "source_restoration_check": {
+    "path": "verification/source-restoration-check.json",
+    "sha256": "e6618faa31aaf84220887a9e82b511c9b0d2865c86d1c1aa96e0d2112c89b12a"
+  },
+  "acceptance_criteria": {
+    "AC-1": "witness asserts fixture.counts.assert(1, prefix_length) right after the barrier; diagnostics record whole=1",
+    "AC-2": "witness asserts the case-correct delivered prefix (0 / CHUNK_SIZE); LEASE_EXPIRED termination is diagnostic-supported (the witness discards the error value and the response status is already 200, so no 410 is observable on this path)",
+    "AC-3": "witness asserts tail_polls == 0 and drops == 1",
+    "AC-4": "witness asserts response_budget.used() == 0 and scratch_budget.used() == 0; diagnostics add eof=true",
+    "AC-5": "not applicable as written: the three base runs did not all pass, so the card took the 'any failure -> keep investigating' branch and delivers the test-side barrier fix instead of an empty diff"
+  },
+  "runtime_note": "The repository-wide cargo test --all gate remains owned by OX-284 final C, consistent with the FIX-OX-15/FIX-OX-16 precedent.",
+  "review_history": [
+    {
+      "round": 1,
+      "verdict": "FAIL",
+      "report_path": "review/round-1/claude.stdout",
+      "report_sha256": "5a4505ff660d6c046b7f93d768b725fa19158cb42dde24bdf7edc3fdbc850b1f",
+      "prompt_sha256": "918700d4595c5bc168c8d5704c62acbad2b3cef4085d17aa1c4e3fa49d1bd3c7",
+      "snapshot_manifest_sha256": "c194896d6711b7bcc7648ff9b89e77db3be59ea82dd8e935f0573e0488026502",
+      "blocking_findings": [
+        "P1-1 three-run VER-1 not archived",
+        "P1-2 historical failure unarchived and contradictory"
+      ],
+      "resolutions": "Three-run gate executed; it reproduced the failure (0/101/101), so the empty-diff path was abandoned and the test-only barrier fix delivered."
+    },
+    {
+      "round": 2,
+      "verdict": "FAIL",
+      "report_path": "review/round-2/claude.stdout",
+      "report_sha256": "3f76992f2094f50672d443c040c8a6b96d6e631197021bc3628291d85e139085",
+      "prompt_sha256": "49fe00be37cc12307a68d44b9812e076b381c4ce9cb02ef4f5721f5b5d20f840",
+      "snapshot_manifest_sha256": "59a902580241e1e1d7d9237cf6a76f87f4ccb19b7258833174fb1005fc9c52f6",
+      "blocking_findings": [
+        "P1-1 the live ledger described the withdrawn AC-5 path instead of the delivered fix"
+      ],
+      "resolutions": "Ledger rewritten; card text amended; 'observed revalidate_access' wording removed; round-1 metadata statuses corrected."
+    },
+    {
+      "round": 3,
+      "verdict": "FAIL",
+      "report_path": "review/round-3/claude.stdout",
+      "report_sha256": "3430990b7affe310fb19013ebf5203ee760d4a8b956bc11b2848e0ca99a0fa1e",
+      "prompt_sha256": "1fb21c05ffef0cf95fc08bf52a87d9d0f8d008bd37c6c502ea3d6f994060ee1d",
+      "snapshot_manifest_sha256": "7692356abf81aea52a3a3eac6d6233726457aa98dd82a4c0b901d8d1a83abcf5",
+      "blocking_findings": [
+        "P1-1 no current tree-state capture; the archived one hid the plan amendment and plan-file-diff.stdout still showed an empty plan diff"
+      ],
+      "resolutions": "Fresh capture taken; plan-file-diff refreshed to the real <LargeFile> marker; packet labels corrected; review_history populated; ledger SHA/count drift and handoff wording fixed."
+    },
+    {
+      "round": 4,
+      "verdict": "FAIL",
+      "report_path": "review/round-4/claude.stdout",
+      "report_sha256": "c20503e7b81fd243f6aa1a5162c980f2f58158e3182e57519ecb26b065ff54ac",
+      "prompt_sha256": "f6f062f0994c65e8dca7d0551cef042d27f7d94a68b1c3160a37b93002700518",
+      "snapshot_manifest_sha256": "9168b3f072b2dad3ed2e00aa4039b144f550bb79c8798d0915d8be1cd04912d8",
+      "blocking_findings": [
+        "P1-1 nested plan-SHA phrasing labelled the post-amendment SHA as pre-amendment"
+      ],
+      "resolutions": "SHA phrasing normalised in all four places; round-3 metadata persisted and covered by redactions.json; FIX-OX-16 deduplicated and added to the \u00a7\u56db/\u00a7\u4e03 lists; stray cell and stale no-push sentence removed; rounds 1-3 recorded in review_history, the ledger and the README."
+    }
+  ],
+  "review": {
+    "reviewer": "Claude Code",
+    "round": 5,
+    "verdict": "PENDING",
+    "report_path": "review/round-5/claude.stdout",
+    "report_sha256": null
+  }
+}

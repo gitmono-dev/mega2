@@ -1,0 +1,20 @@
+diff --git a/src/api/router/snapshot_raw_blob_tests.rs b/src/api/router/snapshot_raw_blob_tests.rs
+index befce84..45a1b26 100644
+--- a/src/api/router/snapshot_raw_blob_tests.rs
++++ b/src/api/router/snapshot_raw_blob_tests.rs
+@@ -525,13 +525,13 @@
+                 }
+             }
+         });
+-        timeout(Duration::from_secs(10), entered.notified())
++        timeout(Duration::from_secs(60), entered.notified())
+             .await
+             .unwrap();
+         fixture.counts.assert(1, prefix_length);
+         release_lease(&fixture).await;
+         release.notify_one();
+-        let finished = timeout(Duration::from_secs(10), &mut task).await;
++        let finished = timeout(Duration::from_secs(30), &mut task).await;
+         if finished.is_err() {
+             task.abort();
+             let _ = task.await;

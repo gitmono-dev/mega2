@@ -1,0 +1,22 @@
+{
+  "card": "FIX-OX-17",
+  "round": 7,
+  "reviewer": "Claude Code",
+  "mode": "read-only",
+  "exit_code": 0,
+  "verdict": "FAIL",
+  "prompt_sha256": "807f995c58bf7afded9f7f2797297e36ff04c709b5af70ab9914a5abcbdd56c4",
+  "snapshot_manifest_sha256": "05e91af8d493f544968b5dcb324aa7fb233f2d54d07abca6a5ef94bf66f65a4c",
+  "report_sha256": "1c5d4bcc5b6612534178164d27f47e377a4050cf3a0ee9656d26dabcb6d4b986",
+  "findings": [
+    {
+      "severity": "P1",
+      "status": "blocking, fixed in round 8",
+      "summary": "P1-1: the \u00a7\u4e00 row still ended with a trailing comma while two records claimed it was fixed."
+    }
+  ],
+  "snapshot_payload_integrity": {
+    "payloads": 88,
+    "mismatches": []
+  }
+}

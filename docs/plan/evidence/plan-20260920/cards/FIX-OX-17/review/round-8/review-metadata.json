@@ -1,0 +1,58 @@
+{
+  "card": "FIX-OX-17",
+  "round": 8,
+  "reviewer": "Claude Code",
+  "mode": "read-only",
+  "exit_code": 0,
+  "verdict": "PASS",
+  "prompt_sha256": "283166addb97466c5334bbc33e665dc28e7c44d67cf885528f3f699e5fe2e9ec",
+  "snapshot_manifest_sha256": "b894bdb87354c6805a8b9da8b864eb783d390d8661d90fd410bbc05fb375923c",
+  "report_sha256": "c29f834a53594cad98928e871785642ecee3a26c3cf08f9baaa79af787bbde22",
+  "p0_p1": "none",
+  "findings": [
+    {
+      "severity": "P2",
+      "status": "closed before commit",
+      "summary": "P2-1: round-7 metadata listed only P1-1; the full finding list is now recorded."
+    },
+    {
+      "severity": "P2",
+      "status": "closed before commit",
+      "summary": "P2-2: round-4/5/6 resolution attributions were misdated; they now note when each half was actually completed."
+    },
+    {
+      "severity": "P3",
+      "status": "closed before commit",
+      "summary": "P3-1: README round-4 stray closing parenthesis fixed."
+    },
+    {
+      "severity": "P3",
+      "status": "closed before commit",
+      "summary": "P3-2: ledger ER-05 bullet now carries the round-6 and round-7 report SHAs."
+    },
+    {
+      "severity": "P3",
+      "status": "closed before commit",
+      "summary": "P3-3: ledger_self_audit now also checks evidence/README.md parentheses."
+    },
+    {
+      "severity": "P3",
+      "status": "noted, pre-existing",
+      "summary": "P3-4: the \u00a7\u516d DEP-OX-02 row has five cells in a four-column table; not this card's scope."
+    },
+    {
+      "severity": "P3",
+      "status": "historical, not rewritten",
+      "summary": "P3-5: copied round snapshot manifests carry a 'round-2' label."
+    },
+    {
+      "severity": "P3",
+      "status": "noted",
+      "summary": "P3-6: the macOS linker warning stays ledgered against OX-284 final C."
+    }
+  ],
+  "snapshot_payload_integrity": {
+    "payloads": 91,
+    "mismatches": []
+  }
+}

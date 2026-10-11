@@ -1,0 +1,16 @@
+   Compiling mega2 v0.42.25 ([REDACTED_EXECUTION_PATH])
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `mega2` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.13s
+     Running unittests src/lib.rs (target/debug/deps/mega2_core-bd8d4bc92bb048ff)
+DIAG case=0 status=200 OK entered=true fixture_ms=20487 map_ms=10517 oneshot_ms=10257 barrier_wait_ms=6200 whole=1 bytes=1 prefix_len=1
+DIAG case=0 delivered_len=0 error_display=LEASE_EXPIRED: lease is not active for this snapshot; re-resolve tail=0 drops=1 response_used=0 scratch_used=0 eof=true
+DIAG case=1 status=200 OK entered=true fixture_ms=19476 map_ms=9518 oneshot_ms=10273 barrier_wait_ms=6141 whole=1 bytes=1 prefix_len=1
+DIAG case=1 delivered_len=0 error_display=LEASE_EXPIRED: lease is not active for this snapshot; re-resolve tail=0 drops=1 response_used=0 scratch_used=0 eof=true
+DIAG case=2 status=200 OK entered=true fixture_ms=18996 map_ms=9399 oneshot_ms=9131 barrier_wait_ms=9448 whole=1 bytes=1048689 prefix_len=1048689
+DIAG case=2 delivered_len=1048576 error_display=LEASE_EXPIRED: lease is not active for this snapshot; re-resolve tail=0 drops=1 response_used=0 scratch_used=0 eof=true
+DIAG case=3 status=200 OK entered=true fixture_ms=19488 map_ms=9412 oneshot_ms=9107 barrier_wait_ms=8817 whole=1 bytes=1048689 prefix_len=1048689
+DIAG case=3 delivered_len=1048576 error_display=LEASE_EXPIRED: lease is not active for this snapshot; re-resolve tail=0 drops=1 response_used=0 scratch_used=0 eof=true

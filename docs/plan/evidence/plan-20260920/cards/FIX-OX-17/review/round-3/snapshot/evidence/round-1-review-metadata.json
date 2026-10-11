@@ -1,0 +1,72 @@
+{
+  "card": "FIX-OX-17",
+  "round": 1,
+  "reviewer": "Claude Code",
+  "mode": "read-only",
+  "exit_code": 0,
+  "verdict": "FAIL",
+  "prompt_sha256": "918700d4595c5bc168c8d5704c62acbad2b3cef4085d17aa1c4e3fa49d1bd3c7",
+  "snapshot_manifest_sha256": "c194896d6711b7bcc7648ff9b89e77db3be59ea82dd8e935f0573e0488026502",
+  "report_sha256": "5a4505ff660d6c046b7f93d768b725fa19158cb42dde24bdf7edc3fdbc850b1f",
+  "findings": [
+    {
+      "severity": "P1",
+      "status": "blocking, fixed in round 2",
+      "summary": "P1-1: VER-1 requires three consecutive focused runs; only one A and one B run were archived."
+    },
+    {
+      "severity": "P1",
+      "status": "blocking, fixed in round 2",
+      "summary": "P1-2: the historical exit-101 record was cited without an archived path/SHA and contradicted the card's Current evidence."
+    },
+    {
+      "severity": "P2",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P2-1: AC-2's LEASE_EXPIRED termination was diagnostic-only and the 410 claim was unobservable on this path."
+    },
+    {
+      "severity": "P2",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P2-2: the route-verification/revalidate_access mechanism was inferred, not instrumented."
+    },
+    {
+      "severity": "P2",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P2-3: the FIX-OX-18 handoff was not durable in a ledger."
+    },
+    {
+      "severity": "P2",
+      "status": "non-blocking; resolved in round 3 by delivering the card's failure branch (reproduced 0/101/101 baseline and a test-only barrier fix); the AC-5 path is not applicable",
+      "summary": "P2-4: the executed hardening path was not reflected in the card text; the card now takes its AC-5 evidence-only path with no source delta."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P3-1: redactions.json carried the FIX-OX-16 card label."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P3-2: worktree-status.stdout predated evidence finalisation."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking, fixed in round 2",
+      "summary": "P3-3: the short-barrier probe was described as reproducing the recorded failure exactly."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking; still applicable \u2014 the 30 s window is part of the delivered hunk, and its rationale is recorded in the README review record",
+      "summary": "P3-4: the 30 s post-release window had no measurement behind it."
+    },
+    {
+      "severity": "P3",
+      "status": "non-blocking, noted",
+      "summary": "P3-5: the macOS linker warning stays ledgered against OX-284 final C."
+    }
+  ],
+  "snapshot_payload_integrity": {
+    "payloads": 51,
+    "mismatches": []
+  }
+}

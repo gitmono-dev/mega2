@@ -1,0 +1,67 @@
+{
+  "card": "FIX-OX-17",
+  "round": 3,
+  "reviewer": "Claude Code",
+  "mode": "read-only",
+  "exit_code": 0,
+  "verdict": "FAIL",
+  "prompt_sha256": "1fb21c05ffef0cf95fc08bf52a87d9d0f8d008bd37c6c502ea3d6f994060ee1d",
+  "snapshot_manifest_sha256": "7692356abf81aea52a3a3eac6d6233726457aa98dd82a4c0b901d8d1a83abcf5",
+  "report_sha256": "3430990b7affe310fb19013ebf5203ee760d4a8b956bc11b2848e0ca99a0fa1e",
+  "findings": [
+    {
+      "severity": "P1",
+      "status": "blocking, fixed in round 4",
+      "summary": "P1-1: no current tree-state capture; the archived one was byte-identical to round 2 and hid the plan amendment, and plan-file-diff.stdout still showed an empty plan diff."
+    },
+    {
+      "severity": "P2",
+      "status": "fixed in round 4",
+      "summary": "P2-1: review_history was empty and the review block was stale."
+    },
+    {
+      "severity": "P2",
+      "status": "fixed in round 4",
+      "summary": "P2-2: round-1 metadata still claimed the AC-5 evidence-only path in its summary field."
+    },
+    {
+      "severity": "P2",
+      "status": "fixed in round 4",
+      "summary": "P2-3: the ledger still named the pre-amendment plan SHA as current."
+    },
+    {
+      "severity": "P3",
+      "status": "fixed in round 4",
+      "summary": "P3-1: count drift across ledger sections plus stale push/commit statements."
+    },
+    {
+      "severity": "P3",
+      "status": "fixed in round 4",
+      "summary": "P3-2: the plan amendment's changed-line count was wrong."
+    },
+    {
+      "severity": "P3",
+      "status": "fixed in round 4",
+      "summary": "P3-3: the FIX-OX-18 handoff said 'route verification' where only the oneshot cost was measured."
+    },
+    {
+      "severity": "P3",
+      "status": "fixed in round 4",
+      "summary": "P3-4: the withdrawal narrative conflated the pre-withdrawal isolated run with A-run1."
+    },
+    {
+      "severity": "P3",
+      "status": "fixed in round 4",
+      "summary": "P3-5: the packet's A-B-source.diff was the libra diff output paired with the diff -u exit file."
+    },
+    {
+      "severity": "P3",
+      "status": "noted",
+      "summary": "P3-6: the macOS linker warning stays ledgered against OX-284 final C."
+    }
+  ],
+  "snapshot_payload_integrity": {
+    "payloads": 72,
+    "mismatches": []
+  }
+}
