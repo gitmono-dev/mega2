@@ -1,2 +1,0 @@
-Snapshot source allowlist: R30 925-file allowlist refreshed to current working-tree bytes, plus all five archived R30 evidence files and all seven archived R31 evidence files.
-Excluded: .git and Libra VCS metadata; local .env/.env.test credentials and configuration; build caches/generated targets; R32 output and prompt artifacts.

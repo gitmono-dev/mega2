@@ -1,4 +1,0 @@
-.env.test
-.libra/
-VCS metadata
-No credentials copied

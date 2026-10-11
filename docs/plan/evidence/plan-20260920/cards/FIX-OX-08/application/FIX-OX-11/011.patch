@@ -1,7 +1,0 @@
-diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
---- a/.github/workflows/docker.yml
-+++ b/.github/workflows/docker.yml
-@@ -41,1 +74,2 @@
--      - name: Build and push
-+      - name: Build and push by digest
-+        id: build

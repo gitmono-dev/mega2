@@ -1,5 +1,0 @@
---- a/.github/workflows/docker.yml
-+++ b/.github/workflows/docker.yml
-@@ -24,1 +61,1 @@
--      - name: Extract metadata
-+      - name: Extract image labels

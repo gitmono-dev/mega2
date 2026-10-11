@@ -1,7 +1,0 @@
---- a/.github/workflows/docker.yml
-+++ b/.github/workflows/docker.yml
-@@ -10,0 +12,4 @@
-+
-+env:
-+  REGISTRY_IMAGE: ${{ vars.DOCKER_USER }}/mega2
-+

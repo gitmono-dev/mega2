@@ -1,9 +1,0 @@
-{
-  "attempt": 1,
-  "status": "incomplete_no_verdict",
-  "reason": "Claude Code returned only attempted tool-call text; no review findings or literal verdict were produced.",
-  "exit_code": 0,
-  "request_only_prompt_sha256": "8585c28741b5fdb3442301b7952c74cda9cdacccf6d1400fc219900f6f7bd5c2",
-  "stdout_sha256": "00cdd5ae67a564b4ac2de91b380f163d4e1be91501f8425ccf5ff9cfa70caddd",
-  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-}

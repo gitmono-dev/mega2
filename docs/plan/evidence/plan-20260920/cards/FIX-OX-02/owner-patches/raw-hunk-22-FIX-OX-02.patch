@@ -1,9 +1,0 @@
---- a/src/api/router/snapshot_chunks_bounded_tests.rs
-+++ b/src/api/router/snapshot_chunks_bounded_tests.rs
-@@ -177,6 +162,0 @@
--    let fixture = Fixture::new_with_pg_config_directories_and_objects(
--        false,
--        0,
--        &[("other".to_string(), vec![19; 4096])],
--    )
--    .await;

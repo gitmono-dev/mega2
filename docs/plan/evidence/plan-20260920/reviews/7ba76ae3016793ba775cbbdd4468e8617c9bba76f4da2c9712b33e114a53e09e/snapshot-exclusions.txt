@@ -1,3 +1,0 @@
-Snapshot source allowlist is the R30 925-file manifest, refreshed to current working-tree bytes, plus the five archived R30 evidence files.
-Excluded: .git and Libra VCS metadata; local .env and .env.test credentials/configuration; build caches and generated target directories; R31 output and prompt artifacts.
-No task-card implementation or tests are run by the review invocation.

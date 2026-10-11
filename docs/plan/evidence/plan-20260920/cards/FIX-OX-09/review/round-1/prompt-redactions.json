@@ -1,7 +1,0 @@
-{
-  "submitted_prompt_sha256": "fed5e8ec5bc8286b04846f90a0810b20e2481331ef46cee7ed95e05bc08fdc5e",
-  "stored_prompt_sha256": "510b3a70e05de169c857d6bda09742eed0c7732ad4332469d9a501e935177169",
-  "prompt_sha256_from_cli_metadata": "fed5e8ec5bc8286b04846f90a0810b20e2481331ef46cee7ed95e05bc08fdc5e",
-  "redaction": "Replaced the single local absolute review-snapshot path with ${FIX_OX_09_REVIEW_SNAPSHOT}; all other bytes unchanged.",
-  "occurrences": 1
-}

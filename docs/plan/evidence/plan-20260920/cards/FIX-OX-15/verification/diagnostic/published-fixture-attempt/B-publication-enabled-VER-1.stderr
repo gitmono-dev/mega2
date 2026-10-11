@@ -1,9 +1,0 @@
-   Compiling mega2 v0.42.25 ([REDACTED_EXECUTION_PATH])
-warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
-  |
-  = note: `#[warn(linker_messages)]` on by default
-
-warning: `mega2` (lib test) generated 1 warning
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.36s
-     Running unittests src/lib.rs (target/debug/deps/mega2_core-bd8d4bc92bb048ff)
-error: test failed, to rerun pass `-p mega2 --lib`

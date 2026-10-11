@@ -1,4 +1,0 @@
---- a/.github/workflows/docker.yml
-+++ b/.github/workflows/docker.yml
-@@ -45,1 +79,0 @@
--          platforms: linux/amd64,linux/arm64

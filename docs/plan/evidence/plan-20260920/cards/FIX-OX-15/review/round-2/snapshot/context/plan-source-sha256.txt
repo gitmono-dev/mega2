@@ -1,3 +1,0 @@
-plan-20260920.md sha256: 24f1be3fe8e431f664ced7eeb03d403a7793ce393d69aa162d663071566b444c
-current plan candidate in plan-status.md: 24f1be3fe8e431f664ced7eeb03d403a7793ce393d69aa162d663071566b444c
-libra diff -- docs/plan/plan-20260920.md: exit 0, empty output

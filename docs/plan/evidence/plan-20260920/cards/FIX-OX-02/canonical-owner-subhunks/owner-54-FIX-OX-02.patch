@@ -1,7 +1,0 @@
---- a/src/api/router/snapshot_content_tests.rs
-+++ b/src/api/router/snapshot_content_tests.rs
-@@ -973,3 +977,1 @@
--                    .body(Body::from(
--                        json!({"target":{"kind":"latest"},"scope":"/project","lease_seconds":options.lease_seconds.unwrap_or(600)}).to_string(),
--                    ))
-+                    .body(Body::from(resolve_request.to_string()))

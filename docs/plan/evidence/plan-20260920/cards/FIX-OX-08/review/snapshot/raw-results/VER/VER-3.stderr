@@ -1,5 +1,0 @@
-Traceback (most recent call last):
-  File "<string>", line 1, in <module>
-    from pathlib import Path; import re; s=Path(".github/workflows/docker.yml").read_text(); m=re.search(r"(?ms)^      - name: Free space for the Rust build\n        run: \\|\n((?:          [^\n]*\n)+)",s); assert m, "free-space step missing"; assert [x[10:] for x in m.group(1).splitlines()]==["sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell","df -h /"]; assert s.index("- name: Free space for the Rust build") < s.index("- name: Checkout")
-                                                                                                                                                                                                                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-AssertionError

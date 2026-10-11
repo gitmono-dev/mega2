@@ -1,5 +1,0 @@
---- a/src/api/router/snapshot_content_tests.rs
-+++ b/src/api/router/snapshot_content_tests.rs
-@@ -891,1 +974,1 @@
--                        json!({"target":{"kind":"latest"},"scope":"/project"}).to_string(),
-+                        json!({"target":{"kind":"latest"},"scope":"/project","lease_seconds":options.lease_seconds.unwrap_or(600)}).to_string(),

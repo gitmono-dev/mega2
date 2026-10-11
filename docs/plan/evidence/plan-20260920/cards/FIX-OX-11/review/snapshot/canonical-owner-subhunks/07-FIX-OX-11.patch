@@ -1,6 +1,0 @@
---- a/.github/workflows/docker.yml
-+++ b/.github/workflows/docker.yml
-@@ -28,1 +65,2 @@
--          images: ${{ vars.DOCKER_USER }}/mega2
-+          images: ${{ env.REGISTRY_IMAGE }}
-+          flavor: latest=false

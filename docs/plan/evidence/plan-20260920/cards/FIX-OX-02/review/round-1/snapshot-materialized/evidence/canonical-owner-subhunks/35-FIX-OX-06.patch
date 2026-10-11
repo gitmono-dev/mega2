@@ -1,5 +1,0 @@
---- a/src/api/router/snapshot_content_tests.rs
-+++ b/src/api/router/snapshot_content_tests.rs
-@@ -1031,1 +1114,1 @@
--    assert_eq!(response.status().as_u16(), status);
-+    let actual_status = response.status().as_u16();

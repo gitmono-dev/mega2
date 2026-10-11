@@ -1,6 +1,0 @@
-
-running 1 test
-test api::router::snapshot_router::content::tests::raw_blob::raw_missing_or_forged_receipt_and_real_stored_corruption_fail_without_rebuilding ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2463 filtered out; finished in 920.25s
-

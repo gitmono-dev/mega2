@@ -1,7 +1,0 @@
-{
-  "plan_sha256": "51c3f272b608badd6fde2a832f507e4635d0257f01b9b471d3f668a2a4bbae6f",
-  "report_sha256": "481c77952dbdfece7094136bd0aec2c9ffd8f1af8bca3e23d0b8c50293cffc50",
-  "claude_code_version": "2.1.288",
-  "reviewed_at_utc": "2026-10-09 18:45:56 UTC",
-  "literal_verdict": "FAIL"
-}

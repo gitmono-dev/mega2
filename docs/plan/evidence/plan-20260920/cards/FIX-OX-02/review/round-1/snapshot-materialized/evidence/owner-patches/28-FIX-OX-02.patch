@@ -1,9 +1,0 @@
---- a/src/api/router/snapshot_chunks_bounded_tests.rs
-+++ b/src/api/router/snapshot_chunks_bounded_tests.rs
-@@ -426,1 +461,1 @@
--                digest,
-+                *digest,
-diff --git a/src/api/router/snapshot_content_tests.rs b/src/api/router/snapshot_content_tests.rs
-index 906752f..2c417e0 100644
---- a/src/api/router/snapshot_content_tests.rs
-+++ b/src/api/router/snapshot_content_tests.rs

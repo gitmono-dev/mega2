@@ -1,1 +1,0 @@
-Excluded from immutable Claude snapshot: `.env.test` and other environment files; Cargo target/build output; VCS metadata; review archives and prior snapshots. Round-1 review report is included separately under context as a finding list, not as a replacement for source/evidence.
