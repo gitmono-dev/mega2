@@ -11,6 +11,48 @@
       "sanitized_sha256": "2e7290a82898d5daadeb9f650b0ab9d0b95ea63a104a840b242bfed0ad00c60a"
     },
     {
+      "path": "verification/cargo-build-tests.stderr",
+      "replacements": [],
+      "original_sha256": "f70a7a2bf496837a9a0710cac5c393358b261c2dca8a2f2b325e425889e79b08",
+      "sanitized_sha256": "f70a7a2bf496837a9a0710cac5c393358b261c2dca8a2f2b325e425889e79b08"
+    },
+    {
+      "path": "verification/cargo-build-tests.stdout",
+      "replacements": [],
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "sanitized_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "verification/cargo-build.stderr",
+      "replacements": [],
+      "original_sha256": "ac4a8fca5a619b4a38c0b8432673a3e73129c37a210113e79c426dd43c52d80a",
+      "sanitized_sha256": "ac4a8fca5a619b4a38c0b8432673a3e73129c37a210113e79c426dd43c52d80a"
+    },
+    {
+      "path": "verification/cargo-build.stdout",
+      "replacements": [],
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "sanitized_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "verification/cargo-test-all.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH] (1)",
+        "secret/token/password/API-key/credential assignment value -> [REDACTED] (4)"
+      ],
+      "original_sha256": "fe6dbc01b42e352c0484757d59e2a8a21f7ae8c01b8cb24d135ee2c3c86dc240",
+      "sanitized_sha256": "393abaf1d8768112dd5c560f8e6c6c46174f08d3b1a9afeba70276b629265433"
+    },
+    {
+      "path": "verification/cargo-test-all.stdout",
+      "replacements": [
+        "database connection URL -> [REDACTED_DSN] (45)",
+        "secret/token/password/API-key/credential assignment value -> [REDACTED] (13)"
+      ],
+      "original_sha256": "24ab4e3b2723f005ad47dcdd33e36789cb141101423ec617ae2174ac2379eb9e",
+      "sanitized_sha256": "8249f91934bd3654103ecf4bd5815feda0046e9c080f09a5d1b74f1abee00257"
+    },
+    {
       "path": "verification/clippy-final.stderr",
       "replacements": [
         "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
@@ -18,6 +60,42 @@
       ],
       "original_sha256": "30f17700a70fb39aab9dd96d7f97de802ac84610564b52a6d22077e06c656d6c",
       "sanitized_sha256": "ca2f250f1fa3411fda4cb82630647d7d0e37273fa2dccd6bf5eec0236859ba1c"
+    },
+    {
+      "path": "verification/diagnostic/full-suite-tail/isolated-1.stderr",
+      "replacements": [],
+      "original_sha256": "404b3dd0e6245f5615874a068a860b8b8ecf4c9f5e8ac9b6efd2530e9c3a3ed9",
+      "sanitized_sha256": "404b3dd0e6245f5615874a068a860b8b8ecf4c9f5e8ac9b6efd2530e9c3a3ed9"
+    },
+    {
+      "path": "verification/diagnostic/full-suite-tail/isolated-1.stdout",
+      "replacements": [],
+      "original_sha256": "06e681e3df9370d763e84a629652d56a1d195a1e43909785febb1a820ff2fba4",
+      "sanitized_sha256": "06e681e3df9370d763e84a629652d56a1d195a1e43909785febb1a820ff2fba4"
+    },
+    {
+      "path": "verification/diagnostic/full-suite-tail/isolated-2.stderr",
+      "replacements": [],
+      "original_sha256": "c5a85156d5d6318af9f3e0626cc6ab6ed7609dc50c15b493f788ef5e222d9be5",
+      "sanitized_sha256": "c5a85156d5d6318af9f3e0626cc6ab6ed7609dc50c15b493f788ef5e222d9be5"
+    },
+    {
+      "path": "verification/diagnostic/full-suite-tail/isolated-2.stdout",
+      "replacements": [],
+      "original_sha256": "ccb277373556cc3fba54db78b47eef518399b184ad56d4e9eba6859c84f3c370",
+      "sanitized_sha256": "ccb277373556cc3fba54db78b47eef518399b184ad56d4e9eba6859c84f3c370"
+    },
+    {
+      "path": "verification/diagnostic/full-suite-tail/isolated-3.stderr",
+      "replacements": [],
+      "original_sha256": "c5a85156d5d6318af9f3e0626cc6ab6ed7609dc50c15b493f788ef5e222d9be5",
+      "sanitized_sha256": "c5a85156d5d6318af9f3e0626cc6ab6ed7609dc50c15b493f788ef5e222d9be5"
+    },
+    {
+      "path": "verification/diagnostic/full-suite-tail/isolated-3.stdout",
+      "replacements": [],
+      "original_sha256": "28060b8654e325fadba83767cbdb104d0e3c6a3f777edf95b507927ee25fa0b2",
+      "sanitized_sha256": "28060b8654e325fadba83767cbdb104d0e3c6a3f777edf95b507927ee25fa0b2"
     },
     {
       "path": "verification/diagnostic/launcher-wrapper/A-login-shell.stderr",
@@ -29,15 +107,6 @@
       "sanitized_sha256": "496752a1739301d790961a9e49284f769f5897fe4ecab279aa721458d3af6669"
     },
     {
-      "path": "verification/diagnostic/published-fixture-attempt/B-publication-enabled-debug.stderr",
-      "replacements": [
-        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
-        "absolute home-directory path -> [REDACTED_HOME]"
-      ],
-      "original_sha256": "523491836c97efad7b2438cc1842b5ac71deaa9cda51f1067b35f8925b5dd225",
-      "sanitized_sha256": "65b5f9c1d23fbb458d7121467ea38d3bb8ec906f65fdd8aec035fcbbf0f358cc"
-    },
-    {
       "path": "verification/diagnostic/published-fixture-attempt/B-publication-enabled-VER-1.stderr",
       "replacements": [
         "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
@@ -45,6 +114,15 @@
       ],
       "original_sha256": "049efa0c4876f3bac733b9c5e285929496f221c75fd3c6a21093e9595e1bac63",
       "sanitized_sha256": "23abf6ca84f37a51ef024edc0cc2de2876b5510f5fc71ec6714685329748be31"
+    },
+    {
+      "path": "verification/diagnostic/published-fixture-attempt/B-publication-enabled-debug.stderr",
+      "replacements": [
+        "absolute execution checkout path -> [REDACTED_EXECUTION_PATH]",
+        "absolute home-directory path -> [REDACTED_HOME]"
+      ],
+      "original_sha256": "523491836c97efad7b2438cc1842b5ac71deaa9cda51f1067b35f8925b5dd225",
+      "sanitized_sha256": "65b5f9c1d23fbb458d7121467ea38d3bb8ec906f65fdd8aec035fcbbf0f358cc"
     },
     {
       "path": "verification/diagnostic/route-lock-investigation/C-debug.stderr",

@@ -1,0 +1,96 @@
+   Compiling mega2 v0.42.25 ([REDACTED_EXECUTION_PATH])
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `mega2` (lib test) generated 1 warning
+warning: `mega2` (bin "mega2") generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.31s
+     Running unittests src/lib.rs (target/debug/deps/mega2_core-bd8d4bc92bb048ff)
+test schema mega2_test_75001_205 was still held when api::router::snapshot_router::content::tests::chunk_map_retention::shared_map_survives_other_source_retirement_while_actual_reader_is_live ended; dropping it now
+test schema mega2_test_75001_426 was still held when ceres::api_service::commit_ops::tests::gpg_status_cache_key_uses_v2 ended; dropping it now
+test schema mega2_test_75001_427 was still held when ceres::api_service::commit_ops::tests::gpg_status_routes_server_and_user_commits_per_commit ended; dropping it now
+test schema mega2_test_75001_439 was still held when ceres::api_service::mono_api_service::mc09_tests::complete_buck_upload_signs_commit_and_backfills_references ended; dropping it now
+test schema mega2_test_75001_455 was still held when ceres::api_service::mono_api_service::mc09_tests::update_branch_listing_failure_leaves_all_sinks_untouched ended; dropping it now
+test schema mega2_test_75001_457 was still held when ceres::api_service::mono_api_service::mc09_tests::update_branch_rebuilds_cl_commits_listing ended; dropping it now
+test schema mega2_test_75001_458 was still held when ceres::api_service::mono_api_service::mc09_tests::update_branch_signs_commit_and_backfills_references ended; dropping it now
+test schema mega2_test_75001_468 was still held when ceres::api_service::mono_api_service::tests::fu07_concurrent_apply_one_lands ended; dropping it now
+test schema mega2_test_75001_470 was still held when ceres::api_service::mono_api_service::tests::tp11_assertion_precedes_conflict_recheck ended; dropping it now
+test schema mega2_test_75001_471 was still held when ceres::api_service::mono_api_service::tests::tp11_cl_ref_is_not_asserted ended; dropping it now
+test schema mega2_test_75001_472 was still held when ceres::api_service::mono_api_service::tests::tp11_inspect_skips_root_and_cl_refs ended; dropping it now
+test schema mega2_test_75001_473 was still held when ceres::api_service::mono_api_service::tests::tp11_merge_repair_advertise_continues_from_tombstone ended; dropping it now
+test schema mega2_test_75001_474 was still held when ceres::api_service::mono_api_service::tests::tp11_merge_stale_tree_hash_refuses_and_tombstones ended; dropping it now
+test schema mega2_test_75001_476 was still held when ceres::api_service::mono_api_service::tests::tp11_push_stale_tree_hash_refuses_and_tombstones ended; dropping it now
+test schema mega2_test_75001_477 was still held when ceres::api_service::mono_api_service::tests::tp11_reconcile_and_inspect_tombstone_stale_rows ended; dropping it now
+test schema mega2_test_75001_478 was still held when ceres::api_service::mono_api_service::tests::tp12_create_n1_and_n2_and_multilevel ended; dropping it now
+test schema mega2_test_75001_480 was still held when ceres::api_service::mono_api_service::tests::tp12_gap14_empty_pack_and_all_known_enqueue_b3 ended; dropping it now
+test schema mega2_test_75001_484 was still held when ceres::api_service::mono_api_service::tests::tp12_n0_matching_tip_is_noop_done ended; dropping it now
+test schema mega2_test_75001_489 was still held when ceres::api_service::mono_api_service::tests::tp12_n1_fast_forward_lands_client_tip ended; dropping it now
+test schema mega2_test_75001_495 was still held when ceres::api_service::mono_api_service::tests::tp12_n2_known_objects_still_squash_and_done_replay ended; dropping it now
+test schema mega2_test_75001_502 was still held when ceres::api_service::mono_api_service::tests::tp12_net_zero_same_tree_cas_once ended; dropping it now
+test schema mega2_test_75001_503 was still held when ceres::api_service::mono_api_service::tests::tp12_tombstone_and_wait_materialize_and_assertions ended; dropping it now
+test schema mega2_test_75001_505 was still held when ceres::api_service::mono_api_service::tests::tp12_tombstone_and_wait_materialize_and_assertions ended; dropping it now
+test schema mega2_test_75001_507 was still held when ceres::api_service::mono_api_service::tests::tp12_tombstone_and_wait_materialize_and_assertions ended; dropping it now
+test schema mega2_test_75001_508 was still held when ceres::api_service::mono_api_service::tests::tp14_push_continues_changed_descendant_and_skips_unchanged ended; dropping it now
+test schema mega2_test_75001_510 was still held when ceres::api_service::mono_api_service::tests::tp16_n1_lands_client_tip_and_root_message_matches ended; dropping it now
+test schema mega2_test_75001_513 was still held when ceres::api_service::mono_api_service::tests::tp16_n3_squash_provenance_and_coauthors ended; dropping it now
+test schema mega2_test_75001_517 was still held when ceres::api_service::mono_api_service::tests::tp16_review_merge_keeps_from_tree_id_shape ended; dropping it now
+test schema mega2_test_75001_540 was still held when ceres::merge_checker::gpg_signature_checker::tests::rotated_server_key_generations_verify_mixed_chain ended; dropping it now
+test schema mega2_test_75001_541 was still held when ceres::merge_checker::gpg_signature_checker::tests::server_identity_commit_verifies_against_server_keyring ended; dropping it now
+test schema mega2_test_75001_542 was still held when ceres::merge_checker::gpg_signature_checker::tests::server_key_with_user_identity_is_fail_closed ended; dropping it now
+test schema mega2_test_75001_558 was still held when ceres::pack::api_tip_lander::tests::api_tip_lander_advances_path_tip ended; dropping it now
+test schema mega2_test_75001_556 was still held when ceres::merge_checker::gpg_signature_checker::tests::user_key_with_forged_server_identity_is_fail_closed ended; dropping it now
+test schema mega2_test_75001_564 was still held when ceres::pack::api_tip_lander::tests::api_tip_lander_nff_is_diagnosable ended; dropping it now
+test schema mega2_test_75001_574 was still held when ceres::pack::api_tip_lander::tests::storage_event_api_commit ended; dropping it now
+test schema mega2_test_75001_618 was still held when ceres::pack::monorepo::tests::fu10_b3_creation_reclassifies_under_lock ended; dropping it now
+test schema mega2_test_75001_619 was still held when ceres::pack::monorepo::tests::fu10_fork_creation_allowed_root_lands ended; dropping it now
+test schema mega2_test_75001_621 was still held when ceres::pack::monorepo::tests::tp17_trunk_finalize_rejects_delete_without_cl ended; dropping it now
+test schema mega2_test_75001_620 was still held when ceres::pack::monorepo::tests::fu10_orphan_allowed_root_uninitialized ended; dropping it now
+test schema mega2_test_75001_622 was still held when ceres::pack::monorepo::tests::fu10_outside_roots_rejected_before_chain ended; dropping it now
+test schema mega2_test_75001_623 was still held when ceres::pack::monorepo::tests::fu10_trunk_creation_path_cases ended; dropping it now
+test schema mega2_test_75001_629 was still held when ceres::pack::monorepo::tests::tp18_trunk_validate_rejects_non_main_ref ended; dropping it now
+test schema mega2_test_75001_655 was still held when ceres::pack::monorepo::tests::tp17_trunk_advertise_omits_cl_refs_review_keeps_them ended; dropping it now
+test schema mega2_test_75001_665 was still held when ceres::pack::monorepo::tests::tp17_trunk_finalize_n1_lands_client_tip_and_records_requester ended; dropping it now
+test schema mega2_test_75001_673 was still held when ceres::pack::monorepo::tests::tp17_trunk_finalize_nff_includes_align_command ended; dropping it now
+test schema mega2_test_75001_680 was still held when ceres::pack::monorepo::tests::tp17_trunk_finalize_stale_nested_baseline_refuses ended; dropping it now
+test schema mega2_test_75001_689 was still held when ceres::pack::monorepo::tests::tp17_trunk_finalize_token_requester_and_n_gt1_notice ended; dropping it now
+test schema mega2_test_75001_700 was still held when ceres::pack::monorepo::tests::tp17_twenty_concurrent_trunk_finalizes_serialize_root_chain ended; dropping it now
+test schema mega2_test_75001_715 was still held when config::secret:"[REDACTED]" ended; dropping it now
+test schema mega2_test_75001_716 was still held when config::secret:"[REDACTED]" ended; dropping it now
+test schema mega2_test_75001_717 was still held when config::secret:"[REDACTED]" ended; dropping it now
+test schema mega2_test_75001_718 was still held when config::secret:"[REDACTED]" ended; dropping it now
+test schema mega2_test_75001_728 was still held when context::tests::resolve_object_storage_secrets_errors_on_missing_secret_without_panicking ended; dropping it now
+test schema mega2_test_75001_729 was still held when context::tests::resolve_object_storage_secrets_passes_through_literal_credentials ended; dropping it now
+test schema mega2_test_75001_730 was still held when context::tests::resolve_object_storage_secrets_resolves_both_credential_refs ended; dropping it now
+test schema mega2_test_75001_731 was still held when context::tests::resolve_object_storage_secrets_resolves_vault_secret_refs ended; dropping it now
+test schema mega2_test_75001_732 was still held when context::tests::resolve_redis_url_secret_passes_through_literal_url ended; dropping it now
+test schema mega2_test_75001_734 was still held when context::tests::resolve_redis_url_secret_redacted_error_does_not_leak_secret_like_scheme ended; dropping it now
+test schema mega2_test_75001_735 was still held when context::tests::resolve_redis_url_secret_rejects_malformed_resolved_url ended; dropping it now
+test schema mega2_test_75001_736 was still held when context::tests::resolve_redis_url_secret_rejects_wrong_namespace ended; dropping it now
+test schema mega2_test_75001_737 was still held when context::tests::resolve_redis_url_secret_resolves_vault_ref ended; dropping it now
+test schema mega2_test_75001_738 was still held when context::tests::storage_events_secret_startup ended; dropping it now
+test schema mega2_test_75001_775 was still held when contract::vault::integration::fix04_list_contract::fix04_an_expired_lease_is_revoked_after_a_restart ended; dropping it now
+test schema mega2_test_75001_780 was still held when contract::vault::integration::un31_readonly::vault_core::un31_open_readonly_reads_secrets_and_refuses_writes ended; dropping it now
+test schema mega2_test_75001_781 was still held when contract::vault::integration::un31_readonly::vault_core::un31_open_readonly_reports_an_uninitialized_vault_instead_of_initializing_it ended; dropping it now
+test schema mega2_test_75001_782 was still held when contract::vault::integration::un31_readonly::vault_core::un31_open_readonly_reports_incomplete_runtime_credentials ended; dropping it now
+test schema mega2_test_75001_784 was still held when contract::vault::integration::vault_core::tests::audit_file_sink_fail_closed_fails_operation_when_unwritable ended; dropping it now
+test schema mega2_test_75001_785 was still held when contract::vault::integration::vault_core::tests::audit_file_sink_fail_open_allows_operation_when_unwritable ended; dropping it now
+test schema mega2_test_75001_786 was still held when contract::vault::integration::vault_core::tests::audit_file_sink_writes_jsonl_records_without_secret_value ended; dropping it now
+test schema mega2_test_75001_787 was still held when contract::vault::integration::vault_core::tests::test_audit_config_is_configurable_and_defaults_enabled ended; dropping it now
+test schema mega2_test_75001_788 was still held when contract::vault::integration::vault_core::tests::test_backup_key_creates_key_and_meta_file ended; dropping it now
+test schema mega2_test_75001_790 was still held when contract::vault::integration::vault_core::tests::test_config_secret_acl_is_not_granted_to_generic_token ended; dropping it now
+test schema mega2_test_75001_791 was still held when contract::vault::integration::vault_core::tests::test_key_material_permissions_are_restricted ended; dropping it now
+test schema mega2_test_75001_792 was still held when contract::vault::integration::vault_core::tests::test_rekey_unseal_shares_rewrites_key_file_without_data_loss ended; dropping it now
+test schema mega2_test_75001_795 was still held when contract::vault::integration::vault_core::tests::test_secret_name_rejects_full_vault_path ended; dropping it now
+test schema mega2_test_75001_799 was still held when contract::vault::integration::vault_core::tests::test_vault_core_initialization ended; dropping it now
+test schema mega2_test_75001_800 was still held when contract::vault::integration::vault_core::tests::test_vault_fails_closed_after_key_file_loss ended; dropping it now
+test schema mega2_test_75001_797 was still held when contract::vault::integration::vault_core::tests::test_vault_api ended; dropping it now
+test schema mega2_test_75001_801 was still held when contract::vault::integration::vault_core::tests::test_restore_key_rejects_backup_that_does_not_unlock_vault ended; dropping it now
+test schema mega2_test_75001_805 was still held when contract::vault::pki::tests_raw::test_pki_module ended; dropping it now
+test schema mega2_test_75001_807 was still held when contract::vault::server_signing::tests::ensure_initializes_once_and_reloads_active_key ended; dropping it now
+test schema mega2_test_75001_806 was still held when contract::vault::server_signing::tests::concurrent_initialization_has_a_single_winner ended; dropping it now
+test schema mega2_test_75001_808 was still held when contract::vault::server_signing::tests::revoked_active_key_fails_closed_until_rotated ended; dropping it now
+test schema mega2_test_75001_809 was still held when contract::vault::server_signing::tests::rotated_out_generation_still_verifies_its_signed_commits ended; dropping it now
+test schema mega2_test_75001_811 was still held when contract::vault::server_signing::tests::rotation_moves_active_and_keeps_history ended; dropping it now
+test schema mega2_test_75001_812 was still held when contract::vault::server_signing::tests::signed_commit_round_trips_through_verifier_reconstruction ended; dropping it now
+test schema mega2_test_75001_813 was still held when contract::vault::server_signing::tests::signed_commits_verify_with_git_cli ended; dropping it now

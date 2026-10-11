@@ -48,20 +48,47 @@
   },
   "required_repository_checks": {
     "source .env.test && cargo test --all": {
-      "state": "running",
+      "state": "incomplete_failed",
       "stdout_path": "verification/cargo-test-all.stdout",
       "stderr_path": "verification/cargo-test-all.stderr",
       "exit_path": "verification/cargo-test-all.exit",
-      "observed_failures_before_completion": true
+      "observed_failures_before_completion": true,
+      "exit_code": 101,
+      "observed_pass_statuses": 1841,
+      "observed_failed_statuses": 34,
+      "tests_without_terminal_status": [
+        "api::router::snapshot_router::content::tests::raw_blob::cold_raw_get_earns_source_proof_then_serves_one_current_stream_with_exact_headers",
+        "api::router::snapshot_router::content::tests::raw_blob::raw_missing_or_forged_receipt_and_real_stored_corruption_fail_without_rebuilding",
+        "api::router::snapshot_router::content::tests::rooted_metadata::rooted_wide_directory_windows_and_lookup_survive_rebuild_with_valid_proofs"
+      ],
+      "final_test_result_summary_present": false,
+      "failure_attribution_path": "verification/full-suite-failure-attribution.md",
+      "failure_attribution": "6 of 34 names overlap the recorded FIX-OX-04 inventory; 28 are not in that inventory. Individual causes and reason for missing final summary are not established.",
+      "stdout_sha256": "8249f91934bd3654103ecf4bd5815feda0046e9c080f09a5d1b74f1abee00257",
+      "stderr_sha256": "393abaf1d8768112dd5c560f8e6c6c46174f08d3b1a9afeba70276b629265433"
     },
     "cargo build": {
-      "state": "not run"
+      "state": "passed_with_warning",
+      "exit_code": 0,
+      "exit_path": "verification/cargo-build.exit",
+      "stdout_path": "verification/cargo-build.stdout",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_path": "verification/cargo-build.stderr",
+      "stderr_sha256": "ac4a8fca5a619b4a38c0b8432673a3e73129c37a210113e79c426dd43c52d80a",
+      "result": "passed; macOS linker warning __eh_frame section too large is assigned to OX-284 final C"
     },
     "cargo build --tests": {
-      "state": "not run"
+      "state": "passed_with_warning",
+      "exit_code": 0,
+      "exit_path": "verification/cargo-build-tests.exit",
+      "stdout_path": "verification/cargo-build-tests.stdout",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_path": "verification/cargo-build-tests.stderr",
+      "stderr_sha256": "f70a7a2bf496837a9a0710cac5c393358b261c2dca8a2f2b325e425889e79b08",
+      "result": "passed; macOS linker warning __eh_frame section too large is assigned to OX-284 final C"
     }
   },
-  "runtime_note": "Cargo test stderr contains the macOS linker warning __eh_frame section too large; the existing plan assigns final C build warnings to OX-284.",
+  "runtime_note": "cargo test --all exited 101 without a final libtest summary; see verification/full-suite-failure-attribution.md. cargo build and cargo build --tests both exited 0 with the macOS linker __eh_frame warning, assigned to OX-284 final C.",
   "diagnostic_runs": [
     {
       "id": "B-publication-enabled-VER-1",
@@ -83,5 +110,43 @@
     "prompt_sha256": "8ea8f1b4bd6a1e3286979ebf42ce6e9246228a25e2b0a3f76a7145e3c25a14fb",
     "snapshot_manifest_sha256": "e3dede49be0aa169745ee2f737abb0d51cc277a1798fde42c36d8afaa16fe15f",
     "exit_code": 0
-  }
+  },
+  "repository_wide_follow_up_runs": [
+    {
+      "id": "full-suite-unfinished-1",
+      "test_name": "api::router::snapshot_router::content::tests::raw_blob::cold_raw_get_earns_source_proof_then_serves_one_current_stream_with_exact_headers",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib 'api::router::snapshot_router::content::tests::raw_blob::cold_raw_get_earns_source_proof_then_serves_one_current_stream_with_exact_headers' -- --exact --test-threads=1",
+      "exit_code": 0,
+      "test_harness_seconds": 877.83,
+      "stdout_path": "verification/diagnostic/full-suite-tail/isolated-1.stdout",
+      "stdout_sha256": "06e681e3df9370d763e84a629652d56a1d195a1e43909785febb1a820ff2fba4",
+      "stderr_path": "verification/diagnostic/full-suite-tail/isolated-1.stderr",
+      "stderr_sha256": "404b3dd0e6245f5615874a068a860b8b8ecf4c9f5e8ac9b6efd2530e9c3a3ed9",
+      "result": "passed individually with --test-threads=1"
+    },
+    {
+      "id": "full-suite-unfinished-2",
+      "test_name": "api::router::snapshot_router::content::tests::raw_blob::raw_missing_or_forged_receipt_and_real_stored_corruption_fail_without_rebuilding",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib 'api::router::snapshot_router::content::tests::raw_blob::raw_missing_or_forged_receipt_and_real_stored_corruption_fail_without_rebuilding' -- --exact --test-threads=1",
+      "exit_code": 0,
+      "test_harness_seconds": 895.07,
+      "stdout_path": "verification/diagnostic/full-suite-tail/isolated-2.stdout",
+      "stdout_sha256": "ccb277373556cc3fba54db78b47eef518399b184ad56d4e9eba6859c84f3c370",
+      "stderr_path": "verification/diagnostic/full-suite-tail/isolated-2.stderr",
+      "stderr_sha256": "c5a85156d5d6318af9f3e0626cc6ab6ed7609dc50c15b493f788ef5e222d9be5",
+      "result": "passed individually with --test-threads=1"
+    },
+    {
+      "id": "full-suite-unfinished-3",
+      "test_name": "api::router::snapshot_router::content::tests::rooted_metadata::rooted_wide_directory_windows_and_lookup_survive_rebuild_with_valid_proofs",
+      "command": "source .env.test && RUST_LOG=error cargo test -p mega2 --lib 'api::router::snapshot_router::content::tests::rooted_metadata::rooted_wide_directory_windows_and_lookup_survive_rebuild_with_valid_proofs' -- --exact --test-threads=1",
+      "exit_code": 0,
+      "test_harness_seconds": 187.48,
+      "stdout_path": "verification/diagnostic/full-suite-tail/isolated-3.stdout",
+      "stdout_sha256": "28060b8654e325fadba83767cbdb104d0e3c6a3f777edf95b507927ee25fa0b2",
+      "stderr_path": "verification/diagnostic/full-suite-tail/isolated-3.stderr",
+      "stderr_sha256": "c5a85156d5d6318af9f3e0626cc6ab6ed7609dc50c15b493f788ef5e222d9be5",
+      "result": "passed individually with --test-threads=1"
+    }
+  ]
 }
