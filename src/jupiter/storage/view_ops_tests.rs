@@ -21,7 +21,7 @@ use crate::{
         },
         storage::{
             Storage,
-            git_db_storage::fu18_support::single_connection,
+            git_db_storage::import_fence_support::single_connection,
             init::database_connection,
             object_storage::mock_object_storage,
             view_root_chain::RootChainOutcome,

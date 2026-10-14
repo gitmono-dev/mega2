@@ -163,7 +163,7 @@
 
 ## 快照重建全维即时生效矩阵（UN-21）
 
-`/.mega_cedar.json` 的授权输入维度由 `src/contract/policy/objects.rs` 与 `mega.cedarschema` 的真实 schema 决定，共八维；`merge_requests` / `issues` 播种为空且不参与求值，不是输入维度。八维与其判定翻转的对应关系逐维锁定在 `src/contract/policy/un21_matrix.rs`（每维一个具名测试函数）：
+`/.mega_cedar.json` 的授权输入维度由 `src/contract/policy/objects.rs` 与 `mega.cedarschema` 的真实 schema 决定，共八维；`merge_requests` / `issues` 播种为空且不参与求值，不是输入维度。八维与其判定翻转的对应关系逐维锁定在 `src/contract/policy/mod.rs` 的 `snapshot_matrix` 测试模块（每维一个具名测试函数）：
 
 | 维 | 数据源字段 | 翻转的判定 |
 |---|---|---|
@@ -176,7 +176,7 @@
 | 七 | `repos[].maintainers` 组引用改指 | maintainer 专属 action |
 | 八 | `repos[].readers` 组引用改指 | reader action |
 
-矩阵的每条断言都针对快照**缓存的** `Entities`（UN-14）求值，而不是从 store 现推，因此缓存残留会让矩阵失败而不是被重新推导掩盖。`src/contract/policy/un21_cache.rs` 另行锁定缓存语义本身：重建发布新的不可变快照而非原地修改（重建前取得的句柄继续服务其自身内容）、反复重建在两个方向都无残留、重建失败保留旧快照并置 dirty。
+矩阵的每条断言都针对快照**缓存的** `Entities`（UN-14）求值，而不是从 store 现推，因此缓存残留会让矩阵失败而不是被重新推导掩盖。`src/contract/policy/mod.rs` 的 `snapshot_cache` 测试模块另行锁定缓存语义本身：重建发布新的不可变快照而非原地修改（重建前取得的句柄继续服务其自身内容）、反复重建在两个方向都无残留、重建失败保留旧快照并置 dirty。
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
@@ -244,7 +244,7 @@
 
 两者都与角色名的承诺相反。现在 `pushRepo` 只在 maintainer 与 admin 动作集中；admin 单独列出而不依赖它继承 maintainer 组，因为那条继承关系是 ACL 数据，可能被改掉。
 
-矩阵（`src/contract/policy/un09_push_matrix.rs`）在**真实 init 产物派生**的 fixture 上求值（`generate_entity` 生成与服务端播种同形的实体，含历史拼写 `matainer`，DEFER-UN-06），再补入各角色成员：admin/maintainer 在公开与私有下均可 push，reader 与无组主体均不可；同时断言两个被编辑块的**其它动作**一字未改（公开仓库仍可 view/pull/fork/openIssue/createMergeRequest）。
+矩阵（`src/contract/policy/mod.rs` 的 `push_matrix` 测试模块）在**真实 init 产物派生**的 fixture 上求值（`generate_entity` 生成与服务端播种同形的实体，含历史拼写 `matainer`，DEFER-UN-06），再补入各角色成员：admin/maintainer 在公开与私有下均可 push，reader 与无组主体均不可；同时断言两个被编辑块的**其它动作**一字未改（公开仓库仍可 view/pull/fork/openIssue/createMergeRequest）。
 
 `off` 默认下策略内容是惰性的——没有求值方，因此无行为变化。
 
@@ -364,7 +364,7 @@ prefix 也接受「目录名但不带尾部 `/`」的形状——`TokenStore::re
 
 `ReadOnlyContext::open()` 因此逐项对照（`src/context/mod.rs`）：不装通知服务、不建 Redis、不做任何 seed/write、Vault 仅经 UN-31 的 readonly bootstrap，且**只在** object storage 凭据真是 `vault://` 引用时才打开。
 
-判据都写成**成对**用例（`src/context/un43_readonly_assembly.rs`），因为「没有副作用」只在副作用可能发生的地方才有意思：
+判据都写成**成对**用例（`src/context/mod.rs` 的 `readonly_assembly` 测试模块），因为「没有副作用」只在副作用可能发生的地方才有意思：
 
 - 通知服务：断言 active 句柄**未变化**而不是为 None——它是进程级全局，同一二进制里别的用例可能合法地装过一个，只在自己先跑时才通过的用例比没有用例更糟。比的是 `Arc::ptr_eq` 身份而不是「有没有」：把一个 active 服务换成另一个，同样是副作用，只看 `is_some()` 看不见。
 - Redis：**数调用次数**，不是只看装配活没活下来——一条连了、把失败吞掉、然后继续跑的路径同样能通过「活下来」的检查，而它确实做了那件事。计数按 URL 分桶（测试二进制是并行跑的，全局计数会被同时发生的别的初始化搅乱，只在别人不跑时才通过的用例比没有用例更糟）。对照断言真的调用一次时计数确实会动。

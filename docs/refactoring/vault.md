@@ -58,8 +58,8 @@
 | 非切换面（误记纠正） | `src/context/`、`src/server/ssh_server.rs`、`src/config/`、`src/commands/` 只消费 `contract::vault::integration`；`src/jupiter/storage/vault_storage.rs`、`src/callisto/` 是 SeaORM 实体 | 不进引用切换写集；只有只读入口签名面随 VLT-02/04 调整 |
 | 只读原语 | `Core.readonly`（`src/vault/core.rs:110`）、`Core::new_readonly`（`:182`）、`MountsRouter::load_readonly`、`AuthModule::load_auth_readonly`、`ExpirationManager::restore_readonly` / `is_lease_checker_started`、`RustyVault::new_readonly`——**上游零命中** | 一律不搬迁；只读语义在 `src/contract/vault/` 重建（VLT-04） |
 | 只读保险 | `ReadonlyBackend`（`src/vault/storage/readonly.rs`） | 移动到 `src/contract/vault/integration/readonly_backend.rs` 并重挂错误标识 |
-| 测试 | `src/vault/fix04_list_contract.rs`、`src/vault/un31_readonly.rs`（挂载于 `src/vault/mod.rs:49,59`） | 迁至 `src/contract/vault/integration/{fix04_list_contract,un31_readonly}.rs` |
-| 只读消费点 | `VaultCore::open_readonly`（`src/contract/vault/integration/vault_core.rs:361`）→ `src/context/mod.rs:436`；断言在 `src/context/un43_readonly_assembly.rs:300-302`、`bin/tests/integration_authz_audit.rs:919-923` | 语义不变（UN-31 八 AC 等价） |
+| 测试 | `src/vault/fix04_list_contract.rs`、`src/vault/un31_readonly.rs`（挂载于 `src/vault/mod.rs:49,59`） | 迁至 `jupiter_backend.rs` 的 `backend_list_contract` 与 `vault_core.rs` 的 `readonly_open` 测试模块 |
+| 只读消费点 | `VaultCore::open_readonly`（`src/contract/vault/integration/vault_core.rs:361`）→ `src/context/mod.rs:436`；断言在 `src/context/mod.rs` 的 `readonly_assembly` 测试模块、`bin/tests/integration_authz_audit.rs:919-923` | 语义不变（UN-31 八 AC 等价） |
 
 不在本次反向迁移范围内：vault 表 schema、`core_key.json` 格式、seal 配置（10/5）、`secret/` 挂载路径、mega 的 `libvault-core` 0.1.0 迁移、libra 的 `libvault` 升级。
 
@@ -89,8 +89,8 @@
 | AC4 | 禁凭据 rotation：不调用 `ensure_runtime_credentials`；runtime tokens 不完整即 `ReadonlyRuntimeTokensIncomplete`；不回写 key 文件、不撤销 root token | `VaultCore::open_readonly` | 保持在 `VaultCore` |
 | AC5 | 不启动过期租约 worker，且 mounts monitor 完全不创建（无论配置 interval）；只读恢复租约（旧格式 fail-closed），禁「普通 `restore` + 拦写」冒充 | `ExpirationManager::restore_readonly`；`is_lease_checker_started` 观测面 | 集成层只读引导；观测面改公共 API |
 | AC6 | 底层 backend write-denying wrapper：任意 `put`/`delete` 硬失败（不是静默 no-op），拒绝计数经 `VaultCore::denied_writes()` 暴露 | `src/vault/storage/readonly.rs` | `src/contract/vault/integration/readonly_backend.rs` |
-| AC7 | 故障注入：wrapper 层与 `VaultCore` 具名层各一组硬失败；具名层拒绝时 `denied_writes() == 0` | `un31_readonly.rs` | 迁后 `integration/un31_readonly.rs` |
-| AC8 | 故障注入：过期租约**成对**断言——可写侧确实撤销并删除记录，只读侧记录仍在且零写入尝试 | `un31_readonly.rs` | 迁后 `integration/un31_readonly.rs` |
+| AC7 | 故障注入：wrapper 层与 `VaultCore` 具名层各一组硬失败；具名层拒绝时 `denied_writes() == 0` | `un31_readonly.rs` | `integration/vault_core.rs` 的 `readonly_open` 测试模块 |
+| AC8 | 故障注入：过期租约**成对**断言——可写侧确实撤销并删除记录，只读侧记录仍在且零写入尝试 | `un31_readonly.rs` | `integration/vault_core.rs` 的 `readonly_open` 测试模块 |
 
 守卫口径（冻结）：迁移后 `un31_` 用例数 **≥ 12**，过滤器用位置无关的 `un31_`（禁用绑定 vendored 模块路径的 `vault::un31_`）；`un43_readonly` ≥ 4 用例；`fix04_list` 保持绿。
 
@@ -197,11 +197,11 @@ vendored 已删除。`src/vault/` 的 82 个 `.rs`（连同 `README.md` 与三�
 | `ReadonlyBackend` | `src/vault/storage/readonly.rs` | `src/contract/vault/integration/readonly_backend.rs` |
 | 只读保险的错误标识 | `RvError::ErrCoreReadonlyWriteDenied`（vendored 自造变体） | 具名层 `VaultError::ReadonlyWriteDenied`；保险层 `RvError::ErrString(READONLY_WRITE_DENIED)`——上游唯一携带调用方可读原因且 `PartialEq` 可断言的变体 |
 | 「状态缺失/旧格式」标识 | `RvError::ErrCoreReadonlyStateIncomplete` | `VaultError::ReadonlyStateIncomplete { detail }`（`detail` 指明是 mount 表、auth 表、token salt 还是租约格式） |
-| FIX-04 / UN-31 测试 | `src/vault/{fix04_list_contract,un31_readonly}.rs` | `src/contract/vault/integration/{fix04_list_contract,un31_readonly}.rs`（钉死落点） |
+| FIX-04 / UN-31 测试 | `src/vault/{fix04_list_contract,un31_readonly}.rs` | `jupiter_backend.rs` 的 `backend_list_contract`、`vault_core.rs` 的 `readonly_open` |
 
 **一律未搬迁的 vendored-only 扩展**（防回流守卫覆盖）：`RustyVault::new_readonly`、`Core::new_readonly`、`MountsRouter::load_readonly`、`AuthModule::load_auth_readonly`、`ExpirationManager::restore_readonly`，以及那个「租约检查线程起了没有」的观测方法。它们是对上游类型的本地 inherent 扩展，搬进集成层只会把同一个 fork 换个地方放。守卫：`rg -n 'fn new_readonly|fn load_readonly|fn load_auth_readonly|fn restore_readonly|lease_checker_started' src/contract src/common src/context bin --glob '!**/config/**'` 零命中（刻意排除 `src/config/`——`loader.rs` 的 `load_readonly` 是无关的既有 API）。
 
-**中间态（VLT-02 → VLT-04）**：`VaultCore::open_readonly` 与库级 `open_readonly_core` 都是**具名 fail-closed 桩**，返回 `VaultError::ReadonlyUnavailable`。刻意不回退到可写路径——那条路径会修补掉只读打开正要保全的那份状态，「成功」的审计会是在报告一份被自己引导过程改写过的 vault。受影响用例全部 `#[ignore = "VLT-04"]` 且**不得删除**：迁后 `un31_readonly.rs` 十二条、`src/context/un43_readonly_assembly.rs` 的 `un43_a_needed_vault_is_opened_read_only_and_unchanged`、`bin/tests/integration_authz_audit.rs` 的 `integration_readonly_assembly_changes_nothing`。本卡为 `REL-VLT-RO` 家族子卡，**不单独推送**。
+**中间态（VLT-02 → VLT-04）**：`VaultCore::open_readonly` 与库级 `open_readonly_core` 都是**具名 fail-closed 桩**，返回 `VaultError::ReadonlyUnavailable`。刻意不回退到可写路径——那条路径会修补掉只读打开正要保全的那份状态，「成功」的审计会是在报告一份被自己引导过程改写过的 vault。受影响用例全部 `#[ignore = "VLT-04"]` 且**不得删除**：迁后 `vault_core.rs` 里 `readonly_open` 十二条、`src/context/mod.rs` 里 `readonly_assembly` 的 `un43_a_needed_vault_is_opened_read_only_and_unchanged`、`bin/tests/integration_authz_audit.rs` 的 `integration_readonly_assembly_changes_nothing`。本卡为 `REL-VLT-RO` 家族子卡，**不单独推送**。
 
 **回归观测点（VLT-S1 额外发现之一）**：vendored 在 `policy_store.rs` 里有一处 token policy 查询回落到持久 ACL view 的改动，那是 FIX-04 之前 `JupiterBackend::list` 契约发散留下的绕行。删除 vendored 即等于撤销该绕行，因此「限权 token 在重启后仍能通过 ACL 校验」必须由既有测试证明，而不是假定：`fix04_an_expired_lease_is_revoked_after_a_restart`（真实 Postgres 后端上 `restore()` 确实恢复到租约并撤销）、`integration_vault`、`integration_authz_audit` 与 config/generic token 隔离矩阵全绿即为判据。
 

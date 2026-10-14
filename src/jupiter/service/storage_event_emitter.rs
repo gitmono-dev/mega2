@@ -1200,7 +1200,7 @@ mod tests {
     /// Thread-local tracing capture. The runtime is built and driven inside
     /// the closure so every record — including those from tasks the
     /// current-thread runtime polls — lands on this subscriber (same shape as
-    /// `ceres::api_service::un25_freeze::capture_tracing`).
+    /// `ceres::api_service::merge_authz_freeze::capture_tracing`).
     fn capture_tracing<F: FnOnce()>(f: F) -> String {
         use std::io::Write;
 

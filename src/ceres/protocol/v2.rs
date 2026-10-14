@@ -457,7 +457,7 @@ mod tests {
             },
         },
         common::utils::ZERO_ID,
-        jupiter::storage::git_db_storage::fu18_support::{test_cache, wired_storage},
+        jupiter::storage::git_db_storage::import_fence_support::{test_cache, wired_storage},
     };
 
     fn git_ref(name: &str, hash: &str, default_branch: bool) -> Refs {

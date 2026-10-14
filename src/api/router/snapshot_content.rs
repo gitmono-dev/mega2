@@ -228,27 +228,39 @@ pub(super) async fn verified_file_metadata<T: crate::ceres::api_service::ApiHand
         .mono_storage()
         .get_verified_blobs(vec![oid.clone()])
         .await
-        .map_err(|error| {
-            let code = if matches!(
-                error,
-                crate::common::errors::MegaError::ObjStorageInconsistent(_)
-            ) {
-                SnapshotErrorCode::IntegrityError
-            } else {
-                SnapshotErrorCode::Internal
-            };
-            tracing::warn!(error = %error, "fixed content metadata lookup failed");
-            mst2_error_response(SnapshotError::new(
-                code,
-                "fixed content metadata lookup failed",
-            ))
-        })?;
+        .map_err(verified_blob_lookup_error)?;
     let fact = verified.remove(&oid).ok_or_else(|| {
         mst2_error_response(SnapshotError::new(
             SnapshotErrorCode::MetadataNotReady,
             "fixed object has no current verified size and digest fact",
         ))
     })?;
+    metadata_from_verified_fact(fs_kind, oid, path, expected_digest, fact)
+}
+
+fn verified_blob_lookup_error(error: crate::common::errors::MegaError) -> Response {
+    let code = if matches!(
+        error,
+        crate::common::errors::MegaError::ObjStorageInconsistent(_)
+    ) {
+        SnapshotErrorCode::IntegrityError
+    } else {
+        SnapshotErrorCode::Internal
+    };
+    tracing::warn!(error = %error, "fixed content metadata lookup failed");
+    mst2_error_response(SnapshotError::new(
+        code,
+        "fixed content metadata lookup failed",
+    ))
+}
+
+fn metadata_from_verified_fact(
+    fs_kind: FsKind,
+    oid: String,
+    path: &str,
+    expected_digest: Option<&str>,
+    fact: crate::callisto::mst2_verified_object::Model,
+) -> Result<ResolvedFileMetadata, Response> {
     let digest: [u8; 32] = fact.raw_sha256.as_slice().try_into().map_err(|_| {
         mst2_error_response(SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
@@ -282,6 +294,160 @@ pub(super) async fn verified_file_metadata<T: crate::ceres::api_service::ApiHand
         size,
         fact,
     })
+}
+
+/// One reader for the whole rooted batch.
+///
+/// `fixed_path_metadata` admits and finishes a reader per path, and each
+/// admission takes the exclusive storage-route advisory lock. Resolving a
+/// wide batch with `.buffered(16)` makes those admissions time out against
+/// each other (`55P03` → retryable 503). `lookup_metadata` already admits
+/// once, reads every path, then finishes once.
+#[allow(clippy::result_large_err)]
+async fn resolve_rooted_objects<T: crate::ceres::api_service::ApiHandler + ?Sized>(
+    handler: &T,
+    ctx: &crate::ceres::snapshot::runtime::SnapshotContext,
+    items: &[ObjectItem],
+) -> Vec<Result<(ObjectItem, ResolvedFileMetadata), Response>> {
+    use crate::jupiter::storage::qualified_metadata_family::RootedLookupStatus;
+
+    let mut resolved = Vec::with_capacity(items.len());
+    for item in items {
+        if let Err(error) = validate_scope_relative_path(&item.path) {
+            resolved.push(Err(mst2_error_response(error)));
+            return resolved;
+        }
+    }
+    let storage = handler.get_context();
+    let repository = match storage.rooted_qualified_metadata_writer().await {
+        Ok(repository) => repository,
+        Err(error) => {
+            resolved.push(Err(mst2_error_response(internal(error))));
+            return resolved;
+        }
+    };
+    let paths: Vec<String> = items.iter().map(|item| item.path.clone()).collect();
+    let batch = match repository.lookup_metadata(ctx, &paths).await {
+        Ok(batch) => batch,
+        Err(error) => {
+            resolved.push(Err(mst2_error_response(error)));
+            return resolved;
+        }
+    };
+    let mut pending = Vec::with_capacity(items.len());
+    for (item, status) in items.iter().zip(batch.results) {
+        let (fs_kind, entry_size, content_id, git_oid) = match status {
+            RootedLookupStatus::File { entry, git_oid } => {
+                let fs_kind = match entry.kind {
+                    mst2_codec::metapage::EntryKind::Regular => FsKind::Regular,
+                    mst2_codec::metapage::EntryKind::Executable => FsKind::Executable,
+                    mst2_codec::metapage::EntryKind::Symlink => FsKind::Symlink,
+                    mst2_codec::metapage::EntryKind::Directory => {
+                        resolved.push(Err(mst2_error_response(internal(
+                            "fixed source file has a directory kind",
+                        ))));
+                        return resolved;
+                    }
+                };
+                (fs_kind, entry.size, entry.content_id, git_oid)
+            }
+            RootedLookupStatus::Directory(_) => {
+                resolved.push(Err(mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::NotDirectory,
+                    format!("{} is a directory", item.path),
+                ))));
+                return resolved;
+            }
+            RootedLookupStatus::Absent => {
+                resolved.push(Err(mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::PathNotFound,
+                    format!("{} absent in the fixed view", item.path),
+                ))));
+                return resolved;
+            }
+            RootedLookupStatus::NotDirectory { symlink } => {
+                resolved.push(Err(mst2_error_response(SnapshotError::new(
+                    if symlink {
+                        SnapshotErrorCode::SymlinkTraversal
+                    } else {
+                        SnapshotErrorCode::NotDirectory
+                    },
+                    format!("{}: intermediate component is not a directory", item.path),
+                ))));
+                return resolved;
+            }
+        };
+        let Some((_, oid)) = git_oid.split_once(':') else {
+            resolved.push(Err(mst2_error_response(internal(
+                "fixed source OID has no hash kind",
+            ))));
+            return resolved;
+        };
+        pending.push((
+            item.clone(),
+            fs_kind,
+            entry_size,
+            content_id,
+            oid.to_owned(),
+        ));
+    }
+    let facts = match storage
+        .mono_storage()
+        .get_verified_blobs(
+            pending
+                .iter()
+                .map(|(_, _, _, _, oid)| oid.clone())
+                .collect(),
+        )
+        .await
+    {
+        Ok(facts) => facts,
+        Err(error) => {
+            resolved.push(Err(verified_blob_lookup_error(error)));
+            return resolved;
+        }
+    };
+    for (item, fs_kind, entry_size, content_id, oid) in pending {
+        let Some(fact) = facts.get(&oid).cloned() else {
+            resolved.push(Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::MetadataNotReady,
+                "fixed object has no current verified size and digest fact",
+            ))));
+            return resolved;
+        };
+        let file = match metadata_from_verified_fact(
+            fs_kind,
+            oid,
+            &item.path,
+            Some(&item.expected_digest),
+            fact,
+        ) {
+            Ok(file) => file,
+            Err(error) => {
+                resolved.push(Err(error));
+                return resolved;
+            }
+        };
+        if file.size != entry_size || file.digest != content_id {
+            resolved.push(Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "fixed content metadata changed from its certified current source occurrence",
+            ))));
+            return resolved;
+        }
+        if file.size > OBJECT_ITEM_MAX {
+            resolved.push(Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                format!(
+                    "{} is {} bytes; objects cap is 256KiB per item",
+                    item.path, file.size
+                ),
+            ))));
+            return resolved;
+        }
+        resolved.push(Ok((item, file)));
+    }
+    resolved
 }
 
 pub(super) fn fs_kind_str(k: FsKind) -> &'static str {
@@ -453,41 +619,47 @@ pub(super) async fn objects(
         .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
 
     // Admit the whole fixed-path batch before opening any object body.
+    // Rooted publication resolves every path under one reader. A per-path
+    // admission takes the exclusive route lock, so a concurrent batch times
+    // itself out and the caller retries the same contention.
     let handler = state
         .api_handler(std::path::Path::new("/"))
         .await
         .map_err(internal)?;
     let root_tree = fixed_content_root(handler.as_ref(), &ctx).await?;
-    // Copied references: each per-item future borrows the shared walk state
-    // without moving it (the stream is an FnMut over owned items).
     let handler_ref = handler.as_ref();
-    let root_ref = root_tree.as_ref();
-    let ctx_ref = &ctx;
-    let resolved: Vec<Result<_, Response>> = futures::stream::iter(req.items.clone())
-        .map(move |item| async move {
-            validate_scope_relative_path(&item.path).map_err(mst2_error_response)?;
-            let f = resolve_file_metadata(
-                handler_ref,
-                root_ref,
-                ctx_ref,
-                &item.path,
-                Some(&item.expected_digest),
-            )
-            .await?;
-            if f.size > OBJECT_ITEM_MAX {
-                return Err(mst2_error_response(SnapshotError::new(
-                    SnapshotErrorCode::ScopeInvalid,
-                    format!(
-                        "{} is {} bytes; objects cap is 256KiB per item",
-                        item.path, f.size
-                    ),
-                )));
-            }
-            Ok((item, f))
-        })
-        .buffered(16)
-        .collect()
-        .await;
+    let resolved: Vec<Result<(ObjectItem, ResolvedFileMetadata), Response>> = if root_tree.is_none()
+    {
+        resolve_rooted_objects(handler_ref, &ctx, &req.items).await
+    } else {
+        let root_ref = root_tree.as_ref();
+        let ctx_ref = &ctx;
+        futures::stream::iter(req.items.clone())
+            .map(move |item| async move {
+                validate_scope_relative_path(&item.path).map_err(mst2_error_response)?;
+                let f = resolve_file_metadata(
+                    handler_ref,
+                    root_ref,
+                    ctx_ref,
+                    &item.path,
+                    Some(&item.expected_digest),
+                )
+                .await?;
+                if f.size > OBJECT_ITEM_MAX {
+                    return Err(mst2_error_response(SnapshotError::new(
+                        SnapshotErrorCode::ScopeInvalid,
+                        format!(
+                            "{} is {} bytes; objects cap is 256KiB per item",
+                            item.path, f.size
+                        ),
+                    )));
+                }
+                Ok((item, f))
+            })
+            .buffered(16)
+            .collect()
+            .await
+    };
     let mut sources: Vec<(ObjectItem, ResolvedFileMetadata)> = Vec::new();
     let mut content_sizes: Vec<([u8; 32], u64)> = Vec::new();
     let mut planned_bytes = 0u64;

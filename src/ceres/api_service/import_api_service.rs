@@ -857,7 +857,7 @@ mod tests {
         callisto::{git_repo, sea_orm_active_enums::RefTypeEnum},
         ceres::pack::import_repo::{RemoveOutcome, detach_import_repo, remove_import_repo},
         common::errors::{ApiError, map_ceres_error},
-        jupiter::storage::git_db_storage::fu18_support::{
+        jupiter::storage::git_db_storage::import_fence_support::{
             blocked_by_me, import_refs_count, object_counts, park_detach, single_connection,
             test_cache, wired_storage,
         },
