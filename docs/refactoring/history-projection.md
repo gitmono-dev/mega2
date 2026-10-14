@@ -1301,7 +1301,7 @@ fn mark_ready_if_covered(F, tip) -> bool:                           # 只在持 
 
 ### 6.7 Agent 工作区
 - 任务创建方调用 `POST /api/v1/views` 拿到 `{filter_id, name, version}`。任务记录保存 `view_name@version`，以及当时的根提交或视图提交，保证任务可复现。Agent 只能使用 `@version` 形式的 URL。
-- Agent Capture 现有的数据模型里没有 commit 或视图字段：session 只有 `repo_id / libra_repoid / cl_link`，checkpoint 只有自由格式的 JSON metadata。P1 需要约定 checkpoint metadata 的 schema，或者新增列；同时修订 `docs/refactoring/agent-capture.md` 的 ingest 契约，以及 `libra.md` 中的 LandingRecord（AC-LB-10 目前以 path commit / root roll-up 为对象）。
+- 现行 Agent Capture 数据模型没有专门的 commit 或视图字段（session 的 `repo_id / libra_repoid / cl_link` 与 checkpoint 的自由 JSON metadata 仍属旧实现）。2026-10-15 的 [替代计划](../plan/plan-20261015.md) 将其退场，后续 P1 的 code/view 关联应扩展 [Traces v1](traces.md) 的 `trace_code_link` 与版本化 metadata 契约，并同步 `libra.md` 中的 LandingRecord（AC-LB-10 目前以 path commit / root roll-up 为对象）；不得在未来 P1 继续新增旧 Capture ingest 接口。Traces 首版只承担现有 code OID 关联，filter/view 扩展仍由 P1 自己排期。
 - 视图也是一种上下文裁剪手段：Agent 只 clone 任务需要的路径。
 - 不做 Josh workspace 那种"过滤器随提交变化"的语义。
 
@@ -1604,7 +1604,7 @@ HP-18 的 `integration_git_ssh` 视图用例沿用该 target 既有 storage-only
 | `mega2 view status\|rebuild\|gc` | rebuild 之后哈希不变；status 能显示滞后量 |
 | GC | `mega2 view gc` 之后，它独占的对象在宽限期过后被回收，与其他视图共享的对象不受影响；7.4"回收与清扫"中的并发用例全部通过 |
 | 不持久化视图提交字节（可选） | 按需重算的结果与持久化时逐字节一致 |
-| Agent Capture 视图字段 | 契约文档修订完成，ingest 端到端测试通过 |
+| Traces 视图关联 | 版本化 checkpoint metadata／trace_code_link 契约修订完成，对应 Git 上传与只读查询端到端测试通过；视图扩展由 P1 自己排期 |
 | 视图 GitHub binding 定案 | plan-20260920 写入相应决策 |
 | ScorpioFS 视图挂载（跨仓） | ScorpioFS 侧验收另行确定 |
 
@@ -1645,7 +1645,7 @@ HP-18 的 `integration_git_ssh` 视图用例沿用该 target 既有 storage-only
   - 写明共享谓词 `same_path_has_later_done` 改为覆盖谓词（5.2 第 9 步），四种 kind 共用。
 - **`docs/refactoring/storage-events.md` 与 MST/2 发布规范**：写入 `view_push` 的事件与回执语义（5.2 第 8 步）。
 - **`docs/refactoring/github-sync.md`**：在 OX 卡开工前，写入两条规则：视图 binding 与路径 binding 二选一；outbox 覆盖 `view_push`（6.8）。
-- **`docs/refactoring/agent-capture.md` 与 `libra.md`**：P1 定义 checkpoint metadata 中的视图字段，以及 LandingRecord 所引用的对象（6.7）。
+- **`docs/refactoring/traces.md` 与 `libra.md`**：P1 定义版本化 checkpoint metadata 的视图字段及 `trace_code_link` 关联，以及 LandingRecord 所引用的对象（6.7）；`agent-capture.md` 在替代计划 H6 实际完成前保留现行实现说明，完成后转为退役说明。
 - **双语用户文档**：
   - `docs/architecture(.zh).md`：在第 6 节的协议面表格中加入视图 URL；
   - `docs/user-guide(.zh).md`：说明 `/<path>.git` 与视图 URL 的区别，以及版本与对齐规则；
