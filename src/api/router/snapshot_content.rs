@@ -236,6 +236,7 @@ pub(super) async fn verified_file_metadata<T: crate::ceres::api_service::ApiHand
         ))
     })?;
     metadata_from_verified_fact(fs_kind, oid, path, expected_digest, fact)
+        .map_err(mst2_error_response)
 }
 
 fn verified_blob_lookup_error(error: crate::common::errors::MegaError) -> Response {
@@ -260,32 +261,32 @@ fn metadata_from_verified_fact(
     path: &str,
     expected_digest: Option<&str>,
     fact: crate::callisto::mst2_verified_object::Model,
-) -> Result<ResolvedFileMetadata, Response> {
+) -> Result<ResolvedFileMetadata, SnapshotError> {
     let digest: [u8; 32] = fact.raw_sha256.as_slice().try_into().map_err(|_| {
-        mst2_error_response(SnapshotError::new(
+        SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
             "invalid verified content digest",
-        ))
+        )
     })?;
     let size = u64::try_from(fact.size).map_err(|_| {
-        mst2_error_response(SnapshotError::new(
+        SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
             "invalid verified content size",
-        ))
+        )
     })?;
     if fs_kind == FsKind::Symlink && !(1..=4095).contains(&size) {
-        return Err(mst2_error_response(SnapshotError::new(
+        return Err(SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
             "verified symlink size is outside the fixed filesystem profile",
-        )));
+        ));
     }
     if let Some(expected) = expected_digest
         && expected != format!("sha256:{}", hex_of(&digest))
     {
-        return Err(mst2_error_response(SnapshotError::new(
+        return Err(SnapshotError::new(
             SnapshotErrorCode::DigestMismatch,
             format!("{path}: content does not match expected_digest"),
-        )));
+        ));
     }
     Ok(ResolvedFileMetadata {
         fs_kind,
@@ -424,7 +425,7 @@ async fn resolve_rooted_objects<T: crate::ceres::api_service::ApiHandler + ?Size
         ) {
             Ok(file) => file,
             Err(error) => {
-                resolved.push(Err(error));
+                resolved.push(Err(mst2_error_response(error)));
                 return resolved;
             }
         };
@@ -1519,3 +1520,7 @@ fn ensure(state: &crate::api::MonoApiServiceState) -> Result<(), Response> {
 #[cfg(test)]
 #[path = "snapshot_content_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "snapshot_verified_fact_tests.rs"]
+mod verified_fact_error_tests;
