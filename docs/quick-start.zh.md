@@ -4,13 +4,13 @@
 
 Mega 是第一代 Monorepo 平台；mega2 是面向 Agent 的第二代引擎，核心能力是 Monorepo 与可选的 Agent Session Capture。推荐将 mega2 与 ScorpioFS（把仓库挂载到 Agent 的本地文件系统）和 Libra（Agent 版本控制与工作流工具）配合使用。本快速开始聚焦 Monorepo 的 Git 使用；Agent Session Capture 需单独启用，见[部署指南](./deployment.zh.md)和[配置参考](./configuration.zh.md)。
 
-在仓库根目录运行适用于当前平台的 Compose 文件，启动本地 mega2 评估栈：macOS + OrbStack 使用 [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml)，Linux 使用 [`linux-mega2-compose.yml`](../linux-mega2-compose.yml)。本指南会带你通过 HTTP 克隆仓库、推送到 `main`，再用 API 读回结果；后续示例还涵盖仓库迁移、Git LFS、OCI 镜像、构建产物和数据持久化。该栈从 **Docker Hub 拉取正式发布镜像**（`genedna/mega2:latest`），不从源码构建，也不需要单独执行初始化命令或提供 token。分支与 Tag 规则见[使用指南](./user-guide.zh.md)。
+从 gitmega.ai 下载适用于当前平台的 Compose 文件（不需要克隆 mega2 源码仓库），启动本地 mega2 评估栈：macOS + OrbStack 使用 [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml)，Linux 使用 [`linux-mega2-compose.yml`](../linux-mega2-compose.yml)。本指南会带你通过 HTTP 克隆仓库、推送到 `main`，再用 API 读回结果；后续示例还涵盖仓库迁移、Git LFS、OCI 镜像、构建产物和数据持久化。该栈从 **Docker Hub 拉取正式发布镜像**（`genedna/mega2:latest`），不从源码构建，也不需要单独执行初始化命令或提供 token。分支与 Tag 规则见[使用指南](./user-guide.zh.md)。
 
 ## 前置条件
 
 - **macOS：**需要 OrbStack；macOS 版 Compose 文件依赖 `*.orb.local` DNS。
 - **Linux：**需要 Docker Engine；Linux 版 Compose 文件让 mega2 使用 host networking。
-- **两者都需要：**Docker Compose v2、`git` 和 `curl`。以下命令均从仓库根目录运行。
+- **两者都需要：**Docker Compose v2、`git` 和 `curl`。不需要 mega2 源码仓库的检出：把 compose 文件下载到你选定的工作目录（例如先运行 `mkdir mega2-eval && cd mega2-eval`），下文的 `docker compose` 命令都在该目录运行。
 - 首次 `up` 会拉取 `genedna/mega2:latest`、PostgreSQL、Redis、RustFS 与 RustFS CLI 镜像，耗时取决于网络。
 
 ## 启动栈
@@ -20,8 +20,13 @@ Mega 是第一代 Monorepo 平台；mega2 是面向 Agent 的第二代引擎，�
 COMPOSE=macos-orbstack-mega2-compose.yml   # macOS + OrbStack
 COMPOSE=linux-mega2-compose.yml            # Linux Docker
 
+curl -fsSLO https://gitmega.ai/$COMPOSE
 docker compose -f $COMPOSE up -d --wait
 ```
+
+下载的文件就是本仓库根目录的同名文件，只引用镜像和具名卷，不依赖仓库中的其它文件。两个文件都固定了 Compose 项目名（Linux 为 `mega2-linux`，macOS 为 `mega2-macos`），容器和具名卷不随所在目录变化。
+
+早先的 macOS 文件没有固定项目名，项目名取自文件所在目录（在本仓库检出中运行即为 `mega2`，可用 `docker compose ls -a` 查看）。如果之前启动过，请先运行 `docker compose -p <旧项目名> -f $COMPOSE down` 停掉旧栈，否则固定的容器名 `mega2-rustfs` 和 9000 端口会冲突。旧数据仍保留在 `<旧项目名>_mega2-*` 卷中；要继续使用这些数据，就在之后的每条命令里加上 `-p <旧项目名>`。
 
 `up` 之后无需任何初始化命令：`rustfs-init` 自动创建 `mega2` 桶，mega2 在服务启动时自动初始化空的 Monorepo（`main` 与顶层目录）。就绪探针是 `/api/openapi.json`。
 
@@ -296,7 +301,7 @@ docker compose -f $COMPOSE down -v
 
 默认栈使用 Docker 具名卷，执行 `down -v` 会删除这些卷及其中的数据。如果要在移除栈后保留数据，请将数据库、对象存储和 mega2 数据目录绑定挂载到宿主机目录。这样即使容器和具名卷被删除，数据仍会留在宿主机上，下一次 `up` 会继续使用这些数据。
 
-在仓库根新建一个覆盖文件 `mega2-compose.persist.yml`：
+在 compose 文件所在目录新建一个覆盖文件 `mega2-compose.persist.yml`：
 
 ```yaml
 # 与你选用的 compose 文件叠加使用：把具名卷替换为宿主目录绑定挂载

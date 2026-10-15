@@ -26,9 +26,13 @@ mega2 是面向 Agent 的第二代 Mega 引擎，其 Monorepo 服务是核心能
 
 之所以分两个变体，是因为 artifact **预签名 URL** 的 host 参与 SigV4 签名：同一个地址必须同时服务 mega2 进程（SDK + 签名）与宿主机客户端（直连下载 blob），而两个平台提供这一共享名称的机制不同。
 
+两个文件都自成一体：只引用镜像与具名卷，没有源码构建或绑定挂载，所以不需要检出本仓库——从 gitmega.ai 下载同名文件，在任意目录即可启动。
+
 ```bash
-docker compose -f macos-orbstack-mega2-compose.yml up -d --wait   # macOS + OrbStack
-docker compose -f linux-mega2-compose.yml up -d --wait            # Linux Docker
+# 按平台下载（无需检出本仓库），之后在同一目录运行 docker compose
+curl -fsSLO https://gitmega.ai/macos-orbstack-mega2-compose.yml   # macOS + OrbStack
+curl -fsSLO https://gitmega.ai/linux-mega2-compose.yml            # Linux Docker
+docker compose -f <文件> up -d --wait
 docker compose -f <文件> logs -f mega2
 docker compose -f <文件> down      # 具名卷保留数据；down -v 清空
 ```

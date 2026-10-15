@@ -3989,7 +3989,7 @@ mod tests {
 
     #[tokio::test]
     async fn fu18_receive_pack_writes_fenced() {
-        use crate::jupiter::storage::git_db_storage::fu18_support::import_refs_count;
+        use crate::jupiter::storage::git_db_storage::import_fence_support::import_refs_count;
 
         let temp = tempfile::tempdir().unwrap();
         let storage = wired_storage_with_monorepo(&temp).await;
@@ -4130,7 +4130,7 @@ mod tests {
     async fn fu18_tag_lock_serializes_with_detach() {
         use sea_orm::TransactionTrait;
 
-        use crate::jupiter::storage::git_db_storage::fu18_support::{
+        use crate::jupiter::storage::git_db_storage::import_fence_support::{
             blocked_by_me, import_refs_count, park_detach, single_connection,
         };
 
@@ -4230,7 +4230,7 @@ mod tests {
         use git_internal::hash::ObjectHash;
         use tokio::sync::mpsc::unbounded_channel;
 
-        use crate::jupiter::storage::git_db_storage::fu18_support::object_counts;
+        use crate::jupiter::storage::git_db_storage::import_fence_support::object_counts;
 
         let temp = tempfile::tempdir().unwrap();
         let storage = wired_storage_with_monorepo(&temp).await;
@@ -4451,7 +4451,7 @@ mod tests {
     async fn fu18_filepath_removed_between_check_and_reads() {
         use sea_orm::{ConnectionTrait, TransactionTrait};
 
-        use crate::jupiter::storage::git_db_storage::fu18_support::blocked_by_me;
+        use crate::jupiter::storage::git_db_storage::import_fence_support::blocked_by_me;
 
         let temp = tempfile::tempdir().unwrap();
         let storage = wired_storage_with_monorepo(&temp).await;

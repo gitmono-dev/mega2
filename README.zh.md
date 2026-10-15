@@ -61,14 +61,18 @@ Agent Session Capture 是独立于 Git push 的可选 HTTP 能力。在 storage-
 
 ## 用 Compose 快速启动
 
-评估栈直接从 Docker Hub 拉取正式发布镜像（`genedna/mega2:latest`），不构建源码、不需要 bootstrap。按平台选择 compose 文件（两者让 artifact 预签名 URL 对宿主机可达的方式不同，见[部署指南](docs/deployment.zh.md)）：
+评估栈直接从 Docker Hub 拉取正式发布镜像（`genedna/mega2:latest`），不构建源码、不需要 bootstrap，也不需要克隆 mega2 源码仓库。按平台从 gitmega.ai 下载 compose 文件，在同一目录启动（两者让 artifact 预签名 URL 对宿主机可达的方式不同，见[部署指南](docs/deployment.zh.md)）：
 
 ```bash
 # macOS + OrbStack
+curl -fsSLO https://gitmega.ai/macos-orbstack-mega2-compose.yml
 docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
 # Linux Docker
+curl -fsSLO https://gitmega.ai/linux-mega2-compose.yml
 docker compose -f linux-mega2-compose.yml up -d --wait
 ```
+
+gitmega.ai 提供的就是本仓库根目录的 [`macos-orbstack-mega2-compose.yml`](macos-orbstack-mega2-compose.yml) 与 [`linux-mega2-compose.yml`](linux-mega2-compose.yml)；已有本仓库检出时可以跳过下载，直接运行 `docker compose`。
 
 HTTP：`http://127.0.0.1:9000/`。这是仅限本机的匿名设置（`push_auth=none`，绑定 `127.0.0.1`）；token 鉴权或共享部署见[部署指南](docs/deployment.zh.md)与 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。先按[快速开始](docs/quick-start.zh.md)启动并推送，再查看[进阶使用场景](docs/recipes.zh.md)中的仓库迁移、LFS、OCI 和构建产物示例。
 
@@ -76,7 +80,7 @@ HTTP：`http://127.0.0.1:9000/`。这是仅限本机的匿名设置（`push_auth
 
 ### 停止
 
-使用 `down -v` 会删除 Docker 数据卷中的数据。
+在 compose 文件所在目录运行。使用 `down -v` 会删除 Docker 数据卷中的数据。
 
 ```bash
 docker compose -f macos-orbstack-mega2-compose.yml down -v   # 或 linux-mega2-compose.yml

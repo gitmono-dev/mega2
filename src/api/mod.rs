@@ -32,18 +32,6 @@ pub mod api_router;
 pub mod api_write_auth;
 pub mod oauth;
 pub mod router;
-#[cfg(test)]
-mod un08_guard_enforcement;
-#[cfg(test)]
-mod un20_queue_requester;
-#[cfg(test)]
-mod un22_principal;
-#[cfg(test)]
-mod un24_merge_authz;
-#[cfg(test)]
-mod un25_service_unavailable;
-#[cfg(test)]
-mod un27_bot_authz;
 
 #[derive(Clone)]
 pub struct MonoApiServiceState {

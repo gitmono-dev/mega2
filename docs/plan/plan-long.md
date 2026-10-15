@@ -126,6 +126,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | PT-14 | trunk 历史只读投影视图 | P0 | 实施中 | P0 已由 [`plan-20261002.md`](plan-20261002.md) 交付；长期剩余：DEFER-HP-01、DEFER-HP-02、DEFER-HP-03、DEFER-HP-04、DEFER-HP-05、DEFER-HP-06、DEFER-HP-07、DEFER-HP-08、DEFER-HP-09、DEFER-HP-10、DEFER-HP-11、DEFER-HP-12、DEFER-HP-13、DEFER-HP-14、DEFER-HP-19。Docker 远端结果独立由 DEFER-HP-20 承接 | N/A（mega2 原生） | [`plan-20261002.md`](plan-20261002.md)（P0）；P1 尚无承接日期计划 | 2026-10-08 |
 | PT-15 | `v0.42.25` Docker 镜像按原提交精确补发 | P1 | 已验证（待排期） | 历史 Docker run 失败，版本镜像缺失；只补不可变的 `v0.42.25` / `0.42.25` 标签，不改 `latest`、不把旧 run 写成成功。接收 [`plan-20260920.md`](plan-20260920.md) 的 `DEFER-OX-02`；与 PT-14 的全部历史 D 结果债务 `DEFER-HP-20` 分开核对 | N/A（mega2 原生发布债务） | [`plan-20260920.md`](plan-20260920.md)（outgoing `DEFER-OX-02`；本计划仅验证新 tag 的 D 门）；补发执行尚无日期计划 | 2026-10-09 |
 | PT-16 | 外部 AI operator 实际接收与执行 | P1 | 候选（待指定目标） | 本仓只交付 Q7 status 拉取 / 具名命令接口及 fake-client 回环；真实 AI 目标的身份、接收、决策、执行与审计仍无证据。接收 [`plan-20260920.md`](plan-20260920.md) 的 `DEFER-OX-03` | N/A（mega2 原生集成） | [`plan-20260920.md`](plan-20260920.md)（outgoing `DEFER-OX-03`；OX-56/53 本地交接）；外部集成尚无日期计划 | 2026-10-09 |
+| PT-17 | Scoped Traces归档与Agent历史检索 | P0 | 未启动（双审PASS，实施未启动） | HTTP/SSH独立scope Git、代码clone对象隔离、session/checkpoint与字面关键词/预算证据读；旧Capture12表及owned对象退场尚未执行 | N/A（mega2原生） | [`plan-20261015.md`](plan-20261015.md)，对偶[Libra计划](../../../libra/docs/development/plan/plan-20261015.md) | 2026-10-15（仅计划） |
 
 ## 工程安全基线
 
@@ -787,6 +788,12 @@ mega2 原生外部集成，Mega 证据为 `N/A`。**接收登记日期：2026-10
 
 若无真实目标或具名维护者接手，`DEFER-OX-03` 保持 open，源计划维护者继续维持 Q7 接口和 fake-client 的已验证边界，禁止写“AI 已收到/已执行”。分歧仍按人工 operator 流程处理，绝不因外部集成空缺自动 force 或放宽鉴权。
 
+## PT-17：Scoped Traces归档与Agent历史检索
+
+Mega2原生能力，承接用户2026-10-14/15明确需求。唯一协议事实源为[`traces.md`](../refactoring/traces.md)，执行分配为[`plan-20261015.md`](plan-20261015.md)的90张MTR卡，与[Libra对偶计划](../../../libra/docs/development/plan/plan-20261015.md)共同按H0..H6推进。当前全部卡pending/空；Claude R15／隔离Codex CA12对90/26卡两计划与跨仓关联及先后依赖均PASS；实施未启动，终稿收据一致性复核后提交；普通clone隔离、新只读Agent API与旧Capturepurge都没有因本次计划登记而完成。
+
+旧[`agent-capture.md`](../refactoring/agent-capture.md)仍描述现行实现；只有H6实际发布和清除证据齐备后才标退场。MegaUI、向量/自动总结、event/file-op模型及未知来源的旧Git traces自动迁移均按日期计划DEFER-MTR登记，不扩大PT-16外部operator范围。收口须核对跨仓无环可用性、raw bytes/权限/索引预算/clone隔离、旧12表与owned历史对象完整清除、各卡C/D及终态证据。
+
 ---
 
 ## 实施顺序
@@ -964,6 +971,7 @@ flowchart TD
 | [`plan-20260920.md`](plan-20260920.md) | N/A（出站同步执行；承接 60916 `DEP-01`）；outgoing `DEFER-OX-02` → PT-15、`DEFER-OX-03` → PT-16 | **设计修订中，任务验收未完成** | OX 任务交付 outbox/worker/reported pack、Q7 operator 接口与 fake-client、GitHub live 门及新 tag 的 Docker D 证据；旧 `v0.42.25` 镜像精确补发和外部 AI 实际执行由 PT-15/16 独立接收，均保持 open。不改直播 ACK。 |
 | [`plan-20260923.md`](plan-20260923.md) | N/A（首次使用路径策略与 ImportRepo 生命周期；非 Mega PT，不新增 PT 编号） | **已完成**（FU-01..FU-23 全部 done/complete，收口 v0.40.12 / `4bf6cc2`；「计划完成门」于 2026-09-26 在 v0.40.13 最终树补跑通过） | GitHub issues #25–#29：#25/#29 路径策略与开通（`root_dirs` / `import_dir` 形状校验、路径策略错误域、首推策略、`mega2 path provision`）；#28 合成 commit 签名头与帧；#26 ImportRepo 增量推送（ref CAS、只写 ref 的更新、存量别名路径规范化）；#27 ImportRepo 清理（台账、原子 detach、元数据清扫、写路径存活栅栏、`POST /api/v1/import-repo/remove`、运维 CLI `mega2 import-repo remove`）。长期剩余见该计划 `DEFER-FU-*`（无对象 GC、SIGTERM 等信号、类型化可重试错误、无分支存量挂载等）。 |
 | [`plan-20261002.md`](plan-20261002.md) | PT-14（trunk 历史只读投影 P0） | **已完成** | 36 张任务卡已完成；34 个独立版本均有 tag 与非草稿 GitHub Release；六张卡的历史 Docker D 组绿灯保留，其余 29 张发布卡依 `EX-HP-01` 延期，Docker 发布不作为本计划完成证据；P1–P3 留在 PT-14。 |
+| [`plan-20261015.md`](plan-20261015.md) | PT-17（Scoped Traces与Agent历史接口） | **未启动，Claude R15／隔离Codex CA12对90/26卡两计划与跨仓关联及先后依赖均PASS；实施未启动，终稿收据一致性复核后提交** | 90卡pending/空；双仓H0..H6按唯一traces契约推进，既有Capture尚未退役。 |
 
 ## 已替代 / 不采纳 / 已实现摘要
 

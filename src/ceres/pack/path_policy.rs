@@ -559,7 +559,7 @@ mod tests {
             common::errors::ProtocolError,
             jupiter::storage::{
                 base_storage::StorageConnector,
-                git_db_storage::fu18_support::{test_cache, wired_storage},
+                git_db_storage::import_fence_support::{test_cache, wired_storage},
             },
         };
 

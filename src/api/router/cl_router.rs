@@ -950,7 +950,7 @@ index 1234567..0000000"#;
 // MC-05 endpoint tests live in a sibling module: they need async runtimes and
 // DB-backed state, unlike the pure-logic cases above.
 #[cfg(test)]
-mod mc05_tests {
+mod cl_commits_tests {
 
     use std::sync::Arc;
 

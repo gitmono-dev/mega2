@@ -4,13 +4,13 @@ English · [中文](quick-start.zh.md)
 
 The original Mega was the first-generation monorepo platform; Mega2 is the second-generation engine built for Agents. Its core capabilities are Monorepo hosting and optional Agent Session Capture. The recommended Agent setup combines Mega2 with ScorpioFS, which mounts repository paths as a local filesystem, and Libra, which provides Agent version-control workflows. This quick start focuses on Git operations against the Monorepo; Agent Session Capture must be enabled separately (see the [Deployment Guide](./deployment.md) and [Configuration Reference](./configuration.md)).
 
-Start the local mega2 evaluation stack with the Compose file for your platform: [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml) on macOS with OrbStack, or [`linux-mega2-compose.yml`](../linux-mega2-compose.yml) on Linux. You will clone a repository over HTTP, push to `main`, and read the result back through the API. The remaining examples cover repository migration, Git LFS, OCI images, build artifacts, and data persistence. The stack pulls the **official release image from Docker Hub** (`genedna/mega2:latest`); it does not build from source and needs no bootstrap command or token. For branch and tag behavior, see the [User Guide](./user-guide.md).
+Download the Compose file for your platform from gitmega.ai (no clone of the mega2 source repository is needed) and start the local mega2 evaluation stack: [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml) on macOS with OrbStack, or [`linux-mega2-compose.yml`](../linux-mega2-compose.yml) on Linux. You will clone a repository over HTTP, push to `main`, and read the result back through the API. The remaining examples cover repository migration, Git LFS, OCI images, build artifacts, and data persistence. The stack pulls the **official release image from Docker Hub** (`genedna/mega2:latest`); it does not build from source and needs no bootstrap command or token. For branch and tag behavior, see the [User Guide](./user-guide.md).
 
 ## Prerequisites
 
 - **macOS:** OrbStack; the macOS Compose file relies on its `*.orb.local` DNS.
 - **Linux:** Docker Engine; the Linux Compose file uses host networking for mega2.
-- **Both:** Docker Compose v2, `git`, and `curl`. Run the commands below from the repository root.
+- **Both:** Docker Compose v2, `git`, and `curl`. No checkout of the mega2 source repository is needed: download the compose file into a working directory of your choice (for example, run `mkdir mega2-eval && cd mega2-eval` first), and run the `docker compose` commands below from that directory.
 - The first `up` pulls `genedna/mega2:latest`, PostgreSQL, Redis, RustFS, and the RustFS CLI images. Pull time depends on your network.
 
 ## Bring up the stack
@@ -20,8 +20,13 @@ Start the local mega2 evaluation stack with the Compose file for your platform: 
 COMPOSE=macos-orbstack-mega2-compose.yml   # macOS with OrbStack
 COMPOSE=linux-mega2-compose.yml            # Linux Docker
 
+curl -fsSLO https://gitmega.ai/$COMPOSE
 docker compose -f $COMPOSE up -d --wait
 ```
+
+The downloaded file is the file of the same name at the root of this repository. It references only images and named volumes and needs no other repository files. Both files fix the Compose project name (`mega2-linux` on Linux, `mega2-macos` on macOS), so containers and named volumes do not depend on the directory.
+
+Earlier versions of the macOS file had no fixed project name, so the project was named after the file's directory (`mega2` in a checkout of this repository; `docker compose ls -a` lists it). If you started that stack before, stop it first with `docker compose -p <old project> -f $COMPOSE down`; otherwise the fixed `mega2-rustfs` container name and port 9000 collide. The old data stays in the `<old project>_mega2-*` volumes; to keep using it, add `-p <old project>` to every later command.
 
 No separate initialization step is needed. `rustfs-init` creates the `mega2` bucket, and mega2 initializes the empty Monorepo—with `main` and the top-level directories—when the service starts. The readiness endpoint is `/api/openapi.json`.
 
@@ -296,7 +301,7 @@ docker compose -f $COMPOSE down -v
 
 The default stack stores data in Docker named volumes, which `down -v` removes. To keep data after removing the stack, bind-mount the database, object store, and mega2 data directory to host paths. Those files remain after the containers and volumes are removed, and the next `up` reuses them.
 
-Create an override file `mega2-compose.persist.yml` in the repository root:
+Create an override file `mega2-compose.persist.yml` in the directory that holds the compose file:
 
 ```yaml
 # Layered on top of your chosen compose file: replace the named volumes with host bind mounts

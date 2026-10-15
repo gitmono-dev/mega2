@@ -1003,7 +1003,7 @@ CAS 在本设计中的角色是**断言/tripwire**而非并发控制：队列成
 
 **1.8 与现有 merge queue 的关系**
 
-`merge_queue` 被 `MonoWriteQueue` **吸收**，不并存——两个队列各管一部分根树写入者等于没有全序。可复用的是**四层形状**（storage/service/router/DTO）与既有语义资产：`requester`（UN-18）、freeze 语义（UN-25）、位置查询与统计 API、HTTP 表面。**不复用**其枚举——`QueueStatusEnum`（`Waiting/Testing/Merging/Merged/Failed`）是 CL 工作流状态机，与本队列生命周期不同构，本队列为新实体配新枚举（`push_queue_status_enum` / `push_queue_kind_enum` / `push_queue_failure_enum`，见 1.4），走独立迁移，不动既有列；UN-25 的 freeze 契约（`un25_freeze.rs`）现以 `Failed + SystemError` 表达，新枚举保留 `SystemError` 变体并在迁移时逐条映射。**不可复用**其互斥（`AtomicBool` → advisory lock）、claim（裸 SELECT → `WHERE status='Queued'` 条件写回）与序号（毫秒时间戳 → `bigserial`）实现。冲突重排的语义映射见 ADR-TP-05 影响段（关行重入队，不改 id）。
+`merge_queue` 被 `MonoWriteQueue` **吸收**，不并存——两个队列各管一部分根树写入者等于没有全序。可复用的是**四层形状**（storage/service/router/DTO）与既有语义资产：`requester`（UN-18）、freeze 语义（UN-25）、位置查询与统计 API、HTTP 表面。**不复用**其枚举——`QueueStatusEnum`（`Waiting/Testing/Merging/Merged/Failed`）是 CL 工作流状态机，与本队列生命周期不同构，本队列为新实体配新枚举（`push_queue_status_enum` / `push_queue_kind_enum` / `push_queue_failure_enum`，见 1.4），走独立迁移，不动既有列；UN-25 的 freeze 契约（`mono_api_service/authz.rs` 的 `merge_authz_freeze` 测试模块）现以 `Failed + SystemError` 表达，新枚举保留 `SystemError` 变体并在迁移时逐条映射。**不可复用**其互斥（`AtomicBool` → advisory lock）、claim（裸 SELECT → `WHERE status='Queued'` 条件写回）与序号（毫秒时间戳 → `bigserial`）实现。冲突重排的语义映射见 ADR-TP-05 影响段（关行重入队，不改 id）。
 
 **Sunset（[`plan-20260910.md`](../plan/plan-20260910.md)）：** 下列「存量行迁移与滚动部署」及 `merge_writer` 双写者开关已废止。CL merge 只经 MonoWriteQueue；无该配置键；不吸收 `merge_queue` 行（表已 DROP）。下文保留为阶段 1 设计时的历史叙述。
 
@@ -1859,7 +1859,7 @@ Monorepo 的每一次落地（trunk 推送、CL merge、attach）都必须改写
   - **活跃操作去重（Codex R5 #2）**：B1 只查 `Done` 行拦不住「原行在队时的并发重试」。新增 `push_queue_active_operation` 唯一部分索引（`(kind, path, operation_id) WHERE status IN ('Queued','Running')`，全 kind 适用）——活跃期重试被拒并提示「重复操作进行中」，终态后重试走 `Done` 回放；merge 冲突重排不受影响（原行已终态）。
   - **树哈希断言覆盖 merge 分支（Codex R5 #3）**：merge 以 `main@P` 行为 parent，消费陈旧行会把陈旧 tip 永久烘进历史。ADR-TP-20 的断言/修复扩展为 push 与 merge 同谓词；1.9 行为变化清单增补第 4 条（陈旧基线 merge 被拒属缺陷修复——现状的「成功」本身带陈旧前史）；配 merge 陈旧基线回归。
   - **数据面全量事务化（Codex R5 #4）**：现状 `apply_update_result` 的 ref/commit/tree 写入分散在多个自管连接（`mono_api_service.rs:2693-2696/2701/2717`）。新增 **1.10 交付物 6**：三类写入全部穿入同一 `&DatabaseTransaction`；配中段 `kill -9` 无孤儿对象验收。
-  - **UN-25 的 SystemError（Codex R5 #5）**：现有 freeze 契约是 `Failed + SystemError`（`un25_freeze.rs`），新枚举补 `SystemError` 变体并在 1.8 声明逐条映射；配 freeze 回归。
+  - **UN-25 的 SystemError（Codex R5 #5）**：现有 freeze 契约是 `Failed + SystemError`（`mono_api_service/authz.rs` 的 `merge_authz_freeze` 测试模块），新枚举补 `SystemError` 变体并在 1.8 声明逐条映射；配 freeze 回归。
   - **措辞（Codex R5 #6/#7）**：风险 6 与 I3 的「同事务删除」统一为「B4 回滚后独立提交事务墓碑修复」；ADR-TP-06 的「推送的权威序号」改为「全局队列操作的权威序号」（merge/attach 也消费 id）。
 - **同日修订 9（第四轮 Codex 评审后）**：R4 评审 4 条 BLOCKING + 1 条 MINOR 全部落实。
   - **N > 1 重试的幂等回放（Codex R4 #1）**：N > 1 落地的是 squash commit，`cmd.new_id != main@P.tip` 恒成立，仅靠 B0 的 tip 相等早退拦不住重试。改为 push 的幂等解析以 **B1 查 `Done` 行**为权威路径（先于 non-fast-forward 预检），`landed_commit_id` 记录实际落地 id（N = 1 为 `cmd.new_id`、N > 1 为 squash id）并以此回放。

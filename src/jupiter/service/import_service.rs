@@ -231,7 +231,7 @@ mod tests {
             protocol::repo::Repo,
         },
         common::errors::ImportRepoError,
-        jupiter::storage::git_db_storage::fu18_support::{
+        jupiter::storage::git_db_storage::import_fence_support::{
             blocked_by_me, object_counts, park_detach, single_connection, test_cache, wired_storage,
         },
     };

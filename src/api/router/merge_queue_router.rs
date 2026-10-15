@@ -318,7 +318,10 @@ mod tests {
     use crate::{
         api::{
             MonoApiServiceState,
-            oauth::{api_store::BrowserSessionStore, model::LoginUser},
+            oauth::{
+                api_store::{BrowserSessionStore, CountingSessionStore, FixedUserSessionStore},
+                model::LoginUser,
+            },
         },
         callisto::{push_queue, sea_orm_active_enums::PushQueueKindEnum},
         ceres::api_service::cache::GitObjectCache,
@@ -397,16 +400,18 @@ mod tests {
             .unwrap();
     }
 
-    fn api_state(storage: Storage) -> MonoApiServiceState {
+    fn fixed_session(username: &str) -> BrowserSessionStore {
+        BrowserSessionStore::Fixed(FixedUserSessionStore {
+            user: LoginUser {
+                username: username.to_string(),
+                ..Default::default()
+            },
+        })
+    }
+
+    fn api_state(storage: Storage, session_store: BrowserSessionStore) -> MonoApiServiceState {
         MonoApiServiceState {
-            session_store: BrowserSessionStore::Fixed(
-                crate::api::oauth::api_store::FixedUserSessionStore {
-                    user: LoginUser {
-                        username: "queue-requester".to_string(),
-                        ..Default::default()
-                    },
-                },
-            ),
+            session_store,
             git_object_cache: Arc::new(GitObjectCache {
                 connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
                     ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
@@ -431,7 +436,7 @@ mod tests {
             .merge(super::routers())
             .split_for_parts();
         let response = router
-            .with_state(api_state(storage.clone()))
+            .with_state(api_state(storage.clone(), fixed_session("queue-requester")))
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -472,6 +477,119 @@ mod tests {
         assert!(
             table_name.is_none(),
             "POST /merge-queue/add must not write merge_queue; the table is dropped"
+        );
+    }
+
+    fn router(state: MonoApiServiceState) -> axum::Router {
+        let (router, _api) = OpenApiRouter::new()
+            .merge(super::routers())
+            .split_for_parts();
+        router.with_state(state)
+    }
+
+    async fn post_add(state: MonoApiServiceState, cl_link: &str) -> StatusCode {
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/merge-queue/add")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"cl_link":"{cl_link}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds")
+            .status()
+    }
+
+    async fn post_retry(state: MonoApiServiceState, cl_link: &str) -> StatusCode {
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/merge-queue/retry/{cl_link}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds")
+            .status()
+    }
+
+    async fn push_queue_merge_row(storage: &Storage, cl_link: &str) -> push_queue::Model {
+        push_queue::Entity::find()
+            .filter(push_queue::Column::Kind.eq(PushQueueKindEnum::Merge))
+            .filter(push_queue::Column::OperationId.eq(cl_link))
+            .one(storage.cl_storage().get_connection())
+            .await
+            .expect("read push_queue")
+            .expect("merge row must exist")
+    }
+
+    #[tokio::test]
+    async fn add_records_the_session_requester() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        seed_mergeable_cl(&storage, "ADDREQ").await;
+
+        let state = api_state(storage.clone(), fixed_session("queue-requester"));
+        assert_eq!(post_add(state, "ADDREQ").await, StatusCode::OK);
+
+        let row = push_queue_merge_row(&storage, "ADDREQ").await;
+        assert_eq!(
+            row.requester.as_deref(),
+            Some("queue-requester"),
+            "the enqueue must record the session subject on push_queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_accepts_an_anonymous_request_and_records_null() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        seed_mergeable_cl(&storage, "ANONADD").await;
+
+        let session_store =
+            BrowserSessionStore::Counting(CountingSessionStore::new(vec![Ok(None)]));
+        let state = api_state(storage.clone(), session_store);
+
+        assert_eq!(
+            post_add(state, "ANONADD").await,
+            StatusCode::OK,
+            "an anonymous enqueue must still be served — the capture is optional"
+        );
+        let row = push_queue_merge_row(&storage, "ANONADD").await;
+        let payload_requester = row
+            .payload
+            .get("requester")
+            .and_then(|v| {
+                if v.is_null() {
+                    Some(None)
+                } else {
+                    v.as_str().map(|s| Some(s.to_string()))
+                }
+            })
+            .unwrap_or(Some("missing".into()));
+        assert_eq!(
+            payload_requester, None,
+            "an anonymous request is recorded as NULL in the merge payload, not as a made-up subject"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_records_the_session_requester() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        seed_mergeable_cl(&storage, "RETRYREQ").await;
+
+        let state = api_state(storage.clone(), fixed_session("retry-requester"));
+        assert_eq!(post_retry(state, "RETRYREQ").await, StatusCode::OK);
+
+        let row = push_queue_merge_row(&storage, "RETRYREQ").await;
+        assert_eq!(
+            row.requester.as_deref(),
+            Some("retry-requester"),
+            "the retry must record who asked for it on push_queue"
         );
     }
 }

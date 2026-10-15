@@ -516,7 +516,7 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 以下依据全部是 mega2 自证，已逐条实测：
 
 - `src/contract/policy/mega.cedarschema`（全文已读，`grep -c "Bot"` = **0**）只有 `entity UserGroup in [UserGroup]` 与 `entity User in [UserGroup]`，**没有 `entity Bot`**；四条 action 声明（`deleteRepo/viewRepo/forkRepo/pullRepo/pushRepo`、`createMergeRequest/editMergeRequest/deleteMergeRequest/approveMergeRequest`、`openIssue/assignIssue/deleteIssue/editIssue`、`addMaintainer/addAdmin`）的 `principal` **全部是 `[User]`**。`Bot::"<id>"` 不是那个类型。
-- 官方说明（`src/api/un27_bot_authz.rs:1-9`）："A full bot authorization model (schema plus identity mapping) is deferred."
+- 官方说明（`src/contract/policy/guard/http_enforcement.rs`）："A full bot authorization model (schema plus identity mapping) is deferred."
 - 行为矩阵：`off` → 200 短路；`shadow` → 200 + would-deny；`enforce` → **403**。
 - `un27_a_bot_does_not_inherit_a_same_named_users_permissions` 明确断言 principal 的类型是身份的一部分。
 - **官方迁移建议是反向的**：`docs/manuel/authz.md:96` 逐字写着「Bot 对受保护 CL 面的操作须在 enforce 前迁移到**用户 token**；完整 Bot 授权模型归后续计划」——即架构性地要求 agent 冒充人。

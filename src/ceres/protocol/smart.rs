@@ -1044,7 +1044,7 @@ pub mod test {
             errors::{MegaError, ProtocolError, ViewUnavailableReason},
             utils::{MEGA_BRANCH_NAME, ZERO_ID},
         },
-        jupiter::storage::git_db_storage::fu18_support::{test_cache, wired_storage},
+        jupiter::storage::git_db_storage::import_fence_support::{test_cache, wired_storage},
         orbit_api::object_storage::MultiObjectByteStream,
     };
 

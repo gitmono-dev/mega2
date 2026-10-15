@@ -837,7 +837,7 @@ impl PackConfig {
     ///
     /// # Examples
     /// ```
-    /// use crate::config::PackConfig;
+    /// use mega2_core::config::PackConfig;
     ///
     /// assert_eq!(PackConfig::get_size_from_str("1MB", || Ok(1 * 1000 * 1000)).unwrap(), 1 * 1000 * 1000);
     /// assert_eq!(PackConfig::get_size_from_str("2MiB", || Ok(2 * 1024 * 1024)).unwrap(), 2 * 1024 * 1024);

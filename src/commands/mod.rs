@@ -7,8 +7,6 @@ pub mod debug;
 pub mod import_repo;
 pub mod path;
 pub mod service;
-#[cfg(test)]
-mod un34_readonly_config;
 
 use std::path::PathBuf;
 

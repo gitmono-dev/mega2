@@ -249,8 +249,15 @@ pub(crate) fn map_ceres_error<D: std::fmt::Display>(err: D, ctx: &str) -> ApiErr
 
 #[cfg(test)]
 mod tests {
-    use axum::{http::StatusCode, response::IntoResponse};
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+        response::IntoResponse,
+        routing::get,
+    };
     use sea_orm::DbErr;
+    use tower::ServiceExt;
 
     use super::ApiError;
     use crate::common::errors::{ImportRepoError, MegaError};
@@ -308,6 +315,73 @@ mod tests {
             let status = error.status();
             assert_eq!(status, expected, "{error:?}");
             assert_eq!(error.into_response().status(), status);
+        }
+    }
+
+    async fn call(router: Router) -> StatusCode {
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds")
+            .status()
+    }
+
+    fn router_returning(code: &'static str) -> Router {
+        Router::new().route(
+            "/probe",
+            get(move || async move {
+                Err::<&'static str, ApiError>(ApiError::from(MegaError::Other(format!(
+                    "[code:{code}] authorization is unavailable"
+                ))))
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn coded_503_reaches_the_client_as_503() {
+        assert_eq!(
+            call(router_returning("503")).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an authorization-unavailable state must be retryable by contract"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_is_distinguishable_from_an_internal_error() {
+        assert_eq!(
+            call(router_returning("500")).await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_ne!(
+            call(router_returning("503")).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "503 must not collapse back into 500 — a caller cannot retry a bug"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_code_falls_back_to_500() {
+        assert_eq!(
+            call(router_returning("599")).await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_status_mappings_are_unchanged() {
+        for (code, expected) in [
+            ("400", StatusCode::BAD_REQUEST),
+            ("401", StatusCode::UNAUTHORIZED),
+            ("403", StatusCode::FORBIDDEN),
+            ("404", StatusCode::NOT_FOUND),
+            ("409", StatusCode::CONFLICT),
+        ] {
+            assert_eq!(call(router_returning(code)).await, expected, "code {code}");
         }
     }
 }

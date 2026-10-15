@@ -94,7 +94,7 @@ rg -n "save_refs|update_ref|mega_head_hash_with_txn|batch_update" src/ --stats
 | ID | Site | Classification | Evidence |
 |---|---|---|---|
 | T-01 | `admin_ops` seed `save_refs` main | `test-fixture` | `admin_ops.rs:220`（`#[cfg(test)]`） |
-| T-02 | `un19_fail_closed` seed `save_refs` main | `test-fixture` | `un19_fail_closed.rs:88`（`#[cfg(test)]`） |
+| T-02 | `merge_acl_unavailable` seed `save_refs` main | `test-fixture` | `mono_api_service/authz.rs` 的 `merge_acl_unavailable` 测试模块（`#[cfg(test)]`） |
 | T-03 | `mono_api_service` tests `setup_main_ref` / CL fixtures | `test-fixture` | `mono_api_service.rs:5777`、`:6337`、`:6523`、`:6667` |
 | T-04 | `import_repo` tests 调 `attach_to_monorepo_parent` | `test-fixture` | `import_repo.rs:872`、`:956` |
 | T-05 | 测试注释提及 `batch_update_by_path_concurrent`（非调用） | `rg-hit`（comment） | `mono_api_service.rs:5918` |
@@ -118,7 +118,7 @@ rg -n "save_refs|update_ref|mega_head_hash_with_txn|batch_update" src/ --stats
 | `import_repo.rs:333` | W-OOS-06（签名） |
 | `import_repo.rs:352/569` | W-OOS-06 |
 | `admin_ops.rs:220` | T-01 |
-| `un19_fail_closed.rs:88` | T-02 |
+| `mono_api_service/authz.rs` `merge_acl_unavailable` | T-02 |
 | `mono_api_service.rs:1927/1978` | W-OOS-04 |
 | `mono_api_service.rs:2694` | W-ROOT-01 |
 | `mono_api_service.rs:3392/3446` | W-OOS-03 |

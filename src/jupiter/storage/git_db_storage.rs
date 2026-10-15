@@ -1302,13 +1302,13 @@ async fn update_filepath_chunk<C: ConnectionTrait>(
     Ok(())
 }
 
-/// Test support shared by the FU-18 fence tests of several modules
+/// Test support shared by the import-repo fence tests of several modules
 /// (`src/jupiter/tests.rs` is outside that card's write set). Lock-wait polls
 /// run on the lock holder's own transaction and discard the per-transaction
 /// `pg_stat_activity` snapshot first; every helper stays within the test
 /// pool's two connections plus one single-connection pool.
 #[cfg(test)]
-pub(crate) mod fu18_support {
+pub(crate) mod import_fence_support {
     use std::{path::Path, sync::Arc};
 
     use sea_orm::{
@@ -2377,7 +2377,7 @@ mod tests {
         // production: on a pool of one connection, whose statistics are
         // flushed on demand, sweeping three batches of the decoy (most of
         // `git_blob`) adds no sequential scan of any object table.
-        let single = fu18_support::single_connection(conn).await;
+        let single = import_fence_support::single_connection(conn).await;
         let before = fu17_seq_scans(&single).await;
         let report = git_db
             .sweep_import_repo_objects(decoy, 3, &single)
@@ -2830,7 +2830,7 @@ mod tests {
         use crate::ceres::pack::import_repo::detach_import_repo;
 
         let temp = TempDir::new().unwrap();
-        let storage = fu18_support::wired_storage(temp.path()).await;
+        let storage = import_fence_support::wired_storage(temp.path()).await;
         let git_db = storage.git_db_storage();
         let conn = git_db.get_connection().clone();
 
@@ -2849,7 +2849,7 @@ mod tests {
         let detaching = tokio::spawn(async move {
             detach_import_repo(
                 &detach_storage,
-                fu18_support::test_cache().await,
+                import_fence_support::test_cache().await,
                 parent1_id,
                 "/third-party/fu18-p1",
                 None,
@@ -2857,7 +2857,7 @@ mod tests {
             .await
         });
         assert!(
-            fu18_support::blocked_by_me(&registering, false).await,
+            import_fence_support::blocked_by_me(&registering, false).await,
             "the detach waits on the registering child"
         );
         registering.commit().await.unwrap();
@@ -2898,13 +2898,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let single = fu18_support::single_connection(&conn).await;
-        let parked = fu18_support::park_detach(&single, parent2_id).await;
+        let single = import_fence_support::single_connection(&conn).await;
+        let parked = import_fence_support::park_detach(&single, parent2_id).await;
         let detach_storage = storage.clone();
         let detaching = tokio::spawn(async move {
             detach_import_repo(
                 &detach_storage,
-                fu18_support::test_cache().await,
+                import_fence_support::test_cache().await,
                 parent2_id,
                 "/third-party/fu18-p2",
                 None,
@@ -2912,7 +2912,7 @@ mod tests {
             .await
         });
         assert!(
-            fu18_support::blocked_by_me(&parked, false).await,
+            import_fence_support::blocked_by_me(&parked, false).await,
             "the detach parks at its import_refs delete"
         );
         let register_db = git_db.clone();
@@ -2922,7 +2922,7 @@ mod tests {
                 .await
         });
         assert!(
-            fu18_support::blocked_by_me(&parked, true).await,
+            import_fence_support::blocked_by_me(&parked, true).await,
             "the child registration waits on the detach"
         );
         parked.commit().await.unwrap();
@@ -2942,6 +2942,9 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(fu18_support::import_refs_count(&conn, parent2_id).await, 0);
+        assert_eq!(
+            import_fence_support::import_refs_count(&conn, parent2_id).await,
+            0
+        );
     }
 }
