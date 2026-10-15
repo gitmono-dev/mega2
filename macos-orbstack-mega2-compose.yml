@@ -61,6 +61,8 @@
 # 这是仅限本机使用的匿名 Git HTTP 写入设置：`push_auth=none` 代表 clone、
 # fetch 与 push 都不需要 token。因此 9000 端口只绑定 127.0.0.1。请勿改成
 # 0.0.0.0 或通过反向代理公开；共享或互联网部署必须改用 token 或 OAuth。
+name: mega2-macos
+
 services:
   postgres:
     image: postgres:18.6-alpine3.24

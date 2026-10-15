@@ -199,7 +199,7 @@ docker compose -f $COMPOSE down -v
 
 The default stack uses Docker named volumes, so `down -v` deletes your data together with the volumes. If you plan to **use this instance long-term and want the data to outlive the stack itself**, switch the database, object storage, and mega2 data directories to bind mounts on the host — then **even if the containers and volumes are deleted, the data stays in the local directory and is picked up again on the next `up`**.
 
-Create an override file `mega2-compose.persist.yml` in the repository root:
+Create an override file `mega2-compose.persist.yml` in the directory that holds the compose file:
 
 ```yaml
 # Layered on top of your chosen compose file: replace the named volumes with host bind mounts

@@ -199,7 +199,7 @@ docker compose -f $COMPOSE down -v
 
 默认栈用的是 Docker 具名卷，`down -v` 会把数据连同卷一起删掉。如果你要**长期使用**这个实例、希望删除栈之后数据还在，就把数据库、对象存储与 mega2 数据目录改成绑定挂载到宿主本地目录——这样**即使容器和卷都被删除，数据仍保留在本地目录里，下次 `up` 直接继续使用**。
 
-在仓库根新建一个覆盖文件 `mega2-compose.persist.yml`：
+在 compose 文件所在目录新建一个覆盖文件 `mega2-compose.persist.yml`：
 
 ```yaml
 # 与你选用的 compose 文件叠加使用：把具名卷替换为宿主目录绑定挂载
