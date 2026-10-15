@@ -4,6 +4,15 @@ Guidance for AI coding agents working in this repository. Keep changes minimal,
 follow the patterns already in the codebase, and verify with the commands below
 before submitting.
 
+Normative task-card rules are defined in
+[`docs/plan/plan-template.md`](docs/plan/plan-template.md), currently **v2.5**
+(effective 2026-10-15): ER-* execution gates, GC-* engineering constraints, and
+G-01–G-13 granularity/release boundaries. Follow its incremental migration
+policy for existing plans; this file is a synchronized entry point, not a
+separate waiver. G-13 permits only a predeclared, reviewed aggregate of 2–3
+independent code defects actually blocking strict gates in one unpublished
+repair frontier; it preserves each card's behavior axis and full final C/D.
+
 ## Project Overview
 
 - **Name:** `mega2` (single Cargo package: lib `mega2_core` + binaries, see `Cargo.toml`).
@@ -300,9 +309,9 @@ gates are resolved. VCS is Libra (no `git`).
    the card complete. Start the next release card only after this card's C
    actions finish; release remains serial.
 
-Family children and no-release cards inherit C/D coverage from the carrier
-named in the card. See [`docs/plan/plan-template.md`](docs/plan/plan-template.md)
-ER-04, ER-07, ER-08, and G-12 for the full gates, deferral rule, and release
+Family, plan-release, repair-aggregate children, and no-release cards inherit
+C/D coverage from the carrier named in the card. See [`docs/plan/plan-template.md`](docs/plan/plan-template.md)
+ER-04, ER-07, ER-08, G-12, and G-13 for the full gates, deferral rule, and release
 order.
 
 For the explicitly declared G-12 plan-wide release group in
@@ -317,11 +326,31 @@ inherit that final point's C/D coverage and become `done/complete` only after
 the coverage is obtained. The unique final tag's Docker D must actually
 succeed; a named ER-04 D deferral does not complete this plan.
 
+For an eligible G-13 repair aggregate, register 2–3 independent implementation
+repairs, their actual blocking logs, source cohorts/unpublished baseline, sole publisher,
+no-push window, recovery/exit rules, and one `release` point in `REL-*` before
+further implementation. Actual, mutually isolated Claude and Codex plan reviews
+must both explicitly pass its applicability. Each child uses
+`repair aggregate child of REL-<n>`, version/R `N/A`, and names the point for C/D.
+Establish each code cause and repair, pass independent A/B, fmt/clippy and actual
+ER-05 review,
+and commit precisely locally with ER-07 signature checks and sign-off. No earlier
+branch/tag push, Release, or interleaved release slice is allowed. The sole
+`repair aggregate release point of REL-<n>` reviews before its actual patch
+bump and executes every C step above on the combined final tree; its tag's
+Docker D must actually succeed before any child is `done/complete`. Unknown
+causes, non-reproduction alone, or environment load without a code defect
+require ER-03 reassessment/new plan review or a return to G-07 independent
+slices. This is not a G-08 family or an EX waiver, and does not replace the G-12
+user directive. Published changes recover forward only; existing ER-09/ER-10
+budgets, signature, no-force, and test/ignore boundaries remain unchanged.
+
 A terminal evidence-only `release` card may set `Version increment=N/A` and
 `Release write set=N/A` only under ER-08: it adds no product behavior and
 cannot replace an independently released code card's, family release point's,
-or G-12 plan-wide group's versioned release. It skips the version edit, tag,
-and GitHub Release while retaining review, the three gates, builds, precise
+G-12 plan-wide group's, or G-13 repair aggregate's versioned release. It skips
+the version edit, tag, and GitHub Release while retaining review, the three
+gates, builds, precise
 commit, push, and actual D-gate mapping. In the G-12 group above, an optional
 terminal evidence-only closeout may push evidence, plan-status, and index docs
 only after the unique patch release point's Docker D succeeds, without another
