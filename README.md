@@ -61,14 +61,18 @@ Agent Session Capture is an optional HTTP capability, separate from Git push. Wh
 
 ## Quick start with Compose
 
-The evaluation stack pulls the official release image from Docker Hub (`genedna/mega2:latest`) — no source build, no bootstrap. Pick the compose file for your platform (they differ in how artifact presigned URLs are made reachable from the host — see the [Deployment Guide](docs/deployment.md)):
+The evaluation stack pulls the official release image from Docker Hub (`genedna/mega2:latest`) — no source build, no bootstrap, and no clone of the mega2 source repository. Download the compose file for your platform from gitmega.ai and start it from the same directory (the two files differ in how artifact presigned URLs are made reachable from the host — see the [Deployment Guide](docs/deployment.md)):
 
 ```bash
 # macOS with OrbStack
+curl -fsSLO https://gitmega.ai/macos-orbstack-mega2-compose.yml
 docker compose -f macos-orbstack-mega2-compose.yml up -d --wait
 # Linux Docker
+curl -fsSLO https://gitmega.ai/linux-mega2-compose.yml
 docker compose -f linux-mega2-compose.yml up -d --wait
 ```
+
+gitmega.ai serves this repository's root [`macos-orbstack-mega2-compose.yml`](macos-orbstack-mega2-compose.yml) and [`linux-mega2-compose.yml`](linux-mega2-compose.yml); in a checkout of this repository, skip the download and run `docker compose` directly.
 
 HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth=none`, bound to `127.0.0.1`); for token-based or shared deployments see the [Deployment Guide](docs/deployment.md) and [`docs/deploy-trunk.md`](docs/deploy-trunk.md) (Chinese). Start and push with the [Quick Start](docs/quick-start.md), then see [Usage Recipes](docs/recipes.md) for repository migration, LFS, OCI, and build-artifact examples.
 
@@ -76,7 +80,7 @@ For local development and tests, see the [Contributing Guide](docs/contributing.
 
 ### Stop
 
-The `-v` flag deletes data stored in the Docker volumes.
+Run this from the directory that holds the compose file. The `-v` flag deletes data stored in the Docker volumes.
 
 ```bash
 docker compose -f macos-orbstack-mega2-compose.yml down -v   # or linux-mega2-compose.yml

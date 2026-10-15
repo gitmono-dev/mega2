@@ -26,9 +26,13 @@ The evaluation stack ships in two platform variants; both pull the **official re
 
 The two variants exist because artifact **presigned URLs** carry the object-storage endpoint host in their SigV4 signature: one address must serve both the mega2 process (SDK + presigning) and clients on the host (direct blob download), and each platform provides a different mechanism for that shared name.
 
+Both files are self-contained — images and named volumes only, with no source build or bind mounts — so no checkout of this repository is needed: download the file of the same name from gitmega.ai and start it from any directory.
+
 ```bash
-docker compose -f macos-orbstack-mega2-compose.yml up -d --wait   # macOS + OrbStack
-docker compose -f linux-mega2-compose.yml up -d --wait            # Linux Docker
+# Download the file for your platform (no checkout needed), then run docker compose from the same directory
+curl -fsSLO https://gitmega.ai/macos-orbstack-mega2-compose.yml   # macOS + OrbStack
+curl -fsSLO https://gitmega.ai/linux-mega2-compose.yml            # Linux Docker
+docker compose -f <file> up -d --wait
 docker compose -f <file> logs -f mega2
 docker compose -f <file> down      # named volumes keep the data; down -v wipes it
 ```
