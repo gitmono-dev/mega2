@@ -24,7 +24,9 @@ curl -fsSLO https://gitmega.ai/$COMPOSE
 docker compose -f $COMPOSE up -d --wait
 ```
 
-The downloaded file is the file of the same name at the root of this repository. It references only images and named volumes and needs no other repository files. The Linux file fixes the Compose project name to `mega2-linux`; the macOS file takes the project name from its directory, so starting it from a different directory creates a separate set of empty named volumes. Keep working in the same directory.
+The downloaded file is the file of the same name at the root of this repository. It references only images and named volumes and needs no other repository files. Both files fix the Compose project name (`mega2-linux` on Linux, `mega2-macos` on macOS), so containers and named volumes do not depend on the directory.
+
+Earlier versions of the macOS file had no fixed project name, so the project was named after the file's directory (`mega2` in a checkout of this repository; `docker compose ls -a` lists it). If you started that stack before, stop it first with `docker compose -p <old project> -f $COMPOSE down`; otherwise the fixed `mega2-rustfs` container name and port 9000 collide. The old data stays in the `<old project>_mega2-*` volumes; to keep using it, add `-p <old project>` to every later command.
 
 No separate initialization step is needed. `rustfs-init` creates the `mega2` bucket, and mega2 initializes the empty Monorepo—with `main` and the top-level directories—when the service starts. The readiness endpoint is `/api/openapi.json`.
 

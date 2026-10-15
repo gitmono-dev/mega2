@@ -24,7 +24,9 @@ curl -fsSLO https://gitmega.ai/$COMPOSE
 docker compose -f $COMPOSE up -d --wait
 ```
 
-下载的文件就是本仓库根目录的同名文件，只引用镜像和具名卷，不依赖仓库中的其它文件。Linux 版把 Compose 项目名固定为 `mega2-linux`；macOS 版以文件所在目录名作为项目名，换一个目录启动会得到另一套空的具名卷，因此后续请在同一目录操作。
+下载的文件就是本仓库根目录的同名文件，只引用镜像和具名卷，不依赖仓库中的其它文件。两个文件都固定了 Compose 项目名（Linux 为 `mega2-linux`，macOS 为 `mega2-macos`），容器和具名卷不随所在目录变化。
+
+早先的 macOS 文件没有固定项目名，项目名取自文件所在目录（在本仓库检出中运行即为 `mega2`，可用 `docker compose ls -a` 查看）。如果之前启动过，请先运行 `docker compose -p <旧项目名> -f $COMPOSE down` 停掉旧栈，否则固定的容器名 `mega2-rustfs` 和 9000 端口会冲突。旧数据仍保留在 `<旧项目名>_mega2-*` 卷中；要继续使用这些数据，就在之后的每条命令里加上 `-p <旧项目名>`。
 
 `up` 之后无需任何初始化命令：`rustfs-init` 自动创建 `mega2` 桶，mega2 在服务启动时自动初始化空的 Monorepo（`main` 与顶层目录）。就绪探针是 `/api/openapi.json`。
 
