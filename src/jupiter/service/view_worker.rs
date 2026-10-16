@@ -471,6 +471,23 @@ mod tests {
         .unwrap();
     }
 
+    // A test safety watchdog, not a production-round latency SLO.
+    const FIRST_ROUND_WATCHDOG: Duration = Duration::from_secs(180);
+    // Keep an automatic retry outside the first-round watchdog horizon.
+    const FIRST_ROUND_RECHECK_SECS: u64 = 3600;
+
+    async fn wait_for_first_compensation_round(
+        completed: &AtomicUsize,
+        limit: Duration,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(limit, async {
+            while completed.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+    }
+
     async fn wait_until_ready(storage: &Storage, filter_id: i64, tip: i64) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -1081,7 +1098,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let mut config = views_config(temp.path().join("unbounded"));
-        config.views.worker_interval_secs = 60;
+        config.views.worker_interval_secs = FIRST_ROUND_RECHECK_SECS;
         config.views.max_append_walk = 1;
         let storage = test_storage_with_config(temp.path(), config).await;
         let view_storage = storage.view_storage();
@@ -1146,7 +1163,9 @@ mod tests {
         let worker = spawn_view_worker_with_round(storage.clone(), token.clone(), round)
             .unwrap()
             .unwrap();
-        wait_for_count(&completed, 1, Duration::from_secs(10)).await;
+        wait_for_first_compensation_round(&completed, FIRST_ROUND_WATCHDOG)
+            .await
+            .expect("first production round must finish within its test safety watchdog");
         wait_until_projected(&storage, 1, 4).await;
         let row = mega_view_filter::Entity::find_by_id(1)
             .one(view_storage.get_connection())
@@ -1171,6 +1190,226 @@ mod tests {
         assert_eq!(tail_commit, history.last().unwrap().commit.id.to_string());
         token.cancel();
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compensation_liveness_causal_regression() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db_config, _schema) = test_db_config(temp.path()).await;
+        let worker_db = Arc::new(database_connection(&db_config).await.unwrap());
+        let lock_db = Arc::new(database_connection(&db_config).await.unwrap());
+        let mut config = views_config(temp.path().join("single-round-watchdog"));
+        config.database = db_config;
+        config.views.worker_interval_secs = FIRST_ROUND_RECHECK_SECS;
+        config.views.max_append_walk = 1;
+        let storage =
+            Storage::new_with_connection(Arc::new(config), worker_db, mock_object_storage())
+                .await
+                .unwrap();
+        let view_storage = storage.view_storage();
+        let mut history = seed_linear_root_history(view_storage.get_connection(), 1).await;
+        view_storage
+            .extend_root_chain(None, 1000, ViewLockMode::Try)
+            .await
+            .unwrap();
+        insert_filter(&storage, 1, 1, Some(1), false).await;
+        let mut parent = history.last().unwrap().clone();
+        for number in 1..=3 {
+            let next = seed_single_parent_root_commit(
+                view_storage.get_connection(),
+                HashKind::Sha1,
+                &parent,
+                &format!("first-round-watchdog {number}"),
+            )
+            .await;
+            assert!(cas_fixture_main(view_storage.get_connection(), &parent, &next).await);
+            history.push(next.clone());
+            parent = next;
+        }
+        let lock_txn = lock_db.begin().await.unwrap();
+        let identity = lock_txn
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT pg_backend_pid() AS holder_pid, \
+                 (SELECT oid::bigint FROM pg_database WHERE datname = current_database()) AS database_oid, \
+                 'mega_view_root_chain'::regclass::oid::bigint AS relation_oid, \
+                 current_setting('application_name') AS application_name"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let holder_pid: i32 = identity.try_get("", "holder_pid").unwrap();
+        let database_oid: i64 = identity.try_get("", "database_oid").unwrap();
+        let relation_oid: i64 = identity.try_get("", "relation_oid").unwrap();
+        let application_name: String = identity.try_get("", "application_name").unwrap();
+        lock_txn
+            .execute_unprepared("LOCK TABLE mega_view_root_chain IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let succeeded = Arc::new(AtomicBool::new(false));
+        let production = production_round();
+        let started_round = started.clone();
+        let completed_round = completed.clone();
+        let succeeded_round = succeeded.clone();
+        let round: ViewWorkerRound = Arc::new(move |storage| {
+            let production = production.clone();
+            let started = started_round.clone();
+            let completed = completed_round.clone();
+            let succeeded = succeeded_round.clone();
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let result = production(storage).await;
+                succeeded.store(result.is_ok(), Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+                result
+            })
+        });
+        let mut worker = match spawn_view_worker_with_round(storage.clone(), token.clone(), round) {
+            Ok(Some(worker)) => worker,
+            _ => {
+                let _ = lock_txn.rollback().await;
+                panic!("controlled worker must start");
+            }
+        };
+
+        // From this point until rollback/cancel/join, collect outcomes rather
+        // than asserting, so the old watchdog's RED cannot retain the lock.
+        let blocked = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                let row = lock_txn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT EXISTS (\
+                           SELECT 1 FROM pg_locks holder \
+                           JOIN pg_locks contender ON contender.database = holder.database \
+                             AND contender.relation = holder.relation \
+                           JOIN pg_stat_activity activity ON activity.pid = contender.pid \
+                           WHERE holder.pid = $1 AND holder.database::bigint = $2 \
+                             AND holder.relation::bigint = $3 AND holder.locktype = 'relation' \
+                             AND holder.mode = 'AccessExclusiveLock' AND holder.granted \
+                             AND contender.locktype = 'relation' AND NOT contender.granted \
+                             AND contender.pid <> $1 \
+                             AND $1 = ANY(pg_blocking_pids(contender.pid)) \
+                             AND activity.application_name = $4\
+                         ) AS waiting",
+                        [
+                            holder_pid.into(),
+                            database_oid.into(),
+                            relation_oid.into(),
+                            application_name.clone().into(),
+                        ],
+                    ))
+                    .await?;
+                if let Some(row) = row {
+                    let waiting: bool = row.try_get("", "waiting")?;
+                    if waiting
+                        && started.load(Ordering::SeqCst) == 1
+                        && completed.load(Ordering::SeqCst) == 0
+                    {
+                        break Ok::<(), sea_orm::DbErr>(());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let proved_blocked = matches!(&blocked, Ok(Ok(())));
+        let wait_started = std::time::Instant::now();
+        let release_delay = if proved_blocked {
+            Duration::from_secs(11)
+        } else {
+            Duration::ZERO
+        };
+        let mut release = tokio::spawn(async move {
+            tokio::time::sleep(release_delay).await;
+            let held_for = wait_started.elapsed();
+            (held_for, lock_txn.rollback().await)
+        });
+        let wait_result = if proved_blocked {
+            Some(wait_for_first_compensation_round(&completed, FIRST_ROUND_WATCHDOG).await)
+        } else {
+            None
+        };
+        let observed_wait = wait_started.elapsed();
+        let (held_for, rollback_ok) =
+            match tokio::time::timeout(Duration::from_secs(180), &mut release).await {
+                Ok(Ok((held_for, result))) => (held_for, result.is_ok()),
+                Ok(Err(_)) => (Duration::ZERO, false),
+                Err(_) => {
+                    release.abort();
+                    let _ = release.await;
+                    (Duration::ZERO, false)
+                }
+            };
+        // Even the old-10s baseline may now finish its real first production
+        // round after rollback; wait separately for safe teardown, not PASS.
+        let finished = if rollback_ok {
+            wait_for_first_compensation_round(&completed, Duration::from_secs(180))
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        token.cancel();
+        let joined = match tokio::time::timeout(Duration::from_secs(10), &mut worker).await {
+            Ok(result) => result.is_ok(),
+            Err(_) => {
+                worker.abort();
+                let _ = worker.await;
+                false
+            }
+        };
+
+        assert!(
+            joined,
+            "controlled worker must join before oracle assertions"
+        );
+        assert!(rollback_ok, "controlled relation lock must be released");
+        assert!(
+            proved_blocked,
+            "setup must prove the production worker's relation-lock wait"
+        );
+        assert!(held_for >= Duration::from_secs(11));
+        assert!(
+            finished,
+            "first production round must finish after lock release"
+        );
+        assert!(
+            succeeded.load(Ordering::SeqCst),
+            "real production round must succeed"
+        );
+        let row = mega_view_filter::Entity::find_by_id(1)
+            .one(view_storage.get_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.projected_seq, 4);
+        assert_eq!(row.ready_seq, Some(1));
+        assert!(row.warming_since.is_none());
+        let tail = view_storage
+            .get_connection()
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT commit_id FROM mega_view_root_chain ORDER BY seq DESC LIMIT 1".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let tail_commit: String = tail.try_get("", "commit_id").unwrap();
+        assert_eq!(tail_commit, history.last().unwrap().commit.id.to_string());
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        // Require the actual waiter result; elapsed time is diagnostic only.
+        // An old-policy late-poll GREEN is not a qualifying RED.
+        assert!(
+            wait_result.as_ref().is_some_and(|result| result.is_ok()),
+            "first-round watchdog rejected a legal single production round: result={wait_result:?}, observed={observed_wait:?}"
+        );
     }
 
     #[tokio::test]

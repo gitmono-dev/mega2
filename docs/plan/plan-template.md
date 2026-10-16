@@ -2,7 +2,7 @@
 
 本文是 `docs/plan/` 下新建计划的标准模板。新计划应复制本文件结构，替换 `<...>` 占位符，并删除不适用的说明性文字；强制章节不得删除，不适用时写 `N/A` 和原因。英文贡献者使用 [`plan-template.en.md`](plan-template.en.md)；两份冲突时以本文为准。
 
-**模板版本:** `v2.4`（2026-10-09 起生效；保留 v2.3 的现场 workflow D 组判定；新增 G-12：用户明确指定时，整份计划可在唯一末尾发布点递增一次 patch，此前不 bump、不推送、不发 tag 或 Release。）
+**模板版本:** `v2.5`（2026-10-15 起生效；保留 v2.4 的 G-12 计划级单次发布规则；新增 G-13：仅将同一未发布修复 frontier 中 2–3 个已实际阻断严格质量门的独立代码缺陷预登记为修复聚合，逐卡验收、review、本地提交，由唯一发布点在最终树执行完整 C/D。）
 
 ### 模板版本与迁移政策
 
@@ -17,7 +17,7 @@
 - 长期能力只进入 `plan-long.md`（当前使用 `PT-*` 与 `SB-*` 编号）。日期计划可以链接长期能力编号，但不得把长期路线图复制成重复任务表。
 - 每个计划必须以当前 checkout 的源码、测试、配置和文档为事实基线。历史计划、截图、会议记录只能作为线索；Mega 是移植目标项目，其 pinned revision 的当前源码是移植基线，但对 Mega 的历史描述同样不能作为已实现证据。
 - 每个任务卡必须能交给 Agent 独立执行：范围明确、依赖明确、文件落点明确、验收标准明确、验证命令明确。
-- 每个任务卡必须满足「任务卡粒度规则」全部 `G-*` 条款：单一可独立恢复的行为轴、条目与规模在上限内、默认一张卡一个发布切片；具名用户明确要求整份计划只在末尾发布时，按 G-12 登记计划级单次发布组。粒度不合格的卡不得进入开工态，必须先拆分或合并。
+- 每个任务卡必须满足「任务卡粒度规则」全部 `G-*` 条款：单一可独立恢复的行为轴、条目与规模在上限内、默认一张卡一个发布切片；具名用户明确要求整份计划只在末尾发布时，按 G-12 登记计划级单次发布组；符合 G-13 的独立质量门缺陷可预登记受限修复聚合。粒度不合格的卡不得进入开工态，必须先拆分或合并。
 - 涉及公开命令、配置项、DB schema、HTTP API、错误类型、存储格式、Git 协议、迁移、权限或安全边界的计划，必须包含测试、文档、回滚和兼容处理。
 - 若计划引用 Mega 目标项目或外部项目（如 Libra、orbit 上游）作为参照，必须 pin 具体 revision、文件路径和核对日期；不得把浮动 `main` 当作规范。Mega 是移植目标而非竞品，其当前 pinned 源码即移植基线。
 - 新增或修改 entity / storage / migration 时，必须同步 `src/callisto/`、`src/jupiter/storage/`、`src/jupiter/migration/`（含 `src/jupiter/migration/mod.rs` 的 `migrations()` 注册列表），并补对应集成测试。
@@ -36,7 +36,7 @@
 | `ADR-*` | 已决议设计决策 | 「已决议设计决策」 |
 | `GAP-*` | 事实基线缺口 | 「当前缺口」 |
 | `DEP-*` | 依赖登记项（含跨计划与外部前置） | 「依赖登记表」 |
-| `REL-*` | 发布分组（含家族卡窗口） | 「发布分组与并发窗口」 |
+| `REL-*` | 发布分组（含家族、计划级单次发布与修复聚合窗口） | 「发布分组与并发窗口」 |
 | `EX-*` | 白名单内的规则 waiver（需具名审批） | 「字段全局默认与例外」 |
 | `FIX-*` | 执行期发现的越界修复卡（ER-10） | 对应 Phase 末尾 |
 | `DEFER-*` | 延后项（本仓惯例为 `DEFER-<计划前缀>-NN`） | 「非目标与延后项」 |
@@ -48,10 +48,11 @@
 
 - **行为轴**：一个可独立恢复、对外语义自洽的变化方向（例如「LFS 批处理鉴权」是一个轴，「LFS 对象传输内容寻址」是另一个轴）。
 - **落点**：一个可枚举的代码或文档归属域，粒度为**一个具体目录**（如 `src/jupiter/storage/`、`src/api/router/`）或**一组同主题文档**（如 `docs/refactoring/config.md`）。仓库根、`src/`、`tests/`、`docs/` 这类顶层目录**不算**一个落点。
-- **写集**：会被修改的文件/目录集合，分三类（G-10）——**实现写集 I**（每卡字段，决定能否并发）、**发布写集 R**（每卡字段，实际版本发布时为版本面 + `Cargo.lock`，终态仅证据收口卡可按 ER-08 写 `N/A`；当前版本面只有一处，即 `Cargo.toml` 的 `version`；不用于实现阶段的并发分组，但进入发布窗口后按 I–R / R–R 规则串行化）、**协调写集 C**（计划级，发布顺序与窗口记录，不进任务卡字段、不参与并发判定；「禁止多 Agent 并发发布」是 ER-12 的仓库级规则，不是 C 的状态）。
+- **写集**：会被修改的文件/目录集合，分三类（G-10）——**实现写集 I**（每卡字段，决定能否并发）、**发布写集 R**（每卡字段，实际版本发布时为版本面 + `Cargo.lock`，子卡、no-release 与终态仅证据收口卡按 ER-08 写 `N/A`；当前版本面只有一处，即 `Cargo.toml` 的 `version`；不用于实现阶段的并发分组，但进入发布窗口后按 I–R / R–R 规则串行化）、**协调写集 C**（计划级，发布顺序与窗口记录，不进任务卡字段、不参与并发判定；「禁止多 Agent 并发发布」是 ER-12 的仓库级规则，不是 C 的状态）。
 - **发布切片**：通常是一次独立的 review + 验收 + 版本 + 提交 + 推送；ER-08 终态仅证据收口 `release` 卡保留 review、适用验收、提交与推送，不新增版本。
 - **家族卡**：因不能独立上线而共用唯一发布点的一组子卡（G-08）。
 - **计划级单次发布组**：具名用户明确要求后，以 `REL-*` 登记全部受影响卡、唯一末尾 `release` 发布点与不推送窗口；成员逐卡本地验收、review 和提交，统一继承最终树的 C/D 覆盖（G-12）。
+- **修复聚合**：同一未发布修复 frontier 中 2–3 个已实际阻断严格仓库质量门的独立缺陷，各自保持 implementation 卡，以 `REL-*` 预登记唯一 patch 发布点；不属于 G-08 不可分割家族，也不代替 G-12 用户指令（G-13）。
 - **恢复模式（字段名 `Rollback mode`）**：`revert` / `forward-only` / `compensating` / `immutable-release` 四种之一（G-01）。不可逆变更用后三种表达，不要求「一次 revert 撤销」。
 
 ## 标题
@@ -198,15 +199,15 @@
    - 两者独立取值：`blocked` 卡的 `Acceptance` 可以已是 `locally-accepted` 甚至 `complete`（例如变更已被三门覆盖，但仍卡在外部前置）。`Lifecycle=done` 必须以 `Acceptance=complete` 为前提；`blocked` 必须先回到 `in-progress` 并完成剩余动作才能进入 `done`，**不允许**从 `blocked` 直接标 `done`。计划完成门另要求所有非延后任务都到 `done`（见「完成判据」）。`Granularity` 里的 `complete=yes` 是 G-02 的结构完整性判据，与本字段无关，不可混用。
 
    **C 组覆盖与执行归属（每张非延后卡都必须取得 C 覆盖，但不都自己执行）:**
-   - **独立发布卡（`Release boundary = independent`）与发布点卡（`release` / `family release point` / `plan release point`）**：自行执行完整 C 组门。
-   - **`family child` 与 `plan release child`**：逐卡取得 A/B、ER-05 `PASS` 和精确本地提交；不 bump、不构建发布产物、不推送 branch/tag、不创建 GitHub Release。**继承**具名唯一发布点的 C 覆盖——前提是发布点的三门运行其被测最终树包含本子卡全部最终变更；同时继承该发布点适用的 D 组。G-12 的计划级子卡在唯一末尾发布点的 C/D 取得前最多为 `locally-accepted`，不得记 `done/complete`。
+   - **独立发布卡（`Release boundary = independent`）与发布点卡（`release` / `family release point` / `plan release point` / `repair aggregate release point`）**：自行执行完整 C 组门。
+   - **`family child`、`plan release child` 与 `repair aggregate child`**：逐卡取得 A/B、fmt/clippy、ER-05 `PASS` 和精确本地提交；不 bump、不构建发布产物、不推送 branch/tag、不创建 GitHub Release。**继承**具名唯一发布点的 C 覆盖——前提是发布点的三门运行其被测最终树包含本子卡全部最终变更；同时继承该发布点适用的 D 组。G-12 与 G-13 子卡在唯一发布点的 C/D 取得前不得记 `done/complete`；未取得 C 时最多为 `locally-accepted`。
    - **`no-release` 卡（`docs` / `audit` / `spike` / `handoff`）**：**继承**任务卡显式声明的承载发布点（或计划收口点）的 C 覆盖与其 D 组；该承载点必须在卡内写明 ID，不得留空。
    - 继承 D 组的卡同样按上述路径处理；具名延期必须明确覆盖本卡及承载发布点。
    - **不存在「用零命中守卫替代三门」的通道**——零命中守卫只用于证明这类卡未改代码，不改变其在取得 C 覆盖前仍是 `locally-accepted` 的事实。
 
-   门分四组，全部适用者累加：**A 表面 focused 门**（按实际改动的表面，每个表面唯一命中一行，命中几行加几行）+ **B 类型门**（按 `Task type` 取一行）+ **C 发布收口门**（由会推送的卡执行，其覆盖可被 `family child` / `plan release child` / `no-release` 卡继承）+ **D 远端后置门**（只在存在不可本地复现的 CI 语义时适用）。A/B/C 是本地可完成的门；D 只能在推送之后取得证据，因此**不阻塞** `locally-accepted` 与 ER-05 的 review 顺序。
+   门分四组，全部适用者累加：**A 表面 focused 门**（按实际改动的表面，每个表面唯一命中一行，命中几行加几行）+ **B 类型门**（按 `Task type` 取一行）+ **C 发布收口门**（由会推送的卡执行，其覆盖可被 `family child` / `plan release child` / `repair aggregate child` / `no-release` 卡继承）+ **D 远端后置门**（只在存在不可本地复现的 CI 语义时适用）。A/B/C 是本地可完成的门；D 只能在推送之后取得证据，因此**不阻塞** `locally-accepted` 与 ER-05 的 review 顺序。
 
-   **A 表面 focused 门**（覆盖全部合法生产表面；`family child` / `plan release child` 复用同一映射）：
+   **A 表面 focused 门**（覆盖全部合法生产表面；`family child` / `plan release child` / `repair aggregate child` 复用同一映射）：
 
    | 实际改动的表面 | focused 门 |
    |---|---|
@@ -247,16 +248,18 @@
 
    | Task type | 类型门 |
    |---|---|
-   | `implementation` / `migration` / `removal` | 无额外类型门（由 A 组 + C 组构成完整验收；`family child` / `plan release child` 自跑 A 组 + fmt/clippy，C 覆盖继承自具名唯一发布点） |
+   | `implementation` / `migration` / `removal` | 无额外类型门（由 A 组 + C 组构成完整验收；`family child` / `plan release child` / `repair aggregate child` 自跑 A 组 + fmt/clippy，C 覆盖继承自具名唯一发布点） |
    | `docs` / `audit` / `handoff` | 结构与链接门：本卡产物文件存在且章节完整、内部链接与 `file:line` 锚点可解析、新引入的 `docs/*.md` 路径全部真实存在（本仓已有多处悬空文档引用，不得新增）、`libra status --short --branch` 无越界改动。这三类**必须保持 no-code / no-config**：一旦发现需要改动代码或配置，不得「就地升级门」，必须先按 ER-03 把卡重分类为 `implementation` / `migration` / `removal`，同步 `Release boundary`、`Version increment`、`Release write set`，重跑粒度门后再执行 |
    | `spike` | 产物门：结论文档或 ADR 已落盘、go/no-go 已判定、承接卡已登记；**allowlist diff 门**——`libra status --short --branch` 的全部变更必须落在本卡 `Deliverables` 声明的产物内，且生产表面零改动（至少覆盖 `src/**`、`tests/**`、`config/**`、`scripts/**`、`Cargo.toml`、`Cargo.lock`、`rustfmt.toml`、`docker/docker-compose.test.yml`、`.github/workflows/**`），用「Verification 判定口径」的退出码模板逐条守卫 |
    | `release` | 实际版本发布点：聚合守卫（本组引入的全部新守卫用例）+ release note / 兼容证据；终态仅证据收口卡：核对既有版本的 D 证据、计划状态、文档链接与兼容记录，不生成新版本的 release note |
 
    **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面 parity 预检（ER-08）→ ② 仅在 `Version increment` 非 `N/A` 时按其值 bump 版本面（当前为**一处**：`Cargo.toml` 的 `version`，处数以 ER-08 的开工日核对为准）+ 让工具链刷新 `Cargo.lock` 的对应条目（不手改）→ ③ 在**最终待提交树**上（实际 bump 时须在 bump 后）跑 `AGENTS.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ④ `cargo build` 与 `cargo build --tests` 均 0 错误 0 警告；需要可执行产物时另跑 `cargo build --release -p mega2` → ⑤ `libra add <相关路径>` + `libra commit -s -m` → ⑥ 推送并确认 branch ref：`libra push origin main` 成功且远端 ref 已更新 → ⑦ 对每次实际版本 bump，在该提交上创建同名标注 tag：`libra tag -m "v<version>: <summary>" v<version>`，并以 `libra push origin refs/tags/v<version>` 推送 → ⑧ 分析该版本最终 diff，人工撰写标准 release note 后执行 `gh release create v<version> -R gitmono-dev/mega2 --title "v<version>" --notes-file <release-notes-file>`。release note 必须包含 Highlights、用户可见变更、兼容性 / 配置 / 迁移说明（无则写 `N/A`）、验证结果和已知限制；禁止使用 `--generate-notes` 或其它自动生成内容。`Version increment=N/A` 的卡不创建 tag 或 release。
 
+   G-13 唯一修复聚合发布点须在全部子卡的明确代码根因/修复、独立 A/B、fmt/clippy、ER-05 `PASS` 和精确本地提交齐备后，先取得本发布点的 ER-05 `PASS`，再独占按上述①–⑧顺序执行一次实际 patch 发布；③④的最终被测树必须包含全部成员最终变更，不能用子卡 focused 门替代。
+
    实际 bump 的卡，其三门必须覆盖 bump 后的最终状态——bump 与 `Cargo.lock` 刷新本身可能引入格式、lint 或编译回归，`cargo build` 不能替代 clippy 与全量测试。
 
-   符合 ER-08 的**终态仅证据收口 `release` 卡**写 `Version increment=N/A`、`Release write set=N/A`：C 的版本修改②、tag⑦、人工 GitHub Release⑧不适用；版本面预检①、最终树上的三门③、构建④、精确提交⑤与 branch 推送⑥仍须执行，且 ER-05 review `PASS` 必须先于 C。D 仍按实际事件/ref/路径/job 判定；不因本卡无 tag 而豁免此前独立代码卡、家族发布点或 G-12 计划级唯一发布点的版本化发布及其 D 门。G-12 中此类收口只能发生在唯一 patch 发布点的 D 成功之后，作为第二次**仅证据文档的 branch 推送**，不得再 bump/tag/创建 Release，也不能成为提前推送代码的通道。
+   符合 ER-08 的**终态仅证据收口 `release` 卡**写 `Version increment=N/A`、`Release write set=N/A`：C 的版本修改②、tag⑦、人工 GitHub Release⑧不适用；版本面预检①、最终树上的三门③、构建④、精确提交⑤与 branch 推送⑥仍须执行，且 ER-05 review `PASS` 必须先于 C。D 仍按实际事件/ref/路径/job 判定；不因本卡无 tag 而豁免此前独立代码卡、家族发布点、G-12 计划级唯一发布点或 G-13 修复聚合发布点的版本化发布及其 D 门。G-12 中此类收口只能发生在唯一 patch 发布点的 D 成功之后，作为第二次**仅证据文档的 branch 推送**，不得再 bump/tag/创建 Release，也不能成为提前推送代码的通道。
 
    **C / D 边界（唯一口径）:** C 组包含已验证的 branch 推送、适用时的 tag 推送与人工 GitHub Release，直至上述本地发布动作全部完成；对应 branch/tag/PR/手动触发的远端 workflow 结果归 **D 组**，即使远端运行与 C 后段并行。任务卡必须为每个 D 组项登记：workflow 文件、job 名、**实际触发事件与 ref**、该 ref 指向的提交、`paths:` / `paths-ignore:` 与 job `if` 的适用性（两者均无时记「无过滤」）、以及远端成功判据。
 
@@ -272,7 +275,7 @@
    上表只说明核对日的现状；workflow 改动后，以执行时的事件/ref/路径/job 条件重算。D 证据必须对应**本卡或承载发布点的实际运行**；PR 运行不能替代 tag 的 Docker registry 门，branch 推送也不能替代未触发的 PR 或 tag 运行。
 
    - D 组**不属于**本地验收，不阻塞 `locally-accepted`，也不改变 ER-05「先本地验收再 review」与 C 组「review 通过后才提交推送」的顺序。
-   - 适用的 D 组门全绿或按下文白名单具名延期后，该卡的 `Acceptance` 才能到 `complete`；此前停在中间态 `remote-pending`。延期只调整计划验收口径，不把未运行或未成功的 workflow 记为成功。
+   - 适用的 D 组门全绿或按下文白名单具名延期后，该卡的 `Acceptance` 才能到 `complete`；此前停在中间态 `remote-pending`。延期只调整计划验收口径，不把未运行或未成功的 workflow 记为成功；G-12/G-13 唯一版本 tag 的 Docker D 不得延期。
    - D 组失败一律**前滚修复**（新提交 / 新版本），不得回退已推送提交；修复卡按 ER-10 的越界规则处理。
 
    「完成判据」的计划级门是最后一次总检查，不替代每张会推送的卡各自跑过的发布收口门。
@@ -288,7 +291,7 @@
 8. **ER-08 版本与发布:** 版本权威源是根 `Cargo.toml` 的 `version`。**版本面自 plan-20260824 单体内联后只有一处**（2026-08-27 核对）：唯一 package 是 `mega2`（`Cargo.toml` `[package] name`，lib target 名 `mega2_core`，另有两个 `[[bin]]` target `mega2` / `migrate_local_to_s3`）；`bin/Cargo.toml` **已不存在**，`crates/orbit*` workspace 成员与 sibling `../orbit` 也已随内联移除。因此发布前的「版本面 parity 预检」在当前拓扑下退化为空操作，但**开工时仍须重新核对版本面文件数量**（`rg -n '^version' Cargo.toml` 与 `rg -l '^\[package\]' --glob '**/Cargo.toml'`）——若未来重新拆包，parity 预检与「不一致时先建立修复卡对齐、禁止直接 bump」的规则立即恢复适用。仅在实际版本递增时按任务卡的 `Version increment` 修改该处 version，让工具链刷新 `Cargo.lock` 的对应条目，其余步骤与顺序按 ER-04 的「发布收口门」执行（bump 后必须重跑三门）。
    - **包名口径**：`cargo` 命令一律用 `-p mega2`；模板与存量计划里出现的 `-p mega2-core` 是单体内联前的旧包名，已失效（同一裁定见 `plan-20260827.md` 的「包名口径」与其 R5 评审记录）。
    - `Version increment` 取值：`patch`（默认）| `minor` | `major` | `N/A`。
-   - `N/A` 只适用于 `family child`、G-12 的 `plan release child`、`docs` / `audit` / `spike` / `handoff`，以及**计划终态、仅在已有版本的 D 结果后提交证据与文档的 `release` 收口卡**。后一类卡的 `Implementation write set` 仅含证据/计划状态/索引文档，不引入产品行为，`Release write set=N/A`，也不能充当版本发布点；所有独立发布的 `implementation` / `migration` / `removal` 卡及家族发布点仍须实际 bump、tag、创建 GitHub Release；`family child` 与 `plan release child` 分别由其具名版本化发布点覆盖，不得用仅证据收口卡代替。
+   - `N/A` 只适用于 `family child`、G-12 的 `plan release child`、G-13 的 `repair aggregate child`、`docs` / `audit` / `spike` / `handoff`，以及**计划终态、仅在已有版本的 D 结果后提交证据与文档的 `release` 收口卡**。后一类卡的 `Implementation write set` 仅含证据/计划状态/索引文档，不引入产品行为，`Release write set=N/A`，也不能充当版本发布点；所有独立发布的 `implementation` / `migration` / `removal` 卡及家族、计划级与修复聚合版本发布点仍须实际 bump、tag、创建 GitHub Release；`family child`、`plan release child` 与 `repair aggregate child` 分别由其具名版本化发布点覆盖，不得用仅证据收口卡代替。G-13 的唯一修复聚合发布点必须实际递增 `patch`，不能写 `N/A`。
    - 删除公开 surface、破坏兼容的 schema/协议变更必须用 `minor` 或 `major`，且递增级别由 ADR + 兼容窗口证据决定，不得用 patch 夹带；家族卡（G-08）的递增级别写在唯一发布点卡上，子卡为 `N/A`。G-12 只允许在整份计划的兼容审计证明 patch 足够时使用；若任何卡要求 `minor`/`major`，该计划保持 blocked，先修兼容设计或取得用户新的版本决策，不能以单次 patch 指令豁免兼容门。
    - `docs` / `audit` / `spike` / `handoff` 卡为 `N/A`，但必须说明产物随哪次提交进入仓库。
    - 每次实际版本 bump 必须创建并推送 `v<version>` 标注 tag，并以人工编写的标准 release note 创建同名 GitHub Release。release note 必须基于最终 diff，包含 Highlights、用户可见变更、兼容性 / 配置 / 迁移说明（无则写 `N/A`）、验证结果和已知限制；禁止 `--generate-notes`。`Version increment=N/A` 的卡不创建 tag 或 release。
@@ -324,11 +327,11 @@
 
 ### 发布分组与并发窗口
 
-默认每张卡独立发布（G-07）。G-08 的不可分割家族或 G-12 的具名用户指令计划级单次发布，都须在本表预登记并由成员任务卡的 `Release boundary` 引用；G-12 登记须逐字记录用户指令、整份计划成员范围、唯一末尾 patch 发布点、不推送窗口、失败恢复与最终树 C/D 覆盖，不得把临时开工笔记当批准。
+默认每张卡独立发布（G-07）。G-08 的不可分割家族、G-12 的具名用户指令计划级单次发布或 G-13 的受限修复聚合，都须在本表预登记并由成员任务卡的 `Release boundary` 引用；G-12 登记须逐字记录用户指令、整份计划成员范围、唯一末尾 patch 发布点、不推送窗口、失败恢复与最终树 C/D 覆盖，G-13 登记须满足其 2–3 个独立代码缺陷、真实阻断日志/来源树、唯一发布点与失效退出要求。不得把临时开工笔记当批准。
 
 | ID | 成员 | 唯一发布点 | 窗口规则 | 失败回滚顺序 | 理由 |
 |---|---|---|---|---|---|
-| REL-01 | `<TASK-ID 列表或 G-12 的整份计划明确范围>` | `<唯一 release TASK-ID>` | `<子卡只本地提交，不 bump、不推送 branch/tag、不创建 Release；窗口期禁止插入其它发布切片>` | `<push 前按依赖逆序撤回；push 后依 ER-10 前滚>` | `<G-08 不可分割理由，或 G-12 具名用户原话与日期>` |
+| REL-01 | `<G-08 成员 / G-12 整份计划范围 / G-13 的 2–3 个 implementation 子卡及另列的 no-release 承载卡>` | `<唯一 release TASK-ID>` | `<子卡只本地提交，不 bump、不推送 branch/tag、不创建 Release；窗口期禁止插入其它发布切片>` | `<push 前按依赖逆序撤回；push 后依 ER-10 前滚>` | `<G-08 不可分割理由 / G-12 用户原话与日期 / G-13 各缺陷真实阻断与来源树、准入及失效退出>` |
 
 **并发声明:** `<实现阶段可并发的卡组（实现写集互不相交）/ 全串行>`（G-10）
 
@@ -400,12 +403,12 @@
   - 把 `src/`、`tests/`、`docs/` 或仓库根算作「一个落点」是规避行为，按「粒度反模式速查」的「落点注水」处理。
 - **G-05 Agent 可独立执行:** 一张卡必须能在不阅读其它卡正文的前提下被执行：`Current evidence` 给出可核对的 `file:line` 锚点，`Acceptance criteria` 自洽可判定，`Verification` 是可直接复制执行的确切命令，`Dependencies` 只引用「依赖登记表」中的 `DEP-*` / 任务 ID。禁止「见上文」「同上一卡」式跨卡隐式约定；确属跨卡共享的约定要提升为全局工程约束或 ADR。
 - **G-06 依赖闭合且无环:** 依赖必须有向无环。本计划内依赖直接引用任务 ID；跨计划与外部前置必须先在「依赖登记表」登记为 `DEP-*` 再引用，不得在卡内自由描述。互相等待、循环依赖、以及「等某个 Phase 整体完成」都是拆分错误——把依赖收敛到具体前置卡。「实施顺序」的依赖边与各卡 `Dependencies` 必须一致；不一致时以「实施顺序」为准并当场修正卡片。
-- **G-07 发布切片对齐（按任务类型）:** 默认「一张卡 = 一个发布切片」（独立 review + ER-04 门 + 版本 + 提交 + 推送）。适用范围按 `Task type`（G-11）区分：`implementation` / `migration` / `removal` 默认走完整发布切片；`docs` / `audit` / `spike` / `handoff` 卡不 bump 版本，`Release boundary` 写 `no-release` 并说明其产物随哪次提交进入仓库；承担版本发布的 `release` 卡本身就是发布点。ER-08 允许的终态仅证据收口 `release` 卡只提交已有发布的 D 证据与文档，不承担版本发布点职责。多卡共用发布点只可按 G-08（不可分割家族）或 G-12（具名用户指令的整份计划单次发布）事先登记 `REL-*`：成员、唯一发布点、窗口期禁止插入的内容、失败时的逆序回滚顺序。必须先在计划登记并通过 review 才可开工；若需修改规范性条款则先修订模板并 bump 模板版本，**不得**在开工时凭笔记临时合并。
+- **G-07 发布切片对齐（按任务类型）:** 默认「一张卡 = 一个发布切片」（独立 review + ER-04 门 + 版本 + 提交 + 推送）。适用范围按 `Task type`（G-11）区分：`implementation` / `migration` / `removal` 默认走完整发布切片；`docs` / `audit` / `spike` / `handoff` 卡不 bump 版本，`Release boundary` 写 `no-release` 并说明其产物随哪次提交进入仓库；承担版本发布的 `release` 卡本身就是发布点。ER-08 允许的终态仅证据收口 `release` 卡只提交已有发布的 D 证据与文档，不承担版本发布点职责。多卡共用发布点只可按 G-08（不可分割家族）、G-12（具名用户指令的整份计划单次发布）或 G-13（受限修复聚合）事先登记 `REL-*`：成员、唯一发布点、窗口期禁止插入的内容、失败时的逆序回滚顺序。必须先在计划登记并通过 review 才可开工；若需修改规范性条款则先修订模板并 bump 模板版本，**不得**在开工时凭笔记临时合并。
 - **G-08 家族卡（不可分割变更路径）:** 当一次公开 surface 删除、或 schema 与 reader 必须同时上线这类变更确实无法切成可独立发布的切片时，用「家族卡」表达：拆成多张各自 review、各自通过全部适用 ER-04 门、各自本地提交的子卡，共用一个唯一发布点卡；**该发布点卡的 `Task type` 必须是 `release`**（不引入新行为，只做版本、构建、聚合守卫与发布证据），以保证它在 ER-04 的 B 组中唯一命中 `release` 行。家族内子卡仍受除 G-07 外的全部 `G-*` 约束；子卡 `Release boundary` 写 `family child`，发布点卡写 `family release point`，家族边界与「不推送窗口」写进 `REL-*` 登记。
 - **G-09 拆分协议:** 拆分已被引用的卡时，原编号保留给主轴，新子卡在所属 Phase 末尾追加新编号，不重排既有编号。原卡必须写明「拆出 `<ID>`、`<ID>`」，新卡写明「自 `<ID>` 拆出」，并同步实施顺序、依赖登记表、「发布分组与并发窗口」、追溯表、测试矩阵、里程碑、风险表，以及「修订历史」中的一行（日期、原因、原卡、新卡、受影响引用）。
 - **G-10 写集与并发:** 写集分三类，每张卡必须声明前两类（第三类由 ER-12 统一定义，卡内不重复）：
   - **`Implementation write set`（I）**：承载本卡行为的代码、测试、文档文件。
-  - **`Release write set`（R）**：实际版本发布时为 ER-08 的版本面（当前**一处**：`Cargo.toml` 的 `version`，2026-08-27 核对）+ `Cargo.lock`。`family child`、G-12 的 `plan release child` 与 `no-release` 卡写 `N/A`（它们不 bump、不推送）；符合 ER-08 的终态仅证据收口 `release` 卡也写 `N/A`（它仍自行执行 C 的适用步骤并推送证据/文档，不修改版本面）。
+  - **`Release write set`（R）**：实际版本发布时为 ER-08 的版本面（当前**一处**：`Cargo.toml` 的 `version`，2026-08-27 核对）+ `Cargo.lock`。`family child`、G-12 的 `plan release child`、G-13 的 `repair aggregate child` 与 `no-release` 卡写 `N/A`（它们不 bump、不推送）；符合 ER-08 的终态仅证据收口 `release` 卡也写 `N/A`（它仍自行执行 C 的适用步骤并推送证据/文档，不修改版本面）。
   - **协调写集（C）**：计划级的发布顺序与窗口记录（「发布分组与并发窗口」的发布者、发布顺序、`REL-*` 登记）。由 ER-12 的单一发布者串行维护，**不计入**任何卡的 I 或 R，也不参与并发判定。
 
   冲突规则：
@@ -419,10 +422,16 @@
   - `removal`：公开 surface 删除，通常进入家族卡（G-08），必须先有 deprecation 窗口证据。
   - `spike`：探索/验证，**不得**改动生产代码。必须写出待回答的问题、时间箱、产物（结论 + ADR 或缺口登记）、go/no-go 退出标准与后续承接卡；不适用 G-04 的文件计数，`Estimated scope` 按时间箱判定：`S` ≤ 0.5 人日、`M` ≤ 2 人日，超出即拆成多个问题或直接转 ADR / `implementation` 卡。
   - `audit` / `docs`：只读核对或文档收敛，按 G-03 的文档-only 口径执行。规模上限按**产物文件数或人日**判定（不适用 G-04 的生产文件计数）：`S` ≤ 5 个产物文件或 ≤ 0.5 人日；`M` ≤ 15 个产物文件或 ≤ 2 人日；超出即拆卡。随代码卡强制同步的文档仍按 G-04 的随附同步集处理，不计入这里。
-  - `release`：通常为发布点卡，不引入新行为，只做版本、构建、聚合守卫与发布证据；仅符合 ER-08 的计划终态证据收口卡可不新增版本，只核对既有发布的 D 证据并提交文档。
+  - `release`：通常为发布点卡（含 G-08 家族、G-12 计划级与 G-13 修复聚合发布点），不引入新行为，只做版本、构建、聚合守卫与发布证据；仅符合 ER-08 的计划终态证据收口卡可不新增版本，只核对既有发布的 D 证据并提交文档。
   - `handoff`：跨计划移交，默认 `no-release`。**移入**（本计划承接他人）在「依赖登记表」登记 `direction: incoming`；**移出**（本计划把范围交给别的计划或 `plan-long.md` 的 PT 项）登记 `direction: outgoing`，并写明接收方、移交日期、本计划不再重做的部分，以及接收方未接手时的回落处理。
 
 - **G-12 具名用户指令的计划级单次 patch 发布:** 仅当用户明确指定**本计划**在全部卡之后只递增并发布一个 patch 版本，才可启用；默认 G-07 与 G-08 对其它计划不变。继续成员工作或任何发布动作前，先在「发布分组与并发窗口」登记一个 `REL-*`，写明用户原话与日期、全部代码成员和 no-release 承载卡、唯一末尾 `Task type=release` 发布点、完整不推送窗口、回滚/前滚顺序及最终树 C/D 证据归属，并通过计划 review；依赖 DAG 须将发布点置于全部预发布成员之后，新增或拆分卡须先更新本组与 G-09 的全局引用；唯一 Docker D 之后的终态仅证据收口卡在本组之外，按 ER-04/ER-08 只作无版本的证据提交与 branch 推送；若指令发生在部分本地工作之后，修订历史还须记录切换点，逐项重核已有编辑的 A/B、review、精确本地提交和未发布状态，不追认未执行的门。全部 `implementation` / `migration` / `removal` 成员的 `Release boundary=plan release child of REL-<n>`、`Version increment=N/A`、`Release write set=N/A`、`C/D coverage from=<唯一发布点 ID>`；预发布的 docs/audit/spike/handoff 仍为 `no-release`，具名继承末尾版本发布点，其受审产物也须精确本地提交并进入最终被测树；只在 Docker D 后才产生的纯证据 docs/audit 卡可留在组外，具名继承后置终态仅证据收口卡的 C/D，不得追认为预发布被测树或引入新产品行为。成员逐卡完成独立 A/B、ER-05 `PASS` 和精确**本地**提交；依赖后继可使用已 `locally-accepted` 且受审的本地产物，不能把未发布伪称为远端可用。直到唯一末尾点前，**不得**修改版本面、推送本计划代码分支、创建或推送版本 tag、创建 GitHub Release、触发 Docker 版本发布，也不得插入其它发布切片；真实私有验收仓库的临时测试推送依本卡清理契约处理，不等同版本发布。末尾发布点在**所有成员** A/B、review 与本地提交齐备、兼容审计确认 patch 足够后，独占执行一次 patch bump、ER-04 完整 C（bump 后最终树三门与构建、精确提交及 branch/tag 推送、人工 GitHub Release）和适用 D；其三门的被测树必须包含全部成员最终变更。**唯一末尾版本 tag 的 Docker D 必须实际成功，不适用 EX-* 的 D 延期；**此前成员最多 `locally-accepted` 或 `remote-pending`，**不得** `done/complete`。D 成功后逐卡核验继承覆盖并收口。若任一卡实际需要 minor/major、依赖必须提前远端发布，或最终树 C/D 失败，则阻断本组，先按 ER-03/ER-10 修计划或前滚，绝不凭本条跳过测试、review、兼容或远端门。
+
+- **G-13 未发布质量门缺陷的受限修复聚合:** 仅用于同一未发布修复 frontier 中 **2–3 个**已实际阻断严格仓库质量门的独立**代码缺陷**，每项仍为单一行为轴的 `implementation` 卡。逐项保存真实脱敏失败日志及可追溯的 source cohort/commit；后一个缺陷可在已包含前项修复的未发布树上暴露，不得伪称所有缺陷在同一字节树上都失败。本条不把独立缺陷改称 G-08 家族，不替代 G-12 的具名用户指令，也不允许新功能、schema 或公开 surface/兼容变更加入；这些仍走 G-07/G-08 或适用的 G-12。
+  - **准入与登记：** 允许以 `pending` 登记待诊断缺陷，但该状态不代表根因、修复或发布资格。继续成员实施前，在 `REL-*` 逐项登记 2–3 个代码成员、共同未发布基线、各失败来源树与未发布证据、唯一 `Task type=release` 发布点、单一发布者、完整不推送窗口、push 前按依赖逆序恢复/push 后前滚、最终树 C/D 归属及失效退出；DAG 令发布点后于所有预发布承载卡。真实且相互隔离的 Claude、Codex 计划 review 均须明确 `PASS` 本组的 G-13 适用性；已有本地改动须记录切换点并逐项重核，未执行的门不得追认。
+  - **子卡契约：** `Release boundary=repair aggregate child of REL-<n>`、`Version increment=N/A`、`Release write set=N/A`、`C/D coverage from=<唯一发布点 ID>`。每项根因与代码修复必须实际明确，各自通过 A/B、fmt/clippy、真实 ER-05 `PASS` 后作按 ER-07 完成签名校验与 sign-off 的精确本地提交；最终 C/D 取得前不得 `done/complete`。不削弱 G-01–G-06、G-09–G-11 或其它适用规则。no-release docs/audit 可具名继承该点，但须独立验收、review、本地提交并进入最终被测树，且不计入 2–3 个代码子卡数量。
+  - **唯一发布：** 唯一点写 `Release boundary=repair aggregate release point of REL-<n>`，`Task type=release`、`Version increment=patch`、R 为实际版本面 + `Cargo.lock`，自身不引入新产品行为。所有成员上项证据齐备且该点取得 ER-05 `PASS` 后，单一发布者严格执行 ER-04 C 的① parity → ②实际 patch bump + 工具链 lock 刷新 → ③最终树三门 → ④双 build → ⑤按 ER-07 签名校验/sign-off 的精确提交 → ⑥ main push → ⑦匹配标注 tag → ⑧人工 GitHub Release，随后取得实际适用 D；唯一 tag 的 Docker D 必须实际成功，不适用 D 延期。此前不得任何 branch/tag push、Release 或插入其它发布切片；不得用仅证据收口卡代替版本发布点。
+  - **失效退出：** 任一项仍原因未知、仅未复现，或只有环境负载而无代码缺陷时，不得记为已完成修复或进入聚合发布；按 ER-03 重评分组并重新计划 review，或回到 G-07 独立流程。成员范围/来源树失去准入、超过 3 个代码缺陷、兼容或依赖要求超出本条、最终树 C/D 失败，同样阻断本组并按 ER-03/ER-10 修计划；未推送时按登记逆序恢复，已推送只前滚，不回退。ER-09 push 失败策略、ER-10 独立故障归属及原有重试预算、签名、禁止 force/未知 flags、ignore/soft-skip 与证据卫生边界均保持；G-13 不是 waiver，不为旧发布窗口或未执行检查补发授权。
 
 #### 推荐拆分维度
 
@@ -450,7 +459,7 @@
 | 悬空依赖 | `Dependencies` 写「Phase N 完成」或自由描述外部前置 | 收敛到具体前置卡 ID / `DEP-*`（G-06） |
 | 假回滚 | 已推送或已迁移数据的卡仍写「一次 revert 撤销」 | 按实际选 `forward-only` / `compensating` / `immutable-release`（G-01） |
 | 并发冲撞 | 两张无依赖的卡实现写集相交 | 只有两条出路：补顺序边，或合并到唯一集成卡（G-10 不可豁免）。版本面争用不算并发冲突，由 ER-12 的串行发布窗口处理 |
-| 顺手合并 | 多张卡凭开工笔记合成一次发布 | 只能预登记 G-08 不可分割家族，或按具名用户指令预登记 G-12 计划级单次发布；否则拆回独立切片（G-07/G-08/G-12） |
+| 顺手合并 | 多张卡凭开工笔记合成一次发布 | 只能预登记 G-08 不可分割家族、G-12 用户指令计划级单次发布或符合准入的 G-13 修复聚合；否则拆回独立切片（G-07/G-08/G-12/G-13） |
 
 #### 字段全局默认与例外
 
@@ -471,14 +480,14 @@
 | `<ID>` | `<Rollback mode>` | `<forward-only：既有迁移 down 为空实现，只能前滚 + 校验>` |
 | `<ID>` | `<Docs and compatibility impact>` | `<仅开发文档，无用户可见命令或配置变化>` |
 
-**规则 waiver（`EX-*`，需具名审批）**：可豁免的规则是**白名单**，只有下表四项；`G-01`、`G-02`、`G-05`、`G-06`、`G-07`、`G-08`、`G-09`、`G-10`、`G-11`、`G-12` **永不可豁免**（它们是可 review、可恢复、可并发的前提；G-12 是具名用户指令下的规则分支，不是 waiver）。
+**规则 waiver（`EX-*`，需具名审批）**：可豁免的规则是**白名单**，只有下表四项；`G-01`、`G-02`、`G-05`、`G-06`、`G-07`、`G-08`、`G-09`、`G-10`、`G-11`、`G-12`、`G-13` **永不可豁免**（它们是可 review、可恢复、可并发的前提；G-12 与 G-13 是受限发布边界规则，不是 waiver）。
 
 | 可豁免项 | 允许的理由范围 |
 |---|---|
 | G-03 条目上限 | 清单型产物（文档 / 审计 / 索引）确实需要超过本类上限，且已写明产物文件清单 |
 | G-04 规模上限（`L-exception`） | 不可拆的机械变更：全仓重命名、批量删除、格式化 |
 | ER-07 签名要求 | 仓库策略层面的具名豁免（sign-off-only） |
-| ER-04 D 组完成证据 | 远端 CI 配额耗尽或外部运行能力不可用；须由用户或维护者具名批准，发布者不得自批；逐卡标明适用的 workflow/job/ref，登记 `DEFER-*` 债务与重启条件。只延期 D，不豁免 A/B/C、本地三门、ER-05 review（适用独立复核的卡另审）、提交、tag 或人工 GitHub Release；远端后续失败按 ER-10 前滚处理。**不适用于 G-12 唯一末尾 tag 的 Docker D**，该门须实际成功才可完成本组 |
+| ER-04 D 组完成证据 | 远端 CI 配额耗尽或外部运行能力不可用；须由用户或维护者具名批准，发布者不得自批；逐卡标明适用的 workflow/job/ref，登记 `DEFER-*` 债务与重启条件。只延期 D，不豁免 A/B/C、本地三门、ER-05 review（适用独立复核的卡另审）、提交、tag 或人工 GitHub Release；远端后续失败按 ER-10 前滚处理。**不适用于 G-12/G-13 唯一版本 tag 的 Docker D**，该门须实际成功才可完成本组 |
 
 | 例外 ID | 任务（或 `ALL/<作用域>`） | 豁免项 | 理由与补偿措施 | Approver | Review round | 证据 | 有效期 |
 |---|---|---|---|---|---|---|---|
@@ -491,7 +500,7 @@
 
 | 任务 | type | axis | recovery | complete | self-contained | AC | VER | landing / prod-files | scope | deps | writeset | release | split-from | exception |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `<ID>` | `<Task type>` | `<行为轴>` | `<恢复动作>` | `<yes>` | `<yes>` | `<n/上限[@EX-ID]>` | `<n/上限[@EX-ID]>` | `<n>/<n>` | `<S/M/L-exception:EX-n>` | `<TASK-ID/DEP-ID/none>` | `<no-overlap/序列化于 ID>` | `<independent/REL-n family child/REL-n plan child/REL-n point/no-release>` | `<ID/N/A>` | `<EX-ID/N/A>` |
+| `<ID>` | `<Task type>` | `<行为轴>` | `<恢复动作>` | `<yes>` | `<yes>` | `<n/上限[@EX-ID]>` | `<n/上限[@EX-ID]>` | `<n>/<n>` | `<S/M/L-exception:EX-n>` | `<TASK-ID/DEP-ID/none>` | `<no-overlap/序列化于 ID>` | `<independent/REL-n family child/REL-n family point/REL-n plan child/REL-n plan point/REL-n repair child/REL-n repair point/no-release>` | `<ID/N/A>` | `<EX-ID/N/A>` |
 
 #### Verification 判定口径
 
@@ -548,7 +557,7 @@
 
 **Implementation write set:** `<承载本卡行为的代码/测试/文档文件或目录。并发判定只看这一项：与并发在跑的卡不得相交，相交时只能补顺序边或合并到唯一集成卡>`（G-10）
 
-**Release write set:** `<Inherited（= Cargo.toml 的 version 一处 + Cargo.lock）/ N/A（family child / plan release child / no-release / ER-08 终态仅证据收口 release 卡）>`（不用于实现阶段并发分组；进入发布窗口后按 G-10 的 I–R / R–R 规则串行化）
+**Release write set:** `<Inherited（= Cargo.toml 的 version 一处 + Cargo.lock）/ N/A（family child / plan release child / repair aggregate child / no-release / ER-08 终态仅证据收口 release 卡）>`（不用于实现阶段并发分组；进入发布窗口后按 G-10 的 I–R / R–R 规则串行化）
 
 **Files likely touched:** `<src/...>, <tests/...>, <config/...>, <docs/...>`（估计值；并发判定以 `Implementation write set` 为准）
 
@@ -564,15 +573,15 @@
 
 **Estimated scope:** `<S / M / L-exception:EX-<n>（仅限已登记的不可拆机械变更）>`（G-04；`XL` 永不允许作为开工态）
 
-**Version increment:** `<patch（默认）| minor | major | N/A（仅 ER-08 允许的卡，含 G-12 plan release child 与终态仅证据收口 release）>`（ER-08）
+**Version increment:** `<patch（默认）| minor | major | N/A（仅 ER-08 允许的卡，含 G-12 plan release child、G-13 repair aggregate child 与终态仅证据收口 release）>`（ER-08）
 
-**Release boundary:** `<independent（默认；终态仅证据收口 release 卡也填此值）| family child of REL-<n>（k/n）| family release point of REL-<n> | plan release child of REL-<n> | plan release point of REL-<n> | no-release（docs/audit/spike/handoff）>`（合并发布须先按 G-07/G-08/G-12 登记 `REL-*`）
+**Release boundary:** `<independent（默认；终态仅证据收口 release 卡也填此值）| family child of REL-<n>（k/n）| family release point of REL-<n> | plan release child of REL-<n> | plan release point of REL-<n> | repair aggregate child of REL-<n> | repair aggregate release point of REL-<n> | no-release（docs/audit/spike/handoff）>`（合并发布须先按 G-07/G-08/G-12/G-13 登记 `REL-*`）
 
-**C/D coverage from:** `<self（自行执行 C 组）| <TASK-ID>（继承该发布点/收口点的 C 覆盖与其 D 组）>`（ER-04；`family child`、`plan release child` 与 `no-release` 卡必填具体 ID，不得留空）
+**C/D coverage from:** `<self（自行执行 C 组）| <TASK-ID>（继承该发布点/收口点的 C 覆盖与其 D 组）>`（ER-04；`family child`、`plan release child`、`repair aggregate child` 与 `no-release` 卡必填具体 ID，不得留空）
 
-**Granularity:** `type=<Task type>; axis=<本卡唯一的行为轴>; recovery=<失败/撤回时的单一恢复动作与恢复后的自洽状态>; complete=<yes：实现+测试+文档同步都在本卡内>; self-contained=<yes：不读其它卡正文即可执行>; AC=<n>/<上限>[@EX-ID]; VER=<n>/<上限>[@EX-ID]; landing=<n>; prod-files=<n>; scope=<S|M|L-exception:EX-n>; deps=<none|TASK-ID,…|DEP-ID,…>; writeset=<no-overlap|序列化于 TASK-ID>; release=<independent|REL-n family child|REL-n family point|REL-n plan child|REL-n plan point|no-release>; split-from=<TASK-ID|N/A>; exception=<EX-ID[,EX-ID…]|N/A>`
+**Granularity:** `type=<Task type>; axis=<本卡唯一的行为轴>; recovery=<失败/撤回时的单一恢复动作与恢复后的自洽状态>; complete=<yes：实现+测试+文档同步都在本卡内>; self-contained=<yes：不读其它卡正文即可执行>; AC=<n>/<上限>[@EX-ID]; VER=<n>/<上限>[@EX-ID]; landing=<n>; prod-files=<n>; scope=<S|M|L-exception:EX-n>; deps=<none|TASK-ID,…|DEP-ID,…>; writeset=<no-overlap|序列化于 TASK-ID>; release=<independent|REL-n family child|REL-n family point|REL-n plan child|REL-n plan point|REL-n repair child|REL-n repair point|no-release>; split-from=<TASK-ID|N/A>; exception=<EX-ID[,EX-ID…]|N/A>`
 
-字段与规则的对应：`type`→G-11，`axis`/`recovery`→G-01，`complete`→G-02，`AC`/`VER`→G-03（分母按 G-03 的 Task type 上限表取值：代码卡与 spike 为 8，`release` 为 12，docs/audit/handoff 为 20；ER-04 的强制门不计入）。**超限只有一种合规写法**：`AC=21/20@EX-01` —— 分子超过分母时必须紧跟豁免该列的 `EX-ID`，否则审计判为不达标；一张卡可同时需要多个豁免，`exception` 用逗号分隔并逐个说明所豁免的列。`landing`/`prod-files`/`scope`→G-04，`self-contained`→G-05，`deps`→G-06，`release`→G-07/G-08/G-12，`split-from`→G-09，`writeset`→G-10，`exception`→已登记的 `EX-*`。这一行是 `G-*` 的机器可核对摘要，ER-03 开工前逐字段核对；写不出来就说明卡还没拆干净。计划级汇总见「任务卡粒度审计表」。
+字段与规则的对应：`type`→G-11，`axis`/`recovery`→G-01，`complete`→G-02，`AC`/`VER`→G-03（分母按 G-03 的 Task type 上限表取值：代码卡与 spike 为 8，`release` 为 12，docs/audit/handoff 为 20；ER-04 的强制门不计入）。**超限只有一种合规写法**：`AC=21/20@EX-01` —— 分子超过分母时必须紧跟豁免该列的 `EX-ID`，否则审计判为不达标；一张卡可同时需要多个豁免，`exception` 用逗号分隔并逐个说明所豁免的列。`landing`/`prod-files`/`scope`→G-04，`self-contained`→G-05，`deps`→G-06，`release`→G-07/G-08/G-12/G-13，`split-from`→G-09，`writeset`→G-10，`exception`→已登记的 `EX-*`。这一行是 `G-*` 的机器可核对摘要，ER-03 开工前逐字段核对；写不出来就说明卡还没拆干净。计划级汇总见「任务卡粒度审计表」。
 
 ## 测试矩阵
 
@@ -653,6 +662,7 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 - [ ] 所有任务卡满足粒度规则 `G-*`：无未登记的 L 例外、无 XL 卡、无碎片卡、无未登记的合并发布例外、实现写集冲突均已消解；「任务卡粒度审计表」已填齐。
 - [ ] 所有非延后任务的 acceptance criteria 已满足，且 `Lifecycle=done` **且** `Acceptance=complete`（ER-04）。任何停在 `remote-pending` 的卡都必须先取得 D 组绿灯，或完成白名单内具名 `EX-*` 延期及 `DEFER-*` 债务登记。任何仍为 `blocked` 的任务都必须先解除阻塞（`blocked` → `in-progress` → 完成剩余动作 → `done`）或按 `DEFER-*` 正式延后，不得带着 `blocked` 通过完成门。
 - [ ] 启用 G-12 的计划核对唯一末尾发布点恰好一次 patch bump、匹配 tag、人工 GitHub Release 与该 tag 的 Docker D 实际成功；本组不适用 D 延期。后置终态证据收口若有，仅作无版本文档/状态提交，不增加第二次版本发布。
+- [ ] 启用 G-13 的组逐项具备真实阻断/来源树、明确代码根因、修复、独立 A/B、ER-05 与精确本地提交；唯一点的实际 patch、最终树完整 C、匹配 tag/人工 Release 与实际 Docker D 全部齐备。未知原因或仅未复现的诊断不得伪记完成，失效组已按 G-13 退出。
 - [ ] 所有任务的 Verification 命令已运行并记录结果。
 - [ ] **计划完成门（区别于每卡 focused gate）**：`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all` 全绿，且 `cargo build`、`cargo build --tests` 均 0 错误 0 警告（`AGENTS.md` 强制）；不得新增 crate 级 `#[allow(...)]`。
 - [ ] 必要的 docs/配置/错误契约/测试矩阵更新已完成。
