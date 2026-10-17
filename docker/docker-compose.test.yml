@@ -35,6 +35,8 @@ services:
       interval: 2s
       timeout: 5s
       retries: 20
+    volumes:
+      - ./traces_pg_trgm_init.sql:/docker-entrypoint-initdb.d/zz-traces-pg-trgm.sql:ro
 
   redis:
     image: redis:8.10.1-alpine3.23

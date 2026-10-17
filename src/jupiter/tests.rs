@@ -1011,6 +1011,398 @@ pub async fn test_redis_manager() -> crate::jupiter::redis::ConnectionManager {
 }
 
 #[cfg(test)]
+static TRACES_NOEXT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+struct TracesIsolatedDatabase {
+    admin_url: String,
+    name: String,
+    dropped: AtomicBool,
+}
+
+#[cfg(test)]
+pub struct TracesIsolatedDatabaseGuard(Arc<TracesIsolatedDatabase>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TracesIsolatedDatabaseGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TracesIsolatedDatabaseGuard")
+            .field("name", &self.0.name)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl TracesIsolatedDatabase {
+    fn claim(&self) -> bool {
+        !self.dropped.swap(true, Ordering::AcqRel)
+    }
+
+    fn drop_off_thread(&self) {
+        let admin_url = self.admin_url.clone();
+        let name = self.name.clone();
+        let worker = std::thread::Builder::new()
+            .name(format!("drop-{name}"))
+            .spawn(move || drop_traces_isolated_database(&admin_url, &name));
+        if let Ok(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TracesIsolatedDatabaseGuard {
+    fn drop(&mut self) {
+        if self.0.claim() {
+            self.0.drop_off_thread();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HELD_ISOLATED_DATABASES: RefCell<HeldIsolatedDatabases> =
+        const { RefCell::new(HeldIsolatedDatabases(Vec::new())) };
+}
+
+#[cfg(test)]
+struct HeldIsolatedDatabases(Vec<Arc<TracesIsolatedDatabase>>);
+
+#[cfg(test)]
+impl Drop for HeldIsolatedDatabases {
+    fn drop(&mut self) {
+        for database in self.0.drain(..) {
+            if database.claim() {
+                database.drop_off_thread();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn traces_isolated_name_is_owned(name: &str) -> bool {
+    let mut parts = name.split('_');
+    parts.next() == Some("traces")
+        && parts.next() == Some("noext")
+        && parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        && parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        && parts.next().is_none()
+}
+
+#[cfg(test)]
+fn scrub_admin_error(err: impl std::fmt::Debug, admin_url: &str) -> String {
+    format!("{err:?}").replace(admin_url, "[redacted]")
+}
+
+#[cfg(test)]
+fn drop_traces_isolated_database(admin_url: &str, name: &str) {
+    if !traces_isolated_name_is_owned(name) {
+        eprintln!("refusing to drop a database outside the traces_noext_ prefix");
+        return;
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("traces isolated database {name} left behind: no runtime: {err}");
+            return;
+        }
+    };
+    let dropped = runtime.block_on(async {
+        let admin = Database::connect(admin_connect_options(admin_url)).await?;
+        let _ = admin
+            .execute_unprepared(&format!(
+                "ALTER DATABASE {name} WITH ALLOW_CONNECTIONS false"
+            ))
+            .await;
+        let _ = admin
+            .execute_unprepared(&format!(
+                "SELECT pg_terminate_backend(pid, 0) FROM pg_stat_activity \
+                 WHERE datname = '{name}' AND pid <> pg_backend_pid()"
+            ))
+            .await;
+        let _ = admin
+            .execute_unprepared("SET statement_timeout = '500ms'")
+            .await;
+        let drop_sql = format!("DROP DATABASE IF EXISTS {name}");
+        let mut dropped = admin.execute_unprepared(&drop_sql).await;
+        for _ in 0..20 {
+            if dropped.is_ok() {
+                break;
+            }
+            let text = format!("{dropped:?}");
+            if !text.contains("being accessed by other users")
+                && !text.contains("statement timeout")
+                && !text.contains("canceling statement")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = admin
+                .execute_unprepared(&format!(
+                    "SELECT pg_terminate_backend(pid, 0) FROM pg_stat_activity \
+                     WHERE datname = '{name}' AND pid <> pg_backend_pid()"
+                ))
+                .await;
+            dropped = admin.execute_unprepared(&drop_sql).await;
+        }
+        dropped?;
+        admin.close().await
+    });
+    if let Err(err) = dropped {
+        eprintln!(
+            "traces isolated database {name} left behind: {}",
+            scrub_admin_error(err, admin_url)
+        );
+    }
+}
+
+/// A database cloned from `template0`, so it does not contain the shared
+/// `pg_trgm` extension. The guard drops only this `traces_noext_` database.
+#[cfg(test)]
+pub async fn test_database_without_extensions()
+-> Result<(DatabaseConnection, TracesIsolatedDatabaseGuard), String> {
+    let admin_url = std::env::var("MEGA2_IT_DB_ADMIN_URL")
+        .map_err(|_| "MEGA2_IT_DB_ADMIN_URL is unset".to_string())?;
+    create_traces_isolated_database(&admin_url).await
+}
+
+#[cfg(test)]
+async fn create_traces_isolated_database(
+    admin_url: &str,
+) -> Result<(DatabaseConnection, TracesIsolatedDatabaseGuard), String> {
+    assert_postgres_url(admin_url);
+    let name = format!(
+        "traces_noext_{}_{}",
+        std::process::id(),
+        TRACES_NOEXT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    if !traces_isolated_name_is_owned(&name) {
+        return Err("refusing to create a database outside the traces_noext_ prefix".to_string());
+    }
+    let admin = Database::connect(admin_connect_options(admin_url))
+        .await
+        .map_err(|err| {
+            format!(
+                "traces isolated database admin connection failed: {}",
+                scrub_admin_error(err, admin_url)
+            )
+        })?;
+    let create_sql = format!("CREATE DATABASE {name} TEMPLATE template0");
+    let mut created = false;
+    let mut last_error = String::new();
+    for attempt in 0..16 {
+        match admin
+            .execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                create_sql.clone(),
+            ))
+            .await
+        {
+            Ok(_) => {
+                created = true;
+                break;
+            }
+            Err(err) => {
+                let text = scrub_admin_error(&err, admin_url);
+                if text.contains("being accessed by other users") && attempt + 1 < 16 {
+                    tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                last_error = text;
+                break;
+            }
+        }
+    }
+    admin
+        .close()
+        .await
+        .map_err(|err| scrub_admin_error(err, admin_url))?;
+    if !created {
+        return Err(last_error);
+    }
+    let db_url = database_url_for_schema(admin_url, &name, "public");
+    let connection = Database::connect(admin_connect_options(&db_url))
+        .await
+        .map_err(|err| scrub_admin_error(err, admin_url))?;
+    let owned = Arc::new(TracesIsolatedDatabase {
+        admin_url: admin_url.to_owned(),
+        name,
+        dropped: AtomicBool::new(false),
+    });
+    let _ = HELD_ISOLATED_DATABASES.try_with(|held| held.borrow_mut().0.push(owned.clone()));
+    Ok((connection, TracesIsolatedDatabaseGuard(owned)))
+}
+
+#[cfg(test)]
+mod traces_isolated_database_tests {
+    use super::*;
+
+    async fn extension_count(admin_url: &str) -> i64 {
+        let admin = Database::connect(admin_connect_options(admin_url))
+            .await
+            .expect("admin connection");
+        let count = admin
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT count(*)::bigint FROM pg_catalog.pg_extension WHERE extname = 'pg_trgm'"
+                    .to_owned(),
+            ))
+            .await
+            .expect("extension count")
+            .expect("extension count row")
+            .try_get_by_index::<i64>(0)
+            .expect("extension count value");
+        admin.close().await.expect("close admin");
+        count
+    }
+
+    async fn database_exists(admin_url: &str, name: &str) -> bool {
+        let admin = Database::connect(admin_connect_options(admin_url))
+            .await
+            .expect("admin connection");
+        let found = admin
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT 1 FROM pg_catalog.pg_database WHERE datname = $1",
+                [Value::from(name)],
+            ))
+            .await
+            .expect("database lookup")
+            .is_some();
+        admin.close().await.expect("close admin");
+        found
+    }
+
+    #[tokio::test]
+    async fn traces_isolated_database_template0_has_no_extension_and_guard_drops_only_itself() {
+        let admin_url = {
+            let _lock = crate::config::testing::env_lock();
+            std::env::var("MEGA2_IT_DB_ADMIN_URL").expect("MEGA2_IT_DB_ADMIN_URL")
+        };
+        let before = extension_count(&admin_url).await;
+        let (db, guard) = create_traces_isolated_database(&admin_url)
+            .await
+            .expect("template0 database");
+        let name = guard.0.name.clone();
+        assert!(traces_isolated_name_is_owned(&name), "{name}");
+        let extension = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT extname FROM pg_catalog.pg_extension WHERE extname = 'pg_trgm'".to_owned(),
+            ))
+            .await
+            .expect("extension query");
+        assert!(extension.is_none(), "template0 database contains pg_trgm");
+        let schema = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'mega2_extensions'"
+                    .to_owned(),
+            ))
+            .await
+            .expect("schema query");
+        assert!(
+            schema.is_none(),
+            "template0 database contains mega2_extensions"
+        );
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations on a database without the extension");
+        let extension_after = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT extname FROM pg_catalog.pg_extension WHERE extname = 'pg_trgm'".to_owned(),
+            ))
+            .await
+            .expect("extension query after migrations");
+        assert!(extension_after.is_none());
+        db.close().await.expect("close isolated database");
+        drop(guard);
+        assert!(
+            !database_exists(&admin_url, &name).await,
+            "{name} survived its guard"
+        );
+        assert_eq!(extension_count(&admin_url).await, before);
+    }
+
+    #[test]
+    fn traces_isolated_database_missing_admin_url_fails() {
+        let lock = crate::config::testing::env_lock();
+        let _removed = crate::config::testing::EnvVarGuard::remove(&lock, "MEGA2_IT_DB_ADMIN_URL");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(test_database_without_extensions())
+            .expect_err("missing admin URL must fail");
+        assert_eq!(err, "MEGA2_IT_DB_ADMIN_URL is unset");
+        assert!(!err.contains("postgres://"));
+    }
+
+    #[tokio::test]
+    async fn traces_isolated_database_without_createdb_fails() {
+        let admin_url = {
+            let _lock = crate::config::testing::env_lock();
+            std::env::var("MEGA2_IT_DB_ADMIN_URL").expect("MEGA2_IT_DB_ADMIN_URL")
+        };
+        let role = format!(
+            "traces_nocreatedb_{}_{}",
+            std::process::id(),
+            TRACES_NOEXT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let password = format!("pw{role}");
+        let admin = Database::connect(admin_connect_options(&admin_url))
+            .await
+            .expect("admin connection");
+        admin
+            .execute_unprepared(&format!(
+                "CREATE ROLE {role} LOGIN PASSWORD '{password}' NOCREATEDB NOSUPERUSER NOINHERIT"
+            ))
+            .await
+            .expect("create role without CREATEDB");
+        admin.close().await.expect("close admin");
+
+        let mut weak = Url::parse(&admin_url).expect("admin url");
+        weak.set_username(&role).expect("role name");
+        weak.set_password(Some(&password)).expect("password");
+        let weak_url = weak.to_string();
+        let result = create_traces_isolated_database(&weak_url).await;
+        let cleanup = Database::connect(admin_connect_options(&admin_url))
+            .await
+            .expect("admin connection");
+        cleanup
+            .execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
+            .await
+            .expect("drop role");
+        cleanup.close().await.expect("close admin");
+
+        let err = result.expect_err("missing CREATEDB must fail");
+        assert!(
+            !err.contains(&password),
+            "the failure included the role password"
+        );
+        assert!(
+            !err.contains("postgres://"),
+            "the failure included a database URL"
+        );
+        let lowered = err.to_ascii_lowercase();
+        assert!(
+            lowered.contains("createdb") || lowered.contains("permission"),
+            "failure was not an explicit admin rejection"
+        );
+    }
+}
+
+#[cfg(test)]
 mod schema_guard_tests {
     use sea_orm::TransactionTrait;
 

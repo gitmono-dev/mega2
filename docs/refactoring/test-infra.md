@@ -84,6 +84,37 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker/
    `export MEGA2_IT_GIT_UID=$(id -u) MEGA2_IT_GIT_GID=$(id -g)` 再
    `up`/`--force-recreate`。
 
+## Traces pg_trgm 测试设施
+
+测试 compose `docker/docker-compose.test.yml` 的 PostgreSQL 在首次 initdb 时挂载
+`docker/traces_pg_trgm_init.sql`。该 SQL 创建 NOLOGIN 角色 `mega2_traces_ext_owner`、
+由其拥有的 schema `mega2_extensions`，并撤销 PUBLIC 对该 schema 的 CREATE，然后
+执行 `CREATE EXTENSION pg_trgm ... VERSION '1.6'`。应用迁移不创建或删除这个扩展。
+具名 app 角色的 USAGE / EXECUTE 不在本设施授权。
+
+CI 在 `Start isolated test dependencies` 之后、全量测试之前运行
+`source .env.test && scripts/traces_pg_trgm_test.sh --case ci-preflight`。
+该 case 只读当前测试库的 catalog，并确认 `MEGA2_IT_DB_ADMIN_URL` 能连接且
+`rolcreatedb` 为真。它不删除共享库、共享 schema 或共享扩展。
+
+`scripts/traces_pg_trgm_test.sh --case fresh-test` 使用唯一项目名
+`traces-pg-test-<pid>-<counter>`。它把实际 compose 配置渲成 JSON，再写成只属于
+本例的派生文件：全部服务端口被替换，postgres 只发布一个随机 loopback 端口，
+`networks.default.name` 换成本例网络，不接入 `mega2-test-network`。启动、探针和
+`down -v` 使用同一派生文件和同一项目。退出时先断开连接，再按该项目 `down -v`，
+并核对本例 container、volume 和网络已经消失。清理失败则 case 非零。常驻
+`mega2-it` 与 storage-only 栈不在清理范围内。若 `mega2-test-network` 已存在，
+case 前后的 name、id、labels 和 containers 必须相同。
+
+无扩展的库测试使用 `MEGA2_IT_DB_ADMIN_URL`，以 `TEMPLATE template0` 创建唯一
+数据库 `traces_noext_<pid>_<counter>`。guard 只删除这个数据库。缺少该环境变量，
+或连接角色没有 `CREATEDB`，对应用例失败，不跳过。
+
+已经用匿名 volume 启动过的本机 `mega2-it` 不会重跑 initdb。该栈的所有者要让
+`ci-preflight` 看到新 SQL，需要先
+`docker compose -p mega2-it -f docker/docker-compose.test.yml down -v` 再启动，
+或对该 postgres 执行 `up -V --force-recreate`。这只由该测试栈的所有者操作。
+
 ## 新服务登记 checklist
 
 新增任何测试栈服务前，必须按下列清单完成书面登记（写入本文「已登记服务」），

@@ -66,6 +66,13 @@ jobs:
           docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git \
             up -d --build --wait postgres redis rustfs rustfs-init git-cli
 
+      - name: Verify traces pg_trgm test prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .env.test
+          scripts/traces_pg_trgm_test.sh --case ci-preflight
+
       - name: Verify necessary v3 publication and performance regressions
         shell: bash
         run: |
