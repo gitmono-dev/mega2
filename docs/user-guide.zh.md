@@ -158,7 +158,7 @@ Base URL 为 HTTP 服务监听地址。写接口经 `git.push_auth` 鉴权,无�
 
 ### 4.1 产品写(目录与文件)
 
-`POST /api/v1/create-entry`、`POST /api/v1/delete-entry`、`POST /api/v1/move-entry` 和 `POST /api/v1/edit/save` 可创建、删除、移动目录与文件，Monorepo 路径上的写入经过与 `git push` 共用的 MonoWriteQueue 和 path tip。存活 ImportRepo 内部的产品写由该仓库自己处理：`edit/save` 直接写默认分支，不经写入队列，也不做推送那样的 ref 校验；删除与移动回 409，新建不受支持（当前回 500）。成功响应中的 `cl_link` 为 `null`（不会创建 CL）；写入提交后，同栈的 `git clone` 或 `git pull` 可立即读到内容。依赖路径索引的浏览结果可能稍后才更新。请求字段与鉴权契约见 [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md)。
+`POST /api/v1/create-entry`、`POST /api/v1/delete-entry`、`POST /api/v1/move-entry` 和 `POST /api/v1/edit/save` 可创建、删除、移动目录与文件，Monorepo 路径上的写入经过与 `git push` 共用的 MonoWriteQueue 和 path tip。存活 ImportRepo 内部的产品写由该仓库自己处理：`edit/save` 直接写默认分支，不经写入队列，也不做推送那样的 ref 校验；新建、删除与移动不受支持，回 409。成功响应中的 `cl_link` 为 `null`（不会创建 CL）；写入提交后，同栈的 `git clone` 或 `git pull` 可立即读到内容。依赖路径索引的浏览结果可能稍后才更新。请求字段与鉴权契约见 [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md)。
 
 ### 4.2 Tags API
 

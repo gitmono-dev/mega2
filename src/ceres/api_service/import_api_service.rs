@@ -60,13 +60,15 @@ impl ApiHandler for ImportApiService {
         &self.git_object_cache
     }
 
+    /// Creating entries inside an ImportRepo is refused with the same
+    /// diagnosable 409 as delete and move below.
     async fn create_monorepo_entry(
         &self,
         _: CreateEntryInfo,
         _: Option<String>,
     ) -> Result<CreateEntryResult, GitError> {
         Err(GitError::CustomError(
-            "import dir does not support create entry".to_string(),
+            "[code:409] import dir does not support create entry".to_string(),
         ))
     }
 

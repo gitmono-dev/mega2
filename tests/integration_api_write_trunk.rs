@@ -1330,6 +1330,33 @@ fn delete_entry_reject_import_repo_409() {
 }
 
 #[test]
+fn create_entry_reject_import_repo_409() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(Some(&[
+        "/project",
+        "/third-party",
+    ])));
+    let repo = format!("create-import-{}", std::process::id());
+    seed_import_repo(&case.env.case_dir, case.port, PUSH_TOKEN, &repo);
+    let import_path = format!("/third-party/{repo}");
+    for (path, name, is_directory) in [
+        (import_path.clone(), "new-dir", true),
+        (format!("{import_path}/src"), "new.rs", false),
+    ] {
+        let (status, json) = fu06_create(&case, &path, name, is_directory);
+        assert_eq!(
+            status, 409,
+            "create-entry {path}/{name} inside an ImportRepo must 409: {json}"
+        );
+        assert_eq!(
+            err_message(&json),
+            "import dir does not support create entry",
+            "{json}"
+        );
+    }
+    case.finish();
+}
+
+#[test]
 fn delete_entry_success_req_result_true() {
     let case = EntryCase::boot(ApiWriteEnv::with_token_config());
     case.seed();

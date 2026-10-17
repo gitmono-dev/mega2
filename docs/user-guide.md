@@ -158,7 +158,7 @@ The base URL is the HTTP service listen address. Write endpoints authenticate vi
 
 ### 4.1 Product writes (directories and files)
 
-`POST /api/v1/create-entry`, `POST /api/v1/delete-entry`, `POST /api/v1/move-entry`, and `POST /api/v1/edit/save` write files and directories. On Monorepo paths, the path tip advances through the same write queue used by `git push`. Product writes inside a live ImportRepo are handled by that repository: `edit/save` writes the default branch directly, without the write queue and without the ref check a push makes; delete and move return 409, and create is not supported (it currently returns 500). A successful response carries `cl_link: null` (no CL is created), and a same-stack `git clone` or `git pull` can read the committed content immediately. Index-backed browse results may take a short time to catch up after a write. The runtime OpenAPI document describes request fields and response schemas.
+`POST /api/v1/create-entry`, `POST /api/v1/delete-entry`, `POST /api/v1/move-entry`, and `POST /api/v1/edit/save` write files and directories. On Monorepo paths, the path tip advances through the same write queue used by `git push`. Product writes inside a live ImportRepo are handled by that repository: `edit/save` writes the default branch directly, without the write queue and without the ref check a push makes; create, delete, and move are not supported and return 409. A successful response carries `cl_link: null` (no CL is created), and a same-stack `git clone` or `git pull` can read the committed content immediately. Index-backed browse results may take a short time to catch up after a write. The runtime OpenAPI document describes request fields and response schemas.
 
 ### 4.2 Tags API
 
