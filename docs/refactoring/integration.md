@@ -59,6 +59,7 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_github_sync` | outbound GitHub-sync SSH session（plan-20260916 / GS-07）：`ssh_connect_authenticates` 钉住回环主机钥并对本地 russh 服务端完成 Ed25519 公钥认证 | 回环 only；不连 GitHub；`--test-threads=1` |
 | `integration_traces` filter `schema_identity_` | traces 身份 schema（plan-20261015 / MTR-02）：`schema_identity_principal_persists`、`schema_identity_namespaces_are_independent`、`schema_identity_path_rebuild_keeps_code_and_capture_tables`。经 `traces_migration_ops::apply_migrations` 跑真实 runner，再按公开实体与 SQL 观察 | PostgreSQL；`--test-threads=1` |
 | `integration_traces` filter `schema_publication_` | traces 发布 schema（plan-20261015 / MTR-03）：`schema_publication_stream_natural_key`、`schema_publication_ref_journal_unique`、`schema_publication_keeps_code_and_capture_rows` | PostgreSQL；`--test-threads=1` |
+| `integration_traces` filter `schema_projection_` | traces 投影 schema（plan-20261015 / MTR-04）：`schema_projection_checkpoint_resource_and_fragment`。经 `traces_migration_ops::apply_migrations` 跑真实 runner，再按公开实体与 SQL 观察 checkpoint 键、`original_tree`、resource 序数与字节范围、fragment `index_version`/`ascii_fold` 和 membership 出处 | PostgreSQL；`--test-threads=1` |
 
 ## Storage-only compose black-box coverage
 
@@ -144,6 +145,12 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 - **元数据保持（UN-48）**：owner / mode / ACL / xattr；写后 `stat`/`getfacl`/xattr 比对，不符即失败（可用 `KILL_SWITCH_META_VERIFY_FAIL` 注入）。
 - **自测**：`bash scripts/authz_kill_switch.sh --selftest`（… + UN-42×6 + UN-44×7 = **58/58**；fsync stub = `scripts/authz_kill_switch_fsync_stub.sh`）。需可用的 `KILL_SWITCH_BIN` 或 `target/debug/mega2`；compose/preflight 需 `yq`（或 `KILL_SWITCH_YQ`）；缺 `getfattr` 时自测会在临时 PATH 放入存在性 stub。
 - **发布**：REL-02 十子卡本地提交后由 UN-45 原子发布为 **v0.2.65**（脚本入口 / 三分支 / 拓扑绑定 / 失败终态安全方向见上；降级 = 不执行该脚本）。
+
+## 迁移覆盖：traces 投影（MTR-04）
+
+`m20261015_000300_trace_projection` 创建 `trace_checkpoint`、`trace_session`、`trace_resource`、`trace_code_link`、`trace_fragment` 与 `trace_fragment_membership`。checkpoint 键在 stream 内唯一，更新 `original_tree` 被触发器拒绝。resource 保存 `ordinal`、`byte_start` 与 `byte_end`。fragment 在 stream 内按 `content_digest` 加 `index_version` 唯一，并保存 `ascii_fold` 文本列。membership 保存 checkpoint 与 resource 出处，更新这些列被触发器拒绝。复合外键要求 resource、code link 和 membership 引用的 checkpoint、resource、fragment 属于同一 stream。普通 btree 索引可以存在。该迁移不创建或删除扩展，也不建 trigram GIN。`down` 是空实现，不删除这些表。
+
+库内契约在各自 `db_contract`，无扩展升级在 `ordinary_schema_without_extensions_`，外部观察在 `integration_traces` 的 `schema_projection_`。
 
 ## 迁移覆盖：traces 发布（MTR-03）
 

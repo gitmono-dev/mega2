@@ -3,8 +3,8 @@ mod traces_db;
 
 use chrono::Utc;
 use mega2_core::{
-    trace_credential_binding, trace_ingest_attempt, trace_principal, trace_ref_update,
-    trace_stream, trace_target,
+    trace_checkpoint, trace_credential_binding, trace_fragment, trace_ingest_attempt,
+    trace_principal, trace_ref_update, trace_resource, trace_stream, trace_target,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, Set,
@@ -313,5 +313,116 @@ async fn schema_publication_keeps_code_and_capture_rows() {
         .expect("capture row");
     assert_eq!(code.try_get::<i64>("", "n").expect("n"), 1);
     assert_eq!(capture.try_get::<i64>("", "n").expect("n"), 1);
+    db.close().await.expect("close traces database");
+}
+
+#[tokio::test]
+async fn schema_projection_checkpoint_resource_and_fragment() {
+    let (_traces, db) = traces_db::TracesDb::migrated().await;
+    let stream_id = published_stream(&db).await;
+    let checkpoint = trace_checkpoint::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        stream_id: Set(stream_id.clone()),
+        checkpoint_key: Set("ckpt-public".to_owned()),
+        original_tree: Set("tree-public".to_owned()),
+        created_at: Set(Utc::now().fixed_offset()),
+    }
+    .insert(&db)
+    .await
+    .expect("checkpoint");
+    let duplicate = trace_checkpoint::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        stream_id: Set(stream_id.clone()),
+        checkpoint_key: Set("ckpt-public".to_owned()),
+        original_tree: Set("tree-other".to_owned()),
+        created_at: Set(Utc::now().fixed_offset()),
+    }
+    .insert(&db)
+    .await;
+    assert!(duplicate.is_err(), "checkpoint key is unique in the stream");
+    let changed = db
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE trace_checkpoint SET original_tree = 'tree-mutated' WHERE id = $1",
+            [checkpoint.id.clone().into()],
+        ))
+        .await;
+    assert!(changed.is_err(), "original_tree is immutable");
+    let resource = trace_resource::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        stream_id: Set(stream_id.clone()),
+        checkpoint_id: Set(checkpoint.id.clone()),
+        ordinal: Set(4),
+        byte_start: Set(32),
+        byte_end: Set(64),
+        created_at: Set(Utc::now().fixed_offset()),
+    }
+    .insert(&db)
+    .await
+    .expect("resource");
+    let fragment = trace_fragment::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        stream_id: Set(stream_id.clone()),
+        content_digest: Set("digest-public".to_owned()),
+        index_version: Set(1),
+        body: Set("Hello".to_owned()),
+        ascii_fold: Set("hello".to_owned()),
+        created_at: Set(Utc::now().fixed_offset()),
+    }
+    .insert(&db)
+    .await
+    .expect("fragment");
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO trace_fragment_membership (
+            id, fragment_id, stream_id, checkpoint_id, resource_id, created_at
+         ) VALUES ($1, $2, $3, $4, $5, now())",
+        [
+            Uuid::new_v4().to_string().into(),
+            fragment.id.clone().into(),
+            stream_id.into(),
+            checkpoint.id.into(),
+            resource.id.clone().into(),
+        ],
+    ))
+    .await
+    .expect("membership");
+    let loaded = trace_resource::Entity::find_by_id(resource.id)
+        .one(&db)
+        .await
+        .expect("load resource")
+        .expect("resource row");
+    assert_eq!(
+        (loaded.ordinal, loaded.byte_start, loaded.byte_end),
+        (4, 32, 64)
+    );
+    let text = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT index_version, ascii_fold FROM trace_fragment WHERE id = $1",
+            [fragment.id.into()],
+        ))
+        .await
+        .expect("fragment sql")
+        .expect("fragment row");
+    assert_eq!(
+        text.try_get::<i64>("", "index_version").expect("version"),
+        1
+    );
+    assert_eq!(
+        text.try_get::<String>("", "ascii_fold").expect("fold"),
+        "hello"
+    );
+    let gin = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS n FROM pg_indexes \
+             WHERE tablename = 'trace_fragment' AND indexdef ILIKE '%gin%'"
+                .to_owned(),
+        ))
+        .await
+        .expect("gin count")
+        .expect("gin row");
+    assert_eq!(gin.try_get::<i64>("", "n").expect("n"), 0);
     db.close().await.expect("close traces database");
 }
