@@ -49,6 +49,7 @@ services:
     volumes:
       # Postgres 18 image: mount the parent dir, not .../data.
       - mega2-trunk-pg:/var/lib/postgresql
+      - ./traces_pg_trgm_init.sql:/docker-entrypoint-initdb.d/zz-traces-pg-trgm.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mega2 -d mega2"]
       interval: 2s

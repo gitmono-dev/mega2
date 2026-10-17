@@ -110,6 +110,12 @@ case 前后的 name、id、labels 和 containers 必须相同。
 数据库 `traces_noext_<pid>_<counter>`。guard 只删除这个数据库。缺少该环境变量，
 或连接角色没有 `CREATEDB`，对应用例失败，不跳过。
 
+`scripts/traces_pg_trgm_test.sh` 另外拥有六个部署 case：`fresh-storage-base`、
+`auth-none-inheritance`、`existing-volume`、`views-bootstrap`、`wrong-namespace`、
+`app-grants`。它们各自从 storage-only compose 派生唯一项目、端口和网络，只清理
+自己创建的 container、volume 和网络，不删除 `mega2-trunk-*` 卷。operator 行为由
+`scripts/traces_pg_trgm_bootstrap.sh` 执行。
+
 已经用匿名 volume 启动过的本机 `mega2-it` 不会重跑 initdb。该栈的所有者要让
 `ci-preflight` 看到新 SQL，需要先
 `docker compose -p mega2-it -f docker/docker-compose.test.yml down -v` 再启动，

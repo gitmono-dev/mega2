@@ -549,6 +549,8 @@ scripts/bb_optin_run.sh views libra_view_smoke.sh '<case>' target/tmp/hp25-<case
 
 SSH case 用 `LIBRA_SSH_COMMAND` 指向本次运行的包装脚本，脚本从隔离的 `known_hosts` 读取环回中继 host key，并保持 `StrictHostKeyChecking=yes`。在 `DEP-HP-04` 落地前，未就绪 SSH 用例只断言 `status 75`；L0 ERR 用例断言 `remote reported an error:` 前缀及重算的 tree id。
 
+views 栈的数据库 `mega2_hp25_views` 不会继承默认库 `mega2` 里的 `pg_trgm`。已有 volume 也不会重跑 `docker/traces_pg_trgm_init.sql`。对这个库单独设置 `MEGA2_TRACES_PG_ADMIN_URL` 和 `MEGA2_TRACES_PG_APP_ROLE`，再执行 `scripts/traces_pg_trgm_bootstrap.sh --apply`。`--check` 只读 catalog。扩展若已在其它 schema，脚本拒绝并保持 catalog 不变。auth-none overlay 不改 Postgres 服务，因此沿用 base 的 init 挂载。
+
 views 栈与默认栈共用 RustFS bucket `mega2`；独立库与 Redis 逻辑库 1 可在 helper 没有运行时手工清理：
 
 ```bash

@@ -117,7 +117,7 @@ cargo build --release -p mega2   # 产物 target/release/mega2
 
 | 依赖 | 说明 |
 | --- | --- |
-| PostgreSQL | 必需。compose 栈用 18.x。 |
+| PostgreSQL | 必需。compose 栈用 18.x。全新 storage-only 库会执行 [`docker/traces_pg_trgm_init.sql`](../docker/traces_pg_trgm_init.sql)，在 NOLOGIN 角色 `mega2_traces_ext_owner` 拥有的 schema `mega2_extensions` 中安装 `pg_trgm` 1.6。已有 volume 不会重跑这段 init。把 `MEGA2_TRACES_PG_ADMIN_URL` 指到目标库，把 `MEGA2_TRACES_PG_APP_ROLE` 设为应用角色，再运行 `scripts/traces_pg_trgm_bootstrap.sh --check` 或 `--apply`。`--apply` 授予该角色 schema 的 `USAGE` 和其中函数的 `EXECUTE`，不授予 `CREATE` 或所有权。若 `pg_trgm` 已装在其它 schema，脚本以 `wrong_namespace` 停止，不移动也不删除它。views 库 `mega2_hp25_views` 是独立数据库：把管理员 URL 指到该库后运行同一脚本。[`docker-compose-storage-only.auth-none.yml`](../docker/docker-compose-storage-only.auth-none.yml) 不替换 Postgres 服务，因此保留这份 init 挂载。 |
 | Redis | 必需。compose 栈用 8.x。 |
 | 对象存储 | 必需，三选一：本地文件系统（`storage_type="local"`，仅单节点）、S3 兼容（默认，RustFS / MinIO / 云 S3）、GCS。经 [`refactoring/orbit.md`](./refactoring/orbit.md) 的 `build_object_storage` 构建。 |
 | Vault | 无外部服务：内嵌 Vault 来自 crates.io `libvault` + [`src/contract/vault/`](../src/contract/vault/)，见 [`refactoring/vault.md`](./refactoring/vault.md)。 |

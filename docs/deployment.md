@@ -117,7 +117,7 @@ Process management: mega2 is a single long-running process; manage it with syste
 
 | Dependency | Notes |
 | --- | --- |
-| PostgreSQL | Required. The compose stack uses 18.x. |
+| PostgreSQL | Required. The compose stack uses 18.x. A fresh storage-only database runs [`docker/traces_pg_trgm_init.sql`](../docker/traces_pg_trgm_init.sql), which installs `pg_trgm` 1.6 in schema `mega2_extensions`, owned by the NOLOGIN role `mega2_traces_ext_owner`. An existing volume does not rerun that init. Set `MEGA2_TRACES_PG_ADMIN_URL` to the target database and `MEGA2_TRACES_PG_APP_ROLE` to the application role, then run `scripts/traces_pg_trgm_bootstrap.sh --check` or `--apply`. `--apply` grants that role `USAGE` on the schema and `EXECUTE` on its functions. It does not grant `CREATE` or ownership. If `pg_trgm` is already in another schema, the script stops with `wrong_namespace` and does not move or drop it. The views database `mega2_hp25_views` is separate: point the admin URL at that database and run the same script. [`docker-compose-storage-only.auth-none.yml`](../docker/docker-compose-storage-only.auth-none.yml) does not replace the Postgres service, so it keeps the init mount. |
 | Redis | Required. The compose stack uses 8.x. |
 | Object storage | Required, one of: local filesystem (`storage_type="local"`, single node only), S3-compatible (default; RustFS / MinIO / cloud S3), GCS. Built via `build_object_storage` per [`architecture.md`](./architecture.md). |
 | Vault | No external service: the embedded Vault comes from crates.io `libvault` + [`src/contract/vault/`](../src/contract/vault/), see [`architecture.md`](./architecture.md). |
