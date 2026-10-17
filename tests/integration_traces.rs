@@ -1,8 +1,15 @@
 #[path = "common/traces_db.rs"]
 mod traces_db;
 
+use std::path::PathBuf;
+
 use chrono::Utc;
 use mega2_core::{
+    config::{
+        Config,
+        loader::{ConfigInput, ConfigLoader},
+        reload::ConfigHandle,
+    },
     trace_checkpoint, trace_credential_binding, trace_fragment, trace_ingest_attempt,
     trace_principal, trace_ref_update, trace_resource, trace_stream, trace_target,
 };
@@ -425,4 +432,117 @@ async fn schema_projection_checkpoint_resource_and_fragment() {
         .expect("gin row");
     assert_eq!(gin.try_get::<i64>("", "n").expect("n"), 0);
     db.close().await.expect("close traces database");
+}
+
+const TRACE_SERVER_ID: &str = "00000000-0000-4000-8000-000000000050";
+
+fn load_profile(path: &str) -> Config {
+    let loaded = ConfigLoader::new(ConfigInput {
+        cli_path: Some(PathBuf::from(path)),
+        ..ConfigInput::default()
+    })
+    .load()
+    .expect("resolve profile");
+    let body = std::fs::read_to_string(&loaded.path).expect("read profile");
+    // Sample storage-only mounts a deploy secret. Substitute only that
+    // placeholder so the shipped `[traces]` table still loads through Config.
+    let rendered = substitute_file_secrets(&body);
+    Config::load_str(&rendered).unwrap_or_else(|err| panic!("load {path}: {err}"))
+}
+
+fn substitute_file_secrets(body: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    const OPEN: &str = "${file:";
+    while let Some(start) = rest.find(OPEN) {
+        let after = &rest[start + OPEN.len()..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str("fixture-token");
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn sample_with_traces(replacement: &str) -> String {
+    let body = std::fs::read_to_string("config/config.toml").expect("sample");
+    let marker = "[traces]\nenabled = false\n";
+    assert!(body.contains(marker), "sample traces block");
+    body.replacen(marker, replacement, 1)
+}
+
+#[tokio::test]
+async fn trace_config_model_profiles_stay_disabled() {
+    for path in [
+        "config/config.toml",
+        "config/config-review.toml",
+        "config/config-storage-only.toml",
+        "config/config-storage-only.none.toml",
+    ] {
+        let config = load_profile(path);
+        assert!(!config.traces.enabled, "{path}");
+        assert!(config.traces.server_id.is_none(), "{path}");
+        assert!(config.traces.scope.is_none(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn trace_config_model_explicit_enable_keeps_configured_server_id() {
+    let rendered = sample_with_traces(&format!(
+        "[traces]\nenabled = true\nserver_id = \"{TRACE_SERVER_ID}\"\nscope = \"fixture-a\"\n"
+    ));
+    let first = Config::load_str(&rendered).expect("first load");
+    let second = Config::load_str(&rendered).expect("second load");
+    first.validate().expect("explicit enable validates");
+    second.validate().expect("second load validates");
+    assert!(first.traces.enabled);
+    assert_eq!(first.traces.server_id.as_deref(), Some(TRACE_SERVER_ID));
+    assert_eq!(first.traces.scope.as_deref(), Some("fixture-a"));
+    assert_eq!(first.traces.server_id, second.traces.server_id);
+    assert_eq!(first.traces.scope, second.traces.scope);
+}
+
+#[tokio::test]
+async fn trace_config_model_enabled_without_server_id_is_rejected() {
+    let rendered = sample_with_traces("[traces]\nenabled = true\n");
+    let config = Config::load_str(&rendered).expect("toml parses");
+    let error = config.validate().expect_err("enabled requires server_id");
+    let text = error.to_string();
+    assert!(
+        text.contains("traces.server_id"),
+        "rejection names server_id: {text}"
+    );
+}
+
+#[tokio::test]
+async fn trace_config_model_rejects_budget_override() {
+    let rendered = sample_with_traces("[traces]\nenabled = false\nmax_object_bytes = 1\n");
+    let error = Config::load_str(&rendered).expect_err("budget key is unknown");
+    let text = error.to_string();
+    assert!(
+        text.contains("max_object_bytes") || text.contains("unknown"),
+        "unknown budget field: {text}"
+    );
+}
+
+#[tokio::test]
+async fn trace_config_model_reload_classifies_traces() {
+    let current = load_profile("config/config.toml");
+    let handle = ConfigHandle::new(current);
+    let before = handle.snapshot().expect("snapshot");
+    let mut candidate = before.as_ref().clone();
+    candidate.traces.enabled = true;
+    candidate.traces.server_id = Some(TRACE_SERVER_ID.to_owned());
+    candidate.traces.scope = Some("fixture-a".to_owned());
+    let report = handle.reload(candidate).expect("reload");
+    assert!(report.restart_required_fields.contains(&"traces.enabled"));
+    assert!(report.restart_required_fields.contains(&"traces.server_id"));
+    assert!(report.restart_required_fields.contains(&"traces.scope"));
+    let after = handle.snapshot().expect("snapshot after reload");
+    assert!(!after.traces.enabled);
+    assert!(after.traces.server_id.is_none());
+    assert!(after.traces.scope.is_none());
 }

@@ -10,7 +10,7 @@ use url::Url;
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig,
     GithubSyncConfig, LFSConfig, LogConfig, MonoConfig, MonoObjectFormat, Mst2Config,
-    NotificationConfig, OAuthConfig, PackConfig, PushAuth, PushPolicy, RedisConfig,
+    NotificationConfig, OAuthConfig, PackConfig, PushAuth, PushPolicy, RedisConfig, TracesConfig,
     VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
     secret::{SecretRef, SecretResolver, is_secret_ref_value},
 };
@@ -146,9 +146,41 @@ impl Config {
         validate_agent_capture_config(self)?;
         validate_storage_events_config(self)?;
         validate_github_sync_config(self)?;
+        validate_traces_config(&self.traces)?;
 
         Ok(())
     }
+}
+
+fn validate_traces_config(config: &TracesConfig) -> Result<(), MegaError> {
+    if config
+        .scope
+        .as_deref()
+        .is_some_and(|scope| scope.trim().is_empty())
+    {
+        return Err(MegaError::Other(
+            "traces.scope must not be empty when configured".to_string(),
+        ));
+    }
+    match config.server_id.as_deref() {
+        Some(server_id) if !server_id.is_empty() => parse_traces_server_id(server_id),
+        _ if !config.enabled => Ok(()),
+        _ => Err(MegaError::Other(
+            "traces.server_id is required when traces.enabled is true".to_string(),
+        )),
+    }
+}
+
+fn parse_traces_server_id(server_id: &str) -> Result<(), MegaError> {
+    let parsed = uuid::Uuid::parse_str(server_id).map_err(|_| {
+        MegaError::Other("traces.server_id must be a valid non-nil UUID".to_string())
+    })?;
+    if parsed.is_nil() {
+        return Err(MegaError::Other(
+            "traces.server_id must be a valid non-nil UUID".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_mst2_config(config: &Mst2Config) -> Result<(), MegaError> {
@@ -2141,6 +2173,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "storage_events",
             "github_sync",
             "cedar",
+            "traces",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -2274,6 +2307,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "agent_tenants",
             "agent_repo_paths",
         ]),
+        "traces" => Some(&["enabled", "server_id", "scope"]),
         "github_sync" => Some(&[
             "enabled",
             "ssh_host",

@@ -192,10 +192,11 @@ Error types and HTTP status mapping are centralized in `crate::common::errors`.
 
 ## 5. Optional service surfaces
 
-Both surfaces require storage-only mode and their own config switch. If either condition is missing, the route is not mounted and returns 404; enabling either switch outside storage-only mode prevents startup.
+Both mounted surfaces require storage-only mode and their own config switch. If either condition is missing, the route is not mounted and returns 404; enabling either switch outside storage-only mode prevents startup. The traces switch below is configuration only and does not mount a route.
 
 - **OCI Distribution `/v2`**: mounted when storage-only and `[oci].enabled=true`; serves as a container registry (`docker login` reuses push tokens — there is no separate token service). See the [Deployment Guide](./deployment.md) for enablement and usage.
 - **Agent Session Capture `/api/v1/agent-capture`**: an optional API for ingesting and querying Agent sessions, events, checkpoints, transcripts, and file operations. It is mounted only in storage-only mode when `[agent_capture].enabled=true` and at least one `[[agent_capture.ingest_tokens]]` is configured. It uses separate ingest tokens and is independent of Git push; a Git push does not create a session capture record. See the [configuration and API reference](./refactoring/agent-capture.md) (Chinese).
+- **Traces archive**: `[traces].enabled` stays `false` in the sample profiles. Turning it on requires an operator UUID in `server_id`; mega2 does not mint that id at startup. This switch does not mount the traces Git or HTTP surface by itself. See the [Configuration Guide](./configuration.md).
 
 ## 6. Using mega2 with Libra
 

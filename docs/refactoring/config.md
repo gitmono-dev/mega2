@@ -194,6 +194,10 @@ fail `config validate` and service start. Both shipped samples keep
 deployments that hand-wrote those values are affected; correct them before
 upgrading.
 
+## Traces enablement
+
+`[traces]` is the enablement and deployment-identity section. `enabled` defaults to false. `server_id` is an operator UUID and is required only when enabled; startup does not generate it. `scope` is an optional operator label. A reload classifies changes to these three fields as restart-required and does not publish them into the live snapshot. `git_limits`, `query_defaults`, and protocol budget keys are unknown fields. The sample profiles in `config/` keep `enabled = false`.
+
 ## Test configuration
 
 `.env.test.example` documents public test endpoints for PostgreSQL, Redis, and

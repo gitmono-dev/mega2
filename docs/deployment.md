@@ -133,6 +133,7 @@ Resource sizing scales with repository size and push concurrency; the write path
 - [ ] Bind host ports to loopback / internal addresses; open only what is needed.
 - [ ] Keep `cedar.enforcement` at `off` (a trunk-mode startup requirement; see the [Deployment shape](#1-deployment-shape)).
 - [ ] Enable OCI `/v2` and Agent Capture explicitly, only when needed (not mounted by default).
+- [ ] Leave `[traces].enabled` false until an operator writes a persistent `server_id` UUID. The process does not generate that id.
 - [ ] Backups, three parts: Postgres dump, object storage bucket, `mega2 --config <path> config vault backup <destination>` (Vault core key; restore with `config vault restore`, see [`src/commands/config.rs`](../src/commands/config.rs)).
 
 ## 6. Upgrades and mode changes

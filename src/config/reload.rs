@@ -688,6 +688,23 @@ fn collect_static_restart_fields(
     collect_oauth_restart_fields(current, candidate, report);
     collect_storage_events_restart_fields(current, candidate, report);
     collect_github_sync_restart_fields(current, candidate, report);
+    collect_traces_restart_fields(current, candidate, report);
+}
+
+fn collect_traces_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.traces.enabled != candidate.traces.enabled {
+        report.restart_required_fields.push("traces.enabled");
+    }
+    if current.traces.server_id != candidate.traces.server_id {
+        report.restart_required_fields.push("traces.server_id");
+    }
+    if current.traces.scope != candidate.traces.scope {
+        report.restart_required_fields.push("traces.scope");
+    }
 }
 
 fn collect_monorepo_restart_fields(

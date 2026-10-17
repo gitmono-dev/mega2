@@ -192,10 +192,11 @@ Monorepo 路径禁止 Git 客户端推送 Tag，Tag 经此入口管理（ImportR
 
 ## 5. 可选服务面
 
-两个面均为**双重门控**(storage-only 形态 + 各自开关),缺一则整面不存在(裸 404);在非 storage-only 形态下打开开关会拒绝启动。
+两个已挂载面均为**双重门控**(storage-only 形态 + 各自开关),缺一则整面不存在(裸 404);在非 storage-only 形态下打开开关会拒绝启动。下面的 traces 开关只是配置，不挂载路由。
 
 - **OCI Distribution `/v2`**:storage-only 且 `[oci].enabled=true` 时挂载,可作容器镜像仓库(`docker login` 复用 push token,无独立 token 服务)。架构与端点事实源见 [`refactoring/oci.md`](./refactoring/oci.md),启用步骤见 [`deploy-trunk.md`](./deploy-trunk.md) 第 10 节。
 - **Agent Session Capture `/api/v1/agent-capture`**：可选能力，接收并查询 Agent 会话、事件、checkpoint、transcript 与文件操作记录。仅在 storage-only 且 `[agent_capture].enabled=true`、配置至少一个 `[[agent_capture.ingest_tokens]]` 时挂载；使用独立 ingest token，不复用 Git push token，也不会由 Git push 自动产生会话记录。配置与配额事实源见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
+- **Traces 归档**：示例配置里的 `[traces].enabled` 保持 `false`。打开它必须由操作者写入 `server_id` UUID，mega2 不会在启动时生成这个 id。这个开关本身不挂载 traces 的 Git 或 HTTP 面。见[配置指南](./configuration.zh.md)。
 
 ## 6. 配合 Libra 使用
 

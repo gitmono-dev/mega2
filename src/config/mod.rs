@@ -147,6 +147,7 @@ impl Config {
             storage_events: StorageEventsConfig::default(),
             github_sync: GithubSyncConfig::default(),
             cedar: CedarConfig::default(),
+            traces: TracesConfig::default(),
         }
     }
 

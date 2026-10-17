@@ -213,6 +213,7 @@ impl TestConfigBuilder {
             storage_events: StorageEventsConfig::default(),
             github_sync: crate::config::GithubSyncConfig::default(),
             cedar: CedarConfig::default(),
+            traces: crate::config::TracesConfig::default(),
         }
     }
 }

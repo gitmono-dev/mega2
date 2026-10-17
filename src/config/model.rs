@@ -73,6 +73,25 @@ pub struct Config {
     /// (no build, no consume of authorization data).
     #[serde(default)]
     pub cedar: CedarConfig,
+    /// Traces archive enablement and deployment identity (MTR-50). Default
+    /// off. `server_id` is an operator UUID, never generated at startup.
+    /// Protocol budgets are not fields of this section.
+    #[serde(default)]
+    pub traces: TracesConfig,
+}
+
+/// `[traces]` enablement and identity. Scope is an optional operator label.
+/// Protocol budgets stay out of config and are rejected as unknown fields.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct TracesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Stable deployment UUID. Required when `enabled` is true.
+    #[serde(default)]
+    pub server_id: Option<String>,
+    /// Optional operator scope label. Not an authorization decision.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20 / GS-26).

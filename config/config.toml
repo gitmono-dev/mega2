@@ -325,6 +325,12 @@ sink = "tracing"
 # (fail-open: a sink write failure is logged but does not block secret access).
 fail_closed = false
 
+# Traces archive (plan-20261015). Stays off until an operator sets enabled and
+# a persistent server_id UUID. The process never generates server_id. scope is
+# an optional operator label. Protocol budgets are not config fields.
+[traces]
+enabled = false
+
 [cedar]
 # Authorization enforcement switch (ADR-UN-01). Three states:
 #   off     = do not build or consume authorization data (default; zero behavior change)

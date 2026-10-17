@@ -296,6 +296,11 @@ endpoint_url = "http://127.0.0.1:29000"
 # 修改需重启.此处 endpoint_url 已是宿主可达地址,无需设置;compose 把
 # endpoint 改成 rustfs:9000,因此默认设为 http://127.0.0.1:29000.
 
+# Traces archive (plan-20261015). Stays off. server_id is required only when
+# enabled, and the process never generates it.
+[traces]
+enabled = false
+
 [cedar]
 # Authorization enforcement: "off" | "shadow" | "enforce".
 # 授权 enforcement 开关.
