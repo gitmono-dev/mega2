@@ -21,7 +21,7 @@ pub(crate) async fn with_generic_history_bootstrap<F: std::future::Future>(futur
 }
 
 #[cfg(test)]
-pub(super) fn generic_history_bootstrap_active() -> bool {
+pub(crate) fn generic_history_bootstrap_active() -> bool {
     GENERIC_HISTORY_BOOTSTRAP.try_with(|_| ()).is_ok()
 }
 
@@ -38,12 +38,15 @@ pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnect
     // through `id_generator::ensure_initialized` (hash/env fallback).
 
     let conn = postgres_connection(db_config).await?;
-    apply_migrations(&conn, false).await?;
-    ensure_queue_control_seed(&conn).await?;
     #[cfg(test)]
     if generic_history_bootstrap_active() {
+        // The database was cloned from the migration-only template.
+        apply_migrations(&conn, false).await?;
+        ensure_queue_control_seed(&conn).await?;
         return Ok(conn);
     }
+    apply_migrations(&conn, false).await?;
+    ensure_queue_control_seed(&conn).await?;
     super::qualified_metadata_family::provision_or_verify_rooted_qualified_family(&conn).await?;
 
     Ok(conn)

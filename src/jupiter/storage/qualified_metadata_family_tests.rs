@@ -361,7 +361,7 @@ async fn q_actual_schema_rr_temp_shadow_and_admitted_ledgers_keep_their_guards()
 #[tokio::test]
 async fn provisioning_locks_candidate_and_registered_union_in_uuid_order() {
     let temp = tempfile::tempdir().unwrap();
-    let (config, _guard) = test_db_config(temp.path()).await;
+    let (config, _guard) = crate::jupiter::tests::test_unprovisioned_db_config(temp.path()).await;
     let core = Database::connect(config.db_url.clone()).await.unwrap();
     Migrator::up(&core, None).await.unwrap();
     let other = Database::connect(config.db_url).await.unwrap();
@@ -472,7 +472,8 @@ async fn q_incomplete_commit_null_binding_and_unsealed_plan_are_rejected() {
 async fn first_registration_cannot_self_sign_a_minimal_or_half_installed_family() {
     for complete in [false, true] {
         let temp = tempfile::tempdir().unwrap();
-        let (config, _guard) = test_db_config(temp.path()).await;
+        let (config, _guard) =
+            crate::jupiter::tests::test_unprovisioned_db_config(temp.path()).await;
         let core = Database::connect(config.db_url).await.unwrap();
         Migrator::up(&core, None).await.unwrap();
         let captured = captured_core(&core).await.unwrap();
@@ -658,7 +659,7 @@ async fn trusted_shape_policy_and_core_validation_functions_are_immutable_or_fai
 #[tokio::test]
 async fn random_q_templates_have_one_trusted_shape_and_changed_composite_signature_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
-    let (config, _guard) = test_db_config(temp.path()).await;
+    let (config, _guard) = crate::jupiter::tests::test_unprovisioned_db_config(temp.path()).await;
     let core = postgres_connection(&config).await.unwrap();
     Migrator::up(&core, None).await.unwrap();
     let captured = captured_core(&core).await.unwrap();

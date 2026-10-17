@@ -60,7 +60,11 @@ const DEFAULT_TEST_DATABASE_URL: &str =
 static TEST_SCHEMA_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn test_db_connection(_temp_dir: &Path) -> DatabaseConnection {
-    let (db_url, schema) = create_test_database_url().await;
+    connect_guarded_database(TestDatabaseKind::Default).await
+}
+
+async fn connect_guarded_database(kind: TestDatabaseKind) -> DatabaseConnection {
+    let (db_url, schema) = create_test_database(kind).await;
 
     let mut opt = ConnectOptions::new(db_url);
     // FIX-OX-26: a loaded `cargo test --all` can push concurrent requests
@@ -79,6 +83,11 @@ pub async fn test_db_connection(_temp_dir: &Path) -> DatabaseConnection {
         // fails the run instead of hanging it.
         .acquire_timeout(std::time::Duration::from_secs(180))
         .connect_timeout(std::time::Duration::from_secs(60))
+        // Same 60s bound as `setup_option`: long enough to keep a session
+        // (and its pg_temp tables) for the test, short enough that an idle
+        // pool slot is returned to the server before the next wave of tests.
+        .idle_timeout(std::time::Duration::from_secs(60))
+        .max_lifetime(std::time::Duration::from_secs(60))
         .sqlx_logging(true)
         .sqlx_logging_level(log::LevelFilter::Debug);
 
@@ -99,8 +108,27 @@ pub async fn test_db_connection(_temp_dir: &Path) -> DatabaseConnection {
 /// The returned [`TestSchemaGuard`] drops the schema; bind it for the whole
 /// test (`let (db_config, _schema) = ...`), because a `DbConfig` cannot carry
 /// it the way the connection from [`test_db_connection`] does.
+/// Migrated schema with no qualified family. Registration tests start here.
+pub async fn test_unprovisioned_db_config(_temp_dir: &Path) -> (DbConfig, TestSchemaGuard) {
+    test_db_config_kind(TestDatabaseKind::MigratedOnly).await
+}
+
+/// Empty schema. Migration tests apply a prefix of the history themselves.
+pub async fn test_blank_db_connection(_temp_dir: &Path) -> DatabaseConnection {
+    connect_guarded_database(TestDatabaseKind::Blank).await
+}
+
+/// Empty schema, as a config. The read-only gate needs a database with no tables.
+pub async fn test_blank_db_config(_temp_dir: &Path) -> (DbConfig, TestSchemaGuard) {
+    test_db_config_kind(TestDatabaseKind::Blank).await
+}
+
 pub async fn test_db_config(_temp_dir: &Path) -> (DbConfig, TestSchemaGuard) {
-    let (db_url, schema) = create_test_database_url().await;
+    test_db_config_kind(TestDatabaseKind::Default).await
+}
+
+async fn test_db_config_kind(kind: TestDatabaseKind) -> (DbConfig, TestSchemaGuard) {
+    let (db_url, schema) = create_test_database(kind).await;
     let config = DbConfig {
         db_type: "postgres".to_owned(),
         db_url,
@@ -221,64 +249,55 @@ fn drop_test_schema(admin_url: &str, schema: &str) {
     };
     let dropped = runtime.block_on(async {
         let admin = Database::connect(admin_connect_options(admin_url)).await?;
-        // Every backend still tagged with this schema belongs to a handle that
-        // has already been let go of (or to a caller that handed the guard
-        // back first), so cutting it loses nothing; waiting for it to close on
-        // its own would park the drop on whatever locks it still holds.
-        admin
-            .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                 WHERE application_name = $1 AND pid <> pg_backend_pid()",
-                [Value::from(schema)],
-            ))
-            .await?;
-        // A bootstrap-created physical Q family belongs to this exact test
-        // core schema. Drop the pair even on panic, before its core FK targets.
-        let registry = admin
-            .query_one_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT pg_catalog.to_regclass($1) IS NOT NULL AS present",
-                [format!("{schema}.mst2_metadata_namespace").into()],
-            ))
-            .await?
-            .unwrap()
-            .try_get::<bool>("", "present")?;
-        if registry {
-            let families = admin
-                .query_all_raw(Statement::from_string(
-                    DatabaseBackend::Postgres,
-                    format!(
-                        "SELECT n.nspname FROM {schema}.mst2_metadata_namespace q
-                 JOIN pg_catalog.pg_namespace n ON n.oid=q.metadata_schema_oid
-                 JOIN pg_catalog.pg_namespace c ON c.oid=q.core_schema_oid
-                 WHERE q.graph_domain='qualified-v1' AND c.nspname='{schema}'
-                   AND q.core_schema='{schema}' AND q.family_identity='v3-rooted-qualified-1'"
-                    ),
-                ))
-                .await?;
-            for family in families {
-                let q_schema: String = family.try_get("", "nspname")?;
-                if !q_schema.starts_with("mst2q_") {
-                    return Err(sea_orm::DbErr::Custom(
-                        "test Q schema escaped its generated prefix".into(),
-                    ));
-                }
-                let quoted = format!("\"{}\"", q_schema.replace('"', "\"\""));
-                admin
-                    .execute_unprepared(&format!(
-                        "SET lock_timeout='120s'; DROP SCHEMA {quoted} CASCADE"
-                    ))
-                    .await?;
-            }
-        }
-        // The timeout turns a lock held by anything else into a leaked schema
-        // and a message, not a hung test run.
-        admin
+        // Stop new sessions attaching while the pool's last backends exit.
+        // Terminating them from here deadlocks with a backend that is still
+        // starting, so the drop itself waits only for sessions that already
+        // exist.
+        let _ = admin
             .execute_unprepared(&format!(
-                "SET lock_timeout = '120s'; DROP SCHEMA IF EXISTS {schema} CASCADE"
+                "ALTER DATABASE {schema} WITH ALLOW_CONNECTIONS false"
             ))
-            .await?;
+            .await;
+        // Only this database. `DROP ... WITH (FORCE)` waits on every backend
+        // that is still starting, including one connecting to a different
+        // database.
+        // timeout 0 signals and returns. Waiting here blocks on a backend
+        // that is still starting, and that backend blocks on this drop.
+        let _ = admin
+            .execute_unprepared(&format!(
+                "SELECT pg_terminate_backend(pid, 0) FROM pg_stat_activity \
+                 WHERE datname = '{schema}' AND pid <> pg_backend_pid()"
+            ))
+            .await;
+        // A barrier wait inside DROP deadlocks with a backend that is still
+        // starting. Cancel that wait so the other session can finish, then
+        // retry once it has gone.
+        let _ = admin
+            .execute_unprepared("SET statement_timeout = '500ms'")
+            .await;
+        let drop_sql = format!("DROP DATABASE IF EXISTS {schema}");
+        let mut dropped = admin.execute_unprepared(&drop_sql).await;
+        for _ in 0..20 {
+            if dropped.is_ok() {
+                break;
+            }
+            let text = format!("{dropped:?}");
+            if !text.contains("being accessed by other users")
+                && !text.contains("statement timeout")
+                && !text.contains("canceling statement")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = admin
+                .execute_unprepared(&format!(
+                    "SELECT pg_terminate_backend(pid, 0) FROM pg_stat_activity \
+                     WHERE datname = '{schema}' AND pid <> pg_backend_pid()"
+                ))
+                .await;
+            dropped = admin.execute_unprepared(&drop_sql).await;
+        }
+        dropped?;
         admin.close().await
     });
     if let Err(err) = dropped {
@@ -286,11 +305,36 @@ fn drop_test_schema(admin_url: &str, schema: &str) {
     }
 }
 
-async fn create_test_database_url() -> (String, TestSchemaGuard) {
+const TEST_TEMPLATE_DATABASE: &str = "mega2_tpl";
+const TEST_TEMPLATE_BASE: &str = "mega2_tpl_base";
+const TEST_TEMPLATE_SCHEMA: &str = "mega2_test_template";
+
+#[derive(Clone, Copy)]
+enum TestDatabaseKind {
+    /// Provisioned template, unless this task is building generic history.
+    Default,
+    /// Migrations applied, qualified family not installed.
+    MigratedOnly,
+    /// No tables. The caller applies the migration prefix it wants to observe.
+    Blank,
+}
+
+async fn create_test_database(kind: TestDatabaseKind) -> (String, TestSchemaGuard) {
     let admin_url =
         std::env::var("MEGA_DATABASE__DB_URL").unwrap_or_else(|_| DEFAULT_TEST_DATABASE_URL.into());
     assert_postgres_url(&admin_url);
-
+    let kind = match kind {
+        TestDatabaseKind::Default
+            if crate::jupiter::storage::init::generic_history_bootstrap_active() =>
+        {
+            TestDatabaseKind::MigratedOnly
+        }
+        other => other,
+    };
+    let provisioned = matches!(kind, TestDatabaseKind::Default);
+    if !matches!(kind, TestDatabaseKind::Blank) {
+        ensure_test_template(&admin_url, provisioned).await;
+    }
     let schema = format!(
         "mega2_test_{}_{}",
         std::process::id(),
@@ -304,27 +348,71 @@ async fn create_test_database_url() -> (String, TestSchemaGuard) {
                 "test PostgreSQL is not available; run `docker compose -f docker/docker-compose.test.yml up -d` first"
             )
         });
-    execute_postgres(&admin, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
-    execute_postgres(&admin, format!("CREATE SCHEMA {schema}")).await;
-    // libtest names the test thread after the test, so a schema that is ever
-    // left behind can be traced back:
-    // `SELECT nspname, obj_description(oid, 'pg_namespace') FROM pg_namespace`.
-    // Straight through sqlx: sea-orm's `debug-print` would put the statement,
-    // test name included, into the tracing output that log-hygiene tests
-    // search for words such as `root_token`.
+    // Cloning the migrated template is the per-test setup. Replaying migrations
+    // here is what made a single fixture take minutes.
+    execute_postgres(&admin, format!("DROP DATABASE IF EXISTS {schema}")).await;
+    if matches!(kind, TestDatabaseKind::Blank) {
+        execute_postgres(&admin, format!("CREATE DATABASE {schema}")).await;
+    } else {
+        // Postgres rejects `CREATE DATABASE ... TEMPLATE` while anything, including
+        // autovacuum, is connected to the template. The template itself disallows
+        // new connections; this retry covers a peer clone that started first.
+        let template = if provisioned {
+            TEST_TEMPLATE_DATABASE
+        } else {
+            TEST_TEMPLATE_BASE
+        };
+        let create_sql = format!("CREATE DATABASE {schema} TEMPLATE {template}");
+        let mut created = false;
+        for attempt in 0..16 {
+            match admin
+                .execute_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    create_sql.clone(),
+                ))
+                .await
+            {
+                Ok(_) => {
+                    created = true;
+                    break;
+                }
+                Err(err) => {
+                    let text = format!("{err:?}");
+                    if text.contains("being accessed by other users") && attempt + 1 < 16 {
+                        tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
+                        continue;
+                    }
+                    panic!("failed to prepare PostgreSQL test schema: {text}");
+                }
+            }
+        }
+        assert!(created, "template {template} stayed busy");
+        // A clone still carries the template's schema name, database oid, and
+        // migration-time UUIDs. Tests address the schema by this database's name.
+        personalize_cloned_database(&admin_url, &schema).await;
+    }
     let owner = std::thread::current()
         .name()
         .unwrap_or("unnamed thread")
         .to_owned();
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "COMMENT ON SCHEMA {schema} IS '{}'",
+        "COMMENT ON DATABASE {schema} IS '{}'",
         owner.replace('\'', "''")
     )))
     .execute(admin.get_postgres_connection_pool())
     .await
-    .expect("failed to label PostgreSQL test schema");
+    .expect("failed to label PostgreSQL test database");
 
-    let db_url = database_url_for_schema(&admin_url, &schema);
+    if matches!(kind, TestDatabaseKind::Blank) {
+        let db = Database::connect(admin_connect_options(&database_url_for_schema(
+            &admin_url, &schema, "public",
+        )))
+        .await
+        .expect("connect blank test database");
+        execute_postgres(&db, format!("CREATE SCHEMA {schema}")).await;
+        db.close().await.expect("close blank test database");
+    }
+    let db_url = database_url_for_schema(&admin_url, &schema, &schema);
     let schema = Arc::new(TestSchema {
         admin_url,
         schema,
@@ -357,13 +445,439 @@ fn assert_postgres_url(db_url: &str) {
     );
 }
 
-fn database_url_for_schema(admin_url: &str, schema: &str) -> String {
+fn database_url_for_schema(admin_url: &str, database: &str, search_path: &str) -> String {
     let mut url = Url::parse(admin_url).expect("MEGA_DATABASE__DB_URL must be a valid URL");
+    url.set_path(&format!("/{database}"));
     url.query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema},public"))
-        // Tags the backends of this schema so `TestSchemaGuard` can find them.
-        .append_pair("application_name", schema);
+        .append_pair(
+            "options",
+            &format!("-csearch_path={search_path},public -clock_timeout=120s"),
+        )
+        // Tags the backends of this database so a drop can find them.
+        .append_pair("application_name", database);
     url.to_string()
+}
+
+async fn personalize_cloned_database(admin_url: &str, database: &str) {
+    let old = TEST_TEMPLATE_SCHEMA;
+    let db = Database::connect(admin_connect_options(&database_url_for_schema(
+        admin_url, database, old,
+    )))
+    .await
+    .expect("connect cloned test database");
+    // Rename keeps the schema oid. Functions and rows still name the template
+    // schema, and every clone shares the migration-time UUIDs, so rewrite both
+    // before any test connection observes them.
+    execute_postgres(&db, format!("ALTER SCHEMA {old} RENAME TO {database}")).await;
+    execute_postgres(&db, format!("SET search_path TO {database}, public")).await;
+    execute_postgres(&db, "SET session_replication_role = replica".to_string()).await;
+    execute_postgres(
+        &db,
+        format!(
+            "UPDATE pg_catalog.pg_proc SET prosrc = replace(prosrc, '{old}', '{database}') \
+             WHERE prosrc LIKE '%{old}%' AND pronamespace IN ( \
+               SELECT oid FROM pg_catalog.pg_namespace \
+               WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema')"
+        ),
+    )
+    .await;
+    execute_postgres(
+        &db,
+        format!(
+            "UPDATE pg_catalog.pg_proc SET proconfig = ARRAY( \
+               SELECT replace(item, '{old}', '{database}') FROM unnest(proconfig) AS item) \
+             WHERE proconfig IS NOT NULL AND EXISTS ( \
+               SELECT 1 FROM unnest(proconfig) AS item WHERE item LIKE '%{old}%') \
+               AND pronamespace IN ( \
+               SELECT oid FROM pg_catalog.pg_namespace \
+               WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema')"
+        ),
+    )
+    .await;
+    execute_postgres(
+        &db,
+        format!(
+            "UPDATE {database}.mst2_metadata_namespace \
+             SET core_schema = CASE WHEN core_schema = '{old}' THEN '{database}' ELSE core_schema END, \
+                 metadata_schema = CASE WHEN metadata_schema = '{old}' THEN '{database}' ELSE metadata_schema END, \
+                 database_name = current_database(), \
+                 database_oid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()), \
+                 mono_lock_key2 = pg_catalog.hashtext('{database}'), \
+                 server_address = pg_catalog.inet_server_addr()::text, \
+                 server_port = pg_catalog.inet_server_port() \
+             WHERE core_schema = '{old}' OR metadata_schema = '{old}'"
+        ),
+    )
+    .await;
+    execute_postgres(
+        &db,
+        format!(
+            r#"DO $$
+             DECLARE r record;
+             BEGIN
+               FOR r IN
+                 SELECT c.relname AS table_name, a.attname AS column_name
+                 FROM pg_catalog.pg_attribute a
+                 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+                 WHERE n.nspname = '{database}' AND c.relkind = 'r' AND a.attnum > 0
+                   AND NOT a.attisdropped AND a.attgenerated = '' AND a.attidentity = '' AND t.typname IN ('text', 'varchar', 'name')
+                   AND NOT (c.relname = 'mst2_metadata_namespace' AND a.attname IN ('core_schema', 'metadata_schema'))
+               LOOP
+                 EXECUTE format('UPDATE %I.%I SET %I = replace(%I::text, %L, %L) WHERE %I::text LIKE %L',
+                   '{database}', r.table_name, r.column_name, r.column_name, '{old}', '{database}',
+                   r.column_name, '%{old}%');
+               END LOOP;
+             END $$;"#
+        ),
+    )
+    .await;
+    execute_postgres(
+        &db,
+        format!(
+            r#"DO $$
+             DECLARE old_storage text; new_storage text := gen_random_uuid()::text; r record;
+                     old_id uuid; new_id uuid;
+             BEGIN
+               IF to_regclass('{database}.mst2_metadata_storage_scope') IS NOT NULL THEN
+                 SELECT storage_uuid INTO old_storage FROM {database}.mst2_metadata_storage_scope WHERE singleton = 1;
+                 IF old_storage IS NOT NULL THEN
+                   FOR r IN
+                     SELECT c.relname AS table_name, a.attname AS column_name
+                     FROM pg_catalog.pg_attribute a
+                     JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                     JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+                     WHERE n.nspname = '{database}' AND c.relkind = 'r' AND a.attnum > 0
+                       AND NOT a.attisdropped AND a.attgenerated = '' AND a.attidentity = '' AND t.typname IN ('text', 'varchar')
+                   LOOP
+                     EXECUTE format('UPDATE %I.%I SET %I = replace(%I, %L, %L) WHERE %I LIKE %L',
+                       '{database}', r.table_name, r.column_name, r.column_name, old_storage, new_storage,
+                       r.column_name, '%' || old_storage || '%');
+                   END LOOP;
+                 END IF;
+               END IF;
+               IF to_regclass('{database}.mst2_metadata_namespace') IS NOT NULL THEN
+                 FOR old_id IN SELECT namespace_uuid FROM {database}.mst2_metadata_namespace WHERE singleton = 1 LOOP
+                   new_id := gen_random_uuid();
+                   UPDATE pg_catalog.pg_proc SET prosrc = replace(prosrc, old_id::text, new_id::text)
+                     WHERE prosrc LIKE '%' || old_id::text || '%'
+                       AND pronamespace IN (
+                         SELECT oid FROM pg_catalog.pg_namespace
+                         WHERE nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema');
+                   FOR r IN
+                     SELECT c.relname AS table_name
+                     FROM pg_catalog.pg_attribute a
+                     JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = '{database}' AND c.relkind = 'r' AND a.attname = 'namespace_uuid'
+                       AND NOT a.attisdropped
+                   LOOP
+                     EXECUTE format('UPDATE %I.%I SET namespace_uuid = %L::uuid WHERE namespace_uuid = %L::uuid',
+                       '{database}', r.table_name, new_id, old_id);
+                   END LOOP;
+                   FOR r IN
+                     SELECT c.relname AS table_name, a.attname AS column_name
+                     FROM pg_catalog.pg_attribute a
+                     JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                     JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+                     WHERE n.nspname = '{database}' AND c.relkind = 'r' AND a.attnum > 0
+                       AND NOT a.attisdropped AND a.attgenerated = '' AND a.attidentity = '' AND t.typname IN ('text', 'varchar')
+                       AND a.attname <> 'namespace_uuid'
+                   LOOP
+                     EXECUTE format('UPDATE %I.%I SET %I = replace(%I, %L, %L) WHERE %I LIKE %L',
+                       '{database}', r.table_name, r.column_name, r.column_name, old_id::text, new_id::text,
+                       r.column_name, '%' || old_id::text || '%');
+                   END LOOP;
+                 END LOOP;
+               END IF;
+             END $$;"#
+        ),
+    )
+    .await;
+    // Rewriting function bodies changes the qualified catalog hash. Store the
+    // hash of the rewritten catalog while triggers are still off.
+    execute_postgres(
+        &db,
+        format!(
+            r#"DO $$
+             DECLARE core_oid oid; q_oid oid; q_ns uuid; q_storage text;
+             BEGIN
+               IF NOT EXISTS (
+                 SELECT 1 FROM {database}.mst2_metadata_namespace WHERE graph_domain = 'qualified-v1'
+               ) THEN
+                 RETURN;
+               END IF;
+               SELECT n.core_schema_oid, n.metadata_schema_oid, n.namespace_uuid, n.metadata_storage_uuid
+                 INTO core_oid, q_oid, q_ns, q_storage
+                 FROM {database}.mst2_metadata_namespace n
+                 WHERE n.graph_domain = 'qualified-v1';
+               UPDATE {database}.mst2_metadata_namespace
+                 SET catalog_fingerprint = mst2_route_family_catalog(core_oid, q_oid)
+                 WHERE graph_domain = 'qualified-v1';
+               UPDATE {database}.mst2_qualified_family_policy
+                 SET authority_catalog = mst2_route_family_catalog(core_oid, 0::oid, q_oid),
+                     expected_shape = mst2_route_family_shape(q_oid, q_ns, q_storage)
+                 WHERE singleton = 1;
+             END $$;"#
+        ),
+    )
+    .await;
+    execute_postgres(&db, "SET session_replication_role = origin".to_string()).await;
+    refresh_unprovisioned_family_policy(&db).await;
+    db.close().await.expect("close cloned test database");
+}
+
+/// The migration records the trusted Q shape, then drops the template schema.
+/// Rewriting function bodies changes that hash, so a database with no real Q
+/// row has to measure it again.
+async fn refresh_unprovisioned_family_policy(db: &DatabaseConnection) {
+    let qualified: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) FROM mst2_metadata_namespace WHERE graph_domain='qualified-v1'"
+                .to_string(),
+        ))
+        .await
+        .expect("count qualified namespaces")
+        .expect("qualified namespace count")
+        .try_get_by_index(0)
+        .expect("qualified namespace count value");
+    if qualified != 0 {
+        return;
+    }
+    let policy_exists: bool = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT to_regclass('mst2_qualified_family_policy') IS NOT NULL".to_string(),
+        ))
+        .await
+        .expect("policy table probe")
+        .expect("policy table probe row")
+        .try_get_by_index(0)
+        .expect("policy table probe value");
+    if !policy_exists {
+        return;
+    }
+    let core = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_schema() AS schema, n.oid::bigint AS oid \
+             FROM pg_catalog.pg_namespace n WHERE n.nspname = current_schema()"
+                .to_string(),
+        ))
+        .await
+        .expect("current schema")
+        .expect("current schema row");
+    let schema: String = core.try_get("", "schema").expect("schema name");
+    let oid: i64 = core.try_get("", "oid").expect("schema oid");
+    let template_uuid = uuid::Uuid::new_v4().to_string();
+    let template_schema = format!("mst2q_{}", template_uuid.replace('-', ""));
+    let template_storage = uuid::Uuid::new_v4().to_string();
+    execute_postgres(db, format!("CREATE SCHEMA \"{template_schema}\"")).await;
+    let template_oid: i64 = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT oid::bigint FROM pg_catalog.pg_namespace WHERE nspname=$1",
+            [template_schema.clone().into()],
+        ))
+        .await
+        .expect("template schema oid")
+        .expect("template schema oid row")
+        .try_get_by_index(0)
+        .expect("template schema oid value");
+    db.execute_unprepared(
+        &crate::jupiter::storage::qualified_metadata_family::render_family(
+            &schema,
+            oid,
+            &template_schema,
+            template_oid,
+            &template_uuid,
+            &template_storage,
+        ),
+    )
+    .await
+    .expect("install temporary family shape");
+    let expected_shape: Vec<u8> = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT \"{schema}\".mst2_route_family_shape($1::bigint::oid,$2::uuid,$3) AS fingerprint"
+            ),
+            [
+                template_oid.into(),
+                template_uuid.into(),
+                template_storage.into(),
+            ],
+        ))
+        .await
+        .expect("template shape")
+        .expect("template shape row")
+        .try_get("", "fingerprint")
+        .expect("template shape value");
+    execute_postgres(db, format!("DROP SCHEMA \"{template_schema}\" CASCADE")).await;
+    let authority: Vec<u8> = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT \"{schema}\".mst2_route_family_catalog({oid},0::oid) AS fingerprint"),
+        ))
+        .await
+        .expect("authority catalog")
+        .expect("authority catalog row")
+        .try_get("", "fingerprint")
+        .expect("authority catalog value");
+    execute_postgres(db, "SET session_replication_role = replica".to_string()).await;
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE mst2_qualified_family_policy \
+         SET expected_shape=$1, authority_catalog=$2 WHERE singleton=1",
+        [expected_shape.into(), authority.into()],
+    ))
+    .await
+    .expect("refresh unprovisioned family policy");
+    execute_postgres(db, "SET session_replication_role = origin".to_string()).await;
+}
+
+fn template_stamp() -> String {
+    use sea_orm_migration::MigratorTrait;
+    crate::jupiter::migration::Migrator::migrations()
+        .last()
+        .map(|migration| format!("{}+clone4", migration.name()))
+        .unwrap_or_else(|| "none+clone4".to_string())
+}
+
+async fn ensure_test_template(admin_url: &str, provisioned: bool) {
+    if provisioned {
+        static READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        let admin_url = admin_url.to_string();
+        READY
+            .get_or_init(|| async move {
+                build_or_reuse_test_template(&admin_url, TEST_TEMPLATE_DATABASE, true).await
+            })
+            .await;
+    } else {
+        static READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        let admin_url = admin_url.to_string();
+        READY
+            .get_or_init(|| async move {
+                build_or_reuse_test_template(&admin_url, TEST_TEMPLATE_BASE, false).await
+            })
+            .await;
+    }
+}
+
+async fn build_or_reuse_test_template(admin_url: &str, database: &str, provisioned: bool) {
+    let admin = Database::connect(admin_connect_options(admin_url))
+        .await
+        .expect("test PostgreSQL is not available");
+    execute_postgres(&admin, "SELECT pg_advisory_lock(872341001)".to_string()).await;
+    let stamp = format!(
+        "{}+{}",
+        template_stamp(),
+        if provisioned { "full" } else { "base" }
+    );
+    let current = admin
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT pg_catalog.shobj_description(oid, 'pg_database') AS stamp \
+                 FROM pg_catalog.pg_database WHERE datname='{database}'"
+            ),
+        ))
+        .await
+        .expect("failed to read test template stamp")
+        .and_then(|row| row.try_get::<String>("", "stamp").ok());
+    if current.as_deref() != Some(stamp.as_str()) {
+        execute_postgres(
+            &admin,
+            format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"),
+        )
+        .await;
+        execute_postgres(&admin, format!("CREATE DATABASE {database}")).await;
+        install_test_template(admin_url, &stamp, database, provisioned).await;
+        execute_postgres(&admin, "SELECT pg_advisory_unlock(872341001)".to_string()).await;
+        admin.close().await.expect("close admin");
+        return;
+    }
+    execute_postgres(&admin, "SELECT pg_advisory_unlock(872341001)".to_string()).await;
+    admin.close().await.expect("close admin");
+}
+
+async fn install_test_template(admin_url: &str, stamp: &str, database: &str, provisioned: bool) {
+    let url = database_url_for_schema(admin_url, database, TEST_TEMPLATE_SCHEMA);
+    let db = Database::connect(admin_connect_options(&url))
+        .await
+        .expect("connect test template");
+    execute_postgres(
+        &db,
+        format!("CREATE SCHEMA IF NOT EXISTS {TEST_TEMPLATE_SCHEMA}"),
+    )
+    .await;
+    execute_postgres(
+        &db,
+        format!("SET search_path TO {TEST_TEMPLATE_SCHEMA}, public"),
+    )
+    .await;
+    apply_migrations(&db, false)
+        .await
+        .expect("migrate test template");
+    if provisioned {
+        crate::jupiter::storage::qualified_metadata_family::provision_or_verify_rooted_qualified_family(
+            &db,
+        )
+        .await
+        .expect("provision test template");
+    }
+    execute_postgres(
+        &db,
+        format!("COMMENT ON SCHEMA {TEST_TEMPLATE_SCHEMA} IS 'mega2-pristine'"),
+    )
+    .await;
+    db.close().await.expect("close template");
+
+    let admin = Database::connect(admin_connect_options(admin_url))
+        .await
+        .expect("rejoin admin");
+    execute_postgres(
+        &admin,
+        format!("ALTER DATABASE {database} SET search_path TO {TEST_TEMPLATE_SCHEMA}, public"),
+    )
+    .await;
+    execute_postgres(
+        &admin,
+        format!("ALTER DATABASE {database} SET synchronous_commit TO off"),
+    )
+    .await;
+    execute_postgres(
+        &admin,
+        format!("ALTER DATABASE {database} SET lock_timeout TO '120s'"),
+    )
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "COMMENT ON DATABASE {database} IS '{}'",
+        stamp.replace('\'', "''")
+    )))
+    .execute(admin.get_postgres_connection_pool())
+    .await
+    .expect("stamp test template");
+    // template0 uses the same setting. `CREATE DATABASE ... TEMPLATE` can still
+    // read it, and autovacuum will not open a session that blocks the clone.
+    execute_postgres(
+        &admin,
+        format!("ALTER DATABASE {database} WITH ALLOW_CONNECTIONS false"),
+    )
+    .await;
+    execute_postgres(
+        &admin,
+        format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{database}' AND pid <> pg_backend_pid()"
+        ),
+    )
+    .await;
+    admin.close().await.expect("close admin");
 }
 
 async fn execute_postgres(db: &DatabaseConnection, sql: String) {
@@ -502,19 +1016,19 @@ mod schema_guard_tests {
 
     use super::*;
 
-    async fn current_schema(db: &DatabaseConnection) -> String {
+    async fn current_database(db: &DatabaseConnection) -> String {
         db.query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
-            "SELECT current_schema()".to_owned(),
+            "SELECT current_database()".to_owned(),
         ))
         .await
-        .expect("current_schema query")
-        .expect("current_schema row")
+        .expect("current_database query")
+        .expect("current_database row")
         .try_get_by_index::<String>(0)
-        .expect("current_schema value")
+        .expect("current_database value")
     }
 
-    async fn schema_exists(schema: &str) -> bool {
+    async fn database_exists(name: &str) -> bool {
         let admin_url = std::env::var("MEGA_DATABASE__DB_URL")
             .unwrap_or_else(|_| DEFAULT_TEST_DATABASE_URL.into());
         let admin = Database::connect(admin_connect_options(&admin_url))
@@ -523,11 +1037,11 @@ mod schema_guard_tests {
         admin
             .query_one_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT 1 FROM pg_namespace WHERE nspname = $1",
-                [Value::from(schema)],
+                "SELECT 1 FROM pg_database WHERE datname = $1",
+                [Value::from(name)],
             ))
             .await
-            .expect("pg_namespace query")
+            .expect("pg_database query")
             .is_some()
     }
 
@@ -536,21 +1050,21 @@ mod schema_guard_tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let db = test_db_connection(temp.path()).await;
         apply_migrations(&db, true).await.expect("migrations");
-        let schema = current_schema(&db).await;
+        let schema = current_database(&db).await;
         assert!(schema.starts_with("mega2_test_"), "{schema}");
-        assert!(schema_exists(&schema).await);
+        assert!(database_exists(&schema).await);
 
         let clone = db.clone();
         drop(db);
         assert!(
-            schema_exists(&schema).await,
-            "a live clone must keep the schema"
+            database_exists(&schema).await,
+            "a live clone must keep the database"
         );
 
         drop(clone);
         assert!(
-            !schema_exists(&schema).await,
-            "schema {schema} outlived its connection"
+            !database_exists(&schema).await,
+            "database {schema} outlived its connection"
         );
     }
 
@@ -560,7 +1074,7 @@ mod schema_guard_tests {
         let failed = tokio::spawn(async move {
             let temp = tempfile::tempdir().expect("temp dir");
             let db = test_db_connection(temp.path()).await;
-            let _ = schema_tx.send(current_schema(&db).await);
+            let _ = schema_tx.send(current_database(&db).await);
             panic!("simulated test failure while holding the connection");
         })
         .await;
@@ -568,8 +1082,8 @@ mod schema_guard_tests {
 
         let schema = schema_rx.await.expect("schema name sent before the panic");
         assert!(
-            !schema_exists(&schema).await,
-            "schema {schema} survived the panic"
+            !database_exists(&schema).await,
+            "database {schema} survived the panic"
         );
     }
 
@@ -585,8 +1099,8 @@ mod schema_guard_tests {
                 let temp = tempfile::tempdir().expect("temp dir");
                 let db = test_db_connection(temp.path()).await;
                 schema_tx
-                    .send(current_schema(&db).await)
-                    .expect("schema name sent");
+                    .send(current_database(&db).await)
+                    .expect("database name sent");
                 // What an `Arc` cycle does to a vault's pool, done on purpose.
                 std::mem::forget(db);
             });
@@ -598,10 +1112,10 @@ mod schema_guard_tests {
             .enable_all()
             .build()
             .expect("runtime")
-            .block_on(schema_exists(&schema));
+            .block_on(database_exists(&schema));
         assert!(
             !exists,
-            "schema {schema} outlived the thread that never released it"
+            "database {schema} outlived the thread that never released it"
         );
     }
 
@@ -612,7 +1126,7 @@ mod schema_guard_tests {
         let db = crate::jupiter::storage::init::database_connection(&db_config)
             .await
             .expect("connection through the config");
-        let schema = current_schema(&db).await;
+        let schema = current_database(&db).await;
         assert_eq!(schema, guard.schema());
 
         // An open transaction with a lock the drop needs: without the
@@ -624,8 +1138,8 @@ mod schema_guard_tests {
 
         drop(guard);
         assert!(
-            !schema_exists(&schema).await,
-            "schema {schema} outlived its guard"
+            !database_exists(&schema).await,
+            "database {schema} outlived its guard"
         );
         drop(txn);
     }

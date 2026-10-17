@@ -201,7 +201,21 @@ async fn terminal_owner_survives_its_deferred_completion_and_prunes_in_a_later_t
 
 #[tokio::test]
 async fn reader_pruning_respects_the_64_owner_budget_with_a_committed_backlog() {
-    let fixture = Fixture::new_with_pg_config(true).await;
+    // Sixty-five serial admissions inside one transaction outlive the default
+    // 600s lease on a loaded database. The guard then rejects a deadline that
+    // is already in the past. The longer lease is test-only, same as FIX-OX-23.
+    let fixture = Fixture::new_in_publication_mode_with_options(
+        true,
+        0,
+        &[],
+        false,
+        true,
+        super::super::FixtureOptions {
+            lease_seconds: Some(3600),
+            ..super::super::FixtureOptions::default()
+        },
+    )
+    .await;
     let initial = q_count(
         &fixture,
         "SELECT high_water FROM {q}.mst2_metadata_reader_issuance",

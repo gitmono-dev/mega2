@@ -1,4 +1,4 @@
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::prelude::MigratorTrait;
 use tracing::log;
 
@@ -42,6 +42,13 @@ async fn apply_migrations_inner(db: &DatabaseConnection, refresh: bool) -> Resul
 }
 
 pub async fn apply_migrations(db: &DatabaseConnection, refresh: bool) -> Result<(), MegaError> {
+    // A per-test database cloned from the migrated template is already at head
+    // and has no user rows. `refresh` would drop that work and replay every
+    // migration. Consume the marker so a later refresh in the same test still
+    // rebuilds.
+    if refresh && consume_cloned_pristine(db).await? {
+        return Ok(());
+    }
     const ATTEMPTS: u32 = 5;
     for attempt in 0..ATTEMPTS {
         match apply_migrations_inner(db, refresh).await {
@@ -58,6 +65,32 @@ pub async fn apply_migrations(db: &DatabaseConnection, refresh: bool) -> Result<
         }
     }
     unreachable!("bounded retry loop returns or errors inside")
+}
+
+async fn consume_cloned_pristine(db: &DatabaseConnection) -> Result<bool, MegaError> {
+    // A schema comment is copied with the database. A custom GUC is not.
+    let Ok(Some(row)) = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_catalog.obj_description(current_schema()::regnamespace, 'pg_namespace') AS marker",
+        ))
+        .await
+    else {
+        return Ok(false);
+    };
+    let marker: String = match row.try_get("", "marker") {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    if marker != "mega2-pristine" {
+        return Ok(false);
+    }
+    db.execute_unprepared(
+        "DO $$ BEGIN EXECUTE format('COMMENT ON SCHEMA %I IS %L', current_schema(), 'mega2-used'); END $$;",
+    )
+        .await
+        .map_err(MegaError::Db)?;
+    Ok(true)
 }
 
 #[cfg(test)]

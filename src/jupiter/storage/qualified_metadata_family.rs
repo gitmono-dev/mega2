@@ -423,7 +423,10 @@ pub(crate) async fn provision_or_verify_rooted_qualified_family(
     connection: &DatabaseConnection,
 ) -> Result<VerifiedQualifiedNamespace, MegaError> {
     let core = captured_core(connection).await?;
-    for attempt in 0..2 {
+    // A peer bootstrap holds the mono advisory lock for the whole schema
+    // install. The SQL lock_timeout stays 5s and fails closed; this loop only
+    // retries that collision and a lost serialization race.
+    for attempt in 0..8 {
         let txn = connection
             .begin_with_config(Some(IsolationLevel::ReadCommitted), None)
             .await?;
@@ -461,7 +464,11 @@ pub(crate) async fn provision_or_verify_rooted_qualified_family(
             .await;
         if let Err(error) = enter {
             txn.rollback().await?;
-            if attempt == 0 && error.to_string().contains("lost bootstrap serialization") {
+            let message = error.to_string();
+            if attempt + 1 < 8
+                && (message.contains("lost bootstrap serialization")
+                    || message.contains("lock timeout"))
+            {
                 continue;
             }
             return Err(error.into());

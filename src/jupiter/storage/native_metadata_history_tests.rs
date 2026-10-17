@@ -520,7 +520,7 @@ async fn history_terminal_wrong_primary_is_unknown_and_current_delete_payload_up
 #[tokio::test]
 async fn history_migration_preserves_preexisting_g1_null_domain_seal_and_composite_mappings() {
     let temp = tempfile::tempdir().unwrap();
-    let (config, _schema) = test_db_config(temp.path()).await;
+    let (config, _schema) = crate::jupiter::tests::test_blank_db_config(temp.path()).await;
     let first = Database::connect(config.db_url.clone()).await.unwrap();
     let second = Database::connect(config.db_url).await.unwrap();
     let at = Migrator::migrations()

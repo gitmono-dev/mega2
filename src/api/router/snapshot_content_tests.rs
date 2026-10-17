@@ -726,29 +726,38 @@ impl Fixture {
         let backend = build_object_storage(&config.object_storage).await.unwrap();
         let counts = Arc::new(ReadCounts::default());
         let (mut storage, schema) = if rebuildable || !generic_history {
-            let (database, schema) = test_db_config(temp.path()).await;
-            config.database = database;
             let assembly = async {
+                // Create the database inside the generic-history scope so it
+                // clones the migration-only template, not the provisioned one.
+                let (database, schema) = test_db_config(temp.path()).await;
+                config.database = database;
                 let connection =
                     crate::jupiter::storage::init::database_connection(&config.database)
                         .await
                         .unwrap();
-                crate::jupiter::storage::Storage::new_with_connection(
+                let storage = crate::jupiter::storage::Storage::new_with_connection(
                     Arc::new(config),
                     Arc::new(connection),
                     backend.clone(),
                 )
                 .await
-                .unwrap()
+                .unwrap();
+                (storage, schema)
             };
-            let storage = if generic_history {
+            let (storage, schema) = if generic_history {
                 crate::jupiter::storage::init::with_generic_history_bootstrap(assembly).await
             } else {
                 assembly.await
             };
             (storage, Some(schema))
         } else {
-            (test_storage_with_config(temp.path(), config).await, None)
+            // This database has to be created inside the generic-history scope.
+            // Otherwise it clones the provisioned template and fails the Q-row guard.
+            let storage = crate::jupiter::storage::init::with_generic_history_bootstrap(
+                test_storage_with_config(temp.path(), config),
+            )
+            .await;
+            (storage, None)
         };
         if generic_history {
             let q_rows:i64=storage.mono_storage().get_connection().query_one_raw(sea_orm::Statement::from_string(

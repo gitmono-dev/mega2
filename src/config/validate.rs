@@ -4882,6 +4882,9 @@ mod tests {
 
     #[test]
     fn github_sync_global_gates() {
+        // validate() reads process env. Hold the same lock as the legacy-mail
+        // test, which temporarily sets MEGA_MAIL__ENABLED.
+        let _env = crate::config::testing::env_lock();
         github_sync_enabled_base()
             .validate()
             .expect("storage-only sha1 plus host key, namespaced ref, and one binding");
@@ -4957,6 +4960,7 @@ mod tests {
 
     #[test]
     fn github_sync_disabled_validation_layers() {
+        let _env = crate::config::testing::env_lock();
         let resolver = CountingResolver {
             calls: AtomicUsize::new(0),
         };
@@ -4993,6 +4997,7 @@ mod tests {
 
     #[test]
     fn github_sync_errors_redact_secret_ref() {
+        let _env = crate::config::testing::env_lock();
         let leaked = distinctive_github_sync_ref();
         let cases: Vec<(&str, Config)> = vec![
             ("disabled-parse", {
@@ -5074,6 +5079,7 @@ mod tests {
 
     #[test]
     fn github_sync_binding_identity() {
+        let _env = crate::config::testing::env_lock();
         github_sync_enabled_base()
             .validate()
             .expect("the GS-04 happy path binding remains valid");
@@ -5108,6 +5114,7 @@ mod tests {
 
     #[test]
     fn github_sync_binding_path() {
+        let _env = crate::config::testing::env_lock();
         let mut relative = github_sync_enabled_base();
         relative.github_sync.bindings[0].path = "project/core".to_string();
         let err = relative.validate().expect_err("relative path");
@@ -5182,6 +5189,7 @@ mod tests {
 
     #[test]
     fn github_sync_binding_remote() {
+        let _env = crate::config::testing::env_lock();
         for invalid in [
             "../repo",
             "./repo",

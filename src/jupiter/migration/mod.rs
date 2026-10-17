@@ -1093,7 +1093,7 @@ mod tests {
     #[tokio::test]
     async fn view_tables_migration_rolls_back_and_recovers() {
         let temp = tempfile::TempDir::new().unwrap();
-        let db = test_db_connection(temp.path()).await;
+        let db = crate::jupiter::tests::test_blank_db_connection(temp.path()).await;
         db.execute_unprepared("CREATE VIEW mega_view_register_log AS SELECT 1 AS id")
             .await
             .unwrap();

@@ -73,7 +73,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::jupiter::{migration::Migrator, tests::test_db_connection};
+    use crate::jupiter::migration::Migrator;
 
     /// `(is_nullable, column_default)` of `merge_queue.requester`, or `None`
     /// when the column does not exist.
@@ -127,7 +127,7 @@ mod tests {
     #[tokio::test]
     async fn un18_up_adds_a_nullable_requester_column_without_a_default() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
-        let db = test_db_connection(temp_dir.path()).await;
+        let db = crate::jupiter::tests::test_blank_db_connection(temp_dir.path()).await;
         apply_migrations_before_merge_queue_drop(&db).await;
 
         let (is_nullable, default) = requester_column(&db)
@@ -143,7 +143,7 @@ mod tests {
     #[tokio::test]
     async fn un18_existing_rows_keep_a_null_requester_and_down_drops_the_column() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
-        let db = test_db_connection(temp_dir.path()).await;
+        let db = crate::jupiter::tests::test_blank_db_connection(temp_dir.path()).await;
         apply_migrations_before_merge_queue_drop(&db).await;
 
         // A row written before any consumer exists reads back as NULL — the

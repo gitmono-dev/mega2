@@ -1716,7 +1716,8 @@ mod readonly_connection {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn un30_the_read_only_connection_runs_no_migration() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let (db_config, _db_schema) = crate::jupiter::tests::test_db_config(temp.path()).await;
+        let (db_config, _db_schema) =
+            crate::jupiter::tests::test_blank_db_config(temp.path()).await;
 
         let read_only = read_only_database_connection(&db_config)
             .await

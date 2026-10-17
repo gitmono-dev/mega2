@@ -1,0 +1,8 @@
+[profile.default]
+# One process per test already pays for a cloned database. Do not multiply
+# that by more workers than the machine has CPUs; the shared Postgres is the
+# limit, not the Rust scheduler.
+test-threads = "num-cpus"
+failure-output = "immediate"
+status-level = "leak"
+retries = 0

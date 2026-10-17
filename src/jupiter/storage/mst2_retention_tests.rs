@@ -545,7 +545,7 @@ async fn t06b_gc_cas_wins_and_new_root_cannot_reference_deleting_node() {
 #[tokio::test]
 async fn t06b_forward_migration_backfills_old_graph_and_enforces_constraints() {
     let temp = tempfile::TempDir::new().unwrap();
-    let db = test_db_connection(temp.path()).await;
+    let db = crate::jupiter::tests::test_blank_db_connection(temp.path()).await;
     let at = Migrator::migrations()
         .iter()
         .position(|migration| migration.name() == "m20261005_000200_harden_mst2_retention_graph")
@@ -603,7 +603,7 @@ async fn t06b_forward_migration_backfills_old_graph_and_enforces_constraints() {
 #[tokio::test]
 async fn t06b_forward_migration_refuses_existing_cycles() {
     let temp = tempfile::TempDir::new().unwrap();
-    let db = test_db_connection(temp.path()).await;
+    let db = crate::jupiter::tests::test_blank_db_connection(temp.path()).await;
     let at = Migrator::migrations()
         .iter()
         .position(|migration| migration.name() == "m20261005_000200_harden_mst2_retention_graph")
