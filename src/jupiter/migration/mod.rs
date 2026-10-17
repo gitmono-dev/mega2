@@ -159,6 +159,7 @@ mod m20261008_000500_fix_mst2_native_runtime;
 mod m20261008_000600_fix_mst2_descriptor_wire;
 mod m20261009_000100_upgrade_qualified_publication_handoff;
 mod m20261015_000100_trace_identity;
+mod m20261015_000200_trace_publication;
 pub(crate) mod qualified_native_runtime_upgrade;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
@@ -356,6 +357,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261008_000600_fix_mst2_descriptor_wire::Migration),
             Box::new(m20261009_000100_upgrade_qualified_publication_handoff::Migration),
             Box::new(m20261015_000100_trace_identity::Migration),
+            Box::new(m20261015_000200_trace_publication::Migration),
         ]
     }
 }
@@ -1357,6 +1359,7 @@ mod tests {
             "m20261008_000600_fix_mst2_descriptor_wire",
             "m20261009_000100_upgrade_qualified_publication_handoff",
             "m20261015_000100_trace_identity",
+            "m20261015_000200_trace_publication",
         ]
         .map(str::to_owned);
         assert_eq!(
