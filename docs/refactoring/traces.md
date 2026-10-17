@@ -65,7 +65,7 @@ v1 固定每个对象最大 64 MiB，metadata/manifest 各最大 1 MiB，压缩 
 
 ## 4. 读模型与关键词索引
 
-身份基础表为 `trace_principal`、`trace_credential_binding`；对象与引用基础表为 `trace_target`、`trace_stream`、`trace_ingest_attempt`、`trace_object`、`trace_ref_update`。派生读模型为 `trace_checkpoint`、`trace_session`、`trace_resource`、`trace_code_link` 与 `trace_fragment`。旧 Capture 维护另有 `trace_legacy_writer_fence`、`trace_legacy_purge`、`trace_legacy_purge_item`，只服务第 7 节，不属于 Agent 读模型，也不随旧 12 表删除；其显式 DROP migrator 使用独立 `traces_maintenance_schema_migrations` ledger。表的外键/唯一约束以 stream 为边界；每个 checkpoint ID 在 stream 内唯一且不可变。`trace_ref_update` 同时提供持久索引任务，具备 claim lease、幂等处理、重试/backoff、失败状态和恢复入口；不能依赖仅内存通知。
+身份基础表为 `trace_principal`、`trace_credential_binding`；对象与引用基础表为 `trace_target`、`trace_stream`、`trace_ingest_attempt`、`trace_object`、`trace_ref_update`。其中 `trace_principal`、`trace_credential_binding` 与 `trace_target` 由迁移 `m20261015_000100_trace_identity` 创建，`down` 为 no-op。派生读模型为 `trace_checkpoint`、`trace_session`、`trace_resource`、`trace_code_link` 与 `trace_fragment`。旧 Capture 维护另有 `trace_legacy_writer_fence`、`trace_legacy_purge`、`trace_legacy_purge_item`，只服务第 7 节，不属于 Agent 读模型，也不随旧 12 表删除；其显式 DROP migrator 使用独立 `traces_maintenance_schema_migrations` ledger。表的外键/唯一约束以 stream 为边界；每个 checkpoint ID 在 stream 内唯一且不可变。`trace_ref_update` 同时提供持久索引任务，具备 claim lease、幂等处理、重试/backoff、失败状态和恢复入口；不能依赖仅内存通知。
 
 后台 worker 从经过验证的原始 manifest 重组有序 transcript parts；支持当前 manifest v1、metadata v2 和明确登记的 lifecycle schema。校验每 part path/OID/type/byte_len、总长度和 content hash。未知 schema 保存归档并标 `unsupported`；已知 schema 语义损坏标 `invalid`。原始 Git 闭包/不变性违反仍在 push 前拒绝。索引只推进到已经完整处理的连续 ref sequence，重启可重放，失败不得跳过后记全部 indexed。
 

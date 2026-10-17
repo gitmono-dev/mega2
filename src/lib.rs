@@ -45,6 +45,13 @@ pub mod import_repo_ops {
     pub use crate::ceres::pack::import_repo::detach_for_integration_test;
 }
 
+/// Internal seam so schema integration tests can run the real migration
+/// runner. Not a product CLI or API.
+#[doc(hidden)]
+pub mod traces_migration_ops {
+    pub use crate::jupiter::migration::apply_migrations;
+}
+
 /// Internal seam for IT bridging promote (UN-35) until `authz-audit promote`
 /// lands in UN-37. Not a supported API.
 #[doc(hidden)]

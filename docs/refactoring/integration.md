@@ -57,6 +57,7 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_storage_events_runtime` | storage-only 出站事件关停接线进程级门（plan-20260912 / WH-13）：默认 disabled 的 `service http` SIGINT 优雅退出并记录 `storage_events_shutdown_complete`、占用端口启动失败仍经清理尾段、`service multi http` SIGINT 退出、`config validate` 无清理日志的 AC7 回归；WH-11 `secret_binding`：enabled+valid secret 经 `config secret set` 种子后启动/SIGINT 退出、enabled+missing 与 wrong-namespace 快速失败且日志无 SecretRef URI（脱敏）、disabled+dangling ref 正常启动 | PostgreSQL, Redis；`--test-threads=1` |
 | `integration_storage_events_git` | storage-only 出站 `repo.push` 进程级门（plan-20260912 / WH-03）：enabled+已播种 secret 下真实 host-git trunk push 落地、真实运输记录一次有界投递尝试（类别日志）、SIGINT 经清理尾段退出；review 形态拒绝 enabled；review 分支 push 建 CL 回归。WH-15 追加：每条 emitter 投递/drop 行带播种的 `installation_id`、drop 行不命中投递过滤器、被静态过滤的 seed push 恰好产生一条 `dropped_filter` 行（API 写用例为零条） | PostgreSQL, Redis；host git；`--test-threads=1` |
 | `integration_github_sync` | outbound GitHub-sync SSH session（plan-20260916 / GS-07）：`ssh_connect_authenticates` 钉住回环主机钥并对本地 russh 服务端完成 Ed25519 公钥认证 | 回环 only；不连 GitHub；`--test-threads=1` |
+| `integration_traces` filter `schema_identity_` | traces 身份 schema（plan-20261015 / MTR-02）：`schema_identity_principal_persists`、`schema_identity_namespaces_are_independent`、`schema_identity_path_rebuild_keeps_code_and_capture_tables`。经 `traces_migration_ops::apply_migrations` 跑真实 runner，再按公开实体与 SQL 观察 | PostgreSQL；`--test-threads=1` |
 
 ## Storage-only compose black-box coverage
 
@@ -142,6 +143,12 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 - **元数据保持（UN-48）**：owner / mode / ACL / xattr；写后 `stat`/`getfacl`/xattr 比对，不符即失败（可用 `KILL_SWITCH_META_VERIFY_FAIL` 注入）。
 - **自测**：`bash scripts/authz_kill_switch.sh --selftest`（… + UN-42×6 + UN-44×7 = **58/58**；fsync stub = `scripts/authz_kill_switch_fsync_stub.sh`）。需可用的 `KILL_SWITCH_BIN` 或 `target/debug/mega2`；compose/preflight 需 `yq`（或 `KILL_SWITCH_YQ`）；缺 `getfattr` 时自测会在临时 PATH 放入存在性 stub。
 - **发布**：REL-02 十子卡本地提交后由 UN-45 原子发布为 **v0.2.65**（脚本入口 / 三分支 / 拓扑绑定 / 失败终态安全方向见上；降级 = 不执行该脚本）。
+
+## 迁移覆盖：traces 身份（MTR-02）
+
+`m20261015_000100_trace_identity` 创建 `trace_principal`、`trace_credential_binding` 与 `trace_target`。principal id、binding id 和 target id 都是服务端指定的 UUID 文本。同一 credential id 可以在 `static_push_token` 与 `mono_account` 两个 namespace 各有一条活动绑定；同一 namespace 的活动绑定唯一。`retired_at` 写入后，同一 namespace 与 credential id 才能再次绑定。同一 `project_path` 同时只有一个 `active` target；停用后再插入是新的 target id，旧行保留。`target_kind` 只接受 `native` 或 `import`。
+
+恢复是 forward-only。`down` 是空实现，不删除这三张表，也不改 `git_repo` 或 `agent_capture_session`。库内契约在各自 `db_contract`，外部观察在 `integration_traces` 的 `schema_identity_`。
 
 ## 迁移覆盖：`mega_cl.link` 唯一索引（UN-10）
 
