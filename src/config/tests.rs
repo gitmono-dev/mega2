@@ -817,3 +817,23 @@ fn protocol_limits_76_constants_match_contract_and_reject_override() {
     assert!(text.contains("max_object_bytes"), "{text}");
     assert!(text.contains("max_metadata_bytes"), "{text}");
 }
+
+#[test]
+fn protocol_limits_77_constants_match_contract_and_reject_override() {
+    assert_eq!(super::TracesProtocolLimits::MAX_MANIFEST_BYTES, 1_048_576);
+    assert_eq!(super::TracesProtocolLimits::MAX_PACK_BYTES, 536_870_912);
+
+    let value = toml::from_str::<toml::Value>(
+        r#"
+        [traces]
+        max_manifest_bytes = 1
+        max_pack_bytes = 1
+        "#,
+    )
+    .unwrap();
+    let err = crate::config::validate::reject_unknown_fields(&value)
+        .expect_err("budget overrides stay unknown");
+    let text = err.to_string();
+    assert!(text.contains("max_manifest_bytes"), "{text}");
+    assert!(text.contains("max_pack_bytes"), "{text}");
+}
