@@ -796,3 +796,24 @@ fn github_sync_rejects_unknown_key() {
         "{binding_err}"
     );
 }
+
+#[test]
+fn protocol_limits_76_constants_match_contract_and_reject_override() {
+    assert_eq!(super::TracesProtocolLimits::MAX_OBJECT_BYTES, 67_108_864);
+    assert_eq!(super::TracesProtocolLimits::MAX_METADATA_BYTES, 1_048_576);
+    assert_eq!(std::mem::size_of::<super::TracesProtocolLimits>(), 0);
+
+    let value = toml::from_str::<toml::Value>(
+        r#"
+        [traces]
+        max_object_bytes = 1
+        max_metadata_bytes = 1
+        "#,
+    )
+    .unwrap();
+    let err = crate::config::validate::reject_unknown_fields(&value)
+        .expect_err("budget overrides stay unknown");
+    let text = err.to_string();
+    assert!(text.contains("max_object_bytes"), "{text}");
+    assert!(text.contains("max_metadata_bytes"), "{text}");
+}

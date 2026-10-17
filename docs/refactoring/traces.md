@@ -95,7 +95,7 @@ v1 固定每个对象最大 64 MiB，metadata/manifest 各最大 1 MiB，压缩 
 
 `/capabilities` 的搜索能力字段固定为 `search_ready: boolean`、`cjk_index_supported: boolean`、`bounded_scan_supported: boolean`。`search_ready=true` 表示当前部署的查询服务、所需扩展及索引版本通过 readiness 检查，能够按预算执行查询；false 时同时返回稳定 `search_unavailable_reason` 字符串。`cjk_index_supported=false` 不使搜索整体不可用，CJK 查询走 `bounded_scan_supported=true` 的预算扫描。它们不替代每个 stream 的索引水位，也不代表全部历史已有索引。
 
-`/capabilities` 的 `limits` 对象逐项公开下表 22 个 `u64` 字段。v1 的 22 项均为固定协议常量；广告与实际准入、请求默认及响应预算引用同一常量来源，不提供 operator override，TOML 中未声明的预算字段／namespace 按现有未知字段规则拒绝。请求仍可显式选择 `limit`／`max_bytes`，必须在固定边界内；省略时使用固定协议默认值。修改常量须先修订此契约、两份计划及兼容性门。KiB/MiB 均按 1024 进制。
+`/capabilities` 的 `limits` 对象逐项公开下表 22 个 `u64` 字段。v1 的 22 项均为固定协议常量；广告与实际准入、请求默认及响应预算引用同一常量来源，不提供 operator override，TOML 中未声明的预算字段／namespace 按现有未知字段规则拒绝。请求仍可显式选择 `limit`／`max_bytes`，必须在固定边界内；省略时使用固定协议默认值。修改常量须先修订此契约、两份计划及兼容性门。KiB/MiB 均按 1024 进制。当前代码只声明 `TracesProtocolLimits::MAX_OBJECT_BYTES` 与 `TracesProtocolLimits::MAX_METADATA_BYTES`。表中其余常量由后续卡逐项声明，本段不提前定义。
 
 | limits 字段 | 固定值 | 唯一常量来源 | 预算性质 |
 |---|---|---|---|

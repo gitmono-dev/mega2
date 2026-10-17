@@ -94,6 +94,17 @@ pub struct TracesConfig {
     pub scope: Option<String>,
 }
 
+/// Fixed traces protocol budgets. Zero-sized and not a `[traces]` field.
+/// Later cards add the remaining contract constants. TOML cannot override these.
+pub enum TracesProtocolLimits {}
+
+impl TracesProtocolLimits {
+    /// `limits.max_object_bytes` from the traces contract.
+    pub const MAX_OBJECT_BYTES: u64 = 67_108_864;
+    /// `limits.max_metadata_bytes` from the traces contract.
+    pub const MAX_METADATA_BYTES: u64 = 1_048_576;
+}
+
 /// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20 / GS-26).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GithubSyncConfig {
