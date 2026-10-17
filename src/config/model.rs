@@ -107,6 +107,10 @@ impl TracesProtocolLimits {
     pub const MAX_MANIFEST_BYTES: u64 = 1_048_576;
     /// `limits.max_pack_bytes` from the traces contract.
     pub const MAX_PACK_BYTES: u64 = 536_870_912;
+    /// `limits.max_decoded_bytes` from the traces contract.
+    pub const MAX_DECODED_BYTES: u64 = 1_073_741_824;
+    /// `limits.max_objects` from the traces contract.
+    pub const MAX_OBJECTS: u64 = 100_000;
 }
 
 /// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20 / GS-26).
