@@ -111,6 +111,10 @@ impl TracesProtocolLimits {
     pub const MAX_DECODED_BYTES: u64 = 1_073_741_824;
     /// `limits.max_objects` from the traces contract.
     pub const MAX_OBJECTS: u64 = 100_000;
+    /// `limits.max_new_commits` from the traces contract.
+    pub const MAX_NEW_COMMITS: u64 = 10_000;
+    /// `limits.max_delta_depth` from the traces contract.
+    pub const MAX_DELTA_DEPTH: u64 = 64;
 }
 
 /// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20 / GS-26).
