@@ -955,3 +955,26 @@ fn protocol_limits_82_constants_match_contract_and_reject_override() {
     assert!(text.contains("query_bytes_max"), "{text}");
     assert!(text.contains("query_timeout_ms"), "{text}");
 }
+
+#[test]
+fn protocol_limits_83_constants_match_contract_and_reject_override() {
+    assert_eq!(super::TracesProtocolLimits::RESPONSE_BYTES_MAX, 1_048_576);
+    assert_eq!(super::TracesProtocolLimits::CANDIDATE_FRAGMENTS_MAX, 2_000);
+    assert_eq!(super::TracesProtocolLimits::SCAN_BYTES_MAX, 8_388_608);
+
+    let value = toml::from_str::<toml::Value>(
+        r#"
+        [traces]
+        response_bytes_max = 1
+        candidate_fragments_max = 1
+        scan_bytes_max = 1
+        "#,
+    )
+    .unwrap();
+    let err = crate::config::validate::reject_unknown_fields(&value)
+        .expect_err("budget overrides stay unknown");
+    let text = err.to_string();
+    assert!(text.contains("response_bytes_max"), "{text}");
+    assert!(text.contains("candidate_fragments_max"), "{text}");
+    assert!(text.contains("scan_bytes_max"), "{text}");
+}

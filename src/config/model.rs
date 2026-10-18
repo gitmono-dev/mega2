@@ -137,6 +137,12 @@ impl TracesProtocolLimits {
     pub const QUERY_BYTES_MAX: u64 = 256;
     /// `limits.query_timeout_ms` from the traces contract.
     pub const QUERY_TIMEOUT_MS: u64 = 2_000;
+    /// `limits.response_bytes_max` from the traces contract.
+    pub const RESPONSE_BYTES_MAX: u64 = 1_048_576;
+    /// `limits.candidate_fragments_max` from the traces contract.
+    pub const CANDIDATE_FRAGMENTS_MAX: u64 = 2_000;
+    /// `limits.scan_bytes_max` from the traces contract.
+    pub const SCAN_BYTES_MAX: u64 = 8_388_608;
 }
 
 /// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20 / GS-26).
