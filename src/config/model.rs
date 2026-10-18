@@ -115,6 +115,10 @@ impl TracesProtocolLimits {
     pub const MAX_NEW_COMMITS: u64 = 10_000;
     /// `limits.max_delta_depth` from the traces contract.
     pub const MAX_DELTA_DEPTH: u64 = 64;
+    /// `limits.max_tree_depth` from the traces contract.
+    pub const MAX_TREE_DEPTH: u64 = 64;
+    /// `limits.ingest_timeout_seconds` from the traces contract.
+    pub const INGEST_TIMEOUT_SECONDS: u64 = 300;
 }
 
 /// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20 / GS-26).
