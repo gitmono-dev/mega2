@@ -81,7 +81,7 @@ mega2 是服务 Agent 工作流的第二代 Mega 引擎；第一代 Mega 项目�
 三类存储各司其职，全部经 `jupiter` 层访问，API/handler 不直接碰 `sea_orm`（[`../AGENTS.md`](../AGENTS.md) 约定）：
 
 1. **元数据：PostgreSQL + sea-orm**（测试可用 SQLite）。表结构实体在 `src/callisto/`（一表一文件），其上每个领域一个 `*Storage` 包装器（`src/jupiter/storage/`，如 `mono_storage`、`git_db_storage`、`lfs_db_storage`、`push_queue_storage`、`vault_storage`），统一由 `Storage`（`src/jupiter/storage/mod.rs`）聚合，共享一个 `BaseStorage` 连接。schema 演进走 `src/jupiter/migration/` 的 sea-orm-migration migrator。
-2. **对象内容：可插拔对象存储**。Git 对象与 LFS 对象的二进制内容不入库，由 `build_object_storage`（`src/jupiter/storage/object_storage.rs`）经 orbit 工厂按 `[object_storage].storage_type` 构建后端：local / S3-compatible / GCS。契约类型在 `src/orbit_api/`，实现在 `src/orbit/`。S3 系凭证支持 `vault://` SecretRef（见第 5 节）。LFS 大文件的 FastCDC 分块见 [`refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md)。
+2. **对象内容：可插拔对象存储**。Git 对象与 LFS 对象的二进制内容不入库，由 `build_object_storage`（`src/jupiter/storage/object_storage.rs`）经 orbit 工厂按 `[object_storage].storage_type` 构建后端：local / S3-compatible / GCS。契约类型在 `src/orbit_api/`，实现在 `src/orbit/`。S3 系凭证支持 `vault://` SecretRef（见第 5 节）。LFS 大文件的 FastCDC 分块见 [`refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md)。Traces 的原始 Git 对象使用独立的 `traces` namespace，不存放在 `git` 或 `agent` 下；key 布局见 [`refactoring/traces.md`](./refactoring/traces.md) 第 3 节。
 3. **Redis：缓存与分布式锁，不是队列**。git 对象缓存（`GitObjectCache`）与 `RedLock` 互斥锁在 Redis（`src/jupiter/redis/`）；写入队列是 Postgres 的 `push_queue` 表（见第 4 节），Redis 侧没有 FIFO/持久化队列。连接经 `connection-manager` 共享，`redis.url` 支持 SecretRef。
 
 深入阅读：[`refactoring/orbit.md`](./refactoring/orbit.md)（对象存储契约与后端）、[`refactoring/storage-events.md`](./refactoring/storage-events.md)（存储事件外发）、[`refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md)。

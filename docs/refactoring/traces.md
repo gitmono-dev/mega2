@@ -61,6 +61,8 @@ traces/v1/<stream-uuid>/objects/<sha1|sha256>/<OID shard>
 traces/v1/staging/<ingest-uuid>/...
 ```
 
+`traces` 是独立对象 namespace（稳定字符串 `traces`），不与 `git` 或 `agent` 共用。该 namespace 下的逻辑 key 保持完整，不按对象 key 的前 6 字节再切片，所以上面的布局就是后端路径 `traces/` 之后的内容。OID shard 由服务端从 OID 文本派生：短于 6 个 ASCII 字节时 OID 本身作为最后一段；更长时为 `aa/bb/cc/<剩余十六进制>`，恰好 6 字节时写成 `aa/bb/cc`，不产生空路径段。stream id 使用小写标准 UUID，hash kind 只接受 `sha1` 或 `sha256`，OID 只接受十六进制并按小写归档。相同字节再次写入同一 stream、hash kind 与 OID 时保持已有 payload；不同字节被拒绝。同一进程内的并发写入按这个规则串行，后到的冲突不会覆盖先写入的字节。本归档不插入 `trace_object` 行，也不要求 stream 行已经存在。
+
 对象 key 由服务端派生，客户端不能指定 object key。对象字节可以在同一 stream 内去重；查询或 delta base 不允许从全局 `git/` 或别的 stream 回退查找。字节已落存储不等于对象已对客户端可见；只有已发布 membership 且从本 stream ref 可达的对象才可成为读/pack/want/delta 的依据。
 
 接收顺序固定：认证和目标授权 → 有界 quarantine 解包 → 校验 OID/闭包/单父 FF 与 checkpoint 不可变 → 所有新对象 durable → 单 DB 事务重新核对 old tip、principal/凭据有效性、目标 active/binding generation 和当前项目写权限，再创建必要 scope、发布 membership、CAS 更新 ref、写 ref journal/outbox → 返回 Git `ok` → 后台索引。权限/目标变更与发布使用已有权威写入屏障或版本 CAS，不可在解包时的旧授权上无条件发布。第一次创建 stream 也遵守此事务顺序；并发首次 push 由自然键唯一约束和 tip CAS 确定唯一赢家。

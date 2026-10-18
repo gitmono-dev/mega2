@@ -17,6 +17,8 @@ pub struct ObjectKey {
     /// - log: path like 2025/03/worker.log
     /// - media: `fastcdc-v2020-32k/{scope}/{kind}/{id}` (unsharded under
     ///   namespace `media`; legacy `v1/…` retained unread, C-08)
+    /// - traces: `v1/<stream-uuid>/objects/<sha1|sha256>/<oid shard>`
+    ///   (unsharded under namespace `traces`)
     pub key: String,
 }
 
@@ -25,14 +27,19 @@ impl ObjectKey {
     ///
     /// The output is a **stable storage-format contract** (see
     /// `docs/compatibility.md`); any change is a breaking storage-format change
-    /// that requires a migration. There are two stable branches:
+    /// that requires a migration. There are three stable branches:
     ///
-    /// - keys shorter than 6 bytes are stored unsharded as `<namespace>/<key>`;
+    /// - `media`, `agent`, and `traces` keep `<namespace>/<key>` at every length,
+    ///   so a traces logical key is not sliced into `aa/bb/cc`;
+    /// - other keys shorter than 6 bytes are stored unsharded as `<namespace>/<key>`;
     /// - otherwise the key is sharded as `<namespace>/aa/bb/cc/<rest>`.
     ///
-    /// The namespace prefix must never change for either branch.
+    /// The namespace prefix must never change for any branch.
     pub fn default_sharding(&self) -> String {
-        if self.namespace == ObjectNamespace::Media || self.namespace == ObjectNamespace::Agent {
+        if matches!(
+            self.namespace,
+            ObjectNamespace::Media | ObjectNamespace::Agent | ObjectNamespace::Traces
+        ) {
             return format!("{}/{}", self.namespace, self.key);
         }
         let id = &self.key;
@@ -124,6 +131,8 @@ pub enum ObjectNamespace {
     Agent,
     /// Immutable receipts minted by the full-stream chunk-map verifier.
     ChunkMapReceipt,
+    /// Raw traces Git objects (`docs/refactoring/traces.md` §3).
+    Traces,
 }
 
 impl ObjectNamespace {
@@ -138,6 +147,7 @@ impl ObjectNamespace {
             ObjectNamespace::Media => "media",
             ObjectNamespace::Agent => "agent",
             ObjectNamespace::ChunkMapReceipt => "chunk-map-receipt",
+            ObjectNamespace::Traces => "traces",
         }
     }
 }
@@ -626,6 +636,7 @@ mod tests {
             ObjectNamespace::Media,
             ObjectNamespace::Agent,
             ObjectNamespace::ChunkMapReceipt,
+            ObjectNamespace::Traces,
         ] {
             let key = ObjectKey {
                 namespace: ns,
@@ -653,6 +664,57 @@ mod tests {
             ObjectNamespace::ChunkMapReceipt.to_string(),
             "chunk-map-receipt"
         );
+        assert_eq!(ObjectNamespace::Traces.to_string(), "traces");
+    }
+
+    #[test]
+    fn traces_namespace_is_not_agent() {
+        assert_ne!(ObjectNamespace::Traces, ObjectNamespace::Agent);
+        assert_ne!(
+            ObjectNamespace::Traces.to_string(),
+            ObjectNamespace::Agent.to_string()
+        );
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Traces,
+            key: "v1/11111111-1111-4111-8111-111111111111/objects/sha1/ab/cd/ef/0123".to_string(),
+        };
+        let path = key.default_sharding();
+        assert!(path.starts_with("traces/"), "{path}");
+        assert!(!path.starts_with("agent/"), "{path}");
+        assert_eq!(
+            path,
+            "traces/v1/11111111-1111-4111-8111-111111111111/objects/sha1/ab/cd/ef/0123"
+        );
+    }
+
+    #[test]
+    fn traces_namespace_is_not_git() {
+        assert_ne!(ObjectNamespace::Traces, ObjectNamespace::Git);
+        assert_ne!(
+            ObjectNamespace::Traces.to_string(),
+            ObjectNamespace::Git.to_string()
+        );
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Traces,
+            key: "v1/11111111-1111-4111-8111-111111111111/objects/sha256/ab/cd/ef/0123".to_string(),
+        };
+        let path = key.default_sharding();
+        assert!(path.starts_with("traces/"), "{path}");
+        assert!(!path.starts_with("git/"), "{path}");
+        assert!(!path.contains("/git/"), "{path}");
+    }
+
+    #[test]
+    fn traces_namespace_keeps_logical_key_unsharded() {
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Traces,
+            key: "v1/11111111-1111-4111-8111-111111111111/objects/sha1/abcdef".to_string(),
+        };
+        assert_eq!(
+            key.default_sharding(),
+            "traces/v1/11111111-1111-4111-8111-111111111111/objects/sha1/abcdef"
+        );
+        assert!(key.validate().is_ok());
     }
 
     #[test]

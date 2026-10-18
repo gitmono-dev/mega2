@@ -28,6 +28,7 @@ pub mod oci_db_storage;
 pub mod push_queue_storage;
 pub(crate) mod qualified_metadata_family;
 pub mod stg_common;
+pub mod trace_object_storage;
 pub mod trace_target_storage;
 pub mod user_storage;
 pub mod vault_storage;
