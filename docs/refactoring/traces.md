@@ -46,6 +46,8 @@ Repo locator 必须先判定 Traces，再进入 Native/ImportRepo。TraceRepo �
 
 权限来源以当前 Mega2 实现为准：静态 token 对 target 当前正规化路径使用 `token_covers_repo`/配置 `paths` 范围门；Mono 账户消费现行 `viewRepo` / `pushRepo`、root Repository resource 与已验证 entity snapshot。当前没有独立的 target ACL 表，本计划不假定每个 target 已有一套独立 ACL。新 traces auth helper 统一承担身份绑定、路径范围和 read/write 动作校验，HTTP/SSH/查询均调用它；现有 code anonymous 门、只用于 CL 的 `cedar_guard` 和 `UnprotectedRequest` 不能作为 traces 权限放行依据。可信身份/snapshot/动作判定缺失时 fail-closed。
 
+当前 helper 是 `ceres::traces::auth::authorize_traces`。静态 push token 的凭据 id 是 token 名称，不是 secret；只匹配 `static_push_token` 命名空间中未退役的绑定，再对 canonical target path 调用 `token_covers_repo`。Mono 账户只匹配 `mono_account` 命名空间，读评估 `viewRepo`，写评估 `pushRepo`，资源是 root Repository 快照。快照缺失、`enforcement` 不消费快照，或 Cedar 拒绝时，traces 拒绝；`off` / `shadow` 对代码推送的放行不放行 traces。匿名调用得到未认证结果。没有绑定、不是 owner，或缺少目标读/写权限时得到不可区分的拒绝。提交作者不参与判定。普通代码读取仍走既有匿名读门，普通代码写入仍走既有 token 路径门和 `decide_push`；没有 traces 绑定不改变这些代码结果。HTTP、SSH 与查询路由接入该 helper 由后续卡完成。
+
 ## 3. 原始对象存储、接收与恢复
 
 原始 Git payload 是证据事实源。commit/tree/blob/tag 均保留原始 bytes，OID 根据 Git kind/length/payload 重新校验；不能用现有 commit/tree ORM 模型重序列化替代原始 bytes。SHA-1/SHA-256 的协商、长度与包头必须一致，禁止跨 hash domain fallback。
