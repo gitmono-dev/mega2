@@ -900,3 +900,29 @@ fn protocol_limits_80_constants_match_contract_and_reject_override() {
     assert!(text.contains("max_tree_depth"), "{text}");
     assert!(text.contains("ingest_timeout_seconds"), "{text}");
 }
+
+#[test]
+fn protocol_limits_81_constants_match_contract_and_reject_override() {
+    assert_eq!(super::TracesProtocolLimits::METADATA_LIMIT_DEFAULT, 50);
+    assert_eq!(super::TracesProtocolLimits::SEARCH_LIMIT_DEFAULT, 20);
+    assert_eq!(super::TracesProtocolLimits::METADATA_LIMIT_MAX, 200);
+    assert_eq!(super::TracesProtocolLimits::SEARCH_LIMIT_MAX, 100);
+
+    let value = toml::from_str::<toml::Value>(
+        r#"
+        [traces]
+        metadata_limit_default = 1
+        search_limit_default = 1
+        metadata_limit_max = 1
+        search_limit_max = 1
+        "#,
+    )
+    .unwrap();
+    let err = crate::config::validate::reject_unknown_fields(&value)
+        .expect_err("budget overrides stay unknown");
+    let text = err.to_string();
+    assert!(text.contains("metadata_limit_default"), "{text}");
+    assert!(text.contains("search_limit_default"), "{text}");
+    assert!(text.contains("metadata_limit_max"), "{text}");
+    assert!(text.contains("search_limit_max"), "{text}");
+}

@@ -119,6 +119,14 @@ impl TracesProtocolLimits {
     pub const MAX_TREE_DEPTH: u64 = 64;
     /// `limits.ingest_timeout_seconds` from the traces contract.
     pub const INGEST_TIMEOUT_SECONDS: u64 = 300;
+    /// `limits.metadata_limit_default` from the traces contract.
+    pub const METADATA_LIMIT_DEFAULT: u64 = 50;
+    /// `limits.search_limit_default` from the traces contract.
+    pub const SEARCH_LIMIT_DEFAULT: u64 = 20;
+    /// `limits.metadata_limit_max` from the traces contract.
+    pub const METADATA_LIMIT_MAX: u64 = 200;
+    /// `limits.search_limit_max` from the traces contract.
+    pub const SEARCH_LIMIT_MAX: u64 = 100;
 }
 
 /// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20 / GS-26).
