@@ -42,6 +42,7 @@ use crate::common::errors::{
 | `ContextError` | Cedar policy context 构建、schema、policy、validation 和 JSON 错误。 | `src/contract/policy/context.rs` |
 | `SaturnContextError` | Cedar 授权请求构造和授权拒绝错误。 | `src/contract/policy/context.rs` |
 | `BuckError` | Buck session/upload 业务错误，作为 `MegaError::Buck` 被 `ApiError` 映射为精确 HTTP status。 | Buck service/router |
+| `TracesError` | traces 稳定错误码。作为 `MegaError::Traces` 由 `ApiError` 与 `ProtocolError::Traces` 读取同一张 HTTP 状态表。公开文本只有稳定码，不含对象 key 或正文。码与状态是：`unauthenticated` 401、`unknown_scope` 404、`invalid_parameter` 400、`invalid_cursor` 400、`unsupported_schema` 409、`invalid_capture` 409、`object_integrity` 409、`trace_history_in_code` 409、`response_budget` 413、`query_timeout` 503、`search_unavailable` 503。503 仍向客户端显示该码。 | traces 调用方；定义在 `common::errors` |
 | `PathPolicyError` | Monorepo 路径创建 / 写入策略错误（稳定码 `MONO_PATH_*`），裸用或经 `MegaError::PathPolicy` 包装，由 `ApiError` 映射为 400/409 并原样输出文本。 | `ceres::pack::path_policy`；产品写、路径开通、receive-pack（plan-20260923 FU-06 / FU-07 / FU-10） |
 | `GitLFSError` | Git LFS 处理错误。 | LFS router/handler |
 | `DiffParseError` | Code review re-anchor 统一 diff 解析错误。 | `src/jupiter/utils/code_review_reanchor.rs` |

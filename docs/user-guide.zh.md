@@ -196,7 +196,7 @@ Monorepo 路径禁止 Git 客户端推送 Tag，Tag 经此入口管理（ImportR
 
 - **OCI Distribution `/v2`**:storage-only 且 `[oci].enabled=true` 时挂载,可作容器镜像仓库(`docker login` 复用 push token,无独立 token 服务)。架构与端点事实源见 [`refactoring/oci.md`](./refactoring/oci.md),启用步骤见 [`deploy-trunk.md`](./deploy-trunk.md) 第 10 节。
 - **Agent Session Capture `/api/v1/agent-capture`**：可选能力，接收并查询 Agent 会话、事件、checkpoint、transcript 与文件操作记录。仅在 storage-only 且 `[agent_capture].enabled=true`、配置至少一个 `[[agent_capture.ingest_tokens]]` 时挂载；使用独立 ingest token，不复用 Git push token，也不会由 Git push 自动产生会话记录。配置与配额事实源见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
-- **Traces 归档**：示例配置里的 `[traces].enabled` 保持 `false`。打开它必须由操作者写入 `server_id` UUID，mega2 不会在启动时生成这个 id。这个开关本身不挂载 traces 的 Git 或 HTTP 面。见[配置指南](./configuration.zh.md)。
+- **Traces 归档**：示例配置里的 `[traces].enabled` 保持 `false`。打开它必须由操作者写入 `server_id` UUID，mega2 不会在启动时生成这个 id。这个开关本身不挂载 traces 的 Git 或 HTTP 面。traces 失败使用稳定错误码：缺认证是 401 `unauthenticated`；未知或无权限的 scope 是 404 `unknown_scope`；非法参数或 cursor 是 400 `invalid_parameter` 或 `invalid_cursor`；`unsupported_schema`、`invalid_capture`、`object_integrity` 和 `trace_history_in_code` 是 409；`response_budget` 是 413；`query_timeout` 和 `search_unavailable` 是 503。错误文本不包含对象 key 或 transcript 正文。见[配置指南](./configuration.zh.md)。
 
 ## 6. 配合 Libra 使用
 

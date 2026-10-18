@@ -134,6 +134,8 @@ v1 固定每个对象最大 64 MiB，metadata/manifest 各最大 1 MiB，压缩 
 
 缺认证 401；无权限/未知 scope 404；非法参数/cursor 400；读取已归档但不可解析 schema 409 `unsupported_schema`/`invalid_capture`；完整性损坏 409 `object_integrity`；单个投影连同 envelope 无法装入响应上限时 413 `response_budget`（返回完整错误 JSON，不能截断 JSON bytes）；部署 `search_ready=false` 时 `/search` 返回 503 `search_unavailable` 与同一稳定 reason。单 stream 的 index_pending 在服务可用时返回 200 并如实给出水位/coverage，不混同部署搜索不可用；临时索引未就绪在 metadata 正文中体现，不把 redacted-only 当 `missing_raw`。错误 DTO 不带内部 key、凭据、绝对工作目录或正文。运行时 OpenAPI 是 schema 证据，所有路径与状态注册在同一类型契约中。
 
+当前 `TracesError` 登记这些稳定码：`unauthenticated` 401、`unknown_scope` 404、`invalid_parameter` 400、`invalid_cursor` 400、`unsupported_schema` 409、`invalid_capture` 409、`object_integrity` 409、`response_budget` 413、`query_timeout` 503、`search_unavailable` 503、`trace_history_in_code` 409。HTTP `ApiError` 与 Git `ProtocolError::Traces` 读取同一张映射，Git 侧保留该分类，不把这些码收成普通 invalid input。公开文本只有稳定码；`search_unavailable` 另带经过校验的 reason token。对象 key、凭据、绝对路径和正文不会进入错误文本。
+
 Libra 提供：
 
 ```text

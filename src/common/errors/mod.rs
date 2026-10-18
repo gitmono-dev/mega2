@@ -111,7 +111,101 @@ pub enum MegaError {
     /// Process exit with a frozen CLI status code (UN-29 authz-audit table).
     #[error("{message}")]
     CliExit { code: i32, message: String },
+    /// Traces contract error. Display text is the stable public code only.
+    #[error("{0}")]
+    Traces(#[from] TracesError),
 }
+
+/// Stable traces failure. Variants do not store object keys or transcript text.
+#[derive(Clone, PartialEq, Eq)]
+pub enum TracesError {
+    Unauthenticated,
+    UnknownScope,
+    InvalidParameter,
+    InvalidCursor,
+    UnsupportedSchema,
+    InvalidCapture,
+    ObjectIntegrity,
+    ResponseBudget,
+    QueryTimeout,
+    SearchUnavailable { reason: String },
+    TraceHistoryInCode,
+}
+
+impl TracesError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::UnknownScope => "unknown_scope",
+            Self::InvalidParameter => "invalid_parameter",
+            Self::InvalidCursor => "invalid_cursor",
+            Self::UnsupportedSchema => "unsupported_schema",
+            Self::InvalidCapture => "invalid_capture",
+            Self::ObjectIntegrity => "object_integrity",
+            Self::ResponseBudget => "response_budget",
+            Self::QueryTimeout => "query_timeout",
+            Self::SearchUnavailable { .. } => "search_unavailable",
+            Self::TraceHistoryInCode => "trace_history_in_code",
+        }
+    }
+
+    pub fn http_status(&self) -> StatusCode {
+        match self {
+            Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+            Self::UnknownScope => StatusCode::NOT_FOUND,
+            Self::InvalidParameter | Self::InvalidCursor => StatusCode::BAD_REQUEST,
+            Self::UnsupportedSchema
+            | Self::InvalidCapture
+            | Self::ObjectIntegrity
+            | Self::TraceHistoryInCode => StatusCode::CONFLICT,
+            Self::ResponseBudget => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::QueryTimeout | Self::SearchUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// Public text. A search reason is kept only when it is a stable token.
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::SearchUnavailable { reason } => {
+                format!("search_unavailable:{}", stable_reason(reason))
+            }
+            other => other.code().to_owned(),
+        }
+    }
+
+    pub fn search_unavailable(reason: &str) -> Self {
+        Self::SearchUnavailable {
+            reason: stable_reason(reason).to_owned(),
+        }
+    }
+}
+
+fn stable_reason(reason: &str) -> &str {
+    let token = !reason.is_empty()
+        && reason.len() <= 64
+        && reason
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        && reason
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase());
+    if token { reason } else { "unavailable" }
+}
+
+impl fmt::Display for TracesError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.public_message())
+    }
+}
+
+impl fmt::Debug for TracesError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.public_message())
+    }
+}
+
+impl std::error::Error for TracesError {}
 
 impl MegaError {
     pub fn print(&self) {
@@ -407,6 +501,9 @@ pub enum ProtocolError {
     },
     #[error("{0}")]
     PackRejected(String),
+    /// Traces failure. The message is the stable code, not an object key or body.
+    #[error("{0}")]
+    Traces(TracesError),
 }
 
 impl From<MegaError> for ProtocolError {
@@ -417,6 +514,7 @@ impl From<MegaError> for ProtocolError {
                 ProtocolError::ViewUnavailable { filter_id, reason }
             }
             MegaError::ViewPackRejected(message) => ProtocolError::PackRejected(message),
+            MegaError::Traces(err) => ProtocolError::Traces(err),
             other => ProtocolError::InvalidInput(other.to_string()),
         }
     }
@@ -440,6 +538,17 @@ impl IntoResponse for ProtocolError {
             }
             ProtocolError::PackRejected(message) => {
                 crate::contract::git_protocol::http::pack_rejected_response(&message)
+            }
+            ProtocolError::Traces(err) => {
+                let status = err.http_status();
+                let code = err.code();
+                let message = err.public_message();
+                let message = if message.starts_with(code) {
+                    message
+                } else {
+                    code.to_owned()
+                };
+                (status, Json(CommonResult::<String>::failed(&message))).into_response()
             }
             error => {
                 let (status, message) = match error {
@@ -855,5 +964,75 @@ mod tests {
         assert!(MegaError::Other("deadlock detected".into()).is_retryable_db_serialization());
         assert!(!MegaError::Other("duplicate key value".into()).is_retryable_db_serialization());
         assert!(!MegaError::NotFound("missing".into()).is_retryable_db_serialization());
+    }
+
+    fn traces_contract_cases() -> Vec<(TracesError, &'static str, u16)> {
+        vec![
+            (TracesError::Unauthenticated, "unauthenticated", 401),
+            (TracesError::UnknownScope, "unknown_scope", 404),
+            (TracesError::InvalidParameter, "invalid_parameter", 400),
+            (TracesError::InvalidCursor, "invalid_cursor", 400),
+            (TracesError::UnsupportedSchema, "unsupported_schema", 409),
+            (TracesError::InvalidCapture, "invalid_capture", 409),
+            (TracesError::ObjectIntegrity, "object_integrity", 409),
+            (TracesError::ResponseBudget, "response_budget", 413),
+            (TracesError::QueryTimeout, "query_timeout", 503),
+            (
+                TracesError::search_unavailable("extension_missing"),
+                "search_unavailable",
+                503,
+            ),
+            (
+                TracesError::TraceHistoryInCode,
+                "trace_history_in_code",
+                409,
+            ),
+        ]
+    }
+
+    #[test]
+    fn traces_error_variant_codes() {
+        let cases = traces_contract_cases();
+        assert!(
+            cases.len() >= 11,
+            "every contract traces error has a variant"
+        );
+        for (err, code, status) in cases {
+            assert_eq!(err.code(), code);
+            assert_eq!(err.http_status().as_u16(), status);
+            assert!(err.public_message().starts_with(code));
+            assert_eq!(err.to_string(), err.public_message());
+            assert_eq!(format!("{err:?}"), err.public_message());
+        }
+    }
+
+    #[test]
+    fn traces_error_variant_trace_history_in_code() {
+        let err = TracesError::TraceHistoryInCode;
+        assert_eq!(err.code(), "trace_history_in_code");
+        assert_eq!(err.public_message(), "trace_history_in_code");
+        assert_eq!(err.http_status(), StatusCode::CONFLICT);
+        let protocol = ProtocolError::from(MegaError::from(err));
+        assert!(matches!(
+            protocol,
+            ProtocolError::Traces(TracesError::TraceHistoryInCode)
+        ));
+        assert_eq!(protocol.to_string(), "trace_history_in_code");
+    }
+
+    #[test]
+    fn traces_error_variant_drops_object_key_and_body() {
+        let object_key = "traces/v1/stream/objects/deadbeef";
+        let transcript = "secret transcript line";
+        let leaked = TracesError::SearchUnavailable {
+            reason: format!("{object_key} {transcript}"),
+        };
+        let sanitized = TracesError::search_unavailable(object_key);
+        for err in [leaked, sanitized, TracesError::ObjectIntegrity] {
+            let text = format!("{} {:?}", err.public_message(), err);
+            assert!(!text.contains("deadbeef"), "{text}");
+            assert!(!text.contains("secret transcript"), "{text}");
+            assert!(!text.contains(object_key), "{text}");
+        }
     }
 }

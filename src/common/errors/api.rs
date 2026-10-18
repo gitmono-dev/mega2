@@ -44,6 +44,10 @@ pub struct ApiError {
     /// The message is a stable contract (e.g. `PathPolicyError`): send it as
     /// is instead of stripping a `[code:…]` marker it may contain.
     verbatim: bool,
+    /// Send the stable text even when the status is 5xx. Traces uses this so
+    /// `query_timeout` and `search_unavailable` stay visible. The text is the
+    /// contract code, not an internal detail.
+    publish_message: bool,
 }
 
 impl ApiError {
@@ -53,6 +57,7 @@ impl ApiError {
             inner: err.into(),
             status: StatusCode::INTERNAL_SERVER_ERROR,
             verbatim: false,
+            publish_message: false,
         }
     }
 
@@ -62,6 +67,7 @@ impl ApiError {
             inner: err.into(),
             status,
             verbatim: false,
+            publish_message: false,
         }
     }
 
@@ -104,7 +110,7 @@ impl IntoResponse for ApiError {
 
         // Only expose detailed error messages for 4xx (client) errors
         // For 5xx (server) errors, use generic message to avoid leaking internal details
-        let response_msg = if self.status.is_client_error() {
+        let response_msg = if self.publish_message || self.status.is_client_error() {
             err_msg
         } else {
             "Internal server error".to_string()
@@ -153,6 +159,24 @@ where
                 inner: anyhow_err,
                 status,
                 verbatim: true,
+                publish_message: false,
+            };
+        }
+
+        if let Some(MegaError::Traces(traces)) = anyhow_err.downcast_ref::<MegaError>() {
+            let status = traces.http_status();
+            let code = traces.code();
+            let message = traces.public_message();
+            let message = if message.starts_with(code) {
+                message
+            } else {
+                code.to_owned()
+            };
+            return ApiError {
+                inner: anyhow::anyhow!(message),
+                status,
+                verbatim: true,
+                publish_message: true,
             };
         }
 
@@ -382,6 +406,60 @@ mod tests {
             ("409", StatusCode::CONFLICT),
         ] {
             assert_eq!(call(router_returning(code)).await, expected, "code {code}");
+        }
+    }
+
+    async fn traces_body(err: crate::common::errors::TracesError) -> (StatusCode, String) {
+        let response = ApiError::from(MegaError::from(err)).into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let message = json["err_message"].as_str().unwrap_or("").to_owned();
+        (status, message)
+    }
+
+    #[tokio::test]
+    async fn traces_error_api_mapping_query_timeout_is_503() {
+        let (status, message) = traces_body(crate::common::errors::TracesError::QueryTimeout).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(message, "query_timeout");
+        assert_ne!(message, "Internal server error");
+    }
+
+    #[tokio::test]
+    async fn traces_error_api_mapping_unsupported_schema_is_409() {
+        let (status, message) =
+            traces_body(crate::common::errors::TracesError::UnsupportedSchema).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(message, "unsupported_schema");
+    }
+
+    #[tokio::test]
+    async fn traces_error_api_mapping_table_and_payload() {
+        let object_key = "traces/v1/stream/objects/deadbeef";
+        let transcript = "secret transcript line";
+        let cases = [
+            crate::common::errors::TracesError::Unauthenticated,
+            crate::common::errors::TracesError::UnknownScope,
+            crate::common::errors::TracesError::InvalidParameter,
+            crate::common::errors::TracesError::InvalidCursor,
+            crate::common::errors::TracesError::InvalidCapture,
+            crate::common::errors::TracesError::ObjectIntegrity,
+            crate::common::errors::TracesError::ResponseBudget,
+            crate::common::errors::TracesError::search_unavailable(object_key),
+            crate::common::errors::TracesError::TraceHistoryInCode,
+        ];
+        for err in cases {
+            let expected_status = err.http_status();
+            let expected_message = err.public_message();
+            let (status, message) = traces_body(err).await;
+            assert_eq!(status, expected_status);
+            assert_eq!(message, expected_message);
+            assert!(!message.contains("deadbeef"), "{message}");
+            assert!(!message.contains(transcript), "{message}");
+            assert!(!message.contains(object_key), "{message}");
         }
     }
 }
