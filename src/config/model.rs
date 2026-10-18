@@ -127,6 +127,16 @@ impl TracesProtocolLimits {
     pub const METADATA_LIMIT_MAX: u64 = 200;
     /// `limits.search_limit_max` from the traces contract.
     pub const SEARCH_LIMIT_MAX: u64 = 100;
+    /// `limits.text_bytes_default` from the traces contract.
+    pub const TEXT_BYTES_DEFAULT: u64 = 16_384;
+    /// `limits.text_bytes_max` from the traces contract.
+    pub const TEXT_BYTES_MAX: u64 = 131_072;
+    /// `limits.query_bytes_min` from the traces contract.
+    pub const QUERY_BYTES_MIN: u64 = 1;
+    /// `limits.query_bytes_max` from the traces contract.
+    pub const QUERY_BYTES_MAX: u64 = 256;
+    /// `limits.query_timeout_ms` from the traces contract.
+    pub const QUERY_TIMEOUT_MS: u64 = 2_000;
 }
 
 /// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20 / GS-26).
