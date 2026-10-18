@@ -133,7 +133,7 @@ cargo build --release -p mega2   # 产物 target/release/mega2
 - [ ] 宿主端口绑定回环 / 内网地址，按需放行。
 - [ ] `cedar.enforcement` 保持 `off`（trunk 形态的启动前置，见 [`deploy-trunk.md`](./deploy-trunk.md) §1）。
 - [ ] OCI `/v2` 与 Agent Capture 按需显式开启（缺省不挂载）。
-- [ ] `[traces].enabled` 保持 false，直到操作者写入持久的 `server_id` UUID。进程不会生成这个 id。
+- [ ] `[traces].enabled` 保持 false，直到操作者写入持久的 `server_id` UUID。进程不会生成这个 id。配置重载和新进程都保留它。轮换 TLS 证书或凭据不会替换它。
 - [ ] 备份三件套：Postgres dump、对象存储 bucket、`mega2 --config <path> config vault backup <destination>`（Vault core key；恢复用 `config vault restore`，见 [`src/commands/config.rs`](../src/commands/config.rs)）。
 
 ## 6. 升级与形态切换

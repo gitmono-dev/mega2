@@ -74,8 +74,9 @@ pub struct Config {
     #[serde(default)]
     pub cedar: CedarConfig,
     /// Traces archive enablement and deployment identity (MTR-50). Default
-    /// off. `server_id` is an operator UUID, never generated at startup.
-    /// Protocol budgets are not fields of this section.
+    /// off. `server_id` is an operator UUID, never generated at startup,
+    /// reload, or service reinitialization. Protocol budgets are not fields
+    /// of this section.
     #[serde(default)]
     pub traces: TracesConfig,
 }
@@ -92,6 +93,19 @@ pub struct TracesConfig {
     /// Optional operator scope label. Not an authorization decision.
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+impl TracesConfig {
+    /// Operator deployment UUID from persistent config.
+    ///
+    /// A fresh load and a config reload both return this stored value. It is
+    /// not derived from certificates, credentials, paths, or start count.
+    pub fn deployment_server_id(&self) -> Option<&str> {
+        match self.server_id.as_deref() {
+            Some(id) if !id.is_empty() => Some(id),
+            _ => None,
+        }
+    }
 }
 
 /// Fixed traces protocol budgets. Zero-sized and not a `[traces]` field.

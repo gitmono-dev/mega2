@@ -8,7 +8,7 @@ use toml::Value;
 
 use crate::{
     common::utils::get_current_bin_name,
-    config::{mega_base, template::default_config_template},
+    config::{Config, mega_base, template::default_config_template},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +66,14 @@ pub struct ConfigInput {
 
 pub struct ConfigLoader {
     input: ConfigInput,
+}
+
+/// Deployment server id after a fresh load or service reinitialization.
+///
+/// The value is the operator UUID already stored on `config`. This does not
+/// derive an id from certificates, credentials, paths, or start count.
+pub fn reinitialized_server_id(config: &Config) -> Option<&str> {
+    config.traces.deployment_server_id()
 }
 
 impl ConfigLoader {

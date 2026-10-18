@@ -978,3 +978,140 @@ fn protocol_limits_83_constants_match_contract_and_reject_override() {
     assert!(text.contains("candidate_fragments_max"), "{text}");
     assert!(text.contains("scan_bytes_max"), "{text}");
 }
+
+const STABLE_SERVER_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn traces_identity_toml(base: &std::path::Path, db_url: &str, host_key: &str) -> String {
+    let body = super::template::config_init_template(base);
+    let body = body.replacen(
+        r#"db_url = "postgres://localhost:5432/mega2""#,
+        &format!(r#"db_url = "{db_url}""#),
+        1,
+    );
+    format!(
+        "{body}\n[github_sync]\nenabled = false\nssh_host_key = \"{host_key}\"\n\n[traces]\nenabled = true\nserver_id = \"{STABLE_SERVER_ID}\"\n"
+    )
+}
+
+fn load_traces_identity(base: &std::path::Path, db_url: &str, host_key: &str) -> super::Config {
+    let _lock = super::testing::env_lock();
+    let _db = super::testing::EnvVarGuard::remove(&_lock, "MEGA_DATABASE__DB_URL");
+    let _id = super::testing::EnvVarGuard::remove(&_lock, "MEGA_TRACES__SERVER_ID");
+    super::Config::load_str(&traces_identity_toml(base, db_url, host_key))
+        .expect("load traces identity")
+}
+
+#[test]
+fn server_identity_stability_repeated_load_keeps_operator_uuid() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = load_traces_identity(
+        dir.path(),
+        "postgres://mega:one@127.0.0.1/mega",
+        "ssh-ed25519 AAAAONE",
+    );
+    let second = load_traces_identity(
+        &dir.path().join("other-base"),
+        "postgres://mega:one@127.0.0.1/mega",
+        "ssh-ed25519 AAAAONE",
+    );
+    assert_eq!(
+        super::loader::reinitialized_server_id(&first),
+        Some(STABLE_SERVER_ID)
+    );
+    assert_eq!(
+        super::loader::reinitialized_server_id(&second),
+        Some(STABLE_SERVER_ID)
+    );
+    assert_eq!(
+        first.traces.deployment_server_id(),
+        second.traces.deployment_server_id()
+    );
+
+    let handle = ConfigHandle::new(first);
+    let report = handle.reload(second).expect("reload same identity");
+    assert!(
+        !report.restart_required_fields.contains(&"traces.server_id"),
+        "{report:?}"
+    );
+    assert_eq!(
+        handle
+            .snapshot()
+            .expect("snapshot")
+            .traces
+            .deployment_server_id(),
+        Some(STABLE_SERVER_ID)
+    );
+}
+
+#[test]
+fn server_identity_stability_certificate_rotation_keeps_server_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let current = load_traces_identity(
+        dir.path(),
+        "postgres://mega:one@127.0.0.1/mega",
+        "ssh-ed25519 AAAAONE",
+    );
+    let rotated = load_traces_identity(
+        dir.path(),
+        "postgres://mega:one@127.0.0.1/mega",
+        "ssh-ed25519 AAAATWO",
+    );
+    assert_eq!(
+        rotated.traces.deployment_server_id(),
+        Some(STABLE_SERVER_ID)
+    );
+    assert_ne!(
+        current.github_sync.ssh_host_key,
+        rotated.github_sync.ssh_host_key
+    );
+
+    let handle = ConfigHandle::new(current);
+    let report = handle
+        .reload(rotated)
+        .expect("reload after host-key rotation");
+    assert!(
+        !report.restart_required_fields.contains(&"traces.server_id"),
+        "{report:?}"
+    );
+    assert_eq!(
+        handle
+            .snapshot()
+            .expect("snapshot")
+            .traces
+            .deployment_server_id(),
+        Some(STABLE_SERVER_ID)
+    );
+}
+
+#[test]
+fn server_identity_stability_credential_rotation_keeps_server_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let current = load_traces_identity(
+        dir.path(),
+        "postgres://mega:one@127.0.0.1/mega",
+        "ssh-ed25519 AAAAONE",
+    );
+    let rotated = load_traces_identity(
+        dir.path(),
+        "postgres://mega:two@127.0.0.1/mega",
+        "ssh-ed25519 AAAAONE",
+    );
+    assert_eq!(
+        rotated.traces.deployment_server_id(),
+        Some(STABLE_SERVER_ID)
+    );
+    assert_ne!(current.database.db_url, rotated.database.db_url);
+
+    let handle = ConfigHandle::new(current);
+    let report = handle
+        .reload(rotated)
+        .expect("reload after credential rotation");
+    assert!(
+        !report.restart_required_fields.contains(&"traces.server_id"),
+        "{report:?}"
+    );
+    assert_eq!(
+        super::loader::reinitialized_server_id(&handle.snapshot().expect("snapshot")),
+        Some(STABLE_SERVER_ID)
+    );
+}

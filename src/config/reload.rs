@@ -151,6 +151,7 @@ impl ConfigHandle {
         collect_database_restart_fields(&current, &candidate, &mut report);
         collect_redis_restart_fields(&current, &candidate, &mut report);
         collect_static_restart_fields(&current, &candidate, &mut report);
+        preserve_traces_deployment_id(&current, &mut next);
 
         if report.applied() {
             let next = Arc::new(next);
@@ -689,6 +690,10 @@ fn collect_static_restart_fields(
     collect_storage_events_restart_fields(current, candidate, report);
     collect_github_sync_restart_fields(current, candidate, report);
     collect_traces_restart_fields(current, candidate, report);
+}
+
+fn preserve_traces_deployment_id(current: &Config, next: &mut Config) {
+    next.traces.server_id.clone_from(&current.traces.server_id);
 }
 
 fn collect_traces_restart_fields(

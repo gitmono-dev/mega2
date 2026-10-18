@@ -8,7 +8,7 @@ Libra 将工作期间捕获的脱敏记录写入 traces Git 历史，Mega2 接�
 
 普通 `/project/foo.git` clone/fetch 不携带 traces 专属历史或对象。项目、身份、来源仓库与 stream epoch 分别确定隔离边界；traces 不成为代码默认分支，不进入 trunk/CL 合并，不出现在 Monorepo 代码目录。HTTP 与 SSH 两种 Git transport 都在首版范围。MegaUI、向量召回、模型生成摘要、事件/文件操作全量索引、隐藏 reasoning 解密不在首版范围。
 
-`[traces].enabled` 在所有现有 profile 默认 `false`。`server_id` 是操作者持久配置的部署 UUID，启用时必填，进程不在启动时生成。`scope` 是可选操作者标签。协议预算不是配置字段。部署者在完成稳定 server/principal 绑定与权限前置后显式启用。H1/H3 的交接凭据须具名记录启用配置与服务 owner，不由计划提交自动修改线上开关。关闭时新 traces Git/API 面不挂载，旧 Capture 的现行开关独立，直到 H6 退场。
+`[traces].enabled` 在所有现有 profile 默认 `false`。`server_id` 是操作者持久配置的部署 UUID，启用时必填，进程不在启动时生成。配置重载和新进程重新初始化都读这份 UUID。证书轮换、凭据轮换、路径和启动次数都不会派生新的 `server_id`。`scope` 是可选操作者标签。协议预算不是配置字段。部署者在完成稳定 server/principal 绑定与权限前置后显式启用。H1/H3 的交接凭据须具名记录启用配置与服务 owner，不由计划提交自动修改线上开关。关闭时新 traces Git/API 面不挂载，旧 Capture 的现行开关独立，直到 H6 退场。
 
 | 交接 | 生产方 | 消费方与先后约束 | 放行凭据 |
 |---|---|---|---|
