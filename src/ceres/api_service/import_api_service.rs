@@ -851,17 +851,25 @@ mod tests {
         blob::Blob,
         tree::{TreeItem, TreeItemMode},
     };
-    use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+    use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, Statement, TransactionTrait};
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
-        callisto::{git_repo, sea_orm_active_enums::RefTypeEnum},
-        ceres::pack::import_repo::{RemoveOutcome, detach_import_repo, remove_import_repo},
+        callisto::{git_repo, sea_orm_active_enums::RefTypeEnum, trace_target},
+        ceres::{
+            api_service::ApiHandler,
+            model::git::{CreateEntryInfo, DeleteEntryInfo, MoveEntryInfo},
+            pack::import_repo::{RemoveOutcome, detach_import_repo, remove_import_repo},
+            protocol::repo::Repo,
+        },
         common::errors::{ApiError, map_ceres_error},
-        jupiter::storage::git_db_storage::import_fence_support::{
-            blocked_by_me, import_refs_count, object_counts, park_detach, single_connection,
-            test_cache, wired_storage,
+        jupiter::storage::{
+            base_storage::StorageConnector,
+            git_db_storage::import_fence_support::{
+                blocked_by_me, import_refs_count, object_counts, park_detach, single_connection,
+                test_cache, wired_storage,
+            },
         },
     };
 
@@ -2052,5 +2060,95 @@ mod tests {
             fu19_ref_ids(&conn, repo.id, "refs/tags/v1").await,
             winner_ref
         );
+    }
+
+    #[tokio::test]
+    async fn target_path_import_reject_does_not_mutate_targets() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let conn = mono.get_connection();
+        let bound = crate::jupiter::service::trace_target_service::bind_first_native_write(
+            conn,
+            "/third-party/lib",
+        )
+        .await
+        .expect("seed target");
+        let before = trace_target::Entity::find()
+            .all(conn)
+            .await
+            .expect("rows before");
+        let api = ImportApiService {
+            storage: storage.clone(),
+            repo: Repo::new(std::path::PathBuf::from("/third-party/lib"), false).expect("repo"),
+            git_object_cache: test_cache().await,
+        };
+
+        let created = api
+            .create_monorepo_entry(
+                CreateEntryInfo {
+                    is_directory: true,
+                    name: "extra".to_owned(),
+                    path: "/third-party/lib".to_owned(),
+                    content: None,
+                    author_email: None,
+                    author_username: None,
+                    skip_build: true,
+                    mode: crate::ceres::model::git::EditCLMode::TryReuse(None),
+                },
+                None,
+            )
+            .await
+            .expect_err("create rejected");
+        let deleted = api
+            .delete_monorepo_entry(
+                DeleteEntryInfo {
+                    path: "/third-party/lib".to_owned(),
+                    name: "extra".to_owned(),
+                    is_directory: true,
+                    author_username: None,
+                    skip_build: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("delete rejected");
+        let moved = api
+            .move_monorepo_entry(
+                MoveEntryInfo {
+                    from_path: "/third-party/lib".to_owned(),
+                    from_name: "extra".to_owned(),
+                    to_path: "/project".to_owned(),
+                    to_name: "extra".to_owned(),
+                    is_directory: true,
+                    author_username: None,
+                    skip_build: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("move rejected");
+        assert_eq!(
+            created.to_string(),
+            "[code:409] import dir does not support create entry"
+        );
+        assert_eq!(
+            deleted.to_string(),
+            "[code:409] import dir does not support delete entry"
+        );
+        assert_eq!(
+            moved.to_string(),
+            "[code:409] import dir does not support move entry"
+        );
+
+        let after = trace_target::Entity::find()
+            .all(conn)
+            .await
+            .expect("rows after");
+        assert_eq!(after.len(), before.len());
+        let still = after.iter().find(|row| row.id == bound.id).expect("seed");
+        assert!(still.active);
+        assert_eq!(still.project_path, "/third-party/lib");
+        assert_eq!(still.target_kind, "native");
     }
 }

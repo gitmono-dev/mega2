@@ -237,7 +237,7 @@ impl ApiHandler for super::MonoApiService {
         } = self.prepare_create_entry_update(&entry_info).await?;
         let new_oid = entry_oid.to_string();
         let entry_path = Self::build_entry_path(&entry_info.path, &entry_info.name);
-        let outcome = self
+        let committed = self
             .commit_tree_update(
                 TreeCommitInput {
                     update_result,
@@ -254,7 +254,11 @@ impl ApiHandler for super::MonoApiService {
                 },
                 requester,
             )
-            .await?;
+            .await;
+        let outcome = committed?;
+        if entry_info.is_directory && target_follows_landed_commit(&self.storage) {
+            bind_if_still_landed(&self.storage, &entry_path).await?;
+        }
         Ok(CreateEntryResult {
             commit_id: outcome.commit_id,
             new_oid,
@@ -342,6 +346,11 @@ impl ApiHandler for super::MonoApiService {
         let update_result =
             MonoServiceLogic::build_result_by_chain(parent.clone(), update_chain, new_parent.id)?;
         let entry_path = Self::build_entry_path(&entry_info.path, &entry_info.name);
+        let retire_ids = if entry_info.is_directory && target_follows_landed_commit(&self.storage) {
+            active_target_ids(&self.storage, &entry_path).await?
+        } else {
+            Vec::new()
+        };
         let outcome = self
             .commit_tree_update(
                 TreeCommitInput {
@@ -360,6 +369,9 @@ impl ApiHandler for super::MonoApiService {
                 requester,
             )
             .await?;
+        if !retire_ids.is_empty() {
+            retire_recorded_targets(&self.storage, &retire_ids, &entry_path).await?;
+        }
         Ok(DeleteEntryResult {
             commit_id: outcome.commit_id,
             path: entry_path,
@@ -520,7 +532,12 @@ impl ApiHandler for super::MonoApiService {
 
         let update_result = Self::rewrite_parent_chains(ancestors, edits)?;
         let landing = common_parent_path(&src_parent, &dest_parent);
-        let outcome = self
+        let moved_ids = if entry_info.is_directory && target_follows_landed_commit(&self.storage) {
+            move_native_directory(&self.storage, &src_full, &dest_full).await?
+        } else {
+            Vec::new()
+        };
+        let committed = self
             .commit_tree_update(
                 TreeCommitInput {
                     update_result,
@@ -537,7 +554,30 @@ impl ApiHandler for super::MonoApiService {
                 },
                 requester,
             )
-            .await?;
+            .await;
+        let outcome = match committed {
+            Ok(outcome) => {
+                if !moved_ids.is_empty() {
+                    restore_active_ids(&self.storage, &moved_ids).await?;
+                }
+                outcome
+            }
+            Err(err) => {
+                if !moved_ids.is_empty() {
+                    let reverted =
+                        move_recorded_targets(&self.storage, &moved_ids, &dest_full, &src_full)
+                            .await;
+                    if let Err(revert_err) = reverted {
+                        tracing::warn!(
+                            error = %revert_err,
+                            "native target move could not be restored after the directory commit failed"
+                        );
+                    }
+                    let _ = restore_active_ids(&self.storage, &moved_ids).await;
+                }
+                return Err(err);
+            }
+        };
         Ok(MoveEntryResult {
             commit_id: outcome.commit_id,
             from_path: src_full,
@@ -872,5 +912,497 @@ impl ApiHandler for super::MonoApiService {
                 Err(GitError::CustomError("[code:500] DB error".to_string()))
             }
         }
+    }
+}
+
+/// Trunk lands the directory on the ref inside this call. Review only opens a
+/// change list, so the global target stays with the landed tree.
+fn target_follows_landed_commit(storage: &Storage) -> bool {
+    storage.config().monorepo.push_policy == PushPolicy::Trunk
+}
+
+async fn bind_new_native_directory(
+    storage: &Storage,
+    path: &str,
+) -> Result<Option<String>, GitError> {
+    let mono = storage.mono_storage();
+    crate::jupiter::service::trace_target_service::bind_new_native_directory(
+        mono.get_connection(),
+        path,
+    )
+    .await
+    .map_err(|err| GitError::CustomError(err.to_string()))
+}
+
+async fn move_native_directory(
+    storage: &Storage,
+    from: &str,
+    to: &str,
+) -> Result<Vec<String>, GitError> {
+    let mono = storage.mono_storage();
+    crate::jupiter::service::trace_target_service::move_covered_native_targets(
+        mono.get_connection(),
+        from,
+        to,
+    )
+    .await
+    .map_err(|err| GitError::CustomError(err.to_string()))
+}
+
+async fn landed_directory(
+    mono: &crate::jupiter::storage::mono_storage::MonoStorage,
+    txn: &sea_orm::DatabaseTransaction,
+    path: &str,
+) -> Result<bool, MegaError> {
+    let Some(root) = mono.get_main_ref_in_txn("/", txn).await? else {
+        return Ok(false);
+    };
+    Ok(mono
+        .resolve_path_tree_hash_in_txn(&root.ref_tree_hash, path, txn)
+        .await?
+        .is_some())
+}
+
+async fn bind_if_still_landed(storage: &Storage, path: &str) -> Result<(), GitError> {
+    use sea_orm::TransactionTrait;
+    let mono = storage.mono_storage();
+    let conn = mono.get_connection().clone();
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|err| GitError::CustomError(err.to_string()))?;
+    let outcome: Result<bool, MegaError> = async {
+        if !landed_directory(&mono, &txn, path).await? {
+            return Ok(false);
+        }
+        match crate::jupiter::storage::trace_target_storage::insert_active(
+            &txn,
+            crate::jupiter::storage::trace_target_storage::TARGET_KIND_NATIVE,
+            path,
+            None,
+        )
+        .await
+        {
+            Ok(_) => Ok(landed_directory(&mono, &txn, path).await?),
+            Err(err) if err.to_string().contains("trace_target_one_active_path") => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+    .await;
+    match outcome {
+        Ok(true) => txn
+            .commit()
+            .await
+            .map_err(|err| GitError::CustomError(err.to_string())),
+        Ok(false) => {
+            let _ = txn.rollback().await;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = txn.rollback().await;
+            Err(GitError::CustomError(err.to_string()))
+        }
+    }
+}
+
+async fn restore_active_ids(storage: &Storage, ids: &[String]) -> Result<(), GitError> {
+    use sea_orm::{ActiveModelTrait, TransactionTrait};
+    let mono = storage.mono_storage();
+    let conn = mono.get_connection().clone();
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|err| GitError::CustomError(err.to_string()))?;
+    let outcome: Result<(), MegaError> = async {
+        for id in ids {
+            let Some(row) =
+                crate::jupiter::storage::trace_target_storage::find_by_id(&txn, id).await?
+            else {
+                continue;
+            };
+            if row.active {
+                continue;
+            }
+            if crate::jupiter::storage::trace_target_storage::active_at(&txn, &row.project_path)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            if !landed_directory(&mono, &txn, &row.project_path).await? {
+                continue;
+            }
+            let path = row.project_path.clone();
+            let mut active: crate::callisto::trace_target::ActiveModel = row.into();
+            active.active = sea_orm::Set(true);
+            active.update(&txn).await?;
+            if !landed_directory(&mono, &txn, &path).await? {
+                let stored =
+                    crate::jupiter::storage::trace_target_storage::find_by_id(&txn, id).await?;
+                if let Some(stored) = stored {
+                    let mut back: crate::callisto::trace_target::ActiveModel = stored.into();
+                    back.active = sea_orm::Set(false);
+                    back.update(&txn).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => txn
+            .commit()
+            .await
+            .map_err(|err| GitError::CustomError(err.to_string())),
+        Err(err) => {
+            let _ = txn.rollback().await;
+            Err(GitError::CustomError(err.to_string()))
+        }
+    }
+}
+
+async fn move_recorded_targets(
+    storage: &Storage,
+    ids: &[String],
+    from: &str,
+    to: &str,
+) -> Result<(), GitError> {
+    let mono = storage.mono_storage();
+    crate::jupiter::storage::trace_target_storage::move_recorded_ids(
+        mono.get_connection(),
+        ids,
+        from,
+        to,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|err| GitError::CustomError(err.to_string()))
+}
+
+async fn active_target_ids(storage: &Storage, path: &str) -> Result<Vec<String>, GitError> {
+    let mono = storage.mono_storage();
+    let rows = crate::jupiter::storage::trace_target_storage::active_at_and_below(
+        mono.get_connection(),
+        path,
+    )
+    .await
+    .map_err(|err| GitError::CustomError(err.to_string()))?;
+    Ok(rows.into_iter().map(|row| row.id).collect())
+}
+
+async fn retire_recorded_targets(
+    storage: &Storage,
+    ids: &[String],
+    path: &str,
+) -> Result<(), GitError> {
+    let mono = storage.mono_storage();
+    crate::jupiter::storage::trace_target_storage::deactivate_ids_still_under(
+        mono.get_connection(),
+        ids,
+        path,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|err| GitError::CustomError(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    use super::super::MonoApiService;
+    use crate::{
+        callisto::trace_target,
+        ceres::{
+            api_service::ApiHandler,
+            model::git::{CreateEntryInfo, DeleteEntryInfo, EditCLMode, MoveEntryInfo},
+        },
+        jupiter::storage::{
+            base_storage::StorageConnector,
+            git_db_storage::import_fence_support::{test_cache, wired_storage},
+            trace_target_storage::active_at,
+        },
+    };
+
+    async fn handler() -> (tempfile::TempDir, MonoApiService) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = crate::config::PushPolicy::Trunk;
+        config.git.push_auth = Some(crate::config::PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        let mut storage =
+            crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+        let git_service = crate::jupiter::service::git_service::GitService {
+            obj_storage: crate::jupiter::storage::object_storage::mock_object_storage(),
+        };
+        storage.git_service = git_service.clone();
+        storage.mono_service = crate::jupiter::service::mono_service::MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service,
+        };
+        storage
+            .mono_service
+            .init_monorepo(&storage.config().monorepo)
+            .await
+            .expect("init monorepo");
+        let storage = crate::jupiter::tests::with_test_vault(storage, temp.path()).await;
+        let api = MonoApiService {
+            storage,
+            git_object_cache: test_cache().await,
+        };
+        (temp, api)
+    }
+
+    fn directory(path: &str, name: &str) -> CreateEntryInfo {
+        CreateEntryInfo {
+            is_directory: true,
+            name: name.to_owned(),
+            path: path.to_owned(),
+            content: None,
+            author_email: None,
+            author_username: Some("synthetic".to_owned()),
+            skip_build: true,
+            mode: EditCLMode::TryReuse(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn target_path_native_api_create_move_delete_and_rebuild() {
+        let (_temp, api) = handler().await;
+        let mono = api.storage.mono_storage();
+        let conn = mono.get_connection();
+
+        let created = api
+            .create_monorepo_entry(directory("/project", "app"), None)
+            .await
+            .expect("create /project/app");
+        assert_eq!(created.path, "/project/app");
+        let child = api
+            .create_monorepo_entry(directory("/project/app", "lib"), None)
+            .await
+            .expect("create /project/app/lib");
+        assert_eq!(child.path, "/project/app/lib");
+        let apple = api
+            .create_monorepo_entry(directory("/project", "apple"), None)
+            .await
+            .expect("create /project/apple");
+        assert_eq!(apple.path, "/project/apple");
+
+        let app = active_at(conn, "/project/app")
+            .await
+            .expect("load app")
+            .expect("app target");
+        let lib = active_at(conn, "/project/app/lib")
+            .await
+            .expect("load lib")
+            .expect("lib target");
+        let apple_target = active_at(conn, "/project/apple")
+            .await
+            .expect("load apple")
+            .expect("apple target");
+        assert_ne!(app.id, lib.id);
+
+        let moved = api
+            .move_monorepo_entry(
+                MoveEntryInfo {
+                    from_path: "/project".to_owned(),
+                    from_name: "app".to_owned(),
+                    to_path: "/project".to_owned(),
+                    to_name: "moved".to_owned(),
+                    is_directory: true,
+                    author_username: Some("synthetic".to_owned()),
+                    skip_build: true,
+                },
+                None,
+            )
+            .await
+            .expect("move app");
+        assert_eq!(moved.from_path, "/project/app");
+        assert_eq!(moved.to_path, "/project/moved");
+        let moved_app = active_at(conn, "/project/moved")
+            .await
+            .expect("load moved")
+            .expect("moved target");
+        let moved_lib = active_at(conn, "/project/moved/lib")
+            .await
+            .expect("load moved lib")
+            .expect("moved lib");
+        assert_eq!(moved_app.id, app.id);
+        assert_eq!(moved_lib.id, lib.id);
+        assert!(
+            active_at(conn, "/project/app")
+                .await
+                .expect("old path")
+                .is_none()
+        );
+        assert_eq!(
+            active_at(conn, "/project/apple")
+                .await
+                .expect("apple stays")
+                .expect("apple")
+                .id,
+            apple_target.id
+        );
+
+        let deleted = api
+            .delete_monorepo_entry(
+                DeleteEntryInfo {
+                    path: "/project".to_owned(),
+                    name: "moved".to_owned(),
+                    is_directory: true,
+                    author_username: Some("synthetic".to_owned()),
+                    skip_build: true,
+                },
+                None,
+            )
+            .await
+            .expect("delete moved");
+        assert_eq!(deleted.path, "/project/moved");
+        let retired = trace_target::Entity::find()
+            .filter(trace_target::Column::Id.is_in([app.id.clone(), lib.id.clone()]))
+            .all(conn)
+            .await
+            .expect("retired rows");
+        assert_eq!(retired.len(), 2);
+        assert!(retired.iter().all(|row| !row.active));
+        assert!(
+            active_at(conn, "/project/apple")
+                .await
+                .expect("apple after delete")
+                .is_some()
+        );
+
+        let rebuilt = api
+            .create_monorepo_entry(directory("/project", "moved"), None)
+            .await
+            .expect("rebuild path");
+        assert_eq!(rebuilt.path, "/project/moved");
+        let again = active_at(conn, "/project/moved")
+            .await
+            .expect("rebuilt row")
+            .expect("new target");
+        assert_ne!(again.id, app.id);
+        assert!(again.active);
+    }
+
+    #[tokio::test]
+    async fn target_path_native_api_failed_delete_keeps_target() {
+        let (_temp, api) = handler().await;
+        let mono = api.storage.mono_storage();
+        let conn = mono.get_connection();
+        let bound = crate::jupiter::service::trace_target_service::bind_first_native_write(
+            conn,
+            "/project/kept",
+        )
+        .await
+        .expect("seed target");
+
+        let err = api
+            .delete_monorepo_entry(
+                DeleteEntryInfo {
+                    path: "/missing-parent".to_owned(),
+                    name: "child".to_owned(),
+                    is_directory: true,
+                    author_username: None,
+                    skip_build: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("missing parent");
+        assert!(err.to_string().contains("404"), "{err}");
+        let still = active_at(conn, "/project/kept")
+            .await
+            .expect("load kept")
+            .expect("kept target");
+        assert_eq!(still.id, bound.id);
+        assert!(still.active);
+    }
+
+    #[tokio::test]
+    async fn target_path_native_api_unbound_parent_move_keeps_child() {
+        let (_temp, api) = handler().await;
+        let mono = api.storage.mono_storage();
+        let conn = mono.get_connection();
+        let created = api
+            .create_monorepo_entry(directory("/project/nest", "lib"), None)
+            .await
+            .expect("create child under a directory this call does not bind");
+        assert_eq!(created.path, "/project/nest/lib");
+        let child = active_at(conn, "/project/nest/lib")
+            .await
+            .expect("child target")
+            .expect("bound child");
+        assert!(
+            active_at(conn, "/project/nest")
+                .await
+                .expect("parent lookup")
+                .is_none()
+        );
+
+        let moved = api
+            .move_monorepo_entry(
+                MoveEntryInfo {
+                    from_path: "/project".to_owned(),
+                    from_name: "nest".to_owned(),
+                    to_path: "/project".to_owned(),
+                    to_name: "renamed".to_owned(),
+                    is_directory: true,
+                    author_username: Some("synthetic".to_owned()),
+                    skip_build: true,
+                },
+                None,
+            )
+            .await
+            .expect("move unbound parent");
+        assert_eq!(moved.to_path, "/project/renamed");
+        let followed = active_at(conn, "/project/renamed/lib")
+            .await
+            .expect("followed")
+            .expect("child followed");
+        assert_eq!(followed.id, child.id);
+        assert!(
+            active_at(conn, "/project/nest/lib")
+                .await
+                .expect("old child")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn target_path_native_api_review_cl_does_not_change_targets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = wired_storage(temp.path()).await;
+        let api = MonoApiService {
+            storage,
+            git_object_cache: test_cache().await,
+        };
+        let mono = api.storage.mono_storage();
+        let conn = mono.get_connection();
+        let kept = crate::jupiter::service::trace_target_service::bind_first_native_write(
+            conn,
+            "/project/kept",
+        )
+        .await
+        .expect("seed");
+        let created = api
+            .create_monorepo_entry(directory("/project", "app"), None)
+            .await
+            .expect("review create");
+        assert_eq!(created.path, "/project/app");
+        assert!(
+            active_at(conn, "/project/app")
+                .await
+                .expect("review create binds nothing")
+                .is_none()
+        );
+        assert_eq!(
+            active_at(conn, "/project/kept")
+                .await
+                .expect("kept")
+                .expect("seed stays")
+                .id,
+            kept.id
+        );
     }
 }

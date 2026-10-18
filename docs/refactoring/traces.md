@@ -31,6 +31,10 @@ H1/H3 必须能够先于 H5 提供服务。后期联合验收不得反向阻塞�
 - `source_repo_id` 由 Libra 已有 `libra.repoid` 提供。独立 clone 创建新的 ID，linked worktree 共用 ID；保留现有 opaque identity/legacy 值，不能静默改写为另一 UUID。服务端按经过编码的完整原值隔离；其作用是来源标签，客户端不能藉此获得别的 principal 的写权限。
 - `epoch_id` 为客户端显式新建并持久化的 UUID。同一 stream 只追加；本地 clean 重写后必须用 `--new-stream` 开新 epoch，旧 stream 保留。创建 epoch 的重试复用已保存值，不每次随机生成。
 
+正规化路径以单个前导 `/` 开头，去掉末尾 `/`（根路径保持 `/`），拒绝 `.`、`..` 和空路径段。路径中的空格保留，不把 `/project/foo ` 收成 `/project/foo`。`/app` 与 `/apple` 不是同一前缀。只有 Trunk 落地的目录提交才改 target。Review 形态只打开 change list，不改全局 target。首次 native 目录写入在 Trunk 目录提交成功之后，于同一个事务里再次确认路径仍是目录再插入。若插入后该目录已经不在当前树中，这次插入回滚。失败回滚会把这次记下的 target id 移回，包括期间被停用的行，不搬走后来出现在目标路径上的其它 target，然后再按当前树恢复 active。提交失败不插入，也不停用别人已经落地的绑定。唯一约束冲突表示路径已有绑定。同一路径的后续写入返回同一 UUID。显式目录 move 在目录提交前用同一个数据库事务更新该路径及其下已有 target 的 `project_path`，目录自身没有 target 时后代仍然跟着移动，UUID 不变；事务中任一更新失败则本次路径都不改。若更早的 push 在这次提交落地前把这些行停用，提交成功后只在该路径没有另一条 active target 时把这些 id 恢复为 active。目录提交失败则先按同样规则恢复，再把路径移回。停用同样是一个事务。目标路径已有另一条 active target，或目标落在自身子树内时，拒绝移动。显式目录 delete 在提交前记下当时的 active target id，只在提交成功后停用这些 id，且它们仍位于被删路径下。提交之后新建的 UUID 不会被这次删除停用。提交前失败不改 target。文件创建、移动和删除不新建 target。inactive 之后对同一路径的再次写入插入新 UUID，旧行保留。相同 tree OID 不改变 target 的 id 或路径。内部 rebind 只接受已经是 canonical 形式的路径；调用方未确认该路径存在，或传入带尾部 `/`、缺少前导 `/`、含 `.` / `..` 的字符串时不写库。公开 rebind 命令不在本卡。
+
+通用代码 push 在 `b3_execute_push_inner` 提交前的同一事务中处理：没有 active target，或 landed tree 行不存在时，不改任何 target。push 路径自身保持 active。其下在 landed tree 中不再是目录的后代 target 设为 inactive；事务回滚后这些行恢复原状。ImportRepo 的 create、delete、move 仍返回 409，不插入也不停用 target。ImportRepo detach 与公开 rebind CLI 由后续卡交付。
+
 Git URL（所有动态 path segment 使用 UTF-8 bytes 的 base64url、无 padding；epoch 和 stream UUID 使用标准 UUID 文本）：
 
 ```text

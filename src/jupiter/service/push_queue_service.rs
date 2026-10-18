@@ -737,6 +737,23 @@ impl PushQueueService {
         &self.mono_storage
     }
 
+    /// Deactivate descendant targets missing from the landed tree, on `txn`.
+    /// The push path stays. No active targets, or a missing tree row, changes nothing.
+    pub async fn publish_target_paths_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        push_path: &str,
+        landed_tree_id: &str,
+    ) -> Result<Vec<String>, MegaError> {
+        crate::jupiter::service::trace_target_service::deactivate_descendants_missing_from_tree(
+            txn,
+            &self.mono_storage,
+            push_path,
+            landed_tree_id,
+        )
+        .await
+    }
+
     pub fn reaper(&self) -> crate::jupiter::service::push_queue_reaper::PushQueueReaper {
         crate::jupiter::service::push_queue_reaper::PushQueueReaper::from_service(self.clone())
     }
@@ -2980,6 +2997,9 @@ impl PushQueueService {
                 .map_err(|error| MegaError::Other(error.to_string()))?;
         }
 
+        self.publish_target_paths_in_txn(&txn, &normalized, &landed_tree)
+            .await?;
+
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
         txn.commit().await?;
         // WH-03 (plan-20260912 ADR-WH-04): the single `repo.push` emission
@@ -3557,15 +3577,26 @@ fn reject_to_error(reason: EnqueueRejectReason) -> MegaError {
 
 #[cfg(test)]
 mod tests {
+    use git_internal::internal::{
+        metadata::EntryMeta,
+        object::{
+            blob::Blob,
+            tree::{Tree, TreeItem, TreeItemMode},
+        },
+    };
+    use sea_orm::{ActiveModelTrait, TransactionTrait};
     use serde_json::json;
 
     use super::*;
     include!("native_publication_push_tests.rs");
     use crate::{
-        callisto::{mega_refs, sea_orm_active_enums::PushQueueFailureEnum},
+        callisto::{mega_refs, mega_tree, sea_orm_active_enums::PushQueueFailureEnum},
         jupiter::{
-            migration::apply_migrations, storage::base_storage::StorageConnector,
+            migration::apply_migrations,
+            service::trace_target_service::bind_first_native_write,
+            storage::{base_storage::StorageConnector, trace_target_storage::active_at},
             tests::test_db_connection,
+            utils::converter::IntoMegaModel,
         },
     };
 
@@ -9352,5 +9383,172 @@ mod tests {
         .await;
         fu18_assert_refused(&storage, &stale, &fu18_removed(path)).await;
         assert_eq!(fu13_root(&storage).await, root);
+    }
+
+    async fn insert_tree(conn: &sea_orm::DatabaseConnection, tree: Tree) -> String {
+        let tree_id = tree.id.to_string();
+        let model = tree.into_mega_model(EntryMeta::default());
+        let row: mega_tree::ActiveModel = model.into();
+        row.insert(conn).await.expect("insert tree");
+        tree_id
+    }
+
+    async fn project_tree(conn: &sea_orm::DatabaseConnection) -> String {
+        let keep = Blob::from_content("keep");
+        let app = Tree::from_tree_items(vec![TreeItem {
+            mode: TreeItemMode::Blob,
+            id: keep.id,
+            name: "keep".to_owned(),
+        }])
+        .expect("app tree");
+        let readme = Blob::from_content("readme");
+        let root = Tree::from_tree_items(vec![
+            TreeItem {
+                mode: TreeItemMode::Tree,
+                id: app.id,
+                name: "app".to_owned(),
+            },
+            TreeItem {
+                mode: TreeItemMode::Blob,
+                id: readme.id,
+                name: "readme".to_owned(),
+            },
+        ])
+        .expect("project tree");
+        insert_tree(conn, app).await;
+        insert_tree(conn, root).await
+    }
+
+    async fn publication_service() -> (tempfile::TempDir, PushQueueService) {
+        let (temp, svc) = service(PushPolicy::Review).await;
+        (temp, svc)
+    }
+
+    #[tokio::test]
+    async fn target_path_publication_deactivates_missing_descendants_in_txn() {
+        let (_temp, svc) = publication_service().await;
+        let conn = svc.mono_storage.get_connection();
+        let tree_id = project_tree(conn).await;
+        let push = bind_first_native_write(conn, "/project")
+            .await
+            .expect("push path");
+        let app = bind_first_native_write(conn, "/project/app")
+            .await
+            .expect("present child");
+        let gone = bind_first_native_write(conn, "/project/gone")
+            .await
+            .expect("missing child");
+        let file = bind_first_native_write(conn, "/project/readme")
+            .await
+            .expect("file path");
+        let neighbor = bind_first_native_write(conn, "/projectile")
+            .await
+            .expect("prefix neighbor");
+        let other = bind_first_native_write(conn, "/other")
+            .await
+            .expect("other");
+
+        let txn = conn.begin().await.expect("txn");
+        let deactivated = svc
+            .publish_target_paths_in_txn(&txn, "/project", &tree_id)
+            .await
+            .expect("publish");
+        txn.commit().await.expect("commit");
+
+        assert!(deactivated.contains(&gone.id));
+        assert!(deactivated.contains(&file.id));
+        assert!(!deactivated.contains(&push.id));
+        assert!(!deactivated.contains(&app.id));
+        assert_eq!(
+            active_at(conn, "/project").await.expect("push").unwrap().id,
+            push.id
+        );
+        assert_eq!(
+            active_at(conn, "/project/app")
+                .await
+                .expect("app")
+                .unwrap()
+                .id,
+            app.id
+        );
+        assert!(
+            active_at(conn, "/project/gone")
+                .await
+                .expect("gone")
+                .is_none()
+        );
+        assert!(
+            active_at(conn, "/project/readme")
+                .await
+                .expect("file")
+                .is_none()
+        );
+        assert_eq!(
+            active_at(conn, "/projectile")
+                .await
+                .expect("neighbor")
+                .unwrap()
+                .id,
+            neighbor.id
+        );
+        assert_eq!(
+            active_at(conn, "/other").await.expect("other").unwrap().id,
+            other.id
+        );
+    }
+
+    #[tokio::test]
+    async fn target_path_publication_missing_tree_and_rollback_keep_targets() {
+        let (_temp, svc) = publication_service().await;
+        let conn = svc.mono_storage.get_connection();
+        let kept = bind_first_native_write(conn, "/project/gone")
+            .await
+            .expect("kept");
+        let txn = conn.begin().await.expect("txn");
+        let untouched = svc
+            .publish_target_paths_in_txn(
+                &txn,
+                "/project",
+                "cccccccccccccccccccccccccccccccccccccccc",
+            )
+            .await
+            .expect("missing tree");
+        assert!(untouched.is_empty());
+        txn.commit().await.expect("commit missing");
+        assert_eq!(
+            active_at(conn, "/project/gone")
+                .await
+                .expect("still active")
+                .unwrap()
+                .id,
+            kept.id
+        );
+
+        let tree_id = project_tree(conn).await;
+        let txn = conn.begin().await.expect("rollback txn");
+        let deactivated = svc
+            .publish_target_paths_in_txn(&txn, "/project", &tree_id)
+            .await
+            .expect("deactivate in txn");
+        assert_eq!(deactivated, vec![kept.id.clone()]);
+        txn.rollback().await.expect("rollback");
+        assert_eq!(
+            active_at(conn, "/project/gone")
+                .await
+                .expect("restored")
+                .unwrap()
+                .id,
+            kept.id
+        );
+
+        let empty = svc
+            .publish_target_paths_in_txn(
+                &conn.begin().await.expect("empty txn"),
+                "/unused",
+                &tree_id,
+            )
+            .await
+            .expect("no targets");
+        assert!(empty.is_empty());
     }
 }
