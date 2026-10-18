@@ -196,7 +196,7 @@ Monorepo 路径禁止 Git 客户端推送 Tag，Tag 经此入口管理（ImportR
 
 - **OCI Distribution `/v2`**:storage-only 且 `[oci].enabled=true` 时挂载,可作容器镜像仓库(`docker login` 复用 push token,无独立 token 服务)。架构与端点事实源见 [`refactoring/oci.md`](./refactoring/oci.md),启用步骤见 [`deploy-trunk.md`](./deploy-trunk.md) 第 10 节。
 - **Agent Session Capture `/api/v1/agent-capture`**：可选能力，接收并查询 Agent 会话、事件、checkpoint、transcript 与文件操作记录。仅在 storage-only 且 `[agent_capture].enabled=true`、配置至少一个 `[[agent_capture.ingest_tokens]]` 时挂载；使用独立 ingest token，不复用 Git push token，也不会由 Git push 自动产生会话记录。配置与配额事实源见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
-- **Traces 归档**：示例配置里的 `[traces].enabled` 保持 `false`。打开它必须由操作者写入 `server_id` UUID，mega2 不会在启动时生成这个 id。这个开关本身不挂载 traces 的 Git 或 HTTP 面。traces 失败使用稳定错误码：缺认证是 401 `unauthenticated`；未知或无权限的 scope 是 404 `unknown_scope`；非法参数或 cursor 是 400 `invalid_parameter` 或 `invalid_cursor`；`unsupported_schema`、`invalid_capture`、`object_integrity` 和 `trace_history_in_code` 是 409；`response_budget` 是 413；`query_timeout` 和 `search_unavailable` 是 503。错误文本不包含对象 key 或 transcript 正文。见[配置指南](./configuration.zh.md)。
+- **Traces 归档**：示例配置里的 `[traces].enabled` 保持 `false`。打开它必须由操作者写入 `server_id` UUID，mega2 不会在启动时生成这个 id。这个开关本身不挂载 traces 的 Git 或 HTTP 面。traces 失败使用稳定错误码：缺认证是 401 `unauthenticated`；未知或无权限的 scope 是 404 `unknown_scope`；非法参数或 cursor 是 400 `invalid_parameter` 或 `invalid_cursor`；`unsupported_schema`、`invalid_capture`、`object_integrity` 和 `trace_history_in_code` 是 409；`response_budget` 是 413；`query_timeout` 和 `search_unavailable` 是 503。错误文本不包含对象 key 或 transcript 正文。具名维护操作者用 `mega2 --config <现存配置> traces rebind-target --target <UUID> --path <canonical-path>` 把已有 target 指到新路径（也可以用 `MEGA_CONFIG` 点名配置）。路径必须已经是 canonical 形式，并且当前已经是目录。目标不存在、路径不是 canonical、或目录不存在时都不写库。该命令不生成默认配置，只在工作目录里发现的配置也会被拒绝。见[配置指南](./configuration.zh.md)。
 
 ## 6. 配合 Libra 使用
 
@@ -220,6 +220,7 @@ libra mega2 browser
 | `mega2 service multi http ssh` | 单进程同时启动 HTTP + SSH(共享授权快照) |
 | `mega2 path provision --server <URL> <PATH>` | 开通 Monorepo 路径(首次推送前,见 2.5);token 只从环境变量 `MEGA2_TOKEN` 读取,不读配置文件 |
 | `mega2 import-repo remove --path <P> --yes [--cleanup-id <ID>] [--max-rounds <N>]` | 在服务器上清理 ImportRepo(storage-only;`--config` 放在 `import-repo` 之前或设 `MEGA_CONFIG`);结局行与退出码见 2.6 |
+| `mega2 --config <现存配置> traces rebind-target --target <UUID> --path <canonical-path>` | 把已有 trace target 指到已经是目录的 canonical 路径（第 5 节）。不生成默认配置 |
 | `mega2 config validate [--resolve-secrets] [--show-sources]` | 启动前校验配置;自动化加 `--deny-warnings` |
 | `mega2 config init [-o PATH] [--force]` | 生成安全的起始配置文件 |
 | `mega2 config secret ref/set/check/rotate` | 管理 vault 承载的配置密文(SecretRef) |

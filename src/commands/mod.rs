@@ -7,6 +7,7 @@ pub mod debug;
 pub mod import_repo;
 pub mod path;
 pub mod service;
+pub mod traces;
 
 use std::path::PathBuf;
 
@@ -97,6 +98,7 @@ pub fn builtin() -> Vec<Command> {
         authz_audit::cli(),
         path::cli(),
         import_repo::cli(),
+        traces::cli(),
     ]
 }
 
@@ -108,6 +110,7 @@ pub(crate) fn builtin_exec(cmd: &str) -> Option<CommandExec> {
         "authz-audit" => authz_audit::exec,
         "path" => path::exec,
         "import-repo" => import_repo::exec,
+        "traces" => traces::exec,
         _ => return None,
     };
 
@@ -128,6 +131,9 @@ pub(crate) fn load_mode(cmd: &str, args: &ArgMatches) -> Option<LoadMode> {
         // Destructive operator command: an existing config only, never a
         // generated default (plan-20260923 FU-21).
         "import-repo" => Some(LoadMode::ParsedExistingConfig),
+        // Named maintenance command: an existing config only, never a
+        // generated default (plan-20261015 MTR-47).
+        "traces" => Some(LoadMode::ParsedExistingConfig),
         _ => None,
     }
 }
@@ -166,9 +172,33 @@ mod tests {
                 "debug",
                 "authz-audit",
                 "path",
-                "import-repo"
+                "import-repo",
+                "traces"
             ]
         );
+    }
+
+    /// plan-20261015 MTR-47: `traces` is registered in all three tables and
+    /// never generates a default config.
+    #[test]
+    fn traces_command_registered() {
+        assert!(builtin().iter().any(|cmd| cmd.get_name() == "traces"));
+        assert!(builtin_exec("traces").is_some());
+        let args = traces::cli()
+            .try_get_matches_from([
+                "traces",
+                "rebind-target",
+                "--target",
+                "00000000-0000-0000-0000-000000000001",
+                "--path",
+                "/project",
+            ])
+            .expect("traces rebind-target arguments");
+        assert_eq!(
+            load_mode("traces", &args),
+            Some(LoadMode::ParsedExistingConfig)
+        );
+        assert!(args.subcommand_matches("rebind-target").is_some());
     }
 
     /// plan-20260923 FU-08: `path` is registered in all three tables and
