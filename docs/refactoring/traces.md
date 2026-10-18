@@ -67,6 +67,8 @@ traces/v1/staging/<ingest-uuid>/...
 
 接收顺序固定：认证和目标授权 → 有界 quarantine 解包 → 校验 OID/闭包/单父 FF 与 checkpoint 不可变 → 所有新对象 durable → 单 DB 事务重新核对 old tip、principal/凭据有效性、目标 active/binding generation 和当前项目写权限，再创建必要 scope、发布 membership、CAS 更新 ref、写 ref journal/outbox → 返回 Git `ok` → 后台索引。权限/目标变更与发布使用已有权威写入屏障或版本 CAS，不可在解包时的旧授权上无条件发布。第一次创建 stream 也遵守此事务顺序；并发首次 push 由自然键唯一约束和 tip CAS 确定唯一赢家。
 
+已落地的引用发布只接受唯一 ref `refs/libra/traces`。删除、非快进、父数大于 1 的新提交、改掉已有 checkpoint 的 `original_tree`，或让已有 checkpoint 从本次提交中消失，都拒绝，并且不改 tip、membership 或 journal。通过校验后，同一数据库事务把本次对象 membership 标为可见、用当前 tip 做 CAS 更新 `trace_stream.tip_oid`，并追加一条 `trace_ref_update`。同一 old tip 的并发发布只有一个事务成功。同一 idempotency key 在 tip 已经是该 new tip 时返回原 journal，不再写第二条。对象字节在该事务开始前写入 `traces` namespace；事务失败时这些字节仍不可见。已知 schema 标识是 `manifest-v1` 与 `metadata-v2`。其它 schema 仍按上述规则归档，发布结果标为 `unsupported`，不拒绝这次引用更新。本事务不重查 credential、target、binding generation 或写权限。
+
 每次 push 只允许更新唯一 `refs/libra/traces`；拒绝额外 ref、删除、非 FF、force rewrite 与 merge commit。对所有新提交逐一校验：已有 checkpoint ID 的 subtree/tree OID 不变且不删除，新增内容必须使用新 ID；不能只比较最终 tip 从而漏掉中途篡改。
 
 v1 固定每个对象最大 64 MiB，metadata/manifest 各最大 1 MiB，压缩 pack 最大 512 MiB、解包总量最大 1 GiB；每 push 最多 100,000 个对象、10,000 个新 commit，delta/tree 最大深度各 64，接收总时限 300s（固定协议值与广告字段见第 5 节，取消时释放资源）。v1 不提供这些预算的 operator override；capability 如实公开协议常量。流式处理在解码/遍历期间累计 bytes、计数、深度和时限，超限立即停，不先整体分配 pack 大小。断开后未发布 staging 由 lease+membership 校验清理，GC 不扫描/删除已发布对象或其他 scope。对象 durable 后 DB 失败只留下不可见 orphan；DB 成功但回复丢失的重试检查同 tip 并返回幂等结果，不重复 journal。

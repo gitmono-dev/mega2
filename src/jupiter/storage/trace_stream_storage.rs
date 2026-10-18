@@ -1,0 +1,740 @@
+//! Append-only publication of `refs/libra/traces`.
+//! One transaction publishes membership, the tip CAS, and the ref journal.
+
+use chrono::Utc;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    DatabaseTransaction, EntityTrait, IntoActiveModel, QueryFilter, Set, Statement,
+    TransactionTrait, Value, sea_query::Expr,
+};
+use uuid::Uuid;
+
+use crate::{
+    callisto::{trace_checkpoint, trace_object, trace_ref_update, trace_stream},
+    common::{
+        errors::{MegaError, TracesError},
+        utils::is_protocol_zero_id,
+    },
+};
+
+pub const TRACES_REF: &str = "refs/libra/traces";
+const SCHEMA_MANIFEST_V1: &str = "manifest-v1";
+const SCHEMA_METADATA_V2: &str = "metadata-v2";
+
+/// How an archived schema is labeled. Unknown schemas are still published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaDisposition {
+    Supported,
+    Unsupported,
+}
+
+/// The result of one successful publication or an exact retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedRef {
+    pub stream_id: String,
+    pub new_tip: String,
+    pub ref_sequence: i64,
+    pub schema: SchemaDisposition,
+    pub idempotent: bool,
+}
+
+/// One new commit and the parents the caller declares for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitParentList {
+    pub oid: String,
+    pub parents: Vec<String>,
+}
+
+/// A checkpoint that remains in the stream after this publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointBinding {
+    pub checkpoint_key: String,
+    pub original_tree: String,
+}
+
+/// The ref update checked inside the publication transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRef {
+    pub stream_id: String,
+    pub ref_names: Vec<String>,
+    pub delete: bool,
+    pub new_tip: String,
+    pub commits: Vec<CommitParentList>,
+    pub checkpoints: Vec<CheckpointBinding>,
+    pub object_oids: Vec<String>,
+    pub hash_kind: String,
+    pub idempotency_key: String,
+    pub schema_id: String,
+}
+
+/// Publish one fast-forward ref update. A rejection writes nothing.
+pub async fn publish_ref(
+    db: &DatabaseConnection,
+    update: &PublishRef,
+) -> Result<PublishedRef, MegaError> {
+    let txn = db.begin().await?;
+    let published = match publish_ref_in_txn(&txn, update).await {
+        Ok(published) => published,
+        Err(err) => {
+            txn.rollback().await?;
+            return Err(err);
+        }
+    };
+    txn.commit().await?;
+    Ok(published)
+}
+
+async fn publish_ref_in_txn(
+    txn: &DatabaseTransaction,
+    update: &PublishRef,
+) -> Result<PublishedRef, MegaError> {
+    let PreparedRef {
+        stream_id,
+        new_tip,
+        commits,
+        checkpoints,
+        object_oids,
+        hash_kind,
+        schema,
+    } = prepare_ref(update)?;
+
+    let (stored_hash_kind, old_tip) = lock_stream(txn, &stream_id).await?;
+    if stored_hash_kind != hash_kind {
+        return Err(rejected());
+    }
+    if let Some(existing) = journal_for_key(txn, &update.idempotency_key).await? {
+        if existing.stream_id == stream_id
+            && existing.new_tip == new_tip
+            && old_tip.as_deref() == Some(new_tip.as_str())
+        {
+            return Ok(PublishedRef {
+                stream_id,
+                new_tip,
+                ref_sequence: existing.ref_sequence,
+                schema,
+                idempotent: true,
+            });
+        }
+        return Err(rejected());
+    }
+    require_fast_forward(old_tip.as_deref(), &new_tip, &commits)?;
+    publish_checkpoints(txn, &stream_id, &checkpoints).await?;
+    publish_membership(txn, &stream_id, &hash_kind, &object_oids).await?;
+    cas_tip(txn, &stream_id, old_tip.as_deref(), &new_tip).await?;
+    let ref_sequence = append_journal(
+        txn,
+        &stream_id,
+        old_tip.as_deref(),
+        &new_tip,
+        &update.idempotency_key,
+    )
+    .await?;
+    Ok(PublishedRef {
+        stream_id,
+        new_tip,
+        ref_sequence,
+        schema,
+        idempotent: false,
+    })
+}
+
+struct PreparedRef {
+    stream_id: String,
+    new_tip: String,
+    commits: Vec<CommitParentList>,
+    checkpoints: Vec<CheckpointBinding>,
+    object_oids: Vec<String>,
+    hash_kind: String,
+    schema: SchemaDisposition,
+}
+
+/// Reject a ref update that cannot be published, before any bytes or rows change.
+pub fn preflight(update: &PublishRef) -> Result<(), MegaError> {
+    prepare_ref(update).map(|_| ())
+}
+
+fn prepare_ref(update: &PublishRef) -> Result<PreparedRef, MegaError> {
+    let stream_id = canonical_uuid(&update.stream_id)?;
+    require_traces_ref(&update.ref_names)?;
+    if update.delete || update.new_tip.is_empty() || is_protocol_zero_id(&update.new_tip) {
+        return Err(rejected());
+    }
+    if update.idempotency_key.is_empty() {
+        return Err(rejected());
+    }
+    let hash_kind = match update.hash_kind.as_str() {
+        "sha1" => "sha1",
+        "sha256" => "sha256",
+        _ => return Err(rejected()),
+    };
+    let new_tip = canonical_oid(&update.new_tip)?;
+    let commits = canonical_commits(&update.commits)?;
+    let checkpoints = canonical_checkpoints(&update.checkpoints)?;
+    let object_oids = canonical_oids(&update.object_oids)?;
+    require_single_parents(&commits)?;
+    require_membership(&new_tip, &commits, &object_oids)?;
+    Ok(PreparedRef {
+        stream_id,
+        new_tip,
+        commits,
+        checkpoints,
+        object_oids,
+        hash_kind: hash_kind.to_owned(),
+        schema: schema_disposition(&update.schema_id),
+    })
+}
+
+fn schema_disposition(schema_id: &str) -> SchemaDisposition {
+    if schema_id == SCHEMA_MANIFEST_V1 || schema_id == SCHEMA_METADATA_V2 {
+        SchemaDisposition::Supported
+    } else {
+        SchemaDisposition::Unsupported
+    }
+}
+
+fn require_traces_ref(ref_names: &[String]) -> Result<(), MegaError> {
+    if ref_names.len() == 1 && ref_names[0] == TRACES_REF {
+        Ok(())
+    } else {
+        Err(rejected())
+    }
+}
+
+fn require_single_parents(commits: &[CommitParentList]) -> Result<(), MegaError> {
+    if commits.iter().all(|commit| commit.parents.len() <= 1) {
+        Ok(())
+    } else {
+        Err(rejected())
+    }
+}
+
+fn require_membership(
+    new_tip: &str,
+    commits: &[CommitParentList],
+    object_oids: &[String],
+) -> Result<(), MegaError> {
+    let listed = |oid: &str| object_oids.iter().any(|listed| listed == oid);
+    if listed(new_tip) && commits.iter().all(|commit| listed(&commit.oid)) {
+        Ok(())
+    } else {
+        Err(rejected())
+    }
+}
+
+fn require_fast_forward(
+    old_tip: Option<&str>,
+    new_tip: &str,
+    commits: &[CommitParentList],
+) -> Result<(), MegaError> {
+    let mut expect_parent = old_tip.map(str::to_owned);
+    if commits.is_empty() {
+        return Err(rejected());
+    }
+    for commit in commits {
+        match (&expect_parent, commit.parents.as_slice()) {
+            (None, []) => {}
+            (Some(parent), [only]) if only == parent => {}
+            _ => return Err(rejected()),
+        }
+        expect_parent = Some(commit.oid.clone());
+    }
+    if expect_parent.as_deref() == Some(new_tip) {
+        Ok(())
+    } else {
+        Err(rejected())
+    }
+}
+
+async fn lock_stream(
+    txn: &DatabaseTransaction,
+    stream_id: &str,
+) -> Result<(String, Option<String>), MegaError> {
+    let row = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT hash_kind, tip_oid FROM trace_stream WHERE id = $1 FOR UPDATE",
+            [Value::from(stream_id.to_owned())],
+        ))
+        .await?
+        .ok_or_else(rejected)?;
+    let hash_kind: String = row.try_get("", "hash_kind")?;
+    let tip_oid: Option<String> = row.try_get("", "tip_oid")?;
+    Ok((hash_kind, tip_oid))
+}
+
+async fn journal_for_key(
+    txn: &DatabaseTransaction,
+    idempotency_key: &str,
+) -> Result<Option<trace_ref_update::Model>, MegaError> {
+    Ok(trace_ref_update::Entity::find()
+        .filter(trace_ref_update::Column::IdempotencyKey.eq(idempotency_key))
+        .one(txn)
+        .await?)
+}
+
+async fn publish_checkpoints(
+    txn: &DatabaseTransaction,
+    stream_id: &str,
+    proposed: &[CheckpointBinding],
+) -> Result<(), MegaError> {
+    let existing = trace_checkpoint::Entity::find()
+        .filter(trace_checkpoint::Column::StreamId.eq(stream_id))
+        .all(txn)
+        .await?;
+    for row in &existing {
+        let kept = proposed
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_key == row.checkpoint_key);
+        if kept.is_none_or(|checkpoint| checkpoint.original_tree != row.original_tree) {
+            return Err(rejected());
+        }
+    }
+    for checkpoint in proposed {
+        if existing
+            .iter()
+            .any(|row| row.checkpoint_key == checkpoint.checkpoint_key)
+        {
+            continue;
+        }
+        trace_checkpoint::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            stream_id: Set(stream_id.to_owned()),
+            checkpoint_key: Set(checkpoint.checkpoint_key.clone()),
+            original_tree: Set(checkpoint.original_tree.clone()),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn publish_membership(
+    txn: &DatabaseTransaction,
+    stream_id: &str,
+    hash_kind: &str,
+    object_oids: &[String],
+) -> Result<(), MegaError> {
+    for oid in object_oids {
+        let existing = trace_object::Entity::find()
+            .filter(trace_object::Column::StreamId.eq(stream_id))
+            .filter(trace_object::Column::HashKind.eq(hash_kind))
+            .filter(trace_object::Column::Oid.eq(oid))
+            .one(txn)
+            .await?;
+        if let Some(existing) = existing {
+            if !existing.visible {
+                let mut active = existing.into_active_model();
+                active.visible = Set(true);
+                active.update(txn).await?;
+            }
+            continue;
+        }
+        trace_object::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            stream_id: Set(stream_id.to_owned()),
+            hash_kind: Set(hash_kind.to_owned()),
+            oid: Set(oid.clone()),
+            visible: Set(true),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn cas_tip(
+    txn: &DatabaseTransaction,
+    stream_id: &str,
+    old_tip: Option<&str>,
+    new_tip: &str,
+) -> Result<(), MegaError> {
+    let mut update = trace_stream::Entity::update_many()
+        .col_expr(
+            trace_stream::Column::TipOid,
+            Expr::value(new_tip.to_owned()),
+        )
+        .filter(trace_stream::Column::Id.eq(stream_id));
+    update = match old_tip {
+        Some(old_tip) => update.filter(trace_stream::Column::TipOid.eq(old_tip)),
+        None => update.filter(trace_stream::Column::TipOid.is_null()),
+    };
+    let result = update.exec(txn).await?;
+    if result.rows_affected == 1 {
+        Ok(())
+    } else {
+        Err(rejected())
+    }
+}
+
+async fn append_journal(
+    txn: &DatabaseTransaction,
+    stream_id: &str,
+    old_tip: Option<&str>,
+    new_tip: &str,
+    idempotency_key: &str,
+) -> Result<i64, MegaError> {
+    let row = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COALESCE(MAX(ref_sequence), 0)::bigint AS n \
+             FROM trace_ref_update WHERE stream_id = $1",
+            [Value::from(stream_id.to_owned())],
+        ))
+        .await?
+        .ok_or_else(rejected)?;
+    let current: i64 = row.try_get("", "n")?;
+    let ref_sequence = current + 1;
+    trace_ref_update::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        stream_id: Set(stream_id.to_owned()),
+        ref_sequence: Set(ref_sequence),
+        idempotency_key: Set(idempotency_key.to_owned()),
+        old_tip: Set(old_tip.map(str::to_owned)),
+        new_tip: Set(new_tip.to_owned()),
+        state: Set("pending".to_owned()),
+        claim_until: Set(None),
+        attempt_count: Set(0),
+        created_at: Set(Utc::now().fixed_offset()),
+    }
+    .insert(txn)
+    .await?;
+    Ok(ref_sequence)
+}
+
+fn canonical_uuid(value: &str) -> Result<String, MegaError> {
+    Uuid::parse_str(value)
+        .map(|id| id.to_string())
+        .map_err(|_| rejected())
+}
+
+fn canonical_oid(oid: &str) -> Result<String, MegaError> {
+    if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(rejected());
+    }
+    Ok(oid.to_ascii_lowercase())
+}
+
+fn canonical_oids(oids: &[String]) -> Result<Vec<String>, MegaError> {
+    oids.iter().map(|oid| canonical_oid(oid)).collect()
+}
+
+fn canonical_commits(commits: &[CommitParentList]) -> Result<Vec<CommitParentList>, MegaError> {
+    commits
+        .iter()
+        .map(|commit| {
+            Ok(CommitParentList {
+                oid: canonical_oid(&commit.oid)?,
+                parents: canonical_oids(&commit.parents)?,
+            })
+        })
+        .collect()
+}
+
+fn canonical_checkpoints(
+    checkpoints: &[CheckpointBinding],
+) -> Result<Vec<CheckpointBinding>, MegaError> {
+    checkpoints
+        .iter()
+        .map(|checkpoint| {
+            if checkpoint.checkpoint_key.is_empty() {
+                return Err(rejected());
+            }
+            Ok(CheckpointBinding {
+                checkpoint_key: checkpoint.checkpoint_key.clone(),
+                original_tree: canonical_oid(&checkpoint.original_tree)?,
+            })
+        })
+        .collect()
+}
+
+fn rejected() -> MegaError {
+    MegaError::Traces(TracesError::InvalidParameter)
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{EntityTrait, PaginatorTrait, Set};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        callisto::{
+            trace_checkpoint, trace_object, trace_principal, trace_ref_update, trace_target,
+        },
+        jupiter::{migration::apply_migrations, tests::test_db_connection},
+    };
+
+    const OID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const OID_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const TREE_A: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    const TREE_B: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    async fn open_db() -> (tempfile::TempDir, DatabaseConnection) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.expect("migrations");
+        (dir, db)
+    }
+
+    async fn stream(db: &DatabaseConnection) -> String {
+        let principal_id = Uuid::new_v4().to_string();
+        let target_id = Uuid::new_v4().to_string();
+        trace_principal::ActiveModel {
+            id: Set(principal_id.clone()),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(db)
+        .await
+        .expect("principal");
+        trace_target::ActiveModel {
+            id: Set(target_id.clone()),
+            target_kind: Set("native".to_owned()),
+            project_path: Set(format!("/team/{target_id}")),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(db)
+        .await
+        .expect("target");
+        trace_stream::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id),
+            target_id: Set(target_id),
+            source_repo_id: Set("source-opaque".to_owned()),
+            epoch_id: Set(Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(None),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(db)
+        .await
+        .expect("stream")
+        .id
+    }
+
+    fn update(stream_id: &str, new_tip: &str, parents: Vec<String>, key: &str) -> PublishRef {
+        PublishRef {
+            stream_id: stream_id.to_owned(),
+            ref_names: vec![TRACES_REF.to_owned()],
+            delete: false,
+            new_tip: new_tip.to_owned(),
+            commits: vec![CommitParentList {
+                oid: new_tip.to_owned(),
+                parents,
+            }],
+            checkpoints: Vec::new(),
+            object_oids: vec![new_tip.to_owned()],
+            hash_kind: "sha1".to_owned(),
+            idempotency_key: key.to_owned(),
+            schema_id: SCHEMA_MANIFEST_V1.to_owned(),
+        }
+    }
+
+    async fn tip(db: &DatabaseConnection, stream_id: &str) -> Option<String> {
+        trace_stream::Entity::find_by_id(stream_id)
+            .one(db)
+            .await
+            .expect("stream")
+            .expect("row")
+            .tip_oid
+    }
+
+    async fn visible_count(db: &DatabaseConnection, stream_id: &str) -> u64 {
+        trace_object::Entity::find()
+            .filter(trace_object::Column::StreamId.eq(stream_id))
+            .filter(trace_object::Column::Visible.eq(true))
+            .count(db)
+            .await
+            .expect("visible")
+    }
+
+    async fn journal_count(db: &DatabaseConnection, stream_id: &str) -> u64 {
+        trace_ref_update::Entity::find()
+            .filter(trace_ref_update::Column::StreamId.eq(stream_id))
+            .count(db)
+            .await
+            .expect("journal")
+    }
+
+    #[tokio::test]
+    async fn ref_transaction_accepts_only_traces_ref_and_rejects_delete() {
+        let (_dir, db) = open_db().await;
+        let stream_id = stream(&db).await;
+        let mut extra = update(&stream_id, OID_A, Vec::new(), "extra-ref");
+        extra.ref_names = vec!["refs/heads/main".to_owned()];
+        assert!(publish_ref(&db, &extra).await.is_err());
+        let mut both = update(&stream_id, OID_A, Vec::new(), "both-refs");
+        both.ref_names = vec![TRACES_REF.to_owned(), "refs/heads/main".to_owned()];
+        assert!(publish_ref(&db, &both).await.is_err());
+        let mut deletion = update(&stream_id, OID_A, Vec::new(), "delete-ref");
+        deletion.delete = true;
+        assert!(publish_ref(&db, &deletion).await.is_err());
+        let mut zero = update(&stream_id, &"0".repeat(40), Vec::new(), "zero-ref");
+        zero.object_oids = vec!["0".repeat(40)];
+        zero.commits[0].oid = "0".repeat(40);
+        assert!(publish_ref(&db, &zero).await.is_err());
+        assert_eq!(tip(&db, &stream_id).await, None);
+        assert_eq!(visible_count(&db, &stream_id).await, 0);
+        assert_eq!(journal_count(&db, &stream_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn ref_transaction_rejects_non_ff_and_multi_parent() {
+        let (_dir, db) = open_db().await;
+        let stream_id = stream(&db).await;
+        publish_ref(&db, &update(&stream_id, OID_A, Vec::new(), "first"))
+            .await
+            .expect("first");
+        let non_ff = update(&stream_id, OID_C, Vec::new(), "orphan");
+        assert!(publish_ref(&db, &non_ff).await.is_err());
+        let mut merge = update(
+            &stream_id,
+            OID_B,
+            vec![OID_A.to_owned(), OID_C.to_owned()],
+            "merge",
+        );
+        merge.object_oids = vec![OID_B.to_owned()];
+        assert!(publish_ref(&db, &merge).await.is_err());
+        assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_A));
+        assert_eq!(visible_count(&db, &stream_id).await, 1);
+        assert_eq!(journal_count(&db, &stream_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn ref_transaction_keeps_checkpoint_tree_and_rejects_delete() {
+        let (_dir, db) = open_db().await;
+        let stream_id = stream(&db).await;
+        let mut first = update(&stream_id, OID_A, Vec::new(), "ckpt-first");
+        first.checkpoints = vec![CheckpointBinding {
+            checkpoint_key: "ckpt-1".to_owned(),
+            original_tree: TREE_A.to_owned(),
+        }];
+        publish_ref(&db, &first).await.expect("first");
+        let mut changed = update(&stream_id, OID_B, vec![OID_A.to_owned()], "ckpt-change");
+        changed.checkpoints = vec![CheckpointBinding {
+            checkpoint_key: "ckpt-1".to_owned(),
+            original_tree: TREE_B.to_owned(),
+        }];
+        assert!(publish_ref(&db, &changed).await.is_err());
+        let removed = update(&stream_id, OID_B, vec![OID_A.to_owned()], "ckpt-remove");
+        assert!(publish_ref(&db, &removed).await.is_err());
+        let mut kept = update(&stream_id, OID_B, vec![OID_A.to_owned()], "ckpt-keep");
+        kept.checkpoints = vec![
+            CheckpointBinding {
+                checkpoint_key: "ckpt-1".to_owned(),
+                original_tree: TREE_A.to_owned(),
+            },
+            CheckpointBinding {
+                checkpoint_key: "ckpt-2".to_owned(),
+                original_tree: TREE_B.to_owned(),
+            },
+        ];
+        publish_ref(&db, &kept).await.expect("kept");
+        let rows = trace_checkpoint::Entity::find()
+            .filter(trace_checkpoint::Column::StreamId.eq(&stream_id))
+            .all(&db)
+            .await
+            .expect("checkpoints");
+        let tree = rows
+            .iter()
+            .find(|row| row.checkpoint_key == "ckpt-1")
+            .expect("ckpt-1")
+            .original_tree
+            .clone();
+        assert_eq!(tree, TREE_A);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_B));
+    }
+
+    #[tokio::test]
+    async fn ref_transaction_commits_membership_ref_and_journal_together() {
+        let (_dir, db) = open_db().await;
+        let stream_id = stream(&db).await;
+        trace_ref_update::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            stream_id: Set(stream_id.clone()),
+            ref_sequence: Set(1),
+            idempotency_key: Set("occupied-key".to_owned()),
+            old_tip: Set(None),
+            new_tip: Set(OID_A.to_owned()),
+            state: Set("pending".to_owned()),
+            claim_until: Set(None),
+            attempt_count: Set(0),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(&db)
+        .await
+        .expect("occupied journal");
+        let blocked = update(&stream_id, OID_A, Vec::new(), "occupied-key");
+        assert!(publish_ref(&db, &blocked).await.is_err());
+        assert_eq!(tip(&db, &stream_id).await, None);
+        assert_eq!(visible_count(&db, &stream_id).await, 0);
+        assert_eq!(journal_count(&db, &stream_id).await, 1);
+
+        let published = publish_ref(&db, &update(&stream_id, OID_A, Vec::new(), "fresh-key"))
+            .await
+            .expect("publish");
+        assert!(!published.idempotent);
+        assert_eq!(published.schema, SchemaDisposition::Supported);
+        assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_A));
+        assert_eq!(visible_count(&db, &stream_id).await, 1);
+        assert_eq!(journal_count(&db, &stream_id).await, 2);
+        let replay = publish_ref(&db, &update(&stream_id, OID_A, Vec::new(), "fresh-key"))
+            .await
+            .expect("replay");
+        assert!(replay.idempotent);
+        assert_eq!(journal_count(&db, &stream_id).await, 2);
+
+        let unknown = {
+            let mut update = update(&stream_id, OID_B, vec![OID_A.to_owned()], "unknown-schema");
+            update.schema_id = "lifecycle-unknown".to_owned();
+            update
+        };
+        let archived = publish_ref(&db, &unknown).await.expect("unknown schema");
+        assert_eq!(archived.schema, SchemaDisposition::Unsupported);
+        assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_B));
+        assert_eq!(journal_count(&db, &stream_id).await, 3);
+    }
+
+    #[tokio::test]
+    async fn ref_transaction_concurrent_old_tip_has_one_winner() {
+        let (_dir, db) = open_db().await;
+        let stream_id = stream(&db).await;
+        let left_db = db.clone();
+        let right_db = db.clone();
+        let left_stream = stream_id.clone();
+        let right_stream = stream_id.clone();
+        let left = tokio::spawn(async move {
+            publish_ref(
+                &left_db,
+                &update(&left_stream, OID_A, Vec::new(), "race-left"),
+            )
+            .await
+        });
+        let right = tokio::spawn(async move {
+            publish_ref(
+                &right_db,
+                &update(&right_stream, OID_B, Vec::new(), "race-right"),
+            )
+            .await
+        });
+        let left = left.await.expect("left");
+        let right = right.await.expect("right");
+        let stored = tip(&db, &stream_id).await.expect("tip");
+        match (left, right) {
+            (Ok(published), Err(_)) => assert_eq!(published.new_tip, stored),
+            (Err(_), Ok(published)) => assert_eq!(published.new_tip, stored),
+            (Ok(_), Ok(_)) => panic!("both publications succeeded"),
+            (Err(left_err), Err(right_err)) => {
+                panic!("both publications failed: {left_err}; {right_err}")
+            }
+        }
+        assert!(stored == OID_A || stored == OID_B);
+        assert_eq!(journal_count(&db, &stream_id).await, 1);
+        assert_eq!(visible_count(&db, &stream_id).await, 1);
+    }
+}

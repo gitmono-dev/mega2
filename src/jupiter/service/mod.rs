@@ -14,6 +14,7 @@ pub mod storage_event;
 pub mod storage_event_emitter;
 pub mod storage_event_transport;
 pub mod trace_object_service;
+pub mod trace_publish_service;
 pub mod trace_target_service;
 pub mod view_metrics;
 pub mod view_projection_service;
