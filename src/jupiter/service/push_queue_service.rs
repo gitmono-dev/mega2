@@ -1889,6 +1889,12 @@ impl PushQueueService {
             }
         }
 
+        let retired = crate::jupiter::service::trace_target_service::retire_import_target_in_txn(
+            &txn,
+            payload.repo_id,
+            repo_path,
+        )
+        .await?;
         import_refs::Entity::delete_many()
             .filter(import_refs::Column::RepoId.eq(payload.repo_id))
             .exec(&txn)
@@ -1900,6 +1906,17 @@ impl PushQueueService {
             .requester
             .clone()
             .unwrap_or_else(|| "anonymous".to_owned());
+        let mut metadata = serde_json::json!({
+            "kind": IMPORT_REPO_REMOVE_KIND,
+            "cleanup_id": row.id,
+            "path": repo_path,
+            "requester": requester,
+            "phase": "detached",
+        });
+        if let Some(retired) = &retired {
+            metadata["trace_target_id"] = serde_json::Value::String(retired.id.clone());
+            metadata["binding_generation"] = serde_json::Value::from(retired.binding_generation);
+        }
         AuditStorage::log_audit_in_txn(
             &txn,
             // Reserved actor: storage-only has no numeric user id.
@@ -1908,13 +1925,7 @@ impl PushQueueService {
             AuditActionEnum::Delete,
             TargetTypeEnum::Repository,
             payload.repo_id,
-            Some(serde_json::json!({
-                "kind": IMPORT_REPO_REMOVE_KIND,
-                "cleanup_id": row.id,
-                "path": repo_path,
-                "requester": requester,
-                "phase": "detached",
-            })),
+            Some(metadata),
         )
         .await?;
         git_db
@@ -9550,5 +9561,311 @@ mod tests {
             .await
             .expect("no targets");
         assert!(empty.is_empty());
+    }
+
+    async fn import_target_row(
+        storage: &crate::jupiter::storage::Storage,
+        id: &str,
+    ) -> crate::callisto::trace_target::Model {
+        use sea_orm::EntityTrait;
+
+        crate::callisto::trace_target::Entity::find_by_id(id)
+            .one(storage.mono_storage().get_connection())
+            .await
+            .expect("load target")
+            .expect("target row")
+    }
+
+    async fn import_target_generation(storage: &crate::jupiter::storage::Storage, id: &str) -> i64 {
+        crate::jupiter::service::trace_target_service::binding_generation(
+            storage.mono_storage().get_connection(),
+            id,
+        )
+        .await
+        .expect("generation")
+    }
+
+    async fn seed_import_target(
+        storage: &crate::jupiter::storage::Storage,
+        path: &str,
+        repo_id: i64,
+    ) -> String {
+        crate::jupiter::storage::trace_target_storage::insert_active(
+            storage.mono_storage().get_connection(),
+            crate::jupiter::storage::trace_target_storage::TARGET_KIND_IMPORT,
+            path,
+            Some(repo_id.to_string()),
+        )
+        .await
+        .expect("import target")
+        .id
+    }
+
+    #[tokio::test]
+    async fn import_target_lifecycle_reject_does_not_create_target() {
+        use sea_orm::EntityTrait;
+
+        use crate::{
+            ceres::{
+                api_service::ApiHandler,
+                model::git::{CreateEntryInfo, DeleteEntryInfo, MoveEntryInfo},
+                protocol::repo::Repo,
+            },
+            jupiter::storage::git_db_storage::import_fence_support::test_cache,
+        };
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let conn = mono.get_connection();
+        assert!(
+            crate::callisto::trace_target::Entity::find()
+                .all(conn)
+                .await
+                .expect("rows before")
+                .is_empty()
+        );
+        let api = crate::ceres::api_service::import_api_service::ImportApiService {
+            storage: storage.clone(),
+            repo: Repo::new(std::path::PathBuf::from("/third-party/mtr48"), false).expect("repo"),
+            git_object_cache: test_cache().await,
+        };
+        let created = api
+            .create_monorepo_entry(
+                CreateEntryInfo {
+                    is_directory: true,
+                    name: "extra".to_owned(),
+                    path: "/third-party/mtr48".to_owned(),
+                    content: None,
+                    author_email: None,
+                    author_username: None,
+                    skip_build: true,
+                    mode: crate::ceres::model::git::EditCLMode::TryReuse(None),
+                },
+                None,
+            )
+            .await
+            .expect_err("create rejected");
+        let deleted = api
+            .delete_monorepo_entry(
+                DeleteEntryInfo {
+                    path: "/third-party/mtr48".to_owned(),
+                    name: "extra".to_owned(),
+                    is_directory: true,
+                    author_username: None,
+                    skip_build: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("delete rejected");
+        let moved = api
+            .move_monorepo_entry(
+                MoveEntryInfo {
+                    from_path: "/third-party/mtr48".to_owned(),
+                    from_name: "extra".to_owned(),
+                    to_path: "/project".to_owned(),
+                    to_name: "extra".to_owned(),
+                    is_directory: true,
+                    author_username: None,
+                    skip_build: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("move rejected");
+        assert_eq!(
+            created.to_string(),
+            "[code:409] import dir does not support create entry"
+        );
+        assert_eq!(
+            deleted.to_string(),
+            "[code:409] import dir does not support delete entry"
+        );
+        assert_eq!(
+            moved.to_string(),
+            "[code:409] import dir does not support move entry"
+        );
+        assert!(
+            crate::callisto::trace_target::Entity::find()
+                .all(conn)
+                .await
+                .expect("rows after")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn import_target_lifecycle_detach_bumps_generation_once() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let path = "/third-party/mtr48-detach";
+        let (repo, _) = fu16_mount(&storage, path).await;
+        let target_id = seed_import_target(&storage, path, repo.repo_id).await;
+        assert_eq!(import_target_generation(&storage, &target_id).await, 1);
+        let (id, outcome) = fu16_detach(&storage, &repo).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Done { .. }),
+            "{outcome:?}"
+        );
+        let row = import_target_row(&storage, &target_id).await;
+        assert!(!row.active);
+        assert_eq!(row.id, target_id);
+        assert_eq!(import_target_generation(&storage, &target_id).await, 2);
+
+        let replay = AttachPayload {
+            op: AttachOp::Detach,
+            repo_id: repo.repo_id,
+            repo_path: repo.repo_path.clone(),
+            commands: Vec::new(),
+        };
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let EnqueueOutcome::Inserted { id: replay_id } = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Attach,
+                operation_id: format!("{id}-replay"),
+                path: repo.repo_path.clone(),
+                old_id: root.ref_commit_hash,
+                new_id: ZERO_ID.to_owned(),
+                requester: None,
+                payload: serde_json::to_value(&replay).unwrap(),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("replay enqueue");
+        };
+        let replayed = fu16_execute(&storage, replay_id).await;
+        assert!(
+            matches!(replayed, ExecuteOutcome::Done { .. }),
+            "{replayed:?}"
+        );
+        let row = import_target_row(&storage, &target_id).await;
+        assert!(!row.active);
+        assert_eq!(import_target_generation(&storage, &target_id).await, 2);
+    }
+
+    #[tokio::test]
+    async fn import_target_lifecycle_plain_detach_and_rollback() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let path = "/third-party/mtr48-plain";
+        let (repo, _) = fu16_register(&storage, path).await;
+        let target_id = seed_import_target(&storage, path, repo.repo_id).await;
+        let (id, outcome) = fu16_detach(&storage, &repo).await;
+        assert!(
+            matches!(
+                outcome,
+                ExecuteOutcome::Done {
+                    root_cas_writes: 0,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(!import_target_row(&storage, &target_id).await.active);
+        assert_eq!(import_target_generation(&storage, &target_id).await, 2);
+        let _ = id;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let path = "/third-party/mtr48-rollback";
+        let (repo, _) = fu16_mount(&storage, path).await;
+        let target_id = seed_import_target(&storage, path, repo.repo_id).await;
+        let before_root = fu13_root(&storage).await;
+        let before_rows = fu16_rows(&storage, repo.repo_id).await;
+        let EnqueueOutcome::Inserted { id } = fu16_enqueue_detach(&storage, &repo, None).await
+        else {
+            panic!("detach insert");
+        };
+        storage
+            .git_db_storage()
+            .insert_cleanup_in_txn(
+                id,
+                "/elsewhere",
+                1,
+                "anonymous",
+                storage.mono_storage().get_connection(),
+            )
+            .await
+            .unwrap();
+        let outcome = fu16_execute(&storage, id).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(fu13_root(&storage).await, before_root);
+        assert_eq!(fu16_rows(&storage, repo.repo_id).await, before_rows);
+        let row = import_target_row(&storage, &target_id).await;
+        assert!(row.active);
+        assert_eq!(row.project_path, path);
+        assert_eq!(import_target_generation(&storage, &target_id).await, 1);
+        assert_eq!(
+            fu16_count(
+                &storage,
+                format!(
+                    "SELECT count(*) AS n FROM audit_logs WHERE metadata->>'trace_target_id' = '{target_id}'"
+                )
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn import_target_lifecycle_replacement_survives_old_continuation() {
+        use std::sync::Arc;
+
+        use crate::ceres::pack::import_repo::remove_import_repo;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = fu13_storage(temp.path()).await;
+        let path = "/third-party/mtr48-next";
+        let (repo, _) = fu16_mount(&storage, path).await;
+        let old_id = seed_import_target(&storage, path, repo.repo_id).await;
+        let (cleanup_id, outcome) = fu16_detach(&storage, &repo).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Done { .. }),
+            "{outcome:?}"
+        );
+        let (next, _) = fu16_register(&storage, path).await;
+        let new_id = seed_import_target(&storage, path, next.repo_id).await;
+        assert_ne!(new_id, old_id);
+        assert!(import_target_row(&storage, &new_id).await.active);
+        assert_eq!(import_target_generation(&storage, &new_id).await, 1);
+        assert!(!import_target_row(&storage, &old_id).await.active);
+
+        let cache = Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+            connection: crate::jupiter::tests::test_redis_manager().await,
+            prefix: String::new(),
+        });
+        let continued = remove_import_repo(&storage, cache, path, None, Some(cleanup_id))
+            .await
+            .expect("old continuation");
+        assert!(
+            matches!(
+                continued,
+                crate::ceres::pack::import_repo::RemoveOutcome::Removed { .. }
+            ),
+            "{continued:?}"
+        );
+        let new_row = import_target_row(&storage, &new_id).await;
+        assert!(new_row.active);
+        assert_eq!(new_row.id, new_id);
+        assert_eq!(
+            new_row.backing_import_repo_id.as_deref(),
+            Some(next.repo_id.to_string().as_str())
+        );
+        assert_eq!(import_target_generation(&storage, &new_id).await, 1);
+        assert!(!import_target_row(&storage, &old_id).await.active);
+        assert_eq!(import_target_generation(&storage, &old_id).await, 2);
     }
 }

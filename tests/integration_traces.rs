@@ -546,3 +546,211 @@ async fn trace_config_model_reload_classifies_traces() {
     assert!(after.traces.server_id.is_none());
     assert!(after.traces.scope.is_none());
 }
+
+#[tokio::test]
+async fn import_target_remove_blackbox_deactivates_matching_target() {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    use sea_orm::{ActiveModelTrait, DatabaseBackend, Statement};
+    use url::Url;
+
+    let (traces, db) = traces_db::TracesDb::migrated().await;
+    let database_name: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_database() AS name".to_owned(),
+        ))
+        .await
+        .expect("database name")
+        .expect("row")
+        .try_get("", "name")
+        .expect("name");
+    let admin = std::env::var("MEGA_DATABASE__DB_URL").unwrap_or_else(|_| {
+        "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".to_owned()
+    });
+    let mut database_url = Url::parse(&admin).expect("admin url");
+    database_url.set_path(&database_name);
+    let database_url = database_url.to_string();
+    let temp = tempfile::tempdir().expect("temp");
+    let config_path = temp.path().join("config.toml");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+        &config_path,
+    )
+    .expect("copy config");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("port")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let stdout_path = temp.path().join("service.out");
+    let stderr_path = temp.path().join("service.err");
+    let mut service = Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .arg("--config")
+        .arg(&config_path)
+        .args(["service", "http", "--host", "127.0.0.1", "-p"])
+        .arg(port.to_string())
+        .env("MEGA_DATABASE__DB_URL", &database_url)
+        .env("MEGA_DATABASE__DB_TYPE", "postgres")
+        .env("MEGA_BASE_DIR", temp.path())
+        .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+        .env("MEGA_LOG__PRINT_STD", "true")
+        .stdout(Stdio::from(
+            std::fs::File::create(&stdout_path).expect("stdout"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("stderr"),
+        ))
+        .spawn()
+        .expect("spawn service");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let ready = loop {
+        if Instant::now() >= deadline {
+            break false;
+        }
+        if service.try_wait().expect("poll service").is_some() {
+            break false;
+        }
+        let count: i64 = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT count(*)::bigint AS n FROM mega_refs".to_owned(),
+            ))
+            .await
+            .expect("count refs")
+            .expect("row")
+            .try_get("", "n")
+            .expect("n");
+        if count > 0 {
+            break true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let _ = service.kill();
+    let _ = service.wait();
+    assert!(
+        ready,
+        "service did not initialize\nstdout:\n{}\nstderr:\n{}",
+        std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+        std::fs::read_to_string(&stderr_path).unwrap_or_default()
+    );
+
+    let path = "/third-party/blackbox";
+    let repo_id = 910_048_i64;
+    let target_id = Uuid::new_v4().to_string();
+    mega2_core::git_repo::ActiveModel {
+        id: Set(repo_id),
+        repo_path: Set(path.to_owned()),
+        repo_name: Set("blackbox".to_owned()),
+        created_at: Set(Utc::now().naive_utc()),
+        updated_at: Set(Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .expect("seed repo");
+    trace_target::ActiveModel {
+        id: Set(target_id.clone()),
+        target_kind: Set("import".to_owned()),
+        project_path: Set(path.to_owned()),
+        backing_import_repo_id: Set(Some(repo_id.to_string())),
+        active: Set(true),
+        created_at: Set(Utc::now().fixed_offset()),
+    }
+    .insert(&db)
+    .await
+    .expect("seed target");
+
+    let remove = Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .arg("--config")
+        .arg(&config_path)
+        .args(["import-repo", "remove", "--path", path, "--yes"])
+        .env("MEGA_DATABASE__DB_URL", &database_url)
+        .env("MEGA_DATABASE__DB_TYPE", "postgres")
+        .env("MEGA_BASE_DIR", temp.path())
+        .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+        .env("MEGA_LOG__PRINT_STD", "true")
+        .output()
+        .expect("run remove");
+    let stdout = String::from_utf8_lossy(&remove.stdout);
+    let stderr = String::from_utf8_lossy(&remove.stderr);
+    assert!(
+        remove.status.success(),
+        "remove failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("removed {path}")),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let retired = trace_target::Entity::find_by_id(&target_id)
+        .one(&db)
+        .await
+        .expect("load")
+        .expect("target");
+    assert!(!retired.active);
+    let generation: i64 = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COALESCE(MAX((metadata->>'binding_generation')::bigint), 1) AS generation
+             FROM audit_logs WHERE metadata->>'trace_target_id' = $1",
+            [target_id.clone().into()],
+        ))
+        .await
+        .expect("generation")
+        .expect("row")
+        .try_get("", "generation")
+        .expect("generation");
+    assert_eq!(generation, 2);
+    let repo_left: i64 = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS n FROM git_repo WHERE id = $1",
+            [repo_id.into()],
+        ))
+        .await
+        .expect("repo count")
+        .expect("row")
+        .try_get("", "n")
+        .expect("n");
+    assert_eq!(repo_left, 0);
+
+    let replacement = Uuid::new_v4().to_string();
+    trace_target::ActiveModel {
+        id: Set(replacement.clone()),
+        target_kind: Set("import".to_owned()),
+        project_path: Set(path.to_owned()),
+        backing_import_repo_id: Set(Some("910049".to_owned())),
+        active: Set(true),
+        created_at: Set(Utc::now().fixed_offset()),
+    }
+    .insert(&db)
+    .await
+    .expect("replacement target");
+    let again = Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .arg("--config")
+        .arg(&config_path)
+        .args(["import-repo", "remove", "--path", path, "--yes"])
+        .env("MEGA_DATABASE__DB_URL", &database_url)
+        .env("MEGA_DATABASE__DB_TYPE", "postgres")
+        .env("MEGA_BASE_DIR", temp.path())
+        .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+        .env("MEGA_LOG__PRINT_STD", "true")
+        .output()
+        .expect("run continuation");
+    let again_out = String::from_utf8_lossy(&again.stdout);
+    let again_err = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        again.status.success(),
+        "second remove failed\nstdout:\n{again_out}\nstderr:\n{again_err}"
+    );
+    let kept = trace_target::Entity::find_by_id(&replacement)
+        .one(&db)
+        .await
+        .expect("load replacement")
+        .expect("replacement");
+    assert!(kept.active);
+    assert_eq!(kept.id, replacement);
+    let _ = traces;
+}

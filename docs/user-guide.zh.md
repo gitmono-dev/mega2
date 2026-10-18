@@ -91,7 +91,7 @@ storage-only **不暴露 SSH receive-pack**(`git.ssh_receive_pack=false` 是强�
 
 **嵌套 ImportRepo。**先推送父路径、再推送其下的子路径是可以的，之后父仓库仍可更新（父仓库是升级前挂载、没有挂载来源记录的存量仓库时除外，见下文「兼容性」）；反过来，已有子仓库时再推送父路径，其分支会以 `IMPORT_REPO_PATH_OCCUPIED` 拒绝。清理时须先清理子仓库，否则以 `IMPORT_REPO_HAS_CHILDREN` 拒绝。
 
-**清理。**清理把 ImportRepo 从服务中摘除：删除仓库记录与 ref，从 Monorepo 根树中移除属于该仓库的挂载点（产生一个 `Remove ImportRepo <P>` 根 commit；不属于它的挂载内容保持不动，见下文「兼容性」），随后分批清扫该仓库的 commit、tree、blob 与 tag 元数据。摘除之后，该路径的 clone / fetch 回 404。摘除提交时仍在进行中的推送，此后要写的 ref 以 `IMPORT_REPO_REMOVED` 拒绝，其中的分支不会落地（Tag 逐个写入，摘除之前已写入的 Tag 属于旧仓库，随清理一并删除）；摘除之后才开始的推送——即使清扫尚未完成——会把该路径导入为一个新的仓库。清理有两个入口，使用同一套清理机制：
+**清理。**清理把 ImportRepo 从服务中摘除：删除仓库记录与 ref，从 Monorepo 根树中移除属于该仓库的挂载点（产生一个 `Remove ImportRepo <P>` 根 commit；不属于它的挂载内容保持不动，见下文「兼容性」），随后分批清扫该仓库的 commit、tree、blob 与 tag 元数据。摘除之后，该路径的 clone / fetch 回 404。摘除提交时仍在进行中的推送，此后要写的 ref 以 `IMPORT_REPO_REMOVED` 拒绝，其中的分支不会落地（Tag 逐个写入，摘除之前已写入的 Tag 属于旧仓库，随清理一并删除）；摘除之后才开始的推送——即使清扫尚未完成——会把该路径导入为一个新的仓库。同一次摘除事务还会把路径和 backing import repository 都匹配的 active trace target 停用，并把 binding generation 记成比原来大 1 的值。同路径上的新 ImportRepo 使用新的 target UUID。续做更早的清理不会改动这个新 target。导入目录上的产品 create、delete、move 仍返回 409，也不创建 target。清理有两个入口，使用同一套清理机制：
 
 - HTTP `POST /api/v1/import-repo/remove`（第 4.6 节）：要求 `git.push_auth = "token"`，且 token 覆盖该路径（第 2.3 节）；`push_auth = "none"` 的部署对合法的清理请求一律回 403（请求体或路径不合法时先回 400 / 422）。请求字段、结局（`removed` / `pending` / `absent`）、续做协议与错误码见契约页 [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md) 的「ImportRepo 叶子清理」。
 - 运维 CLI `mega2 import-repo remove`：在服务器上以服务自己的配置运行，适用于 `push_auth = "none"` 等无法使用 HTTP 清理的部署；能读取服务配置及其中的数据库凭据，即是授权。

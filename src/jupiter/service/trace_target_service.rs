@@ -1,15 +1,29 @@
 //! Target path lifecycle. Callers pass the connection that owns the code write
 //! when they already have a transaction.
 
-use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait, Set,
+    Statement, TransactionTrait,
+};
 
 use crate::{
+    callisto::trace_target,
     common::errors::MegaError,
     jupiter::storage::{
         mono_storage::MonoStorage,
         trace_target_storage::{self, Model, TARGET_KIND_NATIVE},
     },
 };
+
+/// A live binding that has never been retired.
+pub const INITIAL_BINDING_GENERATION: i64 = 1;
+
+/// The import target retired inside a detach transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredImportTarget {
+    pub id: String,
+    pub binding_generation: i64,
+}
 
 pub async fn bind_first_native_write<C: ConnectionTrait>(
     conn: &C,
@@ -130,6 +144,69 @@ pub async fn deactivate_descendants_missing_from_tree(
         }
     }
     Ok(deactivated)
+}
+
+/// Generation recorded for `target_id`. A target with no detach audit is at
+/// [`INITIAL_BINDING_GENERATION`]. Each successful detach writes the next
+/// integer into that audit row.
+pub async fn binding_generation<C: ConnectionTrait>(
+    conn: &C,
+    target_id: &str,
+) -> Result<i64, MegaError> {
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COALESCE(MAX((metadata->>'binding_generation')::bigint), $2::bigint) AS generation
+             FROM audit_logs
+             WHERE metadata->>'trace_target_id' = $1",
+            [target_id.into(), INITIAL_BINDING_GENERATION.into()],
+        ))
+        .await?;
+    let Some(row) = row else {
+        return Ok(INITIAL_BINDING_GENERATION);
+    };
+    row.try_get("", "generation")
+        .map_err(|err| MegaError::Other(err.to_string()))
+}
+
+/// Deactivate the active import target backed by `repo_id` at `path`.
+/// Returns the generation this detach must record, one higher than the
+/// current value. No matching row writes nothing.
+pub async fn retire_import_target_in_txn(
+    txn: &DatabaseTransaction,
+    repo_id: i64,
+    path: &str,
+) -> Result<Option<RetiredImportTarget>, MegaError> {
+    let path = trace_target_storage::canonical_project_path(path)?;
+    let locked = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM trace_target
+             WHERE project_path = $1
+               AND backing_import_repo_id = $2
+               AND active
+             FOR UPDATE",
+            [path.into(), repo_id.to_string().into()],
+        ))
+        .await?;
+    let Some(locked) = locked else {
+        return Ok(None);
+    };
+    let id: String = locked
+        .try_get("", "id")
+        .map_err(|err| MegaError::Other(err.to_string()))?;
+    let generation = binding_generation(txn, &id).await? + 1;
+    let row = trace_target::Entity::find_by_id(&id)
+        .one(txn)
+        .await?
+        .ok_or_else(|| MegaError::Other(format!("trace target {id} disappeared")))?;
+    let mut active: trace_target::ActiveModel = row.into();
+    active.active = Set(false);
+    active.update(txn).await?;
+    Ok(Some(RetiredImportTarget {
+        id,
+        binding_generation: generation,
+    }))
 }
 
 #[cfg(test)]
