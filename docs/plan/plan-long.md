@@ -790,7 +790,9 @@ mega2 原生外部集成，Mega 证据为 `N/A`。**接收登记日期：2026-10
 
 ## PT-17：Scoped Traces归档与Agent历史检索
 
-**当前（2026-10-18 06:09:24 UTC）：** MTR-65 为 in-progress/locally-accepted。版本面 `0.42.44`。VER-1 3 passed，exit 0。fmt、clippy、两套 build 与全量测试均为 exit 0。库测试 2593 passed / 0 failed / 3 ignored。Claude 与 Codex 均为 VERDICT PASS，P0=0，P1=0。推送、tag、Release 与 Docker D 尚未取得。FIX-MTR-03 的 AC-1 与 VER-5 未勾选。LTR-01 未开工。不推送 Libra。
+**当前（2026-10-18 06:24:48 UTC）：** MTR-65 为 done/complete。发布提交 `821f748`，tag `v0.42.44`，Docker run `39103156765` 的 amd64、arm64 与 job `docker` 均为 success。本收口不再次 bump。FIX-MTR-03 的 AC-1 与 VER-5 未勾选。下一张卡是 MTR-05。LTR-01 未开工。不推送 Libra。
+
+**历史（2026-10-18 06:09:24 UTC）：** MTR-65 当时为 in-progress/locally-accepted。全量测试 exit 0。Docker D 当时尚未取得。
 
 **历史（2026-10-18 05:19:33 UTC）：** MTR-83 为 done/complete。发布提交 `ea0d309`，tag `v0.42.43`，Docker run `39099140187` 的 amd64、arm64 与 job `docker` 均为 success。本收口不再次 bump。
 
