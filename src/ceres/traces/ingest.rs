@@ -418,7 +418,273 @@ pub async fn require_closure(
             return Err(rejected());
         }
     }
+    enforce_capture_document_sizes(store, stream_id, hash_kind, objects).await
+}
+
+#[derive(Clone)]
+struct TreeLink {
+    is_tree: bool,
+    name: Vec<u8>,
+    oid: String,
+}
+
+struct RoleWalk {
+    trees: HashMap<String, Option<std::sync::Arc<Vec<TreeLink>>>>,
+    blob_lens: HashMap<String, Option<u64>>,
+    checked_trees: HashSet<(u8, String)>,
+    checked_blobs: HashSet<String>,
+}
+
+/// After closure, every new commit's `checkpoint/<prefix>/<rest>/` metadata
+/// and manifest blobs must sit inside their raw-byte limits. A same-named
+/// file anywhere else is not one of those roles.
+async fn enforce_capture_document_sizes(
+    store: &MegaObjectStorageWrapper,
+    stream_id: &str,
+    hash_kind: &str,
+    objects: &[LooseObject],
+) -> Result<(), MegaError> {
+    let hash_len = hash_width(hash_kind)?;
+    let mut by_oid = HashMap::new();
+    for object in objects {
+        by_oid.insert(object.declared_oid.to_ascii_lowercase(), object);
+    }
+    let mut walk = RoleWalk {
+        trees: HashMap::new(),
+        blob_lens: HashMap::new(),
+        checked_trees: HashSet::new(),
+        checked_blobs: HashSet::new(),
+    };
+    for object in objects {
+        if object.object_type != "commit" {
+            continue;
+        }
+        let Some(tree_oid) = commit_tree_oid(&object.payload, hash_len * 2)? else {
+            continue;
+        };
+        check_commit_tree(store, stream_id, hash_kind, &by_oid, &mut walk, &tree_oid).await?;
+    }
     Ok(())
+}
+
+async fn check_commit_tree(
+    store: &MegaObjectStorageWrapper,
+    stream_id: &str,
+    hash_kind: &str,
+    by_oid: &HashMap<String, &LooseObject>,
+    walk: &mut RoleWalk,
+    tree_oid: &str,
+) -> Result<(), MegaError> {
+    if !walk.checked_trees.insert((0, tree_oid.to_owned())) {
+        return Ok(());
+    }
+    let Some(root) =
+        tree_links_cached(store, stream_id, hash_kind, by_oid, walk, tree_oid, false).await?
+    else {
+        return Ok(());
+    };
+    let checkpoint_oids: Vec<String> = root
+        .iter()
+        .filter(|link| link.is_tree && link.name == b"checkpoint")
+        .map(|link| link.oid.clone())
+        .collect();
+    for checkpoint_oid in checkpoint_oids {
+        if !walk.checked_trees.insert((1, checkpoint_oid.clone())) {
+            continue;
+        }
+        let Some(checkpoint_links) = tree_links_cached(
+            store,
+            stream_id,
+            hash_kind,
+            by_oid,
+            walk,
+            &checkpoint_oid,
+            true,
+        )
+        .await?
+        else {
+            continue;
+        };
+        let prefix_oids: Vec<String> = checkpoint_links
+            .iter()
+            .filter(|link| link.is_tree)
+            .map(|link| link.oid.clone())
+            .collect();
+        for prefix_oid in prefix_oids {
+            if !walk.checked_trees.insert((2, prefix_oid.clone())) {
+                continue;
+            }
+            let Some(prefix_links) =
+                tree_links_cached(store, stream_id, hash_kind, by_oid, walk, &prefix_oid, true)
+                    .await?
+            else {
+                continue;
+            };
+            let rest_oids: Vec<String> = prefix_links
+                .iter()
+                .filter(|link| link.is_tree)
+                .map(|link| link.oid.clone())
+                .collect();
+            for rest_oid in rest_oids {
+                if !walk.checked_trees.insert((3, rest_oid.clone())) {
+                    continue;
+                }
+                let Some(leaf) =
+                    tree_links_cached(store, stream_id, hash_kind, by_oid, walk, &rest_oid, true)
+                        .await?
+                else {
+                    continue;
+                };
+                let roles: Vec<(String, String)> = leaf
+                    .iter()
+                    .filter(|item| !item.is_tree)
+                    .filter_map(|item| {
+                        let role = match item.name.as_slice() {
+                            b"metadata.json" => "metadata",
+                            b"manifest.json" => "manifest",
+                            _ => return None,
+                        };
+                        Some((role.to_owned(), item.oid.clone()))
+                    })
+                    .collect();
+                for (role, oid) in roles {
+                    if !walk.checked_blobs.insert(oid.clone()) {
+                        continue;
+                    }
+                    let Some(raw_bytes) =
+                        blob_len_cached(store, stream_id, hash_kind, by_oid, walk, &oid).await?
+                    else {
+                        continue;
+                    };
+                    admission::admit_raw_capture_role(&role, raw_bytes)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn tree_links_cached(
+    store: &MegaObjectStorageWrapper,
+    stream_id: &str,
+    hash_kind: &str,
+    by_oid: &HashMap<String, &LooseObject>,
+    walk: &mut RoleWalk,
+    oid: &str,
+    strict: bool,
+) -> Result<Option<std::sync::Arc<Vec<TreeLink>>>, MegaError> {
+    if let Some(cached) = walk.trees.get(oid) {
+        return Ok(cached.clone());
+    }
+    let hash_len = hash_width(hash_kind)?;
+    let Some(links) =
+        load_tree_links(store, stream_id, hash_kind, hash_len, by_oid, oid, strict).await?
+    else {
+        return Ok(None);
+    };
+    let links = std::sync::Arc::new(links);
+    walk.trees.insert(oid.to_owned(), Some(links.clone()));
+    Ok(Some(links))
+}
+
+async fn load_tree_links(
+    store: &MegaObjectStorageWrapper,
+    stream_id: &str,
+    hash_kind: &str,
+    hash_len: usize,
+    by_oid: &HashMap<String, &LooseObject>,
+    oid: &str,
+    strict: bool,
+) -> Result<Option<Vec<TreeLink>>, MegaError> {
+    if let Some(object) = by_oid.get(oid) {
+        if object.object_type != "tree" {
+            return if strict { Err(rejected()) } else { Ok(None) };
+        }
+        return Ok(Some(tree_links(&object.payload, hash_len)?));
+    }
+    let Some(bytes) = get_raw(store, stream_id, hash_kind, oid).await? else {
+        return Ok(None);
+    };
+    if trace_object_storage::verify_declared_oid(hash_kind, "tree", &bytes, oid).is_err() {
+        return if strict { Err(rejected()) } else { Ok(None) };
+    }
+    Ok(Some(tree_links(&bytes, hash_len)?))
+}
+
+async fn blob_len_cached(
+    store: &MegaObjectStorageWrapper,
+    stream_id: &str,
+    hash_kind: &str,
+    by_oid: &HashMap<String, &LooseObject>,
+    walk: &mut RoleWalk,
+    oid: &str,
+) -> Result<Option<u64>, MegaError> {
+    if let Some(cached) = walk.blob_lens.get(oid) {
+        return Ok(*cached);
+    }
+    let len = if let Some(object) = by_oid.get(oid) {
+        if object.object_type != "blob" {
+            return Err(rejected());
+        }
+        Some(object.payload.len() as u64)
+    } else if let Some(bytes) = get_raw(store, stream_id, hash_kind, oid).await? {
+        if trace_object_storage::verify_declared_oid(hash_kind, "blob", &bytes, oid).is_err() {
+            return Err(rejected());
+        }
+        Some(bytes.len() as u64)
+    } else {
+        None
+    };
+    walk.blob_lens.insert(oid.to_owned(), len);
+    Ok(len)
+}
+
+fn commit_tree_oid(payload: &[u8], oid_hex_len: usize) -> Result<Option<String>, MegaError> {
+    let header_end = payload
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .unwrap_or(payload.len());
+    for line in payload[..header_end].split(|byte| *byte == b'\n') {
+        let mut parts = line.splitn(2, |byte| *byte == b' ');
+        let label = parts.next().unwrap_or_default();
+        let value = parts.next().unwrap_or_default();
+        if label != b"tree" {
+            continue;
+        }
+        if value.len() != oid_hex_len || !value.iter().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(rejected());
+        }
+        return Ok(Some(String::from_utf8_lossy(value).to_ascii_lowercase()));
+    }
+    Ok(None)
+}
+
+fn tree_links(payload: &[u8], hash_len: usize) -> Result<Vec<TreeLink>, MegaError> {
+    let mut links = Vec::new();
+    let mut rest = payload;
+    while !rest.is_empty() {
+        let Some(nul) = rest.iter().position(|byte| *byte == 0) else {
+            return Err(rejected());
+        };
+        let hash_end = nul.checked_add(1 + hash_len).ok_or_else(rejected)?;
+        if hash_end > rest.len() || nul == 0 || !rest[..nul].contains(&b' ') {
+            return Err(rejected());
+        }
+        let header = &rest[..nul];
+        let space = header
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(rejected)?;
+        let mode = &header[..space];
+        let name = header[space + 1..].to_vec();
+        links.push(TreeLink {
+            is_tree: mode == b"40000" || mode == b"040000",
+            name,
+            oid: encode_hex(&rest[nul + 1..hash_end]),
+        });
+        rest = &rest[hash_end..];
+    }
+    Ok(links)
 }
 
 fn referenced_oids(
@@ -1054,6 +1320,256 @@ mod tests {
                 .expect("row")
                 .tip_oid
                 .is_none()
+        );
+    }
+
+    fn git_entry(mode: &str, name: &str, oid_hex: &str) -> Vec<u8> {
+        let mut bytes = format!("{mode} {name}").into_bytes();
+        bytes.push(0);
+        bytes.extend(hex_decode(oid_hex));
+        bytes
+    }
+
+    fn blob_loose(payload: &[u8]) -> LooseObject {
+        let declared = oid(HashKind::Sha1, ObjectType::Blob, payload);
+        loose("blob", &declared, payload)
+    }
+
+    fn tree_loose(payload: &[u8]) -> LooseObject {
+        let declared = oid(HashKind::Sha1, ObjectType::Tree, payload);
+        loose("tree", &declared, payload)
+    }
+
+    fn commit_loose(tree_oid: &str, parent: Option<&str>) -> LooseObject {
+        let payload = match parent {
+            None => format!("tree {tree_oid}\n\ncheckpoint\n"),
+            Some(parent) => format!("tree {tree_oid}\nparent {parent}\n\ncheckpoint\n"),
+        };
+        let declared = oid(HashKind::Sha1, ObjectType::Commit, payload.as_bytes());
+        loose("commit", &declared, payload.as_bytes())
+    }
+
+    fn checkpoint_objects(
+        metadata: &[u8],
+        manifest: &[u8],
+        parent: Option<&str>,
+        decoy: Option<&[u8]>,
+    ) -> Vec<LooseObject> {
+        let meta = blob_loose(metadata);
+        let manifest_blob = blob_loose(manifest);
+        let mut leaf_bytes = git_entry("100644", "metadata.json", &meta.declared_oid);
+        leaf_bytes.extend(git_entry(
+            "100644",
+            "manifest.json",
+            &manifest_blob.declared_oid,
+        ));
+        let leaf = tree_loose(&leaf_bytes);
+        let prefix = tree_loose(&git_entry("40000", "cdef", &leaf.declared_oid));
+        let checkpoint = tree_loose(&git_entry("40000", "ab", &prefix.declared_oid));
+        let mut root_bytes = git_entry("40000", "checkpoint", &checkpoint.declared_oid);
+        let mut objects = vec![meta, manifest_blob, leaf, prefix, checkpoint];
+        if let Some(decoy_bytes) = decoy {
+            let decoy_blob = blob_loose(decoy_bytes);
+            root_bytes.extend(git_entry(
+                "100644",
+                "metadata.json",
+                &decoy_blob.declared_oid,
+            ));
+            objects.push(decoy_blob);
+        }
+        let root = tree_loose(&root_bytes);
+        let commit = commit_loose(&root.declared_oid, parent);
+        objects.push(root);
+        objects.push(commit);
+        objects
+    }
+
+    #[tokio::test]
+    async fn capture_document_publication_rejects_an_oversized_middle_commit() {
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
+        };
+        use uuid::Uuid;
+
+        use crate::{
+            callisto::{
+                trace_object, trace_principal, trace_ref_update, trace_stream, trace_target,
+            },
+            ceres::traces::auth::PublishAuthority,
+            jupiter::{
+                migration::apply_migrations,
+                service::trace_publish_service::TracePublishService,
+                storage::trace_stream_storage::{CommitParentList, PublishRef, TRACES_REF},
+                tests::test_db_connection,
+            },
+        };
+
+        let store = mock_object_storage();
+        let decoy = vec![7u8; TracesProtocolLimits::MAX_METADATA_BYTES as usize + 1];
+        let allowed = checkpoint_objects(b"ok", b"{}", None, Some(&decoy));
+        require_closure(&store, STREAM_A, "sha1", &allowed)
+            .await
+            .expect("a root metadata.json is not the checkpoint role");
+
+        let over = vec![9u8; TracesProtocolLimits::MAX_METADATA_BYTES as usize + 1];
+        let middle = checkpoint_objects(&over, b"{}", None, None);
+        let middle_oid = middle.last().expect("middle commit").declared_oid.clone();
+        let tip = checkpoint_objects(b"tip", b"{}", Some(&middle_oid), None);
+        let tip_oid = tip.last().expect("tip commit").declared_oid.clone();
+        let mut objects = middle;
+        objects.extend(tip);
+        assert!(
+            require_closure(&store, STREAM_A, "sha1", &objects)
+                .await
+                .is_err(),
+            "the middle commit's metadata is over the role limit"
+        );
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.expect("migrations");
+        let principal_id = Uuid::new_v4().to_string();
+        let target_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().fixed_offset();
+        trace_principal::ActiveModel {
+            id: Set(principal_id.clone()),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("principal");
+        trace_target::ActiveModel {
+            id: Set(target_id.clone()),
+            target_kind: Set("native".to_owned()),
+            project_path: Set(format!("/team/{target_id}")),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("target");
+        let credential_id = format!("publish-{target_id}");
+        crate::callisto::trace_credential_binding::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id.clone()),
+            namespace: Set("static_push_token".to_owned()),
+            credential_id: Set(credential_id.clone()),
+            created_at: Set(now),
+            retired_at: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("binding");
+        let stream_id = trace_stream::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id.clone()),
+            target_id: Set(target_id.clone()),
+            source_repo_id: Set("source-opaque".to_owned()),
+            epoch_id: Set(Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("stream")
+        .id;
+        let journal_before = trace_ref_update::Entity::find()
+            .filter(trace_ref_update::Column::StreamId.eq(&stream_id))
+            .count(&db)
+            .await
+            .expect("journal before");
+        let tip_before = trace_stream::Entity::find_by_id(&stream_id)
+            .one(&db)
+            .await
+            .expect("stream before")
+            .expect("row")
+            .tip_oid;
+        let path = format!("/team/{target_id}");
+        let token = crate::config::PushTokenConfig {
+            name: credential_id.clone(),
+            token: "synthetic-secret".to_owned(),
+            paths: Some(vec![path.clone()]),
+        };
+        let authority = PublishAuthority {
+            caller: crate::ceres::traces::auth::TracesCaller::StaticPushToken {
+                credential_id: &token.name,
+                token: &token,
+            },
+            principal_id: &principal_id,
+            target_id: &target_id,
+            authorized_path: &path,
+            expected_generation: 1,
+            policy: None,
+        };
+        let commits = objects
+            .iter()
+            .filter(|object| object.object_type == "commit")
+            .map(|object| CommitParentList {
+                oid: object.declared_oid.clone(),
+                parents: if object.declared_oid == middle_oid {
+                    Vec::new()
+                } else {
+                    vec![middle_oid.clone()]
+                },
+            })
+            .collect();
+        let object_oids = objects
+            .iter()
+            .map(|object| object.declared_oid.clone())
+            .collect();
+        assert!(
+            TracePublishService::new(store)
+                .publish_quarantine(
+                    &db,
+                    "77777777-7777-4777-8777-777777777777",
+                    UnpackBudget {
+                        compressed_bytes: 1,
+                        expanded_bytes: 0,
+                    },
+                    &objects,
+                    &PublishRef {
+                        stream_id: stream_id.clone(),
+                        ref_names: vec![TRACES_REF.to_owned()],
+                        delete: false,
+                        new_tip: tip_oid,
+                        commits,
+                        checkpoints: Vec::new(),
+                        object_oids,
+                        hash_kind: "sha1".to_owned(),
+                        idempotency_key: "capture-size".to_owned(),
+                        schema_id: "manifest-v1".to_owned(),
+                    },
+                    &authority,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            trace_ref_update::Entity::find()
+                .filter(trace_ref_update::Column::StreamId.eq(&stream_id))
+                .count(&db)
+                .await
+                .expect("journal after"),
+            journal_before
+        );
+        assert_eq!(
+            trace_stream::Entity::find_by_id(&stream_id)
+                .one(&db)
+                .await
+                .expect("stream")
+                .expect("row")
+                .tip_oid,
+            tip_before
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .filter(trace_object::Column::StreamId.eq(&stream_id))
+                .count(&db)
+                .await
+                .expect("membership"),
+            0
         );
     }
 }

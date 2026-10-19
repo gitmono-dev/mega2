@@ -91,6 +91,21 @@ pub fn admit_ingest(admission: &IngestAdmission, max_object_bytes: u64) -> Resul
     Ok(())
 }
 
+/// Reject a checkpoint metadata or manifest blob above its raw-byte limit.
+///
+/// Any other name is not one of those two roles.
+pub fn admit_raw_capture_role(role: &str, raw_bytes: u64) -> Result<(), MegaError> {
+    let limit = match role {
+        "metadata" => TracesProtocolLimits::MAX_METADATA_BYTES,
+        "manifest" => TracesProtocolLimits::MAX_MANIFEST_BYTES,
+        _ => return Ok(()),
+    };
+    if raw_bytes > limit {
+        return Err(MegaError::Traces(TracesError::ResponseBudget));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +171,27 @@ mod tests {
         assert_eq!(cancelled.delta_depth, 0);
         assert_eq!(cancelled.tree_depth, 0);
         assert!(admit_ingest(&cancelled, 1).is_err(), "cancelled worker");
+    }
+
+    #[test]
+    fn raw_capture_document_size_accepts_each_role_limit_and_rejects_one_past_it() {
+        admit_raw_capture_role("metadata", TracesProtocolLimits::MAX_METADATA_BYTES)
+            .expect("metadata limit is inclusive");
+        assert!(
+            admit_raw_capture_role("metadata", TracesProtocolLimits::MAX_METADATA_BYTES + 1)
+                .is_err(),
+            "metadata one byte over"
+        );
+        admit_raw_capture_role("manifest", TracesProtocolLimits::MAX_MANIFEST_BYTES)
+            .expect("manifest limit is inclusive");
+        assert!(
+            admit_raw_capture_role("manifest", TracesProtocolLimits::MAX_MANIFEST_BYTES + 1)
+                .is_err(),
+            "manifest one byte over"
+        );
+        assert!(
+            admit_raw_capture_role("notes", TracesProtocolLimits::MAX_METADATA_BYTES + 1).is_ok(),
+            "another file name is not a capture role"
+        );
     }
 }

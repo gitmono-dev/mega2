@@ -116,6 +116,12 @@ case 前后的 name、id、labels 和 containers 必须相同。
 自己创建的 container、volume 和网络，不删除 `mega2-trunk-*` 卷。operator 行为由
 `scripts/traces_pg_trgm_bootstrap.sh` 执行。
 
+`ceres::traces::ingest::tests::capture_document_publication_` 走真实
+`publish_quarantine`，库用 `test_db_connection`。它只把
+`checkpoint/<prefix>/<rest>/metadata.json` 和同层 `manifest.json` 的原始
+blob 字节交给角色大小门。根目录里的同名文件不算这两个角色。超限时 ref 与
+journal 保持调用前的快照。
+
 已经用匿名 volume 启动过的本机 `mega2-it` 不会重跑 initdb。该栈的所有者要让
 `ci-preflight` 看到新 SQL，需要先
 `docker compose -p mega2-it -f docker/docker-compose.test.yml down -v` 再启动，
