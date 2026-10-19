@@ -790,7 +790,9 @@ mega2 原生外部集成，Mega 证据为 `N/A`。**接收登记日期：2026-10
 
 ## PT-17：Scoped Traces归档与Agent历史检索
 
-**当前（2026-10-19 11:55:43 UTC）：** MTR-87 为 done/complete。发布提交 `2b3013f`，tag `v0.42.55`，Docker run `39246051261` 的 amd64、arm64 与 job `docker` 均为 success。本收口不再次 bump。Harbor run `39245968977` conclusion 为 success，不代替该 tag Docker。FIX-MTR-03 的 AC-1 与 VER-5 未勾选。下一张卡是 MTR-10。LTR-01 未开工。不推送 Libra。
+**当前（2026-10-19 16:38:20 UTC）：** MTR-10 `in-progress/locally-accepted`；R2/R3 独立 Claude/Codex 双 PASS，最终版本树三门、全量 2957 passed/0 failed/3 既有 ignored、双 build 均通过。C⑤–⑧与 tag Docker D 尚待；MTR-38、Libra LTR-01 仍不可越过前驱。Libra 远端 main 已由并发写者前进至 `cbee959c`，本地编辑前须先同步。
+
+**历史（2026-10-19 11:55:43 UTC）：** MTR-87 为 done/complete。发布提交 `2b3013f`，tag `v0.42.55`，Docker run `39246051261` 的 amd64、arm64 与 job `docker` 均为 success。本收口不再次 bump。Harbor run `39245968977` conclusion 为 success，不代替该 tag Docker。FIX-MTR-03 的 AC-1 与 VER-5 未勾选。下一张卡是 MTR-10。LTR-01 未开工。不推送 Libra。
 
 **历史（2026-10-19 11:35:33 UTC）：** MTR-87 当时为 in-progress/locally-accepted。版本面 `0.42.55`。全量测试 exit 0。当时推送、tag、Release 与 Docker D 尚未取得。
 

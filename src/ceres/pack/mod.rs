@@ -44,12 +44,18 @@ pub mod materialize;
 pub mod monorepo;
 pub mod path_policy;
 pub mod push_chain;
+pub mod traces_repo;
 pub mod trunk_provenance;
 pub mod view_repo;
 
 #[async_trait]
 pub trait RepoHandler: Send + Sync + 'static {
     fn is_monorepo(&self) -> bool;
+
+    /// Virtual traces repository. Native and ImportRepo keep the default.
+    fn is_trace_repo(&self) -> bool {
+        false
+    }
 
     /// Authoritative repository object hash kind (`MonoConfig.object_hash_kind()`).
     fn object_hash_kind(&self) -> Result<HashKind, MegaError>;
@@ -357,6 +363,11 @@ pub trait RepoHandler: Send + Sync + 'static {
         ),
         ProtocolError,
     > {
+        if self.is_trace_repo() {
+            return Err(ProtocolError::PackRejected(
+                "trace repository does not write code objects".to_owned(),
+            ));
+        }
         let total_mem = || {
             let sys = System::new_all();
             Ok(sys.total_memory() as usize)

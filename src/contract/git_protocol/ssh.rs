@@ -24,7 +24,7 @@ use crate::{
     config::PushAuth,
     contract::git_protocol::{
         check_push_permission, check_upload_pack_access, lookup_push_token,
-        path::{RepoLocator, classify_repo_locator},
+        path::{LocatorDispatch, RepoLocator, TracesLocator, dispatch_repo_locator},
         resolve_view_target,
     },
     jupiter::storage::Storage,
@@ -242,7 +242,49 @@ struct SshExecRequest {
     kind: SshExecKind,
     repo_path: PathBuf,
     locator: Result<RepoLocator, ProtocolError>,
+    traces: Option<TracesLocator>,
     lfs_operation: Option<String>,
+}
+
+struct LocatedSshRepo {
+    repo_path: PathBuf,
+    locator: Result<RepoLocator, ProtocolError>,
+    traces: Option<TracesLocator>,
+}
+
+fn locate_ssh_repo(raw: &str) -> Result<LocatedSshRepo, String> {
+    let repo_path = normalize_ssh_repo_path(raw)?;
+    let (locator, traces) = match dispatch_repo_locator(raw) {
+        Ok(LocatorDispatch::Traces(locator)) => {
+            (Ok(RepoLocator::Path(repo_path.clone())), Some(locator))
+        }
+        Ok(LocatorDispatch::View(view)) => (Ok(RepoLocator::View(view)), None),
+        Ok(LocatorDispatch::NativeOrImport(path)) => (Ok(RepoLocator::Path(path)), None),
+        Err(err) => (Err(err), None),
+    };
+    Ok(LocatedSshRepo {
+        repo_path,
+        locator,
+        traces,
+    })
+}
+
+fn ssh_pre_dispatch_reply(exec: &SshExecRequest) -> Option<SshErrReply> {
+    if exec.traces.is_some() {
+        return match exec.kind {
+            SshExecKind::Git(_) => None,
+            SshExecKind::LfsAuthenticate | SshExecKind::LfsTransfer => {
+                Some(SshErrReply::new("traces locator not found", 1))
+            }
+        };
+    }
+    match &exec.locator {
+        Err(ProtocolError::NotFound(message)) if message == "traces locator not found" => {
+            Some(SshErrReply::new(message, 1))
+        }
+        Err(_) => Some(SshErrReply::view_not_found()),
+        Ok(_) => None,
+    }
 }
 
 #[derive(Clone)]
@@ -356,13 +398,13 @@ impl server::Handler for SshServer {
             }
         };
 
+        if let Some(reply) = ssh_pre_dispatch_reply(&exec) {
+            self.send_exec_err(channel, session, &reply).await?;
+            return Ok(());
+        }
+
         match &exec.locator {
-            Err(_) => {
-                self.send_exec_err(channel, session, &SshErrReply::view_not_found())
-                    .await?;
-                return Ok(());
-            }
-            Ok(RepoLocator::View(_)) => {
+            Ok(RepoLocator::View(_)) if exec.traces.is_none() => {
                 let reply = if matches!(
                     &exec.kind,
                     SshExecKind::LfsAuthenticate | SshExecKind::LfsTransfer
@@ -379,7 +421,7 @@ impl server::Handler for SshServer {
                     return Ok(());
                 }
             }
-            Ok(RepoLocator::Path(_)) => {}
+            Ok(RepoLocator::Path(_)) | Ok(RepoLocator::View(_)) | Err(_) => {}
         }
 
         match exec.kind {
@@ -676,11 +718,12 @@ fn parse_ssh_exec_request(input: &str) -> Result<SshExecRequest, String> {
                 return Err(format!("{command} requires exactly one repository path"));
             }
             let service_type = ServiceType::from_str(command).map_err(|err| err.to_string())?;
-            let repo_path = normalize_ssh_repo_path(&args[1])?;
+            let located = locate_ssh_repo(&args[1])?;
             Ok(SshExecRequest {
                 kind: SshExecKind::Git(service_type),
-                repo_path,
-                locator: classify_repo_locator(&args[1]),
+                repo_path: located.repo_path,
+                locator: located.locator,
+                traces: located.traces,
                 lfs_operation: None,
             })
         }
@@ -691,17 +734,17 @@ fn parse_ssh_exec_request(input: &str) -> Result<SshExecRequest, String> {
                         .to_owned(),
                 );
             }
-            let repo_path = normalize_ssh_repo_path(&args[1])?;
-            let locator = classify_repo_locator(&args[1]);
-            let lfs_operation = if matches!(&locator, Ok(RepoLocator::Path(_))) {
+            let located = locate_ssh_repo(&args[1])?;
+            let lfs_operation = if matches!(&located.locator, Ok(RepoLocator::Path(_))) {
                 Some(parse_lfs_operation(&args[2])?)
             } else {
                 None
             };
             Ok(SshExecRequest {
                 kind: SshExecKind::LfsAuthenticate,
-                repo_path,
-                locator,
+                repo_path: located.repo_path,
+                locator: located.locator,
+                traces: located.traces,
                 lfs_operation,
             })
         }
@@ -712,17 +755,17 @@ fn parse_ssh_exec_request(input: &str) -> Result<SshExecRequest, String> {
                         .to_owned(),
                 );
             }
-            let repo_path = normalize_ssh_repo_path(&args[1])?;
-            let locator = classify_repo_locator(&args[1]);
-            let lfs_operation = if matches!(&locator, Ok(RepoLocator::Path(_))) {
+            let located = locate_ssh_repo(&args[1])?;
+            let lfs_operation = if matches!(&located.locator, Ok(RepoLocator::Path(_))) {
                 Some(parse_lfs_operation(&args[2])?)
             } else {
                 None
             };
             Ok(SshExecRequest {
                 kind: SshExecKind::LfsTransfer,
-                repo_path,
-                locator,
+                repo_path: located.repo_path,
+                locator: located.locator,
+                traces: located.traces,
                 lfs_operation,
             })
         }
@@ -1996,5 +2039,123 @@ mod tests {
         assert!(!upload_pack_buffer_complete(b"0009don", true));
         assert!(!upload_pack_buffer_complete(b"0009done", true));
         assert!(!upload_pack_buffer_complete(b"0000", true));
+    }
+
+    const STREAM_ID: &str = "abcdef01-2345-4678-89ab-cdef01234567";
+
+    #[test]
+    fn trace_locator_dispatch_ssh_grammar_before_native() {
+        let scope = format!("git-upload-pack '/.traces/by-scope/{STREAM_ID}.git'");
+        let exec = parse_ssh_exec_request(&scope).unwrap();
+        assert!(matches!(
+            exec.traces,
+            Some(TracesLocator::ByScope { ref stream_id }) if stream_id == STREAM_ID
+        ));
+        assert!(ssh_pre_dispatch_reply(&exec).is_none());
+        let lfs = parse_ssh_exec_request(&format!(
+            "git-lfs-authenticate '/.traces/by-scope/{STREAM_ID}.git' download"
+        ))
+        .unwrap();
+        let reply = ssh_pre_dispatch_reply(&lfs).unwrap();
+        assert!(String::from_utf8_lossy(&reply.payload).contains("traces locator not found"));
+        let transfer = parse_ssh_exec_request(&format!(
+            "git-lfs-transfer '/.traces/by-scope/{STREAM_ID}.git' download"
+        ))
+        .unwrap();
+        assert!(ssh_pre_dispatch_reply(&transfer).is_some());
+        assert!(matches!(
+            dispatch_repo_locator(&format!("/.traces/by-scope/{STREAM_ID}.git")).unwrap(),
+            LocatorDispatch::Traces(_)
+        ));
+
+        let path = "git-receive-pack '/.traces/by-path/L3Byb2plY3QvZm9v/self/bGVnYWN5L3JlcG8gaWQ/22222222-2222-4222-8222-222222222222/sha1.git'";
+        let by_path = parse_ssh_exec_request(path).unwrap();
+        assert!(matches!(by_path.traces, Some(TracesLocator::ByPath { .. })));
+        assert!(ssh_pre_dispatch_reply(&by_path).is_none());
+        assert!(matches!(
+            by_path.kind,
+            SshExecKind::Git(ServiceType::ReceivePack)
+        ));
+
+        let native = parse_ssh_exec_request("git-upload-pack '/third-party/vendor.git'").unwrap();
+        assert!(native.traces.is_none());
+        assert!(matches!(
+            dispatch_repo_locator("/third-party/vendor.git").unwrap(),
+            LocatorDispatch::NativeOrImport(_)
+        ));
+        assert!(ssh_pre_dispatch_reply(&native).is_none());
+
+        let illegal = parse_ssh_exec_request("git-upload-pack '/.traces/vendor.git'").unwrap();
+        assert!(illegal.traces.is_none());
+        let reply = ssh_pre_dispatch_reply(&illegal).unwrap();
+        let text = String::from_utf8_lossy(&reply.payload);
+        assert!(text.contains("traces locator not found"));
+        assert!(!text.contains("view not found"));
+
+        let view = parse_ssh_exec_request("git-upload-pack '/.view/a@0.git'").unwrap();
+        let view_reply = ssh_pre_dispatch_reply(&view).unwrap();
+        let view_text = String::from_utf8_lossy(&view_reply.payload);
+        assert!(view_text.contains("view not found"));
+        assert!(!view_text.contains("traces locator not found"));
+    }
+
+    #[tokio::test]
+    async fn trace_locator_dispatch_ssh_handler_before_import_repo() {
+        use sea_orm::{EntityTrait, PaginatorTrait};
+
+        use crate::jupiter::{
+            storage::base_storage::StorageConnector, tests::test_storage_with_config,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(temp.path().join("cfg"));
+        config.monorepo.import_dir = std::path::PathBuf::from("/.traces");
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let redis_url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let state = ProtocolApiState {
+            storage,
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: crate::jupiter::redis::init_connection(&crate::config::RedisConfig {
+                    url: redis_url,
+                })
+                .await
+                .expect("redis connection"),
+                prefix: "disabled".to_string(),
+            }),
+            entity_store: Arc::new(SharedEntityStore::new()),
+        };
+        let exec = parse_ssh_exec_request(&format!(
+            "git-receive-pack '/.traces/by-scope/{STREAM_ID}.git'"
+        ))
+        .unwrap();
+        assert!(ssh_pre_dispatch_reply(&exec).is_none());
+        let session = SmartSession::from_state(
+            exec.repo_path,
+            ServiceType::ReceivePack,
+            TransportProtocol::Ssh,
+            &state,
+        )
+        .unwrap();
+        let git_db = state.storage.git_db_storage();
+        let before = crate::callisto::git_repo::Entity::find()
+            .count(git_db.get_connection())
+            .await
+            .unwrap();
+        let handler = session
+            .repo_handler_with_commands(&state, Vec::new())
+            .await
+            .unwrap();
+        assert!(handler.is_trace_repo());
+        assert!(!handler.is_monorepo());
+        let (head, refs) = handler.refs_with_head_hash().await.unwrap();
+        assert!(crate::common::utils::is_protocol_zero_id(&head));
+        assert!(refs.is_empty());
+        let after = crate::callisto::git_repo::Entity::find()
+            .count(state.storage.git_db_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(before, 0);
+        assert_eq!(after, 0);
     }
 }

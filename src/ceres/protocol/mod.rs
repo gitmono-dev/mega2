@@ -16,14 +16,18 @@ use crate::{
         api_service::state::ProtocolApiState,
         pack::{
             RepoHandler, import_repo::ImportRepo, monorepo::Monorepo,
-            path_policy::check_import_repo_leaf, push_chain, view_repo::ViewRepo,
+            path_policy::check_import_repo_leaf, push_chain, traces_repo::TraceRepo,
+            view_repo::ViewRepo,
         },
     },
     common::{
         errors::{MegaError, ProtocolError},
         utils::{canonicalize_mono_ref_path, is_full_hex_object_id, is_protocol_zero_id},
     },
-    contract::git_protocol::ResolvedView,
+    contract::git_protocol::{
+        ResolvedView,
+        path::{TracesLocator, TracesObjectFormat, parse_traces_locator},
+    },
 };
 
 pub mod import_refs;
@@ -199,8 +203,17 @@ impl SmartSession {
         transport_protocol: TransportProtocol,
         state: &ProtocolApiState,
     ) -> Result<Self, ProtocolError> {
-        Ok(Self::new(repo_path, service_type, transport_protocol)
-            .with_hash_kind(Self::hash_kind_from_state(state)?))
+        let mut session = Self::new(repo_path, service_type, transport_protocol)
+            .with_hash_kind(Self::hash_kind_from_state(state)?);
+        if let Some(TracesLocator::ByPath { hash_kind, .. }) =
+            parse_traces_locator(repo_path_to_str(&session.repo_path)?)?
+        {
+            session.hash_kind = match hash_kind {
+                TracesObjectFormat::Sha1 => HashKind::Sha1,
+                TracesObjectFormat::Sha256 => HashKind::Sha256,
+            };
+        }
+        Ok(session)
     }
 
     pub fn ensure_object_id_hex(&self, hex: &str, what: &str) -> Result<(), ProtocolError> {
@@ -247,6 +260,10 @@ impl SmartSession {
                 view.filter_pk,
                 view.filter_id.clone(),
             )) as Arc<dyn RepoHandler>);
+        }
+        let raw_repo_path = repo_path_to_str(&self.repo_path)?;
+        if let Some(locator) = parse_traces_locator(raw_repo_path)? {
+            return Ok(Arc::new(TraceRepo::new(locator, self.hash_kind)) as Arc<dyn RepoHandler>);
         }
         let config = state.storage.config();
         let import_dir = config.monorepo.import_dir.clone();
@@ -380,5 +397,146 @@ mod tests {
         session
             .ensure_object_id_hex(&sha256_id, "HEAD")
             .expect("64-hex HEAD matches sha256");
+    }
+
+    const STREAM_ID: &str = "abcdef01-2345-4678-89ab-cdef01234567";
+
+    async fn state_with_traces_import_dir() -> (
+        tempfile::TempDir,
+        crate::ceres::api_service::state::ProtocolApiState,
+    ) {
+        use std::sync::Arc;
+
+        use crate::{
+            ceres::api_service::cache::GitObjectCache, config::testing::isolated_config,
+            contract::policy::entitystore::SharedEntityStore,
+            jupiter::tests::test_storage_with_config,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(temp.path().join("cfg"));
+        config.monorepo.import_dir = PathBuf::from("/.traces");
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let redis_url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let state = crate::ceres::api_service::state::ProtocolApiState {
+            storage,
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: crate::jupiter::redis::init_connection(&crate::config::RedisConfig {
+                    url: redis_url,
+                })
+                .await
+                .expect("redis connection"),
+                prefix: "disabled".to_string(),
+            }),
+            entity_store: Arc::new(SharedEntityStore::new()),
+        };
+        (temp, state)
+    }
+
+    async fn git_repo_count(state: &crate::ceres::api_service::state::ProtocolApiState) -> u64 {
+        use sea_orm::{EntityTrait, PaginatorTrait};
+
+        use crate::jupiter::storage::base_storage::StorageConnector;
+
+        let git_db = state.storage.git_db_storage();
+        crate::callisto::git_repo::Entity::find()
+            .count(git_db.get_connection())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn trace_locator_dispatch_selects_trace_repo_before_import_or_native() {
+        let (_temp, state) = state_with_traces_import_dir().await;
+        let traces_path = PathBuf::from(format!("/.traces/by-scope/{STREAM_ID}"));
+        let session = SmartSession::from_state(
+            traces_path,
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+            &state,
+        )
+        .unwrap();
+        let before = git_repo_count(&state).await;
+        let handler = session
+            .repo_handler_with_commands(&state, Vec::new())
+            .await
+            .unwrap();
+        assert!(handler.is_trace_repo());
+        assert!(!handler.is_monorepo());
+        let (head, refs) = handler.refs_with_head_hash().await.unwrap();
+        assert!(is_protocol_zero_id(&head));
+        assert!(refs.is_empty());
+        let advertised = session.git_info_refs(&state).await.unwrap();
+        let text = String::from_utf8_lossy(&advertised);
+        assert!(text.contains("capabilities^{}"));
+        assert!(!text.contains("refs/heads/main"));
+        assert!(!text.contains("HEAD"));
+        assert_eq!(git_repo_count(&state).await, before);
+        assert_eq!(before, 0);
+
+        let illegal_session = match SmartSession::from_state(
+            PathBuf::from("/.traces/vendor"),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+            &state,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("illegal traces locator built a session"),
+        };
+        assert!(
+            illegal_session
+                .to_string()
+                .contains("traces locator not found"),
+            "{illegal_session}"
+        );
+        let illegal = SmartSession::new(
+            PathBuf::from("/.traces/vendor"),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let err = match illegal.repo_handler_with_commands(&state, Vec::new()).await {
+            Err(err) => err,
+            Ok(_) => panic!("illegal traces locator opened a repository"),
+        };
+        assert!(
+            err.to_string().contains("traces locator not found"),
+            "{err}"
+        );
+        assert_eq!(git_repo_count(&state).await, 0);
+
+        let native = SmartSession::from_state(
+            PathBuf::from("/project/app"),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+            &state,
+        )
+        .unwrap();
+        let native_handler = native
+            .repo_handler_with_commands(&state, Vec::new())
+            .await
+            .unwrap();
+        assert!(!native_handler.is_trace_repo());
+        assert!(native_handler.is_monorepo());
+        assert_eq!(session.hash_kind, HashKind::Sha1);
+        assert_eq!(git_repo_count(&state).await, 0);
+
+        let sha256 = SmartSession::from_state(
+            PathBuf::from(
+                "/.traces/by-path/L3Byb2plY3QvZm9v/self/bGVnYWN5L3JlcG8gaWQ/22222222-2222-4222-8222-222222222222/sha256",
+            ),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+            &state,
+        )
+        .unwrap();
+        assert_eq!(sha256.hash_kind, HashKind::Sha256);
+        let advertised = sha256.git_info_refs(&state).await.unwrap();
+        let text = String::from_utf8_lossy(&advertised);
+        assert!(text.contains("object-format=sha256"), "{text}");
+        assert!(text.contains(&"0".repeat(64)), "{text}");
+        assert!(!text.contains("object-format=sha1"), "{text}");
+        assert!(!text.contains("refs/heads/main"), "{text}");
+        assert_eq!(git_repo_count(&state).await, 0);
     }
 }
