@@ -1,9 +1,10 @@
 //! Quarantine unpack for one traces ingest. Objects land under the staging
 //! prefix until closure and OID checks pass.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
+    ceres::traces::admission::{self, IngestAdmission},
     common::errors::{MegaError, TracesError},
     config::TracesProtocolLimits,
     jupiter::storage::{
@@ -51,12 +52,39 @@ pub async fn unpack_into_quarantine(
     store: &MegaObjectStorageWrapper,
     ingest_id: &str,
     hash_kind: &str,
+    budget: UnpackBudget,
+    objects: &[LooseObject],
+) -> Result<Vec<String>, MegaError> {
+    unpack_bounded(
+        store,
+        ingest_id,
+        hash_kind,
+        budget,
+        &mut IngestAdmission::start(),
+        objects,
+    )
+    .await
+}
+
+/// [`unpack_into_quarantine`] with the complexity already counted for this worker.
+pub async fn unpack_bounded(
+    store: &MegaObjectStorageWrapper,
+    ingest_id: &str,
+    hash_kind: &str,
     mut budget: UnpackBudget,
+    admission: &mut IngestAdmission,
     objects: &[LooseObject],
 ) -> Result<Vec<String>, MegaError> {
     admit(budget)?;
+    admission::admit_ingest(admission, 0)?;
+    screen_complexity(hash_kind, admission, objects)?;
     let mut staged = Vec::with_capacity(objects.len());
     for object in objects {
+        admission.refresh_elapsed();
+        admission::admit_ingest(admission, object.payload.len() as u64)?;
+        if object.payload.len() as u64 > TracesProtocolLimits::MAX_OBJECT_BYTES {
+            return Err(budget_exceeded());
+        }
         if is_delta(&object.object_type) {
             return Err(rejected());
         }
@@ -76,7 +104,267 @@ pub async fn unpack_into_quarantine(
             .await?;
         staged.push(oid);
     }
+    admission.record_wall_clock();
+    admission::admit_ingest(admission, 0)?;
     Ok(staged)
+}
+
+fn screen_complexity(
+    hash_kind: &str,
+    admission: &mut IngestAdmission,
+    objects: &[LooseObject],
+) -> Result<(), MegaError> {
+    if admission.is_cancelled() {
+        admission.cancel();
+        return Err(MegaError::Traces(TracesError::QueryTimeout));
+    }
+    let batch_objects = u64::try_from(objects.len()).map_err(|_| budget_exceeded())?;
+    let batch_commits = objects
+        .iter()
+        .filter(|object| object.object_type == "commit")
+        .count();
+    let batch_commits = u64::try_from(batch_commits).map_err(|_| budget_exceeded())?;
+    let next_objects = admission
+        .objects
+        .checked_add(batch_objects)
+        .ok_or_else(budget_exceeded)?;
+    let next_commits = admission
+        .new_commits
+        .checked_add(batch_commits)
+        .ok_or_else(budget_exceeded)?;
+    if next_objects > TracesProtocolLimits::MAX_OBJECTS
+        || next_commits > TracesProtocolLimits::MAX_NEW_COMMITS
+    {
+        return Err(budget_exceeded());
+    }
+    let mut largest = 0u64;
+    for object in objects {
+        largest = largest.max(object.payload.len() as u64);
+    }
+    if largest > TracesProtocolLimits::MAX_OBJECT_BYTES {
+        return Err(budget_exceeded());
+    }
+    let mut preview = admission.clone();
+    preview.objects = next_objects;
+    preview.new_commits = next_commits;
+    admission::admit_ingest(&preview, largest)?;
+    let tree_depth = tree_depth(hash_kind, objects)?;
+    let delta_depth = delta_depth(hash_kind, objects)?;
+    preview.delta_depth = admission.delta_depth.max(delta_depth);
+    preview.tree_depth = admission.tree_depth.max(tree_depth);
+    admission::admit_ingest(&preview, largest)?;
+    admission.objects = preview.objects;
+    admission.new_commits = preview.new_commits;
+    admission.delta_depth = preview.delta_depth;
+    admission.tree_depth = preview.tree_depth;
+    Ok(())
+}
+
+fn tree_depth(hash_kind: &str, objects: &[LooseObject]) -> Result<u64, MegaError> {
+    if !objects.iter().any(|object| object.object_type == "tree") {
+        return Ok(0);
+    }
+    let hash_len = hash_width(hash_kind)?;
+    let mut index = HashMap::new();
+    let mut starts = Vec::new();
+    for (idx, object) in objects.iter().enumerate() {
+        if object.object_type != "tree" {
+            continue;
+        }
+        let Some(raw) = decode_oid(&object.declared_oid, hash_len) else {
+            continue;
+        };
+        index.insert(raw, idx);
+        starts.push(idx);
+    }
+    if starts.is_empty() {
+        return Ok(0);
+    }
+    bounded_depth(&starts, TracesProtocolLimits::MAX_TREE_DEPTH, |idx| {
+        in_batch_tree_children(&objects[idx].payload, hash_len, &index)
+    })
+}
+
+fn delta_depth(hash_kind: &str, objects: &[LooseObject]) -> Result<u64, MegaError> {
+    if !objects.iter().any(|object| object.object_type == "commit") {
+        return Ok(0);
+    }
+    let oid_hex_len = hash_width(hash_kind)? * 2;
+    let mut index = HashMap::new();
+    let mut starts = Vec::new();
+    for (idx, object) in objects.iter().enumerate() {
+        if object.object_type != "commit" {
+            continue;
+        }
+        index.insert(object.declared_oid.to_ascii_lowercase(), idx);
+        starts.push(idx);
+    }
+    bounded_depth(&starts, TracesProtocolLimits::MAX_DELTA_DEPTH, |idx| {
+        in_batch_commit_parents(&objects[idx].payload, oid_hex_len, &index)
+    })
+}
+
+enum ChainDepth {
+    Exact(u64),
+    Over,
+}
+
+/// Longest in-batch chain. The walk stops once `frames_left` is spent, and it
+/// asks for one node's in-batch links at a time instead of retaining every
+/// payload record.
+fn bounded_depth(
+    starts: &[usize],
+    limit: u64,
+    mut links: impl FnMut(usize) -> Result<Vec<usize>, MegaError>,
+) -> Result<u64, MegaError> {
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    let mut deepest = 0u64;
+    for &start in starts {
+        visiting.clear();
+        match depth_at(
+            start,
+            limit.saturating_add(1),
+            &mut links,
+            &mut memo,
+            &mut visiting,
+        )? {
+            ChainDepth::Over => return Ok(limit.saturating_add(1)),
+            ChainDepth::Exact(height) if height > limit => return Ok(height),
+            ChainDepth::Exact(height) => deepest = deepest.max(height),
+        }
+    }
+    Ok(deepest)
+}
+
+fn depth_at(
+    idx: usize,
+    frames_left: u64,
+    links: &mut impl FnMut(usize) -> Result<Vec<usize>, MegaError>,
+    memo: &mut HashMap<usize, u64>,
+    visiting: &mut HashSet<usize>,
+) -> Result<ChainDepth, MegaError> {
+    if frames_left == 0 {
+        return Ok(ChainDepth::Over);
+    }
+    if let Some(height) = memo.get(&idx) {
+        return Ok(ChainDepth::Exact(*height));
+    }
+    if !visiting.insert(idx) {
+        return Err(budget_exceeded());
+    }
+    let mut height = 1u64;
+    for child in links(idx)? {
+        match depth_at(child, frames_left - 1, links, memo, visiting)? {
+            ChainDepth::Over => {
+                visiting.remove(&idx);
+                return Ok(ChainDepth::Over);
+            }
+            ChainDepth::Exact(child_height) => {
+                height = height.max(child_height.saturating_add(1));
+            }
+        }
+    }
+    visiting.remove(&idx);
+    memo.insert(idx, height);
+    Ok(ChainDepth::Exact(height))
+}
+
+fn in_batch_tree_children(
+    payload: &[u8],
+    hash_len: usize,
+    index: &HashMap<Vec<u8>, usize>,
+) -> Result<Vec<usize>, MegaError> {
+    let mut seen = HashSet::new();
+    let mut children = Vec::new();
+    let mut rest = payload;
+    while !rest.is_empty() {
+        let Some(nul) = rest.iter().position(|byte| *byte == 0) else {
+            return Err(rejected());
+        };
+        let hash_end = nul.checked_add(1 + hash_len).ok_or_else(rejected)?;
+        if hash_end > rest.len() || nul == 0 || !rest[..nul].contains(&b' ') {
+            return Err(rejected());
+        }
+        if let Some(&child) = index.get(&rest[nul + 1..hash_end])
+            && seen.insert(child)
+        {
+            children.push(child);
+        }
+        rest = &rest[hash_end..];
+    }
+    Ok(children)
+}
+
+fn in_batch_commit_parents(
+    payload: &[u8],
+    oid_hex_len: usize,
+    index: &HashMap<String, usize>,
+) -> Result<Vec<usize>, MegaError> {
+    let mut seen = HashSet::new();
+    let mut parents = Vec::new();
+    let header_end = payload
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .unwrap_or(payload.len());
+    for line in payload[..header_end].split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, |byte| *byte == b' ');
+        let label = parts.next().unwrap_or_default();
+        let value = parts.next().unwrap_or_default();
+        if label != b"parent" {
+            continue;
+        }
+        if value.len() != oid_hex_len || !value.iter().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(rejected());
+        }
+        let mut lowered = [0u8; 64];
+        for (slot, byte) in lowered.iter_mut().zip(value) {
+            *slot = byte.to_ascii_lowercase();
+        }
+        let key = std::str::from_utf8(&lowered[..value.len()]).map_err(|_| rejected())?;
+        if let Some(&parent) = index.get(key)
+            && seen.insert(parent)
+        {
+            parents.push(parent);
+        }
+    }
+    Ok(parents)
+}
+
+fn hash_width(hash_kind: &str) -> Result<usize, MegaError> {
+    match hash_kind {
+        "sha1" => Ok(20),
+        "sha256" => Ok(32),
+        _ => Err(rejected()),
+    }
+}
+
+fn decode_oid(hex: &str, hash_len: usize) -> Option<Vec<u8>> {
+    if hex.len() != hash_len * 2 {
+        return None;
+    }
+    let bytes = hex.as_bytes();
+    let mut raw = Vec::with_capacity(hash_len);
+    let mut index = 0;
+    while index < bytes.len() {
+        let hi = hex_nibble(bytes[index])?;
+        let lo = hex_nibble(bytes[index + 1])?;
+        raw.push((hi << 4) | lo);
+        index += 2;
+    }
+    Some(raw)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn is_delta(object_type: &str) -> bool {
@@ -416,5 +704,356 @@ mod tests {
         require_closure(&store, STREAM_A, "sha1", &objects)
             .await
             .expect("this stream's archived blob closes the tree");
+    }
+
+    fn tree_pointing(child_oid: &str) -> Vec<u8> {
+        let raw = hex_decode(child_oid);
+        let mut bytes = b"40000 d".to_vec();
+        bytes.push(0);
+        bytes.extend(raw);
+        bytes
+    }
+
+    fn hex_decode(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    fn tree_chain(levels: usize) -> Vec<LooseObject> {
+        let mut objects = Vec::with_capacity(levels);
+        let mut child: Option<String> = None;
+        for _ in 0..levels {
+            let payload = match &child {
+                None => Vec::new(),
+                Some(oid) => tree_pointing(oid),
+            };
+            let declared = oid(HashKind::Sha1, ObjectType::Tree, &payload);
+            objects.push(loose("tree", &declared, &payload));
+            child = Some(declared);
+        }
+        objects
+    }
+
+    fn commit_chain(levels: usize) -> Vec<LooseObject> {
+        let tree = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut objects = Vec::with_capacity(levels);
+        let mut parent: Option<String> = None;
+        for _ in 0..levels {
+            let payload = match &parent {
+                None => format!("tree {tree}\n\nmessage\n"),
+                Some(oid) => format!("tree {tree}\nparent {oid}\n\nmessage\n"),
+            };
+            let declared = oid(HashKind::Sha1, ObjectType::Commit, payload.as_bytes());
+            objects.push(loose("commit", &declared, payload.as_bytes()));
+            parent = Some(declared);
+        }
+        objects
+    }
+
+    #[tokio::test]
+    async fn ingest_resource_budget_stops_before_staging_or_publish() {
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
+        };
+        use uuid::Uuid;
+
+        use crate::{
+            callisto::{trace_object, trace_principal, trace_stream, trace_target},
+            ceres::traces::admission::IngestAdmission,
+            jupiter::{
+                migration::apply_migrations,
+                service::trace_publish_service::TracePublishService,
+                storage::trace_stream_storage::{CommitParentList, PublishRef, TRACES_REF},
+                tests::test_db_connection,
+            },
+        };
+
+        let store = mock_object_storage();
+        let payload = b"budget-blob";
+        let good = oid(HashKind::Sha1, ObjectType::Blob, payload);
+        let object = loose("blob", &good, payload);
+        let budget = UnpackBudget {
+            compressed_bytes: 1,
+            expanded_bytes: 0,
+        };
+
+        let mut too_many = IngestAdmission::start();
+        too_many.objects = TracesProtocolLimits::MAX_OBJECTS;
+        assert!(
+            unpack_bounded(
+                &store,
+                INGEST,
+                "sha1",
+                budget,
+                &mut too_many,
+                std::slice::from_ref(&object)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            get_staging(&store, INGEST, "sha1", &good)
+                .await
+                .expect("object budget"),
+            None
+        );
+
+        let mut too_many_commits = IngestAdmission::start();
+        too_many_commits.new_commits = TracesProtocolLimits::MAX_NEW_COMMITS;
+        let one_commit = commit_chain(1);
+        assert!(
+            unpack_bounded(
+                &store,
+                INGEST,
+                "sha1",
+                budget,
+                &mut too_many_commits,
+                &one_commit
+            )
+            .await
+            .is_err()
+        );
+
+        let at_tree_limit = tree_chain(TracesProtocolLimits::MAX_TREE_DEPTH as usize);
+        let at_tree_tip = at_tree_limit
+            .last()
+            .expect("tree at the limit")
+            .declared_oid
+            .clone();
+        unpack_into_quarantine(&store, INGEST, "sha1", budget, &at_tree_limit)
+            .await
+            .expect("tree depth limit is inclusive");
+        assert!(
+            get_staging(&store, INGEST, "sha1", &at_tree_tip)
+                .await
+                .expect("inclusive tree")
+                .is_some(),
+            "a tree at the depth limit is staged"
+        );
+        let deep_trees = tree_chain(TracesProtocolLimits::MAX_TREE_DEPTH as usize + 1);
+        assert!(
+            unpack_into_quarantine(&store, INGEST, "sha1", budget, &deep_trees)
+                .await
+                .is_err(),
+            "tree depth"
+        );
+        let at_commit_limit = commit_chain(TracesProtocolLimits::MAX_DELTA_DEPTH as usize);
+        unpack_into_quarantine(&store, INGEST, "sha1", budget, &at_commit_limit)
+            .await
+            .expect("delta depth limit is inclusive");
+        let deep_commits = commit_chain(TracesProtocolLimits::MAX_DELTA_DEPTH as usize + 1);
+        assert!(
+            unpack_into_quarantine(&store, INGEST, "sha1", budget, &deep_commits)
+                .await
+                .is_err(),
+            "delta depth"
+        );
+
+        let second_payload = b"budget-blob-2";
+        let second = oid(HashKind::Sha1, ObjectType::Blob, second_payload);
+        let mut during = IngestAdmission::start();
+        during.record_elapsed(TracesProtocolLimits::INGEST_TIMEOUT_SECONDS - 1);
+        during.seconds_per_object = 1;
+        let during_ingest = "66666666-6666-4666-8666-666666666666";
+        let staged_first = unpack_bounded(
+            &store,
+            during_ingest,
+            "sha1",
+            budget,
+            &mut during,
+            &[object.clone(), loose("blob", &second, second_payload)],
+        )
+        .await;
+        assert!(staged_first.is_err(), "deadline fires on the next object");
+        assert_eq!(
+            get_staging(&store, during_ingest, "sha1", &good)
+                .await
+                .expect("first object staged before the deadline"),
+            Some(payload.to_vec())
+        );
+        assert_eq!(
+            get_staging(&store, during_ingest, "sha1", &second)
+                .await
+                .expect("second object"),
+            None
+        );
+
+        let mut late = IngestAdmission::start();
+        late.record_elapsed(TracesProtocolLimits::INGEST_TIMEOUT_SECONDS + 1);
+        assert!(
+            unpack_bounded(
+                &store,
+                INGEST,
+                "sha1",
+                budget,
+                &mut late,
+                std::slice::from_ref(&object)
+            )
+            .await
+            .is_err(),
+            "deadline"
+        );
+
+        let mut cancelled = IngestAdmission::start();
+        cancelled.cancel();
+        assert!(
+            unpack_bounded(
+                &store,
+                INGEST,
+                "sha1",
+                budget,
+                &mut cancelled,
+                std::slice::from_ref(&object)
+            )
+            .await
+            .is_err(),
+            "cancel"
+        );
+        assert_eq!(cancelled.objects, 0);
+        assert!(cancelled.is_cancelled());
+        assert_eq!(
+            get_staging(&store, INGEST, "sha1", &good)
+                .await
+                .expect("cancelled staging"),
+            None
+        );
+
+        let huge = vec![0u8; TracesProtocolLimits::MAX_OBJECT_BYTES as usize + 1];
+        let huge_object = loose("blob", &"ab".repeat(20), &huge);
+        let huge_err = unpack_into_quarantine(
+            &store,
+            INGEST,
+            "sha1",
+            budget,
+            std::slice::from_ref(&huge_object),
+        )
+        .await
+        .expect_err("object size");
+        assert!(
+            matches!(huge_err, MegaError::Traces(TracesError::ResponseBudget)),
+            "object size is a budget failure before parsing"
+        );
+        assert_eq!(
+            get_staging(&store, INGEST, "sha1", &"ab".repeat(20))
+                .await
+                .expect("huge staging"),
+            None
+        );
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.expect("migrations");
+        let principal_id = Uuid::new_v4().to_string();
+        let target_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().fixed_offset();
+        trace_principal::ActiveModel {
+            id: Set(principal_id.clone()),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("principal");
+        trace_target::ActiveModel {
+            id: Set(target_id.clone()),
+            target_kind: Set("native".to_owned()),
+            project_path: Set(format!("/team/{target_id}")),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("target");
+        let credential_id = format!("publish-{target_id}");
+        crate::callisto::trace_credential_binding::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id.clone()),
+            namespace: Set("static_push_token".to_owned()),
+            credential_id: Set(credential_id.clone()),
+            created_at: Set(now),
+            retired_at: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("binding");
+        let stream_id = trace_stream::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id.clone()),
+            target_id: Set(target_id.clone()),
+            source_repo_id: Set("source-opaque".to_owned()),
+            epoch_id: Set(Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("stream")
+        .id;
+        let path = format!("/team/{target_id}");
+        let token = crate::config::PushTokenConfig {
+            name: credential_id.clone(),
+            token: "synthetic-secret".to_owned(),
+            paths: Some(vec![path.clone()]),
+        };
+        let authority = crate::ceres::traces::auth::PublishAuthority {
+            caller: crate::ceres::traces::auth::TracesCaller::StaticPushToken {
+                credential_id: &token.name,
+                token: &token,
+            },
+            principal_id: &principal_id,
+            target_id: &target_id,
+            authorized_path: &path,
+            expected_generation: 1,
+            policy: None,
+        };
+        let service = TracePublishService::new(store);
+        let absent = "dddddddddddddddddddddddddddddddddddddddd";
+        assert!(
+            service
+                .publish_quarantine(
+                    &db,
+                    INGEST,
+                    budget,
+                    &[huge_object],
+                    &PublishRef {
+                        stream_id: stream_id.clone(),
+                        ref_names: vec![TRACES_REF.to_owned()],
+                        delete: false,
+                        new_tip: absent.to_owned(),
+                        commits: vec![CommitParentList {
+                            oid: absent.to_owned(),
+                            parents: Vec::new(),
+                        }],
+                        checkpoints: Vec::new(),
+                        object_oids: vec![absent.to_owned()],
+                        hash_kind: "sha1".to_owned(),
+                        idempotency_key: "over-budget".to_owned(),
+                        schema_id: "manifest-v1".to_owned(),
+                    },
+                    &authority,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .filter(trace_object::Column::StreamId.eq(&stream_id))
+                .count(&db)
+                .await
+                .expect("membership"),
+            0
+        );
+        assert!(
+            trace_stream::Entity::find_by_id(&stream_id)
+                .one(&db)
+                .await
+                .expect("stream")
+                .expect("row")
+                .tip_oid
+                .is_none()
+        );
     }
 }
