@@ -9,7 +9,10 @@
 use std::str::FromStr;
 
 use cedar_policy::{Context, EntityId, EntityTypeName, EntityUid};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
+    Statement, Value,
+};
 
 use crate::{
     MegaError,
@@ -19,7 +22,7 @@ use crate::{
         git_protocol::token_covers_repo,
         policy::{
             builder::EntitySnapshot, context::CedarContext, enforcement::Enforcement,
-            resource::resolve_resource, util::SaturnEUid,
+            entitystore::SharedEntityStore, resource::resolve_resource, util::SaturnEUid,
         },
     },
 };
@@ -183,8 +186,205 @@ fn presented_credential<'a>(request: &TracesAuthRequest<'a>) -> Option<Presented
     }
 }
 
-async fn active_principal(
-    db: &DatabaseConnection,
+/// Authority presented to the publication transaction.
+///
+/// Account write permission is read from [`PublishAuthority::policy`] inside
+/// that transaction. A snapshot carried on [`TracesCaller`] is not the
+/// publication decision.
+#[derive(Clone, Copy)]
+pub struct PublishAuthority<'a> {
+    pub caller: TracesCaller<'a>,
+    pub principal_id: &'a str,
+    pub target_id: &'a str,
+    pub authorized_path: &'a str,
+    pub expected_generation: i64,
+    pub policy: Option<&'a SharedEntityStore>,
+}
+
+/// Recheck credential, target, binding generation, and write permission on `conn`.
+///
+/// `conn` is the publication transaction. A retired credential, an inactive
+/// target, a changed path, a changed generation, or a lost write grant rejects
+/// the publication.
+pub async fn recheck_publish_authority<C: ConnectionTrait>(
+    conn: &C,
+    stream_id: &str,
+    authority: &PublishAuthority<'_>,
+) -> Result<(), MegaError> {
+    let Some((namespace, credential_id)) = credential_identity(authority.caller) else {
+        return Err(publish_unauthenticated());
+    };
+    let stream = trace_stream_owner(conn, stream_id).await?;
+    if stream.principal_id != authority.principal_id || stream.target_id != authority.target_id {
+        return Err(publish_rejected());
+    }
+    let Some(bound_principal) = locked_active_principal(conn, namespace, credential_id).await?
+    else {
+        return Err(publish_rejected());
+    };
+    if bound_principal != stream.principal_id {
+        return Err(publish_rejected());
+    }
+    let target = locked_target(conn, &stream.target_id).await?;
+    if !target.active || target.project_path != authority.authorized_path {
+        return Err(publish_rejected());
+    }
+    let generation =
+        crate::jupiter::service::trace_target_service::binding_generation(conn, &stream.target_id)
+            .await?;
+    if generation != authority.expected_generation {
+        return Err(publish_rejected());
+    }
+    let live_policy = live_account_policy(authority)?;
+    let presented = presented_for_publish(authority, live_policy.as_deref())?;
+    if !target_allows(&presented, &target.project_path, TargetAccess::Write) {
+        return Err(publish_rejected());
+    }
+    Ok(())
+}
+
+fn live_account_policy(
+    authority: &PublishAuthority<'_>,
+) -> Result<Option<std::sync::Arc<EntitySnapshot>>, MegaError> {
+    match authority.caller {
+        TracesCaller::MonoAccount { .. } => {
+            let store = authority.policy.ok_or_else(publish_rejected)?;
+            if store.is_dirty() {
+                return Err(publish_rejected());
+            }
+            Ok(Some(store.snapshot().ok_or_else(publish_rejected)?))
+        }
+        TracesCaller::Anonymous | TracesCaller::StaticPushToken { .. } => Ok(None),
+    }
+}
+
+fn presented_for_publish<'a>(
+    authority: &'a PublishAuthority<'a>,
+    live_policy: Option<&'a EntitySnapshot>,
+) -> Result<Presented<'a>, MegaError> {
+    match authority.caller {
+        TracesCaller::MonoAccount {
+            credential_id,
+            username,
+            enforcement,
+            ..
+        } if !credential_id.is_empty() && !username.is_empty() => Ok(Presented {
+            namespace: CredentialNamespace::MonoAccount,
+            credential_id,
+            kind: PresentedKind::Account {
+                username,
+                enforcement,
+                snapshot: Some(live_policy.ok_or_else(publish_rejected)?),
+            },
+        }),
+        TracesCaller::MonoAccount { .. } => Err(publish_rejected()),
+        TracesCaller::Anonymous | TracesCaller::StaticPushToken { .. } => {
+            presented_credential(&TracesAuthRequest {
+                caller: authority.caller,
+                action: TracesAction::Update {
+                    owner_principal_id: authority.principal_id,
+                },
+                canonical_target_path: authority.authorized_path,
+                commit_author: None,
+            })
+            .ok_or_else(publish_rejected)
+        }
+    }
+}
+
+struct StreamOwner {
+    principal_id: String,
+    target_id: String,
+}
+
+struct LockedTarget {
+    active: bool,
+    project_path: String,
+}
+
+fn credential_identity(caller: TracesCaller<'_>) -> Option<(CredentialNamespace, &str)> {
+    match caller {
+        TracesCaller::Anonymous => None,
+        TracesCaller::StaticPushToken { credential_id, .. } if !credential_id.is_empty() => {
+            Some((CredentialNamespace::StaticPushToken, credential_id))
+        }
+        TracesCaller::StaticPushToken { .. } => None,
+        TracesCaller::MonoAccount { credential_id, .. } if !credential_id.is_empty() => {
+            Some((CredentialNamespace::MonoAccount, credential_id))
+        }
+        TracesCaller::MonoAccount { .. } => None,
+    }
+}
+
+async fn trace_stream_owner<C: ConnectionTrait>(
+    conn: &C,
+    stream_id: &str,
+) -> Result<StreamOwner, MegaError> {
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT principal_id, target_id FROM trace_stream WHERE id = $1 FOR UPDATE",
+            [Value::from(stream_id.to_owned())],
+        ))
+        .await?
+        .ok_or_else(publish_rejected)?;
+    Ok(StreamOwner {
+        principal_id: row.try_get("", "principal_id")?,
+        target_id: row.try_get("", "target_id")?,
+    })
+}
+
+async fn locked_active_principal<C: ConnectionTrait>(
+    conn: &C,
+    namespace: CredentialNamespace,
+    credential_id: &str,
+) -> Result<Option<String>, MegaError> {
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT principal_id FROM trace_credential_binding
+             WHERE namespace = $1 AND credential_id = $2 AND retired_at IS NULL
+             FOR UPDATE",
+            [
+                Value::from(namespace.as_str()),
+                Value::from(credential_id.to_owned()),
+            ],
+        ))
+        .await?;
+    Ok(match row {
+        Some(row) => Some(row.try_get("", "principal_id")?),
+        None => None,
+    })
+}
+
+async fn locked_target<C: ConnectionTrait>(
+    conn: &C,
+    target_id: &str,
+) -> Result<LockedTarget, MegaError> {
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT active, project_path FROM trace_target WHERE id = $1 FOR UPDATE",
+            [Value::from(target_id.to_owned())],
+        ))
+        .await?
+        .ok_or_else(publish_rejected)?;
+    Ok(LockedTarget {
+        active: row.try_get("", "active")?,
+        project_path: row.try_get("", "project_path")?,
+    })
+}
+
+fn publish_rejected() -> MegaError {
+    MegaError::Traces(crate::common::errors::TracesError::UnknownScope)
+}
+
+fn publish_unauthenticated() -> MegaError {
+    MegaError::Traces(crate::common::errors::TracesError::Unauthenticated)
+}
+
+async fn active_principal<C: ConnectionTrait>(
+    db: &C,
     namespace: CredentialNamespace,
     credential_id: &str,
 ) -> Result<Option<String>, MegaError> {
@@ -283,6 +483,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        MegaError,
         callisto::trace_principal,
         ceres::protocol::AuthContext,
         config::GitConfig,
@@ -341,7 +542,7 @@ mod tests {
         }
     }
 
-    fn snapshot(users: &[(&str, &str)]) -> EntitySnapshot {
+    fn policy_json(users: &[(&str, &str)]) -> String {
         let mut value: serde_json::Value =
             serde_json::from_str(&generate_entity(&[], "/").expect("entities")).expect("json");
         let users_map = value["users"].as_object_mut().expect("users");
@@ -354,7 +555,11 @@ mod tests {
                 }),
             );
         }
-        build_from_json(&value.to_string()).expect("snapshot")
+        value.to_string()
+    }
+
+    fn snapshot(users: &[(&str, &str)]) -> EntitySnapshot {
+        build_from_json(&policy_json(users)).expect("snapshot")
     }
 
     #[tokio::test]
@@ -849,6 +1054,318 @@ mod tests {
         .await
         .expect("retired binding");
         assert_eq!(retired, TracesAuthDecision::NotFound);
+    }
+
+    struct PublishFixture {
+        stream_id: String,
+        principal_id: String,
+        target_id: String,
+        path: String,
+        credential_id: String,
+    }
+
+    async fn publish_fixture(db: &sea_orm::DatabaseConnection) -> PublishFixture {
+        let principal_id = principal(db).await;
+        let target_id = Uuid::new_v4().to_string();
+        let path = format!("/team/{target_id}");
+        let credential_id = format!("publish-{target_id}");
+        let now = Utc::now().fixed_offset();
+        crate::callisto::trace_target::ActiveModel {
+            id: Set(target_id.clone()),
+            target_kind: Set("native".to_owned()),
+            project_path: Set(path.clone()),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("target");
+        bind(
+            db,
+            &principal_id,
+            CredentialNamespace::StaticPushToken,
+            &credential_id,
+        )
+        .await;
+        let stream_id = crate::callisto::trace_stream::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id.clone()),
+            target_id: Set(target_id.clone()),
+            source_repo_id: Set("source-opaque".to_owned()),
+            epoch_id: Set(Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(None),
+            created_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("stream")
+        .id;
+        PublishFixture {
+            stream_id,
+            principal_id,
+            target_id,
+            path,
+            credential_id,
+        }
+    }
+
+    fn publish_token(fixture: &PublishFixture, paths: &[&str]) -> PushTokenConfig {
+        token(&fixture.credential_id, paths)
+    }
+
+    fn publish_authority<'a>(
+        fixture: &'a PublishFixture,
+        token: &'a PushTokenConfig,
+    ) -> PublishAuthority<'a> {
+        PublishAuthority {
+            caller: TracesCaller::StaticPushToken {
+                credential_id: &fixture.credential_id,
+                token,
+            },
+            principal_id: &fixture.principal_id,
+            target_id: &fixture.target_id,
+            authorized_path: &fixture.path,
+            expected_generation: 1,
+            policy: None,
+        }
+    }
+
+    fn assert_rejected(err: MegaError) {
+        assert!(
+            matches!(
+                err,
+                MegaError::Traces(crate::common::errors::TracesError::UnknownScope)
+            ),
+            "publication rejection is unknown_scope, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_authority_allows_a_current_credential_and_write_grant() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let token = publish_token(&fixture, &[&fixture.path]);
+        let authority = publish_authority(&fixture, &token);
+        recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .expect("current credential, active target, generation 1, and write grant");
+    }
+
+    #[tokio::test]
+    async fn publish_authority_rejects_a_retired_credential() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let row = trace_credential_binding::Entity::find()
+            .filter(trace_credential_binding::Column::CredentialId.eq(&fixture.credential_id))
+            .one(&db)
+            .await
+            .expect("binding query")
+            .expect("binding");
+        let mut binding: trace_credential_binding::ActiveModel = row.into();
+        binding.retired_at = Set(Some(Utc::now().fixed_offset()));
+        binding.update(&db).await.expect("retire");
+        let token = publish_token(&fixture, &[&fixture.path]);
+        let authority = publish_authority(&fixture, &token);
+        let err = recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .expect_err("retired credential");
+        assert_rejected(err);
+    }
+
+    #[tokio::test]
+    async fn publish_authority_rejects_an_inactive_target() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let row = crate::callisto::trace_target::Entity::find_by_id(&fixture.target_id)
+            .one(&db)
+            .await
+            .expect("target query")
+            .expect("target");
+        let mut target: crate::callisto::trace_target::ActiveModel = row.into();
+        target.active = Set(false);
+        target.update(&db).await.expect("deactivate");
+        let token = publish_token(&fixture, &[&fixture.path]);
+        let authority = publish_authority(&fixture, &token);
+        let err = recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .expect_err("inactive target");
+        assert_rejected(err);
+    }
+
+    #[tokio::test]
+    async fn publish_authority_rejects_a_rebound_path() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let row = crate::callisto::trace_target::Entity::find_by_id(&fixture.target_id)
+            .one(&db)
+            .await
+            .expect("target query")
+            .expect("target");
+        let mut target: crate::callisto::trace_target::ActiveModel = row.into();
+        target.project_path = Set(format!("/other/{}", fixture.target_id));
+        target.update(&db).await.expect("rebind");
+        let token = publish_token(
+            &fixture,
+            &[&fixture.path, &format!("/other/{}", fixture.target_id)],
+        );
+        let authority = publish_authority(&fixture, &token);
+        let err = recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .expect_err("rebound path");
+        assert_rejected(err);
+    }
+
+    #[tokio::test]
+    async fn publish_authority_rejects_a_stale_generation() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        crate::callisto::audit_logs::ActiveModel {
+            id: Set(910_037),
+            actor_id: Set(0),
+            actor_type: Set(crate::callisto::sea_orm_active_enums::ActorTypeEnum::Human),
+            action: Set(crate::callisto::sea_orm_active_enums::AuditActionEnum::Update),
+            target_type: Set(crate::callisto::sea_orm_active_enums::TargetTypeEnum::Repository),
+            target_id: Set(0),
+            metadata: Set(Some(serde_json::json!({
+                "trace_target_id": fixture.target_id,
+                "binding_generation": 2
+            }))),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(&db)
+        .await
+        .expect("generation audit");
+        let token = publish_token(&fixture, &[&fixture.path]);
+        let stale = publish_authority(&fixture, &token);
+        let err = recheck_publish_authority(&db, &fixture.stream_id, &stale)
+            .await
+            .expect_err("stale generation");
+        assert_rejected(err);
+        let mut current = publish_authority(&fixture, &token);
+        current.expected_generation = 2;
+        recheck_publish_authority(&db, &fixture.stream_id, &current)
+            .await
+            .expect("generation 2 matches the detach audit");
+    }
+
+    #[tokio::test]
+    async fn publish_authority_rejects_a_token_outside_the_target_path() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let token = publish_token(&fixture, &["/elsewhere"]);
+        let authority = publish_authority(&fixture, &token);
+        let err = recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .expect_err("token does not cover the current path");
+        assert_rejected(err);
+    }
+
+    #[tokio::test]
+    async fn publish_authority_rejects_an_anonymous_caller() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let authority = PublishAuthority {
+            caller: TracesCaller::Anonymous,
+            principal_id: &fixture.principal_id,
+            target_id: &fixture.target_id,
+            authorized_path: &fixture.path,
+            expected_generation: 1,
+            policy: None,
+        };
+        let err = recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .expect_err("anonymous caller");
+        assert!(
+            matches!(
+                err,
+                MegaError::Traces(crate::common::errors::TracesError::Unauthenticated)
+            ),
+            "a missing credential is unauthenticated, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_authority_rechecks_the_live_account_policy() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let account_id = format!("account-{}", fixture.target_id);
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::MonoAccount,
+            &account_id,
+        )
+        .await;
+        let store = SharedEntityStore::new();
+        store
+            .swap(&policy_json(&[("publisher", "admin")]))
+            .expect("admin policy");
+        let stale = snapshot(&[("publisher", "reader")]);
+        let authority = PublishAuthority {
+            caller: TracesCaller::MonoAccount {
+                credential_id: &account_id,
+                username: "publisher",
+                enforcement: Enforcement::Enforce,
+                snapshot: Some(&stale),
+            },
+            principal_id: &fixture.principal_id,
+            target_id: &fixture.target_id,
+            authorized_path: &fixture.path,
+            expected_generation: 1,
+            policy: Some(&store),
+        };
+        recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .expect("the live admin snapshot grants write even when the caller snapshot does not");
+
+        let mut off = authority;
+        off.caller = TracesCaller::MonoAccount {
+            credential_id: &account_id,
+            username: "publisher",
+            enforcement: Enforcement::Off,
+            snapshot: Some(&stale),
+        };
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &off)
+                .await
+                .expect_err("off does not grant traces write"),
+        );
+        let mut shadow = authority;
+        shadow.caller = TracesCaller::MonoAccount {
+            credential_id: &account_id,
+            username: "publisher",
+            enforcement: Enforcement::Shadow,
+            snapshot: Some(&stale),
+        };
+        recheck_publish_authority(&db, &fixture.stream_id, &shadow)
+            .await
+            .expect("shadow follows the live Cedar allow");
+
+        store
+            .swap(&policy_json(&[("publisher", "reader")]))
+            .expect("reader policy");
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .expect_err("the same authority now sees the reader snapshot"),
+        );
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &shadow)
+                .await
+                .expect_err("shadow does not turn a Cedar denial into a traces write"),
+        );
+
+        store
+            .swap(&policy_json(&[("publisher", "admin")]))
+            .expect("restore admin policy");
+        store.mark_dirty();
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .expect_err("a dirty policy store fails closed"),
+        );
     }
 
     async fn retire_account_binding(db: &sea_orm::DatabaseConnection, credential_id: &str) {

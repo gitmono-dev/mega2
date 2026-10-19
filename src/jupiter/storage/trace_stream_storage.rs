@@ -71,9 +71,10 @@ pub struct PublishRef {
 pub async fn publish_ref(
     db: &DatabaseConnection,
     update: &PublishRef,
+    authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
 ) -> Result<PublishedRef, MegaError> {
     let txn = db.begin().await?;
-    let published = match publish_ref_in_txn(&txn, update).await {
+    let published = match publish_ref_in_txn(&txn, update, authority).await {
         Ok(published) => published,
         Err(err) => {
             txn.rollback().await?;
@@ -87,6 +88,7 @@ pub async fn publish_ref(
 async fn publish_ref_in_txn(
     txn: &DatabaseTransaction,
     update: &PublishRef,
+    authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
 ) -> Result<PublishedRef, MegaError> {
     let PreparedRef {
         stream_id,
@@ -102,6 +104,7 @@ async fn publish_ref_in_txn(
     if stored_hash_kind != hash_kind {
         return Err(rejected());
     }
+    crate::ceres::traces::auth::recheck_publish_authority(txn, &stream_id, authority).await?;
     if let Some(existing) = journal_for_key(txn, &update.idempotency_key).await? {
         if existing.stream_id == stream_id
             && existing.new_tip == new_tip
@@ -479,12 +482,22 @@ mod tests {
         (dir, db)
     }
 
-    async fn stream(db: &DatabaseConnection) -> String {
+    #[derive(Clone)]
+    struct Scope {
+        stream_id: String,
+        principal_id: String,
+        target_id: String,
+        path: String,
+    }
+
+    async fn stream(db: &DatabaseConnection) -> Scope {
         let principal_id = Uuid::new_v4().to_string();
         let target_id = Uuid::new_v4().to_string();
+        let path = format!("/team/{target_id}");
+        let now = Utc::now().fixed_offset();
         trace_principal::ActiveModel {
             id: Set(principal_id.clone()),
-            created_at: Set(Utc::now().fixed_offset()),
+            created_at: Set(now),
         }
         .insert(db)
         .await
@@ -492,28 +505,80 @@ mod tests {
         trace_target::ActiveModel {
             id: Set(target_id.clone()),
             target_kind: Set("native".to_owned()),
-            project_path: Set(format!("/team/{target_id}")),
+            project_path: Set(path.clone()),
             backing_import_repo_id: Set(None),
             active: Set(true),
-            created_at: Set(Utc::now().fixed_offset()),
+            created_at: Set(now),
         }
         .insert(db)
         .await
         .expect("target");
-        trace_stream::ActiveModel {
+        crate::callisto::trace_credential_binding::ActiveModel {
             id: Set(Uuid::new_v4().to_string()),
-            principal_id: Set(principal_id),
-            target_id: Set(target_id),
+            principal_id: Set(principal_id.clone()),
+            namespace: Set("static_push_token".to_owned()),
+            credential_id: Set("publish-operator".to_owned()),
+            created_at: Set(now),
+            retired_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("binding");
+        let stream_id = trace_stream::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id.clone()),
+            target_id: Set(target_id.clone()),
             source_repo_id: Set("source-opaque".to_owned()),
             epoch_id: Set(Uuid::new_v4().to_string()),
             hash_kind: Set("sha1".to_owned()),
             tip_oid: Set(None),
-            created_at: Set(Utc::now().fixed_offset()),
+            created_at: Set(now),
         }
         .insert(db)
         .await
         .expect("stream")
-        .id
+        .id;
+        Scope {
+            stream_id,
+            principal_id,
+            target_id,
+            path,
+        }
+    }
+
+    fn authority<'a>(
+        scope: &'a Scope,
+        token: &'a crate::config::PushTokenConfig,
+    ) -> crate::ceres::traces::auth::PublishAuthority<'a> {
+        use crate::ceres::traces::auth::{PublishAuthority, TracesCaller};
+        PublishAuthority {
+            caller: TracesCaller::StaticPushToken {
+                credential_id: &token.name,
+                token,
+            },
+            principal_id: &scope.principal_id,
+            target_id: &scope.target_id,
+            authorized_path: &scope.path,
+            expected_generation: 1,
+            policy: None,
+        }
+    }
+
+    fn token(path: &str) -> crate::config::PushTokenConfig {
+        crate::config::PushTokenConfig {
+            name: "publish-operator".to_owned(),
+            token: "synthetic-secret".to_owned(),
+            paths: Some(vec![path.to_owned()]),
+        }
+    }
+
+    async fn publish(
+        db: &DatabaseConnection,
+        scope: &Scope,
+        update: &PublishRef,
+    ) -> Result<PublishedRef, MegaError> {
+        let token = token(&scope.path);
+        publish_ref(db, update, &authority(scope, &token)).await
     }
 
     fn update(stream_id: &str, new_tip: &str, parents: Vec<String>, key: &str) -> PublishRef {
@@ -563,20 +628,21 @@ mod tests {
     #[tokio::test]
     async fn ref_transaction_accepts_only_traces_ref_and_rejects_delete() {
         let (_dir, db) = open_db().await;
-        let stream_id = stream(&db).await;
+        let scope = stream(&db).await;
+        let stream_id = scope.stream_id.clone();
         let mut extra = update(&stream_id, OID_A, Vec::new(), "extra-ref");
         extra.ref_names = vec!["refs/heads/main".to_owned()];
-        assert!(publish_ref(&db, &extra).await.is_err());
+        assert!(publish(&db, &scope, &extra).await.is_err());
         let mut both = update(&stream_id, OID_A, Vec::new(), "both-refs");
         both.ref_names = vec![TRACES_REF.to_owned(), "refs/heads/main".to_owned()];
-        assert!(publish_ref(&db, &both).await.is_err());
+        assert!(publish(&db, &scope, &both).await.is_err());
         let mut deletion = update(&stream_id, OID_A, Vec::new(), "delete-ref");
         deletion.delete = true;
-        assert!(publish_ref(&db, &deletion).await.is_err());
+        assert!(publish(&db, &scope, &deletion).await.is_err());
         let mut zero = update(&stream_id, &"0".repeat(40), Vec::new(), "zero-ref");
         zero.object_oids = vec!["0".repeat(40)];
         zero.commits[0].oid = "0".repeat(40);
-        assert!(publish_ref(&db, &zero).await.is_err());
+        assert!(publish(&db, &scope, &zero).await.is_err());
         assert_eq!(tip(&db, &stream_id).await, None);
         assert_eq!(visible_count(&db, &stream_id).await, 0);
         assert_eq!(journal_count(&db, &stream_id).await, 0);
@@ -585,12 +651,13 @@ mod tests {
     #[tokio::test]
     async fn ref_transaction_rejects_non_ff_and_multi_parent() {
         let (_dir, db) = open_db().await;
-        let stream_id = stream(&db).await;
-        publish_ref(&db, &update(&stream_id, OID_A, Vec::new(), "first"))
+        let scope = stream(&db).await;
+        let stream_id = scope.stream_id.clone();
+        publish(&db, &scope, &update(&stream_id, OID_A, Vec::new(), "first"))
             .await
             .expect("first");
         let non_ff = update(&stream_id, OID_C, Vec::new(), "orphan");
-        assert!(publish_ref(&db, &non_ff).await.is_err());
+        assert!(publish(&db, &scope, &non_ff).await.is_err());
         let mut merge = update(
             &stream_id,
             OID_B,
@@ -598,7 +665,7 @@ mod tests {
             "merge",
         );
         merge.object_oids = vec![OID_B.to_owned()];
-        assert!(publish_ref(&db, &merge).await.is_err());
+        assert!(publish(&db, &scope, &merge).await.is_err());
         assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_A));
         assert_eq!(visible_count(&db, &stream_id).await, 1);
         assert_eq!(journal_count(&db, &stream_id).await, 1);
@@ -607,21 +674,22 @@ mod tests {
     #[tokio::test]
     async fn ref_transaction_keeps_checkpoint_tree_and_rejects_delete() {
         let (_dir, db) = open_db().await;
-        let stream_id = stream(&db).await;
+        let scope = stream(&db).await;
+        let stream_id = scope.stream_id.clone();
         let mut first = update(&stream_id, OID_A, Vec::new(), "ckpt-first");
         first.checkpoints = vec![CheckpointBinding {
             checkpoint_key: "ckpt-1".to_owned(),
             original_tree: TREE_A.to_owned(),
         }];
-        publish_ref(&db, &first).await.expect("first");
+        publish(&db, &scope, &first).await.expect("first");
         let mut changed = update(&stream_id, OID_B, vec![OID_A.to_owned()], "ckpt-change");
         changed.checkpoints = vec![CheckpointBinding {
             checkpoint_key: "ckpt-1".to_owned(),
             original_tree: TREE_B.to_owned(),
         }];
-        assert!(publish_ref(&db, &changed).await.is_err());
+        assert!(publish(&db, &scope, &changed).await.is_err());
         let removed = update(&stream_id, OID_B, vec![OID_A.to_owned()], "ckpt-remove");
-        assert!(publish_ref(&db, &removed).await.is_err());
+        assert!(publish(&db, &scope, &removed).await.is_err());
         let mut kept = update(&stream_id, OID_B, vec![OID_A.to_owned()], "ckpt-keep");
         kept.checkpoints = vec![
             CheckpointBinding {
@@ -633,7 +701,7 @@ mod tests {
                 original_tree: TREE_B.to_owned(),
             },
         ];
-        publish_ref(&db, &kept).await.expect("kept");
+        publish(&db, &scope, &kept).await.expect("kept");
         let rows = trace_checkpoint::Entity::find()
             .filter(trace_checkpoint::Column::StreamId.eq(&stream_id))
             .all(&db)
@@ -653,7 +721,8 @@ mod tests {
     #[tokio::test]
     async fn ref_transaction_commits_membership_ref_and_journal_together() {
         let (_dir, db) = open_db().await;
-        let stream_id = stream(&db).await;
+        let scope = stream(&db).await;
+        let stream_id = scope.stream_id.clone();
         trace_ref_update::ActiveModel {
             id: Set(Uuid::new_v4().to_string()),
             stream_id: Set(stream_id.clone()),
@@ -670,22 +739,30 @@ mod tests {
         .await
         .expect("occupied journal");
         let blocked = update(&stream_id, OID_A, Vec::new(), "occupied-key");
-        assert!(publish_ref(&db, &blocked).await.is_err());
+        assert!(publish(&db, &scope, &blocked).await.is_err());
         assert_eq!(tip(&db, &stream_id).await, None);
         assert_eq!(visible_count(&db, &stream_id).await, 0);
         assert_eq!(journal_count(&db, &stream_id).await, 1);
 
-        let published = publish_ref(&db, &update(&stream_id, OID_A, Vec::new(), "fresh-key"))
-            .await
-            .expect("publish");
+        let published = publish(
+            &db,
+            &scope,
+            &update(&stream_id, OID_A, Vec::new(), "fresh-key"),
+        )
+        .await
+        .expect("publish");
         assert!(!published.idempotent);
         assert_eq!(published.schema, SchemaDisposition::Supported);
         assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_A));
         assert_eq!(visible_count(&db, &stream_id).await, 1);
         assert_eq!(journal_count(&db, &stream_id).await, 2);
-        let replay = publish_ref(&db, &update(&stream_id, OID_A, Vec::new(), "fresh-key"))
-            .await
-            .expect("replay");
+        let replay = publish(
+            &db,
+            &scope,
+            &update(&stream_id, OID_A, Vec::new(), "fresh-key"),
+        )
+        .await
+        .expect("replay");
         assert!(replay.idempotent);
         assert_eq!(journal_count(&db, &stream_id).await, 2);
 
@@ -694,7 +771,9 @@ mod tests {
             update.schema_id = "lifecycle-unknown".to_owned();
             update
         };
-        let archived = publish_ref(&db, &unknown).await.expect("unknown schema");
+        let archived = publish(&db, &scope, &unknown)
+            .await
+            .expect("unknown schema");
         assert_eq!(archived.schema, SchemaDisposition::Unsupported);
         assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_B));
         assert_eq!(journal_count(&db, &stream_id).await, 3);
@@ -703,22 +782,27 @@ mod tests {
     #[tokio::test]
     async fn ref_transaction_concurrent_old_tip_has_one_winner() {
         let (_dir, db) = open_db().await;
-        let stream_id = stream(&db).await;
+        let scope = stream(&db).await;
+        let stream_id = scope.stream_id.clone();
         let left_db = db.clone();
         let right_db = db.clone();
-        let left_stream = stream_id.clone();
-        let right_stream = stream_id.clone();
+        let left_scope = scope.clone();
+        let right_scope = scope.clone();
         let left = tokio::spawn(async move {
-            publish_ref(
+            let stream_id = left_scope.stream_id.clone();
+            publish(
                 &left_db,
-                &update(&left_stream, OID_A, Vec::new(), "race-left"),
+                &left_scope,
+                &update(&stream_id, OID_A, Vec::new(), "race-left"),
             )
             .await
         });
         let right = tokio::spawn(async move {
-            publish_ref(
+            let stream_id = right_scope.stream_id.clone();
+            publish(
                 &right_db,
-                &update(&right_stream, OID_B, Vec::new(), "race-right"),
+                &right_scope,
+                &update(&stream_id, OID_B, Vec::new(), "race-right"),
             )
             .await
         });
@@ -736,5 +820,50 @@ mod tests {
         assert!(stored == OID_A || stored == OID_B);
         assert_eq!(journal_count(&db, &stream_id).await, 1);
         assert_eq!(visible_count(&db, &stream_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn publish_generation_rejects_a_stale_generation() {
+        let (_dir, db) = open_db().await;
+        let scope = stream(&db).await;
+        let stream_id = scope.stream_id.clone();
+        publish(
+            &db,
+            &scope,
+            &update(&stream_id, OID_A, Vec::new(), "gen-first"),
+        )
+        .await
+        .expect("generation 1");
+        crate::callisto::audit_logs::ActiveModel {
+            id: Set(910_037),
+            actor_id: Set(0),
+            actor_type: Set(crate::callisto::sea_orm_active_enums::ActorTypeEnum::Human),
+            action: Set(crate::callisto::sea_orm_active_enums::AuditActionEnum::Update),
+            target_type: Set(crate::callisto::sea_orm_active_enums::TargetTypeEnum::Repository),
+            target_id: Set(0),
+            metadata: Set(Some(serde_json::json!({
+                "trace_target_id": scope.target_id,
+                "binding_generation": 2
+            }))),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(&db)
+        .await
+        .expect("generation audit");
+        let stale = update(&stream_id, OID_B, vec![OID_A.to_owned()], "gen-stale");
+        assert!(publish(&db, &scope, &stale).await.is_err());
+        assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_A));
+        assert_eq!(journal_count(&db, &stream_id).await, 1);
+        let token = token(&scope.path);
+        let mut current = authority(&scope, &token);
+        current.expected_generation = 2;
+        publish_ref(
+            &db,
+            &update(&stream_id, OID_B, vec![OID_A.to_owned()], "gen-current"),
+            &current,
+        )
+        .await
+        .expect("generation 2");
+        assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_B));
     }
 }
