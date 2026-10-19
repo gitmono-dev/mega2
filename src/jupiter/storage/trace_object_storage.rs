@@ -4,6 +4,7 @@
 use std::sync::OnceLock;
 
 use futures::StreamExt;
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -124,6 +125,163 @@ fn oid_shard(oid: &str) -> String {
     } else {
         format!("{}/{}/{}/{}", &oid[0..2], &oid[2..4], &oid[4..6], rest)
     }
+}
+
+/// Staging key for one quarantined object. It is not the published object key.
+pub fn staging_object_key(
+    ingest_id: &str,
+    hash_kind: &str,
+    oid: &str,
+) -> Result<ObjectKey, MegaError> {
+    let ingest_id = canonical_stream_id(ingest_id)?;
+    let hash_kind = canonical_hash_kind(hash_kind)?;
+    let oid = canonical_oid(oid)?;
+    let key = ObjectKey {
+        namespace: ObjectNamespace::Traces,
+        key: format!(
+            "v1/staging/{ingest_id}/objects/{hash_kind}/{}",
+            oid_shard(&oid)
+        ),
+    };
+    key.validate()
+        .map_err(|_| MegaError::Traces(TracesError::InvalidParameter))?;
+    Ok(key)
+}
+
+/// Git object id of `type size\\0payload` for `sha1` or `sha256`.
+pub fn git_object_oid(
+    hash_kind: &str,
+    object_type: &str,
+    payload: &[u8],
+) -> Result<String, MegaError> {
+    let kind = match canonical_hash_kind(hash_kind)? {
+        HASH_KIND_SHA1 => git_internal::hash::HashKind::Sha1,
+        HASH_KIND_SHA256 => git_internal::hash::HashKind::Sha256,
+        _ => return Err(MegaError::Traces(TracesError::InvalidParameter)),
+    };
+    let object_type = match object_type {
+        "blob" => git_internal::internal::object::types::ObjectType::Blob,
+        "tree" => git_internal::internal::object::types::ObjectType::Tree,
+        "commit" => git_internal::internal::object::types::ObjectType::Commit,
+        "tag" => git_internal::internal::object::types::ObjectType::Tag,
+        _ => return Err(MegaError::Traces(TracesError::InvalidParameter)),
+    };
+    git_internal::hash::ObjectHash::from_type_and_data_for_kind(kind, object_type, payload)
+        .map(|oid| oid.to_string())
+        .map_err(|_| MegaError::Traces(TracesError::InvalidParameter))
+}
+
+/// Reject a declared id that is not the Git id of this payload.
+pub fn verify_declared_oid(
+    hash_kind: &str,
+    object_type: &str,
+    payload: &[u8],
+    declared_oid: &str,
+) -> Result<String, MegaError> {
+    let declared = canonical_oid(declared_oid)?;
+    let actual = git_object_oid(hash_kind, object_type, payload)?;
+    if actual != declared {
+        return Err(MegaError::Traces(TracesError::ObjectIntegrity));
+    }
+    Ok(actual)
+}
+
+/// Write one object under the ingest quarantine prefix.
+pub async fn put_staging(
+    store: &MegaObjectStorageWrapper,
+    ingest_id: &str,
+    hash_kind: &str,
+    oid: &str,
+    bytes: &[u8],
+) -> Result<(), MegaError> {
+    let key = staging_object_key(ingest_id, hash_kind, oid)?;
+    let _gate = put_gate().lock().await;
+    if let Some(existing) = read_stored(store, &key).await? {
+        if existing.as_slice() == bytes {
+            return Ok(());
+        }
+        return Err(MegaError::Traces(TracesError::ObjectIntegrity));
+    }
+    let meta = ObjectMeta {
+        size: bytes.len() as i64,
+        content_type: Some("application/octet-stream".to_string()),
+        ..Default::default()
+    };
+    store
+        .inner
+        .put_stream(&key, bytes.to_vec().into_stream(), meta)
+        .await?;
+    match read_stored(store, &key).await? {
+        Some(stored) if stored.as_slice() == bytes => Ok(()),
+        _ => Err(MegaError::Traces(TracesError::ObjectIntegrity)),
+    }
+}
+
+/// Read one quarantined object. A missing object is `None`.
+pub async fn get_staging(
+    store: &MegaObjectStorageWrapper,
+    ingest_id: &str,
+    hash_kind: &str,
+    oid: &str,
+) -> Result<Option<Vec<u8>>, MegaError> {
+    let key = staging_object_key(ingest_id, hash_kind, oid)?;
+    read_stored(store, &key).await
+}
+
+async fn delete_staging(
+    store: &MegaObjectStorageWrapper,
+    ingest_id: &str,
+    hash_kind: &str,
+    oid: &str,
+) -> Result<(), MegaError> {
+    let key = staging_object_key(ingest_id, hash_kind, oid)?;
+    match store.inner.delete(&key).await {
+        Ok(()) => Ok(()),
+        Err(err) => match MegaError::from(err) {
+            MegaError::ObjStorageNotFound(_) => Ok(()),
+            other => Err(other),
+        },
+    }
+}
+
+/// Delete staged copies whose oid is not a visible membership of this stream.
+/// Published object keys and membership rows are left in place.
+pub async fn recover_quarantine_objects<C: ConnectionTrait>(
+    conn: &C,
+    store: &MegaObjectStorageWrapper,
+    stream_id: &str,
+    ingest_id: &str,
+    hash_kind: &str,
+    staged_oids: &[String],
+) -> Result<Vec<String>, MegaError> {
+    let stream_id = canonical_stream_id(stream_id)?;
+    let hash_kind = canonical_hash_kind(hash_kind)?;
+    let mut deleted = Vec::new();
+    for oid in staged_oids {
+        let oid = canonical_oid(oid)?;
+        if staging_oid_published(conn, &stream_id, hash_kind, &oid).await? {
+            continue;
+        }
+        delete_staging(store, ingest_id, hash_kind, &oid).await?;
+        deleted.push(oid);
+    }
+    Ok(deleted)
+}
+
+async fn staging_oid_published<C: ConnectionTrait>(
+    conn: &C,
+    stream_id: &str,
+    hash_kind: &str,
+    oid: &str,
+) -> Result<bool, MegaError> {
+    let count = crate::callisto::trace_object::Entity::find()
+        .filter(crate::callisto::trace_object::Column::StreamId.eq(stream_id))
+        .filter(crate::callisto::trace_object::Column::HashKind.eq(hash_kind))
+        .filter(crate::callisto::trace_object::Column::Oid.eq(oid))
+        .filter(crate::callisto::trace_object::Column::Visible.eq(true))
+        .count(conn)
+        .await?;
+    Ok(count > 0)
 }
 
 async fn read_stored(
@@ -553,5 +711,112 @@ mod tests {
             Some(b"same-payload".to_vec())
         );
         assert_no_membership(&db).await;
+    }
+
+    #[tokio::test]
+    async fn quarantine_object_recovery_keeps_published_bytes() {
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, ColumnTrait, QueryFilter, Set};
+        use uuid::Uuid;
+
+        use crate::callisto::{trace_principal, trace_target};
+
+        let (_dir, db) = open_db().await;
+        let store = mock_object_storage();
+        let principal_id = Uuid::new_v4().to_string();
+        let target_id = Uuid::new_v4().to_string();
+        let now = Utc::now().fixed_offset();
+        trace_principal::ActiveModel {
+            id: Set(principal_id.clone()),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("principal");
+        trace_target::ActiveModel {
+            id: Set(target_id.clone()),
+            target_kind: Set("native".to_owned()),
+            project_path: Set(format!("/team/{target_id}")),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("target");
+        let stream_id = trace_stream::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id),
+            target_id: Set(target_id),
+            source_repo_id: Set("source-opaque".to_owned()),
+            epoch_id: Set(Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("stream")
+        .id;
+        let published = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let unpublished = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let ingest_id = "33333333-3333-4333-8333-333333333333";
+        put_raw(&store, &stream_id, "sha1", published, b"keep-me")
+            .await
+            .expect("durable");
+        put_staging(&store, ingest_id, "sha1", published, b"keep-me")
+            .await
+            .expect("published staging");
+        put_staging(&store, ingest_id, "sha1", unpublished, b"drop-me")
+            .await
+            .expect("unpublished staging");
+        trace_object::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            stream_id: Set(stream_id.clone()),
+            hash_kind: Set("sha1".to_owned()),
+            oid: Set(published.to_owned()),
+            visible: Set(true),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("membership");
+        let deleted = recover_quarantine_objects(
+            &db,
+            &store,
+            &stream_id,
+            ingest_id,
+            "sha1",
+            &[published.to_owned(), unpublished.to_owned()],
+        )
+        .await
+        .expect("recover");
+        assert_eq!(deleted, vec![unpublished.to_owned()]);
+        assert_eq!(
+            get_raw(&store, &stream_id, "sha1", published)
+                .await
+                .expect("durable read"),
+            Some(b"keep-me".to_vec())
+        );
+        assert_eq!(
+            get_staging(&store, ingest_id, "sha1", published)
+                .await
+                .expect("published staging"),
+            Some(b"keep-me".to_vec())
+        );
+        assert_eq!(
+            get_staging(&store, ingest_id, "sha1", unpublished)
+                .await
+                .expect("unpublished staging"),
+            None
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .filter(trace_object::Column::Oid.eq(published))
+                .count(&db)
+                .await
+                .expect("membership count"),
+            1
+        );
     }
 }

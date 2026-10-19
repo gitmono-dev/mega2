@@ -64,6 +64,57 @@ impl TracePublishService {
         }
         trace_stream_storage::publish_ref(db, &request.update, authority).await
     }
+
+    /// Stage objects in quarantine, then publish only a closed set.
+    pub async fn publish_quarantine(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+        ingest_id: &str,
+        budget: crate::ceres::traces::ingest::UnpackBudget,
+        objects: &[crate::ceres::traces::ingest::LooseObject],
+        update: &PublishRef,
+        authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
+    ) -> Result<PublishedRef, MegaError> {
+        trace_stream_storage::preflight(update)?;
+        crate::ceres::traces::ingest::unpack_into_quarantine(
+            &self.store,
+            ingest_id,
+            &update.hash_kind,
+            budget,
+            objects,
+        )
+        .await?;
+        crate::ceres::traces::ingest::require_closure(
+            &self.store,
+            &update.stream_id,
+            &update.hash_kind,
+            objects,
+        )
+        .await?;
+        for object in objects {
+            trace_object_storage::put_raw(
+                &self.store,
+                &update.stream_id,
+                &update.hash_kind,
+                &object.declared_oid,
+                &object.payload,
+            )
+            .await?;
+        }
+        let mut required = update.object_oids.clone();
+        required.push(update.new_tip.clone());
+        for commit in &update.commits {
+            required.push(commit.oid.clone());
+        }
+        crate::ceres::traces::ingest::require_durable_oids(
+            &self.store,
+            &update.stream_id,
+            &update.hash_kind,
+            &required,
+        )
+        .await?;
+        trace_stream_storage::publish_ref(db, update, authority).await
+    }
 }
 
 #[cfg(test)]
@@ -451,6 +502,195 @@ mod tests {
                 .expect("row")
                 .tip_oid
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantine_publication_rejects_a_missing_base_before_the_ref() {
+        use crate::ceres::traces::ingest::{LooseObject, UnpackBudget};
+
+        let (_dir, db) = open_db().await;
+        let service = TracePublishService::mock();
+        let scope = stream(&db).await;
+        let blob = b"quarantine-blob";
+        let blob_oid = git_internal::hash::ObjectHash::from_type_and_data_for_kind(
+            git_internal::hash::HashKind::Sha1,
+            git_internal::internal::object::types::ObjectType::Blob,
+            blob,
+        )
+        .expect("blob oid")
+        .to_string();
+        let commit = format!("tree {blob_oid}\n\nmessage\n");
+        let commit_oid = git_internal::hash::ObjectHash::from_type_and_data_for_kind(
+            git_internal::hash::HashKind::Sha1,
+            git_internal::internal::object::types::ObjectType::Commit,
+            commit.as_bytes(),
+        )
+        .expect("commit oid")
+        .to_string();
+        let open = vec![LooseObject {
+            object_type: "commit".to_owned(),
+            declared_oid: commit_oid.clone(),
+            payload: commit.as_bytes().to_vec(),
+        }];
+        let ingest_id = "33333333-3333-4333-8333-333333333333";
+        let token = token(&scope);
+        let authority = crate::ceres::traces::auth::PublishAuthority {
+            caller: crate::ceres::traces::auth::TracesCaller::StaticPushToken {
+                credential_id: &token.name,
+                token: &token,
+            },
+            principal_id: &scope.principal_id,
+            target_id: &scope.target_id,
+            authorized_path: &scope.path,
+            expected_generation: 1,
+            policy: None,
+        };
+        let absent = "cccccccccccccccccccccccccccccccccccccccc";
+        assert!(
+            service
+                .publish_quarantine(
+                    &db,
+                    ingest_id,
+                    UnpackBudget {
+                        compressed_bytes: 1,
+                        expanded_bytes: 0,
+                    },
+                    &[],
+                    &PublishRef {
+                        stream_id: scope.stream_id.clone(),
+                        ref_names: vec![TRACES_REF.to_owned()],
+                        delete: false,
+                        new_tip: absent.to_owned(),
+                        commits: vec![CommitParentList {
+                            oid: absent.to_owned(),
+                            parents: Vec::new(),
+                        }],
+                        checkpoints: Vec::new(),
+                        object_oids: vec![absent.to_owned()],
+                        hash_kind: "sha1".to_owned(),
+                        idempotency_key: "missing-bytes".to_owned(),
+                        schema_id: "manifest-v1".to_owned(),
+                    },
+                    &authority,
+                )
+                .await
+                .is_err(),
+            "membership requires durable bytes on this stream"
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .filter(trace_object::Column::StreamId.eq(&scope.stream_id))
+                .count(&db)
+                .await
+                .expect("membership before bytes"),
+            0
+        );
+        assert!(
+            service
+                .publish_quarantine(
+                    &db,
+                    ingest_id,
+                    UnpackBudget {
+                        compressed_bytes: commit.len() as u64,
+                        expanded_bytes: 0,
+                    },
+                    &open,
+                    &PublishRef {
+                        stream_id: scope.stream_id.clone(),
+                        ref_names: vec![TRACES_REF.to_owned()],
+                        delete: false,
+                        new_tip: commit_oid.clone(),
+                        commits: vec![CommitParentList {
+                            oid: commit_oid.clone(),
+                            parents: Vec::new(),
+                        }],
+                        checkpoints: Vec::new(),
+                        object_oids: vec![commit_oid.clone()],
+                        hash_kind: "sha1".to_owned(),
+                        idempotency_key: "open-closure".to_owned(),
+                        schema_id: "manifest-v1".to_owned(),
+                    },
+                    &authority,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            trace_object_storage::get_raw(&service.store, &scope.stream_id, "sha1", &commit_oid)
+                .await
+                .expect("durable"),
+            None
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .filter(trace_object::Column::StreamId.eq(&scope.stream_id))
+                .count(&db)
+                .await
+                .expect("membership"),
+            0
+        );
+
+        let closed = vec![
+            LooseObject {
+                object_type: "blob".to_owned(),
+                declared_oid: blob_oid.clone(),
+                payload: blob.to_vec(),
+            },
+            LooseObject {
+                object_type: "commit".to_owned(),
+                declared_oid: commit_oid.clone(),
+                payload: commit.into_bytes(),
+            },
+        ];
+        service
+            .publish_quarantine(
+                &db,
+                ingest_id,
+                UnpackBudget {
+                    compressed_bytes: 64,
+                    expanded_bytes: 0,
+                },
+                &closed,
+                &PublishRef {
+                    stream_id: scope.stream_id.clone(),
+                    ref_names: vec![TRACES_REF.to_owned()],
+                    delete: false,
+                    new_tip: commit_oid.clone(),
+                    commits: vec![CommitParentList {
+                        oid: commit_oid.clone(),
+                        parents: Vec::new(),
+                    }],
+                    checkpoints: Vec::new(),
+                    object_oids: vec![blob_oid.clone(), commit_oid.clone()],
+                    hash_kind: "sha1".to_owned(),
+                    idempotency_key: "closed-quarantine".to_owned(),
+                    schema_id: "manifest-v1".to_owned(),
+                },
+                &authority,
+            )
+            .await
+            .expect("closed publication");
+        assert_eq!(
+            trace_object_storage::get_staging(&service.store, ingest_id, "sha1", &blob_oid)
+                .await
+                .expect("staging"),
+            Some(blob.to_vec())
+        );
+        assert_eq!(
+            trace_object_storage::get_raw(&service.store, &scope.stream_id, "sha1", &blob_oid)
+                .await
+                .expect("promoted"),
+            Some(blob.to_vec())
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .filter(trace_object::Column::StreamId.eq(&scope.stream_id))
+                .filter(trace_object::Column::Visible.eq(true))
+                .count(&db)
+                .await
+                .expect("visible"),
+            2
         );
     }
 }
