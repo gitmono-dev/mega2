@@ -12,7 +12,7 @@ Libra 将工作期间捕获的脱敏记录写入 traces Git 历史，Mega2 接�
 
 | 交接 | 生产方 | 消费方与先后约束 | 放行凭据 |
 |---|---|---|---|
-| H0 契约冻结 | Mega2 MTR-01 / Libra LTR-00 | 两仓实现前置 | 两份计划及本契约联合 Claude 与隔离 Codex PASS；冻结 revision/hash 与两仓基线 |
+| H0 契约冻结 | 两仓 root 当前联合治理审查；Mega2 MTR-01 登记 | 两仓实现前置；LTR-00 已取消后续验收，不再作为生产者 | 两份计划及本契约联合 Claude 与隔离 Codex PASS；冻结 revision/hash 与两仓基线 |
 | H1 Git 服务可用 | Mega2 MTR-12，前置 MTR-13 普通 clone 隔离 | Libra LTR-10/11/12 实现 scoped push，由 LTR-01 发布；LTR-02 clone 验收 | HTTP+SSH scope/auth/FF/对象隔离验收及发布凭据，或明确的受审本地双传输 fixture；不得以最后收口作为服务启动条件 |
 | H2 scoped push 可用 | Libra LTR-01 | Mega2 MTR-14 起以真实 Libra 输入重建索引及验收 | 客户端发布凭据或受审本地 fixture；持久 source/epoch 和失败重试收据 |
 | H3 查询服务可用 | Mega2 MTR-20 | Libra LTR-13/19 capability/readiness、LTR-24 target resolve、LTR-14/15/20 导航筛选、LTR-03/04/25/05 checkpoint/search/准入/read | 列表、关键词、预算读取与水位契约的实际验收；服务版本/fixture 明确 |
@@ -21,6 +21,8 @@ Libra 将工作期间捕获的脱敏记录写入 traces Git 历史，Mega2 接�
 | H6 旧 Capture 清除/退场完成 | Mega2 MTR-29 | Libra LTR-09、Mega2 MTR-30 | 旧对象（含历史版本）及 12 表清除收据、旧 surface 消失的发布证据 |
 
 H1/H3 必须能够先于 H5 提供服务。后期联合验收不得反向阻塞早期服务或客户端，H6 也不能成为新 Git 接收/读 API 的启动前置。允许本地 fixture 作为开发依赖，不把本地可用称为远端已发布；正式完成仍须对应计划全部 C/D 门。
+
+MTR-38 提供经授权的 discovery 元数据及 v0/v2 编码；真实 HTTP/SSH discovery入口接线由MTR-92承接，认证前置由MTR-11/MTR-39提供，H1 保留双传输实际验收。当前发布源码消费资格由 MTR-91 审计，不能据此补认取消卡的历史验收。
 
 ## 2. Scope、身份与 Git 虚拟入口
 
