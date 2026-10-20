@@ -15,7 +15,7 @@ use crate::{
     callisto::sea_orm_active_enums::RefTypeEnum,
     ceres::{
         api_service::state::ProtocolApiState,
-        pack::RepoHandler,
+        pack::{RepoHandler, traces_repo::TraceDiscovery},
         protocol::{
             Capability, ServiceType, SideBind, SmartSession, TransportProtocol,
             import_refs::{CommandType, RefCommand},
@@ -63,6 +63,22 @@ fn advertised_capabilities(service_type: ServiceType, hash_kind: HashKind) -> St
         ServiceType::ReceivePack => format!("{RECEIVE_CAP_LIST}{COMMON_CAP_LIST}"),
     };
     format!("{caps} object-format={}", hash_kind.as_str())
+}
+
+pub(crate) fn traces_v0_capabilities(discovery: &TraceDiscovery) -> String {
+    let service_caps = match discovery.service_type() {
+        ServiceType::UploadPack => "",
+        ServiceType::ReceivePack => "report-status no-thin ",
+    };
+    let mut caps = format!(
+        "{service_caps}agent=mega/0.1.0 object-format={} libra-traces-v1 libra-traces-server={}",
+        discovery.hash_kind().as_str(),
+        discovery.server_id(),
+    );
+    if let Some(scope_id) = discovery.scope_id() {
+        caps.push_str(&format!(" libra-traces-scope={scope_id}"));
+    }
+    caps
 }
 
 impl SmartSession {
@@ -1030,13 +1046,13 @@ pub mod test {
         callisto::sea_orm_active_enums::RefTypeEnum,
         ceres::{
             api_service::state::ProtocolApiState,
-            pack::RepoHandler,
+            pack::{RepoHandler, traces_repo::tests::DiscoveryFixture},
             protocol::{
                 Capability, ServiceType, SmartSession, TransportProtocol,
                 import_refs::{CommandType, RefCommand, Refs},
                 smart::{
                     PKT_LINE_END_MARKER, PktLine, add_pkt_line_string, advertised_capabilities,
-                    read_until_white_space, try_read_pkt_line,
+                    read_until_white_space, traces_v0_capabilities, try_read_pkt_line,
                 },
             },
         },
@@ -1468,6 +1484,116 @@ pub mod test {
         )];
         let pkt_line_stream = mock.build_smart_reply(&ref_list, String::from("git-upload-pack"));
         assert_eq!(&pkt_line_stream[..], b"001e# service=git-upload-pack\n000000e87bdc783132575d5b3e78400ace9971970ff43a18 refs/heads/master\0report-status report-status-v2 thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative multi_ack_detailed no-done object-format=sha1\n0000")
+    }
+
+    #[tokio::test]
+    async fn discovery_capability_v0_scope_hash_and_code_isolation() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            for existing in [false, true] {
+                let fixture = DiscoveryFixture::new(kind, existing).await;
+                for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+                    let discovery = fixture.metadata(service).await;
+                    let caps = traces_v0_capabilities(&discovery);
+                    let tokens: Vec<_> = caps.split(' ').collect();
+                    assert_eq!(
+                        tokens
+                            .iter()
+                            .filter(|&&cap| cap == "libra-traces-v1")
+                            .count(),
+                        1
+                    );
+                    let expected_server = format!(
+                        "libra-traces-server={}",
+                        uuid::Uuid::parse_str(
+                            fixture.config.deployment_server_id().expect("server id")
+                        )
+                        .expect("server UUID")
+                    );
+                    assert!(tokens.contains(&expected_server.as_str()));
+                    let object_format = format!("object-format={}", kind.as_str());
+                    assert!(tokens.contains(&object_format.as_str()));
+                    let scopes: Vec<_> = tokens
+                        .iter()
+                        .filter(|cap| cap.starts_with("libra-traces-scope="))
+                        .copied()
+                        .collect();
+                    if existing {
+                        let expected_scope = format!("libra-traces-scope={}", fixture.stream_id);
+                        assert_eq!(scopes, [expected_scope.as_str()]);
+                    } else {
+                        assert!(scopes.is_empty(), "an absent scope has no invented UUID");
+                    }
+                    for unsupported in ["shallow", "filter", "ofs-delta", "delete-refs"] {
+                        assert!(!tokens.contains(&unsupported), "{caps}");
+                    }
+                    let receive = service == ServiceType::ReceivePack;
+                    assert_eq!(tokens.contains(&"report-status"), receive);
+                    assert_eq!(tokens.contains(&"no-thin"), receive);
+                    let code_caps = advertised_capabilities(service, kind);
+                    assert!(!code_caps.contains("libra-traces"));
+                    assert!(code_caps.contains("ofs-delta"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_capability_v0_http_ssh_use_same_authorized_metadata() {
+        let fixture = DiscoveryFixture::new(HashKind::Sha256, true).await;
+        for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+            let discovery = fixture.metadata(service).await;
+            let caps = traces_v0_capabilities(&discovery);
+            let line = format!(
+                "{} capabilities^{{}}\0{caps}\n",
+                "0".repeat(discovery.hash_kind().hex_len())
+            );
+            let refs = vec![line.clone()];
+            for transport in [TransportProtocol::Http, TransportProtocol::Ssh] {
+                let session = SmartSession::new(PathBuf::new(), service, transport);
+                let mut reply = session
+                    .build_smart_reply(&refs, service.to_string())
+                    .freeze();
+                if transport == TransportProtocol::Http {
+                    assert_eq!(
+                        try_read_pkt_line(&mut reply).expect("service packet"),
+                        PktLine::Data(Bytes::from(format!("# service={service}\n")))
+                    );
+                    assert_eq!(
+                        try_read_pkt_line(&mut reply).expect("service flush"),
+                        PktLine::Flush
+                    );
+                }
+                assert_eq!(
+                    try_read_pkt_line(&mut reply).expect("discovery packet"),
+                    PktLine::Data(Bytes::from(line.clone()))
+                );
+                assert_eq!(
+                    try_read_pkt_line(&mut reply).expect("final flush"),
+                    PktLine::Flush
+                );
+                assert!(reply.is_empty(), "no trailing advertisement bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_capability_does_not_extend_standard_push_ok() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let command = RefCommand::new(
+                "0".repeat(kind.hex_len()),
+                "1".repeat(kind.hex_len()),
+                "refs/libra/traces".to_owned(),
+            );
+            assert_eq!(command.get_status(), "ok refs/libra/traces");
+            let mut report = BytesMut::new();
+            add_pkt_line_string(&mut report, command.get_status());
+            let mut report = report.freeze();
+            assert_eq!(
+                try_read_pkt_line(&mut report).expect("standard report packet"),
+                PktLine::Data(Bytes::from_static(b"ok refs/libra/traces"))
+            );
+            assert!(report.is_empty());
+        }
     }
 
     #[tokio::test]

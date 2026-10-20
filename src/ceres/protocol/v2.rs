@@ -7,9 +7,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     ceres::{
         api_service::state::ProtocolApiState,
-        pack::RepoHandler,
+        pack::{RepoHandler, traces_repo::TraceDiscovery},
         protocol::{
-            SmartSession,
+            ServiceType, SmartSession,
             import_refs::Refs,
             smart::{self, PktLine, add_pkt_line_string, try_read_pkt_line},
         },
@@ -32,6 +32,34 @@ pub fn build_v2_capability_advertisement(hash_kind: HashKind) -> BytesMut {
     add_pkt_line_string(&mut buf, format!("object-format={}\n", hash_kind.as_str()));
     buf.put(Bytes::from_static(smart::PKT_LINE_END_MARKER));
     buf
+}
+
+pub(crate) fn build_traces_v2_capability_advertisement(
+    discovery: &TraceDiscovery,
+) -> Result<BytesMut, ProtocolError> {
+    if discovery.service_type() != ServiceType::UploadPack {
+        return Err(ProtocolError::InvalidInput(
+            "traces v2 discovery requires upload-pack authorization".to_owned(),
+        ));
+    }
+    let mut buf = BytesMut::new();
+    for capability in ["version 2", "agent=mega/0.1.0", "ls-refs", "fetch"] {
+        add_pkt_line_string(&mut buf, format!("{capability}\n"));
+    }
+    add_pkt_line_string(
+        &mut buf,
+        format!("object-format={}\n", discovery.hash_kind().as_str()),
+    );
+    add_pkt_line_string(&mut buf, "libra-traces-v1\n".to_owned());
+    add_pkt_line_string(
+        &mut buf,
+        format!("libra-traces-server={}\n", discovery.server_id()),
+    );
+    if let Some(scope_id) = discovery.scope_id() {
+        add_pkt_line_string(&mut buf, format!("libra-traces-scope={scope_id}\n"));
+    }
+    buf.put(Bytes::from_static(smart::PKT_LINE_END_MARKER));
+    Ok(buf)
 }
 
 fn encode_ls_refs_response(
@@ -451,6 +479,7 @@ mod tests {
     use crate::{
         ceres::{
             api_service::state::ProtocolApiState,
+            pack::traces_repo::tests::DiscoveryFixture,
             protocol::{
                 ServiceType, TransportProtocol,
                 smart::test::{DefaultHooksProbe, HookFailure, HookProbe, assert_hook_failure},
@@ -520,6 +549,63 @@ mod tests {
             !adv_str.contains("server-option"),
             "server-option must not be advertised: {adv_str}"
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_capability_v2_scope_hash_packets_and_code_isolation() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            for existing in [false, true] {
+                let fixture = DiscoveryFixture::new(kind, existing).await;
+                let discovery = fixture.metadata(ServiceType::UploadPack).await;
+                let mut advertisement = build_traces_v2_capability_advertisement(&discovery)
+                    .expect("authorized upload discovery")
+                    .freeze();
+                let mut lines = Vec::new();
+                loop {
+                    match try_read_pkt_line(&mut advertisement).expect("valid discovery packet") {
+                        PktLine::Data(line) => {
+                            lines.push(String::from_utf8(line.to_vec()).expect("UTF-8 capability"));
+                        }
+                        PktLine::Flush => break,
+                        other => panic!("unexpected discovery packet: {other:?}"),
+                    }
+                }
+                assert!(
+                    advertisement.is_empty(),
+                    "flush terminates the advertisement"
+                );
+                let server_id = uuid::Uuid::parse_str(
+                    fixture.config.deployment_server_id().expect("server id"),
+                )
+                .expect("server UUID");
+                let mut expected = vec![
+                    "version 2\n".to_owned(),
+                    "agent=mega/0.1.0\n".to_owned(),
+                    "ls-refs\n".to_owned(),
+                    "fetch\n".to_owned(),
+                    format!("object-format={}\n", kind.as_str()),
+                    "libra-traces-v1\n".to_owned(),
+                    format!("libra-traces-server={server_id}\n"),
+                ];
+                if existing {
+                    expected.push(format!("libra-traces-scope={}\n", fixture.stream_id));
+                }
+                assert_eq!(lines, expected);
+                let code = build_v2_capability_advertisement(kind);
+                let code = std::str::from_utf8(&code).expect("ordinary code advertisement");
+                assert!(!code.contains("libra-traces"));
+                assert!(code.contains("fetch=shallow filter"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_capability_v2_rejects_receive_pack_metadata() {
+        let fixture = DiscoveryFixture::new(HashKind::Sha1, true).await;
+        let discovery = fixture.metadata(ServiceType::ReceivePack).await;
+        let error = build_traces_v2_capability_advertisement(&discovery)
+            .expect_err("receive-pack authorization is not a v2 upload discovery");
+        assert!(matches!(error, ProtocolError::InvalidInput(_)));
     }
 
     #[test]
