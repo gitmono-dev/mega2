@@ -1130,3 +1130,1418 @@ async fn rebind_target_cli_rebinds_existing_target_and_rejects_bad_paths() {
     assert_eq!(row.project_path, "/project");
     assert!(row.active);
 }
+
+#[allow(
+    dead_code,
+    reason = "shared git-cli helper also contains SSH/LFS/auth probes unused by traces HTTP cases"
+)]
+#[path = "common/git_cli.rs"]
+mod git_cli;
+
+mod disabled_http {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        panic::AssertUnwindSafe,
+        path::Path,
+        process::{Child, Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use futures::FutureExt;
+    use sea_orm::{AccessMode, IsolationLevel, TransactionTrait};
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    const LIMIT: Duration = Duration::from_secs(90);
+    const SENTINEL: &[u8] = b"mtr94 ordinary Git sentinel\n";
+    const SYNTHETIC_BASIC: &str = "Basic bXRyOTQ6c3ludGhldGljLWludmFsaWQtdG9rZW4=";
+    const SYNTHETIC_BEARER: &str = "Bearer mtr94-synthetic-invalid-token";
+    const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
+    type Snapshot = BTreeMap<String, Vec<String>>;
+
+    #[derive(Clone, Copy)]
+    pub enum Endpoint {
+        Discovery,
+        ReceiveDiscovery,
+        Upload,
+        Receive,
+    }
+
+    impl Endpoint {
+        fn method(self) -> &'static str {
+            match self {
+                Self::Discovery | Self::ReceiveDiscovery => "GET",
+                Self::Upload | Self::Receive => "POST",
+            }
+        }
+
+        fn content_type(self) -> Option<&'static str> {
+            match self {
+                Self::Discovery | Self::ReceiveDiscovery => None,
+                Self::Upload => Some("application/x-git-upload-pack-request"),
+                Self::Receive => Some("application/x-git-receive-pack-request"),
+            }
+        }
+
+        fn suffix(self) -> &'static str {
+            match self {
+                Self::Discovery => "/info/refs?service=git-upload-pack",
+                Self::ReceiveDiscovery => "/info/refs?service=git-receive-pack",
+                Self::Upload => "/git-upload-pack",
+                Self::Receive => "/git-receive-pack",
+            }
+        }
+    }
+
+    struct OwnedChild(Option<Child>);
+
+    impl OwnedChild {
+        fn spawn(command: &mut Command) -> Self {
+            Self(Some(
+                command.spawn().expect("spawn isolated fixture process"),
+            ))
+        }
+
+        fn stop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                child.wait().expect("reap isolated fixture process");
+            }
+        }
+
+        async fn require_success(&mut self) {
+            let deadline = Instant::now() + LIMIT;
+            loop {
+                let child = self.0.as_mut().expect("owned child");
+                if let Some(status) = child.try_wait().expect("poll fixture process") {
+                    self.0.take();
+                    assert!(status.success(), "fixture command failed: {status}");
+                    return;
+                }
+                assert!(Instant::now() < deadline, "fixture command exceeded 90s");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    struct Fixture {
+        temp: tempfile::TempDir,
+        shared: tempfile::TempDir,
+        database_url: String,
+        service: OwnedChild,
+        port: u16,
+        scope: String,
+        epoch: String,
+        epoch_sha256: String,
+        scope_sha256: String,
+        source: String,
+        tip: String,
+        pack: Vec<u8>,
+    }
+
+    impl Fixture {
+        async fn new(db: &sea_orm::DatabaseConnection) -> Self {
+            assert!(!git_cli::git_cli_skip_requested(), "Docker Git is required");
+            assert_ne!(
+                std::env::var("MEGA2_IT_ALLOW_HOST_GIT").as_deref(),
+                Ok("1"),
+                "host Git fallback is not this oracle"
+            );
+            git_cli::require_git_cli_runner();
+            let work = git_cli::git_cli_workdir();
+            fs::create_dir_all(&work).expect("shared Git work root");
+            let shared = tempfile::Builder::new()
+                .prefix("traces-http-")
+                .tempdir_in(work)
+                .expect("isolated Docker Git workdir");
+            let temp = tempfile::tempdir().expect("HTTP fixture directory");
+            let mut config: toml::Value = toml::from_str(
+                &fs::read_to_string(
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+                )
+                .expect("read fixture config"),
+            )
+            .expect("parse fixture config");
+            config
+                .get_mut("git")
+                .and_then(toml::Value::as_table_mut)
+                .expect("Git config table")
+                .remove("push_auth");
+            fs::write(
+                temp.path().join("config.toml"),
+                toml::to_string(&config).expect("serialize fixture config"),
+            )
+            .expect("write fixture config");
+            let name = scalar(db, "SELECT current_database() AS value").await;
+            let admin = std::env::var("MEGA_DATABASE__DB_URL").unwrap_or_else(|_| {
+                "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".to_owned()
+            });
+            let mut url = url::Url::parse(&admin).expect("test database URL");
+            url.set_path(&name);
+            Self {
+                temp,
+                shared,
+                database_url: url.to_string(),
+                service: OwnedChild(None),
+                port: 0,
+                scope: Uuid::new_v4().to_string(),
+                epoch: Uuid::new_v4().to_string(),
+                epoch_sha256: Uuid::new_v4().to_string(),
+                scope_sha256: Uuid::new_v4().to_string(),
+                source: "mtr94-source".to_owned(),
+                tip: String::new(),
+                pack: Vec::new(),
+            }
+        }
+
+        fn command(&self, enabled: bool, policy: &str, import_dir: &str) -> Command {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
+            command.env_clear().current_dir(self.temp.path());
+            for key in ["PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            command
+                .arg("--config")
+                .arg(self.temp.path().join("config.toml"))
+                .env("MEGA_BASE_DIR", self.temp.path().join("base"))
+                .env("MEGA_CACHE_DIR", self.temp.path().join("cache"))
+                .env("MEGA_DATABASE__DB_TYPE", "postgres")
+                .env("MEGA_DATABASE__DB_URL", &self.database_url)
+                .env("MEGA_DATABASE__MAX_CONNECTION", "4")
+                .env("MEGA_DATABASE__MIN_CONNECTION", "1")
+                .env("MEGA_DATABASE__ACQUIRE_TIMEOUT", "5")
+                .env("MEGA_DATABASE__CONNECT_TIMEOUT", "5")
+                .env("MEGA_DATABASE__SQLX_LOGGING", "false")
+                .env(
+                    "MEGA_REDIS__URL",
+                    std::env::var("MEGA_REDIS__URL")
+                        .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_owned()),
+                )
+                .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+                .env(
+                    "MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR",
+                    self.temp.path().join("objects"),
+                )
+                .env("MEGA_MONOREPO__PUSH_POLICY", policy)
+                .env("MEGA_MONOREPO__OBJECT_FORMAT", "sha1")
+                .env("MEGA_MONOREPO__IMPORT_DIR", import_dir)
+                .env(
+                    "MEGA_MONOREPO__ROOT_DIRS",
+                    "third-party,project,%2etraces,.traces-backup,.tracesx,.TRACES,.traces.git",
+                )
+                .env("MEGA_GIT__ANONYMOUS_ACCESS", "true")
+                .env("MEGA_CEDAR__ENFORCEMENT", "off")
+                .env("MEGA_TRACES__ENABLED", enabled.to_string())
+                .env("MEGA_TRACES__SERVER_ID", TRACE_SERVER_ID)
+                .env("MEGA_NOTIFICATION__ENABLED", "false")
+                .env("MEGA_BUCK__ENABLE_SESSION_CLEANUP", "false")
+                .env("MEGA_ARTIFACTS_GC__ENABLE", "false")
+                .env("MEGA_VIEWS__ENABLED", "false")
+                .env("MEGA_MST2__ENABLED", "false")
+                .env("MEGA_STORAGE_EVENTS__ENABLED", "false")
+                .env("MEGA_LOG__PRINT_STD", "true")
+                .env("MEGA_LOG__WITH_ANSI", "false")
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(
+                    fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(self.temp.path().join("process.out"))
+                        .expect("stdout file"),
+                ))
+                .stderr(Stdio::from(
+                    fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(self.temp.path().join("process.err"))
+                        .expect("stderr file"),
+                ));
+            if policy == "trunk" {
+                command.env("MEGA_GIT__PUSH_AUTH", "none");
+            }
+            command
+        }
+
+        async fn start(&mut self, enabled: bool, policy: &str, import_dir: &str) {
+            self.stop();
+            self.port = git_cli::reserve_ephemeral_port();
+            let mut command = self.command(enabled, policy, import_dir);
+            command.args([
+                "service",
+                "http",
+                "--host",
+                git_cli::service_listen_host(),
+                "-p",
+            ]);
+            command.arg(self.port.to_string());
+            self.service = OwnedChild::spawn(&mut command);
+            git_cli::record_service_pid(self.service.0.as_ref().expect("child").id());
+            let deadline = Instant::now() + LIMIT;
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("readiness client");
+            loop {
+                assert!(
+                    self.service
+                        .0
+                        .as_mut()
+                        .expect("child")
+                        .try_wait()
+                        .expect("poll service")
+                        .is_none(),
+                    "HTTP service exited before readiness"
+                );
+                if let Ok(response) = client
+                    .get(git_cli::mega2_host_http_url(self.port, "/api/openapi.json"))
+                    .send()
+                    .await
+                    && response.status() == reqwest::StatusCode::OK
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "HTTP service readiness exceeded 90s"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        fn stop(&mut self) {
+            self.service.stop();
+            if self.port != 0 {
+                git_cli::wait_until_port_closed(self.port, Duration::from_secs(5));
+            }
+        }
+
+        fn git(&self, args: &[&str]) -> Vec<u8> {
+            let output = git_cli::git_cli_no_auth(self.shared.path(), args);
+            assert!(
+                output.status.success(),
+                "Docker Git fixture command failed ({}) args={args:?}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        }
+
+        fn git_text(&self, args: &[&str]) -> String {
+            String::from_utf8(self.git(args))
+                .expect("Git text output")
+                .trim()
+                .to_owned()
+        }
+
+        async fn prepare(&mut self, db: &sea_orm::DatabaseConnection) {
+            let mut init = self.command(false, "trunk", "/third-party");
+            init.args(["service", "init", "--yes"]);
+            OwnedChild::spawn(&mut init).require_success().await;
+            self.start(true, "trunk", "/third-party").await;
+            let root_url = git_cli::mega2_http_url(self.port, "/");
+            let native_alias = format!("%2etraces/by-scope/{}", self.scope);
+            let scope_dir = format!("by-scope/{}", self.scope);
+            let roots: [(&str, Vec<&str>); 6] = [
+                ("project", vec!["control", ".traces/repo"]),
+                (".traces-backup", vec!["repo"]),
+                (".tracesx", vec!["repo"]),
+                (".TRACES", vec!["repo"]),
+                (".traces.git", vec!["ordinary"]),
+                ("%2etraces", vec![&scope_dir]),
+            ];
+            for (index, (root, directories)) in roots.into_iter().enumerate() {
+                let source = format!("native-source-{index}");
+                let new_child = root == ".traces.git";
+                let url = git_cli::mega2_http_url(
+                    self.port,
+                    &if new_child {
+                        "/.traces.git/ordinary.git".to_owned()
+                    } else {
+                        format!("/{root}.git")
+                    },
+                );
+                let source_url = if new_child {
+                    git_cli::mega2_http_url(self.port, "/project.git")
+                } else {
+                    url.clone()
+                };
+                self.git(&["clone", &source_url, &source]);
+                for directory in &directories {
+                    let path = self.shared.path().join(&source).join(if new_child {
+                        ""
+                    } else {
+                        directory
+                    });
+                    fs::create_dir_all(&path).expect("native subtree");
+                    fs::write(path.join("sentinel.txt"), SENTINEL).expect("native sentinel");
+                }
+                self.git(&["-C", &source, "add", "."]);
+                self.git(&[
+                    "-C",
+                    &source,
+                    "-c",
+                    "user.name=Traces Test",
+                    "-c",
+                    "user.email=traces@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "MTR94 native sentinel",
+                ]);
+                self.git(&[
+                    "-C",
+                    &source,
+                    "push",
+                    "--no-thin",
+                    &url,
+                    "HEAD:refs/heads/main",
+                ]);
+                for (child_index, directory) in directories.into_iter().enumerate() {
+                    let child_url =
+                        git_cli::mega2_http_url(self.port, &format!("/{root}/{directory}.git"));
+                    let check = format!("native-target-{index}-{child_index}");
+                    self.git(&["clone", &child_url, &check]);
+                    assert_eq!(
+                        fs::read(self.shared.path().join(check).join("sentinel.txt"))
+                            .expect("native target clone bytes"),
+                        SENTINEL
+                    );
+                }
+            }
+            let root_tip = scalar(db, "SELECT ref_commit_hash AS value FROM mega_refs WHERE path='/' AND ref_name='refs/heads/main'").await;
+            let mut fetch = Vec::new();
+            pkt(&mut fetch, "command=fetch\n");
+            fetch.extend_from_slice(b"0001");
+            pkt(&mut fetch, &format!("want {root_tip}\n"));
+            pkt(&mut fetch, "done\n");
+            fetch.extend_from_slice(b"0000");
+            let root_fetch =
+                request(self.port, Endpoint::Upload, "", true, &fetch, None, false).await;
+            assert_eq!(
+                root_fetch.status,
+                200,
+                "ordinary root fetch failed: {}",
+                String::from_utf8_lossy(&root_fetch.body)
+            );
+            self.git(&["clone", &root_url, "native-check"]);
+            assert_eq!(
+                fs::read(
+                    self.shared
+                        .path()
+                        .join("native-check/project/control/sentinel.txt")
+                )
+                .expect("native clone bytes"),
+                SENTINEL
+            );
+            assert_eq!(
+                fs::read(
+                    self.shared
+                        .path()
+                        .join("native-check")
+                        .join(&native_alias)
+                        .join("sentinel.txt")
+                )
+                .expect("native alias root tree bytes"),
+                SENTINEL
+            );
+            self.git(&[
+                "init",
+                "--initial-branch=main",
+                "--object-format=sha1",
+                "import",
+            ]);
+            fs::write(self.shared.path().join("import/sentinel.txt"), SENTINEL)
+                .expect("import sentinel");
+            self.git(&["-C", "import", "add", "sentinel.txt"]);
+            self.git(&[
+                "-C",
+                "import",
+                "-c",
+                "user.name=Traces Test",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "MTR94 import sentinel",
+            ]);
+            let import_url = git_cli::mega2_http_url(self.port, "/third-party/mtr94-control.git");
+            self.git(&["-C", "import", "push", &import_url, "HEAD:refs/heads/main"]);
+            self.git(&["clone", &import_url, "import-check"]);
+            assert_eq!(
+                fs::read(self.shared.path().join("import-check/sentinel.txt"))
+                    .expect("import clone bytes"),
+                SENTINEL
+            );
+            self.tip = self.git_text(&["-C", "import", "rev-parse", "HEAD"]);
+            self.pack = self.git(&[
+                "-C",
+                "import",
+                "pack-objects",
+                "--stdout",
+                "--revs",
+                "--all",
+                "--window=0",
+                "--no-reuse-delta",
+                "--no-reuse-object",
+            ]);
+            assert!(self.pack.starts_with(b"PACK"));
+            for path in [
+                "/project/control.git",
+                "/project/.traces/repo.git",
+                "/.traces-backup/repo.git",
+                "/.tracesx/repo.git",
+                "/.TRACES/repo.git",
+                "/.traces.git/ordinary.git",
+            ] {
+                for version in ["0", "2"] {
+                    let refs = self.git_text(&[
+                        "-c",
+                        &format!("protocol.version={version}"),
+                        "ls-remote",
+                        &git_cli::mega2_http_url(self.port, path),
+                    ]);
+                    assert!(
+                        refs.contains("refs/heads/main"),
+                        "ordinary path missing main"
+                    );
+                }
+            }
+            let principal = Uuid::new_v4().to_string();
+            let target = Uuid::new_v4().to_string();
+            trace_principal::ActiveModel {
+                id: Set(principal.clone()),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .expect("seed trace principal");
+            trace_target::ActiveModel {
+                id: Set(target.clone()),
+                target_kind: Set("native".to_owned()),
+                project_path: Set("/project/control".to_owned()),
+                backing_import_repo_id: Set(None),
+                active: Set(true),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .expect("seed trace target");
+            trace_stream::ActiveModel {
+                id: Set(self.scope.clone()),
+                principal_id: Set(principal.clone()),
+                target_id: Set(target.clone()),
+                source_repo_id: Set(self.source.clone()),
+                epoch_id: Set(self.epoch.clone()),
+                hash_kind: Set("sha1".to_owned()),
+                tip_oid: Set(None),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .expect("seed trace stream");
+            trace_stream::ActiveModel {
+                id: Set(self.scope_sha256.clone()),
+                principal_id: Set(principal),
+                target_id: Set(target),
+                source_repo_id: Set(self.source.clone()),
+                epoch_id: Set(self.epoch_sha256.clone()),
+                hash_kind: Set("sha256".to_owned()),
+                tip_oid: Set(None),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .expect("seed sha256 trace stream");
+            self.start(false, "trunk", "/third-party").await;
+            self.converge(db).await;
+            for (index, path) in [
+                "/project/control.git",
+                "/project/.traces/repo.git",
+                "/.traces-backup/repo.git",
+                "/.tracesx/repo.git",
+                "/.TRACES/repo.git",
+                "/.traces.git/ordinary.git",
+                "/third-party/mtr94-control.git",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let url = git_cli::mega2_http_url(self.port, path);
+                for version in ["0", "2"] {
+                    let refs = self.git_text(&[
+                        "-c",
+                        &format!("protocol.version={version}"),
+                        "ls-remote",
+                        &url,
+                    ]);
+                    assert!(
+                        refs.contains("refs/heads/main"),
+                        "disabled traces guard rejected ordinary path {path}"
+                    );
+                }
+                let check = format!("disabled-ordinary-{index}");
+                self.git(&["clone", &url, &check]);
+                assert_eq!(
+                    fs::read(self.shared.path().join(check).join("sentinel.txt"))
+                        .expect("ordinary clone bytes with traces disabled"),
+                    SENTINEL
+                );
+            }
+        }
+
+        async fn converge(&self, db: &sea_orm::DatabaseConnection) {
+            let deadline = Instant::now() + LIMIT;
+            loop {
+                let pending = scalar(db, "SELECT count(*)::text AS value FROM push_queue WHERE status::text IN ('Queued','Running')").await;
+                if pending == "0" {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture queue did not finish within 90s"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let root_url = git_cli::mega2_http_url(self.port, "/");
+            self.git(&["-C", "native-check", "fetch", &root_url, "main"]);
+            let root_tip = self.git_text(&["-C", "native-check", "rev-parse", "FETCH_HEAD"]);
+            assert_eq!(scalar(db, "SELECT ref_commit_hash AS value FROM mega_refs WHERE path='/' AND ref_name='refs/heads/main'").await, root_tip);
+            let tree = self.git_text(&["-C", "native-check", "ls-tree", "-r", "-t", "FETCH_HEAD"]);
+            let mut entries: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+            for line in tree.lines() {
+                let (header, path) = line.split_once('\t').expect("ls-tree record");
+                let parts: Vec<_> = header.split_whitespace().collect();
+                let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+                entries.entry(parent.to_owned()).or_default().push((
+                    parts[1].to_owned(),
+                    parts[2].to_owned(),
+                    path.to_owned(),
+                ));
+            }
+            let mut stack = vec![String::new()];
+            let mut expected = BTreeSet::new();
+            let mut final_paths = BTreeMap::new();
+            while let Some(parent) = stack.pop() {
+                for (kind, oid, path) in entries.get(&parent).into_iter().flatten() {
+                    if kind == "tree" {
+                        stack.push(path.clone());
+                    } else {
+                        let absolute = format!("/{path}");
+                        expected.insert((oid.clone(), absolute.clone()));
+                        final_paths.insert(oid.clone(), absolute);
+                    }
+                }
+            }
+            assert!(!expected.is_empty(), "real root tree must have blobs");
+            loop {
+                let pending = scalar(db, "SELECT count(*)::text AS value FROM push_queue WHERE status::text IN ('Queued','Running')").await;
+                let rows = db
+                    .query_all_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT blob_id, path FROM blob_paths".to_owned(),
+                    ))
+                    .await
+                    .expect("blob paths convergence query");
+                let actual: BTreeSet<(String, String)> = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.try_get("", "blob_id").expect("blob id"),
+                            row.try_get("", "path").expect("blob path"),
+                        )
+                    })
+                    .collect();
+                let blobs = db
+                    .query_all_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT blob_id, file_path FROM mega_blob".to_owned(),
+                    ))
+                    .await
+                    .expect("blob filepath convergence query");
+                let paths_match = blobs.iter().all(|row| {
+                    let oid: String = row.try_get("", "blob_id").expect("blob oid");
+                    let path: String = row.try_get("", "file_path").expect("blob filepath");
+                    final_paths
+                        .get(&oid)
+                        .is_none_or(|expected| expected == &path)
+                });
+                if pending == "0" && actual == expected && paths_match {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture queue/root/blob_paths did not converge within 90s"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+
+        fn locators(&self) -> Vec<String> {
+            let target = URL_SAFE_NO_PAD.encode("/project/control");
+            let source = URL_SAFE_NO_PAD.encode(&self.source);
+            let scope = &self.scope;
+            let canonical = format!("/.traces/by-scope/{scope}.git");
+            vec![
+                canonical.clone(),
+                format!("/.traces/by-scope/{}.git", self.scope_sha256),
+                format!("/.traces/by-scope/{}.git", Uuid::new_v4()),
+                format!(
+                    "/.traces/by-path/{target}/self/{source}/{}/sha1.git",
+                    self.epoch
+                ),
+                format!(
+                    "/.traces/by-path/{target}/self/{source}/{}/sha256.git",
+                    self.epoch_sha256
+                ),
+                format!(
+                    "/.traces/by-path/{target}/self/{source}/{}/sha1.git",
+                    Uuid::new_v4()
+                ),
+                format!(
+                    "/.traces/by-path/{target}/self/{source}/{}/sha256.git",
+                    Uuid::new_v4()
+                ),
+                format!("/{canonical}"),
+                format!("/./{}", &canonical[1..]),
+                format!("/other/..{canonical}"),
+                "/.traces/../project/control.git".to_owned(),
+                "//.traces/../project/control.git".to_owned(),
+                format!("/%2etraces/by-scope/{scope}.git"),
+                format!("/.%74races/by-scope/{scope}.git"),
+                format!("/%2Etraces/by-scope/{scope}.git"),
+                format!("/.traces%2Fby-scope/{scope}.git"),
+                format!("/%2f.traces/by-scope/{scope}.git"),
+                format!("/other/%2e%2e{canonical}"),
+                "/.traces/by-scope".to_owned(),
+                "/.traces/by-scope/not-a-uuid.git".to_owned(),
+                format!("/.traces/by-scope/{}.git", scope.to_uppercase()),
+                format!("/.traces/by-scope/{scope}/extra.git"),
+                format!(
+                    "/.traces/by-path/{target}=/self/{source}/{}/sha1.git",
+                    self.epoch
+                ),
+                format!(
+                    "/.traces/by-path/{target}/self/{source}/{}/sha512.git",
+                    self.epoch
+                ),
+                format!("/.traces/by-scope/{scope}"),
+                "/.traces/%FF/bad.git".to_owned(),
+                "/.traces/%GG/bad.git".to_owned(),
+                "/.traces.git".to_owned(),
+            ]
+        }
+
+        fn request_body(&self, endpoint: Endpoint, v2: bool) -> Vec<u8> {
+            match endpoint {
+                Endpoint::Discovery | Endpoint::ReceiveDiscovery => Vec::new(),
+                Endpoint::Upload => {
+                    let mut body = Vec::new();
+                    if v2 {
+                        pkt(&mut body, "command=fetch\n");
+                        body.extend_from_slice(b"0001");
+                        pkt(&mut body, &format!("want {}\n", self.tip));
+                        pkt(&mut body, "done\n");
+                        body.extend_from_slice(b"0000");
+                    } else {
+                        pkt(&mut body, &format!("want {}\n", self.tip));
+                        body.extend_from_slice(b"0000");
+                        pkt(&mut body, "done\n");
+                    }
+                    body
+                }
+                Endpoint::Receive => {
+                    let mut body = Vec::new();
+                    pkt(
+                        &mut body,
+                        &format!(
+                            "{} {} refs/libra/traces\0report-status\n",
+                            "0".repeat(40),
+                            self.tip
+                        ),
+                    );
+                    body.extend_from_slice(b"0000");
+                    body.extend_from_slice(&self.pack);
+                    body
+                }
+            }
+        }
+
+        async fn disabled(&self, db: &sea_orm::DatabaseConnection, endpoint: Endpoint) {
+            let before = snapshot(db).await;
+            let mut common = None;
+            for locator in self.locators() {
+                for v2 in [false, true] {
+                    let response = request(
+                        self.port,
+                        endpoint,
+                        &locator,
+                        v2,
+                        &self.request_body(endpoint, v2),
+                        None,
+                        false,
+                    )
+                    .await;
+                    response.refused(&self.tip);
+                    if let Some(expected) = &common {
+                        assert_eq!(
+                            &response.body, expected,
+                            "disabled responses disclose locator differences"
+                        );
+                    } else {
+                        common = Some(response.body.clone());
+                    }
+                    unchanged(&before, &snapshot(db).await);
+                }
+            }
+            for prefix in [".traces", "%2etraces"] {
+                let path = format!("/{prefix}/by-scope/{}.git{}", self.scope, endpoint.suffix());
+                for authorization in [SYNTHETIC_BASIC, SYNTHETIC_BEARER] {
+                    for v2 in [false, true] {
+                        let mut headers = vec![("Authorization", authorization)];
+                        if v2 {
+                            headers.push(("Git-Protocol", "version=2"));
+                        }
+                        let response = raw_request(
+                            self.port,
+                            endpoint.method(),
+                            &path,
+                            endpoint.content_type(),
+                            &self.request_body(endpoint, v2),
+                            &headers,
+                            false,
+                        )
+                        .await;
+                        response.refused(&self.tip);
+                        assert_eq!(
+                            Some(&response.body),
+                            common.as_ref(),
+                            "credentials must not affect disabled refusal"
+                        );
+                        unchanged(&before, &snapshot(db).await);
+                    }
+                }
+            }
+            for encoding in ["unknown-mtr94-encoding", "gzip"] {
+                let response = request(
+                    self.port,
+                    endpoint,
+                    &format!("/.traces/by-scope/{}.git", self.scope),
+                    false,
+                    b"invalid-compressed-body",
+                    Some(encoding),
+                    false,
+                )
+                .await;
+                response.refused(&self.tip);
+                unchanged(&before, &snapshot(db).await);
+            }
+            let response = request(
+                self.port,
+                endpoint,
+                &format!("/.traces/by-scope/{}.git", self.scope),
+                false,
+                b"",
+                None,
+                true,
+            )
+            .await;
+            response.refused(&self.tip);
+            unchanged(&before, &snapshot(db).await);
+            if matches!(endpoint, Endpoint::Receive) {
+                let response = request(
+                    self.port,
+                    endpoint,
+                    &format!("/.traces/by-scope/{}.git", self.scope),
+                    false,
+                    b"0000",
+                    None,
+                    false,
+                )
+                .await;
+                response.refused(&self.tip);
+                unchanged(&before, &snapshot(db).await);
+            }
+        }
+
+        async fn lfs_controls(&self, db: &sea_orm::DatabaseConnection, enabled: bool) {
+            let before = snapshot(db).await;
+            let mut paths = vec!["/project/control.git/info/lfs/objects/batch".to_owned()];
+            if enabled {
+                paths.push(format!(
+                    "/%2etraces/by-scope/{}.git/info/lfs/objects/batch",
+                    self.scope
+                ));
+            }
+            for path in paths {
+                for operation in ["download", "upload"] {
+                    let body = lfs_batch(operation);
+                    let response = raw_request(
+                        self.port,
+                        "POST",
+                        &path,
+                        Some(LFS_CONTENT_TYPE),
+                        &body,
+                        &[],
+                        false,
+                    )
+                    .await;
+                    assert_eq!(
+                        response.status, 200,
+                        "ordinary LFS {operation} failed at {path}"
+                    );
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&response.body).expect("ordinary LFS batch JSON");
+                    assert_eq!(json["objects"], serde_json::json!([]));
+                    assert_eq!(json["transfer"], "basic");
+                    assert_eq!(json["hash_algo"], "sha256");
+                    unchanged(&before, &snapshot(db).await);
+                }
+            }
+        }
+
+        async fn disabled_lfs(&self, db: &sea_orm::DatabaseConnection) {
+            let before = snapshot(db).await;
+            let canonical = request(
+                self.port,
+                Endpoint::Discovery,
+                &format!("/.traces/by-scope/{}.git", self.scope),
+                false,
+                b"",
+                None,
+                false,
+            )
+            .await;
+            canonical.refused(&self.tip);
+            unchanged(&before, &snapshot(db).await);
+            for prefix in ["%2etraces", ".%74races", ".traces"] {
+                let path = format!(
+                    "/{prefix}/by-scope/{}.git/info/lfs/objects/batch",
+                    self.scope
+                );
+                for operation in ["download", "upload"] {
+                    let body = lfs_batch(operation);
+                    for authorization in [None, Some(SYNTHETIC_BASIC), Some(SYNTHETIC_BEARER)] {
+                        let headers: Vec<_> = authorization
+                            .map(|value| ("Authorization", value))
+                            .into_iter()
+                            .collect();
+                        let response = raw_request(
+                            self.port,
+                            "POST",
+                            &path,
+                            Some(LFS_CONTENT_TYPE),
+                            &body,
+                            &headers,
+                            false,
+                        )
+                        .await;
+                        assert_eq!(
+                            response.status, 404,
+                            "disabled LFS {operation} alias bypass: {path}"
+                        );
+                        response.refused(&self.tip);
+                        assert_eq!(
+                            response.body, canonical.body,
+                            "LFS alias must use the same disabled refusal"
+                        );
+                        unchanged(&before, &snapshot(db).await);
+                    }
+                }
+                for (content_type, body, omit_body) in [
+                    (LFS_CONTENT_TYPE, b"{".as_slice(), false),
+                    ("text/plain", b"invalid LFS JSON".as_slice(), false),
+                    (LFS_CONTENT_TYPE, b"".as_slice(), true),
+                ] {
+                    let response = raw_request(
+                        self.port,
+                        "POST",
+                        &path,
+                        Some(content_type),
+                        body,
+                        &[],
+                        omit_body,
+                    )
+                    .await;
+                    response.refused(&self.tip);
+                    assert_eq!(
+                        response.body, canonical.body,
+                        "LFS body must not affect disabled refusal"
+                    );
+                    unchanged(&before, &snapshot(db).await);
+                }
+            }
+        }
+
+        async fn relocate_import(&mut self, db: &sea_orm::DatabaseConnection) {
+            self.stop();
+            let before = snapshot(db).await;
+            let id = scalar(db, "SELECT id::text AS value FROM git_repo WHERE repo_path='/third-party/mtr94-control'").await;
+            let path = format!("/%2etraces/by-scope/{}", self.scope);
+            let result = db
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE git_repo SET repo_path=$1 WHERE id::text=$2",
+                    [path.into(), id.clone().into()],
+                ))
+                .await
+                .expect("relocate import fixture");
+            assert_eq!(result.rows_affected(), 1);
+            let after = snapshot(db).await;
+            let mut before_rest = before.clone();
+            let mut after_rest = after.clone();
+            before_rest.remove("git_repo");
+            after_rest.remove("git_repo");
+            unchanged(&before_rest, &after_rest);
+            assert_eq!(scalar(db, &format!("SELECT id::text AS value FROM git_repo WHERE repo_path='/%2etraces/by-scope/{}'", self.scope)).await, id);
+            self.start(true, "trunk", "/%2etraces").await;
+            let url = git_cli::mega2_http_url(
+                self.port,
+                &format!("/%2etraces/by-scope/{}.git", self.scope),
+            );
+            self.git(&["clone", &url, "relocated-import-check"]);
+            assert_eq!(
+                fs::read(
+                    self.shared
+                        .path()
+                        .join("relocated-import-check/sentinel.txt")
+                )
+                .expect("relocated import clone bytes before disabling traces"),
+                SENTINEL
+            );
+            self.start(false, "trunk", "/%2etraces").await;
+            self.converge(db).await;
+        }
+
+        async fn enabled(&mut self, db: &sea_orm::DatabaseConnection, endpoint: Endpoint) {
+            self.start(true, "trunk", "/%2etraces").await;
+            self.converge(db).await;
+            let before = snapshot(db).await;
+            let locator = format!("/.traces/by-scope/{}.git", self.scope);
+            for v2 in [false, true] {
+                let response = request(
+                    self.port,
+                    endpoint,
+                    &locator,
+                    v2,
+                    &self.request_body(endpoint, v2),
+                    None,
+                    false,
+                )
+                .await;
+                match endpoint {
+                    Endpoint::Discovery | Endpoint::ReceiveDiscovery => {
+                        assert_eq!(response.status, 200);
+                        assert!(
+                            !response
+                                .body
+                                .windows(self.tip.len())
+                                .any(|w| w == self.tip.as_bytes())
+                        );
+                        assert!(
+                            !response
+                                .body
+                                .windows(b"refs/heads/main".len())
+                                .any(|w| w == b"refs/heads/main")
+                        );
+                        let advertised = if v2 && matches!(endpoint, Endpoint::Discovery) {
+                            b"version 2".as_slice()
+                        } else {
+                            b"capabilities^{}".as_slice()
+                        };
+                        assert!(
+                            response
+                                .body
+                                .windows(advertised.len())
+                                .any(|w| w == advertised)
+                        );
+                    }
+                    Endpoint::Upload => {
+                        assert_eq!(response.status, 400, "enabled trace fetch remains closed");
+                        assert!(!response.body.windows(4).any(|w| w == b"PACK"));
+                    }
+                    Endpoint::Receive => {
+                        assert_eq!(response.status, 200);
+                        assert!(response.body.windows(4).any(|w| w == b"ERR "));
+                        assert!(
+                            !response
+                                .body
+                                .windows(b"ok refs/libra/traces".len())
+                                .any(|w| w == b"ok refs/libra/traces")
+                        );
+                    }
+                }
+                unchanged(&before, &snapshot(db).await);
+            }
+            if matches!(endpoint, Endpoint::Receive) {
+                let response =
+                    request(self.port, endpoint, &locator, false, b"0000", None, false).await;
+                assert_eq!(response.status, 200);
+                assert_eq!(response.body, b"0000");
+                unchanged(&before, &snapshot(db).await);
+                let mut no_pack = Vec::new();
+                pkt(
+                    &mut no_pack,
+                    &format!(
+                        "{} {} refs/libra/traces\0report-status\n",
+                        "0".repeat(40),
+                        self.tip
+                    ),
+                );
+                no_pack.extend_from_slice(b"0000");
+                let response =
+                    request(self.port, endpoint, &locator, false, &no_pack, None, false).await;
+                assert_eq!(response.status, 200);
+                assert!(response.body.windows(4).any(|w| w == b"ng r"));
+                assert!(!response.body.windows(4).any(|w| w == b"ok r"));
+                unchanged(&before, &snapshot(db).await);
+                let output = git_cli::git_cli_no_auth(
+                    self.shared.path(),
+                    &[
+                        "-C",
+                        "import",
+                        "push",
+                        &git_cli::mega2_http_url(self.port, &locator),
+                        "HEAD:refs/libra/traces",
+                    ],
+                );
+                assert!(
+                    !output.status.success(),
+                    "enabled trace push must remain closed"
+                );
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    error.contains("ERR")
+                        || error.contains("remote rejected")
+                        || error.contains("traces"),
+                    "Git rejection must identify protocol refusal"
+                );
+                unchanged(&before, &snapshot(db).await);
+            }
+        }
+    }
+
+    async fn scalar(db: &sea_orm::DatabaseConnection, sql: &str) -> String {
+        db.query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.to_owned(),
+        ))
+        .await
+        .expect("fixture scalar query")
+        .expect("fixture scalar row")
+        .try_get("", "value")
+        .expect("fixture scalar value")
+    }
+
+    async fn snapshot(db: &sea_orm::DatabaseConnection) -> Snapshot {
+        let txn = db
+            .begin_with_config(
+                Some(IsolationLevel::RepeatableRead),
+                Some(AccessMode::ReadOnly),
+            )
+            .await
+            .expect("begin business snapshot");
+        let tables = txn
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename"
+                    .to_owned(),
+            ))
+            .await
+            .expect("list public business tables");
+        let mut snapshot = BTreeMap::new();
+        for row in tables {
+            let table: String = row.try_get("", "tablename").expect("table name");
+            let quoted = table.replace('"', "\"\"");
+            let rows = txn.query_all_raw(Statement::from_string(DatabaseBackend::Postgres,
+                format!("SELECT to_jsonb(t)::text AS row_data FROM public.\"{quoted}\" t ORDER BY to_jsonb(t)::text"))).await.expect("read business table rows");
+            let values = rows
+                .into_iter()
+                .map(|row| row.try_get("", "row_data").expect("business row JSON"))
+                .collect();
+            snapshot.insert(table, values);
+        }
+        txn.commit().await.expect("finish business snapshot");
+        snapshot
+    }
+
+    fn unchanged(before: &Snapshot, after: &Snapshot) {
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>(),
+            "business table inventory changed"
+        );
+        for (table, rows) in before {
+            if after.get(table) != Some(rows) {
+                let old = Sha256::digest(serde_json::to_vec(rows).expect("snapshot JSON"));
+                let new = Sha256::digest(serde_json::to_vec(&after[table]).expect("snapshot JSON"));
+                panic!(
+                    "business state changed: table={table} before={} after={}",
+                    hex::encode(old),
+                    hex::encode(new)
+                );
+            }
+        }
+    }
+
+    fn pkt(out: &mut Vec<u8>, line: &str) {
+        out.extend_from_slice(format!("{:04x}", line.len() + 4).as_bytes());
+        out.extend_from_slice(line.as_bytes());
+    }
+
+    struct Response {
+        status: u16,
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    impl Response {
+        fn refused(&self, oid: &str) {
+            assert_eq!(self.status, 404, "disabled traces request must be refused");
+            assert!(
+                !self
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate:")
+            );
+            assert!(!self.body.windows(4).any(|w| w == b"PACK"));
+            assert!(!self.body.windows(oid.len()).any(|w| w == oid.as_bytes()));
+            assert!(!self.body.windows(SENTINEL.len()).any(|w| w == SENTINEL));
+            assert!(
+                !self
+                    .body
+                    .windows(b"refs/heads/main".len())
+                    .any(|w| w == b"refs/heads/main")
+            );
+        }
+    }
+
+    async fn request(
+        port: u16,
+        endpoint: Endpoint,
+        locator: &str,
+        v2: bool,
+        body: &[u8],
+        encoding: Option<&str>,
+        omit_body: bool,
+    ) -> Response {
+        let mut headers = Vec::new();
+        if v2 {
+            headers.push(("Git-Protocol", "version=2"));
+        }
+        if let Some(encoding) = encoding {
+            headers.push(("Content-Encoding", encoding));
+        }
+        raw_request(
+            port,
+            endpoint.method(),
+            &format!("{locator}{}", endpoint.suffix()),
+            endpoint.content_type(),
+            body,
+            &headers,
+            omit_body,
+        )
+        .await
+    }
+
+    fn lfs_batch(operation: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "operation": operation, "transfers": ["basic"], "objects": [], "hash_algo": "sha256"
+        }))
+        .expect("LFS fixture JSON")
+    }
+
+    async fn raw_request(
+        port: u16,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+        omit_body: bool,
+    ) -> Response {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("connect raw HTTP fixture");
+            let length = if omit_body { 4096 } else { body.len() };
+            let mut headers = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: {length}\r\n");
+            for (name, value) in extra_headers {
+                headers.push_str(&format!("{name}: {value}\r\n"));
+            }
+            if let Some(content_type) = content_type {
+                headers.push_str(&format!("Content-Type: {content_type}\r\n"));
+            }
+            headers.push_str("\r\n");
+            socket.write_all(headers.as_bytes()).await.expect("write request headers");
+            if !omit_body { socket.write_all(body).await.expect("write request body"); }
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 1024];
+                let n = socket.read(&mut chunk).await.expect("read HTTP response headers");
+                assert_ne!(n, 0, "HTTP response ended before headers");
+                bytes.extend_from_slice(&chunk[..n]);
+                assert!(bytes.len() <= 64 * 1024, "bounded HTTP response headers");
+                if let Some(position) = bytes.windows(4).position(|w| w == b"\r\n\r\n") { break position + 4; }
+            };
+            let headers = String::from_utf8(bytes[..header_end].to_vec()).expect("HTTP headers UTF8");
+            let status = headers.split_whitespace().nth(1).expect("HTTP status").parse().expect("numeric status");
+            let length: Option<usize> = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).map(|(_, value)| value.trim().parse().expect("response length")));
+            let mut body = bytes[header_end..].to_vec();
+            if let Some(length) = length {
+                assert!(length < 1024 * 1024, "bounded fixture response");
+                while body.len() < length {
+                    let mut chunk = [0u8; 4096];
+                    let n = socket.read(&mut chunk).await.expect("read response body");
+                    assert_ne!(n, 0, "truncated HTTP response body");
+                    body.extend_from_slice(&chunk[..n]);
+                }
+                assert_eq!(body.len(), length);
+            } else {
+                let mut tail = Vec::new();
+                socket.take(1024 * 1024).read_to_end(&mut tail).await.expect("read bounded response");
+                body.extend_from_slice(&tail);
+                assert!(body.len() < 1024 * 1024);
+                if headers.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+                    let mut decoded = Vec::new();
+                    let mut remaining = body.as_slice();
+                    loop {
+                        let end = remaining.windows(2).position(|w| w == b"\r\n").expect("chunk size line");
+                        let size = usize::from_str_radix(std::str::from_utf8(&remaining[..end]).expect("chunk size").split(';').next().expect("size"), 16).expect("hex chunk size");
+                        remaining = &remaining[end + 2..];
+                        if size == 0 { break; }
+                        assert!(remaining.len() >= size + 2, "complete chunk");
+                        decoded.extend_from_slice(&remaining[..size]);
+                        assert_eq!(&remaining[size..size + 2], b"\r\n");
+                        remaining = &remaining[size + 2..];
+                    }
+                    body = decoded;
+                }
+            }
+            Response { status, headers, body }
+        }).await.expect("raw HTTP response deadline (body deliberately omitted when requested)")
+    }
+
+    pub async fn run(endpoint: Endpoint) {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(Fixture::new(&db).await);
+            let fixture = fixture.as_mut().expect("fixture");
+            fixture.prepare(&db).await;
+            if matches!(endpoint, Endpoint::Discovery) {
+                fixture.lfs_controls(&db, false).await;
+                fixture.disabled_lfs(&db).await;
+            }
+            fixture.disabled(&db, endpoint).await;
+            if matches!(endpoint, Endpoint::Discovery) {
+                fixture.disabled(&db, Endpoint::ReceiveDiscovery).await;
+            }
+            let disabled_url = git_cli::mega2_http_url(
+                fixture.port,
+                &format!("/.traces/by-scope/{}.git", fixture.scope),
+            );
+            let before = snapshot(&db).await;
+            let output = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &["clone", &disabled_url, "must-not-clone"],
+            );
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("404")
+                    || String::from_utf8_lossy(&output.stderr).contains("not found")
+            );
+            unchanged(&before, &snapshot(&db).await);
+            let output = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &[
+                    "-C",
+                    "import",
+                    "push",
+                    &disabled_url,
+                    "HEAD:refs/libra/traces",
+                ],
+            );
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("404")
+                    || String::from_utf8_lossy(&output.stderr).contains("not found")
+            );
+            unchanged(&before, &snapshot(&db).await);
+            fixture.relocate_import(&db).await;
+            fixture.disabled(&db, endpoint).await;
+            if matches!(endpoint, Endpoint::Discovery) {
+                fixture.disabled_lfs(&db).await;
+                fixture.disabled(&db, Endpoint::ReceiveDiscovery).await;
+            }
+            fixture.enabled(&db, endpoint).await;
+            if matches!(endpoint, Endpoint::Discovery) {
+                fixture.lfs_controls(&db, true).await;
+                fixture.start(false, "review", "/%2etraces").await;
+                fixture.converge(&db).await;
+                fixture.disabled_lfs(&db).await;
+                fixture.disabled(&db, endpoint).await;
+                fixture.disabled(&db, Endpoint::ReceiveDiscovery).await;
+            }
+        })
+        .catch_unwind()
+        .await;
+        let cleanup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(fixture) = &mut fixture {
+                fixture.stop();
+            }
+        }));
+        let closed = db.close().await;
+        drop(guard);
+        if (result.is_err() || cleanup.is_err())
+            && let Some(fixture) = fixture.take()
+        {
+            let log_dir = fixture.temp.keep();
+            for name in ["process.out", "process.err"] {
+                if let Ok(bytes) = fs::read(log_dir.join(name)) {
+                    let digest = Sha256::digest(&bytes);
+                    eprintln!(
+                        "HTTP fixture failure log retained: file={} sha256={}",
+                        log_dir.join(name).display(),
+                        hex::encode(digest)
+                    );
+                }
+            }
+        }
+        drop(fixture);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close HTTP fixture pool before database guard");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn traces_disabled_http_discovery() {
+    disabled_http::run(disabled_http::Endpoint::Discovery).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn traces_disabled_http_upload() {
+    disabled_http::run(disabled_http::Endpoint::Upload).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn traces_disabled_http_receive() {
+    disabled_http::run(disabled_http::Endpoint::Receive).await;
+}

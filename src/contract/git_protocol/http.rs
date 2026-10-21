@@ -1,9 +1,12 @@
-use std::{convert::Infallible, str::FromStr};
+use std::{borrow::Cow, convert::Infallible, str::FromStr};
 
 use anyhow::Result;
 use axum::{
     body::Body,
-    http::{HeaderValue, Request, Response},
+    extract::State,
+    http::{HeaderValue, Method, Request, Response, Uri},
+    middleware::Next,
+    response::IntoResponse,
 };
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
@@ -23,7 +26,61 @@ use crate::{
         InfoRefsParams, check_push_permission, check_upload_pack_access, lookup_push_token,
         path::ViewLocator, receive_pack_requires_http_auth, resolve_view_target,
     },
+    jupiter::storage::Storage,
 };
+
+#[derive(Clone)]
+pub(crate) struct OriginalGitHttpUri(pub(crate) Uri);
+
+pub(crate) async fn reject_disabled_traces(
+    State(storage): State<Storage>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    if (request.method() == Method::GET || request.method() == Method::POST)
+        && !storage.config().traces.enabled
+        && (reserved_traces_http_path(request.uri().path())
+            || request
+                .extensions()
+                .get::<OriginalGitHttpUri>()
+                .is_some_and(|original| reserved_traces_http_path(original.0.path())))
+    {
+        return ProtocolError::NotFound("traces locator not found".to_owned()).into_response();
+    }
+    next.run(request).await
+}
+
+fn reserved_traces_http_path(path: &str) -> bool {
+    let raw = path.as_bytes();
+    if reserved_traces_http_bytes(raw) {
+        return true;
+    }
+    let decoded: Cow<'_, [u8]> = percent_encoding::percent_decode(raw).into();
+    reserved_traces_http_bytes(&decoded)
+}
+
+fn reserved_traces_http_bytes(path: &[u8]) -> bool {
+    if enters_traces_root(path) {
+        return true;
+    }
+    ["/info/refs", "/git-upload-pack", "/git-receive-pack"]
+        .iter()
+        .filter_map(|suffix| path.strip_suffix(suffix.as_bytes()))
+        .any(|repo| enters_traces_root(repo.strip_suffix(b".git").unwrap_or(repo)))
+}
+
+fn enters_traces_root(path: &[u8]) -> bool {
+    let mut depth = 0usize;
+    for segment in path.split(|byte| *byte == b'/') {
+        match segment {
+            b"" | b"." => {}
+            b".." => depth = depth.saturating_sub(1),
+            b".traces" if depth == 0 => return true,
+            _ => depth += 1,
+        }
+    }
+    false
+}
 
 // # Discovering Reference
 // HTTP clients that support the "smart" protocol (or both the "smart" and "dumb" protocols) MUST
@@ -497,6 +554,62 @@ mod tests {
     use futures::stream;
 
     use super::*;
+
+    #[test]
+    fn disabled_traces_namespace_rejects_root_aliases() {
+        for path in [
+            "/.traces/by-scope/00000000-0000-4000-8000-000000000001.git/info/refs",
+            "/.traces/by-path/Lw/self/agent/session/epoch/sha256.git/git-upload-pack",
+            "/.traces",
+            "/.traces.git/info/refs",
+            "/.traces.git/git-upload-pack",
+            "/.traces.git/git-receive-pack",
+            "//.traces/by-scope/bad.git/info/refs",
+            "/./.traces/",
+            "/other/../.traces/",
+            "/.traces/../ordinary/git-upload-pack",
+            "//.traces/../ordinary/info/refs",
+            "/%2etraces/by-scope/bad.git/info/refs",
+            "/.%74races/git-receive-pack",
+            "/%2Etraces/",
+            "/.traces%2Fby-scope/bad",
+            "/%2f.traces/",
+            "/other/%2e%2e/.traces/",
+            "/.traces/%FF/bad",
+            "/.traces/%GG/bad",
+            "/other/../.traces.git/git-receive-pack",
+        ] {
+            assert!(
+                reserved_traces_http_path(path),
+                "missed reserved path: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_traces_namespace_preserves_ordinary_paths() {
+        for path in [
+            "/",
+            "/info/refs",
+            "/project/git-upload-pack",
+            "/.traces-backup/repo.git/info/refs",
+            "/.tracesx/repo.git/info/refs",
+            "/project/.traces/repo.git/info/refs",
+            "/project/%2etraces/repo.git/info/refs",
+            "/.TRACES/repo.git/info/refs",
+            "/.traces.git/ordinary.git/info/refs",
+            "/.traces.git.git/info/refs",
+            "/project/a/../.traces/repo.git/info/refs",
+            "/%252etraces/repo.git/info/refs",
+            "/.traces%ZZ/repo.git/info/refs",
+            "/project/.traces/../../ordinary/git-upload-pack",
+        ] {
+            assert!(
+                !reserved_traces_http_path(path),
+                "changed ordinary path: {path}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn collect_body_data_maps_stream_errors_to_protocol_error() {

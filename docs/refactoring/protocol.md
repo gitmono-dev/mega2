@@ -640,6 +640,8 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 **2026-06-28 更新**：已抽出 `GitProtocolPath` parser（`src/contract/git_protocol/path.rs`），统一处理 repo path、仅去除末尾 `.git` suffix、service endpoint 与 HTTP 方法校验，并保留 `third-party.git` root repo 禁用规则。`src/server/http_server.rs::handle_smart_protocol` 不再内联后缀判断和 404 `unwrap()`，而是直接调用 parser。剩余工作：404/400/403/405 返回策略可随认证统一进一步标准化。
 
+**2026-10-20（MTR-94）**：HTTP Router 外层对禁用 traces 的 GET/POST 保留命名空间请求先返回 HTTP 404（JSON 错误消息为 `traces locator not found`），覆盖 smart discovery/upload-pack/receive-pack，避免 v2 discovery、receive 探测和请求解压绕过关闭入口。根段规则同时检查原始 URI 与一次百分号解码后的字节路径；只移除 Git endpoint 前仓库名的一个末尾 `.git`，不把普通嵌套 `.traces` 或 `.traces-backup` 当成保留根。拒绝先于业务鉴权、body 消费和 Native/Import 分派，不查询 scope 存在性。 LFS 重写前的 URI 由服务端保存在请求扩展，禁用门同时检查它与当前路由 URI，避免移除仓库前缀后丢失保留根。字面根名为 `%2etraces` 的代码仓，其 `/%2etraces/…` URL 在 disabled 时同样拒绝；enabled 时保持既有分派。具体关闭语义及尚未接通的 enabled 数据面见 [traces 协议](./traces.md)。
+
 历史建议（已落地）：
 
 - 抽出 `GitProtocolPath` parser，统一处理 repo path、`.git` suffix、service endpoint。

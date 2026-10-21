@@ -975,7 +975,12 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         router
     };
 
-    Ok(router.merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api)))
+    Ok(router
+        .merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api))
+        .layer(middleware::from_fn_with_state(
+            storage,
+            crate::contract::git_protocol::http::reject_disabled_traces,
+        )))
 }
 
 pub(crate) fn mount_agent_capture(config: &Config) -> bool {
@@ -1068,6 +1073,9 @@ fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
         match Uri::builder().path_and_query(&new_path_and_query).build() {
             Ok(uri) => {
                 tracing::debug!("rewrite: old uri {:?}", req.uri());
+                let original =
+                    crate::contract::git_protocol::http::OriginalGitHttpUri(req.uri().clone());
+                req.extensions_mut().insert(original);
                 *req.uri_mut() = uri;
                 tracing::debug!("rewrite: new uri {:?}", req.uri());
             }
@@ -1761,6 +1769,27 @@ mod tests {
         let new_req = rewrite_lfs_request_uri(req);
 
         assert_eq!(new_req.uri().path(), "/info/lfs/objects/123");
+    }
+
+    #[test]
+    fn lfs_rewrite_preserves_original_uri_for_disabled_traces_guard() {
+        for path in [
+            "/%2etraces/by-scope/example.git/info/lfs/objects/batch?x=1",
+            "/.traces%2Fby-scope/example.git/info/lfs/objects/batch?x=1",
+            "/project/control.git/info/lfs/objects/batch?x=1",
+        ] {
+            let req = Request::builder().uri(path).body("unread body").unwrap();
+            let req = rewrite_lfs_request_uri(req);
+            assert_eq!(req.uri(), "/info/lfs/objects/batch?x=1");
+            assert_eq!(
+                req.extensions()
+                    .get::<crate::contract::git_protocol::http::OriginalGitHttpUri>()
+                    .expect("original URI before rewrite")
+                    .0,
+                path
+            );
+            assert_eq!(req.body(), &"unread body");
+        }
     }
 
     #[test]
