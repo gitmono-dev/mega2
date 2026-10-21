@@ -227,6 +227,50 @@ ssh_receive_pack = false
     }
 }
 
+fn is_service_tcp_connection(stream: &TcpStream) -> bool {
+    matches!(
+        (stream.local_addr(), stream.peer_addr()),
+        (Ok(local), Ok(peer)) if local != peer
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn self_connected_tcp_probe() -> TcpStream {
+    with_runtime(async {
+        let socket = tokio::net::TcpSocket::new_v4().expect("create self-connect socket");
+        socket
+            .bind(([127, 0, 0, 1], 0).into())
+            .expect("bind self-connect socket");
+        let addr = socket.local_addr().expect("self-connect local address");
+        // Keep the bound socket and connect it to itself without ever listening;
+        // no random ephemeral-port collision or shared port settings are needed.
+        tokio::time::timeout(Duration::from_secs(5), socket.connect(addr))
+            .await
+            .expect("self-connect handshake exceeded five seconds")
+            .expect("self-connect handshake failed")
+            .into_std()
+            .expect("convert self-connected stream")
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn service_readiness_rejects_tcp_self_connection() {
+    let stream = self_connected_tcp_probe();
+    assert_eq!(stream.local_addr().unwrap(), stream.peer_addr().unwrap());
+    assert!(!is_service_tcp_connection(&stream));
+}
+
+#[test]
+fn service_readiness_accepts_real_listener_connection() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (accepted, _) = listener.accept().unwrap();
+    assert_ne!(stream.local_addr().unwrap(), stream.peer_addr().unwrap());
+    assert_eq!(stream.peer_addr().unwrap(), accepted.local_addr().unwrap());
+    assert!(is_service_tcp_connection(&stream));
+}
+
 struct ServiceProcess {
     child: Child,
     reaped: bool,
@@ -251,7 +295,9 @@ impl ServiceProcess {
     ) {
         let deadline = Instant::now() + timeout;
         loop {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            if TcpStream::connect(("127.0.0.1", port))
+                .is_ok_and(|stream| is_service_tcp_connection(&stream))
+            {
                 return;
             }
             if let Some(status) = self.child.try_wait().expect("poll service") {
