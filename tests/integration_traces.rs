@@ -2235,6 +2235,550 @@ mod disabled_http {
         }
     }
 
+    struct SshClient;
+
+    impl russh::client::Handler for SshClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            // Only the isolated loopback fixture is contacted by this raw client.
+            Ok(true)
+        }
+    }
+
+    type SshSession = russh::client::Handle<SshClient>;
+
+    impl Fixture {
+        async fn seed_ssh(&self, db: &sea_orm::DatabaseConnection) {
+            let key = self.shared.path().join("ssh/client_ed25519");
+            git_cli::generate_client_ed25519(&key);
+            let public = fs::read_to_string(key.with_extension("pub")).expect("SSH public key");
+            let finger = git_cli::ssh_fingerprint_sha256_col2(&key.with_extension("pub"));
+            let result = db.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO ssh_keys (id, username, title, ssh_key, finger, created_at) VALUES ($1, $2, $3, $4, $5, now())",
+                [Utc::now().timestamp_micros().into(), git_cli::DEFAULT_SSH_AUTH_USER.into(),
+                    "MTR100 disposable fixture".into(), public.into(), finger.into()],
+            )).await.expect("seed real SSH key without a nested runtime");
+            assert_eq!(result.rows_affected(), 1);
+        }
+
+        async fn start_ssh(&mut self, enabled: bool, storage_only: bool) {
+            self.stop();
+            self.port = git_cli::reserve_ephemeral_port();
+            let policy = if storage_only { "trunk" } else { "review" };
+            let mut command = self.command(enabled, policy, "/third-party");
+            command.env("MEGA_GIT__SSH_RECEIVE_PACK", (!storage_only).to_string());
+            command.env("MEGA_GIT_OBJECT_CACHE_PREFIX", "disabled");
+            command.args([
+                "service",
+                "ssh",
+                "--host",
+                git_cli::service_listen_host(),
+                "--ssh-port",
+            ]);
+            command.arg(self.port.to_string());
+            self.service = OwnedChild::spawn(&mut command);
+            git_cli::record_service_pid(self.service.0.as_ref().expect("SSH child").id());
+            let deadline = Instant::now() + LIMIT;
+            loop {
+                assert!(
+                    self.service
+                        .0
+                        .as_mut()
+                        .expect("SSH child")
+                        .try_wait()
+                        .expect("poll SSH")
+                        .is_none(),
+                    "SSH service exited before readiness"
+                );
+                if let Ok(mut socket) =
+                    tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await
+                {
+                    let mut banner = [0; 4];
+                    if matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            socket.read_exact(&mut banner)
+                        )
+                        .await,
+                        Ok(Ok(_))
+                    ) {
+                        assert_eq!(&banner, b"SSH-", "real SSH listener banner");
+                        break;
+                    }
+                }
+                assert!(Instant::now() < deadline, "SSH readiness exceeded 90s");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            git_cli::write_known_hosts_via_keyscan(
+                &self.shared.path().join("ssh/known_hosts"),
+                self.port,
+            );
+        }
+
+        async fn ssh_session(&self, storage_only: bool) -> SshSession {
+            let (session,) = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut session = russh::client::connect(
+                    std::sync::Arc::new(russh::client::Config::default()),
+                    ("127.0.0.1", self.port),
+                    SshClient,
+                )
+                .await
+                .expect("connect real SSH fixture");
+                let result = if storage_only {
+                    session
+                        .authenticate_none(git_cli::DEFAULT_SSH_AUTH_USER)
+                        .await
+                        .expect("storage-only anonymous SSH auth")
+                } else {
+                    let key = russh::keys::load_secret_key(
+                        self.shared.path().join("ssh/client_ed25519"),
+                        None,
+                    )
+                    .expect("SSH private key");
+                    session
+                        .authenticate_publickey(
+                            git_cli::DEFAULT_SSH_AUTH_USER,
+                            russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(key), None),
+                        )
+                        .await
+                        .expect("real SSH public key authentication")
+                };
+                assert!(
+                    result.success(),
+                    "SSH oracle requires successful authentication"
+                );
+                (session,)
+            })
+            .await
+            .expect("SSH authentication deadline");
+            session
+        }
+
+        fn ssh_git(&self, args: &[&str]) -> std::process::Output {
+            git_cli::git_cli_ssh(
+                self.shared.path(),
+                &git_cli::git_ssh_command(self.shared.path(), self.port),
+                args,
+            )
+        }
+
+        fn ssh_url(&self, path: &str) -> String {
+            // Git decodes the SSH URL before sending the literal exec argument.
+            let path = path.replace('%', "%25");
+            format!(
+                "ssh://{}@{}:{}{path}",
+                git_cli::DEFAULT_SSH_AUTH_USER,
+                git_cli::mega2_reachable_host(),
+                self.port
+            )
+        }
+
+        fn ssh_locators(&self) -> Vec<String> {
+            // SSH exec arguments are literal paths, not HTTP percent-encoded URIs.
+            let canonical = format!("/.traces/by-scope/{}.git", self.scope);
+            let mut paths: Vec<_> = self
+                .locators()
+                .into_iter()
+                .filter(|p| {
+                    p.starts_with("/.traces/")
+                        || p.starts_with("//.traces/")
+                        || p.starts_with("/./.traces/")
+                        || p.starts_with("/other/../.traces/")
+                        || p == "/.traces.git"
+                })
+                .collect();
+            paths.extend([
+                canonical.trim_start_matches('/').to_owned(),
+                format!("/other/../../{canonical}"),
+                "/.traces/../third-party/mtr94-control.git".to_owned(),
+                "/.traces".to_owned(),
+            ]);
+            paths
+        }
+
+        async fn ssh_ordinary(&self, db: &sea_orm::DatabaseConnection, session: &SshSession) {
+            let before = snapshot(db).await;
+            let paths = [
+                "/project/control.git".to_owned(),
+                "/project/.traces/repo.git".to_owned(),
+                "/.traces-backup/repo.git".to_owned(),
+                "/.tracesx/repo.git".to_owned(),
+                "/.TRACES/repo.git".to_owned(),
+                "/.traces.git/ordinary.git".to_owned(),
+                format!("/%2etraces/by-scope/{}.git", self.scope),
+                "/third-party/mtr94-control.git".to_owned(),
+            ];
+            for (index, path) in paths.iter().enumerate() {
+                let output =
+                    self.ssh_git(&["-c", "protocol.version=0", "ls-remote", &self.ssh_url(path)]);
+                assert!(
+                    output.status.success(),
+                    "ordinary SSH {path}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("refs/heads/main"));
+                let destination = format!("ssh-ordinary-{index}");
+                let output = self.ssh_git(&["clone", &self.ssh_url(path), &destination]);
+                assert!(
+                    output.status.success(),
+                    "ordinary SSH clone {path}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    fs::read(self.shared.path().join(destination).join("sentinel.txt"))
+                        .expect("SSH clone sentinel"),
+                    SENTINEL
+                );
+                unchanged(&before, &snapshot(db).await);
+            }
+            // The same authenticated connection remains usable after rejected channels.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut channel = session
+                    .channel_open_session()
+                    .await
+                    .expect("ordinary channel after rejection");
+                channel
+                    .exec(true, "git-upload-pack '/project/control.git'")
+                    .await
+                    .expect("ordinary exec");
+                let mut advertised = Vec::new();
+                loop {
+                    match channel.wait().await.expect("ordinary advertisement") {
+                        russh::ChannelMsg::Data { data } => {
+                            advertised.extend_from_slice(&data);
+                            assert!(
+                                advertised.len() < 1024 * 1024,
+                                "bounded ordinary advertisement"
+                            );
+                            if advertised.ends_with(b"0000") {
+                                break;
+                            }
+                        }
+                        russh::ChannelMsg::Failure | russh::ChannelMsg::Close => {
+                            panic!("rejected channel poisoned ordinary exec")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(String::from_utf8_lossy(&advertised).contains("refs/heads/main"));
+                channel.eof().await.expect("finish ordinary discovery");
+                channel.close().await.expect("close ordinary channel");
+            })
+            .await
+            .expect("ordinary SSH discovery deadline");
+            unchanged(&before, &snapshot(db).await);
+        }
+
+        async fn ssh_disabled(
+            &self,
+            db: &sea_orm::DatabaseConnection,
+            session: &SshSession,
+            receive: bool,
+        ) {
+            let service = if receive {
+                "git-receive-pack"
+            } else {
+                "git-upload-pack"
+            };
+            for path in self.ssh_locators() {
+                for v2 in [false, true] {
+                    let before = snapshot(db).await;
+                    // Exercise both supported quote forms through the real exec parser.
+                    let command = if v2 {
+                        format!("{service} \"{path}\"")
+                    } else {
+                        format!("{service} '{path}'")
+                    };
+                    ssh_refused(session, &command, v2).await;
+                    unchanged(&before, &snapshot(db).await);
+                }
+            }
+            let url = self.ssh_url(&format!("/.traces/by-scope/{}.git", self.scope));
+            let before = snapshot(db).await;
+            let output = if receive {
+                self.ssh_git(&["-C", "import", "push", &url, "HEAD:refs/libra/traces"])
+            } else {
+                self.ssh_git(&["ls-remote", &url])
+            };
+            assert!(
+                !output.status.success(),
+                "real Git must reject disabled SSH traces"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("traces locator not found"),
+                "not an authentication/connection failure: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            unchanged(&before, &snapshot(db).await);
+        }
+
+        async fn ssh_enabled(&mut self, db: &sea_orm::DatabaseConnection, receive: bool) {
+            self.start_ssh(true, false).await;
+            let session = self.ssh_session(false).await;
+            let before = snapshot(db).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut channel = session
+                    .channel_open_session()
+                    .await
+                    .expect("enabled SSH channel");
+                let service = if receive {
+                    "git-receive-pack"
+                } else {
+                    "git-upload-pack"
+                };
+                channel
+                    .exec(
+                        true,
+                        format!("{service} '/.traces/by-scope/{}.git'", self.scope),
+                    )
+                    .await
+                    .expect("enabled SSH exec");
+                let mut advertisement = Vec::new();
+                loop {
+                    match channel
+                        .wait()
+                        .await
+                        .expect("enabled existing advertisement")
+                    {
+                        russh::ChannelMsg::Data { data } => {
+                            advertisement.extend_from_slice(&data);
+                            assert!(
+                                advertisement.len() < 1024 * 1024,
+                                "bounded enabled advertisement"
+                            );
+                            if advertisement.ends_with(b"0000") {
+                                break;
+                            }
+                        }
+                        russh::ChannelMsg::Failure | russh::ChannelMsg::Close => {
+                            panic!("enabled path was replaced by disabled refusal")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(String::from_utf8_lossy(&advertisement).contains("capabilities^{}"));
+                assert!(!String::from_utf8_lossy(&advertisement).contains(&self.tip));
+                let endpoint = if receive {
+                    Endpoint::Receive
+                } else {
+                    Endpoint::Upload
+                };
+                channel
+                    .data(self.request_body(endpoint, false).as_slice())
+                    .await
+                    .expect("enabled real PACK/request");
+                channel.eof().await.expect("finish enabled request");
+                let mut response = Vec::new();
+                while let Some(message) = channel.wait().await {
+                    match message {
+                        russh::ChannelMsg::Data { data }
+                        | russh::ChannelMsg::ExtendedData { data, .. } => {
+                            response.extend_from_slice(&data)
+                        }
+                        russh::ChannelMsg::Close => break,
+                        _ => {}
+                    }
+                }
+                assert!(!response.windows(4).any(|bytes| bytes == b"PACK"));
+                assert!(!String::from_utf8_lossy(&response).contains("ok refs/libra/traces"));
+                assert!(
+                    String::from_utf8_lossy(&response)
+                        .contains("trace repository does not write code objects"),
+                    "enabled fail-closed response: {}",
+                    String::from_utf8_lossy(&response)
+                );
+            })
+            .await
+            .expect("enabled SSH existing refusal deadline");
+            unchanged(&before, &snapshot(db).await);
+            session
+                .disconnect(russh::Disconnect::ByApplication, "fixture complete", "en")
+                .await
+                .expect("disconnect enabled SSH");
+        }
+
+        async fn ssh_storage_only(&mut self, db: &sea_orm::DatabaseConnection, receive: bool) {
+            self.start_ssh(false, true).await;
+            let session = self.ssh_session(true).await;
+            let before = snapshot(db).await;
+            let service = if receive {
+                "git-receive-pack"
+            } else {
+                "git-upload-pack"
+            };
+            ssh_refused(
+                &session,
+                &format!("{service} '/.traces/by-scope/{}.git'", self.scope),
+                false,
+            )
+            .await;
+            unchanged(&before, &snapshot(db).await);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut channel = session
+                    .channel_open_session()
+                    .await
+                    .expect("storage-only ordinary channel");
+                channel
+                    .exec(true, "git-receive-pack '/project/control.git'")
+                    .await
+                    .expect("storage-only exec");
+                let mut stderr = Vec::new();
+                let mut eof = false;
+                let mut closed = false;
+                while let Some(message) = channel.wait().await {
+                    match message {
+                        russh::ChannelMsg::ExtendedData { data, ext } => {
+                            assert_eq!(ext, 1);
+                            stderr.extend_from_slice(&data);
+                        }
+                        russh::ChannelMsg::Data { data } => {
+                            assert!(data.is_empty(), "storage-only receive must not advertise")
+                        }
+                        russh::ChannelMsg::Eof => eof = true,
+                        russh::ChannelMsg::Close => {
+                            closed = true;
+                            break;
+                        }
+                        russh::ChannelMsg::Failure => {
+                            panic!("storage-only refusal must identify the existing gate")
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(stderr, b"error: SSH receive-pack is disabled\n");
+                assert!(eof && closed, "storage-only early refusal EOF and close");
+            })
+            .await
+            .expect("storage-only receive refusal with stdin held open");
+            unchanged(&before, &snapshot(db).await);
+            session
+                .disconnect(russh::Disconnect::ByApplication, "fixture complete", "en")
+                .await
+                .expect("disconnect storage-only SSH");
+        }
+    }
+
+    async fn ssh_refused(session: &SshSession, command: &str, v2: bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut channel = session
+                .channel_open_session()
+                .await
+                .expect("disabled SSH channel");
+            if v2 {
+                channel
+                    .set_env(false, "GIT_PROTOCOL", "version=2")
+                    .await
+                    .expect("SSH protocol env");
+            }
+            channel
+                .exec(true, command)
+                .await
+                .expect("disabled SSH exec");
+            // Deliberately send neither data nor EOF: refusal must precede stdin consumption.
+            let mut expected = Vec::new();
+            pkt(&mut expected, "ERR traces locator not found\n");
+            let mut actual = Vec::new();
+            let mut status = None;
+            let mut eof = false;
+            let mut closed = false;
+            let mut accepted = false;
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::Data { data } => {
+                        actual.extend_from_slice(&data);
+                        assert!(
+                            expected.starts_with(&actual),
+                            "disabled SSH leaked advertisement/fallback for {command}: {}",
+                            String::from_utf8_lossy(&actual)
+                        );
+                    }
+                    russh::ChannelMsg::ExtendedData { data, .. } => assert!(
+                        data.is_empty(),
+                        "expected traces ERR, not generic SSH refusal"
+                    ),
+                    russh::ChannelMsg::Success => accepted = true,
+                    russh::ChannelMsg::Failure => {
+                        panic!("exec failure is not the traces protocol oracle")
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status } => {
+                        assert!(status.replace(exit_status).is_none());
+                    }
+                    russh::ChannelMsg::Eof => eof = true,
+                    russh::ChannelMsg::Close => {
+                        closed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(actual, expected, "precise traces refusal for {command}");
+            assert_eq!(status, Some(1), "traces refusal exit status");
+            assert!(
+                accepted && eof && closed,
+                "exec success, EOF and close required for {command}"
+            );
+        })
+        .await
+        .expect("disabled SSH must refuse before stdin/EOF within 10s");
+    }
+
+    pub async fn run_ssh(receive: bool) {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(Fixture::new(&db).await);
+            let fixture = fixture.as_mut().expect("SSH fixture");
+            fixture.prepare(&db).await;
+            fixture.seed_ssh(&db).await;
+            fixture.start_ssh(false, false).await;
+            let session = fixture.ssh_session(false).await;
+            fixture.ssh_disabled(&db, &session, receive).await;
+            fixture.ssh_ordinary(&db, &session).await;
+            session
+                .disconnect(russh::Disconnect::ByApplication, "fixture complete", "en")
+                .await
+                .expect("disconnect disabled SSH");
+            fixture.ssh_enabled(&db, receive).await;
+            fixture.ssh_storage_only(&db, receive).await;
+        })
+        .catch_unwind()
+        .await;
+        let cleanup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(fixture) = &mut fixture {
+                fixture.stop();
+            }
+        }));
+        let closed = db.close().await;
+        drop(guard);
+        if (result.is_err() || cleanup.is_err())
+            && let Some(fixture) = fixture.take()
+        {
+            let logs = fixture.temp.keep();
+            for name in ["process.out", "process.err"] {
+                if let Ok(bytes) = fs::read(logs.join(name)) {
+                    eprintln!(
+                        "SSH fixture failure log retained: file={} sha256={}",
+                        logs.join(name).display(),
+                        hex::encode(Sha256::digest(bytes))
+                    );
+                }
+            }
+        }
+        drop(fixture);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close SSH fixture pool before database guard");
+    }
+
     async fn scalar(db: &sea_orm::DatabaseConnection, sql: &str) -> String {
         db.query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -2544,4 +3088,14 @@ async fn traces_disabled_http_upload() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn traces_disabled_http_receive() {
     disabled_http::run(disabled_http::Endpoint::Receive).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn traces_disabled_ssh_upload() {
+    disabled_http::run_ssh(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn traces_disabled_ssh_receive() {
+    disabled_http::run_ssh(true).await;
 }

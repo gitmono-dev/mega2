@@ -269,6 +269,24 @@ fn locate_ssh_repo(raw: &str) -> Result<LocatedSshRepo, String> {
     })
 }
 
+fn reserved_traces_ssh_path(repo_path: &std::path::Path) -> bool {
+    let mut depth = 0usize;
+    // SSH repository arguments are literal paths, without HTTP percent decoding.
+    for segment in repo_path
+        .as_os_str()
+        .as_encoded_bytes()
+        .split(|byte| *byte == b'/')
+    {
+        match segment {
+            b"" | b"." => {}
+            b".." => depth = depth.saturating_sub(1),
+            b".traces" if depth == 0 => return true,
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
 fn ssh_pre_dispatch_reply(exec: &SshExecRequest) -> Option<SshErrReply> {
     if exec.traces.is_some() {
         return match exec.kind {
@@ -397,6 +415,18 @@ impl server::Handler for SshServer {
                 return Ok(());
             }
         };
+
+        if !self.state.storage.config().traces.enabled && reserved_traces_ssh_path(&exec.repo_path)
+        {
+            self.channels.remove(&channel);
+            self.send_exec_err(
+                channel,
+                session,
+                &SshErrReply::new("traces locator not found", 1),
+            )
+            .await?;
+            return Ok(());
+        }
 
         if let Some(reply) = ssh_pre_dispatch_reply(&exec) {
             self.send_exec_err(channel, session, &reply).await?;
@@ -2157,5 +2187,49 @@ mod tests {
             .unwrap();
         assert_eq!(before, 0);
         assert_eq!(after, 0);
+    }
+
+    #[test]
+    fn disabled_traces_ssh_reserved_roots() {
+        for path in [
+            "/.traces",
+            ".traces",
+            "/.traces.git",
+            "/.traces/by-scope/invalid.git",
+            "/.traces/by-path/invalid.git",
+            "//./.traces/invalid",
+            "/normal/../.traces/invalid",
+            "/../../.traces/invalid",
+            "/.traces/../ordinary",
+        ] {
+            for command in ["git-upload-pack", "git-receive-pack"] {
+                let exec = parse_ssh_exec_request(&format!("{command} '{path}'")).unwrap();
+                assert!(
+                    reserved_traces_ssh_path(&exec.repo_path),
+                    "{command}: {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_traces_ssh_literal_compatibility() {
+        for path in [
+            "/ordinary.git",
+            "/ordinary/.traces/repo.git",
+            "/.traces-backup/repo.git",
+            "/.TRACES/repo.git",
+            "/.traces.git/ordinary.git",
+            "/%2etraces/repo.git",
+            "/.traces%2Frepo.git",
+        ] {
+            for command in ["git-upload-pack", "git-receive-pack"] {
+                let exec = parse_ssh_exec_request(&format!("{command} '{path}'")).unwrap();
+                assert!(
+                    !reserved_traces_ssh_path(&exec.repo_path),
+                    "{command}: {path}"
+                );
+            }
+        }
     }
 }
