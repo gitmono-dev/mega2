@@ -343,9 +343,13 @@ fn integration_storage_events_runtime_http_sigint_clean_shutdown() {
 #[test]
 fn integration_storage_events_runtime_occupied_port_exits_through_cleanup() {
     let case = RuntimeCase::new();
-    let port = reserve_free_port();
-    // Hold the port so the service bind fails after AppContext creation.
-    let _blocker = TcpListener::bind(("127.0.0.1", port)).expect("bind blocker port");
+    // Hold the blocker first: its own listener is the only race-free source of
+    // the port this test wants the service to fail to bind. Reserving a free
+    // port and re-binding it later races with parallel tests in this binary.
+    let blocker = TcpListener::bind(("127.0.0.1", 0)).expect("bind blocker port");
+    let port = blocker.local_addr().expect("blocker local addr").port();
+    // Keep the port occupied so the service bind fails after AppContext creation.
+    let _blocker = blocker;
     let (stdout_path, stderr_path) = case.log_paths("http-occupied");
     let mut command = case.command();
     command.args([

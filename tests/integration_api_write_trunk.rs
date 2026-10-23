@@ -17,7 +17,7 @@ mod git_cli;
 
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -234,6 +234,78 @@ fn is_service_tcp_connection(stream: &TcpStream) -> bool {
     )
 }
 
+/// A bare TCP accept is not readiness: another test's port allocator briefly
+/// `listen`s on a port it already claimed and then drops it, so a successful
+/// `connect` can belong to a stranger that never answers HTTP. Only a peer that
+/// replies with an HTTP/1.x status line can be this test's own service.
+fn is_service_http_ready(port: u16, deadline: Instant) -> bool {
+    let remaining = || {
+        let now = Instant::now();
+        (now < deadline).then(|| deadline - now)
+    };
+    let Some(connect_budget) = remaining() else {
+        return false;
+    };
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&address, connect_budget.min(Duration::from_secs(2)))
+    else {
+        return false;
+    };
+    if !is_service_tcp_connection(&stream) {
+        return false;
+    }
+    let Some(write_budget) = remaining() else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(write_budget.min(Duration::from_secs(2))));
+    let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    // Read one bounded status line instead of a fixed prefix: a stranger that
+    // sends just `HTTP/` and closes must not be accepted as the service. Every
+    // read is bounded by the remaining startup budget so a slow drip cannot
+    // stretch one probe past the caller's deadline.
+    let mut status = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    while status.len() < 64 {
+        let Some(read_budget) = remaining() else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(read_budget.min(Duration::from_secs(2))));
+        match stream.read(&mut byte) {
+            Ok(1) => {
+                status.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            _ => return false,
+        }
+    }
+    status_line_is_http(&status)
+}
+
+/// `HTTP/1.x` + exactly three status digits, terminated by a line break.
+fn status_line_is_http(status: &[u8]) -> bool {
+    let Some(line) = status.strip_suffix(b"\n") else {
+        return false;
+    };
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let Ok(line) = std::str::from_utf8(line) else {
+        return false;
+    };
+    let Some((version, rest)) = line.split_once(' ') else {
+        return false;
+    };
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+        return false;
+    }
+    let code = rest.split(' ').next().unwrap_or_default();
+    code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit())
+}
+
 #[cfg(target_os = "linux")]
 fn self_connected_tcp_probe() -> TcpStream {
     with_runtime(async {
@@ -259,6 +331,105 @@ fn service_readiness_rejects_tcp_self_connection() {
     let stream = self_connected_tcp_probe();
     assert_eq!(stream.local_addr().unwrap(), stream.peer_addr().unwrap());
     assert!(!is_service_tcp_connection(&stream));
+}
+
+#[test]
+fn service_readiness_rejects_non_http_listener() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let started = Instant::now();
+    assert!(
+        !is_service_http_ready(port, Instant::now() + Duration::from_millis(300)),
+        "a listener that never answers HTTP must not count as service readiness"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    drop(listener);
+}
+
+#[test]
+fn service_readiness_accepts_http_responder() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut stream = listener.accept().expect("accept readiness probe").0;
+        let mut request = [0u8; 64];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("answer readiness probe");
+    });
+    assert!(is_service_http_ready(
+        port,
+        Instant::now() + Duration::from_secs(2)
+    ));
+    handle.join().expect("responder thread");
+}
+
+#[test]
+fn service_readiness_rejects_truncated_http_prefix() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut stream = listener.accept().expect("accept probe").0;
+        let mut request = [0u8; 64];
+        let _ = stream.read(&mut request);
+        stream.write_all(b"HTTP/").expect("write prefix");
+    });
+    assert!(!is_service_http_ready(
+        port,
+        Instant::now() + Duration::from_secs(2)
+    ));
+    handle.join().expect("prefix thread");
+}
+
+#[test]
+fn service_readiness_rejects_malformed_status_line() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut stream = listener.accept().expect("accept probe").0;
+        let mut request = [0u8; 64];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(b"HTTP/1.1 NOT_A_CODE Nope\r\n")
+            .expect("write malformed status");
+    });
+    assert!(!is_service_http_ready(
+        port,
+        Instant::now() + Duration::from_secs(2)
+    ));
+    handle.join().expect("malformed thread");
+}
+
+#[test]
+fn service_readiness_rejects_slow_drip_status_line() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut stream = listener.accept().expect("accept probe").0;
+        let mut request = [0u8; 64];
+        let _ = stream.read(&mut request);
+        // Never finish the status line: the probe must stop at its own deadline
+        // instead of granting every byte a fresh read timeout.
+        for chunk in [b"H".as_slice(), b"T", b"T", b"P", b"/", b"1", b".", b"1"] {
+            if stream.write_all(chunk).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    let started = Instant::now();
+    assert!(!is_service_http_ready(
+        port,
+        Instant::now() + Duration::from_millis(400)
+    ));
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "probe must honour the cumulative deadline, took {:?}",
+        started.elapsed()
+    );
+    handle.join().expect("slow drip thread");
 }
 
 #[test]
@@ -295,9 +466,7 @@ impl ServiceProcess {
     ) {
         let deadline = Instant::now() + timeout;
         loop {
-            if TcpStream::connect(("127.0.0.1", port))
-                .is_ok_and(|stream| is_service_tcp_connection(&stream))
-            {
+            if is_service_http_ready(port, deadline) {
                 return;
             }
             if let Some(status) = self.child.try_wait().expect("poll service") {
