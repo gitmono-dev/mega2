@@ -949,116 +949,19 @@ async fn move_native_directory(
     .map_err(|err| GitError::CustomError(err.to_string()))
 }
 
-async fn landed_directory(
-    mono: &crate::jupiter::storage::mono_storage::MonoStorage,
-    txn: &sea_orm::DatabaseTransaction,
-    path: &str,
-) -> Result<bool, MegaError> {
-    let Some(root) = mono.get_main_ref_in_txn("/", txn).await? else {
-        return Ok(false);
-    };
-    Ok(mono
-        .resolve_path_tree_hash_in_txn(&root.ref_tree_hash, path, txn)
-        .await?
-        .is_some())
-}
-
 async fn bind_if_still_landed(storage: &Storage, path: &str) -> Result<(), GitError> {
-    use sea_orm::TransactionTrait;
-    let mono = storage.mono_storage();
-    let conn = mono.get_connection().clone();
-    let txn = conn
-        .begin()
-        .await
-        .map_err(|err| GitError::CustomError(err.to_string()))?;
-    let outcome: Result<bool, MegaError> = async {
-        if !landed_directory(&mono, &txn, path).await? {
-            return Ok(false);
-        }
-        match crate::jupiter::storage::trace_target_storage::insert_active(
-            &txn,
-            crate::jupiter::storage::trace_target_storage::TARGET_KIND_NATIVE,
-            path,
-            None,
-        )
-        .await
-        {
-            Ok(_) => Ok(landed_directory(&mono, &txn, path).await?),
-            Err(err) if err.to_string().contains("trace_target_one_active_path") => Ok(false),
-            Err(err) => Err(err),
-        }
-    }
-    .await;
-    match outcome {
-        Ok(true) => txn
-            .commit()
-            .await
-            .map_err(|err| GitError::CustomError(err.to_string())),
-        Ok(false) => {
-            let _ = txn.rollback().await;
-            Ok(())
-        }
-        Err(err) => {
-            let _ = txn.rollback().await;
-            Err(GitError::CustomError(err.to_string()))
-        }
-    }
+    crate::jupiter::service::trace_target_service::bind_if_still_landed(
+        &storage.mono_storage(),
+        path,
+    )
+    .await
+    .map_err(|err| GitError::CustomError(err.to_string()))
 }
 
 async fn restore_active_ids(storage: &Storage, ids: &[String]) -> Result<(), GitError> {
-    use sea_orm::{ActiveModelTrait, TransactionTrait};
-    let mono = storage.mono_storage();
-    let conn = mono.get_connection().clone();
-    let txn = conn
-        .begin()
+    crate::jupiter::service::trace_target_service::restore_active_ids(&storage.mono_storage(), ids)
         .await
-        .map_err(|err| GitError::CustomError(err.to_string()))?;
-    let outcome: Result<(), MegaError> = async {
-        for id in ids {
-            let Some(row) =
-                crate::jupiter::storage::trace_target_storage::find_by_id(&txn, id).await?
-            else {
-                continue;
-            };
-            if row.active {
-                continue;
-            }
-            if crate::jupiter::storage::trace_target_storage::active_at(&txn, &row.project_path)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-            if !landed_directory(&mono, &txn, &row.project_path).await? {
-                continue;
-            }
-            let path = row.project_path.clone();
-            let mut active: crate::callisto::trace_target::ActiveModel = row.into();
-            active.active = sea_orm::Set(true);
-            active.update(&txn).await?;
-            if !landed_directory(&mono, &txn, &path).await? {
-                let stored =
-                    crate::jupiter::storage::trace_target_storage::find_by_id(&txn, id).await?;
-                if let Some(stored) = stored {
-                    let mut back: crate::callisto::trace_target::ActiveModel = stored.into();
-                    back.active = sea_orm::Set(false);
-                    back.update(&txn).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-    .await;
-    match outcome {
-        Ok(()) => txn
-            .commit()
-            .await
-            .map_err(|err| GitError::CustomError(err.to_string())),
-        Err(err) => {
-            let _ = txn.rollback().await;
-            Err(GitError::CustomError(err.to_string()))
-        }
-    }
+        .map_err(|err| GitError::CustomError(err.to_string()))
 }
 
 async fn move_recorded_targets(

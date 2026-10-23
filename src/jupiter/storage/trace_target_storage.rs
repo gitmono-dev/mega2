@@ -1,9 +1,12 @@
 //! Stable trace target rows. A path locates the current project. The UUID
 //! stays when that path is moved and changes when the path is created again.
 
+use std::collections::HashSet;
+
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, Set,
-    TransactionTrait, sea_query::LikeExpr,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    sea_query::{CaseStatement, Expr, ExprTrait, LikeExpr, Order},
 };
 use uuid::Uuid;
 
@@ -11,6 +14,7 @@ pub use crate::callisto::trace_target::Model;
 use crate::{
     callisto::trace_target,
     common::{errors::MegaError, utils::escape_like},
+    jupiter::storage::base_storage::{BaseStorage, StorageConnector},
 };
 
 pub const TARGET_KIND_NATIVE: &str = "native";
@@ -331,6 +335,89 @@ where
     }
     .await;
     finish_write(txn, outcome).await
+}
+
+/// Lock current native models before checking their paths. The caller holds
+/// the native root share lock until this transaction finishes.
+pub(crate) async fn lock_native_ids_in_txn(
+    txn: &DatabaseTransaction,
+    ids: &[String],
+) -> Result<Vec<Model>, MegaError> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut rows = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+        // Input ordinals preserve Rust's byte ordering regardless of DB collation.
+        let mut order = CaseStatement::new();
+        for (ordinal, id) in chunk.iter().enumerate() {
+            order = order.case(
+                Expr::col(trace_target::Column::Id).eq(id.clone()),
+                ordinal as i32,
+            );
+        }
+        let order: Expr = order.into();
+        rows.extend(
+            trace_target::Entity::find()
+                .filter(trace_target::Column::Id.is_in(chunk.iter().cloned()))
+                .filter(trace_target::Column::TargetKind.eq(TARGET_KIND_NATIVE))
+                .order_by(order, Order::Asc)
+                .lock_exclusive()
+                .all(txn)
+                .await?,
+        );
+    }
+    Ok(rows)
+}
+
+/// Read owners of all kinds without adding locks beyond the selected targets.
+pub(crate) async fn active_owner_paths_in_txn(
+    txn: &DatabaseTransaction,
+    paths: &[String],
+) -> Result<HashSet<String>, MegaError> {
+    let mut paths = paths.to_vec();
+    paths.sort_unstable();
+    paths.dedup();
+    let mut occupied = HashSet::new();
+    for chunk in paths.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+        occupied.extend(
+            trace_target::Entity::find()
+                .select_only()
+                .column(trace_target::Column::ProjectPath)
+                .filter(trace_target::Column::ProjectPath.is_in(chunk.iter().cloned()))
+                .filter(trace_target::Column::Active.eq(true))
+                .into_tuple::<String>()
+                .all(txn)
+                .await?,
+        );
+    }
+    Ok(occupied)
+}
+
+/// IDs are already locked and include at most one winner per current path.
+/// A unique conflict after the statement snapshot aborts the outer transaction.
+pub(crate) async fn reactivate_locked_native_ids_in_txn(
+    txn: &DatabaseTransaction,
+    ids: &[String],
+) -> Result<(), MegaError> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    for chunk in ids.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+        trace_target::Entity::update_many()
+            .col_expr(trace_target::Column::Active, Expr::value(true))
+            .filter(trace_target::Column::Id.is_in(chunk.iter().cloned()))
+            .filter(trace_target::Column::TargetKind.eq(TARGET_KIND_NATIVE))
+            .filter(trace_target::Column::Active.eq(false))
+            .filter(Expr::cust(
+                "NOT EXISTS (SELECT 1 FROM \"trace_target\" AS \"owner\" \
+                 WHERE \"owner\".\"project_path\" = \"trace_target\".\"project_path\" \
+                 AND \"owner\".\"active\" = TRUE)",
+            ))
+            .exec(txn)
+            .await?;
+    }
+    Ok(())
 }
 
 fn path_is_at_or_under(parent: &str, child: &str) -> bool {

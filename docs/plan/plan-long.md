@@ -1,4 +1,85 @@
+> **最新事实前沿（2026-10-22 22:47:54 UTC为本轮事实正式写入起始秒，实际apply收据 `/tmp/fix06_A_smoke_final_fact_apply_actual_20261023/receipt.json`）：** FIX06批量生产实现及测试已应用，累计24个新增测试、当前批量来源新增13个；正式8AC/8VER及canonical限定不变。执行合同R3 actual70980/exit0/chunk7b76dc为真实Claude/Codex双PASS（含VER2_MAPPING），仅合同资格；新产品A actual13933/exit0/chunk7bb0e2十门真实通过：fmt/clippy/release各exit0，VER1/2/3/5分别4/13/4/7通过，VER6_7_capture另1通过，traces24，api433通过/1原ignored。84次native查询，32次清理信号发送有完整journal，remaining_owned={}。root已具名判定当前源码VER4/6/7/8手工证据PASS，VER2+VER5跨选择器映射按两门实际通过共同消费。新smoke执行合同86711/exit0/chunkcd70d8真实Claude/Codex双PASS；产品smoke81644/exit0/chunk7be561实际18通过、0失败，runtime OpenAPI HTTP200/3.1.0/30 paths，7个owned containers和10项fixture清理成功，host清理0信号/0错误、remaining_owned={}。本次事实同步B、自身ER05、完整C/D及提交/推送/版本发布仍未完成。 A与手工原件位置见Mega2 FIX-MTR-06 Current evidence；旧FAIL/STOP/缺失/取消和各历史pending原文保留，不能回填为当时通过。AC勾选、Lifecycle/Acceptance、Dependencies/I/R/独立发布边界不改；Libra13本地文档不提前push，MTR95仍独立阻塞。
+
+> **执行事实更新（2026-10-22 22:01:45 UTC，本次写入时点）：** FIX06批量源码及测试已应用，实际产品A尚未启动。执行合同R1 session92123/exit1与R2 session24301/exit1均为Claude PASS、Codex FAIL；R2确认两项P1关闭，清理journal及独立观察连接P2正在前滚修复，未以评审次数耗尽停止。前两次准备实际64055/78353共扣72秒，原首个A claim未创建，后续准备继续累计；旧FAIL/STOP与FIX3/LTR00取消不变。VER2的owner预占零tree证据明确由VER5具名用例补充，必须两门真实通过；此映射澄清待下一轮双审，8AC/8VER、原命令/覆盖/期限、依赖与发布边界均不变。H0既成PASS仅为计划采纳；FIX06新A/自身ER05/C/D、提交与推送均未完成，Libra13笔本地文档不得提前push，MTR95独立阻塞保留。R2原件 `/tmp/fix06_batch_A_execution_review_r2_20261023/root-terminal.json` SHA `ca767f9eaaad960097ca08b1b42598276f80c7056c010dd48b837c8e3d6cedf0`。
+
+> **最新结果登记（2026-10-22 21:26:53 UTC，root实际终态判定时点，非候选生成/未来写入时间）：** H0 R2真实session81653/exit0/chunkf7fd06，Claude与隔离Codex对H0_GOVERNANCE及FIX06_PLAN_ADOPTION均明确PASS；root已核同一manifest `b6d576d9af90cfbf678bf62f951ad58c798abfafeae3f95dd9df35b36dc1b181` 与全部冻结输入并完成P0/P1关闭、具名P2处置。仅准当前8AC/8VER+canonical计划采纳与H0前置闭合；FIX06批量源码、新A/B、自身ER05及完整C/D尚未完成。Libra52474来源资格仍仅限域carry（full10757/21ignored/1flaky、15focused及具名三门；network3；余1093），13笔本地文档不得提前push；MTR95的move/rebind/Native intermediate风险仍独立阻塞。R1 actual81582 ClaudeFAIL/CodexPASS、全部旧FAIL/STOP/missing/取消及审前pending保留为各自历史时点。root终态 `/tmp/fix06_joint_H0_final_review_r2_20261023/root-terminal.json` SHA256 `4338a0aac40b068a01663301c3a01d5d0d86ccaf333a804db7c98c92d404da28`；本登记不改变AC/Lifecycle/Dependencies或发布边界。
+
 # mega2 长期移植规划（Mega → mega2 完全移植）
+
+> **现行执行前沿（原8文档正式写入：2026-10-22 21:00:20 UTC；非本次新采纳或评审PASS时间）：Libra选定f966来源资格限域接受，FIX06的8AC/8VER与canonical采纳仍待本轮共同H0。** 新恢复方案84664/exit0/chunk8f6dc7真实Claude与隔离Codex双PASS后，actual52474/exit0/chunkac9169完成原network3通过/0ignored/0重试、42条命令全部exit0且owned清理为空；新各boundary源码inventory与VCS身份一致。仅具名继承旧fmt/strict clippy/product CLI build、15focused及full10757最终通过/21原ignored/1flaky；不把旧22040/31114 STOP、missing终态、迁移者UNKNOWN或非连续审计改写成通过。root终态 `/tmp/libra_f966_cwd_recovery_actual_after31114_20261023/root-terminal.json` SHA256 `3fb07e4b14bb915b6dbf1de6cbcb5e75f3f9656e33d94f972ea4f3456ad8c77d`绑定本地430b1cae/上游f966548/版本0.30.86。inner185.297950秒不是最终预算记账；outer188.596712秒加1秒launcher余量扣190，7200累计6107、剩余1093秒（不是1097），无自动新尝试授权。H0尚未PASS；FIX06批量实现、新A/B、自身ER05及完整C/D未完成，LTR卡未完成，13笔本地文档不得提前push。以下旧“当前/待资格/运行中”等段均按各自时点保留。 原实际写入由 `/tmp/fix06_H0_governance_apply_actual_20261023/receipt.json` SHA256 `6dd403e4bbd18ecbd6ba2c920d691dc18ef2e0a2533982aef6ef4b5bb56fcb0f`绑定；此前20:59:30为候选生成时间，H0 R1 actual81582/exit1/chunk061e55为Claude FAIL/Codex PASS，此次仅订正登记，仍待复审。
+
+
+> **2026-10-23 更新执行前沿：Libra 31114启动前STOP，剩余1283秒，恢复与共同H0仍待。** actual31114/exit1/chunk899531因root从 `/media/eli/data/mega2` 启动，与冻结cwd `/media/eli/data/libra` 不符而在入口断言STOP；未启动native或产品命令，inner输出目录/claim/终态均不存在，不补造。外部一次launch已消费；实际观测32.762631秒及1秒launcher余量共扣34，原7200累计5917、剩余1283秒。root终态 `/tmp/libra_31114_cwd_stop_20261023/root-terminal.json` SHA256 `160ed68426886d37066f4e139eb1b6b3d34ddd0e2b5b29535e68968b09119f9b`不授权自动重试或新增窗口；修正启动cwd的新恢复仍待审及真实执行终态。以下22040的STOP、限定15focused/full10757最终通过/21ignored/1flaky及当时1317余额逐字保留为历史；network未取得资格通过。FIX06仍8AC/8VER及合法canonical存储状态等价/异常路径Err整txn回滚限定，批量实现未启动，当前采纳差异及两仓H0仍pending，不继承旧8/5设计PASS。无新增提交、push、tag、Release或CI/D；旧FAIL/STOP及FIX3/LTR00取消不变。
+
+
+> **本次共同H0待审采纳差异：** 批量恢复仅对合法canonical存储状态声明静态等价。锁后inactive行须严格验证存储路径为canonical；异常路径返回Err并由外层事务rollback，不能silent normalize或顺手修DB。该防御归既有AC-5错误回滚与VER-2错误覆盖，不新增AC/VER，仍8AC/8VER；R2旧8/5设计PASS不覆盖本差异。
+
+
+> **2026-10-23 当前执行前沿：Libra 22040实际STOP，FIX06采纳稿8AC/8VER待共同H0。** Libra actual22040/outer exit1/chunk9c321b：15focused全部exit0，full实际exit0、10757最终通过/21旧ignored/1flaky；随后固定0.30.69 CLI的rev-parse HEAD因数据库schema2026102201超过支持的2026101902而exit128，network未启动。full-after源码inventory与入场逐项相同，但不覆盖活仓VCS DB；原full-after-vcs及terminal-inputs缺失不可补造，迁移触发者UNKNOWN。整窗3214.211489秒扣3215，原7200累计5883、剩余1317秒；来源资格未完成、不构成H0/C/D或LTR完成。root仅登记1317余额内匹配0.30.86工具的新恢复方案，待新真实双审，未预授carry或执行PASS。FIX06方案R1 actual8843/exit1的Claude FAIL/Codex PASS保留；R2 actual15527/exit0/chunkbfc3c6真实双PASS仅覆盖旧8AC/5VER设计（manifest c1b9e7f8af1f6969819ec56e3c622303e8c19438ccad47e2a1cd4c8ccc1bec50、62输入核同）。当前采纳稿按G-03将SQL锁对象、唯一索引、fallible解析分列VER6/7/8，总8AC/8VER、无余量，尚待共同H0真实审查；批量实现、新A/B、自身ER05及完整C/D未启动。旧7/4与8/5证据和以下全部旧“当前/运行中”段按各自时点保留。Libra13笔本地文档仍不得提前push；Mega6/109、Libra0/26不变。
+
+
+> **2026-10-23 FIX06同轴批量恢复v2待复审终态：** 当前候选新增AC-8/VER-5，粒度为8AC/5VER、四生产文件/三落点/M，行为轴、Dependencies、I/R及independent patch/self发布边界不变。拟将逐目标SQL改为排序分块锁定、分块owner查询、按层批取tree和受唯一约束保护的分块激活；批量实现尚未启动，新A/B、自身ER05和完整C/D均未执行。旧7AC/4VER输入的A10886与smoke78803只归历史源码，不覆盖未来批量树。方案层R1真实session8843/exit1/chunk68d34d为Claude FAIL/Codex PASS、整体FAIL，manifest `db813099268253c1998e032260e928f52a9d45dc2bd914734e27c78b7e9a0627`原件保留。v2以七项精确修订补齐跨chunk错误整txn回滚、owner四时点竞争、空ID仍验证root/Q1、root歧义、原无全表锁/无新增timeout重试、schema guard及borrowed txn计数正控制；新真实复审终态待，不预记PASS，也不以旧Performance文字澄清豁免GC-10。Libra22040仍在完整测试，最终资格和共同H0待实际终态审定。
+
+
+> **2026-10-23 当前前滚控制恢复已双审、资格执行中：** 固定Libra来源430b1cae/f966548/0.30.86不变。56333控制STOP、已消费claim、0产品cases及缺失终态inventory继续保留，不补造旧终态。具名前滚控制恢复R1 actual37040/exit1为Claude PASS、Codex BLOCKED（越过可读allowlist），不是双PASS；read_guard修复后R2 actual10179/exit0/chunkcaf5d4真实双PASS，manifest `328049a5f61c4dfffad2c95b1cd9daf2baa03c3981986790041cd15304931d7b`，仅覆盖恢复执行安全及覆盖。准备2314/exit0耗7.012474秒扣8，原累计余额4540降为4532秒；新增时间0，审查轮次不重置旧测试/诊断预算。一次新执行22040已启动，当前没有实际终态，不能记产品资格通过或倒填最后退出、计数、清理及输入一致性。H0、FIX06自身/Performance/完整C/D、95独立风险及LTR01发布边界仍待；Libra13笔本地文档不提前push，Mega6/109、Libra0/26不变。下面56333段落是其原时点历史记录。
+
+
+> **2026-10-23 56333时点历史资格STOP与恢复待审：** Libra固定整合来源 `430b1cae5a165adfc0f70858805bb480c085b737` / 上游 `f96654855d59455604b7b64669ba036b7b452ef7` / 0.30.86；13笔本地Traces文档重放、签名/DCO及上游产品树保留是既有整合事实，未提前push。listing恢复16996实际exit0，full10757 selected/21 ignored、network3/0，111条差异归属与6项未消费范围保留。最终执行合同R1为Claude PASS/Codex FAIL（binary privacy），R2 actual96103/exit0双PASS仅覆盖执行合同。产品资格 actual56333/exit1 STOP：53.788156秒扣54，账面余额4540秒，claim已消费，focused/full/network产品cases为0；缺失原terminal inventory，不能声称终态全树未漂移。确定的控制器缺陷是JSON list与runtime tuple比较误拒；两行修复及51项保存数据控制fixture已有原件，只是候选，不是产品/H0通过。root登记一次前滚恢复，仍从原7200累计余额扣账，旧claim/STOP不重置，须新真实双审与独立入口。H0、FIX06自身ER05/Performance及完整C/D、MTR95独立风险、LTR10的H1/WRITERS/LIVE和LTR01唯一发布边界均未解除；完成数Mega6/109、Libra0/26不变。以下旧“当前/待执行”均保留其原时点，不改旧失败、取消或预算。
+
+
+> **2026-10-22 当前 Traces 前沿：** Libra 已将13个本地计划提交原生重放至最新上游 `f96654855d59455604b7b64669ba036b7b452ef7`（0.30.86），当前HEAD `430b1cae5a165adfc0f70858805bb480c085b737`；逐个DCO/签名及上游产品树保留已核，四份脏文档保留、index空、未推送。旧MC32四处格式候选已被上游吸收，旧R7只覆盖旧树；新整合源资格/当前治理双审待。完整复验按用户既有rebase重测授权具名执行，旧FAIL/STOP预算保留。FIX06自身/H0/C/D、MTR95独立风险及Libra H1/LTR01尚待，正式Mega6/109、Libra0/26不变。详见[日期计划当前执行前沿](plan-20261015.md#当前执行前沿libra-最新源整合2026-10-22)；以下旧“当前”按其原时点理解。
+
+## 双评审迭代规则（2026-10-22 用户授权，当前生效）
+
+用户原话：“请修改计划,双评审可以多次,直到双评审可以通过”。适用于 Mega2/Libra 两份 Traces 计划及其当前阻塞修复（含 FIX06、MC-32）的计划、源码和验收脚本双评审。root 可在处理本轮问题后继续发起后续轮次，直到真实 Claude 与独立上下文 Codex 对同一最终冻结输入均明确 `VERDICT: PASS`；不再设“双方各一次后必须重新申请”的总轮数限制，也不因上一轮 FAIL 或既有审查次数用完而重复询问这类评审授权。
+
+每轮均保留独立原件、输入摘要、实际退出与终态；先修复问题或具名核清事实，再冻结新输入复审，不以重复请求施压取得 PASS。P0/P1 必须关闭，P2 按模板具名责任与条件处置。PASS 仅覆盖对应输入及审查范围；两人隔离审查，root 核实实际终态后才记双 PASS。每轮保留最多30分钟的进程看护上限；该上限不作为后续修复评审轮次的总预算。provider/MCP 等技术故障仍按 ER-10 分类及有界退避，真实凭据、额度或服务不可用须报告，不能伪造成功或静默空转。
+
+本条只前滚调整双评审的轮次授权；历史 R1/R2/R3 FAIL、STOP、截止和原件原样保留，其“各一次/后续须另授权”只描述当时规则，不再限制本条生效后的审查。产品诊断、A/B/C 测试次数与窗口、旧 FIX-MTR-03/LTR-00 预算、验收标准、提交签名及发布边界仍分别按原任务卡执行；本条不授予新的产品测试次数或提前发布权限。解析器fixture通过不替代产品资格，当前修复版正式双审可直接按本条开展。
+
+## 当前双审迭代：R6 终态与 v11/v12 修复（2026-10-22）
+
+R6 实际 session24950 / exit1，Claude PASS、Codex FAIL；原件 `/tmp/libra_mc32_recovery_review_r6_20261022/`，manifest `e7cc6f3f5047901490c4cce45d9bdfaa0e6c871e7e43c59d5fc5ea387abc7a3f`。两方认可多轮评审规则及v10 flaky/leaky可观察边界；新的 `P1-R6-OUTCOME-METADATA` 是JUnit outcome只核非空type、console对账只核成功/失败，可能接受执行错误、普通失败、超时或recap类别矛盾。v11候选按固定producer严格核tag/type组合和每attempt的共同可观察类别；失败case主outcome是第1attempt、rerun按序，flaky事件对应成功前失败；recap对console规范化标签一致，不猜JUnit未给出的信号号码。未知type、不兼容tag/type、类别错配及recap矛盾均STOP。首轮纯解析671/671、exit0原件保留（chunk bd87a0，`/tmp/libra_mc32_junit_v11_parser_validation_actual_20261022/`）；随后补齐已知LEAK-FAIL但summary省略附计数的拒绝，最终纯解析676/676、exit0（chunk474cc7，原件 `/tmp/libra_mc32_junit_v11_parser_validation_r2_actual_20261022/`），最终候选run SHA `ae6c8fa177dbef0ad8c0c92f500057a9a6b18b964e5785a16f83407f45cc7e11`；原397名称保留，其中`final-error`错误接受预期改为拒绝，旧helper错误type及无JUnit stub输入修正另列清单，原397历史原件不改。五组旧v10错误接受/新v11拒绝对照成立；这是解析检查，尚待最终冻结后的真实双审，不是产品资格。
+
+v12随后仅收紧本机Linux普通失败退出码为1..255：executor先把0归成功，排除信号后由Rust/libc WEXITSTATUS取低8位；无效0/负数/>255不能以普通failure type通过。独立LEAK-FAIL的error文本code0语义保持。实际纯解析760/760、exit0（chunk52149f，原件 `/tmp/libra_mc32_junit_v12_parser_validation_actual_20261022/`），原676项同名同判定、15组v11错误接受/v12拒绝；最终候选run SHA `97a28b7004f128b250060442dcb2fa9ff840fbf2bbe692e25be4b416be63f0c5`，待R7真实双审。
+
+R6 P2具名处置（owner=root）：finalize前核产品授权原话及hash与多轮评审授权不同；产品启动前特别检查冻结`.pi`临时文件对应写者，记录不可见进程及点时观察限制，不停止用户写者、不豁免inventory；若实际hardstop exit124且缺terminal，外层仍记录真实退出、清理状态与已消费claim。继承R5允许新增selected全部执行、零删除/ignored变化，GC-MC-07五exact具名退出/集合/日志收据，execfail不一致STOP且不自动重跑。后续评审仍按用户持续授权，不另申请轮次。历史FAIL/STOP不改；FIX06自身/H0、MC32产品资格与C/D仍待，无新增产品运行、提交、推送或发布。下方旧“当前”均为原时点记录。
+
+## 当前双审迭代：R5 终态与 v10 修复（2026-10-22）
+
+R5 实际 session41138 / exit1，Claude PASS、Codex FAIL；原件 `/tmp/libra_mc32_recovery_review_r5_20261022/`，manifest `0f2f67cf5bffbcdb9644ae105f6fdb23db24913f55d5939f85cb4e2324da014c`。v9信号映射已受核；本轮 `P1-R5-FLAKY-LEAK` 是nextest重试成功即使泄漏也只打印 `TRY n PASS`、summary却同时计入flaky/leaky，旧脚本误拒合法结果。v10按固定nextest源码核对显式成功泄漏数K、无显式泄漏身份的成功flaky候选数F与实际summary泄漏数L，要求K≤L≤K+F，持久记录真实L、已知身份、候选集合和差值；不臆造具体flaky用例的泄漏身份。该日志/JUnit不能独立证伪区间内少报，明确保留此信息限制，其它逐case/summary/exit一致性仍严格检查。实际纯解析397/397、exit0（chunk d50c3f，原件 `/tmp/libra_mc32_junit_v10_parser_validation_actual_20261022/`），原363项同名同判定，三组v9 RED/v10 GREEN保留；最终修复仍待真实双审，不是产品资格。
+
+R5 P2具名处置（owner=root）：相对旧资格基线的selected新增允许记录并全部执行，selected删除和ignored增删仍为零；本轮源码/config/env冻结，实际listing/JUnit身份精确一致，本条不减少覆盖。产品finalize须另绑定一次7200秒明确产品授权原话，禁止复用多轮评审授权；启动前只读检查`.pi`写者并记录不可见进程限制，不停止用户写者、不豁免输入。R4的GC-MC-07外层具名收据、五exact退出/集合/日志绑定和execfail不一致即STOP义务继承。继续双审无需另问次数；历史FAIL/STOP不改，FIX06自身/H0、MC32产品资格及C/D尚未完成。本轮无产品运行、提交、推送或发布。下方旧“当前”均为原时点记录。
+
+## 当前双审迭代：R4 终态与 v9 修复（2026-10-22）
+
+R4 实际 session78924 / exit1，Claude PASS、Codex FAIL；原件 `/tmp/libra_mc32_recovery_review_r4_20261022/`，manifest `08c59cc99bd88df39d9b6db28ba6f91d6238c8156534ff35fcd5c601c1bd14d3`。两方认可本页多轮双评审规则，R3捕获输出问题已在v8受核；整体仍FAIL，因为 `P1-R4-SIGNAL-STATUS`：pinned nextest 的重试信号缩写（如SEGV/KILL）会被旧解析拒绝。root按既有用户授权修复并继续下一轮，不另申请评审次数。v9候选精确补齐该版本信号/短状态映射，首轮纯解析实际363/363、exit0（chunk dbc0be，原件 `/tmp/libra_mc32_junit_v9_parser_validation_actual_20261022/`），原139项保留；候选最终输入与后续真实双审另行绑定，未记产品资格或P1最终闭合。
+
+R4 P2具名处置（owner=root）：① finalize前须绑定与“多轮双评审”不同、明确授予一次7200秒产品运行的用户原话，并在外层收据引用；② 本次补齐MC-32 R2/R3/v8/用户授权/R4修订历史；③ 启动产品验收前只读核查`.pi`写者，不停止用户写者、不豁免冻结输入；④ execfail显示内容与JUnit描述不一致时记“full failed、metadata STOP、network未收集”，不自动重跑；⑤ 最终外层收据须具名GC-MC-07等价执行方式，并绑定五条原exact实际退出、结果集合、日志摘要。全部旧FAIL/STOP及产品预算保留；本次没有产品运行、提交、推送或发布，FIX06自身/H0与MC32 C/D仍未完成。下方旧轮次状态是原时点记录。
+
+## MC-32 恢复审查 R3 终态（2026-10-22）
+
+Libra MC-32 恢复合同实际双审 session8661 / exit1：Claude PASS、Codex FAIL；root采纳 `P1-R3-LOG-FRAMING`，合法测试输出被误判为nextest控制记录，须先修验收脚本。原件 `/tmp/libra_mc32_recovery_review_r3_20261022/`，manifest SHA256 `2a08cc88555a51c7a76cdb027563203caa1cf4964947c506e03897ac1034bd5e`。本次review-only各一次已用并STOP，未创建后继产品claim、未获新的7200秒产品窗口；旧R1/R2/R3失败与预算保留。v8修复候选已保存，纯解析实际139/139、exit0（chunk21281a；原件 `/tmp/libra_mc32_junit_v8_parser_validation_r2_actual_20261022/`），保留原81项及三项旧v7 RED/新v8 GREEN；候选尚待新双审，不当作产品资格或P1正式闭合。Libra四处格式修复已落工作区；FIX06已有A/smoke结果不变，自身最终双审、两仓H0同步、版本后完整C/D仍待。资格真实终态前维持既有H0同步顺序，完成数Mega6/109、Libra0/26不变；本轮无提交、推送或发布。下方较早“当前”段落均为原时点快照。
+
+## FIX06 A 终态索引（2026-10-22；待审候选）
+
+FIX06实际10886八门A exit0，仍in-progress/Acceptance空；smoke78803实际exit0/18通过、OpenAPI200，root配对终态已核、待最终冻结；文档B、自身/联合ER05及完整C/D仍待，smoke合同12055双PASS不代源码验收。97580编译FAIL、5349parserSTOP及原A绝对预算保留；逐八门signals0，14个native status查询共28发送/14身份，顶层仅最后2次；后代exe/cmd未保存，不能混称全程零信号或猜测程序归属。Mega6/109、Libra0/26不变。原件 `/tmp/fix06_A_parser_recovery_actual_20261022/`；详见[日期计划](plan-20261015.md)本轮入口。当前SSOT b58da1a新字节仍待最终审查及FIX06/LTR01各自覆盖；Libra资格/branch-force/H1/LTR01与95独立风险不因A通过解除。下方旧“当前”段落按其时点保留。
+
+## FIX06实现语义绑定候选（2026-10-22；验收/最终审查待）
+
+FIX06新增SSOT实现说明候选 `b58da1a818465da51b72d3148a91aad763d5317ec92c00efc13d5320cc51c07a` 待最终自身/H0联合双审及FIX06 C/D；Libra文档覆盖仍LTR01，MC32资格终态前不应用本Libra索引候选。完成数Mega6/109、Libra0/26不变；[权威事务合同及剩余边界](plan-20261015.md)。
+
+## 当前执行前沿（2026-10-22）
+
+FIX06/H0治理真实R3双PASS，ER01/02/03已核，FIX06现in-progress/空；自身实现、验收、ER05及完整C/D待。Libra固定99资格session77621因MC-32四处fmt差异实际exit1，原一次claim已消费，其余门未运行；修复与新恢复合同待。最新远端观察fbdf5ee未整合，发布前fresh整合重测。Mega6/109、Libra0/26不变；95独立风险、H1/LTR01及Libra不push边界保留。详见[日期计划](plan-20261015.md)当前入口，旧FAIL/STOP与预算不改。
+
+## 当前99固定整合树前沿（2026-10-21T18:10:31.027815+00:00；新联合治理待审）
+
+MTR100完整C/D与后置收口已完成，Mega6/109、Libra0/26不变。Libra13笔签名文档与上游MCP三行/原dirty治理精确保留，HEAD `57fb4accac009e4f09a76e466a32ef239a09d354` / upstream99a92c1、版本.84；新五门首次资格7200一次/29必选未执行，旧f0入口90973 STOP、0测试/0claim保留。FIX06仍pending，原7AC/4VER/4生产/3落点/M及SSOT e274439不变，联合双审待；branch-force独立交付阻塞、95具名风险、H1/LTR01与不push边界保持。发布前fresh整合重测，后续远端观察不追溯取消固定树真实结果。详见[日期计划](plan-20261015.md)。
+
+## 历史f0候选前沿（2026-10-21T17:45:12.316323+00:00；本轮治理待双审）
+
+MTR100及后置七文档已实际双审/提交，Mega main为9149149；.60完整C/D保持done/complete。Libra13笔文档已精确重放到f0ea585，本地HEAD f733ba7d83e84b191c244c75d8988ae2a1461738，新.83全量资格待、未push。FIX06按ER03待审4生产文件/3落点/M及六P2处置，新SSOT e274439未发布；7AC/4VER/独立patch不变，95其余具名风险仍阻塞。完成数Mega6/109、Libra0/26；历史失败/取消/STOP/预算不变。此次治理由FIX06与LTR01分别承载，不能继承旧.60覆盖新字节。完整事实与单次资格合同见[日期计划](plan-20261015.md)。
 
 ## 当前实际发布前沿（2026-10-21T16:49:06.220390+00:00；新增文档待提交）
 

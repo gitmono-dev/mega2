@@ -9563,6 +9563,531 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    #[derive(Clone, Copy)]
+    enum NativeFenceOperation {
+        Bind,
+        Restore,
+    }
+
+    async fn native_fence_seed(
+        storage: &crate::jupiter::storage::Storage,
+    ) -> anyhow::Result<(git_internal::internal::object::commit::Commit, Tree)> {
+        use git_internal::internal::object::{ObjectTrait, commit::Commit, types::ObjectType};
+
+        // Every object in this directory-only fixture is persisted; no placeholder blobs.
+        let empty = Tree::from_bytes(
+            &[],
+            git_internal::hash::ObjectHash::from_type_and_data(ObjectType::Tree, &[]),
+        )?;
+        let project = Tree::from_tree_items(vec![
+            TreeItem::new(TreeItemMode::Tree, empty.id, "gate".into()),
+            TreeItem::new(TreeItemMode::Tree, empty.id, "keep".into()),
+            TreeItem::new(TreeItemMode::Tree, empty.id, "sub".into()),
+        ])?;
+        let root = Tree::from_tree_items(vec![
+            TreeItem::new(TreeItemMode::Tree, project.id, "project".into()),
+            TreeItem::new(TreeItemMode::Tree, empty.id, "unrelated".into()),
+        ])?;
+        let root_commit = Commit::from_tree_id(root.id, vec![], "native fence root");
+        let path_commit = Commit::from_tree_id(project.id, vec![], "native fence project");
+        let mono = storage.mono_storage();
+        mono.save_mega_trees(
+            vec![empty.clone(), project.clone(), root.clone()],
+            root_commit.id,
+            None,
+        )
+        .await?;
+        mono.save_mega_commits(vec![root_commit.clone(), path_commit.clone()], None)
+            .await?;
+        for (path, commit, tree) in [
+            ("/", root_commit.id, root.id),
+            ("/project", path_commit.id, project.id),
+        ] {
+            mono.save_refs(
+                mega_refs::Model::new(
+                    path,
+                    MEGA_BRANCH_NAME.to_owned(),
+                    commit.to_string(),
+                    tree.to_string(),
+                    false,
+                ),
+                None,
+            )
+            .await?;
+            anyhow::ensure!(
+                mono.get_commit_by_hash(&commit.to_string())
+                    .await?
+                    .is_some()
+            );
+        }
+        for tree in [&empty, &project, &root] {
+            anyhow::ensure!(mono.get_tree_by_hash(&tree.id.to_string()).await?.is_some());
+        }
+        let txn = mono.get_connection().begin().await?;
+        for path in [
+            "/project/sub",
+            "/project/gate",
+            "/project/keep",
+            "/unrelated",
+        ] {
+            anyhow::ensure!(
+                mono.resolve_path_tree_hash_in_txn(&root.id.to_string(), path, &txn)
+                    .await?
+                    == Some(empty.id.to_string()),
+                "fixture directory is not stored: {path}"
+            );
+        }
+        txn.rollback().await?;
+        Ok((path_commit, empty))
+    }
+
+    async fn native_fence_n1(
+        storage: &crate::jupiter::storage::Storage,
+        parent: git_internal::hash::ObjectHash,
+        empty: &Tree,
+        rebuild: bool,
+    ) -> anyhow::Result<(String, String, PushPayload)> {
+        use git_internal::internal::object::commit::Commit;
+
+        let mut items = vec![TreeItem::new(TreeItemMode::Tree, empty.id, "keep".into())];
+        if rebuild {
+            items.push(TreeItem::new(TreeItemMode::Tree, empty.id, "sub".into()));
+        }
+        let tree = Tree::from_tree_items(items)?;
+        let commit = Commit::from_tree_id(
+            tree.id,
+            vec![parent],
+            if rebuild {
+                "rebuild sub"
+            } else {
+                "delete sub and gate"
+            },
+        );
+        let mono = storage.mono_storage();
+        mono.save_mega_trees(vec![tree.clone()], commit.id, None)
+            .await?;
+        mono.save_mega_commits(vec![commit.clone()], None).await?;
+        let id = commit.id.to_string();
+        Ok((
+            id.clone(),
+            tree.id.to_string(),
+            PushPayload {
+                commits: vec![id],
+                fork_base: Some(parent.to_string()),
+                n: 1,
+            },
+        ))
+    }
+
+    async fn native_fence_targets(
+        mono: &MonoStorage,
+    ) -> anyhow::Result<Vec<crate::callisto::trace_target::Model>> {
+        use sea_orm::{EntityTrait, QueryOrder};
+
+        Ok(crate::callisto::trace_target::Entity::find()
+            .order_by_asc(crate::callisto::trace_target::Column::Id)
+            .all(mono.get_connection())
+            .await?)
+    }
+
+    async fn native_fence_wait_edge(
+        observer: &DatabaseTransaction,
+        blocker: i32,
+        relation: &str,
+    ) -> anyhow::Result<i32> {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // Refresh transaction-cached activity before observing the next lock edge.
+                observer
+                    .execute_unprepared("SELECT pg_stat_clear_snapshot()")
+                    .await?;
+                let rows = observer
+                    .query_all_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "SELECT pid, query FROM pg_stat_activity \
+                         WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                         AND $1 = ANY(pg_blocking_pids(pid)) \
+                         AND pid <> pg_backend_pid() AND query ILIKE $2 ORDER BY pid",
+                        [blocker.into(), format!("%{relation}%").into()],
+                    ))
+                    .await?;
+                anyhow::ensure!(
+                    rows.len() <= 1,
+                    "ambiguous waiters on fixture backend {blocker}"
+                );
+                if let Some(row) = rows.first() {
+                    let pid: i32 = row.try_get("", "pid")?;
+                    let query: String = row.try_get("", "query")?;
+                    eprintln!("native target fence: backend {pid} waits on {blocker}: {query}");
+                    return Ok(pid);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("no {relation} wait edge to backend {blocker} within 5s"))?
+    }
+
+    fn native_fence_spawn_target(
+        storage: &crate::jupiter::storage::Storage,
+        operation: NativeFenceOperation,
+        old_id: &str,
+    ) -> tokio::task::JoinHandle<Result<(), MegaError>> {
+        let mono = storage.mono_storage();
+        let old_id = old_id.to_owned();
+        tokio::spawn(async move {
+            match operation {
+                NativeFenceOperation::Bind => {
+                    crate::jupiter::service::trace_target_service::bind_if_still_landed(
+                        &mono,
+                        "/project/sub",
+                    )
+                    .await
+                }
+                NativeFenceOperation::Restore => {
+                    crate::jupiter::service::trace_target_service::restore_active_ids(
+                        &mono,
+                        &[old_id],
+                    )
+                    .await
+                }
+            }
+        })
+    }
+
+    async fn native_fence_join<T>(
+        task: &mut tokio::task::JoinHandle<Result<T, MegaError>>,
+    ) -> anyhow::Result<T> {
+        match tokio::time::timeout(Duration::from_secs(10), &mut *task).await {
+            Ok(result) => Ok(result??),
+            Err(_) => {
+                task.abort();
+                let cleanup = tokio::time::timeout(Duration::from_secs(5), task).await;
+                anyhow::ensure!(cleanup.is_ok(), "timed-out task did not stop after abort");
+                anyhow::bail!("native fence task did not finish within 10s");
+            }
+        }
+    }
+
+    async fn native_fence_assert_landed(
+        mono: &MonoStorage,
+        commit: &str,
+        tree: &str,
+        empty: &Tree,
+        sub_present: bool,
+    ) -> anyhow::Result<String> {
+        use anyhow::Context;
+        use git_internal::internal::object::commit::Commit;
+
+        let txn = mono.get_connection().begin().await?;
+        let root = mono
+            .get_main_ref_in_txn("/", &txn)
+            .await?
+            .context("root ref")?;
+        let path = mono
+            .get_main_ref_in_txn("/project", &txn)
+            .await?
+            .context("path ref")?;
+        anyhow::ensure!(path.ref_commit_hash == commit && path.ref_tree_hash == tree);
+        let root_commit = Commit::from_mega_model(
+            mono.get_commit_by_hash(&root.ref_commit_hash)
+                .await?
+                .context("root commit")?,
+        );
+        let path_commit = Commit::from_mega_model(
+            mono.get_commit_by_hash(commit)
+                .await?
+                .context("path commit")?,
+        );
+        anyhow::ensure!(root_commit.tree_id.to_string() == root.ref_tree_hash);
+        anyhow::ensure!(path_commit.tree_id.to_string() == tree);
+        for (path, expected) in [
+            ("/project", Some(tree.to_owned())),
+            ("/project/keep", Some(empty.id.to_string())),
+            ("/unrelated", Some(empty.id.to_string())),
+            ("/project/sub", sub_present.then(|| empty.id.to_string())),
+            ("/project/gate", None),
+        ] {
+            let actual = mono
+                .resolve_path_tree_hash_in_txn(&root.ref_tree_hash, path, &txn)
+                .await?;
+            anyhow::ensure!(
+                actual == expected,
+                "root resolution for {path}: {actual:?} != {expected:?}"
+            );
+        }
+        txn.rollback().await?;
+        Ok(root.ref_commit_hash)
+    }
+
+    async fn native_fence_case(
+        operation: NativeFenceOperation,
+        target_first: bool,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use git_internal::internal::object::commit::Commit;
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Set, Statement};
+
+        use crate::jupiter::storage::trace_target_storage;
+
+        let transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_temp, storage) = wh03_storage(false, transport).await;
+        let (parent, empty) = native_fence_seed(&storage).await?;
+        let mono = storage.mono_storage();
+        let conn = mono.get_connection();
+        for path in ["/project", "/project/keep", "/unrelated"] {
+            bind_first_native_write(conn, path).await?;
+        }
+        let old = bind_first_native_write(conn, "/project/sub").await?;
+        let mut inactive: crate::callisto::trace_target::ActiveModel = old.clone().into();
+        inactive.active = Set(false);
+        inactive.update(conn).await?;
+        let gate = if target_first {
+            None
+        } else {
+            Some(bind_first_native_write(conn, "/project/gate").await?)
+        };
+        let before = native_fence_targets(&mono).await?;
+        let root_before = mono.get_main_ref("/").await?.context("initial root")?;
+        let (new_id, new_tree, payload) =
+            native_fence_n1(&storage, parent.id, &empty, false).await?;
+        let id = wh03_enqueue_push(
+            &storage,
+            "/project",
+            &parent.id.to_string(),
+            &new_id,
+            &payload,
+        )
+        .await;
+        let enter = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let ctx = PushExecContext {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+                connection: crate::jupiter::tests::test_redis_manager().await,
+                prefix: String::new(),
+            }),
+            pre_apply_enter_barrier: Some(Arc::clone(&enter)),
+            pre_apply_release_barrier: Some(Arc::clone(&release)),
+        };
+        let locker = conn.begin().await?;
+        let locker_pid: i32 = locker
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT pg_backend_pid() AS pid",
+            ))
+            .await?
+            .context("locker pid")?
+            .try_get("", "pid")?;
+        if target_first && matches!(operation, NativeFenceOperation::Bind) {
+            trace_target_storage::insert_active(
+                &locker,
+                trace_target_storage::TARGET_KIND_NATIVE,
+                "/project/sub",
+                None,
+            )
+            .await?;
+        } else {
+            let locked_id = if target_first {
+                &old.id
+            } else {
+                &gate.as_ref().context("gate target")?.id
+            };
+            let locked = locker
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT id FROM trace_target WHERE id = $1 FOR UPDATE",
+                    [locked_id.to_owned().into()],
+                ))
+                .await?;
+            anyhow::ensure!(locked.is_some(), "fixture target row is missing");
+        }
+        let exec_storage = storage.clone();
+        let mut exec = tokio::spawn(async move {
+            exec_storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    Some(&ctx),
+                )
+                .await
+        });
+        let mut target = None;
+        let handshake: anyhow::Result<()> = async {
+            tokio::time::timeout(Duration::from_secs(5), enter.wait())
+                .await
+                .context("B3 pre-apply entry")?;
+            if target_first {
+                target = Some(native_fence_spawn_target(&storage, operation, &old.id));
+                let target_pid =
+                    native_fence_wait_edge(&locker, locker_pid, "trace_target").await?;
+                tokio::time::timeout(Duration::from_secs(5), release.wait())
+                    .await
+                    .context("B3 pre-apply release")?;
+                let b3_pid = native_fence_wait_edge(&locker, target_pid, "mega_refs").await?;
+                anyhow::ensure!(b3_pid != target_pid && b3_pid != locker_pid);
+                anyhow::ensure!(
+                    native_fence_wait_edge(&locker, locker_pid, "trace_target").await?
+                        == target_pid
+                );
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), release.wait())
+                    .await
+                    .context("B3 pre-apply release")?;
+                // This UPDATE is after the real root CAS and before the B3 outer commit.
+                let b3_pid = native_fence_wait_edge(&locker, locker_pid, "trace_target").await?;
+                target = Some(native_fence_spawn_target(&storage, operation, &old.id));
+                let target_pid = native_fence_wait_edge(&locker, b3_pid, "mega_refs").await?;
+                anyhow::ensure!(b3_pid != target_pid && target_pid != locker_pid);
+                anyhow::ensure!(
+                    native_fence_wait_edge(&locker, locker_pid, "trace_target").await? == b3_pid
+                );
+            }
+            Ok(())
+        }
+        .await;
+        // Release our unique/row lock before abort/join on every handshake failure.
+        let unlocked = tokio::time::timeout(Duration::from_secs(5), locker.rollback()).await;
+        let cleanup_needed = handshake.is_err() || !matches!(&unlocked, Ok(Ok(())));
+        if cleanup_needed {
+            exec.abort();
+            if let Some(task) = target.as_ref() {
+                task.abort();
+            }
+            let exec_stopped = tokio::time::timeout(Duration::from_secs(5), &mut exec)
+                .await
+                .is_ok();
+            let target_stopped = match target.as_mut() {
+                Some(task) => tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .is_ok(),
+                None => true,
+            };
+            anyhow::ensure!(
+                exec_stopped && target_stopped,
+                "fence tasks failed to stop after abort"
+            );
+            handshake?;
+            unlocked.context("fixture rollback timeout")??;
+            anyhow::bail!("fence cleanup path unexpectedly succeeded");
+        }
+        let target_result = native_fence_join(target.as_mut().context("target task")?).await;
+        let exec_result = native_fence_join(&mut exec).await;
+        target_result?;
+        let outcome = exec_result?;
+        anyhow::ensure!(
+            outcome
+                == ExecuteOutcome::Done {
+                    id,
+                    landed_commit_id: new_id.clone(),
+                    root_cas_writes: 1
+                },
+            "{outcome:?}"
+        );
+        let root_after =
+            native_fence_assert_landed(&mono, &new_id, &new_tree, &empty, false).await?;
+        anyhow::ensure!(root_after != root_before.ref_commit_hash);
+        let after = native_fence_targets(&mono).await?;
+        anyhow::ensure!(active_at(conn, "/project/sub").await?.is_none());
+        for row in &before {
+            let actual = after
+                .iter()
+                .find(|item| item.id == row.id)
+                .context("original target vanished")?;
+            let mut expected = row.clone();
+            if row.project_path == "/project/gate" {
+                expected.active = false;
+            }
+            anyhow::ensure!(
+                *actual == expected,
+                "unexpected target mutation: {actual:?}"
+            );
+        }
+        let extra = usize::from(target_first && matches!(operation, NativeFenceOperation::Bind));
+        anyhow::ensure!(after.len() == before.len() + extra);
+        let sub_rows: Vec<_> = after
+            .iter()
+            .filter(|row| row.project_path == "/project/sub")
+            .collect();
+        anyhow::ensure!(sub_rows.len() == 1 + extra && sub_rows.iter().all(|row| !row.active));
+        let landed = Commit::from_mega_model(
+            mono.get_commit_by_hash(&new_id)
+                .await?
+                .context("landed commit")?,
+        );
+        let (rebuilt_id, rebuilt_tree, rebuilt_payload) =
+            native_fence_n1(&storage, landed.id, &empty, true).await?;
+        let rebuilt_queue =
+            wh03_enqueue_push(&storage, "/project", &new_id, &rebuilt_id, &rebuilt_payload).await;
+        let rebuild_storage = storage.clone();
+        let mut rebuilding =
+            tokio::spawn(async move { Ok(wh03_exec(&rebuild_storage, rebuilt_queue).await) });
+        let rebuilt = native_fence_join(&mut rebuilding).await?;
+        anyhow::ensure!(
+            rebuilt
+                == ExecuteOutcome::Done {
+                    id: rebuilt_queue,
+                    landed_commit_id: rebuilt_id.clone(),
+                    root_cas_writes: 1
+                },
+            "{rebuilt:?}"
+        );
+        let rebuilt_root =
+            native_fence_assert_landed(&mono, &rebuilt_id, &rebuilt_tree, &empty, true).await?;
+        anyhow::ensure!(rebuilt_root != root_after);
+        crate::jupiter::service::trace_target_service::bind_if_still_landed(&mono, "/project/sub")
+            .await?;
+        let new_target = active_at(conn, "/project/sub")
+            .await?
+            .context("rebuilt active target")?;
+        anyhow::ensure!(sub_rows.iter().all(|row| row.id != new_target.id));
+        let rebuilt_targets = native_fence_targets(&mono).await?;
+        anyhow::ensure!(rebuilt_targets.len() == after.len() + 1);
+        for row in &after {
+            anyhow::ensure!(rebuilt_targets.iter().find(|item| item.id == row.id) == Some(row));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_target_fence_bind_first_delete_second() {
+        native_fence_case(NativeFenceOperation::Bind, true)
+            .await
+            .expect("bind first");
+    }
+
+    #[tokio::test]
+    async fn native_target_fence_delete_first_bind_second() {
+        native_fence_case(NativeFenceOperation::Bind, false)
+            .await
+            .expect("delete before bind");
+    }
+
+    #[tokio::test]
+    async fn native_target_fence_restore_first_delete_second() {
+        native_fence_case(NativeFenceOperation::Restore, true)
+            .await
+            .expect("restore first");
+    }
+
+    #[tokio::test]
+    async fn native_target_fence_delete_first_restore_second() {
+        native_fence_case(NativeFenceOperation::Restore, false)
+            .await
+            .expect("delete before restore");
+    }
+
     async fn import_target_row(
         storage: &crate::jupiter::storage::Storage,
         id: &str,

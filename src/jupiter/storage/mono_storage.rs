@@ -10,6 +10,7 @@ use git_internal::{
     internal::{
         metadata::EntryMeta,
         object::{
+            ObjectTrait,
             commit::Commit,
             tree::{Tree, TreeItemMode},
         },
@@ -283,6 +284,24 @@ impl MonoStorage {
             .filter(mega_refs::Column::Path.eq(path))
             .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME))
             .filter(mega_refs::Column::IsCl.eq(false))
+            .all(txn)
+            .await?;
+        match rows.len() {
+            0 => Ok(None),
+            1 => Ok(rows.into_iter().next()),
+            _ => Err(MegaError::Other("selected native ref is ambiguous".into())),
+        }
+    }
+
+    pub(crate) async fn lock_native_root_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<mega_refs::Model>, MegaError> {
+        let rows = mega_refs::Entity::find()
+            .filter(mega_refs::Column::Path.eq("/"))
+            .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME))
+            .filter(mega_refs::Column::IsCl.eq(false))
+            .lock_shared()
             .all(txn)
             .await?;
         match rows.len() {
@@ -1735,6 +1754,71 @@ impl MonoStorage {
             tree = Tree::from_mega_model(next);
         }
         Ok(Some(tree.id.to_string()))
+    }
+
+    /// Resolve requested directories by depth, retaining only the next frontier.
+    /// Missing rows and parsed non-tree entries are ineligible; parse failures abort.
+    pub(crate) async fn existing_path_trees_in_txn(
+        &self,
+        root_tree_hash: &str,
+        paths: &[String],
+        txn: &DatabaseTransaction,
+    ) -> Result<HashSet<String>, MegaError> {
+        let components: Vec<Vec<&str>> = paths
+            .iter()
+            .map(|path| path.split('/').filter(|part| !part.is_empty()).collect())
+            .collect();
+        let mut existing = HashSet::new();
+        let mut frontier: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        for (index, path) in paths.iter().enumerate() {
+            if path.is_empty() || path == "/" {
+                existing.insert(path.clone());
+            } else {
+                frontier
+                    .entry(root_tree_hash.to_owned())
+                    .or_default()
+                    .push((index, 0));
+            }
+        }
+        let hash_kind = get_hash_kind();
+        while !frontier.is_empty() {
+            let mut hashes: Vec<String> = frontier.keys().cloned().collect();
+            hashes.sort_unstable();
+            let mut next: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+            for chunk in hashes.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+                // Chunk before calling the helper: it collects every requested model.
+                let models = self.get_trees_by_hashes_fallible(txn, chunk).await?;
+                for model in models {
+                    let Some(requests) = frontier.remove(&model.tree_id) else {
+                        continue;
+                    };
+                    let id = ObjectHash::from_hex_for_kind(hash_kind, &model.tree_id).map_err(
+                        |error| MegaError::Other(format!("invalid native tree hash: {error}")),
+                    )?;
+                    let tree = Tree::from_bytes(&model.sub_trees, id).map_err(|error| {
+                        MegaError::Other(format!("invalid native tree data: {error}"))
+                    })?;
+                    for (index, depth) in requests {
+                        let Some(component) = components[index].get(depth) else {
+                            // The final directory's model was fetched and parsed too.
+                            existing.insert(paths[index].clone());
+                            continue;
+                        };
+                        if let Some(item) =
+                            tree.tree_items.iter().find(|item| item.name == *component)
+                            && item.mode == TreeItemMode::Tree
+                        {
+                            next.entry(item.id.to_string())
+                                .or_default()
+                                .push((index, depth + 1));
+                        }
+                    }
+                }
+            }
+            // Missing models leave requests here, and are discarded as ineligible.
+            frontier = next;
+        }
+        Ok(existing)
     }
 
     pub async fn get_trees_by_hashes(
