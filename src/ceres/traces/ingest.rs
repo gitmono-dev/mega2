@@ -1031,7 +1031,9 @@ mod tests {
             jupiter::{
                 migration::apply_migrations,
                 service::trace_publish_service::TracePublishService,
-                storage::trace_stream_storage::{CommitParentList, PublishRef, TRACES_REF},
+                storage::trace_stream_storage::{
+                    CommitParentList, ExpectedOldTip, PublishRef, TRACES_REF,
+                },
                 tests::test_db_connection,
             },
         };
@@ -1286,6 +1288,7 @@ mod tests {
                     &[huge_object],
                     &PublishRef {
                         stream_id: stream_id.clone(),
+                        expected_old_tip: ExpectedOldTip::Unspecified,
                         ref_names: vec![TRACES_REF.to_owned()],
                         delete: false,
                         new_tip: absent.to_owned(),
@@ -1399,7 +1402,9 @@ mod tests {
             jupiter::{
                 migration::apply_migrations,
                 service::trace_publish_service::TracePublishService,
-                storage::trace_stream_storage::{CommitParentList, PublishRef, TRACES_REF},
+                storage::trace_stream_storage::{
+                    CommitParentList, ExpectedOldTip, PublishRef, TRACES_REF,
+                },
                 tests::test_db_connection,
             },
         };
@@ -1531,6 +1536,7 @@ mod tests {
                     &objects,
                     &PublishRef {
                         stream_id: stream_id.clone(),
+                        expected_old_tip: ExpectedOldTip::Unspecified,
                         ref_names: vec![TRACES_REF.to_owned()],
                         delete: false,
                         new_tip: tip_oid,

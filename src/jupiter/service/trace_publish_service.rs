@@ -1,11 +1,19 @@
 //! Publish a traces ref after its raw bytes are already durable.
 
+use sea_orm::{DatabaseConnection, TransactionTrait};
+
 use crate::{
+    ceres::traces::auth::PublishAuthority,
     common::errors::MegaError,
-    jupiter::storage::{
-        object_storage::MegaObjectStorageWrapper,
-        trace_object_storage,
-        trace_stream_storage::{self, PublishRef, PublishedRef},
+    jupiter::{
+        service::trace_target_service,
+        storage::{
+            mono_storage::MonoStorage,
+            object_storage::MegaObjectStorageWrapper,
+            trace_object_storage,
+            trace_stream_storage::{self, PublishRef, PublishedRef, ScopeFacts},
+            trace_target_storage::{self, TARGET_KIND_NATIVE},
+        },
     },
 };
 
@@ -21,6 +29,14 @@ pub struct ObjectBytes {
 pub struct PublishBytes {
     pub update: PublishRef,
     pub objects: Vec<ObjectBytes>,
+}
+
+/// One first-scope publication request.
+pub struct FirstScopeRequest<'a> {
+    pub path: &'a str,
+    pub facts: &'a trace_stream_storage::ScopeFacts<'a>,
+    pub request: &'a PublishBytes,
+    pub authority: &'a crate::ceres::traces::auth::PublishAuthority<'a>,
 }
 
 /// Stores raw bytes, then publishes membership, the tip, and the journal.
@@ -63,6 +79,130 @@ impl TracePublishService {
             .await?;
         }
         trace_stream_storage::publish_ref(db, &request.update, authority).await
+    }
+
+    /// Publish a scope's first ref. The native target binding, the stream
+    /// identity and the ref publication share one database transaction; raw
+    /// bytes are durable before it. A rejection leaves no target or stream row.
+    pub async fn publish_first_scope(
+        &self,
+        config: &crate::config::MonoConfig,
+        db: &DatabaseConnection,
+        mono: &MonoStorage,
+        scope: &FirstScopeRequest<'_>,
+    ) -> Result<PublishedRef, MegaError> {
+        let FirstScopeRequest {
+            path,
+            facts,
+            request,
+            authority,
+        } = *scope;
+        trace_stream_storage::preflight(&request.update)?;
+        if request.update.stream_id != facts.stream_id
+            || request.update.hash_kind != facts.hash_kind
+        {
+            return Err(MegaError::Other(
+                "first scope facts and ref update disagree".into(),
+            ));
+        }
+        for oid in &request.update.object_oids {
+            let bytes = request
+                .objects
+                .iter()
+                .find(|object| object.oid.eq_ignore_ascii_case(oid))
+                .ok_or_else(|| {
+                    MegaError::Traces(crate::common::errors::TracesError::InvalidParameter)
+                })?;
+            trace_object_storage::put_raw(
+                &self.store,
+                &request.update.stream_id,
+                &request.update.hash_kind,
+                oid,
+                &bytes.bytes,
+            )
+            .await?;
+        }
+        let path = trace_target_storage::strict_canonical_project_path(path)
+            .map_err(|_| crate::ceres::traces::auth::publish_rejection())?;
+        let txn = db.begin().await?;
+        let published = Self::publish_first_scope_in_txn(
+            &txn,
+            config,
+            mono,
+            &path,
+            facts,
+            &request.update,
+            authority,
+        )
+        .await;
+        match published {
+            Ok(published) => {
+                txn.commit().await?;
+                Ok(published)
+            }
+            Err(err) => {
+                txn.rollback().await?;
+                Err(err)
+            }
+        }
+    }
+
+    async fn publish_first_scope_in_txn(
+        txn: &sea_orm::DatabaseTransaction,
+        config: &crate::config::MonoConfig,
+        mono: &MonoStorage,
+        path: &str,
+        facts: &ScopeFacts<'_>,
+        update: &PublishRef,
+        authority: &PublishAuthority<'_>,
+    ) -> Result<PublishedRef, MegaError> {
+        let Some(root) = mono.lock_native_root_in_txn(txn).await? else {
+            return Err(MegaError::Other("native root is missing".into()));
+        };
+        let eligible = mono
+            .existing_path_trees_in_txn(&root.ref_tree_hash, &[path.to_owned()], txn)
+            .await?;
+        if !eligible.contains(path) {
+            return Err(crate::ceres::traces::auth::publish_rejection());
+        }
+        // The caller's authorization decision is binding: its path and expected
+        // generation stay untouched, so a rebind or generation change between
+        // authorization and this transaction is rejected by the recheck instead
+        // of being compared against itself.
+        let authorized =
+            trace_target_storage::strict_canonical_project_path(authority.authorized_path)
+                .map_err(|_| crate::ceres::traces::auth::publish_rejection())?;
+        if authorized != path {
+            return Err(crate::ceres::traces::auth::publish_rejection());
+        }
+        // A path inside the ImportRepo namespace never gets a native binding,
+        // even when no target row exists there yet.
+        if crate::ceres::pack::path_policy::in_import_namespace(config, path) {
+            return Err(crate::ceres::traces::auth::publish_rejection());
+        }
+        let target = trace_target_service::bind_first_native_write(txn, path).await?;
+        if target.target_kind != TARGET_KIND_NATIVE {
+            return Err(crate::ceres::traces::auth::publish_rejection());
+        }
+        // A path-level authorization carries no target id; an authorization
+        // that named a target must still name the same binding. Otherwise a
+        // retired target's grant would silently apply to its replacement.
+        if !authority.target_id.is_empty() && authority.target_id != target.id {
+            return Err(crate::ceres::traces::auth::publish_rejection());
+        }
+        if !facts.target_id.is_empty() && facts.target_id != target.id {
+            return Err(crate::ceres::traces::auth::publish_rejection());
+        }
+        let scoped_authority = PublishAuthority {
+            target_id: &target.id,
+            ..*authority
+        };
+        let scoped_facts = ScopeFacts {
+            target_id: &target.id,
+            ..*facts
+        };
+        trace_stream_storage::publish_scope_in_txn(txn, &scoped_facts, update, &scoped_authority)
+            .await
     }
 
     /// Stage objects in quarantine, then publish only a closed set.
@@ -129,7 +269,7 @@ mod tests {
             migration::apply_migrations,
             storage::{
                 trace_object_storage,
-                trace_stream_storage::{CommitParentList, TRACES_REF},
+                trace_stream_storage::{CommitParentList, ExpectedOldTip, TRACES_REF},
             },
             tests::test_db_connection,
         },
@@ -220,6 +360,98 @@ mod tests {
         }
     }
 
+    fn mono(conn: &sea_orm::DatabaseConnection) -> MonoStorage {
+        use crate::jupiter::storage::base_storage::StorageConnector;
+        MonoStorage {
+            base: crate::jupiter::storage::base_storage::BaseStorage::new(std::sync::Arc::new(
+                conn.clone(),
+            )),
+        }
+    }
+
+    async fn seed_root(mono: &MonoStorage, directories: &[&str]) {
+        use git_internal::{
+            hash::ObjectHash,
+            internal::object::{
+                ObjectTrait,
+                commit::Commit,
+                tree::{Tree, TreeItem, TreeItemMode},
+                types::ObjectType,
+            },
+        };
+
+        use crate::{callisto::mega_refs, common::utils::MEGA_BRANCH_NAME};
+        let leaf = Tree::from_bytes(&[], ObjectHash::from_type_and_data(ObjectType::Tree, &[]))
+            .expect("empty leaf tree");
+        let root = Tree::from_tree_items(
+            directories
+                .iter()
+                .map(|name| TreeItem {
+                    mode: TreeItemMode::Tree,
+                    id: leaf.id,
+                    name: (*name).into(),
+                })
+                .collect(),
+        )
+        .expect("root");
+        let commit = Commit::from_tree_id(root.id, vec![], "first scope root");
+        mono.save_mega_trees(vec![leaf, root.clone()], commit.id, None)
+            .await
+            .expect("persist trees");
+        mono.save_mega_commits(vec![commit.clone()], None)
+            .await
+            .expect("persist commit");
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/",
+                MEGA_BRANCH_NAME.to_owned(),
+                commit.id.to_string(),
+                root.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .expect("root ref");
+    }
+
+    struct FirstScope {
+        principal_id: String,
+        credential_id: String,
+        stream_id: String,
+        epoch_id: String,
+    }
+
+    async fn first_scope(db: &sea_orm::DatabaseConnection) -> FirstScope {
+        let principal_id = Uuid::new_v4().to_string();
+        let credential_id = "publish-first-scope".to_owned();
+        let now = chrono::Utc::now().fixed_offset();
+        trace_principal::ActiveModel {
+            id: Set(principal_id.clone()),
+            created_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("principal");
+        crate::callisto::trace_credential_binding::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id.clone()),
+            namespace: Set("static_push_token".to_owned()),
+            credential_id: Set(credential_id.clone()),
+            created_at: Set(now),
+            retired_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("binding");
+        FirstScope {
+            principal_id,
+            credential_id,
+            stream_id: Uuid::new_v4().to_string(),
+            epoch_id: Uuid::new_v4().to_string(),
+        }
+    }
+
     async fn publish(
         service: &TracePublishService,
         db: &sea_orm::DatabaseConnection,
@@ -252,6 +484,7 @@ mod tests {
         PublishBytes {
             update: PublishRef {
                 stream_id: stream_id.to_owned(),
+                expected_old_tip: ExpectedOldTip::Unspecified,
                 ref_names: vec![TRACES_REF.to_owned()],
                 delete: false,
                 new_tip: oid.to_owned(),
@@ -559,6 +792,7 @@ mod tests {
                     &[],
                     &PublishRef {
                         stream_id: scope.stream_id.clone(),
+                        expected_old_tip: ExpectedOldTip::Unspecified,
                         ref_names: vec![TRACES_REF.to_owned()],
                         delete: false,
                         new_tip: absent.to_owned(),
@@ -598,6 +832,7 @@ mod tests {
                     &open,
                     &PublishRef {
                         stream_id: scope.stream_id.clone(),
+                        expected_old_tip: ExpectedOldTip::Unspecified,
                         ref_names: vec![TRACES_REF.to_owned()],
                         delete: false,
                         new_tip: commit_oid.clone(),
@@ -654,6 +889,7 @@ mod tests {
                 &closed,
                 &PublishRef {
                     stream_id: scope.stream_id.clone(),
+                    expected_old_tip: ExpectedOldTip::Unspecified,
                     ref_names: vec![TRACES_REF.to_owned()],
                     delete: false,
                     new_tip: commit_oid.clone(),
@@ -692,5 +928,349 @@ mod tests {
                 .expect("visible"),
             2
         );
+    }
+    #[tokio::test]
+    async fn first_scope_publish_binds_target_and_rolls_back_rejections() {
+        use crate::{
+            ceres::traces::auth::{PublishAuthority, TracesCaller},
+            jupiter::storage::trace_stream_storage::ScopeFacts,
+        };
+        let (_dir, db) = open_db().await;
+        let mono = mono(&db);
+        seed_root(&mono, &["proj", "other", "third", "third-party"]).await;
+        let config = crate::config::MonoConfig::default();
+        let storage_dir = tempfile::TempDir::new().expect("storage dir");
+        let storage_config = crate::orbit_api::factory::ObjectStorageConfig {
+            storage_type: crate::orbit_api::factory::ObjectStorageBackend::Local,
+            local: crate::orbit_api::factory::LocalConfig {
+                root_dir: storage_dir.path().to_string_lossy().to_string(),
+            },
+            ..Default::default()
+        };
+        let store = crate::orbit::factory::ObjectStorageFactory::build(&storage_config)
+            .await
+            .expect("local object storage");
+        let scope = first_scope(&db).await;
+        let token = crate::config::PushTokenConfig {
+            name: scope.credential_id.clone(),
+            token: "synthetic-secret".to_owned(),
+            paths: Some(vec![
+                "/proj".to_owned(),
+                "/other".to_owned(),
+                "/third".to_owned(),
+                "/third-party".to_owned(),
+            ]),
+        };
+        let authority = PublishAuthority {
+            caller: TracesCaller::StaticPushToken {
+                credential_id: &token.name,
+                token: &token,
+            },
+            principal_id: &scope.principal_id,
+            target_id: "",
+            authorized_path: "/proj",
+            expected_generation: 1,
+            policy: None,
+        };
+        let facts = ScopeFacts {
+            stream_id: &scope.stream_id,
+            principal_id: &scope.principal_id,
+            target_id: "",
+            source_repo_id: "source-opaque",
+            epoch_id: &scope.epoch_id,
+            hash_kind: "sha1",
+        };
+        let service = TracePublishService::new(store);
+        let first_request = request(&scope.stream_id, OID_A, Vec::new(), "first", b"a");
+        let published = service
+            .publish_first_scope(
+                &config,
+                &db,
+                &mono,
+                &FirstScopeRequest {
+                    path: "/proj",
+                    facts: &facts,
+                    request: &first_request,
+                    authority: &authority,
+                },
+            )
+            .await
+            .expect("first scope publish");
+        assert_eq!(published.stream_id, scope.stream_id);
+        let target_count = trace_target::Entity::find()
+            .filter(trace_target::Column::ProjectPath.eq("/proj"))
+            .filter(trace_target::Column::Active.eq(true))
+            .count(&db)
+            .await
+            .expect("target count");
+        assert_eq!(target_count, 1);
+        let stream_count = trace_stream::Entity::find()
+            .filter(trace_stream::Column::Id.eq(&scope.stream_id))
+            .count(&db)
+            .await
+            .expect("stream count");
+        assert_eq!(stream_count, 1);
+
+        // The same shape of first request succeeds with the authorized
+        // generation on another path.
+        let third_stream_id = Uuid::new_v4().to_string();
+        let third_epoch_id = Uuid::new_v4().to_string();
+        let third_facts = ScopeFacts {
+            stream_id: &third_stream_id,
+            epoch_id: &third_epoch_id,
+            ..facts
+        };
+        let third_request = request(&third_stream_id, OID_B, Vec::new(), "third", b"b");
+        let third_authority = PublishAuthority {
+            authorized_path: "/third",
+            ..authority
+        };
+        service
+            .publish_first_scope(
+                &config,
+                &db,
+                &mono,
+                &FirstScopeRequest {
+                    path: "/third",
+                    facts: &third_facts,
+                    request: &third_request,
+                    authority: &third_authority,
+                },
+            )
+            .await
+            .expect("authorized generation succeeds");
+
+        // A failure after the target binding still rolls the whole transaction
+        // back: the only difference from the successful request is the stale
+        // generation, so the recheck is the reason it fails.
+        let other_stream_id = Uuid::new_v4().to_string();
+        let other_epoch_id = Uuid::new_v4().to_string();
+        let other_facts = ScopeFacts {
+            stream_id: &other_stream_id,
+            epoch_id: &other_epoch_id,
+            ..facts
+        };
+        let other_request = request(&other_stream_id, OID_B, Vec::new(), "other", b"b");
+        let stale_generation = PublishAuthority {
+            authorized_path: "/other",
+            expected_generation: 99,
+            ..authority
+        };
+        assert!(
+            service
+                .publish_first_scope(
+                    &config,
+                    &db,
+                    &mono,
+                    &FirstScopeRequest {
+                        path: "/other",
+                        facts: &other_facts,
+                        request: &other_request,
+                        authority: &stale_generation,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        let other_targets = trace_target::Entity::find()
+            .filter(trace_target::Column::ProjectPath.eq("/other"))
+            .count(&db)
+            .await
+            .expect("other targets");
+        assert_eq!(other_targets, 0);
+        let other_streams = trace_stream::Entity::find()
+            .filter(trace_stream::Column::Id.eq(&other_stream_id))
+            .count(&db)
+            .await
+            .expect("other streams");
+        assert_eq!(other_streams, 0);
+        let raw = trace_object_storage::get_raw(&service.store, &other_stream_id, "sha1", OID_B)
+            .await
+            .expect("raw lookup");
+        assert!(
+            raw.is_some(),
+            "raw bytes stay durable after a rejected publication"
+        );
+        let membership = trace_object::Entity::find()
+            .filter(trace_object::Column::StreamId.eq(&other_stream_id))
+            .count(&db)
+            .await
+            .expect("membership");
+        assert_eq!(membership, 0, "rejected publication writes no membership");
+
+        // An authorization that named a target cannot silently apply to a new
+        // binding at the same path.
+        let replacement = trace_target::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            target_kind: Set("native".to_owned()),
+            project_path: Set("/other".to_owned()),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(chrono::Utc::now().fixed_offset()),
+        }
+        .insert(&db)
+        .await
+        .expect("replacement target");
+        let proj_target = trace_target::Entity::find()
+            .filter(trace_target::Column::ProjectPath.eq("/proj"))
+            .filter(trace_target::Column::Active.eq(true))
+            .one(&db)
+            .await
+            .expect("proj target lookup")
+            .expect("proj target");
+        let named_target = PublishAuthority {
+            target_id: &proj_target.id,
+            authorized_path: "/other",
+            ..authority
+        };
+        let error = service
+            .publish_first_scope(
+                &config,
+                &db,
+                &mono,
+                &FirstScopeRequest {
+                    path: "/other",
+                    facts: &other_facts,
+                    request: &other_request,
+                    authority: &named_target,
+                },
+            )
+            .await
+            .expect_err("a stale authorized target id must not adopt the replacement");
+        assert!(
+            matches!(
+                error,
+                crate::common::errors::MegaError::Traces(
+                    crate::common::errors::TracesError::UnknownScope
+                )
+            ),
+            "identity rejection keeps the typed traces contract: {error:?}"
+        );
+        assert_eq!(
+            trace_target::Entity::find()
+                .filter(trace_target::Column::Id.eq(&replacement.id))
+                .count(&db)
+                .await
+                .expect("replacement lookup"),
+            1
+        );
+
+        // A preflight rejection never opens a transaction or binds a target.
+        let mut bad = request(&other_stream_id, OID_B, vec![OID_A.to_owned()], "bad", b"b");
+        bad.update.ref_names = vec!["refs/heads/main".to_owned()];
+        assert!(
+            service
+                .publish_first_scope(
+                    &config,
+                    &db,
+                    &mono,
+                    &FirstScopeRequest {
+                        path: "/other",
+                        facts: &other_facts,
+                        request: &bad,
+                        authority: &authority,
+                    },
+                )
+                .await
+                .is_err()
+        );
+
+        // A missing directory never binds a target and keeps the typed contract.
+        let missing = PublishAuthority {
+            authorized_path: "/missing",
+            ..authority
+        };
+        let error = service
+            .publish_first_scope(
+                &config,
+                &db,
+                &mono,
+                &FirstScopeRequest {
+                    path: "/missing",
+                    facts: &facts,
+                    request: &first_request,
+                    authority: &missing,
+                },
+            )
+            .await
+            .expect_err("missing directory is rejected");
+        assert!(matches!(
+            error,
+            crate::common::errors::MegaError::Traces(
+                crate::common::errors::TracesError::UnknownScope
+            )
+        ));
+
+        // A non-canonical authorized path is rejected with the same typed error.
+        let non_canonical = PublishAuthority {
+            authorized_path: "proj",
+            ..authority
+        };
+        let error = service
+            .publish_first_scope(
+                &config,
+                &db,
+                &mono,
+                &FirstScopeRequest {
+                    path: "/proj",
+                    facts: &facts,
+                    request: &first_request,
+                    authority: &non_canonical,
+                },
+            )
+            .await
+            .expect_err("non-canonical authorization is rejected");
+        assert!(matches!(
+            error,
+            crate::common::errors::MegaError::Traces(
+                crate::common::errors::TracesError::UnknownScope
+            )
+        ));
+
+        // An ImportRepo namespace path never binds a native target, even when
+        // the directory exists and no target row is present yet.
+        let import_path = PublishAuthority {
+            authorized_path: "/third-party",
+            ..authority
+        };
+        let import_facts = ScopeFacts {
+            stream_id: &other_stream_id,
+            ..other_facts
+        };
+        let import_request = request(&other_stream_id, OID_B, Vec::new(), "import", b"b");
+        let error = service
+            .publish_first_scope(
+                &config,
+                &db,
+                &mono,
+                &FirstScopeRequest {
+                    path: "/third-party",
+                    facts: &import_facts,
+                    request: &import_request,
+                    authority: &import_path,
+                },
+            )
+            .await
+            .expect_err("import namespace is not native");
+        assert!(matches!(
+            error,
+            crate::common::errors::MegaError::Traces(
+                crate::common::errors::TracesError::UnknownScope
+            )
+        ));
+        assert_eq!(
+            trace_target::Entity::find()
+                .filter(trace_target::Column::ProjectPath.eq("/third-party"))
+                .count(&db)
+                .await
+                .expect("import namespace targets"),
+            0
+        );
+        let missing_targets = trace_target::Entity::find()
+            .filter(trace_target::Column::ProjectPath.eq("/missing"))
+            .count(&db)
+            .await
+            .expect("missing targets");
+        assert_eq!(missing_targets, 0);
     }
 }

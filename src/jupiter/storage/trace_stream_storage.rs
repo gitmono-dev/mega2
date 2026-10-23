@@ -4,8 +4,9 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    DatabaseTransaction, EntityTrait, IntoActiveModel, QueryFilter, Set, Statement,
-    TransactionTrait, Value, sea_query::Expr,
+    DatabaseTransaction, DbErr, EntityTrait, IntoActiveModel, QueryFilter, Set, Statement,
+    TransactionTrait, Value,
+    sea_query::{Expr, OnConflict},
 };
 use uuid::Uuid;
 
@@ -52,10 +53,23 @@ pub struct CheckpointBinding {
     pub original_tree: String,
 }
 
+/// Client-declared old tip condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedOldTip {
+    /// No client condition.
+    Unspecified,
+    /// The ref must not exist yet.
+    Absent,
+    /// The ref must equal this tip.
+    At(String),
+}
+
 /// The ref update checked inside the publication transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRef {
     pub stream_id: String,
+    /// Client-declared old tip condition, checked under the stream lock.
+    pub expected_old_tip: ExpectedOldTip,
     pub ref_names: Vec<String>,
     pub delete: bool,
     pub new_tip: String,
@@ -65,6 +79,134 @@ pub struct PublishRef {
     pub hash_kind: String,
     pub idempotency_key: String,
     pub schema_id: String,
+}
+
+/// Natural identity of one traces scope.
+pub struct ScopeFacts<'a> {
+    pub stream_id: &'a str,
+    pub principal_id: &'a str,
+    pub target_id: &'a str,
+    pub source_repo_id: &'a str,
+    pub epoch_id: &'a str,
+    pub hash_kind: &'a str,
+}
+
+/// Publish the first ref of a scope, creating its stream row in the same
+/// transaction when the natural tuple does not exist yet.
+pub async fn publish_scope(
+    db: &DatabaseConnection,
+    facts: &ScopeFacts<'_>,
+    update: &PublishRef,
+    authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
+) -> Result<PublishedRef, MegaError> {
+    let txn = db.begin().await?;
+    let published = match publish_scope_in_txn(&txn, facts, update, authority).await {
+        Ok(published) => published,
+        Err(err) => {
+            txn.rollback().await?;
+            return Err(err);
+        }
+    };
+    txn.commit().await?;
+    Ok(published)
+}
+
+/// First-scope publication inside a caller-owned transaction.
+///
+/// The stream is selected or inserted by its natural key before the ref
+/// update, so the target binding, the stream identity and the tip publication
+/// either all commit or all roll back.
+pub async fn publish_scope_in_txn(
+    txn: &DatabaseTransaction,
+    facts: &ScopeFacts<'_>,
+    update: &PublishRef,
+    authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
+) -> Result<PublishedRef, MegaError> {
+    let hash_kind = canonical_hash_kind(facts.hash_kind)?;
+    if hash_kind != canonical_hash_kind(&update.hash_kind)? {
+        return Err(rejected());
+    }
+    let stream_id = canonical_uuid(facts.stream_id)?;
+    if stream_id != facts.stream_id {
+        return Err(rejected());
+    }
+    let stream_id = ensure_stream_in_txn(txn, facts, hash_kind).await?;
+    let mut scoped = update.clone();
+    scoped.stream_id = stream_id;
+    publish_ref_in_txn(txn, &scoped, authority).await
+}
+
+/// Select the stream for the natural tuple or insert it. An existing row keeps
+/// its identity; a concurrent insert resolves to the winner, and a different
+/// `hash_kind` for the same tuple is rejected instead of reused.
+async fn ensure_stream_in_txn(
+    txn: &DatabaseTransaction,
+    facts: &ScopeFacts<'_>,
+    hash_kind: &str,
+) -> Result<String, MegaError> {
+    if let Some(row) = find_stream_by_natural_key(txn, facts).await? {
+        if row.hash_kind != hash_kind || row.id != facts.stream_id {
+            return Err(rejected());
+        }
+        return Ok(row.id);
+    }
+    let id = facts.stream_id.to_owned();
+    let insert = trace_stream::Entity::insert(trace_stream::ActiveModel {
+        id: Set(id.clone()),
+        principal_id: Set(facts.principal_id.to_owned()),
+        target_id: Set(facts.target_id.to_owned()),
+        source_repo_id: Set(facts.source_repo_id.to_owned()),
+        epoch_id: Set(facts.epoch_id.to_owned()),
+        hash_kind: Set(hash_kind.to_owned()),
+        tip_oid: Set(None),
+        created_at: Set(Utc::now().fixed_offset()),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            trace_stream::Column::PrincipalId,
+            trace_stream::Column::TargetId,
+            trace_stream::Column::SourceRepoId,
+            trace_stream::Column::EpochId,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .exec(txn)
+    .await;
+    match insert {
+        Ok(_) => Ok(id),
+        Err(DbErr::RecordNotInserted) => {
+            let row = find_stream_by_natural_key(txn, facts)
+                .await?
+                .ok_or_else(rejected)?;
+            if row.hash_kind != hash_kind || row.id != facts.stream_id {
+                return Err(rejected());
+            }
+            Ok(row.id)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn find_stream_by_natural_key(
+    txn: &DatabaseTransaction,
+    facts: &ScopeFacts<'_>,
+) -> Result<Option<trace_stream::Model>, MegaError> {
+    Ok(trace_stream::Entity::find()
+        .filter(trace_stream::Column::PrincipalId.eq(facts.principal_id))
+        .filter(trace_stream::Column::TargetId.eq(facts.target_id))
+        .filter(trace_stream::Column::SourceRepoId.eq(facts.source_repo_id))
+        .filter(trace_stream::Column::EpochId.eq(facts.epoch_id))
+        .one(txn)
+        .await?)
+}
+
+fn canonical_hash_kind(value: &str) -> Result<&str, MegaError> {
+    match value {
+        "sha1" => Ok("sha1"),
+        "sha256" => Ok("sha256"),
+        _ => Err(rejected()),
+    }
 }
 
 /// Publish one fast-forward ref update. A rejection writes nothing.
@@ -92,6 +234,7 @@ async fn publish_ref_in_txn(
 ) -> Result<PublishedRef, MegaError> {
     let PreparedRef {
         stream_id,
+        expected_old_tip,
         new_tip,
         commits,
         checkpoints,
@@ -120,6 +263,16 @@ async fn publish_ref_in_txn(
         }
         return Err(rejected());
     }
+    // The expected-old condition is checked only for a new publication: an
+    // exact retry of an already successful request still returns its journal.
+    match &expected_old_tip {
+        ExpectedOldTip::Unspecified => {}
+        ExpectedOldTip::Absent if old_tip.is_some() => return Err(rejected()),
+        ExpectedOldTip::At(expected) if old_tip.as_deref() != Some(expected.as_str()) => {
+            return Err(rejected());
+        }
+        _ => {}
+    }
     require_fast_forward(old_tip.as_deref(), &new_tip, &commits)?;
     publish_checkpoints(txn, &stream_id, &checkpoints).await?;
     publish_membership(txn, &stream_id, &hash_kind, &object_oids).await?;
@@ -143,6 +296,7 @@ async fn publish_ref_in_txn(
 
 struct PreparedRef {
     stream_id: String,
+    expected_old_tip: ExpectedOldTip,
     new_tip: String,
     commits: Vec<CommitParentList>,
     checkpoints: Vec<CheckpointBinding>,
@@ -171,6 +325,11 @@ fn prepare_ref(update: &PublishRef) -> Result<PreparedRef, MegaError> {
         _ => return Err(rejected()),
     };
     let new_tip = canonical_oid(&update.new_tip)?;
+    let expected_old_tip = match &update.expected_old_tip {
+        ExpectedOldTip::Unspecified => ExpectedOldTip::Unspecified,
+        ExpectedOldTip::Absent => ExpectedOldTip::Absent,
+        ExpectedOldTip::At(value) => ExpectedOldTip::At(canonical_oid(value)?),
+    };
     let commits = canonical_commits(&update.commits)?;
     let checkpoints = canonical_checkpoints(&update.checkpoints)?;
     let object_oids = canonical_oids(&update.object_oids)?;
@@ -178,6 +337,7 @@ fn prepare_ref(update: &PublishRef) -> Result<PreparedRef, MegaError> {
     require_membership(&new_tip, &commits, &object_oids)?;
     Ok(PreparedRef {
         stream_id,
+        expected_old_tip,
         new_tip,
         commits,
         checkpoints,
@@ -546,6 +706,58 @@ mod tests {
         }
     }
 
+    async fn scope_target(db: &DatabaseConnection) -> Scope {
+        let principal_id = Uuid::new_v4().to_string();
+        let target_id = Uuid::new_v4().to_string();
+        let path = format!("/team/{target_id}");
+        let now = Utc::now().fixed_offset();
+        trace_principal::ActiveModel {
+            id: Set(principal_id.clone()),
+            created_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("principal");
+        trace_target::ActiveModel {
+            id: Set(target_id.clone()),
+            target_kind: Set("native".to_owned()),
+            project_path: Set(path.clone()),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("target");
+        crate::callisto::trace_credential_binding::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal_id.clone()),
+            namespace: Set("static_push_token".to_owned()),
+            credential_id: Set("publish-operator".to_owned()),
+            created_at: Set(now),
+            retired_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("binding");
+        let stream_id = Uuid::new_v4().to_string();
+        Scope {
+            stream_id,
+            principal_id,
+            target_id,
+            path,
+        }
+    }
+
+    async fn stream_rows(db: &DatabaseConnection, scope: &Scope) -> u64 {
+        trace_stream::Entity::find()
+            .filter(trace_stream::Column::TargetId.eq(&scope.target_id))
+            .filter(trace_stream::Column::PrincipalId.eq(&scope.principal_id))
+            .count(db)
+            .await
+            .expect("stream rows")
+    }
+
     fn authority<'a>(
         scope: &'a Scope,
         token: &'a crate::config::PushTokenConfig,
@@ -584,6 +796,7 @@ mod tests {
     fn update(stream_id: &str, new_tip: &str, parents: Vec<String>, key: &str) -> PublishRef {
         PublishRef {
             stream_id: stream_id.to_owned(),
+            expected_old_tip: ExpectedOldTip::Unspecified,
             ref_names: vec![TRACES_REF.to_owned()],
             delete: false,
             new_tip: new_tip.to_owned(),
@@ -865,5 +1078,190 @@ mod tests {
         .await
         .expect("generation 2");
         assert_eq!(tip(&db, &stream_id).await.as_deref(), Some(OID_B));
+    }
+    #[tokio::test]
+    async fn first_scope_atomic_creates_one_stream_and_keeps_identity() {
+        let (_dir, db) = open_db().await;
+        let scope = scope_target(&db).await;
+        let epoch = Uuid::new_v4().to_string();
+        let facts = ScopeFacts {
+            stream_id: &scope.stream_id,
+            principal_id: &scope.principal_id,
+            target_id: &scope.target_id,
+            source_repo_id: "source-opaque",
+            epoch_id: &epoch,
+            hash_kind: "sha1",
+        };
+        let token = token(&scope.path);
+        let auth = authority(&scope, &token);
+
+        let first = publish_scope(
+            &db,
+            &facts,
+            &update("", OID_A, Vec::new(), "first-scope"),
+            &auth,
+        )
+        .await
+        .expect("first scope publish");
+        assert_eq!(stream_rows(&db, &scope).await, 1);
+        assert_eq!(tip(&db, &first.stream_id).await.as_deref(), Some(OID_A));
+        assert_eq!(journal_count(&db, &first.stream_id).await, 1);
+
+        // AC-8: the exact retry is idempotent and does not add a journal row.
+        let replay = publish_scope(
+            &db,
+            &facts,
+            &update("", OID_A, Vec::new(), "first-scope"),
+            &auth,
+        )
+        .await
+        .expect("idempotent retry");
+        assert!(replay.idempotent);
+        assert_eq!(replay.stream_id, first.stream_id);
+        assert_eq!(journal_count(&db, &first.stream_id).await, 1);
+        assert_eq!(stream_rows(&db, &scope).await, 1);
+
+        // AC-5: a client-declared old tip that disagrees with the locked tip
+        // rejects before any write, even when the update is otherwise a fast-forward.
+        let mut wrong_old = update("", OID_B, vec![OID_A.to_owned()], "wrong-old");
+        wrong_old.expected_old_tip = ExpectedOldTip::At(OID_C.to_owned());
+        assert!(publish_scope(&db, &facts, &wrong_old, &auth).await.is_err());
+        assert_eq!(tip(&db, &first.stream_id).await.as_deref(), Some(OID_A));
+
+        // AC-4: the existing scope keeps its identity on later updates, and the
+        // matching declared old tip is accepted.
+        let mut second = update("", OID_B, vec![OID_A.to_owned()], "second-scope");
+        second.expected_old_tip = ExpectedOldTip::At(OID_A.to_owned());
+        second.checkpoints = vec![CheckpointBinding {
+            checkpoint_key: "ckpt-1".to_owned(),
+            original_tree: TREE_A.to_owned(),
+        }];
+        let next = publish_scope(&db, &facts, &second, &auth)
+            .await
+            .expect("second scope publish");
+        assert_eq!(next.stream_id, first.stream_id);
+        assert_eq!(stream_rows(&db, &scope).await, 1);
+
+        // AC-8: replaying the already-successful second request returns its
+        // journal even though the locked tip has moved to the new value.
+        let replay_second = publish_scope(&db, &facts, &second, &auth)
+            .await
+            .expect("second request replay");
+        assert!(replay_second.idempotent);
+        assert_eq!(replay_second.stream_id, first.stream_id);
+        assert_eq!(journal_count(&db, &first.stream_id).await, 2);
+
+        // AC-5: a stale expected-old is rejected and writes nothing.
+        let stale = update("", OID_C, Vec::new(), "stale-old");
+        assert!(publish_scope(&db, &facts, &stale, &auth).await.is_err());
+        assert_eq!(tip(&db, &first.stream_id).await.as_deref(), Some(OID_B));
+        assert_eq!(journal_count(&db, &first.stream_id).await, 2);
+        assert_eq!(visible_count(&db, &first.stream_id).await, 2);
+        let checkpoints = trace_checkpoint::Entity::find()
+            .filter(trace_checkpoint::Column::StreamId.eq(&first.stream_id))
+            .all(&db)
+            .await
+            .expect("checkpoints");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].checkpoint_key, "ckpt-1");
+        assert_eq!(checkpoints[0].original_tree, TREE_A);
+
+        // AC-6: the same natural tuple with another hash_kind is rejected.
+        let mut sha256 = update("", OID_C, vec![OID_B.to_owned()], "hash-kind");
+        sha256.hash_kind = "sha256".to_owned();
+        let sha256_facts = ScopeFacts {
+            hash_kind: "sha256",
+            ..facts
+        };
+        let mut sha256_auth = auth;
+        sha256_auth.expected_generation = auth.expected_generation;
+        assert!(
+            publish_scope(&db, &sha256_facts, &sha256, &sha256_auth)
+                .await
+                .is_err()
+        );
+        assert_eq!(stream_rows(&db, &scope).await, 1);
+    }
+
+    #[tokio::test]
+    async fn first_scope_atomic_rejection_leaves_no_stream_row() {
+        let (_dir, db) = open_db().await;
+        let scope = scope_target(&db).await;
+        let epoch = Uuid::new_v4().to_string();
+        let facts = ScopeFacts {
+            stream_id: &scope.stream_id,
+            principal_id: &scope.principal_id,
+            target_id: &scope.target_id,
+            source_repo_id: "source-opaque",
+            epoch_id: &epoch,
+            hash_kind: "sha1",
+        };
+        let token = token(&scope.path);
+        let auth = authority(&scope, &token);
+        let mut bad = update("", OID_A, Vec::new(), "bad-ref");
+        bad.ref_names = vec!["refs/heads/main".to_owned()];
+        assert!(publish_scope(&db, &facts, &bad, &auth).await.is_err());
+        assert_eq!(stream_rows(&db, &scope).await, 0);
+    }
+    #[tokio::test]
+    async fn first_scope_atomic_concurrent_insert_keeps_one_identity() {
+        let (_dir, db) = open_db().await;
+        let scope = scope_target(&db).await;
+        let epoch = Uuid::new_v4().to_string();
+        let id_a = Uuid::new_v4().to_string();
+        let id_b = Uuid::new_v4().to_string();
+        let facts_a = ScopeFacts {
+            stream_id: &id_a,
+            principal_id: &scope.principal_id,
+            target_id: &scope.target_id,
+            source_repo_id: "source-opaque",
+            epoch_id: &epoch,
+            hash_kind: "sha1",
+        };
+        let facts_b = ScopeFacts {
+            stream_id: &id_b,
+            ..facts_a
+        };
+        let token = token(&scope.path);
+        let auth = authority(&scope, &token);
+        let first = update("", OID_A, Vec::new(), "racing-first");
+        let second = update("", OID_A, Vec::new(), "racing-first");
+        let (left, right) = tokio::join!(
+            publish_scope(&db, &facts_a, &first, &auth),
+            publish_scope(&db, &facts_b, &second, &auth)
+        );
+        assert!(
+            left.is_ok() != right.is_ok(),
+            "exactly one natural-key identity must win"
+        );
+        assert_eq!(stream_rows(&db, &scope).await, 1);
+    }
+    #[tokio::test]
+    async fn first_scope_atomic_absent_condition_matches_only_an_empty_ref() {
+        let (_dir, db) = open_db().await;
+        let scope = scope_target(&db).await;
+        let epoch = Uuid::new_v4().to_string();
+        let facts = ScopeFacts {
+            stream_id: &scope.stream_id,
+            principal_id: &scope.principal_id,
+            target_id: &scope.target_id,
+            source_repo_id: "source-opaque",
+            epoch_id: &epoch,
+            hash_kind: "sha1",
+        };
+        let token = token(&scope.path);
+        let auth = authority(&scope, &token);
+        let mut first = update("", OID_A, Vec::new(), "absent-first");
+        first.expected_old_tip = ExpectedOldTip::Absent;
+        publish_scope(&db, &facts, &first, &auth)
+            .await
+            .expect("the ref does not exist yet");
+        let mut second = update("", OID_B, vec![OID_A.to_owned()], "absent-second");
+        second.expected_old_tip = ExpectedOldTip::Absent;
+        assert!(
+            publish_scope(&db, &facts, &second, &auth).await.is_err(),
+            "an existing ref must not satisfy the absent condition"
+        );
+        assert_eq!(tip(&db, &scope.stream_id).await.as_deref(), Some(OID_A));
     }
 }

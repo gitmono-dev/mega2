@@ -375,6 +375,12 @@ async fn locked_target<C: ConnectionTrait>(
     })
 }
 
+/// The typed rejection shared by every publication recheck, including the
+/// first-scope identity/path checks in the publish service.
+pub fn publish_rejection() -> MegaError {
+    publish_rejected()
+}
+
 fn publish_rejected() -> MegaError {
     MegaError::Traces(crate::common::errors::TracesError::UnknownScope)
 }
@@ -1382,5 +1388,118 @@ mod tests {
         let mut active: trace_credential_binding::ActiveModel = row.into();
         active.retired_at = Set(Some(Utc::now().fixed_offset()));
         active.update(db).await.expect("retire binding");
+    }
+    #[tokio::test]
+    async fn first_scope_authority_rejects_new_target_retired_credential_and_generation_drift() {
+        use sea_orm::TransactionTrait;
+
+        use crate::callisto::{trace_stream, trace_target};
+
+        let (_temp, db) = migrated_db().await;
+        let principal_id = principal(&db).await;
+        let credential_id = "first-scope-operator";
+        bind(
+            &db,
+            &principal_id,
+            CredentialNamespace::StaticPushToken,
+            credential_id,
+        )
+        .await;
+        let target_id = Uuid::new_v4().to_string();
+        let now = Utc::now().fixed_offset();
+        trace_target::ActiveModel {
+            id: Set(target_id.clone()),
+            target_kind: Set("native".to_owned()),
+            project_path: Set("/project/foo".to_owned()),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("target");
+        let stream_id = Uuid::new_v4().to_string();
+        trace_stream::ActiveModel {
+            id: Set(stream_id.clone()),
+            principal_id: Set(principal_id.clone()),
+            target_id: Set(target_id.clone()),
+            source_repo_id: Set("source-opaque".to_owned()),
+            epoch_id: Set(Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("stream");
+
+        let token = token(credential_id, &["/project/foo"]);
+        let authority = PublishAuthority {
+            caller: TracesCaller::StaticPushToken {
+                credential_id,
+                token: &token,
+            },
+            principal_id: &principal_id,
+            target_id: &target_id,
+            authorized_path: "/project/foo",
+            expected_generation: 1,
+            policy: None,
+        };
+        let txn = db.begin().await.expect("txn");
+        recheck_publish_authority(&txn, &stream_id, &authority)
+            .await
+            .expect("bound target is accepted");
+        txn.rollback().await.expect("rollback");
+
+        let stranger = Uuid::new_v4().to_string();
+        let stranger_authority = PublishAuthority {
+            target_id: &stranger,
+            ..authority
+        };
+        let txn = db.begin().await.expect("txn");
+        assert!(
+            recheck_publish_authority(&txn, &stream_id, &stranger_authority)
+                .await
+                .is_err()
+        );
+        txn.rollback().await.expect("rollback");
+
+        let stale_generation = PublishAuthority {
+            expected_generation: 2,
+            ..authority
+        };
+        let txn = db.begin().await.expect("txn");
+        assert!(
+            recheck_publish_authority(&txn, &stream_id, &stale_generation)
+                .await
+                .is_err()
+        );
+        txn.rollback().await.expect("rollback");
+
+        let moved_path = PublishAuthority {
+            authorized_path: "/project/bar",
+            ..authority
+        };
+        let txn = db.begin().await.expect("txn");
+        assert!(
+            recheck_publish_authority(&txn, &stream_id, &moved_path)
+                .await
+                .is_err()
+        );
+        txn.rollback().await.expect("rollback");
+
+        db.execute_unprepared(&format!(
+            "UPDATE trace_credential_binding SET retired_at = now() \
+             WHERE namespace = 'static_push_token' AND credential_id = '{credential_id}'"
+        ))
+        .await
+        .expect("retire credential");
+        let txn = db.begin().await.expect("txn");
+        assert!(
+            recheck_publish_authority(&txn, &stream_id, &authority)
+                .await
+                .is_err()
+        );
+        txn.rollback().await.expect("rollback");
     }
 }
