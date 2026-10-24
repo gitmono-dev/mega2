@@ -84,6 +84,8 @@ mega2 是服务 Agent 工作流的第二代 Mega 引擎；第一代 Mega 项目�
 2. **对象内容：可插拔对象存储**。Git 对象与 LFS 对象的二进制内容不入库，由 `build_object_storage`（`src/jupiter/storage/object_storage.rs`）经 orbit 工厂按 `[object_storage].storage_type` 构建后端：local / S3-compatible / GCS。契约类型在 `src/orbit_api/`，实现在 `src/orbit/`。S3 系凭证支持 `vault://` SecretRef（见第 5 节）。LFS 大文件的 FastCDC 分块见 [`refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md)。Traces 的原始 Git 对象使用独立的 `traces` namespace，不存放在 `git` 或 `agent` 下；key 布局见 [`refactoring/traces.md`](./refactoring/traces.md) 第 3 节。
 3. **Redis：缓存与分布式锁，不是队列**。git 对象缓存（`GitObjectCache`）与 `RedLock` 互斥锁在 Redis（`src/jupiter/redis/`）；写入队列是 Postgres 的 `push_queue` 表（见第 4 节），Redis 侧没有 FIFO/持久化队列。连接经 `connection-manager` 共享，`redis.url` 支持 SecretRef。
 
+Traces raw/staging 通过适配器的完整对象条件创建保留先写入内容，两种上传策略遵守同一规则；原始层读回比对决定幂等或内容冲突。固定对象上限、冲突期间的可重试分类、内存范围和各部署后端的资格要求统一见 [Traces 存储合同](./refactoring/traces.md)。这不改变 Git/LFS/Artifact/Media 的上传策略，也不为未使用的 Traces 可变写入接口提供不可变保证。
+
 深入阅读：[`refactoring/orbit.md`](./refactoring/orbit.md)（对象存储契约与后端）、[`refactoring/storage-events.md`](./refactoring/storage-events.md)（存储事件外发）、[`refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md)。
 
 ## 4. 写入路径：MonoWriteQueue

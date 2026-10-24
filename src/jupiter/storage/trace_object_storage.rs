@@ -317,6 +317,234 @@ mod tests {
         orbit_api::object_storage::ObjectNamespace,
     };
 
+    struct RawChild(std::process::Child, std::path::PathBuf);
+
+    impl RawChild {
+        fn wait(&mut self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(50);
+            loop {
+                if let Some(status) = self.0.try_wait().unwrap() {
+                    assert!(
+                        status.success(),
+                        "raw child exited {status}: {}",
+                        std::fs::read_to_string(&self.1).unwrap_or_default()
+                    );
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "raw child deadline");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for RawChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    fn raw_wait_ready(path: &std::path::Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+        while !path.try_exists().unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not observe real NotFound"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn raw_cross_process_matrix(rustfs: bool, same: bool, simultaneous: bool) {
+        use crate::orbit_api::factory::{
+            LocalConfig, ObjectStorageBackend, ObjectStorageConfig, S3Config,
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for staging in [false, true] {
+            for multipart in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let backend_dir = directory.path().join("objects");
+                std::fs::create_dir(&backend_dir).unwrap();
+                let cfg = if rustfs {
+                    ObjectStorageConfig {
+                        storage_type: ObjectStorageBackend::S3Compatible,
+                        s3: S3Config {
+                            region: "us-east-1".into(),
+                            bucket: "mega2".into(),
+                            access_key_id: "rustfs".into(),
+                            secret_access_key: "rustfs_secret".into(),
+                            endpoint_url: std::env::var("MEGA2_IT_RUSTFS_URL")
+                                .unwrap_or_else(|_| "http://127.0.0.1:19000".into()),
+                            public_endpoint_url: String::new(),
+                        },
+                        ..Default::default()
+                    }
+                } else {
+                    ObjectStorageConfig {
+                        local: LocalConfig {
+                            root_dir: backend_dir.to_str().unwrap().into(),
+                        },
+                        ..Default::default()
+                    }
+                };
+                std::fs::write(
+                    directory.path().join("config.json"),
+                    serde_json::to_vec(&cfg).unwrap(),
+                )
+                .unwrap();
+                let store = runtime
+                    .block_on(crate::orbit::factory::ObjectStorageFactory::build(&cfg))
+                    .unwrap();
+                let id = Uuid::new_v4().to_string();
+                let key = if staging {
+                    staging_object_key(&id, "sha1", "abcdef")
+                } else {
+                    object_key(&id, "sha1", "abcdef")
+                }
+                .unwrap();
+                let read = || {
+                    runtime.block_on(read_stored(&store, &key)).expect("canonical RustFS is required; run docker compose -p mega2-it -f docker/docker-compose.test.yml up -d --wait and initialize the test bucket")
+                };
+                assert!(read().is_none());
+                let spawn = |role: &str, retry: bool| {
+                    let payload = if role == "a" || same {
+                        "first-payload"
+                    } else {
+                        "other-payload"
+                    };
+                    let release = if simultaneous {
+                        "release".to_owned()
+                    } else {
+                        format!("{role}.release")
+                    };
+                    let log_path = directory.path().join(format!("{role}.child.log"));
+                    let log = std::fs::File::create(&log_path).unwrap();
+                    RawChild(
+                        std::process::Command::new(std::env::current_exe().unwrap())
+                            .args([
+                                "--exact",
+                                "orbit::adapter::tests::traces_immutable_create_child",
+                                "--nocapture",
+                            ])
+                            .env("MEGA2_FIX07_CHILD_DIRECTORY", directory.path())
+                            .env("MEGA2_FIX07_ROLE", role)
+                            .env("MEGA2_FIX07_RELEASE", release)
+                            .env("MEGA2_FIX07_MULTIPART", multipart.to_string())
+                            .env("MEGA2_FIX07_STAGING", staging.to_string())
+                            .env("MEGA2_FIX07_RETRY", retry.to_string())
+                            .env("MEGA2_FIX07_ID", &id)
+                            .env("MEGA2_FIX07_PAYLOAD", payload)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(log.try_clone().unwrap())
+                            .stderr(log)
+                            .spawn()
+                            .unwrap(),
+                        log_path,
+                    )
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut a = spawn("a", false);
+                    let mut b = spawn("b", false);
+                    raw_wait_ready(&directory.path().join("a.ready"));
+                    raw_wait_ready(&directory.path().join("b.ready"));
+                    if simultaneous {
+                        std::fs::write(directory.path().join("release"), b"go").unwrap();
+                    } else {
+                        std::fs::write(directory.path().join("a.release"), b"go").unwrap();
+                        a.wait();
+                        assert_eq!(read().unwrap(), b"first-payload");
+                        std::fs::write(directory.path().join("b.release"), b"go").unwrap();
+                    }
+                    a.wait();
+                    b.wait();
+                    let result_for = |role: &str| {
+                        std::fs::read_to_string(directory.path().join(format!("{role}.result")))
+                            .unwrap()
+                    };
+                    let first = [result_for("a"), result_for("b")];
+                    assert!(
+                        first.iter().any(|value| value == "ok"),
+                        "no successful creator: {first:?}"
+                    );
+                    let winner = read().unwrap();
+                    assert!(winner == b"first-payload" || (!same && winner == b"other-payload"));
+                    for role in ["a", "b"] {
+                        if result_for(role) == "retryable" {
+                            spawn(role, true).wait();
+                        }
+                    }
+                    let results = [result_for("a"), result_for("b")];
+                    if same {
+                        assert_eq!(results, ["ok", "ok"]);
+                    } else if simultaneous {
+                        assert!(
+                            results == ["ok", "integrity"] || results == ["integrity", "ok"],
+                            "{results:?}"
+                        );
+                        assert_eq!(
+                            winner,
+                            if results[0] == "ok" {
+                                b"first-payload".as_slice()
+                            } else {
+                                b"other-payload".as_slice()
+                            }
+                        );
+                    } else {
+                        assert_eq!(results, ["ok", "integrity"]);
+                        assert_eq!(winner, b"first-payload");
+                    }
+                    assert_eq!(read().unwrap(), winner);
+                    eprintln!(
+                        "raw process oracle backend={} staging={staging} multipart={multipart} same={same} simultaneous={simultaneous} results={results:?}",
+                        if rustfs { "RustFS" } else { "Local" }
+                    );
+                }));
+                runtime
+                    .block_on(store.inner.delete(&key))
+                    .expect("cleanup owned raw key");
+                assert!(read().is_none(), "owned raw key leaked");
+                if let Err(panic) = result {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_cross_process_local_sequential_different() {
+        raw_cross_process_matrix(false, false, false);
+    }
+    #[test]
+    fn raw_cross_process_local_sequential_same() {
+        raw_cross_process_matrix(false, true, false);
+    }
+    #[test]
+    fn raw_cross_process_local_simultaneous_different() {
+        raw_cross_process_matrix(false, false, true);
+    }
+    #[test]
+    fn raw_cross_process_local_simultaneous_same() {
+        raw_cross_process_matrix(false, true, true);
+    }
+    #[test]
+    fn raw_cross_process_rustfs_sequential_different() {
+        raw_cross_process_matrix(true, false, false);
+    }
+    #[test]
+    fn raw_cross_process_rustfs_sequential_same() {
+        raw_cross_process_matrix(true, true, false);
+    }
+    #[test]
+    fn raw_cross_process_rustfs_simultaneous_different() {
+        raw_cross_process_matrix(true, false, true);
+    }
+    #[test]
+    fn raw_cross_process_rustfs_simultaneous_same() {
+        raw_cross_process_matrix(true, true, true);
+    }
+
     const STREAM_A: &str = "11111111-1111-4111-8111-111111111111";
     const STREAM_B: &str = "22222222-2222-4222-8222-222222222222";
     const OID_SHA1: &str = "abcdef0123456789abcdef0123456789abcdef01";

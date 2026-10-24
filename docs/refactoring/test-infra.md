@@ -127,6 +127,14 @@ journal 保持调用前的快照。
 `docker compose -p mega2-it -f docker/docker-compose.test.yml down -v` 再启动，
 或对该 postgres 执行 `up -V --force-recreate`。这只由该测试栈的所有者操作。
 
+## Traces 原子创建进程与协议测试
+
+`source .env.test && cargo test -p mega2 --lib jupiter::storage::trace_object_storage::tests::raw_cross_process_ -- --test-threads=1` 同时覆盖 Local 与 RustFS；`raw_cross_process_rustfs_` 是其中的 RustFS 子集。每个测试分别覆盖 raw/staging、SinglePut/Multipart，测试名区分同/不同 bytes 与顺序/同时放行。父进程通过当前单元测试二进制的 exact child selector 启动两个独立 OS 进程，child 位于私有 adapter 模块，只在实际后端 GET 返回 NotFound 后进入文件 barrier；透明 wrapper 完整转发对象与日志接口。child stdout/stderr写入自有TempDir日志，失败时由parent报告，避免嵌套摘要混入仓库测试计数。父进程核退出码、结果与最终完整 bytes；同 bytes 瞬时 WouldBlock 须在赢家退出后实际重试成功，不能当首次成功。child 有独立期限，parent guard 只回收自己启动的进程。
+
+RustFS 使用本页固定镜像、公开测试凭据及 `mega2` 桶，端点来自 `MEGA2_IT_RUSTFS_URL`，默认 `http://127.0.0.1:19000`。服务或桶缺失会硬失败，按规范 `mega2-it` Compose 栈启动及初始化；不 skip，也不使用生产桶。每个矩阵项生成私有 UUID raw/staging 键，结束或断言失败时删除自己的对象并验证缺失，不删除共享桶或服务。Local 后端及同步文件使用自有 TempDir。
+
+`source .env.test && cargo test -p mega2 --lib orbit::adapter::tests::traces_immutable_create_ -- --test-threads=1` 包含完整缓冲边界/输入失败/原 namespace 行为、真实 S3/GCS SDK 回环 HTTP 协议及 child standalone oracle。`traces_immutable_create_protocol_` 是该门子集，验证条件头、PUT→冲突后 HEAD、raw 原预读/末次内容比较、错误脱敏及有限 SDK 重试；它不连接真实 AWS/GCS，不能证明云部署资格。计数按唯一测试去重，不把子集或 child 嵌套执行重复算入主测试总数。实际部署资格由 [Traces 合同](traces.md) 和对应传输卡核验。
+
 ## 新服务登记 checklist
 
 新增任何测试栈服务前，必须按下列清单完成书面登记（写入本文「已登记服务」），
@@ -180,7 +188,7 @@ journal 保持调用前的快照。
 | 清理 | `docker compose -p mega2-it -f docker/docker-compose.test.yml down -v`；零残留按 project label 判定 |
 | CI 入口 | （历史登记，该 workflow 已不在仓库中）`.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MEGA2_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs、`rustfs-init`（建桶）与 git-cli 的栈；执行面含 `cargo test -p mega2 --test integration_vault`、`--test integration_website_auth`、`--test integration_git_cli`（本 job **不**跑本仓 SMTP 投递门）；job 末尾 `if: always()` 下 `-p mega2-it --profile git --profile app --profile web down -v` |
 | secret | 公开测试凭据 `rustfs` / `rustfs_secret`（仅测试栈，与 `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` 及 `.env.test.example` 对齐）；CI 对同类凭据使用 `::add-mask::` |
-| 降级 | 无客户端版本 pin 需求；本地可不启 rustfs（相关 gate 自行 skip/opt-in） |
+| 降级 | Traces `raw_cross_process_rustfs_` 与完整仓库门要求 RustFS 实际可用，缺失硬失败；其它既有 opt-in 门仍按各自声明，不得据此跳过本门 |
 
 对照锚点：`docker/docker-compose.test.yml` 的 `rustfs` / `rustfs-init` 服务块与 `networks.default`。
 

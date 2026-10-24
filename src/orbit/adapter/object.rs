@@ -18,6 +18,9 @@ impl MegaObjectStorage for ObjectStoreAdapter {
     ) -> OrbitResult<()> {
         reject_receipt_mutation(key)?;
         let path = Self::checked_path(key)?;
+        if key.namespace == ObjectNamespace::Traces {
+            return self.put_traces_create(&path, data).await;
+        }
         // Artifacts are keyed by UUID and must not depend on LFS/Git upload_strategy
         // (e.g. S3 often uses `Multipart` for LFS while we still need create-if-absent semantics).
         if matches!(key.namespace, ObjectNamespace::Artifact) {
