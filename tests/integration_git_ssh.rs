@@ -1737,6 +1737,15 @@ fn integration_git_ssh_pull_cl_ref_round_trip() {
 
 #[test]
 fn integration_git_ssh_authenticated_push_creates_cl_ref() {
+    authenticated_ssh_push_and_optional_delete(false);
+}
+
+#[test]
+fn integration_git_ssh_delete_only_removes_created_cl() {
+    authenticated_ssh_push_and_optional_delete(true);
+}
+
+fn authenticated_ssh_push_and_optional_delete(delete: bool) {
     assert!(
         !git_cli::git_cli_skip_requested(),
         "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
@@ -1855,6 +1864,19 @@ fn integration_git_ssh_authenticated_push_creates_cl_ref() {
         "expected refs/cl/* tip after authenticated SSH push, got {cl_ref}"
     );
 
+    if delete {
+        let delete_refspec = format!(":{cl_ref}");
+        git_cli::assert_git_success(
+            &git_cli::git_cli_ssh(
+                &env.case_dir,
+                &git_ssh,
+                &["-C", clone_name, "push", "origin", &delete_refspec],
+            ),
+            "delete-only SSH push must finish within the existing Git command deadline",
+        );
+        assert!(!ls_remote_cl_refs_ssh(&env.case_dir, &git_ssh, &remote).contains(&cl_ref));
+    }
+
     let status = service.shutdown_via_sigint(Duration::from_secs(10));
     assert!(
         status.success(),
@@ -1862,6 +1884,55 @@ fn integration_git_ssh_authenticated_push_creates_cl_ref() {
         read_log(&stderr_path),
     );
     git_cli::assert_process_reaped(service_pid);
+    git_cli::wait_until_port_closed(port, Duration::from_secs(5));
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_delete_only_rejects_main() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "Git runner must not skip"
+    );
+    git_cli::require_git_cli_runner();
+    let env = GitSshEnv::new();
+    let (mut service, port, _stdout_path, stderr_path, git_ssh, remote) =
+        prepare_authenticated_ssh(&env);
+    let pid = service.pid();
+    let clone_name = "delete-protected-main";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, clone_name]),
+        "clone before protected deletion",
+    );
+    let before = git_cli::git_cli_ssh(
+        &env.case_dir,
+        &git_ssh,
+        &["ls-remote", &remote, "refs/heads/main"],
+    );
+    git_cli::assert_git_success(&before, "read main before deletion");
+    assert!(!before.stdout.is_empty());
+    let rejected = git_cli::git_cli_ssh(
+        &env.case_dir,
+        &git_ssh,
+        &["-C", clone_name, "push", "origin", ":refs/heads/main"],
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("refusing to delete the main branch"),
+        "{:?}",
+        rejected
+    );
+    let after = git_cli::git_cli_ssh(
+        &env.case_dir,
+        &git_ssh,
+        &["ls-remote", &remote, "refs/heads/main"],
+    );
+    git_cli::assert_git_success(&after, "read protected main after rejection");
+    assert_eq!(before.stdout, after.stdout);
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(status.success(), "{}", read_log(&stderr_path));
+    git_cli::assert_process_reaped(pid);
     git_cli::wait_until_port_closed(port, Duration::from_secs(5));
     drop(service);
     drop(env);

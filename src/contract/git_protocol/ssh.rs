@@ -16,6 +16,7 @@ use crate::{
         lfs::lfs_structs::Link,
         protocol::{
             ServiceType, SmartSession, TransportProtocol,
+            import_refs::CommandType,
             smart::{self},
             v2,
         },
@@ -161,6 +162,7 @@ where
                     data_combined: BytesMut::new(),
                     pending_shallow_request: None,
                     exit_code: None,
+                    receive_pack: ReceivePackProgress::default(),
                 },
             );
             out.data(advertise.freeze())?;
@@ -211,6 +213,52 @@ fn take_ready_request(state: Option<&mut GitSshChannelState>, data: &[u8]) -> Op
                 Some(take_complete_upload_pack_request(&mut state.data_combined))
             } else {
                 None
+            }
+        }
+    }
+}
+
+fn receive_pack_delete_only_ready(state: &mut GitSshChannelState) -> bool {
+    if state.receive_pack.wait_for_eof || state.receive_pack.finished {
+        return false;
+    }
+    let data = &state.data_combined;
+    loop {
+        let offset = state.receive_pack.command_offset;
+        let Some(header) = data.get(offset..offset + 4) else {
+            return false;
+        };
+        let length = std::str::from_utf8(header)
+            .ok()
+            .and_then(|header| usize::from_str_radix(header, 16).ok());
+        match length {
+            Some(0) => {
+                // Inspect commands once; never rescan or copy a growing PACK.
+                state.receive_pack.wait_for_eof = true;
+                if offset == 0 || offset + 4 != data.len() {
+                    return false;
+                }
+                let mut parser = state.smart_protocol.clone();
+                return parser
+                    .split_receive_pack_request(Bytes::copy_from_slice(data))
+                    .is_ok_and(|(commands, pack)| {
+                        pack.is_empty()
+                            && !commands.is_empty()
+                            && commands.iter().all(|command| {
+                                command.command_type == CommandType::Delete
+                                    && !command.ref_name.is_empty()
+                            })
+                    });
+            }
+            Some(length) if length >= 4 => {
+                if data.len() - offset < length {
+                    return false;
+                }
+                state.receive_pack.command_offset += length;
+            }
+            _ => {
+                state.receive_pack.wait_for_eof = true;
+                return false;
             }
         }
     }
@@ -315,6 +363,13 @@ pub struct SshServer {
     pub authenticated_user: Option<String>,
 }
 
+#[derive(Clone, Default)]
+struct ReceivePackProgress {
+    command_offset: usize,
+    wait_for_eof: bool,
+    finished: bool,
+}
+
 #[derive(Clone)]
 pub struct GitSshChannelState {
     pub smart_protocol: SmartSession,
@@ -322,6 +377,7 @@ pub struct GitSshChannelState {
     /// Wants/depth from a v0 shallow-info round; SSH sends only `done` next.
     pub pending_shallow_request: Option<Bytes>,
     pub exit_code: Option<u32>,
+    receive_pack: ReceivePackProgress,
 }
 
 impl server::Server for SshServer {
@@ -527,6 +583,7 @@ impl server::Handler for SshServer {
                             data_combined: BytesMut::new(),
                             pending_shallow_request: None,
                             exit_code: None,
+                            receive_pack: ReceivePackProgress::default(),
                         },
                     );
                     session.data(channel, v2_adv.to_vec())?;
@@ -897,9 +954,21 @@ where
         );
         return Ok(());
     };
+    if state.receive_pack.finished {
+        return Ok(());
+    }
     tracing::info!(channel = ?key, "receiving data length:{}", data.len());
     if let Some(request) = take_ready_request(Some(state), data) {
         handle_upload_pack(state, api_state, &request, out).await;
+    } else if state.exit_code.is_none()
+        && state.smart_protocol.service_type == ServiceType::ReceivePack
+        && receive_pack_delete_only_ready(state)
+    {
+        state.receive_pack.finished = true;
+        handle_receive_pack(state, api_state, out).await;
+        out.exit_status_request(state.exit_code.unwrap_or(0))?;
+        out.eof()?;
+        return out.close();
     }
     out.channel_success()
 }
@@ -917,6 +986,9 @@ where
 {
     let mut state = channels.remove(&key);
     if let Some(state) = state.as_mut() {
+        if state.receive_pack.finished {
+            return Ok(());
+        }
         match state.smart_protocol.service_type {
             ServiceType::ReceivePack => handle_receive_pack(state, api_state, out).await,
             ServiceType::UploadPack => {
@@ -1236,7 +1308,271 @@ mod tests {
             data_combined: BytesMut::new(),
             pending_shallow_request: None,
             exit_code: None,
+            receive_pack: ReceivePackProgress::default(),
         }
+    }
+
+    fn receive_pack_test_state() -> GitSshChannelState {
+        let mut state = upload_pack_state();
+        state.smart_protocol.service_type = ServiceType::ReceivePack;
+        state
+    }
+
+    fn receive_pack_test_request(commands: &[(&str, &str, &str)]) -> Bytes {
+        let mut request = BytesMut::new();
+        for (index, (old, new, name)) in commands.iter().enumerate() {
+            let capabilities = if index == 0 { "\0report-status" } else { "" };
+            smart::add_pkt_line_string(&mut request, format!("{old} {new} {name}{capabilities}\n"));
+        }
+        request.extend_from_slice(smart::PKT_LINE_END_MARKER);
+        request.freeze()
+    }
+
+    async fn seed_receive_pack_ref(server: &SshServer, name: &str, old: &str) {
+        server
+            .state
+            .storage
+            .mono_storage()
+            .save_refs(
+                crate::callisto::mega_refs::Model {
+                    id: crate::common::utils::generate_id(),
+                    path: "/".to_owned(),
+                    ref_name: name.to_owned(),
+                    ref_commit_hash: old.to_owned(),
+                    ref_tree_hash: "2".repeat(40),
+                    created_at: Utc::now().naive_utc(),
+                    updated_at: Utc::now().naive_utc(),
+                    is_cl: name.starts_with("refs/cl/"),
+                },
+                None,
+            )
+            .await
+            .expect("seed receive ref");
+    }
+
+    fn recorded_data(out: &RecordedOut) -> Vec<u8> {
+        out.events
+            .iter()
+            .filter_map(|event| match event {
+                RecordedEvent::Data(bytes) => Some(bytes.as_ref()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn receive_pack_delete_only_completes_before_eof_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = ssh_server_with_git(temp.path(), GitConfig::default()).await;
+        let old = "1".repeat(40);
+        let name = "refs/cl/delete-before-eof";
+        seed_receive_pack_ref(&server, name, &old).await;
+        let request = receive_pack_test_request(&[(&old, &"0".repeat(40), name)]);
+        let mut channels = HashMap::from([(7_u32, receive_pack_test_state())]);
+        let mut out = RecordedOut::default();
+        on_channel_data(&mut channels, 7, &server.state, &request, &mut out)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(recorded_data(&out))
+                .unwrap()
+                .contains(&format!("ok {name}")),
+            "report-status must arrive before client EOF: {:?}",
+            out.events
+        );
+        assert!(
+            server
+                .state
+                .storage
+                .mono_storage()
+                .get_ref_by_name(name)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let event_count = out.events.len();
+        on_channel_data(&mut channels, 7, &server.state, &request, &mut out)
+            .await
+            .unwrap();
+        finish_channel_eof(&mut channels, 7, true, &server.state, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.events.len(),
+            event_count,
+            "no response or transaction replay after completion"
+        );
+        assert!(channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn receive_pack_delete_only_fragmented_commands_and_flush() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = ssh_server_with_git(temp.path(), GitConfig::default()).await;
+        let old = "1".repeat(40);
+        let zero = "0".repeat(40);
+        let names = ["refs/cl/fragment-one", "refs/cl/fragment-two"];
+        for name in names {
+            seed_receive_pack_ref(&server, name, &old).await;
+        }
+        let request =
+            receive_pack_test_request(&[(&old, &zero, names[0]), (&old, &zero, names[1])]);
+        let mut channels = HashMap::from([(7_u32, receive_pack_test_state())]);
+        let mut out = RecordedOut::default();
+        for (index, byte) in request.iter().enumerate() {
+            on_channel_data(&mut channels, 7, &server.state, &[*byte], &mut out)
+                .await
+                .unwrap();
+            if index + 1 < request.len() {
+                assert!(
+                    recorded_data(&out).is_empty(),
+                    "partial command/flush must not execute"
+                );
+            }
+        }
+        let report = String::from_utf8(recorded_data(&out)).unwrap();
+        for name in names {
+            assert!(report.contains(&format!("ok {name}")), "{report}");
+            assert!(
+                server
+                    .state
+                    .storage
+                    .mono_storage()
+                    .get_ref_by_name(name)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let count = recorded_data(&out).len();
+        finish_channel_eof(&mut channels, 7, true, &server.state, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(recorded_data(&out).len(), count);
+        assert!(channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn receive_pack_delete_only_incomplete_invalid_and_pack_requests_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = ssh_server_with_git(temp.path(), GitConfig::default()).await;
+        let old = "1".repeat(40);
+        let zero = "0".repeat(40);
+        let name = "refs/cl/must-remain";
+        seed_receive_pack_ref(&server, name, &old).await;
+        let valid = receive_pack_test_request(&[(&old, &zero, name)]);
+        let requests = [
+            Bytes::from_static(b"0000"),
+            Bytes::from_static(b"zzzz0000"),
+            receive_pack_test_request(&[("invalid", &zero, name)]),
+            valid.slice(..valid.len() - 1),
+            receive_pack_test_request(&[(&zero, &old, "refs/heads/new")]),
+            receive_pack_test_request(&[(&old, &"3".repeat(40), "refs/heads/update")]),
+            receive_pack_test_request(&[(&old, &zero, name), (&zero, &old, "refs/heads/new")]),
+            Bytes::from([valid.as_ref(), b"PACK"].concat()),
+        ];
+        for request in requests {
+            let mut channels = HashMap::from([(7_u32, receive_pack_test_state())]);
+            let mut out = RecordedOut::default();
+            on_channel_data(&mut channels, 7, &server.state, &request, &mut out)
+                .await
+                .unwrap();
+            assert!(
+                recorded_data(&out).is_empty(),
+                "must await EOF: {:?}",
+                out.events
+            );
+            assert_eq!(
+                channels.get(&7).unwrap().data_combined.as_ref(),
+                request.as_ref()
+            );
+            assert!(
+                server
+                    .state
+                    .storage
+                    .mono_storage()
+                    .get_ref_by_name(name)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_pack_delete_only_keeps_main_and_tag_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = ssh_server_with_git(temp.path(), GitConfig::default()).await;
+        let old = "1".repeat(40);
+        for name in [
+            crate::common::utils::MEGA_BRANCH_NAME,
+            "refs/tags/protected",
+        ] {
+            seed_receive_pack_ref(&server, name, &old).await;
+            let request = receive_pack_test_request(&[(&old, &"0".repeat(40), name)]);
+            let mut channels = HashMap::from([(7_u32, receive_pack_test_state())]);
+            let mut out = RecordedOut::default();
+            on_channel_data(&mut channels, 7, &server.state, &request, &mut out)
+                .await
+                .unwrap();
+            let report = String::from_utf8(recorded_data(&out)).unwrap();
+            assert!(report.contains(&format!("ng {name}")), "{report}");
+            assert!(
+                server
+                    .state
+                    .storage
+                    .mono_storage()
+                    .get_ref_by_name(name)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let count = out.events.len();
+            finish_channel_eof(&mut channels, 7, true, &server.state, &mut out)
+                .await
+                .unwrap();
+            assert_eq!(out.events.len(), count);
+            assert!(channels.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_pack_delete_only_cas_failure_does_not_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = ssh_server_with_git(temp.path(), GitConfig::default()).await;
+        let name = "refs/cl/moved";
+        seed_receive_pack_ref(&server, name, &"1".repeat(40)).await;
+        let request = receive_pack_test_request(&[(&"3".repeat(40), &"0".repeat(40), name)]);
+        let mut channels = HashMap::from([(7_u32, receive_pack_test_state())]);
+        let mut out = RecordedOut::default();
+        on_channel_data(&mut channels, 7, &server.state, &request, &mut out)
+            .await
+            .unwrap();
+        let report = String::from_utf8(recorded_data(&out)).unwrap();
+        assert!(
+            report.contains(&format!("ng {name}")) && report.contains("moved since advertisement"),
+            "{report}"
+        );
+        assert_eq!(
+            server
+                .state
+                .storage
+                .mono_storage()
+                .get_ref_by_name(name)
+                .await
+                .unwrap()
+                .unwrap()
+                .ref_commit_hash,
+            "1".repeat(40)
+        );
+        let count = out.events.len();
+        finish_channel_eof(&mut channels, 7, true, &server.state, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(out.events.len(), count);
+        assert!(channels.is_empty());
     }
 
     fn expected_err_packet(message: &str) -> Bytes {
@@ -2043,6 +2379,7 @@ mod tests {
             data_combined: BytesMut::new(),
             pending_shallow_request: None,
             exit_code: None,
+            receive_pack: ReceivePackProgress::default(),
         };
         let mut channel_b = GitSshChannelState {
             smart_protocol: SmartSession::new(
@@ -2053,6 +2390,7 @@ mod tests {
             data_combined: BytesMut::new(),
             pending_shallow_request: None,
             exit_code: None,
+            receive_pack: ReceivePackProgress::default(),
         };
 
         channel_a.data_combined.extend_from_slice(b"payload-a");

@@ -1,3 +1,11 @@
+> **FIX10代码审查R1事实与文档订正（2026-10-24，最终输入R2待）：** 本地Claude session `235da2d1-f225-4c03-a85c-e84971911a44`，exit0，ER05/H0/最终VERDICT均PASS，无P0/P1；输出SHA256 `a5380d528ff218fe57c31644581059fd5ad0c172611ad65ce5426610ba1ede2a`。root选择在发布前关闭P2-A～C：订正陈旧RED/GREEN待执行文字，恢复误插FIX10的历史快照原文并保留当前依赖边，对齐Granularity写集措辞；上述变更另行R2审查，源码及A1输入不变，不冒用R1覆盖改后文档。root具名接受P2-D：头长度解析允许前导+但最终原解析器拒绝，至多回原EOF路径；P2-E：缺权限由未改exec入口先拒绝，现有完整SSH进程目标在最终C实跑，早处理不绕过此入口。无新scope/waiver。C/版本/提交/推送/D均未执行。
+
+> **FIX10本地A/B结果（2026-10-24，代码ER05待）：** 独立clone单生产文件SSH修复候选完成；旧源handler RED1PASS/4FAIL、真实Docker Git RED0PASS/2FAIL（原90秒期限）已保存。相同新测试GREEN5/5、真实Git2/2、完整SSH模块34/34，0failed/0ignored；nightly fmt、strict all-targets/all-features clippy、release build均exit0。原19项HTTP/SSH/PUSH/LFS smoke 19PASS/0FAIL/0skip，HTTP OpenAPI200/3.1.0/96paths、SSH就绪实测；自有服务exit0、DB/Redis键/容器/目录均清理，无source/runner漂移。A1 terminal SHA256 `bdfd4f90cb34791337ab0dbb84d9eaeae9c70c19db6fa050b304f2ec97b6f330`，原件`/tmp/fix-mtr10-A1-20261024/`；smoke log SHA256 `addaaa247a9809959889bd54deb08267e79c48c195f0e0372afd5a166624a59b`，原件`/tmp/fix-mtr10-entry-20261024/`。原始A/B不替代最终C：本卡尚无代码ER05、版本bump、签名提交、推送、tag/Release或D。原FIX07候选仍冻结/blocked，未随本卡发布。两仓当前完成数仍11/0/11，Libra不push。
+
+> **FIX10计划采纳事实（2026-10-24）：** 本地Claude R2 session `9057479b-c960-44fc-ad17-5f38715acd2f`、exit0，ER03/H0及最终VERDICT: PASS；输出SHA256 `7caa7cc57c97dadf32a5dec7c1499ea80f33405841c209143b3743bf9a2fb6b5`，manifest SHA256 `48fe01cd13f5f2d2545c9c637bdc36b8b7cfc09a67af4e197b67efcaf93f7fad`，九文件SHA守卫应用成功，仅Mega独立发布clone六文件及Libra三文件。原Mega11个FIX07候选完全冻结。R1两个P1已关闭，R1真实FAIL原件/摘要保留于`/tmp/fix-mtr10-entry-20261024/review-terminal.json`；本PASS只准入计划，不是代码ER05/C-D。root负责R2 P2-1～4本批事实同步（待代码ER05核）、P2-5未来整合候选证明原生stash/ff-only行为、P2-6本登记。新测试先运行旧源RED；源码实现、全部A/Review/C-D/提交/推送仍待。
+
+> **当前实施状态补充（FIX10候选）：** FIX07原子创建仅为原工作区的已保存源码候选，其完整smoke失败，尚未发布。普通SSH delete-only故障由独立FIX-MTR-10先修复；该卡不开放Traces传输，也不改变本文件唯一协议事实源地位。
+
 # Libra Traces v1：Git 捕获归档与 Agent 历史检索契约
 
 本文是 Mega2 与 Libra 对接的唯一协议事实源。状态为**已选定、待实现**；不表示下述路由、表、命令已上线。执行计划分别为 [Mega2 plan-20261015](../plan/plan-20261015.md) 与 [Libra plan-20261015](../../../libra/docs/development/plan/plan-20261015.md)。各仓任务卡、工程门与实际发布状态由对应计划维护；协议修订须同步两份计划并重新进行联合审查。
@@ -72,6 +80,8 @@ traces/v1/staging/<ingest-uuid>/...
 ```
 
 `traces` 是独立对象 namespace（稳定字符串 `traces`），不与 `git` 或 `agent` 共用。该 namespace 下的逻辑 key 保持完整，不按对象 key 的前 6 字节再切片，所以上面的布局就是后端路径 `traces/` 之后的内容。OID shard 由服务端从 OID 文本派生：短于 6 个 ASCII 字节时 OID 本身作为最后一段；更长时为 `aa/bb/cc/<剩余十六进制>`，恰好 6 字节时写成 `aa/bb/cc`，不产生空路径段。stream id 使用小写标准 UUID，hash kind 只接受 `sha1` 或 `sha256`，OID 只接受十六进制并按小写归档。相同字节再次写入同一 stream、hash kind 与 OID 时保持已有 payload；不同字节被拒绝。同一进程内的并发写入按这个规则串行，后到的冲突不会覆盖先写入的字节。本归档不插入 `trace_object` 行，也不要求 stream 行已经存在。
+
+**FIX-MTR-07 条件创建合同已采纳（R6本地Claude ER03/H0 PASS；原工作区候选未发布且不在FIX10发布clone源码内，正式验收以任务卡为准）：** raw/staging须在对象存储适配器使用一次逻辑`PutMode::Create`，两种upload strategy均用固定64MiB以内的完整对象条件写；SDK有限重试每次保留条件，不能回落覆盖写。受信后端合同是Local POSIX原子link/EEXIST、S3 `If-None-Match: *`及GCS generation=0；S3的304/409/412及GCS的412映射AlreadyExists后只做一次逻辑HEAD，存在才由raw层读回逐字节判幂等/冲突，仍不存在返回非完整性、非NotFound的可重试Io WouldBlock；HEAD其它错误静态传播，不转WouldBlock。赢家创建可见后的同bytes重试须成功，不同bytes仍为ObjectIntegrity；不重置97的原始时钟/计数，后继调用方在原请求预算内处理可重试结果。输入/后端可观察失败使用静态无key/payload错误，不打印任意服务端正文。返回成功却不履行条件合同的失信服务在支持范围之外，代码不宣称能够识别任意假成功；也不由此把云后端一概禁用。Local实际文件系统、固定RustFS部署、S3/GCS协议fixture分别取证，不将fixture等同live云验收。root/MTR98核所有新raw/staging消费路径；root/MTR11/92/12/H1须对每个实际部署端点登记具名conformance收据，未知/失败端点不可启用；不能以Local-only交付替代完整计划。未使用的bounded/metadata/log/presigned写路由不在本卡保证内，staging合法清理仍允许。权威验收为[FIX-MTR-07](../plan/plan-20261015.md)新增8AC/7VER，原HEAD/SSOT历史候选和失败不得倒写为已通过。R6审查输出SHA256 `50022225aa0a7c6065489c7f9e4800d79ca042c0f73239fb4bbf922cd56458bd`，manifest SHA256 `28b47b4c139118284b37987329917b2425e78079bbdaecb08f10102d68258d69`；仅计划采纳，不作代码PASS。
 
 对象 key 由服务端派生，客户端不能指定 object key。对象字节可以在同一 stream 内去重；查询或 delta base 不允许从全局 `git/` 或别的 stream 回退查找。字节已落存储不等于对象已对客户端可见；只有已发布 membership 且从本 stream ref 可达的对象才可成为读/pack/want/delta 的依据。
 
