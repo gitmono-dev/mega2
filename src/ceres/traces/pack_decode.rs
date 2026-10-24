@@ -42,6 +42,8 @@ pub enum PackError {
     Trailing,
     #[error("pack object size overflows the platform width")]
     SizeOverflow,
+    #[error("pack exceeds its {0} budget")]
+    Budget(&'static str),
     #[error("inflated object size {actual} differs from the declared {declared}")]
     Size { declared: usize, actual: usize },
     #[error("inflate failed: {0}")]
@@ -62,6 +64,30 @@ pub trait PackSink {
     fn object_header(&mut self, object_type: ObjectType, size: usize) -> Result<(), PackError>;
     fn object_chunk(&mut self, chunk: &[u8]) -> Result<(), PackError>;
     fn object_end(&mut self) -> Result<(), PackError>;
+
+    /// Upper bound for the next inflated chunk. `None` means the sink accepts
+    /// the decoder's default chunk size.
+    fn chunk_limit(&self) -> Option<usize> {
+        None
+    }
+}
+
+impl<T: PackSink + ?Sized> PackSink for &mut T {
+    fn object_header(&mut self, object_type: ObjectType, size: usize) -> Result<(), PackError> {
+        (**self).object_header(object_type, size)
+    }
+
+    fn object_chunk(&mut self, chunk: &[u8]) -> Result<(), PackError> {
+        (**self).object_chunk(chunk)
+    }
+
+    fn object_end(&mut self) -> Result<(), PackError> {
+        (**self).object_end()
+    }
+
+    fn chunk_limit(&self) -> Option<usize> {
+        (**self).chunk_limit()
+    }
 }
 
 /// What a successful decode observed.
@@ -129,11 +155,15 @@ where
     };
     sink.object_header(object_type, size)?;
     let mut inflater = ReadBoxed::new_with_kind(&mut *reader, object_type, size, kind)?;
-    let chunk = MAX_SINK_CHUNK.min(size.max(1));
-    let mut buffer = vec![0u8; chunk];
+    let mut buffer = vec![0u8; MAX_SINK_CHUNK.min(size.max(1))];
     let mut inflated = 0usize;
     loop {
-        match inflater.read(&mut buffer) {
+        let limit = sink
+            .chunk_limit()
+            .map(|limit| limit.min(buffer.len()))
+            .unwrap_or(buffer.len())
+            .max(1);
+        match inflater.read(&mut buffer[..limit]) {
             Ok(0) => break,
             Ok(read) => {
                 inflated += read;
@@ -543,6 +573,34 @@ mod tests {
         (objects, pack)
     }
 
+    fn single_blob_pack(kind: HashKind, bytes: &[u8]) -> Vec<u8> {
+        let dir = tempfile::tempdir().expect("temp repo");
+        let format = match kind {
+            HashKind::Sha1 => "sha1",
+            HashKind::Sha256 => "sha256",
+            HashKind::Blake3 => panic!("git does not support blake3 packs"),
+        };
+        git(dir.path(), &["init", "-q", "--object-format", format], b"");
+        let oid = git(
+            dir.path(),
+            &["hash-object", "-w", "-t", "blob", "--stdin"],
+            bytes,
+        );
+        let input = String::from_utf8(oid).expect("oid");
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "pack-objects",
+                "--stdout",
+            ],
+            input.trim().as_bytes(),
+        )
+    }
+
     fn decode(kind: HashKind, pack: &[u8]) -> Result<Decoded, PackError> {
         let mut sink = CollectSink::default();
         let summary = decode_pack(pack, kind, &mut sink)?;
@@ -755,5 +813,191 @@ mod tests {
             decode(HashKind::Sha1, &pack),
             Err(PackError::Truncated)
         ));
+    }
+    #[tokio::test]
+    async fn wire_ingest_budget_stops_real_streams_at_each_limit() {
+        use crate::ceres::traces::admission::{BoundedPackSink, IngestAdmission, PackBudget};
+
+        let (_, pack) = real_pack(HashKind::Sha1, false);
+
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct ObservedInput<'a> {
+            bytes: &'a [u8],
+            read: Arc<AtomicUsize>,
+        }
+        impl tokio::io::AsyncRead for ObservedInput<'_> {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                out: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let count = out.remaining().min(self.bytes.len());
+                out.put_slice(&self.bytes[..count]);
+                self.bytes = &self.bytes[count..];
+                self.read.fetch_add(count, Ordering::Relaxed);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        for limit in [
+            8,
+            pack.len() as u64 - 1,
+            pack.len() as u64,
+            pack.len() as u64 + 1,
+        ] {
+            let mut admission = IngestAdmission::start();
+            let read = Arc::new(AtomicUsize::new(0));
+            let source = ObservedInput {
+                bytes: &pack,
+                read: read.clone(),
+            };
+            let budget = PackBudget::for_test(limit, u64::MAX, u64::MAX, u64::MAX, u64::MAX, 300);
+            let result = crate::ceres::traces::ingest::decode_wire_pack_with_budget(
+                &mut admission,
+                HashKind::Sha1,
+                source,
+                budget,
+            )
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                limit >= pack.len() as u64,
+                "compressed limit {limit}: {result:?}"
+            );
+            assert!(
+                read.load(Ordering::Relaxed) as u64 <= limit + 1,
+                "at most one EOF probe beyond the delivered budget"
+            );
+        }
+
+        // The object limit is inclusive; one less than the payload is rejected.
+        let single = single_blob_pack(HashKind::Sha1, b"plain\n");
+        let object_size = expected_first_object_size(&single);
+        for (limit, accepted) in [(object_size, true), (object_size - 1, false)] {
+            let mut admission = IngestAdmission::start();
+            let mut sink = CollectSink::default();
+            let budget = PackBudget::for_test(u64::MAX, u64::MAX, limit, u64::MAX, u64::MAX, 300);
+            let mut bounded = BoundedPackSink::new(&mut sink, &mut admission, budget);
+            let outcome = decode_pack(&single[..], HashKind::Sha1, &mut bounded);
+            assert_eq!(
+                outcome.is_ok(),
+                accepted,
+                "object limit {limit}: {outcome:?}"
+            );
+        }
+
+        // Object count: one object only.
+        let mut admission = IngestAdmission::start();
+        let mut sink = CollectSink::default();
+        let budget = PackBudget::for_test(u64::MAX, u64::MAX, u64::MAX, 1, u64::MAX, 300);
+        let mut bounded = BoundedPackSink::new(&mut sink, &mut admission, budget);
+        assert!(matches!(
+            decode_pack(&pack[..], HashKind::Sha1, &mut bounded),
+            Err(PackError::Budget("objects"))
+        ));
+        assert_eq!(sink.entries.len(), 1, "no second object reaches the sink");
+
+        for limit in [0, 1] {
+            let mut admission = IngestAdmission::start();
+            let budget = PackBudget::for_test(u64::MAX, u64::MAX, u64::MAX, limit, u64::MAX, 300);
+            let result = crate::ceres::traces::ingest::decode_wire_pack_with_budget(
+                &mut admission,
+                HashKind::Sha1,
+                &single[..],
+                budget,
+            )
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                limit == 1,
+                "inclusive object count boundary"
+            );
+            if let Ok(decoded) = result {
+                assert_eq!(decoded.object_count(), 1);
+            }
+        }
+        for limit in [0, 1] {
+            let mut admission = IngestAdmission::start();
+            let budget = PackBudget::for_test(u64::MAX, u64::MAX, u64::MAX, u64::MAX, limit, 300);
+            let result = crate::ceres::traces::ingest::decode_wire_pack_with_budget(
+                &mut admission,
+                HashKind::Sha1,
+                &pack[..],
+                budget,
+            )
+            .await;
+            assert_eq!(result.is_ok(), limit == 1, "inclusive new commit boundary");
+        }
+
+        // New commits: this fixture carries one commit.
+        let mut admission = IngestAdmission::start();
+        let mut sink = CollectSink::default();
+        let budget = PackBudget::for_test(u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0, 300);
+        let mut bounded = BoundedPackSink::new(&mut sink, &mut admission, budget);
+        assert!(matches!(
+            decode_pack(&pack[..], HashKind::Sha1, &mut bounded),
+            Err(PackError::Budget("new commits"))
+        ));
+        assert!(
+            sink.entries
+                .iter()
+                .all(|(kind, _)| *kind != ObjectType::Commit)
+        );
+
+        // Decoded bytes: stop before the whole pack is inflated.
+        let mut admission = IngestAdmission::start();
+        let mut sink = CollectSink::default();
+        let budget = PackBudget::for_test(u64::MAX, 1, u64::MAX, u64::MAX, u64::MAX, 300);
+        let mut bounded = BoundedPackSink::new(&mut sink, &mut admission, budget);
+        assert!(matches!(
+            decode_pack(&pack[..], HashKind::Sha1, &mut bounded),
+            Err(PackError::Budget("decoded bytes"))
+        ));
+        assert!(sink.entries.is_empty());
+        assert!(sink.current.is_empty(), "over-budget bytes are not written");
+        for limit in [object_size - 1, object_size] {
+            let mut admission = IngestAdmission::start();
+            let mut sink = CollectSink::default();
+            let budget = PackBudget::for_test(u64::MAX, limit, u64::MAX, u64::MAX, u64::MAX, 300);
+            let mut bounded = BoundedPackSink::new(&mut sink, &mut admission, budget);
+            let result = decode_pack(&single[..], HashKind::Sha1, &mut bounded);
+            assert_eq!(
+                result.is_ok(),
+                limit == object_size,
+                "inclusive expanded limit"
+            );
+            if result.is_err() {
+                assert!(sink.entries.is_empty());
+                assert!(sink.current.is_empty());
+            }
+        }
+
+        // Cancellation stops the same loop.
+        let mut admission = IngestAdmission::start();
+        admission.cancel();
+        let mut sink = CollectSink::default();
+        let mut bounded = BoundedPackSink::new(&mut sink, &mut admission, PackBudget::fixed());
+        assert!(matches!(
+            decode_pack(&pack[..], HashKind::Sha1, &mut bounded),
+            Err(PackError::Budget("deadline"))
+        ));
+    }
+
+    fn expected_first_object_size(pack: &[u8]) -> u64 {
+        let mut reader = std::io::Cursor::new(pack);
+        let mut header = [0u8; 12];
+        reader.read_exact(&mut header).expect("header");
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).expect("object header");
+        let mut size = u64::from(byte[0] & 0x0f);
+        let mut shift = 4u32;
+        while byte[0] & 0x80 != 0 {
+            reader.read_exact(&mut byte).expect("size");
+            size |= u64::from(byte[0] & 0x7f) << shift;
+            shift += 7;
+        }
+        size
     }
 }

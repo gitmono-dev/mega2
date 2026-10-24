@@ -45,6 +45,38 @@ fn admit(budget: UnpackBudget) -> Result<(), MegaError> {
     Ok(())
 }
 
+/// Decode one wire PACK under the fixed budget.
+///
+/// Nothing is written to the object store. Tree hashes are local budget
+/// indexes; later publication must verify object identities independently.
+pub async fn decode_wire_pack<R: tokio::io::AsyncRead + Unpin>(
+    admission: &mut IngestAdmission,
+    kind: git_internal::hash::HashKind,
+    pack: R,
+) -> Result<admission::BoundedDecodedPack, MegaError> {
+    admission::decode_wire_pack(admission, kind, pack, None).await
+}
+
+/// Decode with the original ingest clock and a shared cancellation signal.
+pub async fn decode_wire_pack_with_control<R: tokio::io::AsyncRead + Unpin>(
+    admission: &mut IngestAdmission,
+    kind: git_internal::hash::HashKind,
+    pack: R,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<admission::BoundedDecodedPack, MegaError> {
+    admission::decode_wire_pack(admission, kind, pack, Some(cancel)).await
+}
+
+#[cfg(test)]
+pub(super) async fn decode_wire_pack_with_budget<R: tokio::io::AsyncRead + Unpin>(
+    admission: &mut IngestAdmission,
+    kind: git_internal::hash::HashKind,
+    pack: R,
+    budget: admission::PackBudget,
+) -> Result<admission::BoundedDecodedPack, MegaError> {
+    admission::decode_wire_pack_with_budget(admission, kind, pack, budget).await
+}
+
 /// Verify OIDs and write the objects to ingest quarantine.
 ///
 /// A budget overrun or a bad OID writes nothing further and does not publish.
@@ -185,6 +217,58 @@ fn tree_depth(hash_kind: &str, objects: &[LooseObject]) -> Result<u64, MegaError
     })
 }
 
+/// Longest in-pack tree chain, using a local OID index only for depth
+/// accounting. The derived OIDs are never exposed or treated as identity.
+pub(super) fn decoded_tree_depth(
+    kind: git_internal::hash::HashKind,
+    entries: &[(git_internal::internal::object::types::ObjectType, Vec<u8>)],
+    limit: u64,
+    control: &admission::PackControl,
+) -> Result<u64, MegaError> {
+    use std::collections::HashMap;
+
+    use git_internal::{internal::object::types::ObjectType, utils::HashAlgorithm};
+
+    control.check()?;
+    let hash_len = match kind {
+        git_internal::hash::HashKind::Sha1 => 20usize,
+        git_internal::hash::HashKind::Sha256 => 32usize,
+        git_internal::hash::HashKind::Blake3 => return Err(rejected()),
+    };
+    let mut index = HashMap::new();
+    let mut starts = Vec::new();
+    for (idx, (object_type, payload)) in entries.iter().enumerate() {
+        if *object_type != ObjectType::Tree {
+            continue;
+        }
+        control.check()?;
+        let mut hasher = HashAlgorithm::new_for_kind(kind);
+        hasher.update(format!("tree {}\0", payload.len()).as_bytes());
+        for chunk in payload.chunks(super::pack_decode::MAX_SINK_CHUNK) {
+            control.check()?;
+            hasher.update(chunk);
+        }
+        index.insert(hasher.finalize(), idx);
+        starts.push(idx);
+    }
+    if starts.is_empty() {
+        return Ok(0);
+    }
+    let depth = bounded_depth_controlled(
+        &starts,
+        limit,
+        |idx| {
+            in_batch_tree_children_controlled(&entries[idx].1, hash_len, &index, || control.check())
+        },
+        || control.check(),
+    )?;
+    control.check()?;
+    if depth > limit {
+        return Err(budget_exceeded());
+    }
+    Ok(depth)
+}
+
 fn delta_depth(hash_kind: &str, objects: &[LooseObject]) -> Result<u64, MegaError> {
     if !objects.iter().any(|object| object.object_type == "commit") {
         return Ok(0);
@@ -215,12 +299,22 @@ enum ChainDepth {
 fn bounded_depth(
     starts: &[usize],
     limit: u64,
+    links: impl FnMut(usize) -> Result<Vec<usize>, MegaError>,
+) -> Result<u64, MegaError> {
+    bounded_depth_controlled(starts, limit, links, || Ok(()))
+}
+
+fn bounded_depth_controlled(
+    starts: &[usize],
+    limit: u64,
     mut links: impl FnMut(usize) -> Result<Vec<usize>, MegaError>,
+    mut check: impl FnMut() -> Result<(), MegaError>,
 ) -> Result<u64, MegaError> {
     let mut memo = HashMap::new();
     let mut visiting = HashSet::new();
     let mut deepest = 0u64;
     for &start in starts {
+        check()?;
         visiting.clear();
         match depth_at(
             start,
@@ -228,6 +322,7 @@ fn bounded_depth(
             &mut links,
             &mut memo,
             &mut visiting,
+            &mut check,
         )? {
             ChainDepth::Over => return Ok(limit.saturating_add(1)),
             ChainDepth::Exact(height) if height > limit => return Ok(height),
@@ -243,7 +338,9 @@ fn depth_at(
     links: &mut impl FnMut(usize) -> Result<Vec<usize>, MegaError>,
     memo: &mut HashMap<usize, u64>,
     visiting: &mut HashSet<usize>,
+    check: &mut impl FnMut() -> Result<(), MegaError>,
 ) -> Result<ChainDepth, MegaError> {
+    check()?;
     if frames_left == 0 {
         return Ok(ChainDepth::Over);
     }
@@ -255,7 +352,7 @@ fn depth_at(
     }
     let mut height = 1u64;
     for child in links(idx)? {
-        match depth_at(child, frames_left - 1, links, memo, visiting)? {
+        match depth_at(child, frames_left - 1, links, memo, visiting, check)? {
             ChainDepth::Over => {
                 visiting.remove(&idx);
                 return Ok(ChainDepth::Over);
@@ -275,11 +372,31 @@ fn in_batch_tree_children(
     hash_len: usize,
     index: &HashMap<Vec<u8>, usize>,
 ) -> Result<Vec<usize>, MegaError> {
+    in_batch_tree_children_controlled(payload, hash_len, index, || Ok(()))
+}
+
+fn in_batch_tree_children_controlled(
+    payload: &[u8],
+    hash_len: usize,
+    index: &HashMap<Vec<u8>, usize>,
+    mut check: impl FnMut() -> Result<(), MegaError>,
+) -> Result<Vec<usize>, MegaError> {
     let mut seen = HashSet::new();
     let mut children = Vec::new();
     let mut rest = payload;
     while !rest.is_empty() {
-        let Some(nul) = rest.iter().position(|byte| *byte == 0) else {
+        check()?;
+        let mut found = None;
+        let mut offset = 0;
+        for chunk in rest.chunks(super::pack_decode::MAX_SINK_CHUNK) {
+            check()?;
+            if let Some(nul) = chunk.iter().position(|byte| *byte == 0) {
+                found = Some(offset + nul);
+                break;
+            }
+            offset += chunk.len();
+        }
+        let Some(nul) = found else {
             return Err(rejected());
         };
         let hash_end = nul.checked_add(1 + hash_len).ok_or_else(rejected)?;
@@ -1577,5 +1694,221 @@ mod tests {
                 .expect("membership"),
             0
         );
+    }
+    fn small_pack() -> Vec<u8> {
+        use git_internal::utils::HashAlgorithm;
+        let mut pack = b"PACK\x00\x00\x00\x02\x00\x00\x00\x01".to_vec();
+        pack.push(0x31);
+        pack.extend([0x78, 0x9c, 0x4b, 0x04, 0x00, 0x00, 0x62, 0x00, 0x62]);
+        let mut hasher = HashAlgorithm::new_for_kind(HashKind::Sha1);
+        hasher.update(&pack);
+        pack.extend(hasher.finalize());
+        pack
+    }
+
+    #[tokio::test]
+    async fn wire_ingest_quarantine_over_budget_publishes_nothing() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
+
+        use crate::{
+            callisto::{trace_object, trace_principal, trace_stream, trace_target},
+            ceres::traces::admission::{IngestAdmission, PackBudget},
+            orbit_api::factory::{LocalConfig, ObjectStorageConfig},
+        };
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = crate::jupiter::tests::test_db_connection(dir.path()).await;
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .expect("migrations");
+        let store =
+            crate::jupiter::storage::object_storage::build_object_storage(&ObjectStorageConfig {
+                local: LocalConfig {
+                    root_dir: dir.path().join("objects").to_string_lossy().into_owned(),
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("real filesystem storage");
+        let principal = uuid::Uuid::new_v4().to_string();
+        let target = uuid::Uuid::new_v4().to_string();
+        let stream = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().fixed_offset();
+        trace_principal::ActiveModel {
+            id: Set(principal.clone()),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("principal");
+        trace_target::ActiveModel {
+            id: Set(target.clone()),
+            target_kind: Set("native".to_owned()),
+            project_path: Set(format!("/wire-budget/{target}")),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("target");
+        trace_stream::ActiveModel {
+            id: Set(stream.clone()),
+            principal_id: Set(principal),
+            target_id: Set(target),
+            source_repo_id: Set("wire-budget-fixture".to_owned()),
+            epoch_id: Set(uuid::Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("stream");
+        let existing = b"already-published";
+        let existing_oid = oid(HashKind::Sha1, ObjectType::Blob, existing);
+        put_raw(&store, &stream, "sha1", &existing_oid, existing)
+            .await
+            .expect("seed published raw");
+        let membership = trace_object::ActiveModel {
+            id: Set(uuid::Uuid::new_v4().to_string()),
+            stream_id: Set(stream.clone()),
+            hash_kind: Set("sha1".to_owned()),
+            oid: Set(existing_oid.clone()),
+            visible: Set(true),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("published membership");
+        let before = trace_object::Entity::find()
+            .all(&db)
+            .await
+            .expect("before memberships");
+        assert_eq!(before, vec![membership]);
+        let pack = small_pack();
+        let mut admission = IngestAdmission::start();
+        let budget = PackBudget::for_test(u64::MAX, 0, u64::MAX, u64::MAX, u64::MAX, 300);
+        let error = decode_wire_pack_with_budget(&mut admission, HashKind::Sha1, &pack[..], budget)
+            .await
+            .expect_err("over-budget decode fails");
+        assert!(matches!(
+            error,
+            MegaError::Traces(TracesError::ResponseBudget)
+        ));
+        assert_eq!(
+            get_raw(&store, &stream, "sha1", &existing_oid)
+                .await
+                .expect("durable read"),
+            Some(existing.to_vec())
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .all(&db)
+                .await
+                .expect("after memberships"),
+            before
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .count(&db)
+                .await
+                .expect("count"),
+            1
+        );
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str], input: &[u8]) -> Vec<u8> {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let mut child = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn git");
+        child
+            .stdin
+            .take()
+            .expect("git stdin")
+            .write_all(input)
+            .expect("write stdin");
+        let output = child.wait_with_output().expect("git output");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// A real pack holding `depth` nested trees.
+    fn nested_tree_pack(depth: usize) -> Vec<u8> {
+        let dir = tempfile::TempDir::new().expect("temp repo");
+        run_git(dir.path(), &["init", "-q", "--object-format", "sha1"], b"");
+        let mut oid = String::from_utf8(run_git(
+            dir.path(),
+            &["hash-object", "-w", "-t", "tree", "--stdin"],
+            b"",
+        ))
+        .expect("oid")
+        .trim()
+        .to_owned();
+        let mut oids = vec![oid.clone()];
+        for _ in 1..depth {
+            let mut payload = b"40000 d\0".to_vec();
+            payload.extend(hex_decode(&oid));
+            oid = String::from_utf8(run_git(
+                dir.path(),
+                &["hash-object", "-w", "-t", "tree", "--stdin"],
+                &payload,
+            ))
+            .expect("oid")
+            .trim()
+            .to_owned();
+            oids.push(oid.clone());
+        }
+        let input = format!("{}\n", oids.join("\n"));
+        run_git(
+            dir.path(),
+            &[
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "pack-objects",
+                "--stdout",
+            ],
+            input.as_bytes(),
+        )
+    }
+
+    #[tokio::test]
+    async fn wire_ingest_depth_over_limit_is_not_delivered() {
+        use crate::ceres::traces::admission::{IngestAdmission, PackBudget};
+
+        let pack = nested_tree_pack(3);
+        let mut admission = IngestAdmission::start();
+        let over = PackBudget::for_test(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, 300)
+            .with_tree_depth(1);
+        let error = decode_wire_pack_with_budget(&mut admission, HashKind::Sha1, &pack[..], over)
+            .await
+            .expect_err("depth over the limit is rejected");
+        assert!(matches!(
+            error,
+            MegaError::Traces(TracesError::ResponseBudget)
+        ));
+
+        let mut admission = IngestAdmission::start();
+        let ok = PackBudget::for_test(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, 300)
+            .with_tree_depth(8);
+        let decoded = decode_wire_pack_with_budget(&mut admission, HashKind::Sha1, &pack[..], ok)
+            .await
+            .expect("depth within the limit");
+        assert_eq!(decoded.object_count(), 3);
+        assert!(admission.tree_depth >= 2);
     }
 }

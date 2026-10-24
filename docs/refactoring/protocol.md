@@ -644,6 +644,8 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 **2026-10-21（MTR-100）**：SSH 在既有连接认证及 exec 解析后检查关闭开关；根 `.traces` 请求在 `SmartSession`、广告及 stdin 消费之前返回 `ERR traces locator not found`、exit status 1、EOF 并关闭通道。匹配字面路径及点段折叠，不作 HTTP 百分号解码；普通认证、普通代码分派与 storage-only receive-pack 限制不变。该守卫不启用 traces 数据面；匹配规则与实际验收边界见 [traces 协议](./traces.md) 和[执行计划](../plan/plan-20261015.md)。
 
+**2026-10-23（MTR-97 候选）**：内部 wire 解码准入采用可取消异步输入与有界解码worker；固定限额、生命周期和当前验收状态见 [traces 协议](./traces.md) 与 [MTR-97 任务卡](../plan/plan-20261015.md)。真实 HTTP/SSH 数据面仍由后继卡接线。
+
 历史建议（已落地）：
 
 - 抽出 `GitProtocolPath` parser，统一处理 repo path、`.git` suffix、service endpoint。
