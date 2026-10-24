@@ -15,6 +15,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct IngestAdmission {
     started: Instant,
+    continuation_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     worker_done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
@@ -38,6 +39,7 @@ impl IngestAdmission {
     pub fn start() -> Self {
         Self {
             started: Instant::now(),
+            continuation_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             worker_done: None,
             #[cfg(test)]
@@ -77,6 +79,8 @@ impl IngestAdmission {
     /// Cancel this worker and drop the counters it was holding.
     pub fn cancel(&mut self) {
         self.cancelled = true;
+        self.continuation_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
         self.compressed_bytes = 0;
         self.decoded_bytes = 0;
         self.objects = 0;
@@ -94,6 +98,9 @@ impl IngestAdmission {
 pub fn admit_ingest(admission: &IngestAdmission, max_object_bytes: u64) -> Result<(), MegaError> {
     let elapsed = Duration::from_secs(admission.elapsed_secs).max(admission.started.elapsed());
     if admission.cancelled
+        || admission
+            .continuation_cancel
+            .load(std::sync::atomic::Ordering::Acquire)
         || elapsed > Duration::from_secs(TracesProtocolLimits::INGEST_TIMEOUT_SECONDS)
     {
         return Err(MegaError::Traces(TracesError::QueryTimeout));
@@ -677,11 +684,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wire_ingest_lifetime_continuation_preserves_deadline_and_external_cancel() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        use crate::ceres::traces::publication::tests::Fixture;
+        let mut fixture = Fixture::new(git_internal::hash::HashKind::Sha1);
+        fixture.tree(&[]);
+        let pack = fixture.pack(None);
+        let mut admission = IngestAdmission::start();
+        admission.started = Instant::now() - Duration::from_secs(1);
+        let decoded = decode_wire_pack_with_budget(
+            &mut admission,
+            fixture.kind,
+            pack.as_slice(),
+            PackBudget::for_test(4096, 4096, 4096, 10, 10, 2),
+        )
+        .await
+        .unwrap();
+        assert!(decoded.continuation().deadline <= admission.started + Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(matches!(
+            decoded.continuation().check(),
+            Err(MegaError::Traces(TracesError::QueryTimeout))
+        ));
+        let flag = Arc::new(AtomicBool::new(false));
+        let decoded = decode_wire_pack(
+            &mut IngestAdmission::start(),
+            fixture.kind,
+            pack.as_slice(),
+            Some(flag.clone()),
+        )
+        .await
+        .unwrap();
+        let cancel = async {
+            tokio::task::yield_now().await;
+            flag.store(true, Ordering::Release);
+        };
+        let (result, ()) = tokio::join!(
+            decoded
+                .continuation()
+                .run(std::future::pending::<Result<(), MegaError>>()),
+            cancel
+        );
+        assert!(matches!(
+            result,
+            Err(MegaError::Traces(TracesError::QueryTimeout))
+        ));
+        assert!(matches!(
+            decoded.continuation().checkpoint().await,
+            Err(MegaError::Traces(TracesError::QueryTimeout))
+        ));
+    }
+
     #[test]
     fn bounded_pack_debug_does_not_expose_payload() {
         let payload = b"not-for-logs".repeat(256);
         let rendered_payload = format!("{payload:?}");
         let decoded = BoundedDecodedPack {
+            hash_kind: git_internal::hash::HashKind::Sha1,
+            continuation: IngestContinuation {
+                deadline: Instant::now() + Duration::from_secs(300),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                external_cancel: None,
+            },
             decoded_bytes: payload.len() as u64,
             objects: 1,
             entries: vec![(
@@ -788,6 +857,7 @@ pub(super) struct PackControl {
     deadline: Instant,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    request_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PackControl {
@@ -805,12 +875,14 @@ impl PackControl {
             deadline,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel: None,
+            request_cancel: admission.continuation_cancel.clone(),
         })
     }
 
     pub(super) fn check(&self) -> Result<(), MegaError> {
         use std::sync::atomic::Ordering;
         if self.stop.load(Ordering::Acquire)
+            || self.request_cancel.load(Ordering::Acquire)
             || self
                 .cancel
                 .as_ref()
@@ -880,9 +952,62 @@ impl Drop for StopWorker<'_> {
 
 /// A result can only be constructed by the controlled decode implementation.
 pub struct BoundedDecodedPack {
-    entries: Vec<(git_internal::internal::object::types::ObjectType, Vec<u8>)>,
+    entries: DecodedEntries,
     decoded_bytes: u64,
     objects: u64,
+    hash_kind: git_internal::hash::HashKind,
+    continuation: IngestContinuation,
+}
+
+pub(super) type DecodedEntries = Vec<(git_internal::internal::object::types::ObjectType, Vec<u8>)>;
+
+/// Request lifetime after the decoder has joined. Worker shutdown is separate.
+#[derive(Clone)]
+pub(crate) struct IngestContinuation {
+    deadline: Instant,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    external_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl IngestContinuation {
+    pub(crate) fn check(&self) -> Result<(), MegaError> {
+        use std::sync::atomic::Ordering;
+        if Instant::now() > self.deadline
+            || self.cancelled.load(Ordering::Acquire)
+            || self
+                .external_cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(timeout());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn checkpoint(&self) -> Result<(), MegaError> {
+        self.check()?;
+        tokio::task::yield_now().await;
+        self.check()
+    }
+
+    pub(crate) async fn run<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, MegaError>>,
+    ) -> Result<T, MegaError> {
+        self.check()?;
+        tokio::pin!(future);
+        let mut timer = tokio::time::interval(Duration::from_millis(5));
+        loop {
+            tokio::select! {
+                biased;
+                _ = timer.tick() => self.check()?,
+                result = &mut future => {
+                    self.check()?;
+                    return result;
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for BoundedDecodedPack {
@@ -905,6 +1030,20 @@ impl BoundedDecodedPack {
 
     pub fn object_count(&self) -> u64 {
         self.objects
+    }
+
+    pub(crate) fn continuation(&self) -> &IngestContinuation {
+        &self.continuation
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        git_internal::hash::HashKind,
+        DecodedEntries,
+        IngestContinuation,
+    ) {
+        (self.hash_kind, self.entries, self.continuation)
     }
 }
 
@@ -1116,6 +1255,12 @@ fn decode_worker(
                 entries: sink.inner.entries,
                 decoded_bytes: sink.decoded_bytes,
                 objects: sink.objects,
+                hash_kind: kind,
+                continuation: IngestContinuation {
+                    deadline: control.deadline,
+                    cancelled: sink.admission.continuation_cancel.clone(),
+                    external_cancel: control.cancel.clone(),
+                },
             })
         }
         Err(PackError::Budget("deadline")) => Err(timeout()),

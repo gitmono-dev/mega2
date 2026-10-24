@@ -2,9 +2,120 @@
 //! stay in `trace_object_storage`.
 
 use crate::{
-    common::errors::MegaError,
+    ceres::traces::admission::IngestContinuation,
+    common::errors::{MegaError, TracesError},
+    config::TracesProtocolLimits,
     jupiter::storage::{object_storage::MegaObjectStorageWrapper, trace_object_storage},
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawObjectType {
+    Commit,
+    Tree,
+    Blob,
+    Tag,
+}
+
+impl RawObjectType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Tree => "tree",
+            Self::Blob => "blob",
+            Self::Tag => "tag",
+        }
+    }
+}
+
+pub(crate) struct VerifiedRawObject {
+    object_type: RawObjectType,
+    bytes: Vec<u8>,
+}
+
+impl VerifiedRawObject {
+    pub(crate) fn object_type(&self) -> RawObjectType {
+        self.object_type
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+async fn hash_payload<D: sha2::Digest + Default>(
+    object_type: RawObjectType,
+    payload: &[u8],
+    control: &IngestContinuation,
+) -> Result<String, MegaError> {
+    let mut hash = D::new();
+    hash.update(format!("{} {}\0", object_type.as_str(), payload.len()).as_bytes());
+    for chunk in payload.chunks(64 * 1024) {
+        control.checkpoint().await?;
+        hash.update(chunk);
+    }
+    control.check()?;
+    Ok(hex::encode(hash.finalize()))
+}
+
+pub(crate) async fn raw_object_oid(
+    hash_kind: &str,
+    object_type: RawObjectType,
+    payload: &[u8],
+    control: &IngestContinuation,
+) -> Result<String, MegaError> {
+    if payload.len() as u64 > TracesProtocolLimits::MAX_OBJECT_BYTES {
+        return Err(MegaError::Traces(TracesError::ResponseBudget));
+    }
+    match hash_kind {
+        "sha1" => hash_payload::<sha1::Sha1>(object_type, payload, control).await,
+        "sha256" => hash_payload::<sha2::Sha256>(object_type, payload, control).await,
+        _ => Err(MegaError::Traces(TracesError::InvalidParameter)),
+    }
+}
+
+pub(crate) async fn verify_raw_object(
+    hash_kind: &str,
+    oid: &str,
+    bytes: Vec<u8>,
+    control: &IngestContinuation,
+) -> Result<VerifiedRawObject, MegaError> {
+    let width = match hash_kind {
+        "sha1" => 40,
+        "sha256" => 64,
+        _ => return Err(MegaError::Traces(TracesError::InvalidParameter)),
+    };
+    if oid.len() != width || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(MegaError::Traces(TracesError::ObjectIntegrity));
+    }
+    let mut matching = None;
+    for object_type in [
+        RawObjectType::Commit,
+        RawObjectType::Tree,
+        RawObjectType::Blob,
+        RawObjectType::Tag,
+    ] {
+        let actual = raw_object_oid(hash_kind, object_type, &bytes, control).await?;
+        if actual.eq_ignore_ascii_case(oid) && matching.replace(object_type).is_some() {
+            return Err(MegaError::Traces(TracesError::ObjectIntegrity));
+        }
+    }
+    Ok(VerifiedRawObject {
+        object_type: matching.ok_or(MegaError::Traces(TracesError::ObjectIntegrity))?,
+        bytes,
+    })
+}
+
+pub(crate) fn raw_storage_error(error: MegaError) -> MegaError {
+    match error {
+        MegaError::Traces(_) => error,
+        // A conditional-create visibility race and backend IO both fail closed.
+        _ => MegaError::Traces(TracesError::QueryTimeout),
+    }
+}
 
 /// Reads and writes raw Git bytes for one stream.
 #[derive(Clone)]
@@ -48,6 +159,59 @@ impl TraceObjectService {
     ) -> Result<Option<Vec<u8>>, MegaError> {
         trace_object_storage::read_delta_base(&self.store, stream_id, hash_kind, oid).await
     }
+
+    /// Verifies identity only; the caller must independently qualify stream membership.
+    pub(crate) async fn read_verified_raw(
+        &self,
+        stream_id: &str,
+        hash_kind: &str,
+        oid: &str,
+        control: &IngestContinuation,
+    ) -> Result<Option<VerifiedRawObject>, MegaError> {
+        use futures::StreamExt;
+
+        let key = trace_object_storage::object_key(stream_id, hash_kind, oid)?;
+        let bytes = control
+            .run(async {
+                let (mut stream, meta) = match self.store.inner.get_stream(&key).await {
+                    Ok(value) => value,
+                    Err(error) if error.is_not_found() => return Ok(None),
+                    Err(error) => return Err(raw_storage_error(error.into())),
+                };
+                let size = u64::try_from(meta.size)
+                    .map_err(|_| MegaError::Traces(TracesError::ObjectIntegrity))?;
+                if size > TracesProtocolLimits::MAX_OBJECT_BYTES {
+                    return Err(MegaError::Traces(TracesError::ResponseBudget));
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    control.checkpoint().await?;
+                    let chunk = chunk.map_err(|error| raw_storage_error(error.into()))?;
+                    let total = bytes
+                        .len()
+                        .checked_add(chunk.len())
+                        .ok_or(MegaError::Traces(TracesError::ResponseBudget))?;
+                    if total as u64 > TracesProtocolLimits::MAX_OBJECT_BYTES {
+                        return Err(MegaError::Traces(TracesError::ResponseBudget));
+                    }
+                    bytes
+                        .try_reserve_exact(chunk.len())
+                        .map_err(|_| MegaError::Traces(TracesError::ResponseBudget))?;
+                    bytes.extend_from_slice(&chunk);
+                }
+                if bytes.len() as u64 != size {
+                    return Err(MegaError::Traces(TracesError::ObjectIntegrity));
+                }
+                Ok(Some(bytes))
+            })
+            .await?;
+        match bytes {
+            Some(bytes) => verify_raw_object(hash_kind, oid, bytes, control)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -66,6 +230,71 @@ mod tests {
         },
         orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
     };
+
+    #[tokio::test]
+    async fn verified_raw_type_real_git_four_types_both_hashes_and_corruption() {
+        use git_internal::hash::HashKind;
+
+        use crate::ceres::traces::publication::tests::{Fixture, local_store};
+        let (_directory, store) = local_store().await;
+        let service = TraceObjectService::new(store);
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let mut fixture = Fixture::new(kind);
+            fixture.object("blob", b"raw\x00\xffbytes");
+            let tree = fixture.tree(&[]);
+            let commit = fixture.commit(&tree, None);
+            fixture.object("tag", format!("object {commit}\ntype commit\ntag sample\ntagger Test <test@example.test> 0 +0000\n\nraw tag\n").as_bytes());
+            let decoded = fixture.decoded(None).await;
+            let control = decoded.continuation();
+            let stream = uuid::Uuid::new_v4().to_string();
+            for (oid, kind, bytes) in &fixture.objects {
+                let verified = verify_raw_object(fixture.hash_kind(), oid, bytes.clone(), control)
+                    .await
+                    .unwrap();
+                assert_eq!(verified.object_type().as_str(), kind);
+                assert_eq!(verified.bytes(), bytes);
+                service
+                    .put_raw(&stream, fixture.hash_kind(), oid, bytes)
+                    .await
+                    .unwrap();
+                let read = service
+                    .read_verified_raw(&stream, fixture.hash_kind(), oid, control)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(read.object_type(), verified.object_type());
+                assert_eq!(read.bytes(), bytes);
+                let mut corrupted = bytes.clone();
+                corrupted.push(0);
+                assert!(matches!(
+                    verify_raw_object(fixture.hash_kind(), oid, corrupted, control).await,
+                    Err(MegaError::Traces(TracesError::ObjectIntegrity))
+                ));
+                assert!(matches!(
+                    verify_raw_object(
+                        fixture.hash_kind(),
+                        &"0".repeat(oid.len()),
+                        bytes.clone(),
+                        control
+                    )
+                    .await,
+                    Err(MegaError::Traces(TracesError::ObjectIntegrity))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn verified_raw_type_would_block_is_static_existing_error() {
+        let error = raw_storage_error(
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "private-object-key").into(),
+        );
+        assert!(matches!(
+            error,
+            MegaError::Traces(TracesError::QueryTimeout)
+        ));
+        assert!(!error.to_string().contains("private-object-key"));
+    }
 
     const STREAM_A: &str = "11111111-1111-4111-8111-111111111111";
     const STREAM_B: &str = "22222222-2222-4222-8222-222222222222";

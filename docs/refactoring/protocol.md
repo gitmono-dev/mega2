@@ -975,3 +975,5 @@ acknowledgments 之前运行；后者只在确定发包前运行。v0 中 have �
 pkt-line。错误字段与完整应答表见 [错误文档](../errors.md#megaerrorviewunavailable--viewpackrejected视图协议错误plan-20261002)
 和 [history-projection 设计 §6.1「错误契约」](history-projection.md#61-url-与路由决策)。视图 URL 的错误产生方和
 黑盒覆盖由后续入口与打包卡登记，本节不重复场景覆盖表行。
+
+**2026-10-24（MTR-98 本地A/B已核，自身审查与发布待）**：内部发布事实由受控 PACK 与本 stream 已发布 raw 闭包推导，原始字节、取消、schema 归档及可见性边界见 [Traces 唯一协议源](./traces.md)。封闭事实桥尚未接入 HTTP/SSH；逐提交 checkpoint 历史资格仍待 MTR-101，不能据此放行 wire 发布。

@@ -879,6 +879,170 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
+pub(super) struct RawCommitLinks {
+    pub(super) tree: String,
+    pub(super) parents: Vec<String>,
+}
+
+pub(super) fn verified_commit_links(
+    payload: &[u8],
+    width: usize,
+    control: &admission::IngestContinuation,
+) -> Result<RawCommitLinks, MegaError> {
+    let mut end = None;
+    for (index, pair) in payload.windows(2).enumerate() {
+        if index % (64 * 1024) == 0 {
+            control.check()?;
+        }
+        if pair == b"\n\n" {
+            end = Some(index);
+            break;
+        }
+    }
+    let end = end.ok_or_else(rejected)?;
+    let mut tree = None;
+    let mut parents = Vec::new();
+    let mut author = false;
+    let mut committer = false;
+    let mut past_parents = false;
+    for (index, line) in payload[..end].split(|byte| *byte == b'\n').enumerate() {
+        control.check()?;
+        let Some(space) = line.iter().position(|byte| *byte == b' ') else {
+            return Err(rejected());
+        };
+        let label = &line[..space];
+        if index == 0 && label != b"tree" {
+            return Err(rejected());
+        }
+        if label == b"parent" && past_parents {
+            return Err(rejected());
+        }
+        if label != b"tree" && label != b"parent" {
+            past_parents = true;
+        }
+        if label == b"author" || label == b"committer" {
+            let seen = if label == b"author" {
+                &mut author
+            } else {
+                &mut committer
+            };
+            if std::mem::replace(seen, true) || space + 1 == line.len() {
+                return Err(rejected());
+            }
+        }
+        if label != b"tree" && label != b"parent" {
+            continue;
+        }
+        let value = &line[space + 1..];
+        if value.len() != width || !value.iter().all(|b| b.is_ascii_hexdigit()) {
+            return Err(rejected());
+        }
+        let value = std::str::from_utf8(value)
+            .map_err(|_| rejected())?
+            .to_ascii_lowercase();
+        if label == b"tree" {
+            if tree.replace(value).is_some() {
+                return Err(rejected());
+            }
+        } else {
+            parents.push(value);
+        }
+    }
+    control.check()?;
+    if !author || !committer {
+        return Err(rejected());
+    }
+    Ok(RawCommitLinks {
+        tree: tree.ok_or_else(rejected)?,
+        parents,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RawTreeMode {
+    Tree,
+    Blob,
+    Gitlink,
+}
+
+pub(super) struct RawTreeEntry<'a> {
+    pub(super) mode: RawTreeMode,
+    pub(super) name: &'a [u8],
+    pub(super) oid: String,
+}
+
+pub(super) fn verified_tree_entries<'a>(
+    payload: &'a [u8],
+    hash_bytes: usize,
+    control: &admission::IngestContinuation,
+) -> Result<Vec<RawTreeEntry<'a>>, MegaError> {
+    let mut rest = payload;
+    let mut entries = Vec::new();
+    let mut names = HashSet::new();
+    let mut previous: Option<(&[u8], RawTreeMode)> = None;
+    while !rest.is_empty() {
+        control.check()?;
+        let mut nul = None;
+        for (index, chunk) in rest.chunks(64 * 1024).enumerate() {
+            control.check()?;
+            if let Some(position) = chunk.iter().position(|byte| *byte == 0) {
+                nul = Some(index * 64 * 1024 + position);
+                break;
+            }
+        }
+        let nul = nul.ok_or_else(rejected)?;
+        let space = rest[..nul]
+            .iter()
+            .position(|b| *b == b' ')
+            .ok_or_else(rejected)?;
+        let end = nul.checked_add(1 + hash_bytes).ok_or_else(rejected)?;
+        if end > rest.len() {
+            return Err(rejected());
+        }
+        let name = &rest[space + 1..nul];
+        if name.is_empty()
+            || name == b"."
+            || name == b".."
+            || name.contains(&b'/')
+            || !names.insert(name)
+        {
+            return Err(rejected());
+        }
+        let mode = match &rest[..space] {
+            b"40000" | b"040000" => RawTreeMode::Tree,
+            b"100644" | b"100755" | b"120000" => RawTreeMode::Blob,
+            b"160000" => RawTreeMode::Gitlink,
+            _ => return Err(rejected()),
+        };
+        if let Some((previous_name, previous_mode)) = previous {
+            let previous_end = if previous_mode == RawTreeMode::Tree {
+                b'/'
+            } else {
+                0
+            };
+            let current_end = if mode == RawTreeMode::Tree { b'/' } else { 0 };
+            if previous_name
+                .iter()
+                .copied()
+                .chain(std::iter::once(previous_end))
+                .cmp(name.iter().copied().chain(std::iter::once(current_end)))
+                != std::cmp::Ordering::Less
+            {
+                return Err(rejected());
+            }
+        }
+        previous = Some((name, mode));
+        entries.push(RawTreeEntry {
+            mode,
+            name,
+            oid: encode_hex(&rest[nul + 1..end]),
+        });
+        rest = &rest[end..];
+    }
+    control.check()?;
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use git_internal::{

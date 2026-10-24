@@ -4,14 +4,15 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    DatabaseTransaction, DbErr, EntityTrait, IntoActiveModel, QueryFilter, Set, Statement,
-    TransactionTrait, Value,
+    DatabaseTransaction, DbErr, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect,
+    Set, Statement, TransactionTrait, Value,
     sea_query::{Expr, OnConflict},
 };
 use uuid::Uuid;
 
 use crate::{
     callisto::{trace_checkpoint, trace_object, trace_ref_update, trace_stream},
+    ceres::traces::publication::PreparedPublication,
     common::{
         errors::{MegaError, TracesError},
         utils::is_protocol_zero_id,
@@ -93,7 +94,8 @@ pub struct ScopeFacts<'a> {
 
 /// Publish the first ref of a scope, creating its stream row in the same
 /// transaction when the natural tuple does not exist yet.
-pub async fn publish_scope(
+#[cfg(test)]
+pub(in crate::jupiter) async fn publish_scope(
     db: &DatabaseConnection,
     facts: &ScopeFacts<'_>,
     update: &PublishRef,
@@ -116,11 +118,31 @@ pub async fn publish_scope(
 /// The stream is selected or inserted by its natural key before the ref
 /// update, so the target binding, the stream identity and the tip publication
 /// either all commit or all roll back.
-pub async fn publish_scope_in_txn(
+#[cfg(test)]
+pub(in crate::jupiter) async fn publish_scope_in_txn(
     txn: &DatabaseTransaction,
     facts: &ScopeFacts<'_>,
     update: &PublishRef,
     authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
+) -> Result<PublishedRef, MegaError> {
+    publish_scope_with_facts(txn, facts, update, authority, None).await
+}
+
+pub(in crate::jupiter) async fn publish_prepared_scope_in_txn(
+    txn: &DatabaseTransaction,
+    facts: &ScopeFacts<'_>,
+    prepared: &PreparedPublication,
+    authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
+) -> Result<PublishedRef, MegaError> {
+    publish_scope_with_facts(txn, facts, prepared.update(), authority, Some(prepared)).await
+}
+
+async fn publish_scope_with_facts(
+    txn: &DatabaseTransaction,
+    facts: &ScopeFacts<'_>,
+    update: &PublishRef,
+    authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
+    prepared: Option<&PreparedPublication>,
 ) -> Result<PublishedRef, MegaError> {
     let hash_kind = canonical_hash_kind(facts.hash_kind)?;
     if hash_kind != canonical_hash_kind(&update.hash_kind)? {
@@ -133,7 +155,7 @@ pub async fn publish_scope_in_txn(
     let stream_id = ensure_stream_in_txn(txn, facts, hash_kind).await?;
     let mut scoped = update.clone();
     scoped.stream_id = stream_id;
-    publish_ref_in_txn(txn, &scoped, authority).await
+    publish_ref_in_txn(txn, &scoped, authority, prepared).await
 }
 
 /// Select the stream for the natural tuple or insert it. An existing row keeps
@@ -210,13 +232,14 @@ fn canonical_hash_kind(value: &str) -> Result<&str, MegaError> {
 }
 
 /// Publish one fast-forward ref update. A rejection writes nothing.
-pub async fn publish_ref(
+#[cfg(test)]
+pub(in crate::jupiter) async fn publish_ref(
     db: &DatabaseConnection,
     update: &PublishRef,
     authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
 ) -> Result<PublishedRef, MegaError> {
     let txn = db.begin().await?;
-    let published = match publish_ref_in_txn(&txn, update, authority).await {
+    let published = match publish_ref_in_txn(&txn, update, authority, None).await {
         Ok(published) => published,
         Err(err) => {
             txn.rollback().await?;
@@ -227,10 +250,39 @@ pub async fn publish_ref(
     Ok(published)
 }
 
+pub(in crate::jupiter) async fn publish_prepared_ref(
+    db: &DatabaseConnection,
+    prepared: &PreparedPublication,
+    authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
+) -> Result<PublishedRef, MegaError> {
+    let control = prepared.control();
+    let txn = control.run(async { Ok(db.begin().await?) }).await?;
+    let result = control
+        .run(publish_ref_in_txn(
+            &txn,
+            prepared.update(),
+            authority,
+            Some(prepared),
+        ))
+        .await;
+    match result {
+        Ok(published) => {
+            control.check()?;
+            txn.commit().await?;
+            Ok(published)
+        }
+        Err(error) => {
+            txn.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
 async fn publish_ref_in_txn(
     txn: &DatabaseTransaction,
     update: &PublishRef,
     authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
+    prepared: Option<&PreparedPublication>,
 ) -> Result<PublishedRef, MegaError> {
     let PreparedRef {
         stream_id,
@@ -274,7 +326,10 @@ async fn publish_ref_in_txn(
         _ => {}
     }
     require_fast_forward(old_tip.as_deref(), &new_tip, &commits)?;
-    publish_checkpoints(txn, &stream_id, &checkpoints).await?;
+    match prepared {
+        Some(prepared) => publish_prepared_checkpoints(txn, &stream_id, prepared).await?,
+        None => publish_checkpoints(txn, &stream_id, &checkpoints).await?,
+    }
     publish_membership(txn, &stream_id, &hash_kind, &object_oids).await?;
     cas_tip(txn, &stream_id, old_tip.as_deref(), &new_tip).await?;
     let ref_sequence = append_journal(
@@ -433,6 +488,63 @@ async fn journal_for_key(
         .filter(trace_ref_update::Column::IdempotencyKey.eq(idempotency_key))
         .one(txn)
         .await?)
+}
+
+async fn publish_prepared_checkpoints(
+    txn: &DatabaseTransaction,
+    stream_id: &str,
+    prepared: &PreparedPublication,
+) -> Result<(), MegaError> {
+    let proposed = prepared.final_checkpoints()?;
+    let mut after = None::<String>;
+    loop {
+        prepared.control().check()?;
+        let mut query = trace_checkpoint::Entity::find()
+            .filter(trace_checkpoint::Column::StreamId.eq(stream_id));
+        if let Some(after) = &after {
+            query = query.filter(trace_checkpoint::Column::Id.gt(after.clone()));
+        }
+        let rows = query
+            .order_by_asc(trace_checkpoint::Column::Id)
+            .limit(128)
+            .all(txn)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            prepared.control().checkpoint().await?;
+            if proposed
+                .get(&row.checkpoint_key)?
+                .is_none_or(|binding| binding.original_tree != row.original_tree)
+            {
+                return Err(rejected());
+            }
+            after = Some(row.id);
+        }
+    }
+    for checkpoint in proposed.iter()? {
+        prepared.control().checkpoint().await?;
+        let checkpoint = checkpoint?;
+        let existing = trace_checkpoint::Entity::find()
+            .filter(trace_checkpoint::Column::StreamId.eq(stream_id))
+            .filter(trace_checkpoint::Column::CheckpointKey.eq(&checkpoint.checkpoint_key))
+            .one(txn)
+            .await?;
+        if existing.is_some() {
+            continue;
+        }
+        trace_checkpoint::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            stream_id: Set(stream_id.to_owned()),
+            checkpoint_key: Set(checkpoint.checkpoint_key),
+            original_tree: Set(checkpoint.original_tree),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn publish_checkpoints(

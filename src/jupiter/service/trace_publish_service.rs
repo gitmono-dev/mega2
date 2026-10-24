@@ -2,8 +2,10 @@
 
 use sea_orm::{DatabaseConnection, TransactionTrait};
 
+#[cfg(test)]
+use crate::jupiter::storage::trace_stream_storage::PublishRef;
 use crate::{
-    ceres::traces::auth::PublishAuthority,
+    ceres::traces::{auth::PublishAuthority, publication::PreparedPublication},
     common::errors::MegaError,
     jupiter::{
         service::trace_target_service,
@@ -11,13 +13,14 @@ use crate::{
             mono_storage::MonoStorage,
             object_storage::MegaObjectStorageWrapper,
             trace_object_storage,
-            trace_stream_storage::{self, PublishRef, PublishedRef, ScopeFacts},
+            trace_stream_storage::{self, PublishedRef, ScopeFacts},
             trace_target_storage::{self, TARGET_KIND_NATIVE},
         },
     },
 };
 
 /// Raw bytes that belong to one object in a publication.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectBytes {
     pub oid: String,
@@ -25,6 +28,7 @@ pub struct ObjectBytes {
 }
 
 /// Bytes plus the ref update. The bytes are stored before the database transaction.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishBytes {
     pub update: PublishRef,
@@ -32,11 +36,25 @@ pub struct PublishBytes {
 }
 
 /// One first-scope publication request.
+#[cfg(test)]
 pub struct FirstScopeRequest<'a> {
     pub path: &'a str,
     pub facts: &'a trace_stream_storage::ScopeFacts<'a>,
     pub request: &'a PublishBytes,
     pub authority: &'a crate::ceres::traces::auth::PublishAuthority<'a>,
+}
+
+enum ScopeUpdate<'a> {
+    Prepared(&'a PreparedPublication),
+    #[cfg(test)]
+    Legacy(&'a PublishRef),
+}
+
+pub(in crate::jupiter) struct PreparedScopeRequest<'a> {
+    pub(in crate::jupiter) path: &'a str,
+    pub(in crate::jupiter) facts: &'a ScopeFacts<'a>,
+    pub(in crate::jupiter) prepared: &'a PreparedPublication,
+    pub(in crate::jupiter) authority: &'a PublishAuthority<'a>,
 }
 
 /// Stores raw bytes, then publishes membership, the tip, and the journal.
@@ -54,6 +72,94 @@ impl TracePublishService {
         Self::new(crate::jupiter::storage::object_storage::mock_object_storage())
     }
 
+    async fn store_prepared(&self, prepared: &PreparedPublication) -> Result<(), MegaError> {
+        trace_stream_storage::preflight(prepared.update())?;
+        for oid in &prepared.update().object_oids {
+            if let Some(bytes) = prepared.incoming_bytes(oid).await? {
+                prepared
+                    .control()
+                    .run(trace_object_storage::put_raw(
+                        &self.store,
+                        &prepared.update().stream_id,
+                        &prepared.update().hash_kind,
+                        oid,
+                        &bytes,
+                    ))
+                    .await
+                    .map_err(super::trace_object_service::raw_storage_error)?;
+            }
+        }
+        prepared.control().check()
+    }
+
+    // Internal only until the history-policy witness in MTR-101 is enforced.
+    pub(in crate::jupiter) async fn publish_prepared(
+        &self,
+        db: &DatabaseConnection,
+        prepared: &PreparedPublication,
+        authority: &PublishAuthority<'_>,
+    ) -> Result<PublishedRef, MegaError> {
+        self.store_prepared(prepared).await?;
+        trace_stream_storage::publish_prepared_ref(db, prepared, authority)
+            .await
+            .map_err(super::trace_object_service::raw_storage_error)
+    }
+
+    pub(in crate::jupiter) async fn publish_prepared_first_scope(
+        &self,
+        config: &crate::config::MonoConfig,
+        db: &DatabaseConnection,
+        mono: &MonoStorage,
+        scope: &PreparedScopeRequest<'_>,
+    ) -> Result<PublishedRef, MegaError> {
+        self.publish_prepared_first_scope_inner(config, db, mono, scope)
+            .await
+            .map_err(super::trace_object_service::raw_storage_error)
+    }
+
+    async fn publish_prepared_first_scope_inner(
+        &self,
+        config: &crate::config::MonoConfig,
+        db: &DatabaseConnection,
+        mono: &MonoStorage,
+        scope: &PreparedScopeRequest<'_>,
+    ) -> Result<PublishedRef, MegaError> {
+        let prepared = scope.prepared;
+        if prepared.update().stream_id != scope.facts.stream_id
+            || prepared.update().hash_kind != scope.facts.hash_kind
+        {
+            return Err(crate::ceres::traces::auth::publish_rejection());
+        }
+        self.store_prepared(prepared).await?;
+        let path = trace_target_storage::strict_canonical_project_path(scope.path)
+            .map_err(|_| crate::ceres::traces::auth::publish_rejection())?;
+        let control = prepared.control();
+        let txn = control.run(async { Ok(db.begin().await?) }).await?;
+        let result = control
+            .run(Self::publish_first_scope_in_txn(
+                &txn,
+                config,
+                mono,
+                &path,
+                scope.facts,
+                ScopeUpdate::Prepared(prepared),
+                scope.authority,
+            ))
+            .await;
+        match result {
+            Ok(published) => {
+                control.check()?;
+                txn.commit().await?;
+                Ok(published)
+            }
+            Err(error) => {
+                txn.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub async fn publish(
         &self,
         db: &sea_orm::DatabaseConnection,
@@ -84,6 +190,7 @@ impl TracePublishService {
     /// Publish a scope's first ref. The native target binding, the stream
     /// identity and the ref publication share one database transaction; raw
     /// bytes are durable before it. A rejection leaves no target or stream row.
+    #[cfg(test)]
     pub async fn publish_first_scope(
         &self,
         config: &crate::config::MonoConfig,
@@ -131,7 +238,7 @@ impl TracePublishService {
             mono,
             &path,
             facts,
-            &request.update,
+            ScopeUpdate::Legacy(&request.update),
             authority,
         )
         .await;
@@ -153,7 +260,7 @@ impl TracePublishService {
         mono: &MonoStorage,
         path: &str,
         facts: &ScopeFacts<'_>,
-        update: &PublishRef,
+        update: ScopeUpdate<'_>,
         authority: &PublishAuthority<'_>,
     ) -> Result<PublishedRef, MegaError> {
         let Some(root) = mono.lock_native_root_in_txn(txn).await? else {
@@ -201,11 +308,31 @@ impl TracePublishService {
             target_id: &target.id,
             ..*facts
         };
-        trace_stream_storage::publish_scope_in_txn(txn, &scoped_facts, update, &scoped_authority)
-            .await
+        match update {
+            ScopeUpdate::Prepared(prepared) => {
+                trace_stream_storage::publish_prepared_scope_in_txn(
+                    txn,
+                    &scoped_facts,
+                    prepared,
+                    &scoped_authority,
+                )
+                .await
+            }
+            #[cfg(test)]
+            ScopeUpdate::Legacy(update) => {
+                trace_stream_storage::publish_scope_in_txn(
+                    txn,
+                    &scoped_facts,
+                    update,
+                    &scoped_authority,
+                )
+                .await
+            }
+        }
     }
 
     /// Stage objects in quarantine, then publish only a closed set.
+    #[cfg(test)]
     pub async fn publish_quarantine(
         &self,
         db: &sea_orm::DatabaseConnection,
@@ -275,6 +402,672 @@ mod tests {
         },
     };
 
+    fn prepared_authority<'a>(
+        scope: &'a Scope,
+        token: &'a crate::config::PushTokenConfig,
+    ) -> PublishAuthority<'a> {
+        PublishAuthority {
+            caller: crate::ceres::traces::auth::TracesCaller::StaticPushToken {
+                credential_id: &token.name,
+                token,
+            },
+            principal_id: &scope.principal_id,
+            target_id: &scope.target_id,
+            authorized_path: &scope.path,
+            expected_generation: 1,
+            policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_publication_atomic_real_local_both_hashes_retry_and_closure() {
+        use git_internal::hash::HashKind;
+
+        use crate::ceres::traces::publication::tests::{Fixture, local_store};
+        let (_database, db) = open_db().await;
+        let (_backend, store) = local_store().await;
+        let service = TracePublishService::new(store.clone());
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let mut fixture = Fixture::new(kind);
+            let scope = stream_with_hash(&db, fixture.hash_kind()).await;
+            let token = token(&scope);
+            let authority = prepared_authority(&scope, &token);
+            let (root, _) = fixture.capture(br#"{"schema_version":2}"#);
+            let first = fixture.commit(&root, None);
+            let extra = fixture.object("blob", b"extra unpublished pack object");
+            let key = Uuid::new_v4().to_string();
+            let prepared = fixture
+                .prepare(&db, &store, &scope.stream_id, &first, &key, None)
+                .await
+                .unwrap();
+            let published = service
+                .publish_prepared(&db, &prepared, &authority)
+                .await
+                .unwrap();
+            assert_eq!(published.new_tip, first);
+            assert_eq!(
+                published.schema,
+                trace_stream_storage::SchemaDisposition::Supported
+            );
+            assert!(!published.idempotent);
+            assert!(
+                service
+                    .publish_prepared(&db, &prepared, &authority)
+                    .await
+                    .unwrap()
+                    .idempotent
+            );
+            let replay = fixture
+                .prepare(&db, &store, &scope.stream_id, &first, &key, None)
+                .await
+                .unwrap();
+            assert!(replay.commits().is_empty());
+            assert!(
+                service
+                    .publish_prepared(&db, &replay, &authority)
+                    .await
+                    .unwrap()
+                    .idempotent
+            );
+            assert!(
+                trace_object::Entity::find()
+                    .filter(trace_object::Column::StreamId.eq(&scope.stream_id))
+                    .filter(trace_object::Column::Oid.eq(&extra))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let second = fixture.commit(&root, Some(&first));
+            let prepared = fixture
+                .prepare(
+                    &db,
+                    &store,
+                    &scope.stream_id,
+                    &second,
+                    &Uuid::new_v4().to_string(),
+                    Some(std::slice::from_ref(&second)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(prepared.update().object_oids, std::slice::from_ref(&second));
+            assert_eq!(prepared.commits()[0].parents(), [first.as_str()]);
+            service
+                .publish_prepared(&db, &prepared, &authority)
+                .await
+                .unwrap();
+            assert_eq!(
+                trace_stream::Entity::find_by_id(&scope.stream_id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .tip_oid,
+                Some(second)
+            );
+            assert_eq!(
+                crate::callisto::trace_ref_update::Entity::find()
+                    .filter(
+                        crate::callisto::trace_ref_update::Column::StreamId.eq(&scope.stream_id)
+                    )
+                    .count(&db)
+                    .await
+                    .unwrap(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_publication_final_list_defense_and_intermediate_facts() {
+        use git_internal::hash::HashKind;
+
+        use crate::ceres::traces::publication::tests::{Fixture, local_store};
+        let (_database, db) = open_db().await;
+        let (_backend, store) = local_store().await;
+        let service = TracePublishService::new(store.clone());
+        let scope = stream(&db).await;
+        let token = token(&scope);
+        let authority = prepared_authority(&scope, &token);
+        let mut fixture = Fixture::new(HashKind::Sha1);
+        let (root, leaf) = fixture.capture(br#"{"schema_version":2}"#);
+        let first = fixture.commit(&root, None);
+        let prepared = fixture
+            .prepare(
+                &db,
+                &store,
+                &scope.stream_id,
+                &first,
+                "prepared-first",
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .publish_prepared(&db, &prepared, &authority)
+            .await
+            .unwrap();
+        let (changed_root, changed_leaf) =
+            fixture.capture(br#"{"schema_version":2,"changed":true}"#);
+        let changed = fixture.commit(&changed_root, Some(&first));
+        let prepared = fixture
+            .prepare(
+                &db,
+                &store,
+                &scope.stream_id,
+                &changed,
+                "changed-final",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            service
+                .publish_prepared(&db, &prepared, &authority)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            trace_stream::Entity::find_by_id(&scope.stream_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .tip_oid
+                .as_deref(),
+            Some(first.as_str())
+        );
+        assert!(
+            trace_object::Entity::find()
+                .filter(trace_object::Column::StreamId.eq(&scope.stream_id))
+                .filter(trace_object::Column::Oid.eq(&changed))
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let empty = fixture.tree(&[]);
+        let deleted = fixture.commit(&empty, Some(&first));
+        let prepared = fixture
+            .prepare(
+                &db,
+                &store,
+                &scope.stream_id,
+                &deleted,
+                "deleted-final",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            service
+                .publish_prepared(&db, &prepared, &authority)
+                .await
+                .is_err()
+        );
+        let restored = fixture.commit(&root, Some(&changed));
+        let prepared = fixture
+            .prepare(
+                &db,
+                &store,
+                &scope.stream_id,
+                &restored,
+                "restored-final",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.commits().len(), 2);
+        assert_eq!(
+            prepared
+                .checkpoints(prepared.commits()[0].tree())
+                .unwrap()
+                .get("abcd")
+                .unwrap()
+                .unwrap()
+                .original_tree,
+            changed_leaf
+        );
+        assert_eq!(
+            prepared
+                .final_checkpoints()
+                .unwrap()
+                .get("abcd")
+                .unwrap()
+                .unwrap()
+                .original_tree,
+            leaf
+        );
+        // This is only MTR-95's final-list defense. MTR-101 must reject
+        // the intermediate mutation before any future wire publication.
+        service
+            .publish_prepared(&db, &prepared, &authority)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_publication_rechecks_expected_old_and_live_authority() {
+        use git_internal::hash::HashKind;
+
+        use crate::ceres::traces::publication::{
+            self, PublicationProposal,
+            tests::{Fixture, local_store},
+        };
+        let (_database, db) = open_db().await;
+        let (_backend, store) = local_store().await;
+        let service = TracePublishService::new(store.clone());
+        let scope = stream(&db).await;
+        let token = token(&scope);
+        let authority = prepared_authority(&scope, &token);
+        let mut fixture = Fixture::new(HashKind::Sha1);
+        let tree = fixture.tree(&[]);
+        let first = fixture.commit(&tree, None);
+        let prepared = publication::prepare(
+            &db,
+            &super::super::trace_object_service::TraceObjectService::new(store.clone()),
+            fixture.decoded(None).await,
+            PublicationProposal {
+                stream_id: scope.stream_id.clone(),
+                expected_old_tip: ExpectedOldTip::At("a".repeat(40)),
+                new_tip: first.clone(),
+                ref_names: vec![TRACES_REF.into()],
+                delete: false,
+                idempotency_key: "wrong-expected-old".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            service
+                .publish_prepared(&db, &prepared, &authority)
+                .await
+                .is_err()
+        );
+        let prepared = fixture
+            .prepare(
+                &db,
+                &store,
+                &scope.stream_id,
+                &first,
+                "retired-before-publish",
+                None,
+            )
+            .await
+            .unwrap();
+        crate::callisto::trace_credential_binding::Entity::update_many()
+            .col_expr(
+                crate::callisto::trace_credential_binding::Column::RetiredAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now().fixed_offset()),
+            )
+            .filter(
+                crate::callisto::trace_credential_binding::Column::CredentialId
+                    .eq(&scope.credential_id),
+            )
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(
+            service
+                .publish_prepared(&db, &prepared, &authority)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .filter(trace_object::Column::StreamId.eq(&scope.stream_id))
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::callisto::trace_ref_update::Entity::find()
+                .filter(crate::callisto::trace_ref_update::Column::StreamId.eq(&scope.stream_id))
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            trace_stream::Entity::find_by_id(&scope.stream_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .tip_oid
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_publication_first_scope_preserves_atomic_target_binding() {
+        use git_internal::hash::HashKind;
+
+        use crate::ceres::traces::{
+            auth::TracesCaller,
+            publication::tests::{Fixture, local_store},
+        };
+        let (_database, db) = open_db().await;
+        let (_backend, store) = local_store().await;
+        let mono = mono(&db);
+        seed_root(&mono, &["proj", "other"]).await;
+        let config = crate::config::MonoConfig::default();
+        let service = TracePublishService::new(store.clone());
+        let scope = first_scope(&db).await;
+        let token = crate::config::PushTokenConfig {
+            name: scope.credential_id.clone(),
+            token: "synthetic-secret".into(),
+            paths: Some(vec!["/proj".into(), "/other".into()]),
+        };
+        let authority = PublishAuthority {
+            caller: TracesCaller::StaticPushToken {
+                credential_id: &token.name,
+                token: &token,
+            },
+            principal_id: &scope.principal_id,
+            target_id: "",
+            authorized_path: "/proj",
+            expected_generation: 1,
+            policy: None,
+        };
+        let facts = ScopeFacts {
+            stream_id: &scope.stream_id,
+            principal_id: &scope.principal_id,
+            target_id: "",
+            source_repo_id: "source-opaque",
+            epoch_id: &scope.epoch_id,
+            hash_kind: "sha1",
+        };
+        let mut fixture = Fixture::new(HashKind::Sha1);
+        let tree = fixture.tree(&[]);
+        let tip = fixture.commit(&tree, None);
+        let prepared = fixture
+            .prepare(
+                &db,
+                &store,
+                &scope.stream_id,
+                &tip,
+                "prepared-first-scope",
+                None,
+            )
+            .await
+            .unwrap();
+        let request = PreparedScopeRequest {
+            path: "/proj",
+            facts: &facts,
+            prepared: &prepared,
+            authority: &authority,
+        };
+        service
+            .publish_prepared_first_scope(&config, &db, &mono, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            trace_target::Entity::find()
+                .filter(trace_target::Column::ProjectPath.eq("/proj"))
+                .count(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        let other_id = Uuid::new_v4().to_string();
+        let other_epoch = Uuid::new_v4().to_string();
+        let facts = ScopeFacts {
+            stream_id: &other_id,
+            epoch_id: &other_epoch,
+            ..facts
+        };
+        let stale = PublishAuthority {
+            authorized_path: "/other",
+            expected_generation: 99,
+            ..authority
+        };
+        let prepared = fixture
+            .prepare(&db, &store, &other_id, &tip, "prepared-stale-binding", None)
+            .await
+            .unwrap();
+        let request = PreparedScopeRequest {
+            path: "/other",
+            facts: &facts,
+            prepared: &prepared,
+            authority: &stale,
+        };
+        assert!(
+            service
+                .publish_prepared_first_scope(&config, &db, &mono, &request)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            trace_target::Entity::find()
+                .filter(trace_target::Column::ProjectPath.eq("/other"))
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            trace_stream::Entity::find_by_id(&other_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            trace_object::Entity::find()
+                .filter(trace_object::Column::StreamId.eq(&other_id))
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_publication_rejects_other_stream_invisible_and_corrupt_old_objects() {
+        use git_internal::hash::HashKind;
+
+        use crate::ceres::traces::publication::tests::{Fixture, local_store};
+        let (_database, db) = open_db().await;
+        let (_backend, store) = local_store().await;
+        let scope = stream(&db).await;
+        let other = stream(&db).await;
+        let mut fixture = Fixture::new(HashKind::Sha1);
+        let tree = fixture.tree(&[]);
+        let first = fixture.commit(&tree, None);
+        let second = fixture.commit(&tree, Some(&first));
+        let raw = &fixture
+            .objects
+            .iter()
+            .find(|(oid, _, _)| oid == &first)
+            .unwrap()
+            .2;
+        trace_object_storage::put_raw(&store, &scope.stream_id, "sha1", &first, raw)
+            .await
+            .unwrap();
+        let membership = |stream_id: &str, visible| trace_object::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            stream_id: Set(stream_id.into()),
+            hash_kind: Set("sha1".into()),
+            oid: Set(first.clone()),
+            visible: Set(visible),
+            created_at: Set(chrono::Utc::now().fixed_offset()),
+        };
+        membership(&other.stream_id, true)
+            .insert(&db)
+            .await
+            .unwrap();
+        let included = [tree.clone(), second.clone()];
+        assert!(
+            fixture
+                .prepare(
+                    &db,
+                    &store,
+                    &scope.stream_id,
+                    &second,
+                    "other-stream",
+                    Some(&included)
+                )
+                .await
+                .is_err()
+        );
+        let row = membership(&scope.stream_id, false)
+            .insert(&db)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .prepare(
+                    &db,
+                    &store,
+                    &scope.stream_id,
+                    &second,
+                    "invisible",
+                    Some(&included)
+                )
+                .await
+                .is_err()
+        );
+        trace_object::Entity::update_many()
+            .col_expr(
+                trace_object::Column::Visible,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(trace_object::Column::Id.eq(&row.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .prepare(
+                    &db,
+                    &store,
+                    &scope.stream_id,
+                    &second,
+                    "qualified",
+                    Some(&included)
+                )
+                .await
+                .is_ok()
+        );
+        // Deliberately corrupt the fixture's backend outside the immutable API;
+        // published membership alone must not authenticate these bytes.
+        let key = trace_object_storage::object_key(&scope.stream_id, "sha1", &first).unwrap();
+        store.inner.delete(&key).await.unwrap();
+        trace_object_storage::put_raw(
+            &store,
+            &scope.stream_id,
+            "sha1",
+            &first,
+            b"corrupt stored bytes",
+        )
+        .await
+        .unwrap();
+        assert!(
+            fixture
+                .prepare(
+                    &db,
+                    &store,
+                    &scope.stream_id,
+                    &second,
+                    "corrupt",
+                    Some(&included)
+                )
+                .await
+                .is_err()
+        );
+        // The old DTO primitive could publish a commit without its tree.
+        // A visible row therefore is not a historical transitive-closure seal.
+        let missing_tree = "f".repeat(40);
+        let legacy = fixture.commit(&missing_tree, None);
+        let legacy_bytes = &fixture
+            .objects
+            .iter()
+            .find(|(oid, _, _)| oid == &legacy)
+            .unwrap()
+            .2;
+        let legacy_request = request(
+            &scope.stream_id,
+            &legacy,
+            Vec::new(),
+            "legacy-open-closure",
+            legacy_bytes,
+        );
+        let service = TracePublishService::new(store.clone());
+        publish(&service, &db, &scope, &legacy_request)
+            .await
+            .unwrap();
+        let child = fixture.commit(&tree, Some(&legacy));
+        assert!(
+            fixture
+                .prepare(
+                    &db,
+                    &store,
+                    &scope.stream_id,
+                    &child,
+                    "unsealed-old-closure",
+                    Some(&[tree.clone(), child.clone()])
+                )
+                .await
+                .is_err(),
+            "a qualified old commit still needs its referenced tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_publication_database_failure_is_static() {
+        use git_internal::hash::HashKind;
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        use crate::ceres::traces::publication::tests::{Fixture, local_store};
+        let (_database, db) = open_db().await;
+        let (_observer_directory, observer) = open_db().await;
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT current_database() AS name",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let database_name: String = row.try_get("", "name").unwrap();
+        let (_backend, store) = local_store().await;
+        let scope = stream(&db).await;
+        let token = token(&scope);
+        let authority = prepared_authority(&scope, &token);
+        let mut fixture = Fixture::new(HashKind::Sha1);
+        let tree = fixture.tree(&[]);
+        let tip = fixture.commit(&tree, None);
+        let prepared = fixture
+            .prepare(&db, &store, &scope.stream_id, &tip, "closed-db", None)
+            .await
+            .unwrap();
+        db.clone().close().await.unwrap();
+        let result = TracePublishService::new(store)
+            .publish_prepared(&db, &prepared, &authority)
+            .await;
+        assert!(matches!(
+            result,
+            Err(MegaError::Traces(
+                crate::common::errors::TracesError::QueryTimeout
+            ))
+        ));
+        drop(db);
+        assert!(
+            observer
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT 1 FROM pg_database WHERE datname = $1",
+                    [database_name.into()],
+                ))
+                .await
+                .unwrap()
+                .is_none(),
+            "closed test pool's final owner drops its actual database"
+        );
+    }
+
     const OID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -295,6 +1088,10 @@ mod tests {
     }
 
     async fn stream(db: &sea_orm::DatabaseConnection) -> Scope {
+        stream_with_hash(db, "sha1").await
+    }
+
+    async fn stream_with_hash(db: &sea_orm::DatabaseConnection, hash_kind: &str) -> Scope {
         let principal_id = Uuid::new_v4().to_string();
         let target_id = Uuid::new_v4().to_string();
         let path = format!("/team/{target_id}");
@@ -335,7 +1132,7 @@ mod tests {
             target_id: Set(target_id.clone()),
             source_repo_id: Set("source-opaque".to_owned()),
             epoch_id: Set(Uuid::new_v4().to_string()),
-            hash_kind: Set("sha1".to_owned()),
+            hash_kind: Set(hash_kind.to_owned()),
             tip_oid: Set(None),
             created_at: Set(now),
         }
