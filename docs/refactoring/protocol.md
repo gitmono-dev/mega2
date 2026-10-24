@@ -976,4 +976,12 @@ pkt-line。错误字段与完整应答表见 [错误文档](../errors.md#megaerr
 和 [history-projection 设计 §6.1「错误契约」](history-projection.md#61-url-与路由决策)。视图 URL 的错误产生方和
 黑盒覆盖由后续入口与打包卡登记，本节不重复场景覆盖表行。
 
-**2026-10-24（MTR-98 本地A/B已核，自身审查与发布待）**：内部发布事实由受控 PACK 与本 stream 已发布 raw 闭包推导，原始字节、取消、schema 归档及可见性边界见 [Traces 唯一协议源](./traces.md)。封闭事实桥尚未接入 HTTP/SSH；逐提交 checkpoint 历史资格仍待 MTR-101，不能据此放行 wire 发布。
+**2026-10-24（MTR-98 自身Claude审查、v0.42.69完整C/D已核）**：内部发布事实由受控 PACK 与本 stream 已发布 raw 闭包推导，原始字节、取消、schema 归档及可见性边界见 [Traces 唯一协议源](./traces.md)。封闭事实桥尚未接入 HTTP/SSH；逐提交 checkpoint 历史资格仍待 MTR-101，不能据此放行 wire 发布。
+
+<a id="ssh-dependency-security"></a>
+
+### SSH 依赖安全基线（FIX-MTR-11）
+
+`russh` 的实际锁定版本为 0.64.1，包含 [GHSA-j7h2-66j4-ghjf](https://github.com/Eugeny/russh/security/advisories/GHSA-j7h2-66j4-ghjf) 的公钥请求/签名算法一致性修复，以及 [GHSA-4wc5-f2rc-q74m](https://github.com/Eugeny/russh/security/advisories/GHSA-4wc5-f2rc-q74m) 的 agent 重复 lifetime 约束修复。后者先验证完整约束，再插入身份和创建过期任务；本项目未启用 agent 服务或转发入口。
+
+0.64.0 移除的可选 `legacy-ed25519-pkcs8-parser` 在旧实际 feature 树中未启用；本次不新增 feature，不改变现有标准 OpenSSH 密钥、用户公钥指纹或 github_sync 密钥持久化接口。测试使用临时密钥和私有传输，负例只有两个短 lifetime 约束，不运行高放大资源耗尽演示。源码/验收/审查/发布与 GitHub 告警终态分开登记于[日期计划](../plan/plan-20261015.md)的 FIX-MTR-11；依赖升级本身不等于远端告警已经关闭。

@@ -38,6 +38,8 @@ trunk 模式下的推送规则（Monorepo 路径；ImportRepo 见第 2.6 节）�
 
 storage-only **不暴露 SSH receive-pack**(`git.ssh_receive_pack=false` 是强制配置,省略会拒绝启动);SSH 仅用于 clone / fetch / pull。`anonymous_access` 与 `push_auth` 组合下的认证形态见 [`deploy-trunk.md`](./deploy-trunk.md) 第 4 节。
 
+SSH 公钥认证会检查请求声明的算法与实际签名算法一致；例如声明 `rsa-sha2-512` 却提交 SHA-1 签名的请求会被拒绝，匹配的 RSA-SHA2-512 认证保持支持。现有标准 OpenSSH 密钥的保存、重载和公钥指纹接口保持不变。本次依赖更新没有启用 SSH agent 服务或转发；安全修复来源与密钥兼容说明见[协议文档](./refactoring/protocol.md#ssh-dependency-security)。
+
 ### 2.3 推送鉴权:token 或 none
 
 写面(Git receive-pack、LFS 批/锁写、产品 API 写)共用 `git.push_auth`:

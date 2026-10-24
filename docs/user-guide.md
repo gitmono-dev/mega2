@@ -38,6 +38,8 @@ The protocol endpoints and write surfaces are listed in the [Architecture Guide]
 
 storage-only **does not expose SSH receive-pack** (`git.ssh_receive_pack=false` is mandatory configuration; omitting it refuses startup). SSH is only for clone, fetch, and pull. See the [Deployment Guide](./deployment.md) for supported authentication modes.
 
+SSH public-key authentication checks that the declared algorithm matches the actual signature algorithm. For example, a request declaring `rsa-sha2-512` with a SHA-1 signature is rejected; matching RSA-SHA2-512 authentication remains supported. Existing standard OpenSSH key storage, reload, and public-key fingerprint interfaces remain unchanged. This dependency update does not enable SSH agent service or forwarding. See the [protocol document](./refactoring/protocol.md#ssh-dependency-security) for upstream security fixes and key compatibility.
+
 ### 2.3 Push auth: token or none
 
 The write surfaces (Git receive-pack, LFS batch/lock writes, product API writes) share `git.push_auth`:
