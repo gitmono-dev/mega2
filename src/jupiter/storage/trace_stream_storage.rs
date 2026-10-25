@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     callisto::{trace_checkpoint, trace_object, trace_ref_update, trace_stream},
-    ceres::traces::publication::PreparedPublication,
+    ceres::traces::checkpoint_history::CheckpointValidatedPublication,
     common::{
         errors::{MegaError, TracesError},
         utils::is_protocol_zero_id,
@@ -131,7 +131,7 @@ pub(in crate::jupiter) async fn publish_scope_in_txn(
 pub(in crate::jupiter) async fn publish_prepared_scope_in_txn(
     txn: &DatabaseTransaction,
     facts: &ScopeFacts<'_>,
-    prepared: &PreparedPublication,
+    prepared: &CheckpointValidatedPublication,
     authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
 ) -> Result<PublishedRef, MegaError> {
     publish_scope_with_facts(txn, facts, prepared.update(), authority, Some(prepared)).await
@@ -142,7 +142,7 @@ async fn publish_scope_with_facts(
     facts: &ScopeFacts<'_>,
     update: &PublishRef,
     authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
-    prepared: Option<&PreparedPublication>,
+    prepared: Option<&CheckpointValidatedPublication>,
 ) -> Result<PublishedRef, MegaError> {
     let hash_kind = canonical_hash_kind(facts.hash_kind)?;
     if hash_kind != canonical_hash_kind(&update.hash_kind)? {
@@ -252,7 +252,7 @@ pub(in crate::jupiter) async fn publish_ref(
 
 pub(in crate::jupiter) async fn publish_prepared_ref(
     db: &DatabaseConnection,
-    prepared: &PreparedPublication,
+    prepared: &CheckpointValidatedPublication,
     authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
 ) -> Result<PublishedRef, MegaError> {
     let control = prepared.control();
@@ -282,7 +282,7 @@ async fn publish_ref_in_txn(
     txn: &DatabaseTransaction,
     update: &PublishRef,
     authority: &crate::ceres::traces::auth::PublishAuthority<'_>,
-    prepared: Option<&PreparedPublication>,
+    prepared: Option<&CheckpointValidatedPublication>,
 ) -> Result<PublishedRef, MegaError> {
     let PreparedRef {
         stream_id,
@@ -493,7 +493,7 @@ async fn journal_for_key(
 async fn publish_prepared_checkpoints(
     txn: &DatabaseTransaction,
     stream_id: &str,
-    prepared: &PreparedPublication,
+    prepared: &CheckpointValidatedPublication,
 ) -> Result<(), MegaError> {
     let proposed = prepared.final_checkpoints()?;
     let mut after = None::<String>;

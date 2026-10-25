@@ -1,3 +1,23 @@
+> **MTR101 A4验收与最终源码审查前沿（2026-10-25T00:34:41.026023+00:00）：** MTR101 A4实际PASS：fmt/严格Clippy、selector6/4/1及四完整模块7/9/16/10全通过，42唯一用例、0failed/0ignored；212.117/900秒，root后检确认输入/工具/104个DB名称与owner不变、无新孤儿、未手工清理。新覆盖已兑现，最终候选自身Claude ER05 R2待；0.42.70不变，未bump/提交/push/C-D。Libra PR635已推但CI缺fontconfig未闭合，未合并/tag/Release；资格02/03与H1前驱不变。 原A1/A2 FAIL/STOP、A3/R1限定输入PASS保留；正式Mega15/112、Libra0/26、联合15/138、外部0/3不变。
+
+> **MTR101 覆盖方案采纳与实现候选（2026-10-25 00:20:32 UTC）：** 本地Claude ER03/H0实际PASS，无P0/P1；仅两现有cfg(test)模块补齐候选，生产字节不变。新增storage第二页缺失/异tree拒绝及全匹配正对照，保留At并补Absent/首发无副作用、原checkpoint同一行的真实增量发布，原断言与空tree stale-binding覆盖保持。A4预期42例、一次900秒执行准入待，尚未编译/测试；自己的新ER05与C/D仍待。A3/R1 PASS和旧FAIL/STOP均保留；Libra PR635 CI缺件未闭合，正式计数不变。
+
+> **MTR101 自身审查与覆盖补齐候选（2026-10-25 00:12:22 UTC）：** MTR101当前源码自身Claude ER05/H0已PASS、A3实际41例通过；root决定在C前关闭P2-1/2覆盖缺口与P2-6正文滞后。仅两个现有cfg(test)模块拟补断言/一个case，生产源码不改；A4一次900秒方案待ER03/H0审查，尚未实施/claim。0.42.70不变，未提交/push/C-D。Libra PR635 clippy缺fontconfig失败，未合并/tag/Release；其余资格和H1前驱不变。 原A3 PASS、A1/A2 FAIL/STOP及预算全部保留；正式15/112、0/26、联合15/138、外部0/3不变。
+
+> **MTR101 实际A3与自身代码审查前沿（2026-10-24 23:59:09 UTC）：** 2026-10-24 23:59:09 UTC：MTR101 A3实际PASS，完整模块7/9/15/10共41例、0fail/0ignore；fmt/严格Clippy通过，32.954/900秒。root核输入/工具/DB/进程无漂移或残留，原A1/A2 FAIL/STOP不改；源码及A/B完成候选，自己的本地Claude代码ER05待，未bump/提交/push/C-D。Libra FIX-LTR01已signed2852497推功能分支PR635，远端clippy缺fontconfig.pc失败，未合并/tag/Release；资格02/03与H1仍待。 正式Mega15/112、Libra0/26、联合15/138、外部0/3不变；以下旧时点均为历史。
+
+> **当前恢复与跨仓前沿（2026-10-24 23:51:00 UTC）：** 2026-10-24 23:51:00 UTC：MTR101 A2实际FAIL/STOP；三组selector6/3/1已PASS，外部阶段名校验在首个完整模块Cargo启动前失败，四完整模块均未执行。A3恢复候选一次900秒、ER03/H0/执行准入待本地Claude；源码不变，8AC/4VER未勾。Libra FIX-LTR-01本地C受限接受、自己的Claude PASS，signed/DCO提交2852497已推功能分支并建PR635；远端clippy缺fontconfig.pc失败，未合并/tag/Release。 原A1/A2预算与FAIL/STOP全部保留；旧时点为历史。正式Mega15/112、Libra0/26、联合15/138、外部0/3不变。
+
+> **MTR101 A2准入修订（2026-10-24 22:10:09 UTC）：** R1实际EXECUTION FAIL/H0 PASS；执行器串行前置P1已修成R2候选，待本地Claude复审，尚未claim/测试。原A1 FAIL/STOP、源码恢复ER03/H0 PASS与一行夹具修复保留。Libra FIX-LTR-01已bump0.30.87并运行独立C，尚未提交/推送/发布；不与A2并跑测试。下方旧时点保留。
+
+> **MTR101恢复方案实际通过（2026-10-24 22:01:36 UTC）：** 本地Claude ER03/H0 PASS，P0/P1无；root采纳受审的一行cfg(test)键隔离修复，8AC/4VER未勾，in-progress/空。A1 FAIL/STOP保留；A2一次1800秒最终执行准入待，尚未运行。原功能链/计数与C/D边界不变；下方候选及旧状态为历史。
+
+> **MTR101恢复候选与Libra并行前沿（2026-10-24 21:56:54 UTC）：** 2026-10-24 21:56:54 UTC：MTR101 A1实际FAIL/STOP，chain6/6、publication0/3，resources及四完整模块未运行；原8AC/4VER未勾。仅测试fixture冪等键隔离的ER03/H0恢复候选待本地Claude，A2一次1800秒未准入/未执行，旧A1不重置。FIX-LTR-01源码/A/自身Claude ER05已PASS，C准入待、无提交/push/发布；外部0/3。FIX11已done/complete；Mega15/112、Libra0/26、联合15/138。 当前功能链仍101→99→11→40→13→39→92→12/H1→LTR10→11→12→LTR01；LTR10仍需H0/H1/WRITERS/LIVE及DEP-TR-QUAL-REPAIRS，原merge签名政策未关闭。以下旧时点事实保留。
+
+> **MTR101 实施候选与 Libra 并行验收（2026-10-24T20:47:02.168654+00:00）：** FIX11两个告警已实际fixed且C/D闭合；MTR101按已PASS的R2五生产文件写集开始实施：raw事实绑定原请求old-tip与真实新增链，新增私有历史witness，service/storage只接收witness，storage原事务算法不变。已写真实raw链、完整关系快照、原请求稀疏重试、新键no-op、旧tip竞态、跨页取消/Drop测试候选；尚未编译、A/自身ER05/C/D均未执行，不能据此放行HTTP/SSH。仅编辑期nightly rustfmt已应用，不是fmt验收。Mega A保留一次1800秒且尚未claim，测试/发布与当前Libra A串行。Libra独立clone FIX-LTR-01本地Claude执行准入PASS，当前fmt/clippy exit0、精确1/1与完整target54/54通过，全量列举仍运行；其A总判定、自己的代码ER05/C/D未完成。原治理签名本地提交Mega71d15f84、Libra660d7d2e已核且未push；当前新增事实由既定后续卡覆盖。Mega15/112、Libra0/26、外部修复0/3不变，原失败/STOP及旧证据缺口保留。**
+
+> **FIX-MTR-11实际收口（2026-10-24 20:22:25 UTC）：Dependabot23/24已由GitHub实际标fixed，fixed_at分别2026-10-24T20:16:51Z/20:16:52Z，均非dismissed；main与v0.42.70解引用均932731d9b7f274638d2fb1bfa10d571207a54a39，人工Release已发布，main Harbor40112708799及tag Docker40112738161三job全部success。自己的Claude R3 ER05/H0 PASS、21 targets/3085 PASS/0 FAIL/3原ignored的五门C与signed/DCO均已核，现done/complete；RED1 FAIL/STOP与原P2不改。原件D-alerts-fixed-terminal-20261025 SHA256 2585fecfeacde5f37a6bae1eed701898e20f8254e11d704cc08e017129a0e7f9。Mega15/112（活动15/111）、Libra0/26（活动0/25）、联合15/138（活动15/136）；外部恢复0/3。恢复方案R4及治理自身R5真实本地Claude均PASS。安全前置已解除；下一步优先在独立Libra clone核入场并实施FIX-LTR-01，MTR101亦仅解除本安全前置，不跳过各卡独立门。原Libra merge签名政策、H1/LTR10及LTR01仍未完成。**
+
 > **2026-10-24 20:15:32 UTC 治理采纳与自身审查实际收据：** 九份文档已按受审hash采纳；真实本地Claude R5 `DOCS_ER05_VERDICT / ER03_VERDICT / H0_SYNC_VERDICT / VERDICT: PASS`，P0/P1=0，session `e72fd9de-c479-457d-9eff-71ea07a7b49d`，审查输出SHA256 `cd632543ed9722003ebdda14f6e6f32512eb84f7b8e63e0940ce13a96291d4b7`，manifest SHA256 `096eae5326d3714271eaa2c4c3ba59dfa1f7c1156b6aa3d48d8bdf5c7f0fa78a`。本行是审查之后的事实收据，不声称审查器读过其自身后产出的输出。root接受非阻断P2：例行维护收据/预算约束以下方具名表为准，执行前并入对应条款并实审；历史横幅保留，本文首收据为当前时点；终态执行器仍须生成/冻结/实审。缓存复制实际exit0，31147文件（deps11178/build4563/fingerprint15406）、19035122524字节，root已核排除第一方/测试可执行文件及硬链接；这只完成源准备，不是验收。两仓精确signed本地提交待，尚未push；原治理由既定MTR01/LTR01承载。三张修复仍pending、0/3；原14/138不变；FIX11两告警实际fixed及逐卡入场条件未满足前不实施，不复用任何旧FAIL/STOP窗口。
 
 > **2026-10-24 20:09:49 UTC 恢复计划实审收据：** 本地Claude R4 ER03/H0/VERDICT均PASS（session67756716-0e46-4d90-bf70-fd23dff6b918，输出SHA256 48f93079f925f4129fa9523b78a5cf2bae123e9aa4fab890be11b9b15dd793a2），P0/P1=0；R1～R3 FAIL保留。当前仅计划准入，P2时间/日志已校正，最终治理自身ER05待审；源码/验收/提交/发布未执行，FIX11两告警实际fixed前不放行新卡。原14/138与外部0/3不变。
@@ -133,6 +153,8 @@ MTR-94 的源码实现在 HTTP Router 外层增加禁用守卫：`[traces].enabl
 当前 helper 是 `ceres::traces::auth::authorize_traces`。静态 push token 的凭据 id 是 token 名称，不是 secret；只匹配 `static_push_token` 命名空间中未退役的绑定，再对 canonical target path 调用 `token_covers_repo`。Mono 账户只匹配 `mono_account` 命名空间，读评估 `viewRepo`，写评估 `pushRepo`，资源是 root Repository 快照。快照缺失、`enforcement` 不消费快照，或 Cedar 拒绝时，traces 拒绝；`off` / `shadow` 对代码推送的放行不放行 traces。匿名调用得到未认证结果。没有绑定、不是 owner，或缺少目标读/写权限时得到不可区分的拒绝。提交作者不参与判定。普通代码读取仍走既有匿名读门，普通代码写入仍走既有 token 路径门和 `decide_push`；没有 traces 绑定不改变这些代码结果。HTTP、SSH 与查询路由接入该 helper 由后续卡完成。
 
 ## 3. 原始对象存储、接收与恢复
+
+**MTR-101 当前内部实现边界（2026-10-25，A4 42例实际PASS；最终代码ER05 R2与C/D待）：** raw prepare只从真实new-tip parent链取得顺序；请求必须显式使用Absent或At，At基线取自请求old-tip的raw tree，不能悄悄重读新tip。Unspecified仅供raw事实诊断，不能取得私有CheckpointValidatedPublication。历史验证逐commit保留已有和本批先前新增checkpoint的original_tree，不允许中间改删后恢复绕过；service现有stream和first-scope的正式发布入口均要求此witness，原DB权限/old-tip CAS/单事务保持。非法At或历史完整性拒绝当前返回ObjectIntegrity，wire公开错误映射由MTR11消费。算法复用原97的continuation/取消/时钟，仍有完整闭包扫描、每个不同tree的role读取及逐binding同步文件I/O成本，不承诺新的端到端时间/RSS上限。HTTP/SSH公开接线尚未完成；旧历史数据不重写。P2覆盖增补与正式发布状态见[MTR-101任务卡](../plan/plan-20261015.md#task-mtr-101-新增commit逐步checkpoint历史保护)。
 
 原始 Git payload 是证据事实源。commit/tree/blob/tag 均保留原始 bytes，OID 根据 Git kind/length/payload 重新校验；不能用现有 commit/tree ORM 模型重序列化替代原始 bytes。SHA-1/SHA-256 的协商、长度与包头必须一致，禁止跨 hash domain fallback。
 

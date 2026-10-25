@@ -234,6 +234,7 @@ pub(crate) struct PreparedPublication {
     commits: Vec<CommitFacts>,
     maps: HashMap<String, CheckpointMap>,
     tip_tree: String,
+    baseline_tree: Option<String>,
     incoming: HashSet<String>,
     spool: Spool,
     control: IngestContinuation,
@@ -251,6 +252,16 @@ impl PreparedPublication {
     }
     pub(crate) fn final_checkpoints(&self) -> Result<&CheckpointMap, MegaError> {
         self.maps.get(&self.tip_tree).ok_or_else(invalid)
+    }
+    pub(crate) fn baseline_checkpoints(&self) -> Result<Option<&CheckpointMap>, MegaError> {
+        self.baseline_tree
+            .as_ref()
+            .map(|tree| self.maps.get(tree).ok_or_else(invalid))
+            .transpose()
+    }
+    #[cfg(test)]
+    pub(crate) fn spool_path_for_test(&self) -> &std::path::Path {
+        &self.spool.path
     }
     pub(crate) fn control(&self) -> &IngestContinuation {
         &self.control
@@ -620,12 +631,35 @@ pub(crate) async fn prepare(
     builder.closure(&tip).await?;
     let (tip_tree, _): (String, Vec<String>) =
         serde_json::from_reader(spool.open(&format!("commit-{tip}"))?).map_err(io_error)?;
+    let expected_old_tip = match &proposal.expected_old_tip {
+        ExpectedOldTip::At(old) => ExpectedOldTip::At(old.to_ascii_lowercase()),
+        other => other.clone(),
+    };
     let mut commits = Vec::new();
     let mut maps = HashMap::new();
+    let mut baseline_tree = None;
     let mut next = tip.clone();
     let mut seen = HashSet::new();
-    while builder.fresh.contains(&next) {
+    loop {
         control.checkpoint().await?;
+        if let ExpectedOldTip::At(old) = &expected_old_tip
+            && old == &next
+        {
+            let (tree, _): (String, Vec<String>) =
+                serde_json::from_reader(spool.open(&format!("commit-{next}"))?)
+                    .map_err(io_error)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = maps.entry(tree.clone()) {
+                entry.insert(builder.checkpoint_map(&tree).await?);
+            }
+            baseline_tree = Some(tree);
+            break;
+        }
+        // Unspecified is retained for raw-fact diagnostics only. Production
+        // history validation requires an explicit request baseline.
+        if matches!(expected_old_tip, ExpectedOldTip::Unspecified) && !builder.fresh.contains(&next)
+        {
+            break;
+        }
         if !seen.insert(next.clone()) {
             return Err(invalid());
         }
@@ -642,6 +676,7 @@ pub(crate) async fn prepare(
         });
         match parent {
             Some(parent) => next = parent,
+            None if matches!(expected_old_tip, ExpectedOldTip::At(_)) => return Err(invalid()),
             None => break,
         }
     }
@@ -653,11 +688,13 @@ pub(crate) async fn prepare(
     if !builder.membership.contains(&tip) {
         object_oids.push(tip.clone());
     }
+    object_oids.extend(commits.iter().map(|commit| commit.oid.clone()));
     object_oids.sort();
+    object_oids.dedup();
     let schema_id = maps.get(&tip_tree).ok_or_else(invalid)?.schema_id.clone();
     let update = PublishRef {
         stream_id: proposal.stream_id.clone(),
-        expected_old_tip: proposal.expected_old_tip,
+        expected_old_tip,
         new_tip: tip,
         ref_names: proposal.ref_names,
         delete: false,
@@ -681,6 +718,7 @@ pub(crate) async fn prepare(
         commits,
         maps,
         tip_tree,
+        baseline_tree,
         incoming,
         spool,
         control,

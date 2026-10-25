@@ -5,7 +5,7 @@ use sea_orm::{DatabaseConnection, TransactionTrait};
 #[cfg(test)]
 use crate::jupiter::storage::trace_stream_storage::PublishRef;
 use crate::{
-    ceres::traces::{auth::PublishAuthority, publication::PreparedPublication},
+    ceres::traces::{auth::PublishAuthority, checkpoint_history::CheckpointValidatedPublication},
     common::errors::MegaError,
     jupiter::{
         service::trace_target_service,
@@ -45,7 +45,7 @@ pub struct FirstScopeRequest<'a> {
 }
 
 enum ScopeUpdate<'a> {
-    Prepared(&'a PreparedPublication),
+    Prepared(&'a CheckpointValidatedPublication),
     #[cfg(test)]
     Legacy(&'a PublishRef),
 }
@@ -53,7 +53,7 @@ enum ScopeUpdate<'a> {
 pub(in crate::jupiter) struct PreparedScopeRequest<'a> {
     pub(in crate::jupiter) path: &'a str,
     pub(in crate::jupiter) facts: &'a ScopeFacts<'a>,
-    pub(in crate::jupiter) prepared: &'a PreparedPublication,
+    pub(in crate::jupiter) prepared: &'a CheckpointValidatedPublication,
     pub(in crate::jupiter) authority: &'a PublishAuthority<'a>,
 }
 
@@ -72,7 +72,10 @@ impl TracePublishService {
         Self::new(crate::jupiter::storage::object_storage::mock_object_storage())
     }
 
-    async fn store_prepared(&self, prepared: &PreparedPublication) -> Result<(), MegaError> {
+    async fn store_prepared(
+        &self,
+        prepared: &CheckpointValidatedPublication,
+    ) -> Result<(), MegaError> {
         trace_stream_storage::preflight(prepared.update())?;
         for oid in &prepared.update().object_oids {
             if let Some(bytes) = prepared.incoming_bytes(oid).await? {
@@ -92,11 +95,11 @@ impl TracePublishService {
         prepared.control().check()
     }
 
-    // Internal only until the history-policy witness in MTR-101 is enforced.
+    // Publication requires the sealed history-policy witness.
     pub(in crate::jupiter) async fn publish_prepared(
         &self,
         db: &DatabaseConnection,
-        prepared: &PreparedPublication,
+        prepared: &CheckpointValidatedPublication,
         authority: &PublishAuthority<'_>,
     ) -> Result<PublishedRef, MegaError> {
         self.store_prepared(prepared).await?;
@@ -402,6 +405,39 @@ mod tests {
         },
     };
 
+    impl crate::ceres::traces::publication::tests::Fixture {
+        async fn prepare_validated(
+            &self,
+            db: &DatabaseConnection,
+            store: &MegaObjectStorageWrapper,
+            stream: &str,
+            tip: &str,
+            key: &str,
+            included: Option<&[String]>,
+        ) -> Result<CheckpointValidatedPublication, MegaError> {
+            let old = trace_stream::Entity::find_by_id(stream)
+                .one(db)
+                .await?
+                .and_then(|stream| stream.tip_oid)
+                .map_or(ExpectedOldTip::Absent, ExpectedOldTip::At);
+            let facts = crate::ceres::traces::publication::prepare(
+                db,
+                &super::super::trace_object_service::TraceObjectService::new(store.clone()),
+                self.decoded(included).await,
+                crate::ceres::traces::publication::PublicationProposal {
+                    stream_id: stream.to_owned(),
+                    expected_old_tip: old,
+                    new_tip: tip.to_owned(),
+                    ref_names: vec![TRACES_REF.into()],
+                    delete: false,
+                    idempotency_key: key.to_owned(),
+                },
+            )
+            .await?;
+            crate::ceres::traces::checkpoint_history::validate_checkpoint_history(facts).await
+        }
+    }
+
     fn prepared_authority<'a>(
         scope: &'a Scope,
         token: &'a crate::config::PushTokenConfig,
@@ -437,7 +473,7 @@ mod tests {
             let extra = fixture.object("blob", b"extra unpublished pack object");
             let key = Uuid::new_v4().to_string();
             let prepared = fixture
-                .prepare(&db, &store, &scope.stream_id, &first, &key, None)
+                .prepare_validated(&db, &store, &scope.stream_id, &first, &key, None)
                 .await
                 .unwrap();
             let published = service
@@ -458,10 +494,10 @@ mod tests {
                     .idempotent
             );
             let replay = fixture
-                .prepare(&db, &store, &scope.stream_id, &first, &key, None)
+                .prepare_validated(&db, &store, &scope.stream_id, &first, &key, None)
                 .await
                 .unwrap();
-            assert!(replay.commits().is_empty());
+            assert!(replay.update().commits.is_empty());
             assert!(
                 service
                     .publish_prepared(&db, &replay, &authority)
@@ -480,7 +516,7 @@ mod tests {
             );
             let second = fixture.commit(&root, Some(&first));
             let prepared = fixture
-                .prepare(
+                .prepare_validated(
                     &db,
                     &store,
                     &scope.stream_id,
@@ -491,7 +527,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(prepared.update().object_oids, std::slice::from_ref(&second));
-            assert_eq!(prepared.commits()[0].parents(), [first.as_str()]);
+            assert_eq!(prepared.update().commits[0].parents, [first.as_str()]);
             service
                 .publish_prepared(&db, &prepared, &authority)
                 .await
@@ -522,7 +558,13 @@ mod tests {
     async fn prepared_publication_final_list_defense_and_intermediate_facts() {
         use git_internal::hash::HashKind;
 
-        use crate::ceres::traces::publication::tests::{Fixture, local_store};
+        use crate::ceres::traces::{
+            checkpoint_history::validate_checkpoint_history,
+            publication::{
+                self, PublicationProposal,
+                tests::{Fixture, local_store},
+            },
+        };
         let (_database, db) = open_db().await;
         let (_backend, store) = local_store().await;
         let service = TracePublishService::new(store.clone());
@@ -533,7 +575,7 @@ mod tests {
         let (root, leaf) = fixture.capture(br#"{"schema_version":2}"#);
         let first = fixture.commit(&root, None);
         let prepared = fixture
-            .prepare(
+            .prepare_validated(
                 &db,
                 &store,
                 &scope.stream_id,
@@ -550,23 +592,72 @@ mod tests {
         let (changed_root, changed_leaf) =
             fixture.capture(br#"{"schema_version":2,"changed":true}"#);
         let changed = fixture.commit(&changed_root, Some(&first));
-        let prepared = fixture
-            .prepare(
-                &db,
-                &store,
-                &scope.stream_id,
-                &changed,
-                "changed-final",
-                None,
-            )
-            .await
-            .unwrap();
         assert!(
-            service
-                .publish_prepared(&db, &prepared, &authority)
+            fixture
+                .prepare_validated(
+                    &db,
+                    &store,
+                    &scope.stream_id,
+                    &changed,
+                    "changed-final",
+                    None
+                )
                 .await
                 .is_err()
         );
+        let empty = fixture.tree(&[]);
+        let deleted = fixture.commit(&empty, Some(&first));
+        assert!(
+            fixture
+                .prepare_validated(
+                    &db,
+                    &store,
+                    &scope.stream_id,
+                    &deleted,
+                    "deleted-final",
+                    None
+                )
+                .await
+                .is_err()
+        );
+        let restored = fixture.commit(&root, Some(&changed));
+        let facts = publication::prepare(
+            &db,
+            &super::super::trace_object_service::TraceObjectService::new(store.clone()),
+            fixture.decoded(None).await,
+            PublicationProposal {
+                stream_id: scope.stream_id.clone(),
+                expected_old_tip: ExpectedOldTip::At(first.clone()),
+                new_tip: restored,
+                ref_names: vec![TRACES_REF.into()],
+                delete: false,
+                idempotency_key: "restored-final".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(facts.commits().len(), 2);
+        assert_eq!(
+            facts
+                .checkpoints(facts.commits()[0].tree())
+                .unwrap()
+                .get("abcd")
+                .unwrap()
+                .unwrap()
+                .original_tree,
+            changed_leaf
+        );
+        assert_eq!(
+            facts
+                .final_checkpoints()
+                .unwrap()
+                .get("abcd")
+                .unwrap()
+                .unwrap()
+                .original_tree,
+            leaf
+        );
+        assert!(validate_checkpoint_history(facts).await.is_err());
         assert_eq!(
             trace_stream::Entity::find_by_id(&scope.stream_id)
                 .one(&db)
@@ -586,64 +677,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let empty = fixture.tree(&[]);
-        let deleted = fixture.commit(&empty, Some(&first));
-        let prepared = fixture
-            .prepare(
-                &db,
-                &store,
-                &scope.stream_id,
-                &deleted,
-                "deleted-final",
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            service
-                .publish_prepared(&db, &prepared, &authority)
-                .await
-                .is_err()
-        );
-        let restored = fixture.commit(&root, Some(&changed));
-        let prepared = fixture
-            .prepare(
-                &db,
-                &store,
-                &scope.stream_id,
-                &restored,
-                "restored-final",
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(prepared.commits().len(), 2);
-        assert_eq!(
-            prepared
-                .checkpoints(prepared.commits()[0].tree())
-                .unwrap()
-                .get("abcd")
-                .unwrap()
-                .unwrap()
-                .original_tree,
-            changed_leaf
-        );
-        assert_eq!(
-            prepared
-                .final_checkpoints()
-                .unwrap()
-                .get("abcd")
-                .unwrap()
-                .unwrap()
-                .original_tree,
-            leaf
-        );
-        // This is only MTR-95's final-list defense. MTR-101 must reject
-        // the intermediate mutation before any future wire publication.
-        service
-            .publish_prepared(&db, &prepared, &authority)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -676,16 +709,15 @@ mod tests {
                 idempotency_key: "wrong-expected-old".into(),
             },
         )
-        .await
-        .unwrap();
-        assert!(
-            service
-                .publish_prepared(&db, &prepared, &authority)
-                .await
-                .is_err()
-        );
+        .await;
+        assert!(matches!(
+            prepared,
+            Err(MegaError::Traces(
+                crate::common::errors::TracesError::ObjectIntegrity
+            ))
+        ));
         let prepared = fixture
-            .prepare(
+            .prepare_validated(
                 &db,
                 &store,
                 &scope.stream_id,
@@ -780,10 +812,74 @@ mod tests {
             hash_kind: "sha1",
         };
         let mut fixture = Fixture::new(HashKind::Sha1);
-        let tree = fixture.tree(&[]);
+        let empty = fixture.tree(&[]);
+        let empty_tip = fixture.commit(&empty, None);
+        let (tree, first_leaf) = fixture.capture(br#"{"schema_version":2}"#);
         let tip = fixture.commit(&tree, None);
+        for deletion in [false, true] {
+            let changed_tree = if deletion {
+                empty.clone()
+            } else {
+                fixture.capture(br#"{"schema_version":2,"changed":true}"#).0
+            };
+            let changed = fixture.commit(&changed_tree, Some(&tip));
+            let restored = fixture.commit(&tree, Some(&changed));
+            let before = history_snapshot(&db).await;
+            let rejected = async {
+                let prepared = fixture
+                    .prepare_validated(
+                        &db,
+                        &store,
+                        &scope.stream_id,
+                        &restored,
+                        &format!("first-scope-invalid-{deletion}"),
+                        None,
+                    )
+                    .await?;
+                let request = PreparedScopeRequest {
+                    path: "/proj",
+                    facts: &facts,
+                    prepared: &prepared,
+                    authority: &authority,
+                };
+                service
+                    .publish_prepared_first_scope(&config, &db, &mono, &request)
+                    .await
+            }
+            .await;
+            assert!(matches!(
+                rejected,
+                Err(MegaError::Traces(
+                    crate::common::errors::TracesError::ObjectIntegrity
+                ))
+            ));
+            assert_eq!(history_snapshot(&db).await, before);
+            assert!(
+                trace_stream::Entity::find_by_id(&scope.stream_id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                trace_target::Entity::find()
+                    .filter(trace_target::Column::ProjectPath.eq("/proj"))
+                    .count(&db)
+                    .await
+                    .unwrap(),
+                0
+            );
+            for oid in [&changed, &restored] {
+                assert!(
+                    trace_object_storage::get_raw(&store, &scope.stream_id, "sha1", oid)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
         let prepared = fixture
-            .prepare(
+            .prepare_validated(
                 &db,
                 &store,
                 &scope.stream_id,
@@ -811,6 +907,14 @@ mod tests {
                 .unwrap(),
             1
         );
+        let checkpoints = crate::callisto::trace_checkpoint::Entity::find()
+            .filter(crate::callisto::trace_checkpoint::Column::StreamId.eq(&scope.stream_id))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].checkpoint_key, "abcd");
+        assert_eq!(checkpoints[0].original_tree, first_leaf);
         let other_id = Uuid::new_v4().to_string();
         let other_epoch = Uuid::new_v4().to_string();
         let facts = ScopeFacts {
@@ -824,7 +928,14 @@ mod tests {
             ..authority
         };
         let prepared = fixture
-            .prepare(&db, &store, &other_id, &tip, "prepared-stale-binding", None)
+            .prepare_validated(
+                &db,
+                &store,
+                &other_id,
+                &empty_tip,
+                "prepared-stale-binding",
+                None,
+            )
             .await
             .unwrap();
         let request = PreparedScopeRequest {
@@ -901,7 +1012,7 @@ mod tests {
         let included = [tree.clone(), second.clone()];
         assert!(
             fixture
-                .prepare(
+                .prepare_validated(
                     &db,
                     &store,
                     &scope.stream_id,
@@ -918,7 +1029,7 @@ mod tests {
             .unwrap();
         assert!(
             fixture
-                .prepare(
+                .prepare_validated(
                     &db,
                     &store,
                     &scope.stream_id,
@@ -940,7 +1051,7 @@ mod tests {
             .unwrap();
         assert!(
             fixture
-                .prepare(
+                .prepare_validated(
                     &db,
                     &store,
                     &scope.stream_id,
@@ -966,7 +1077,7 @@ mod tests {
         .unwrap();
         assert!(
             fixture
-                .prepare(
+                .prepare_validated(
                     &db,
                     &store,
                     &scope.stream_id,
@@ -1001,7 +1112,7 @@ mod tests {
         let child = fixture.commit(&tree, Some(&legacy));
         assert!(
             fixture
-                .prepare(
+                .prepare_validated(
                     &db,
                     &store,
                     &scope.stream_id,
@@ -1040,7 +1151,7 @@ mod tests {
         let tree = fixture.tree(&[]);
         let tip = fixture.commit(&tree, None);
         let prepared = fixture
-            .prepare(&db, &store, &scope.stream_id, &tip, "closed-db", None)
+            .prepare_validated(&db, &store, &scope.stream_id, &tip, "closed-db", None)
             .await
             .unwrap();
         db.clone().close().await.unwrap();
@@ -1070,6 +1181,585 @@ mod tests {
 
     const OID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    async fn history_table_snapshot<E>(db: &DatabaseConnection) -> Vec<String>
+    where
+        E: EntityTrait,
+        E::Model: serde::Serialize,
+    {
+        let mut rows: Vec<_> = E::find()
+            .all(db)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    async fn history_snapshot(db: &DatabaseConnection) -> Vec<Vec<String>> {
+        use crate::callisto;
+        vec![
+            history_table_snapshot::<callisto::trace_principal::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_credential_binding::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_target::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_stream::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_checkpoint::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_object::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_ref_update::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_session::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_fragment::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_resource::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_code_link::Entity>(db).await,
+            history_table_snapshot::<callisto::trace_ingest_attempt::Entity>(db).await,
+            history_table_snapshot::<callisto::mega_refs::Entity>(db).await,
+        ]
+    }
+
+    fn history_proposal(
+        scope: &Scope,
+        tip: &str,
+        old: ExpectedOldTip,
+        key: &str,
+    ) -> crate::ceres::traces::publication::PublicationProposal {
+        crate::ceres::traces::publication::PublicationProposal {
+            stream_id: scope.stream_id.clone(),
+            expected_old_tip: old,
+            new_tip: tip.to_owned(),
+            ref_names: vec![TRACES_REF.into()],
+            delete: false,
+            idempotency_key: format!("{}:{key}", scope.stream_id),
+        }
+    }
+
+    async fn history_prepared(
+        fixture: &crate::ceres::traces::publication::tests::Fixture,
+        db: &DatabaseConnection,
+        store: &MegaObjectStorageWrapper,
+        proposal: crate::ceres::traces::publication::PublicationProposal,
+        included: Option<&[String]>,
+    ) -> Result<CheckpointValidatedPublication, MegaError> {
+        let raw = crate::ceres::traces::publication::prepare(
+            db,
+            &super::super::trace_object_service::TraceObjectService::new(store.clone()),
+            fixture.decoded(included).await,
+            proposal,
+        )
+        .await?;
+        crate::ceres::traces::checkpoint_history::validate_checkpoint_history(raw).await
+    }
+
+    #[tokio::test]
+    async fn checkpoint_history_publication_rejects_mutation_and_deletion_without_partial_rows() {
+        use git_internal::hash::HashKind;
+
+        use crate::ceres::traces::publication::tests::{Fixture, local_store};
+        let (_directory, db) = open_db().await;
+        let (_backend, store) = local_store().await;
+        let service = TracePublishService::new(store.clone());
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            for existing in [false, true] {
+                for deletion in [false, true] {
+                    let mut fixture = Fixture::new(kind);
+                    let scope = stream_with_hash(&db, fixture.hash_kind()).await;
+                    let token = token(&scope);
+                    let authority = prepared_authority(&scope, &token);
+                    let empty = fixture.tree(&[]);
+                    let root = fixture.commit(&empty, None);
+                    let (tree, _) = fixture.capture(br#"{"schema_version":2}"#);
+                    let introduced = fixture.commit(&tree, Some(&root));
+                    let old = if existing { &introduced } else { &root };
+                    let accepted = history_prepared(
+                        &fixture,
+                        &db,
+                        &store,
+                        history_proposal(&scope, old, ExpectedOldTip::Absent, "history-base"),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        !service
+                            .publish_prepared(&db, &accepted, &authority)
+                            .await
+                            .unwrap()
+                            .idempotent
+                    );
+                    let before = history_snapshot(&db).await;
+                    let changed_tree = if deletion {
+                        empty
+                    } else {
+                        fixture.capture(br#"{"schema_version":2,"changed":true}"#).0
+                    };
+                    let changed = fixture.commit(&changed_tree, Some(&introduced));
+                    let restored = fixture.commit(&tree, Some(&changed));
+                    let result = history_prepared(
+                        &fixture,
+                        &db,
+                        &store,
+                        history_proposal(
+                            &scope,
+                            &restored,
+                            ExpectedOldTip::At(old.clone()),
+                            "history-reject",
+                        ),
+                        None,
+                    )
+                    .await;
+                    assert!(matches!(
+                        result,
+                        Err(MegaError::Traces(
+                            crate::common::errors::TracesError::ObjectIntegrity
+                        ))
+                    ));
+                    assert_eq!(history_snapshot(&db).await, before);
+                    assert!(
+                        trace_object_storage::get_raw(
+                            &store,
+                            &scope.stream_id,
+                            fixture.hash_kind(),
+                            &changed
+                        )
+                        .await
+                        .unwrap()
+                        .is_none()
+                    );
+                    assert!(
+                        trace_object_storage::get_raw(
+                            &store,
+                            &scope.stream_id,
+                            fixture.hash_kind(),
+                            &restored
+                        )
+                        .await
+                        .unwrap()
+                        .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_history_publication_explicit_retry_and_new_key_noop_both_hashes() {
+        use git_internal::hash::HashKind;
+
+        use crate::ceres::traces::publication::tests::{Fixture, local_store};
+        let (_directory, db) = open_db().await;
+        let (_backend, store) = local_store().await;
+        let service = TracePublishService::new(store.clone());
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let mut fixture = Fixture::new(kind);
+            let scope = stream_with_hash(&db, fixture.hash_kind()).await;
+            let token = token(&scope);
+            let authority = prepared_authority(&scope, &token);
+            let empty = fixture.tree(&[]);
+            let first = fixture.commit(&empty, None);
+            let (tree, original_leaf) = fixture.capture(br#"{"schema_version":2}"#);
+            let second = fixture.commit(&tree, Some(&first));
+            let tip = fixture.commit(&tree, Some(&second));
+            let initial = history_prepared(
+                &fixture,
+                &db,
+                &store,
+                history_proposal(&scope, &tip, ExpectedOldTip::Absent, "history-initial"),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(initial.update().commits.len(), 3);
+            let accepted = service
+                .publish_prepared(&db, &initial, &authority)
+                .await
+                .unwrap();
+            assert_eq!(accepted.new_tip, tip);
+            assert!(!accepted.idempotent);
+            let before = history_snapshot(&db).await;
+            // Retrying the original request still validates its full history,
+            // even when only the tip is resent and all parents are published.
+            let retry = history_prepared(
+                &fixture,
+                &db,
+                &store,
+                history_proposal(&scope, &tip, ExpectedOldTip::Absent, "history-initial"),
+                Some(std::slice::from_ref(&tip)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(retry.update().commits.len(), 3);
+            let repeated = service
+                .publish_prepared(&db, &retry, &authority)
+                .await
+                .unwrap();
+            assert!(repeated.idempotent);
+            assert_eq!(repeated.ref_sequence, accepted.ref_sequence);
+            assert_eq!(history_snapshot(&db).await, before);
+            let noop = history_prepared(
+                &fixture,
+                &db,
+                &store,
+                history_proposal(
+                    &scope,
+                    &tip,
+                    ExpectedOldTip::At(tip.clone()),
+                    "history-noop-new-key",
+                ),
+                Some(std::slice::from_ref(&tip)),
+            )
+            .await
+            .unwrap();
+            assert!(noop.update().commits.is_empty());
+            assert!(matches!(
+                service.publish_prepared(&db, &noop, &authority).await,
+                Err(MegaError::Traces(
+                    crate::common::errors::TracesError::InvalidParameter
+                ))
+            ));
+            assert_eq!(history_snapshot(&db).await, before);
+            let original = crate::callisto::trace_checkpoint::Entity::find()
+                .filter(crate::callisto::trace_checkpoint::Column::StreamId.eq(&scope.stream_id))
+                .filter(crate::callisto::trace_checkpoint::Column::CheckpointKey.eq("abcd"))
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(original.original_tree, original_leaf);
+            let (_, new_leaf) = fixture.capture(br#"{"schema_version":2,"incremental":true}"#);
+            let prefix = fixture.tree(&[
+                ("40000", b"cd", &original_leaf),
+                ("40000", b"ef", &new_leaf),
+            ]);
+            let checkpoints = fixture.tree(&[("40000", b"ab", &prefix)]);
+            let root = fixture.tree(&[("40000", b"checkpoint", &checkpoints)]);
+            let increment = fixture.commit(&root, Some(&tip));
+            let next = fixture.commit(&root, Some(&increment));
+            let incremental = history_prepared(
+                &fixture,
+                &db,
+                &store,
+                history_proposal(
+                    &scope,
+                    &next,
+                    ExpectedOldTip::At(tip),
+                    "history-existing-plus-multi",
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                incremental
+                    .update()
+                    .commits
+                    .iter()
+                    .map(|commit| commit.oid.as_str())
+                    .collect::<Vec<_>>(),
+                [increment.as_str(), next.as_str()]
+            );
+            let published = service
+                .publish_prepared(&db, &incremental, &authority)
+                .await
+                .unwrap();
+            assert!(!published.idempotent);
+            assert_eq!(published.new_tip, next);
+            assert!(published.ref_sequence > accepted.ref_sequence);
+            let rows = crate::callisto::trace_checkpoint::Entity::find()
+                .filter(crate::callisto::trace_checkpoint::Column::StreamId.eq(&scope.stream_id))
+                .all(&db)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            let retained = rows
+                .iter()
+                .find(|row| row.checkpoint_key == "abcd")
+                .unwrap();
+            assert_eq!(retained.id, original.id);
+            assert_eq!(retained.original_tree, original.original_tree);
+            let added = rows
+                .iter()
+                .find(|row| row.checkpoint_key == "abef")
+                .unwrap();
+            assert_ne!(added.id, original.id);
+            assert_eq!(added.original_tree, new_leaf);
+            assert_eq!(
+                trace_stream::Entity::find_by_id(&scope.stream_id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .tip_oid
+                    .as_deref(),
+                Some(next.as_str())
+            );
+            assert_eq!(
+                crate::callisto::trace_ref_update::Entity::find()
+                    .filter(
+                        crate::callisto::trace_ref_update::Column::StreamId.eq(&scope.stream_id)
+                    )
+                    .count(&db)
+                    .await
+                    .unwrap(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_history_publication_storage_defense_second_page_is_atomic() {
+        use git_internal::hash::HashKind;
+        use sea_orm::{QueryOrder, QuerySelect};
+
+        use crate::{
+            callisto::trace_checkpoint,
+            ceres::traces::publication::tests::{Fixture, local_store},
+        };
+
+        let (_directory, db) = open_db().await;
+        let (_backend, store) = local_store().await;
+        let service = TracePublishService::new(store.clone());
+        let mut next_id = 1_u64;
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            for mismatch in [None, Some("missing"), Some("changed")] {
+                let mut fixture = Fixture::new(kind);
+                let scope = stream_with_hash(&db, fixture.hash_kind()).await;
+                let token = token(&scope);
+                let authority = prepared_authority(&scope, &token);
+                let (_, leaf) = fixture.capture(br#"{"schema_version":2}"#);
+                let (_, other_leaf) = fixture.capture(br#"{"schema_version":2,"unrelated":true}"#);
+                assert_ne!(leaf, other_leaf);
+                let names: Vec<_> = (0..129).map(|n| format!("{n:08x}")).collect();
+                let entries: Vec<_> = names
+                    .iter()
+                    .map(|name| ("40000", name.as_bytes(), leaf.as_str()))
+                    .collect();
+                let prefix = fixture.tree(&entries);
+                let checkpoints = fixture.tree(&[("40000", b"ab", &prefix)]);
+                let root = fixture.tree(&[("40000", b"checkpoint", &checkpoints)]);
+                let tip = fixture.commit(&root, None);
+                let prepared = history_prepared(
+                    &fixture,
+                    &db,
+                    &store,
+                    history_proposal(&scope, &tip, ExpectedOldTip::Absent, "second-page"),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    prepared
+                        .final_checkpoints()
+                        .unwrap()
+                        .iter()
+                        .unwrap()
+                        .count(),
+                    129
+                );
+                let mut ids = Vec::new();
+                let mut rows = Vec::new();
+                for (index, name) in names.iter().enumerate() {
+                    let id = format!("00000000-0000-4000-8000-{next_id:012x}");
+                    next_id += 1;
+                    assert_eq!(Uuid::parse_str(&id).unwrap().to_string(), id);
+                    ids.push(id.clone());
+                    rows.push(trace_checkpoint::ActiveModel {
+                        id: Set(id),
+                        stream_id: Set(scope.stream_id.clone()),
+                        checkpoint_key: Set(if index == 128 && mismatch == Some("missing") {
+                            "ffffffffffff".to_owned()
+                        } else {
+                            format!("ab{name}")
+                        }),
+                        original_tree: Set(if index == 128 && mismatch == Some("changed") {
+                            other_leaf.clone()
+                        } else {
+                            leaf.clone()
+                        }),
+                        created_at: Set(chrono::Utc::now().fixed_offset()),
+                    });
+                }
+                trace_checkpoint::Entity::insert_many(rows)
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                let first_page = trace_checkpoint::Entity::find()
+                    .filter(trace_checkpoint::Column::StreamId.eq(&scope.stream_id))
+                    .order_by_asc(trace_checkpoint::Column::Id)
+                    .limit(128)
+                    .all(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(first_page.len(), 128);
+                assert!(!first_page.iter().any(|row| row.id == ids[128]));
+                for row in &first_page {
+                    let binding = prepared
+                        .final_checkpoints()
+                        .unwrap()
+                        .get(&row.checkpoint_key)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(binding.original_tree, row.original_tree);
+                }
+                let second_page = trace_checkpoint::Entity::find()
+                    .filter(trace_checkpoint::Column::StreamId.eq(&scope.stream_id))
+                    .filter(trace_checkpoint::Column::Id.gt(first_page.last().unwrap().id.clone()))
+                    .order_by_asc(trace_checkpoint::Column::Id)
+                    .limit(128)
+                    .all(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(second_page.len(), 1);
+                assert_eq!(second_page[0].id, ids[128]);
+                let last_binding = prepared
+                    .final_checkpoints()
+                    .unwrap()
+                    .get(&second_page[0].checkpoint_key)
+                    .unwrap();
+                match mismatch {
+                    Some("missing") => assert!(last_binding.is_none()),
+                    Some("changed") => assert_ne!(
+                        last_binding.unwrap().original_tree,
+                        second_page[0].original_tree
+                    ),
+                    None => assert_eq!(
+                        last_binding.unwrap().original_tree,
+                        second_page[0].original_tree
+                    ),
+                    _ => unreachable!(),
+                }
+                let before = history_snapshot(&db).await;
+                let result = service.publish_prepared(&db, &prepared, &authority).await;
+                if mismatch.is_some() {
+                    assert!(matches!(
+                        result,
+                        Err(MegaError::Traces(
+                            crate::common::errors::TracesError::InvalidParameter
+                        ))
+                    ));
+                    assert_eq!(history_snapshot(&db).await, before);
+                } else {
+                    let published = result.unwrap();
+                    assert!(!published.idempotent);
+                    assert_eq!(published.new_tip, tip);
+                    assert_eq!(
+                        trace_stream::Entity::find_by_id(&scope.stream_id)
+                            .one(&db)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .tip_oid
+                            .as_deref(),
+                        Some(tip.as_str())
+                    );
+                    assert_eq!(
+                        trace_checkpoint::Entity::find()
+                            .filter(trace_checkpoint::Column::StreamId.eq(&scope.stream_id))
+                            .count(&db)
+                            .await
+                            .unwrap(),
+                        129
+                    );
+                    assert_eq!(
+                        crate::callisto::trace_ref_update::Entity::find()
+                            .filter(
+                                crate::callisto::trace_ref_update::Column::StreamId
+                                    .eq(&scope.stream_id)
+                            )
+                            .count(&db)
+                            .await
+                            .unwrap(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_history_publication_old_tip_race_keeps_verified_baseline() {
+        use git_internal::hash::HashKind;
+
+        use crate::ceres::traces::publication::tests::{Fixture, local_store};
+        let (_directory, db) = open_db().await;
+        let (_backend, store) = local_store().await;
+        let service = TracePublishService::new(store.clone());
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let mut fixture = Fixture::new(kind);
+            let scope = stream_with_hash(&db, fixture.hash_kind()).await;
+            let token = token(&scope);
+            let authority = prepared_authority(&scope, &token);
+            let empty = fixture.tree(&[]);
+            let first = fixture.commit(&empty, None);
+            let initial = history_prepared(
+                &fixture,
+                &db,
+                &store,
+                history_proposal(&scope, &first, ExpectedOldTip::Absent, "race-base"),
+                None,
+            )
+            .await
+            .unwrap();
+            service
+                .publish_prepared(&db, &initial, &authority)
+                .await
+                .unwrap();
+            let (left_tree, _) = fixture.capture(br#"{"schema_version":2,"writer":"left"}"#);
+            let left = fixture.commit(&left_tree, Some(&first));
+            let (right_tree, _) = fixture.capture(br#"{"schema_version":2,"writer":"right"}"#);
+            let right = fixture.commit(&right_tree, Some(&first));
+            let stale = history_prepared(
+                &fixture,
+                &db,
+                &store,
+                history_proposal(
+                    &scope,
+                    &left,
+                    ExpectedOldTip::At(first.clone()),
+                    "race-left",
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+            let winner = history_prepared(
+                &fixture,
+                &db,
+                &store,
+                history_proposal(
+                    &scope,
+                    &right,
+                    ExpectedOldTip::At(first.clone()),
+                    "race-right",
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+            service
+                .publish_prepared(&db, &winner, &authority)
+                .await
+                .unwrap();
+            let before = history_snapshot(&db).await;
+            assert_eq!(stale.update().expected_old_tip, ExpectedOldTip::At(first));
+            assert!(matches!(
+                service.publish_prepared(&db, &stale, &authority).await,
+                Err(MegaError::Traces(
+                    crate::common::errors::TracesError::InvalidParameter
+                ))
+            ));
+            assert_eq!(history_snapshot(&db).await, before);
+            assert_eq!(
+                trace_stream::Entity::find_by_id(&scope.stream_id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .tip_oid
+                    .as_deref(),
+                Some(right.as_str())
+            );
+        }
+    }
 
     async fn open_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
         let dir = tempfile::TempDir::new().expect("temp dir");
