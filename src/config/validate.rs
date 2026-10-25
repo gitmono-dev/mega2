@@ -2348,6 +2348,155 @@ mod tests {
         isolated_config(std::env::temp_dir().join("mega2-config-validate-tests"))
     }
 
+    fn legacy_env_test_child_phase(test_name: &str) -> Option<String> {
+        match std::env::var("MEGA2_LEGACY_ENV_TEST_CHILD") {
+            Err(std::env::VarError::NotPresent) => None,
+            Ok(name) => {
+                assert_eq!(name, test_name, "child test name");
+                Some(std::env::var("MEGA2_LEGACY_ENV_TEST_PHASE").expect("child phase"))
+            }
+            Err(std::env::VarError::NotUnicode(_)) => panic!("invalid child test name"),
+        }
+    }
+
+    fn run_legacy_env_test_child(test_name: &str, phase: &str, values: &[(&str, &str)]) {
+        use std::{
+            io::Read,
+            process::{Child, Command, Stdio},
+            sync::atomic::{AtomicBool, Ordering},
+            thread,
+            time::{Duration, Instant},
+        };
+
+        const OAUTH_KEYS: [&str; 3] = [
+            "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
+            "MEGA_OAUTH__TINYSHIP_API_DOMAIN",
+            "MEGA_OAUTH__API_STORE_BACKEND",
+        ];
+        let snapshot = || {
+            std::env::vars_os()
+                .filter(|(key, _)| {
+                    OAUTH_KEYS
+                        .iter()
+                        .any(|name| key.as_os_str() == std::ffi::OsStr::new(name))
+                        || key.to_string_lossy().starts_with("MEGA_MAIL__")
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        const OUTPUT_LIMIT: u64 = 1024 * 1024;
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let before = snapshot();
+        let mut command = Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .args([
+                "--exact",
+                test_name,
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .env("MEGA2_LEGACY_ENV_TEST_CHILD", test_name)
+            .env("MEGA2_LEGACY_ENV_TEST_PHASE", phase)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for key in OAUTH_KEYS {
+            command.env_remove(key);
+        }
+        for key in before.keys() {
+            command.env_remove(key);
+        }
+        for (key, value) in values {
+            command.env(key, value);
+        }
+        let mut child = ChildGuard(
+            command
+                .spawn()
+                .expect("spawn isolated legacy environment test"),
+        );
+        let stdout = child.0.stdout.take().expect("child stdout");
+        let stderr = child.0.stderr.take().expect("child stderr");
+        let too_large = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let read = |stream: Box<dyn Read + Send>| {
+            let mut bytes = Vec::new();
+            stream
+                .take(OUTPUT_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .expect("read child output");
+            if bytes.len() as u64 > OUTPUT_LIMIT {
+                too_large.store(true, Ordering::Release);
+            }
+            bytes
+        };
+        let (status, stdout, stderr) = thread::scope(|scope| {
+            let stdout = scope.spawn(|| read(Box::new(stdout)));
+            let stderr = scope.spawn(|| read(Box::new(stderr)));
+            let result = loop {
+                if too_large.load(Ordering::Acquire) {
+                    break Err("isolated legacy environment test output limit exceeded");
+                }
+                if Instant::now() >= deadline {
+                    break Err("isolated legacy environment test exceeded 20 seconds");
+                }
+                if snapshot() != before {
+                    break Err(
+                        "isolated legacy environment test changed parent legacy environment",
+                    );
+                }
+                match child.0.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) => thread::sleep(Duration::from_millis(5)),
+                    Err(_) => break Err("could not wait for isolated legacy environment test"),
+                }
+            };
+            // Close pipes before joining readers, including every failure path.
+            if result.is_err() {
+                let _ = child.0.kill();
+                let _ = child.0.wait();
+            }
+            (
+                result,
+                stdout.join().expect("stdout reader"),
+                stderr.join().expect("stderr reader"),
+            )
+        });
+        assert!(
+            stdout.len() as u64 <= OUTPUT_LIMIT && stderr.len() as u64 <= OUTPUT_LIMIT,
+            "child output limit"
+        );
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(
+            status
+                .expect("isolated legacy environment test completion")
+                .success(),
+            "{stdout}\n{stderr}"
+        );
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| *line == format!("test {test_name} ... ok"))
+                .count(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+            "{stdout}"
+        );
+        assert!(snapshot() == before, "parent legacy environment changed");
+    }
+
     fn assert_views_validation_error(config: Config, field: &str) {
         let err = config
             .validate()
@@ -2951,15 +3100,20 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_legacy_oauth_environment_variables() {
-        use crate::config::testing::{EnvVarGuard, env_lock};
-
-        let lock = env_lock();
+        const TEST_NAME: &str =
+            "config::validate::tests::config_validate_rejects_legacy_oauth_environment_variables";
+        match legacy_env_test_child_phase(TEST_NAME) {
+            None => {
+                run_legacy_env_test_child(
+                    TEST_NAME,
+                    "oauth",
+                    &[("MEGA_OAUTH__CAMPSITE_API_DOMAIN", "http://legacy.example")],
+                );
+                return;
+            }
+            Some(phase) => assert_eq!(phase, "oauth", "child phase"),
+        }
         let config = valid_config();
-        let _var = EnvVarGuard::set(
-            &lock,
-            "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
-            "http://legacy.example",
-        );
         let err = config
             .validate()
             .expect_err("legacy MEGA_OAUTH__CAMPSITE_API_DOMAIN should fail validate");
@@ -2971,11 +3125,16 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_legacy_mail_environment_variables() {
-        use crate::config::testing::{EnvVarGuard, env_lock};
-
-        let lock = env_lock();
+        const TEST_NAME: &str =
+            "config::validate::tests::config_validate_rejects_legacy_mail_environment_variables";
+        match legacy_env_test_child_phase(TEST_NAME) {
+            None => {
+                run_legacy_env_test_child(TEST_NAME, "mail", &[("MEGA_MAIL__ENABLED", "true")]);
+                return;
+            }
+            Some(phase) => assert_eq!(phase, "mail", "child phase"),
+        }
         let config = valid_config();
-        let _var = EnvVarGuard::set(&lock, "MEGA_MAIL__ENABLED", "true");
         let err = config
             .validate()
             .expect_err("legacy MEGA_MAIL__ENABLED should fail validate");
