@@ -584,32 +584,42 @@ mod tests {
     /// reached directly; the control client (no bypass) goes to the proxy.
     #[test]
     fn loopback_requests_skip_a_configured_proxy() {
-        use crate::config::testing::{EnvVarGuard, env_lock};
+        use crate::config::testing::{proxy_test_child_phase, run_proxy_test_child};
 
-        let lock = env_lock();
+        const TEST: &str = "commands::path::tests::loopback_requests_skip_a_configured_proxy";
+        if let Some(phase) = proxy_test_child_phase(TEST) {
+            let server = std::env::var("MEGA2_PROXY_TEST_SERVER").expect("child server");
+            match phase.as_str() {
+                "direct" => {
+                    let direct = http_client(Duration::from_secs(5), true).unwrap();
+                    assert_eq!(
+                        provision_request(&direct, &server, "/p", None).unwrap(),
+                        "already exists /p"
+                    );
+                }
+                "control" => {
+                    let proxied = http_client(Duration::from_secs(5), false).unwrap();
+                    assert!(provision_request(&proxied, &server, "/p", None).is_err());
+                }
+                _ => panic!("unknown proxy test phase"),
+            }
+            return;
+        }
         let proxy = serve(json_response("502 Bad Gateway", "{}"));
         let server = serve(json_response(
             "200 OK",
             r#"{"req_result":true,"data":{"path":"/p","created":false,"commit_id":null},"err_message":""}"#,
         ));
-        let _guards = [
-            EnvVarGuard::set(&lock, "HTTP_PROXY", &proxy.url),
-            EnvVarGuard::set(&lock, "http_proxy", &proxy.url),
-            EnvVarGuard::remove(&lock, "NO_PROXY"),
-            EnvVarGuard::remove(&lock, "no_proxy"),
-            EnvVarGuard::remove(&lock, "ALL_PROXY"),
-            EnvVarGuard::remove(&lock, "all_proxy"),
+        let values = [
+            ("HTTP_PROXY", proxy.url.as_str()),
+            ("http_proxy", proxy.url.as_str()),
+            ("MEGA2_PROXY_TEST_SERVER", server.url.as_str()),
         ];
-        let direct = http_client(Duration::from_secs(5), true).unwrap();
-        assert_eq!(
-            provision_request(&direct, &server.url, "/p", None).unwrap(),
-            "already exists /p"
-        );
+        run_proxy_test_child(TEST, "direct", &values);
         assert_eq!(proxy.hits(), 0);
         assert_eq!(server.hits(), 1);
 
-        let proxied = http_client(Duration::from_secs(5), false).unwrap();
-        assert!(provision_request(&proxied, &server.url, "/p", None).is_err());
+        run_proxy_test_child(TEST, "control", &values);
         assert_eq!(proxy.hits(), 1, "control goes through the proxy");
         assert_eq!(server.hits(), 1);
     }

@@ -37,9 +37,8 @@ pub type EnvLockGuard = MutexGuard<'static, ()>;
 pub fn env_lock() -> EnvLockGuard {
     // Recover from a poisoned lock instead of cascading a single test's panic
     // into PoisonError failures across every other env-serialized test. The
-    // lock only serializes process-wide env access; `EnvVarGuard`'s Drop restores
-    // any mutated variable during unwinding, so the env is consistent by the time
-    // the next test acquires the lock.
+    // lock only serializes participating callers; it does not protect unrelated
+    // environment readers. Proxy tests use child startup environments instead.
     ENV_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -56,8 +55,8 @@ pub struct EnvVarGuard<'a> {
 impl<'a> EnvVarGuard<'a> {
     pub fn set(lock: &'a EnvLockGuard, key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
-        // SAFETY: tests that mutate MEGA_* variables must hold the shared config env lock,
-        // and this guard restores the previous value before that lock is released.
+        // SAFETY: callers must exclude concurrent environment readers as well as
+        // writers. This lock alone only serializes participating tests.
         unsafe {
             std::env::set_var(key, value);
         }
@@ -100,6 +99,144 @@ impl Drop for EnvVarGuard<'_> {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub fn proxy_test_child_phase(test_name: &str) -> Option<String> {
+    (std::env::var("MEGA2_PROXY_TEST_CHILD").as_deref() == Ok(test_name))
+        .then(|| std::env::var("MEGA2_PROXY_TEST_PHASE").expect("child phase"))
+}
+
+#[cfg(test)]
+pub fn run_proxy_test_child(test_name: &str, phase: &str, values: &[(&str, &str)]) {
+    use std::{
+        io::Read,
+        process::{Child, Command, Stdio},
+        sync::atomic::{AtomicBool, Ordering},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const PROXY_KEYS: [&str; 8] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+    const OUTPUT_LIMIT: u64 = 1024 * 1024;
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let before = PROXY_KEYS.map(std::env::var_os);
+    let mut command = Command::new(std::env::current_exe().expect("test binary"));
+    command
+        .args([
+            "--exact",
+            test_name,
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never",
+        ])
+        .env("MEGA2_PROXY_TEST_CHILD", test_name)
+        .env("MEGA2_PROXY_TEST_PHASE", phase)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for key in PROXY_KEYS {
+        command.env_remove(key);
+    }
+    for (key, value) in values {
+        command.env(key, value);
+    }
+    let mut child = ChildGuard(command.spawn().expect("spawn isolated proxy test"));
+    let stdout = child.0.stdout.take().expect("child stdout");
+    let stderr = child.0.stderr.take().expect("child stderr");
+    let too_large = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let read = |stream: Box<dyn Read + Send>| {
+        let mut bytes = Vec::new();
+        stream
+            .take(OUTPUT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .expect("read child output");
+        if bytes.len() as u64 > OUTPUT_LIMIT {
+            too_large.store(true, Ordering::Release);
+        }
+        bytes
+    };
+    let (status, stdout, stderr) = thread::scope(|scope| {
+        let stdout = scope.spawn(|| read(Box::new(stdout)));
+        let stderr = scope.spawn(|| read(Box::new(stderr)));
+        let result = loop {
+            if too_large.load(Ordering::Acquire) {
+                break Err("isolated proxy test output limit exceeded");
+            }
+            if Instant::now() >= deadline {
+                break Err("isolated proxy test exceeded 20 seconds");
+            }
+            if !PROXY_KEYS
+                .iter()
+                .zip(&before)
+                .all(|(key, value)| std::env::var_os(key) == *value)
+            {
+                break Err("isolated proxy test changed parent proxy environment");
+            }
+            match child.0.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => break Err("could not wait for isolated proxy test"),
+            }
+        };
+        // Close pipes before joining readers, including every failure path.
+        if result.is_err() {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+        }
+        (
+            result,
+            stdout.join().expect("stdout reader"),
+            stderr.join().expect("stderr reader"),
+        )
+    });
+    assert!(
+        stdout.len() as u64 <= OUTPUT_LIMIT && stderr.len() as u64 <= OUTPUT_LIMIT,
+        "child output limit"
+    );
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        status.expect("isolated proxy test completion").success(),
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| *line == format!("test {test_name} ... ok"))
+            .count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+        "{stdout}"
+    );
+    assert!(
+        PROXY_KEYS
+            .iter()
+            .zip(&before)
+            .all(|(key, value)| std::env::var_os(key) == *value),
+        "parent proxy environment changed"
+    );
 }
 
 #[derive(Debug, Clone)]

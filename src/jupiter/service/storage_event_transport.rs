@@ -525,7 +525,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::testing::{EnvVarGuard, env_lock};
+    use crate::config::testing::{proxy_test_child_phase, run_proxy_test_child};
 
     const GOLDEN_TIMESTAMP: u64 = 1_700_000_000;
     const GOLDEN_BODY: &[u8] =
@@ -718,6 +718,64 @@ mod tests {
 
     #[test]
     fn network_policy_matrix() {
+        const TEST: &str =
+            "jupiter::service::storage_event_transport::tests::network_policy_matrix";
+        if proxy_test_child_phase(TEST).is_none() {
+            struct Proxy {
+                stop: Arc<std::sync::atomic::AtomicBool>,
+                thread: Option<thread::JoinHandle<()>>,
+            }
+            impl Drop for Proxy {
+                fn drop(&mut self) {
+                    self.stop.store(true, Ordering::Release);
+                    if let Some(thread) = self.thread.take() {
+                        let result = thread.join();
+                        if !thread::panicking() {
+                            result.expect("proxy listener stopped");
+                        }
+                    }
+                }
+            }
+            let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+            let proxy_addr = proxy.local_addr().expect("proxy addr");
+            proxy.set_nonblocking(true).expect("nonblocking proxy");
+            let proxy_hits = Arc::new(AtomicUsize::new(0));
+            let proxy_hits_clone = Arc::clone(&proxy_hits);
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let _proxy = Proxy {
+                stop,
+                thread: Some(thread::spawn(move || {
+                    while !stopped.load(Ordering::Acquire) {
+                        match proxy.accept() {
+                            Ok((_stream, _)) => {
+                                proxy_hits_clone.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(StdDuration::from_millis(5));
+                            }
+                            Err(error) => panic!("proxy accept failed: {error}"),
+                        }
+                    }
+                })),
+            };
+            let url = format!("http://{proxy_addr}");
+            run_proxy_test_child(
+                TEST,
+                "network",
+                &[
+                    ("HTTP_PROXY", &url),
+                    ("http_proxy", &url),
+                    ("HTTPS_PROXY", &url),
+                    ("https_proxy", &url),
+                    ("ALL_PROXY", &url),
+                    ("all_proxy", &url),
+                ],
+            );
+            assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
+            return;
+        }
+        assert_eq!(proxy_test_child_phase(TEST).as_deref(), Some("network"));
         let err = crate::config::validate::validate_storage_events_target_url(
             "http://events.example.invalid/ingest",
         )
@@ -773,19 +831,6 @@ mod tests {
         assert_eq!(outcome, Err(TransportError::Redirect));
         assert_eq!(collector.hits.load(Ordering::SeqCst), 1);
 
-        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
-        let proxy_addr = proxy.local_addr().expect("proxy addr");
-        let proxy_hits = Arc::new(AtomicUsize::new(0));
-        let proxy_hits_clone = Arc::clone(&proxy_hits);
-        thread::spawn(move || {
-            for _ in proxy.incoming() {
-                proxy_hits_clone.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-        let lock = env_lock();
-        let _http = EnvVarGuard::set(&lock, "HTTP_PROXY", &format!("http://{proxy_addr}"));
-        let _https = EnvVarGuard::set(&lock, "HTTPS_PROXY", &format!("http://{proxy_addr}"));
-        let _all = EnvVarGuard::set(&lock, "ALL_PROXY", &format!("http://{proxy_addr}"));
         let collector = spawn_tls_collector(|_| (200, Vec::new(), None));
         let client = test_client(
             &collector.cert_der,
@@ -801,11 +846,6 @@ mod tests {
         .expect("target");
         let outcome = runtime().block_on(transport.post(&target, Bytes::from_static(GOLDEN_BODY)));
         assert_eq!(outcome, Ok(TransportSuccess::Accepted2xx { status: 200 }));
-        assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
-        drop(_http);
-        drop(_https);
-        drop(_all);
-        drop(lock);
     }
 
     #[test]
