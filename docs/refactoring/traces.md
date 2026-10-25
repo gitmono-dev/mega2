@@ -1,3 +1,13 @@
+> **MTR99自身R1源审PASS/H0 FAIL与前滚修订（2026-10-25T02:50:50.524869+00:00）：** MTR101 done/complete：v0.42.71完整C/D；MTR99 A1实际61例通过、自己的R1源码ER05/内存PASS，但H0四处索引P1导致总FAIL；索引已前滚、R2待审，未bump/提交/push/C-D。正式Mega16/112、Libra0/26、联合16/138、外部0/3；Libra资格/H1/原merge政策待。 原R1精确1016输入与FAIL完整保留；A1源码字节不变、不重跑已通过的61例。五项P2具名登记，原FAIL/STOP与缺失证据保持。
+
+> **MTR99实际A1通过、自己的源码审查待（2026-10-25T02:39:53.809601+00:00）：** MTR99五文件实现已通过A1：nightlyfmt/严格Clippy、原selector4/3/4及七完整模块7/13/5/6/9/7/14，共61唯一用例0fail/0ignore；root后检496/1800秒，104个DB名称/owner保持、无owned进程/私有spool、RustFS raw前缀仍0，未手工清理。自己的Claude ER05/H0及完整C/D待，0.42.71不变，未提交/push/tag/Release。正式Mega16/112、Libra0/26、联合16/138、外部0/3保持；101已done/complete，Libra PR635 fontconfig及资格02/03、H1/原merge政策仍待。旧FAIL/STOP与缺失原件不改。
+
+> **MTR99开工已准入、源码实施候选（2026-10-25T02:06:58.385961+00:00）：** 本地Claude R2实际五项PASS（session0b34282e，终态01:56:01 UTC），root重算54输入无漂移、保存原件并具名处置5项P2；R1 FAIL/STOP与缺失证据保持。MTR99已开始五文件I内实现及真实后端测试候选，尚未执行A/自己的源码ER05/C/D，不勾AC/VER、不bump/提交/push。MTR101 v0.42.71完整C/D已闭合。正式Mega16/112、Libra0/26、联合16/138、外部0/3保持；Libra PR635远端fontconfig阻塞与资格02/03、H1及原merge签名政策未关闭。
+
+> **MTR101实际C/D闭合与MTR99 R2候选（2026-10-25 01:50:01 UTC）：** MTR101 done/complete：0.42.71源码/A4/自身Claude/五门C/签名提交6a63504/main/tag/人工Release及实际D全通过；MTR99 R1三P1 FAIL保留，R2候选待本地Claude，未实施。Mega16/112、Libra0/26、联合16/138、外部0/3；H1与Libra资格/原merge政策仍待。 main40150856672及tag40150892586全部四job success，终态01:43:34 UTC。Libra原三已审文档signed+DCO本地7541e9b已核，未push；PR635仍未合并/tag/Release，compat-clippy缺fontconfig。旧FAIL/STOP与缺失原件均保留；下方带日期旧前沿为历史。
+
+> **MTR101已发布、MTR99开工修订候选（2026-10-25 01:36:27 UTC）：** MTR101自己的Claude R2 ER05/H0 PASS；0.42.71五门C实际21 targets/3096 passed/0 failed/3原ignored/0 filtered，root资源后检2596/2700秒。signed+DCO `6a635042a40bb4d013c56c8655d9a42558150c83`、main、标注v0.42.71及人工Release实核；main40150856672/tag40150892586正在执行，in-progress/remote-pending。MTR99仅候选：解耦raw读取/parser控制与push时钟，拟5生产文件/3落点/M，8AC/3VER与independent patch/self保持，须本地Claude ER03/H0及101 D成功后实施。Libra PR635未合并/tag/Release，compat-clippy缺fontconfig.pc，资格02/03与H1/原merge政策待。正式Mega15/112、Libra0/26、联合15/138、外部0/3不变；历史FAIL/STOP与缺失原件保留。
+
 > **MTR101 A4验收与最终源码审查前沿（2026-10-25T00:34:41.026023+00:00）：** MTR101 A4实际PASS：fmt/严格Clippy、selector6/4/1及四完整模块7/9/16/10全通过，42唯一用例、0failed/0ignored；212.117/900秒，root后检确认输入/工具/104个DB名称与owner不变、无新孤儿、未手工清理。新覆盖已兑现，最终候选自身Claude ER05 R2待；0.42.70不变，未bump/提交/push/C-D。Libra PR635已推但CI缺fontconfig未闭合，未合并/tag/Release；资格02/03与H1前驱不变。 原A1/A2 FAIL/STOP、A3/R1限定输入PASS保留；正式Mega15/112、Libra0/26、联合15/138、外部0/3不变。
 
 > **MTR101 覆盖方案采纳与实现候选（2026-10-25 00:20:32 UTC）：** 本地Claude ER03/H0实际PASS，无P0/P1；仅两现有cfg(test)模块补齐候选，生产字节不变。新增storage第二页缺失/异tree拒绝及全匹配正对照，保留At并补Absent/首发无副作用、原checkpoint同一行的真实增量发布，原断言与空tree stale-binding覆盖保持。A4预期42例、一次900秒执行准入待，尚未编译/测试；自己的新ER05与C/D仍待。A3/R1 PASS和旧FAIL/STOP均保留；Libra PR635 CI缺件未闭合，正式计数不变。
@@ -154,7 +164,7 @@ MTR-94 的源码实现在 HTTP Router 外层增加禁用守卫：`[traces].enabl
 
 ## 3. 原始对象存储、接收与恢复
 
-**MTR-101 当前内部实现边界（2026-10-25，A4 42例实际PASS；最终代码ER05 R2与C/D待）：** raw prepare只从真实new-tip parent链取得顺序；请求必须显式使用Absent或At，At基线取自请求old-tip的raw tree，不能悄悄重读新tip。Unspecified仅供raw事实诊断，不能取得私有CheckpointValidatedPublication。历史验证逐commit保留已有和本批先前新增checkpoint的original_tree，不允许中间改删后恢复绕过；service现有stream和first-scope的正式发布入口均要求此witness，原DB权限/old-tip CAS/单事务保持。非法At或历史完整性拒绝当前返回ObjectIntegrity，wire公开错误映射由MTR11消费。算法复用原97的continuation/取消/时钟，仍有完整闭包扫描、每个不同tree的role读取及逐binding同步文件I/O成本，不承诺新的端到端时间/RSS上限。HTTP/SSH公开接线尚未完成；旧历史数据不重写。P2覆盖增补与正式发布状态见[MTR-101任务卡](../plan/plan-20261015.md#task-mtr-101-新增commit逐步checkpoint历史保护)。
+**MTR-101 当前内部实现边界（2026-10-25，A4 42例与最终代码Claude R2/完整C已PASS；0.42.71已发布且main/tag D实际全绿）：** raw prepare只从真实new-tip parent链取得顺序；请求必须显式使用Absent或At，At基线取自请求old-tip的raw tree，不能悄悄重读新tip。Unspecified仅供raw事实诊断，不能取得私有CheckpointValidatedPublication。历史验证逐commit保留已有和本批先前新增checkpoint的original_tree，不允许中间改删后恢复绕过；service现有stream和first-scope的正式发布入口均要求此witness，原DB权限/old-tip CAS/单事务保持。非法At或历史完整性拒绝当前返回ObjectIntegrity，wire公开错误映射由MTR11消费。算法复用原97的continuation/取消/时钟，仍有完整闭包扫描、每个不同tree的role读取及逐binding同步文件I/O成本，不承诺新的端到端时间/RSS上限。HTTP/SSH公开接线尚未完成；旧历史数据不重写。P2覆盖增补与正式发布状态见[MTR-101任务卡](../plan/plan-20261015.md#task-mtr-101-新增commit逐步checkpoint历史保护)。
 
 原始 Git payload 是证据事实源。commit/tree/blob/tag 均保留原始 bytes，OID 根据 Git kind/length/payload 重新校验；不能用现有 commit/tree ORM 模型重序列化替代原始 bytes。SHA-1/SHA-256 的协商、长度与包头必须一致，禁止跨 hash domain fallback。
 
@@ -185,7 +195,7 @@ traces/v1/staging/<ingest-uuid>/...
 
 v1 固定每个对象最大 64 MiB，metadata/manifest 各最大 1 MiB，压缩 pack 最大 512 MiB、解包总量最大 1 GiB；每 push 最多 100,000 个对象、10,000 个新 commit，delta/tree 最大深度各 64，接收总时限 300s（固定协议值与广告字段见第 5 节，取消时释放资源）。v1 不提供这些预算的 operator override；capability 如实公开协议常量。流式处理在解码/遍历期间累计 bytes、计数、深度和时限，超限立即停，不先整体分配 pack 大小。断开后未发布 staging 由 lease+membership 校验清理，GC 不扫描/删除已发布对象或其他 scope。对象 durable 后 DB 失败只留下不可见 orphan；DB 成功但回复丢失的重试检查同 tip 并返回幂等结果，不重复 journal。
 
-### MTR-98 内部可信事实候选（2026-10-24，尚待本卡验收与发布）
+### 历史快照：MTR-98 内部可信事实候选（2026-10-24，原记尚待本卡验收与发布）
 
 `ceres::traces::publication::prepare` 消费 MTR-97 的受控解码结果；该结果携带原 hash domain、deadline 和共享取消状态，decoder 正常退出的 stop 标志不取消后续校验。提议只含 stream、tip、ref、expected-old 与幂等键；`PreparedPublication` 的字段和构造封闭，不能从 HTTP 反序列化或直接填写 parents/checkpoints/membership/schema。发布桥仅在 `jupiter` 内可见，旧任意 DTO 入口仅供 cfg(test) 回归真实事务；MTR-101 的逐提交历史资格仍是未来 wire 接线前置。
 
@@ -317,3 +327,19 @@ DROP 依 FK 顺序删除 `agent_capture_session/event/source_stream/checkpoint/f
 没有真实服务运行或凭据时，依对应计划登记未运行与前置缺口，不把 fixture、过滤零命中或 provider skipped 记为 live PASS。分别记录 Git 已接收、读索引可查、联合实际服务通过、旧 Capture 全量删除及发布 C/D 的证据；计划文档提交不改变任何实施卡的 pending 状态。
 
 **MTR-98 当前内部实现的取消边界（2026-10-24，root）：** prepare 与发布事务提交前的受控操作沿用原请求 deadline/cancel；COMMIT 一旦发出不取消。事务操作取消后，显式 rollback 仍等待驱动完成，未设置数据库 statement/lock timeout，也未实测证明此等待受原300秒上限约束，因此当前内部实现不提供包含回滚清理在内的端到端300秒返回保证。原固定协议值不变，HTTP/SSH仍未接线；root/MTR101在既有来源审计登记该P2，MTR11接线前核真实等待/连接生命周期及适用预算，必要修复先按ER03核写集，不隐式扩大MTR101的源码范围。正常prepare取消/Drop清理已验收，不能据其PASS推定事务锁等待清理同样有界，也不证明历史C2根因。
+
+### 历史：MTR-99请求读授权语义候选（2026-10-25，原ER03 R2待审时输入）
+
+本读侧按稳定target UUID的当前路径权限授权既有历史；显式rebind后由新路径合法读者读取该UUID历史，不继承旧路径ACL。grant在本请求开始时授权一次：使用真实active credential及Mono当前SharedEntityStore快照，随后同条SQL/只读快照核stream/target/binding与授权所用target_id/path/active/hash/principal相符并固定tip；期间变化拒绝，不能悄悄转新路径。grant不可跨请求复用；取得后同请求不连续追踪撤权或move，客户端取消仍停止读取。inactive拒绝，明确reactivate后的新请求重新授权；同路径新UUID不别名旧scope。旧47/06的CLI补偿/import detach缺陷不因本限制而记修复。
+
+候选输出为固定tip可达集合中的`closure(wants) - closure(合法haves)`；commit/tree/blob可作want，gitlink不跨仓遍历，tag不属当前v1发布闭包。跨scope/不可达have忽略且不读其raw，越界want拒绝。私有temp_dir spool的目录/文件Unix权限0700/0600，磁盘随可达bytes增长，Drop同步清理不等于崩溃GC或硬实时承诺。不会把push总量或300秒限制扩为全部历史fetch新配额；具体五文件/验证/风险处置以[MTR99卡](../plan/plan-20261015.md#task-mtr-99-scoped-published-raw对象流服务)为准，当前仍是待审候选。
+
+### 历史：MTR99 R2开工采纳与实现边界（2026-10-25，A前记录）
+
+上述R2候选已获实际本地Claude五项PASS并由root采纳，源码仍为未验收候选。读侧不补偿import detach失败：显式退役前，新路径合法读者持续可读；原47/06缺陷不关闭。服务层可接受固定tip闭包内commit/tree/blob，后继11/12须使wire want策略与实际广告capability一致，不自动把服务层范围作为Git协议广告。完整原VER与R2子断言同等有效，实际本卡日志由现有tracing-subscriber捕获并核对非空事件和隐私负对照。见[任务卡及具名P2处置](../plan/plan-20261015.md#task-mtr-99-scoped-published-raw对象流服务)；无新quota/schema/runtime依赖，实际A/源码ER05/C/D待。
+
+### MTR99当前内部raw fetch实现与验收边界（2026-10-25）
+
+上述请求级授权/固定tip/闭包减集/原bytes语义已经内部实现，A1原三VER及七完整模块61例实际通过，真实Postgres/固定RustFS/Git两hash已核；自己的源码ER05与独立版本C/D尚待，HTTP/SSH仍未接线。Frame实际live峰值在16/320规模正且≤3、规模间一致，外存frontier实际增长；这不等于总RSS或其它parser变量已由计数器证明，必须结合最终自身源码审查。请求结束资源已实际后检，无手工清理；同步Drop不承诺崩溃GC/硬实时。完整收据及限制见[MTR99任务卡](../plan/plan-20261015.md#task-mtr-99-scoped-published-raw对象流服务)。
+
+**MTR99自身R1剩余消费边界（2026-10-25）：** 源码ER05/内存PASS，但H0当前索引P1使总FAIL，修订待R2；不据此发布。进程遍历Frame/parser有界不等于tmpfs物理RAM有界，部署TMPDIR须指向磁盘（本次A实际/tmp为ext4）。同步IO/Drop没有硬实时承诺；每次仍读取固定tip全闭包，haves只减少输出。stored parser当前InvalidParameter残余将在11公开wire前按任务卡P2-1精确映射ObjectIntegrity，取消及非法want错误保持。单对象parser可放大，不声称总RSS64MiB。

@@ -1,12 +1,43 @@
 //! Service entry for raw traces objects. Key derivation and byte preservation
 //! stay in `trace_object_storage`.
 
+use std::future::Future;
+
 use crate::{
     ceres::traces::admission::IngestContinuation,
     common::errors::{MegaError, TracesError},
     config::TracesProtocolLimits,
     jupiter::storage::{object_storage::MegaObjectStorageWrapper, trace_object_storage},
 };
+
+/// Push retains its original deadline; fetch supplies request cancellation only.
+pub(crate) trait RawReadControl: Sync {
+    fn check(&self) -> Result<(), MegaError>;
+
+    fn checkpoint(&self) -> impl Future<Output = Result<(), MegaError>> + Send;
+
+    fn run<T: Send>(
+        &self,
+        future: impl Future<Output = Result<T, MegaError>> + Send,
+    ) -> impl Future<Output = Result<T, MegaError>> + Send;
+}
+
+impl RawReadControl for IngestContinuation {
+    fn check(&self) -> Result<(), MegaError> {
+        IngestContinuation::check(self)
+    }
+
+    async fn checkpoint(&self) -> Result<(), MegaError> {
+        IngestContinuation::checkpoint(self).await
+    }
+
+    async fn run<T: Send>(
+        &self,
+        future: impl Future<Output = Result<T, MegaError>> + Send,
+    ) -> Result<T, MegaError> {
+        IngestContinuation::run(self, future).await
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RawObjectType {
@@ -49,7 +80,7 @@ impl VerifiedRawObject {
 async fn hash_payload<D: sha2::Digest + Default>(
     object_type: RawObjectType,
     payload: &[u8],
-    control: &IngestContinuation,
+    control: &impl RawReadControl,
 ) -> Result<String, MegaError> {
     let mut hash = D::new();
     hash.update(format!("{} {}\0", object_type.as_str(), payload.len()).as_bytes());
@@ -65,7 +96,7 @@ pub(crate) async fn raw_object_oid(
     hash_kind: &str,
     object_type: RawObjectType,
     payload: &[u8],
-    control: &IngestContinuation,
+    control: &impl RawReadControl,
 ) -> Result<String, MegaError> {
     if payload.len() as u64 > TracesProtocolLimits::MAX_OBJECT_BYTES {
         return Err(MegaError::Traces(TracesError::ResponseBudget));
@@ -81,7 +112,7 @@ pub(crate) async fn verify_raw_object(
     hash_kind: &str,
     oid: &str,
     bytes: Vec<u8>,
-    control: &IngestContinuation,
+    control: &impl RawReadControl,
 ) -> Result<VerifiedRawObject, MegaError> {
     let width = match hash_kind {
         "sha1" => 40,
@@ -166,7 +197,7 @@ impl TraceObjectService {
         stream_id: &str,
         hash_kind: &str,
         oid: &str,
-        control: &IngestContinuation,
+        control: &impl RawReadControl,
     ) -> Result<Option<VerifiedRawObject>, MegaError> {
         use futures::StreamExt;
 

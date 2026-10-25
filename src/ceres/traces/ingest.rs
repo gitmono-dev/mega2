@@ -879,15 +879,15 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-pub(super) struct RawCommitLinks {
-    pub(super) tree: String,
-    pub(super) parents: Vec<String>,
+pub(crate) struct RawCommitLinks {
+    pub(crate) tree: String,
+    pub(crate) parents: Vec<String>,
 }
 
-pub(super) fn verified_commit_links(
+pub(crate) fn verified_commit_links(
     payload: &[u8],
     width: usize,
-    control: &admission::IngestContinuation,
+    control: &impl crate::jupiter::service::trace_object_service::RawReadControl,
 ) -> Result<RawCommitLinks, MegaError> {
     let mut end = None;
     for (index, pair) in payload.windows(2).enumerate() {
@@ -959,22 +959,22 @@ pub(super) fn verified_commit_links(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum RawTreeMode {
+pub(crate) enum RawTreeMode {
     Tree,
     Blob,
     Gitlink,
 }
 
-pub(super) struct RawTreeEntry<'a> {
-    pub(super) mode: RawTreeMode,
-    pub(super) name: &'a [u8],
-    pub(super) oid: String,
+pub(crate) struct RawTreeEntry<'a> {
+    pub(crate) mode: RawTreeMode,
+    pub(crate) name: &'a [u8],
+    pub(crate) oid: String,
 }
 
-pub(super) fn verified_tree_entries<'a>(
+pub(crate) fn verified_tree_entries<'a>(
     payload: &'a [u8],
     hash_bytes: usize,
-    control: &admission::IngestContinuation,
+    control: &impl crate::jupiter::service::trace_object_service::RawReadControl,
 ) -> Result<Vec<RawTreeEntry<'a>>, MegaError> {
     let mut rest = payload;
     let mut entries = Vec::new();

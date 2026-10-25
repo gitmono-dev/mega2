@@ -1,3 +1,13 @@
+> **MTR99自身R1源审PASS/H0 FAIL与前滚修订（2026-10-25T02:50:50.524869+00:00）：** MTR101 done/complete：v0.42.71完整C/D；MTR99 A1实际61例通过、自己的R1源码ER05/内存PASS，但H0四处索引P1导致总FAIL；索引已前滚、R2待审，未bump/提交/push/C-D。正式Mega16/112、Libra0/26、联合16/138、外部0/3；Libra资格/H1/原merge政策待。 原R1精确1016输入与FAIL完整保留；A1源码字节不变、不重跑已通过的61例。五项P2具名登记，原FAIL/STOP与缺失证据保持。
+
+> **MTR99实际A1通过、自己的源码审查待（2026-10-25T02:39:53.809601+00:00）：** MTR99五文件实现已通过A1：nightlyfmt/严格Clippy、原selector4/3/4及七完整模块7/13/5/6/9/7/14，共61唯一用例0fail/0ignore；root后检496/1800秒，104个DB名称/owner保持、无owned进程/私有spool、RustFS raw前缀仍0，未手工清理。自己的Claude ER05/H0及完整C/D待，0.42.71不变，未提交/push/tag/Release。正式Mega16/112、Libra0/26、联合16/138、外部0/3保持；101已done/complete，Libra PR635 fontconfig及资格02/03、H1/原merge政策仍待。旧FAIL/STOP与缺失原件不改。
+
+> **MTR99开工已准入、源码实施候选（2026-10-25T02:06:58.385961+00:00）：** 本地Claude R2实际五项PASS（session0b34282e，终态01:56:01 UTC），root重算54输入无漂移、保存原件并具名处置5项P2；R1 FAIL/STOP与缺失证据保持。MTR99已开始五文件I内实现及真实后端测试候选，尚未执行A/自己的源码ER05/C/D，不勾AC/VER、不bump/提交/push。MTR101 v0.42.71完整C/D已闭合。正式Mega16/112、Libra0/26、联合16/138、外部0/3保持；Libra PR635远端fontconfig阻塞与资格02/03、H1及原merge签名政策未关闭。
+
+> **MTR101实际C/D闭合与MTR99 R2候选（2026-10-25 01:50:01 UTC）：** MTR101 done/complete：0.42.71源码/A4/自身Claude/五门C/签名提交6a63504/main/tag/人工Release及实际D全通过；MTR99 R1三P1 FAIL保留，R2候选待本地Claude，未实施。Mega16/112、Libra0/26、联合16/138、外部0/3；H1与Libra资格/原merge政策仍待。 main40150856672及tag40150892586全部四job success，终态01:43:34 UTC。Libra原三已审文档signed+DCO本地7541e9b已核，未push；PR635仍未合并/tag/Release，compat-clippy缺fontconfig。旧FAIL/STOP与缺失原件均保留；下方带日期旧前沿为历史。
+
+> **MTR101已发布、MTR99开工修订候选（2026-10-25 01:36:27 UTC）：** MTR101自己的Claude R2 ER05/H0 PASS；0.42.71五门C实际21 targets/3096 passed/0 failed/3原ignored/0 filtered，root资源后检2596/2700秒。signed+DCO `6a635042a40bb4d013c56c8655d9a42558150c83`、main、标注v0.42.71及人工Release实核；main40150856672/tag40150892586正在执行，in-progress/remote-pending。MTR99仅候选：解耦raw读取/parser控制与push时钟，拟5生产文件/3落点/M，8AC/3VER与independent patch/self保持，须本地Claude ER03/H0及101 D成功后实施。Libra PR635未合并/tag/Release，compat-clippy缺fontconfig.pc，资格02/03与H1/原merge政策待。正式Mega15/112、Libra0/26、联合15/138、外部0/3不变；历史FAIL/STOP与缺失原件保留。
+
 > **MTR101 A4验收与最终源码审查前沿（2026-10-25T00:34:41.026023+00:00）：** MTR101 A4实际PASS：fmt/严格Clippy、selector6/4/1及四完整模块7/9/16/10全通过，42唯一用例、0failed/0ignored；212.117/900秒，root后检确认输入/工具/104个DB名称与owner不变、无新孤儿、未手工清理。新覆盖已兑现，最终候选自身Claude ER05 R2待；0.42.70不变，未bump/提交/push/C-D。Libra PR635已推但CI缺fontconfig未闭合，未合并/tag/Release；资格02/03与H1前驱不变。 原A1/A2 FAIL/STOP、A3/R1限定输入PASS保留；正式Mega15/112、Libra0/26、联合15/138、外部0/3不变。
 
 > **MTR101 覆盖方案采纳与实现候选（2026-10-25 00:20:32 UTC）：** 本地Claude ER03/H0实际PASS，无P0/P1；仅两现有cfg(test)模块补齐候选，生产字节不变。新增storage第二页缺失/异tree拒绝及全匹配正对照，保留At并补Absent/首发无副作用、原checkpoint同一行的真实增量发布，原断言与空tree stale-binding覆盖保持。A4预期42例、一次900秒执行准入待，尚未编译/测试；自己的新ER05与C/D仍待。A3/R1 PASS和旧FAIL/STOP均保留；Libra PR635 CI缺件未闭合，正式计数不变。
@@ -994,7 +1004,7 @@ pkt-line。错误字段与完整应答表见 [错误文档](../errors.md#megaerr
 
 **2026-10-24（MTR-98 自身Claude审查、v0.42.69完整C/D已核）**：内部发布事实由受控 PACK 与本 stream 已发布 raw 闭包推导，原始字节、取消、schema 归档及可见性边界见 [Traces 唯一协议源](./traces.md)。封闭事实桥尚未接入 HTTP/SSH；逐提交 checkpoint 历史资格仍待 MTR-101，不能据此放行 wire 发布。
 
-**2026-10-25（MTR-101内部实现）**：逐提交历史校验及受控发布入口已完成真实A4 42例，P2覆盖与正文缺口已补齐；最终候选自身Claude ER05 R2及C/D待，尚未发布。原A3与ER05 R1按旧输入保留。显式基线、私有witness、错误分类与成本见[Traces唯一协议源](./traces.md#3-原始对象存储接收与恢复)。HTTP/SSH公开接线仍由后继任务交付。
+**2026-10-25（MTR-101内部实现）**：逐提交历史校验及受控发布入口已完成真实A4 42例，P2覆盖与正文缺口已补齐；最终候选自身Claude ER05 R2及五门C已PASS，0.42.71已提交推送并发布，main/tag实际D全绿。原A3与ER05 R1按旧输入保留。显式基线、私有witness、错误分类与成本见[Traces唯一协议源](./traces.md#3-原始对象存储接收与恢复)。HTTP/SSH公开接线仍由后继任务交付。
 
 > 原候选历史原文：**2026-10-25（MTR-101 未验收候选）**：逐提交历史校验与受控发布入口已在工作区接线，实际边界与待验收状态见 [Traces 唯一协议源](./traces.md)。当前尚无本卡 A、代码审查或 C/D 通过结论；HTTP/SSH 接线仍由后继任务交付。
 
@@ -1005,3 +1015,7 @@ pkt-line。错误字段与完整应答表见 [错误文档](../errors.md#megaerr
 `russh` 的实际锁定版本为 0.64.1，包含 [GHSA-j7h2-66j4-ghjf](https://github.com/Eugeny/russh/security/advisories/GHSA-j7h2-66j4-ghjf) 的公钥请求/签名算法一致性修复，以及 [GHSA-4wc5-f2rc-q74m](https://github.com/Eugeny/russh/security/advisories/GHSA-4wc5-f2rc-q74m) 的 agent 重复 lifetime 约束修复。后者先验证完整约束，再插入身份和创建过期任务；本项目未启用 agent 服务或转发入口。
 
 0.64.0 移除的可选 `legacy-ed25519-pkcs8-parser` 在旧实际 feature 树中未启用；本次不新增 feature，不改变现有标准 OpenSSH 密钥、用户公钥指纹或 github_sync 密钥持久化接口。测试使用临时密钥和私有传输，负例只有两个短 lifetime 约束，不运行高放大资源耗尽演示。源码/验收/审查/发布与 GitHub 告警终态分开登记于[日期计划](../plan/plan-20261015.md)的 FIX-MTR-11；依赖升级本身不等于远端告警已经关闭。
+
+### MTR99内部raw fetch验收边界（2026-10-25）
+
+授权快照、闭包减集、取消和外存语义仅以[traces唯一契约](traces.md#mtr99当前内部raw-fetch实现与验收边界2026-10-25)及[MTR99任务卡](../plan/plan-20261015.md#task-mtr-99-scoped-published-raw对象流服务)为准。A1已通过，自己的R1源码/内存PASS但H0 FAIL正在前滚修订；未发布、HTTP/SSH未接线。磁盘TMPDIR、同步IO及完整闭包成本、stored parser错误分类由任务卡具名P2承接，不在此复制协议规则。

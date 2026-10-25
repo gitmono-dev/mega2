@@ -216,6 +216,168 @@ pub(crate) async fn resolve_trace_discovery(
     })
 }
 
+/// A single request's authorized, published snapshot. No public constructor,
+/// deserialization, or cloning: advertisement and bare locators are not grants.
+pub(crate) struct TraceFetchGrant {
+    db: DatabaseConnection,
+    server_id: Uuid,
+    stream_id: String,
+    hash_kind: HashKind,
+    tip_oid: Option<String>,
+}
+
+impl TraceFetchGrant {
+    pub(crate) fn db(&self) -> &DatabaseConnection {
+        &self.db
+    }
+
+    pub(crate) fn server_id(&self) -> Uuid {
+        self.server_id
+    }
+
+    pub(crate) fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub(crate) fn hash_kind(&self) -> HashKind {
+        self.hash_kind
+    }
+
+    pub(crate) fn tip_oid(&self) -> Option<&str> {
+        self.tip_oid.as_deref()
+    }
+}
+
+pub(crate) async fn resolve_trace_fetch(
+    db: &DatabaseConnection,
+    config: &TracesConfig,
+    locator: &TracesLocator,
+    caller: TracesCaller<'_>,
+    policy: Option<&crate::contract::policy::entitystore::SharedEntityStore>,
+) -> Result<TraceFetchGrant, MegaError> {
+    resolve_trace_fetch_capture(db, config, locator, caller, policy, std::future::ready(())).await
+}
+
+async fn resolve_trace_fetch_capture(
+    db: &DatabaseConnection,
+    config: &TracesConfig,
+    locator: &TracesLocator,
+    caller: TracesCaller<'_>,
+    policy: Option<&crate::contract::policy::entitystore::SharedEntityStore>,
+    after_authorization: impl std::future::Future<Output = ()>,
+) -> Result<TraceFetchGrant, MegaError> {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let live_snapshot = if matches!(caller, TracesCaller::MonoAccount { .. }) {
+        let policy = policy.ok_or(TracesError::UnknownScope)?;
+        if policy.is_dirty() {
+            return Err(TracesError::UnknownScope.into());
+        }
+        Some(policy.snapshot().ok_or(TracesError::UnknownScope)?)
+    } else {
+        None
+    };
+    let caller = match caller {
+        TracesCaller::MonoAccount {
+            credential_id,
+            username,
+            enforcement,
+            ..
+        } => TracesCaller::MonoAccount {
+            credential_id,
+            username,
+            enforcement,
+            snapshot: live_snapshot.as_deref(),
+        },
+        other => other,
+    };
+    let discovery = resolve_trace_discovery(db, config, locator, caller, ServiceType::UploadPack)
+        .await
+        .map_err(fetch_authority_error)?;
+    let stream_id = discovery
+        .scope_id
+        .ok_or(TracesError::UnknownScope)?
+        .to_string();
+    let stream = trace_stream::Entity::find_by_id(&stream_id)
+        .one(db)
+        .await
+        .map_err(|_| MegaError::Traces(TracesError::QueryTimeout))?
+        .ok_or(TracesError::UnknownScope)?;
+    let target = trace_target::Entity::find_by_id(&stream.target_id)
+        .filter(trace_target::Column::Active.eq(true))
+        .one(db)
+        .await
+        .map_err(|_| MegaError::Traces(TracesError::QueryTimeout))?
+        .ok_or(TracesError::UnknownScope)?;
+    if target.project_path.contains(['\0', '\\'])
+        || strict_canonical_project_path(&target.project_path).is_err()
+        || stream.hash_kind != discovery.hash_kind.as_str()
+    {
+        return Err(TracesError::UnknownScope.into());
+    }
+    if let TracesLocator::ByPath { target_path, .. } = locator
+        && *target_path != target.project_path
+    {
+        return Err(TracesError::UnknownScope.into());
+    }
+    let principal = discovery_principal(db, caller, TracesAction::Read, &target.project_path)
+        .await
+        .map_err(fetch_authority_error)?;
+    let (namespace, credential) = match caller {
+        TracesCaller::StaticPushToken { credential_id, .. } => ("static_push_token", credential_id),
+        TracesCaller::MonoAccount { credential_id, .. } => ("mono_account", credential_id),
+        TracesCaller::Anonymous => return Err(TracesError::Unauthenticated.into()),
+    };
+    after_authorization.await;
+    // One PostgreSQL statement observes target, stream and current credential
+    // together. Publication after this statement cannot change this request's tip.
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT s.tip_oid FROM trace_stream s \
+             JOIN trace_target t ON t.id = s.target_id \
+             JOIN trace_credential_binding b ON b.namespace = $1 AND b.credential_id = $2 \
+             AND b.retired_at IS NULL AND b.principal_id = $3 \
+             WHERE s.id = $4 AND s.target_id = $5 AND s.hash_kind = $6 \
+             AND t.project_path = $7 AND t.active = TRUE",
+            [
+                namespace.into(),
+                credential.into(),
+                principal.into(),
+                stream_id.clone().into(),
+                target.id.into(),
+                stream.hash_kind.into(),
+                target.project_path.into(),
+            ],
+        ))
+        .await
+        .map_err(|_| MegaError::Traces(TracesError::QueryTimeout))?
+        .ok_or(TracesError::UnknownScope)?;
+    let tip_oid: Option<String> = row
+        .try_get("", "tip_oid")
+        .map_err(|_| MegaError::Traces(TracesError::QueryTimeout))?;
+    if tip_oid.as_ref().is_some_and(|oid| {
+        oid.len() != discovery.hash_kind.hex_len()
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(TracesError::ObjectIntegrity.into());
+    }
+    Ok(TraceFetchGrant {
+        db: db.clone(),
+        server_id: discovery.server_id,
+        stream_id,
+        hash_kind: discovery.hash_kind,
+        tip_oid: tip_oid.map(|oid| oid.to_ascii_lowercase()),
+    })
+}
+
+fn fetch_authority_error(error: MegaError) -> MegaError {
+    match error {
+        MegaError::Traces(_) => error,
+        _ => TracesError::QueryTimeout.into(),
+    }
+}
+
 /// Virtual repository selected before Native and ImportRepo.
 ///
 /// Discovery of a legal locator returns an empty ref list. This handler does
@@ -1056,5 +1218,298 @@ pub(crate) mod tests {
         assert!(refs.is_empty());
         assert_eq!(sha256.object_hash_kind().unwrap(), HashKind::Sha256);
         assert_unchanged(&before, &writer_counts(&state).await);
+    }
+    fn fetch_rejected<T>(result: Result<T, MegaError>, expected: TracesError) {
+        match result {
+            Err(MegaError::Traces(actual)) => {
+                assert_eq!(actual.code(), expected.code());
+                assert_eq!(actual.http_status(), expected.http_status());
+            }
+            Err(other) => panic!("unexpected non-traces rejection: {other}"),
+            Ok(_) => panic!("expected fetch rejection"),
+        }
+    }
+
+    async fn fetch_target_state(f: &DiscoveryFixture, path: &str, active: bool) {
+        trace_target::Entity::update_many()
+            .col_expr(
+                trace_target::Column::ProjectPath,
+                sea_orm::sea_query::Expr::value(path),
+            )
+            .col_expr(
+                trace_target::Column::Active,
+                sea_orm::sea_query::Expr::value(active),
+            )
+            .filter(trace_target::Column::Id.eq(&f.target_id))
+            .exec(&f.db)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoped_fetch_authority_snapshot_and_indistinguishable_denial_both_hashes() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let f = DiscoveryFixture::new(kind, true).await;
+            let tip = "a".repeat(kind.hex_len());
+            let grant = resolve_trace_fetch_capture(
+                &f.db,
+                &f.config,
+                &f.by_scope(),
+                f.caller(),
+                None,
+                async {
+                    trace_stream::Entity::update_many()
+                        .col_expr(
+                            trace_stream::Column::TipOid,
+                            sea_orm::sea_query::Expr::value(tip.clone()),
+                        )
+                        .filter(trace_stream::Column::Id.eq(&f.stream_id))
+                        .exec(&f.db)
+                        .await
+                        .unwrap();
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(grant.stream_id(), f.stream_id);
+            assert_eq!(grant.hash_kind(), kind);
+            assert_eq!(
+                grant.server_id().to_string(),
+                f.config.server_id.clone().unwrap()
+            );
+            trace_stream::Entity::update_many()
+                .col_expr(
+                    trace_stream::Column::TipOid,
+                    sea_orm::sea_query::Expr::value("b".repeat(kind.hex_len())),
+                )
+                .filter(trace_stream::Column::Id.eq(&f.stream_id))
+                .exec(&f.db)
+                .await
+                .unwrap();
+            assert_eq!(grant.tip_oid(), Some(tip.as_str()));
+            let mut denied = f.token.clone();
+            denied.paths = Some(vec!["/elsewhere".into()]);
+            let caller = TracesCaller::StaticPushToken {
+                credential_id: &f.token.name,
+                token: &denied,
+            };
+            fetch_rejected(
+                resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, None).await,
+                TracesError::UnknownScope,
+            );
+            fetch_rejected(
+                resolve_trace_fetch(
+                    &f.db,
+                    &f.config,
+                    &TracesLocator::ByScope {
+                        stream_id: Uuid::new_v4().to_string(),
+                    },
+                    caller,
+                    None,
+                )
+                .await,
+                TracesError::UnknownScope,
+            );
+            fetch_rejected(
+                resolve_trace_fetch(
+                    &f.db,
+                    &f.config,
+                    &f.by_scope(),
+                    TracesCaller::Anonymous,
+                    None,
+                )
+                .await,
+                TracesError::Unauthenticated,
+            );
+            let mut off = f.config.clone();
+            off.enabled = false;
+            fetch_rejected(
+                resolve_trace_fetch(&f.db, &off, &f.by_scope(), f.caller(), None).await,
+                TracesError::UnknownScope,
+            );
+            assert!(
+                resolve_trace_fetch(&f.db, &f.config, &f.locator, f.caller(), None)
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_fetch_authority_move_rebind_and_retirement_races() {
+        let f = DiscoveryFixture::new(HashKind::Sha1, true).await;
+        for destination in ["/team/moved", "/import/rebound"] {
+            fetch_rejected(
+                resolve_trace_fetch_capture(
+                    &f.db,
+                    &f.config,
+                    &f.by_scope(),
+                    f.caller(),
+                    None,
+                    fetch_target_state(&f, destination, true),
+                )
+                .await,
+                TracesError::UnknownScope,
+            );
+            fetch_rejected(
+                resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), f.caller(), None).await,
+                TracesError::UnknownScope,
+            );
+            // A different principal with permission at the current path may read.
+            let other = Uuid::new_v4().to_string();
+            trace_principal::ActiveModel {
+                id: Set(other.clone()),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(&f.db)
+            .await
+            .unwrap();
+            let mut reader = f.token.clone();
+            reader.name = format!("reader-{other}");
+            reader.paths = Some(vec![destination.into()]);
+            discovery_binding(&f.db, &other, "static_push_token", &reader.name).await;
+            let caller = TracesCaller::StaticPushToken {
+                credential_id: &reader.name,
+                token: &reader,
+            };
+            assert!(
+                resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, None)
+                    .await
+                    .is_ok()
+            );
+            fetch_rejected(
+                resolve_trace_fetch(&f.db, &f.config, &f.locator, caller, None).await,
+                TracesError::UnknownScope,
+            );
+            fetch_target_state(&f, "/team/app", true).await;
+        }
+        fetch_rejected(
+            resolve_trace_fetch_capture(
+                &f.db,
+                &f.config,
+                &f.by_scope(),
+                f.caller(),
+                None,
+                fetch_target_state(&f, "/team/app", false),
+            )
+            .await,
+            TracesError::UnknownScope,
+        );
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), f.caller(), None).await,
+            TracesError::UnknownScope,
+        );
+        fetch_target_state(&f, "/team/app", true).await;
+        assert!(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), f.caller(), None)
+                .await
+                .is_ok()
+        );
+        fetch_rejected(
+            resolve_trace_fetch_capture(&f.db, &f.config, &f.by_scope(), f.caller(), None, async {
+                trace_credential_binding::Entity::update_many()
+                    .col_expr(
+                        trace_credential_binding::Column::RetiredAt,
+                        sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+                    )
+                    .filter(trace_credential_binding::Column::CredentialId.eq(&f.token.name))
+                    .exec(&f.db)
+                    .await
+                    .unwrap();
+            })
+            .await,
+            TracesError::UnknownScope,
+        );
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), f.caller(), None).await,
+            TracesError::UnknownScope,
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_fetch_authority_recreated_path_never_aliases_old_target() {
+        let f = DiscoveryFixture::new(HashKind::Sha1, true).await;
+        fetch_target_state(&f, "/team/app", false).await;
+        trace_target::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            target_kind: Set("native".into()),
+            project_path: Set("/team/app".into()),
+            backing_import_repo_id: Set(None),
+            active: Set(true),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(&f.db)
+        .await
+        .unwrap();
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), f.caller(), None).await,
+            TracesError::UnknownScope,
+        );
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.locator, f.caller(), None).await,
+            TracesError::UnknownScope,
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_fetch_authority_uses_live_policy_not_stale_caller() {
+        use crate::contract::policy::{enforcement::Enforcement, entitystore::generate_entity};
+        let f = DiscoveryFixture::new(HashKind::Sha1, true).await;
+        discovery_binding(&f.db, &f.principal_id, "mono_account", "account").await;
+        let make = |group: Option<&str>| {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&generate_entity(&[], "/").unwrap()).unwrap();
+            if let Some(group) = group {
+                value["users"].as_object_mut().unwrap().insert(
+                    "User::\"current\"".into(),
+                    serde_json::json!({
+                        "euid": "User::\"current\"", "parents": [format!("UserGroup::\"{group}\"")]
+                    }),
+                );
+            }
+            value.to_string()
+        };
+        let store = SharedEntityStore::new();
+        store.swap(&make(Some("admin"))).unwrap();
+        let stale = store.snapshot().unwrap();
+        let caller = TracesCaller::MonoAccount {
+            credential_id: "account",
+            username: "current",
+            enforcement: Enforcement::Enforce,
+            snapshot: Some(&stale),
+        };
+        store.swap(&make(None)).unwrap();
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+        store.swap(&make(Some("reader"))).unwrap();
+        assert!(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store))
+                .await
+                .is_ok(),
+            "current read permission suffices without ownership or write permission"
+        );
+        for policy in [None, Some(&SharedEntityStore::new())] {
+            fetch_rejected(
+                resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, policy).await,
+                TracesError::UnknownScope,
+            );
+        }
+        let off = TracesCaller::MonoAccount {
+            credential_id: "account",
+            username: "current",
+            enforcement: Enforcement::Off,
+            snapshot: Some(&stale),
+        };
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), off, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+        store.mark_dirty();
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
     }
 }
