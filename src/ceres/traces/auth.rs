@@ -25,6 +25,7 @@ use crate::{
             entitystore::SharedEntityStore, resource::resolve_resource, util::SaturnEUid,
         },
     },
+    jupiter::storage::user_storage::AuthenticatedAccessToken,
 };
 
 /// Credential namespace stored on `trace_credential_binding.namespace`.
@@ -54,6 +55,12 @@ pub enum TracesCaller<'a> {
         credential_id: &'a str,
         token: &'a PushTokenConfig,
     },
+    MonoAccessToken {
+        token: &'a AuthenticatedAccessToken,
+        enforcement: Enforcement,
+        snapshot: Option<&'a EntitySnapshot>,
+    },
+    #[cfg(test)]
     MonoAccount {
         credential_id: &'a str,
         username: &'a str,
@@ -133,6 +140,11 @@ pub async fn authorize_traces(
         commit_author_ignored = request.commit_author.is_some(),
         "traces authorization ignores commit author"
     );
+    if let TracesCaller::MonoAccessToken { token, .. } = request.caller
+        && !token.is_current(db, false).await?
+    {
+        return Ok(TracesAuthDecision::NotFound);
+    }
     let Some(presented) = presented_credential(request) else {
         return Ok(TracesAuthDecision::Unauthenticated);
     };
@@ -168,6 +180,20 @@ fn presented_credential<'a>(request: &TracesAuthRequest<'a>) -> Option<Presented
             kind: PresentedKind::Token { token },
         }),
         TracesCaller::StaticPushToken { .. } => None,
+        TracesCaller::MonoAccessToken {
+            token,
+            enforcement,
+            snapshot,
+        } => Some(Presented {
+            namespace: CredentialNamespace::MonoAccount,
+            credential_id: token.credential_id(),
+            kind: PresentedKind::Account {
+                username: token.username(),
+                enforcement,
+                snapshot,
+            },
+        }),
+        #[cfg(test)]
         TracesCaller::MonoAccount {
             credential_id,
             username,
@@ -182,6 +208,7 @@ fn presented_credential<'a>(request: &TracesAuthRequest<'a>) -> Option<Presented
                 snapshot,
             },
         }),
+        #[cfg(test)]
         TracesCaller::MonoAccount { .. } => None,
     }
 }
@@ -225,6 +252,11 @@ pub async fn recheck_publish_authority<C: ConnectionTrait>(
     if bound_principal != stream.principal_id {
         return Err(publish_rejected());
     }
+    if let TracesCaller::MonoAccessToken { token, .. } = authority.caller
+        && !token.is_current(conn, true).await?
+    {
+        return Err(publish_rejected());
+    }
     let target = locked_target(conn, &stream.target_id).await?;
     if !target.active || target.project_path != authority.authorized_path {
         return Err(publish_rejected());
@@ -246,16 +278,20 @@ pub async fn recheck_publish_authority<C: ConnectionTrait>(
 fn live_account_policy(
     authority: &PublishAuthority<'_>,
 ) -> Result<Option<std::sync::Arc<EntitySnapshot>>, MegaError> {
-    match authority.caller {
-        TracesCaller::MonoAccount { .. } => {
-            let store = authority.policy.ok_or_else(publish_rejected)?;
-            if store.is_dirty() {
-                return Err(publish_rejected());
-            }
-            Ok(Some(store.snapshot().ok_or_else(publish_rejected)?))
-        }
-        TracesCaller::Anonymous | TracesCaller::StaticPushToken { .. } => Ok(None),
+    let account = match authority.caller {
+        TracesCaller::MonoAccessToken { .. } => true,
+        #[cfg(test)]
+        TracesCaller::MonoAccount { .. } => true,
+        TracesCaller::Anonymous | TracesCaller::StaticPushToken { .. } => false,
+    };
+    if !account {
+        return Ok(None);
     }
+    let store = authority.policy.ok_or_else(publish_rejected)?;
+    if store.is_dirty() {
+        return Err(publish_rejected());
+    }
+    Ok(Some(store.snapshot().ok_or_else(publish_rejected)?))
 }
 
 fn presented_for_publish<'a>(
@@ -263,6 +299,18 @@ fn presented_for_publish<'a>(
     live_policy: Option<&'a EntitySnapshot>,
 ) -> Result<Presented<'a>, MegaError> {
     match authority.caller {
+        TracesCaller::MonoAccessToken {
+            token, enforcement, ..
+        } => Ok(Presented {
+            namespace: CredentialNamespace::MonoAccount,
+            credential_id: token.credential_id(),
+            kind: PresentedKind::Account {
+                username: token.username(),
+                enforcement,
+                snapshot: Some(live_policy.ok_or_else(publish_rejected)?),
+            },
+        }),
+        #[cfg(test)]
         TracesCaller::MonoAccount {
             credential_id,
             username,
@@ -277,6 +325,7 @@ fn presented_for_publish<'a>(
                 snapshot: Some(live_policy.ok_or_else(publish_rejected)?),
             },
         }),
+        #[cfg(test)]
         TracesCaller::MonoAccount { .. } => Err(publish_rejected()),
         TracesCaller::Anonymous | TracesCaller::StaticPushToken { .. } => {
             presented_credential(&TracesAuthRequest {
@@ -309,9 +358,14 @@ fn credential_identity(caller: TracesCaller<'_>) -> Option<(CredentialNamespace,
             Some((CredentialNamespace::StaticPushToken, credential_id))
         }
         TracesCaller::StaticPushToken { .. } => None,
+        TracesCaller::MonoAccessToken { token, .. } => {
+            Some((CredentialNamespace::MonoAccount, token.credential_id()))
+        }
+        #[cfg(test)]
         TracesCaller::MonoAccount { credential_id, .. } if !credential_id.is_empty() => {
             Some((CredentialNamespace::MonoAccount, credential_id))
         }
+        #[cfg(test)]
         TracesCaller::MonoAccount { .. } => None,
     }
 }
@@ -1501,5 +1555,370 @@ mod tests {
                 .is_err()
         );
         txn.rollback().await.expect("rollback");
+    }
+    async fn authenticated_token(
+        db: &DatabaseConnection,
+        id: i64,
+        username: &str,
+    ) -> AuthenticatedAccessToken {
+        use crate::jupiter::storage::{
+            base_storage::{BaseStorage, StorageConnector},
+            user_storage::UserStorage,
+        };
+        let secret = format!("synthetic-mono-token-{id}");
+        crate::callisto::access_token::ActiveModel {
+            id: Set(id),
+            username: Set(username.into()),
+            token: Set(secret.clone()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        UserStorage {
+            base: BaseStorage::new(std::sync::Arc::new(db.clone())),
+        }
+        .authenticate_traces_access_token(&secret)
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    fn mono_authority<'a>(
+        fixture: &'a PublishFixture,
+        token: &'a AuthenticatedAccessToken,
+        policy: &'a SharedEntityStore,
+    ) -> PublishAuthority<'a> {
+        PublishAuthority {
+            caller: TracesCaller::MonoAccessToken {
+                token,
+                enforcement: Enforcement::Enforce,
+                snapshot: None,
+            },
+            principal_id: &fixture.principal_id,
+            target_id: &fixture.target_id,
+            authorized_path: &fixture.path,
+            expected_generation: 1,
+            policy: Some(policy),
+        }
+    }
+
+    #[tokio::test]
+    async fn mono_token_rotation_keeps_explicit_principal_and_namespace() {
+        let (_temp, db) = migrated_db().await;
+        let owner = principal(&db).await;
+        let other = principal(&db).await;
+        let first = authenticated_token(&db, 7001, "publisher").await;
+        let second = authenticated_token(&db, 7002, "publisher").await;
+        bind(
+            &db,
+            &other,
+            CredentialNamespace::StaticPushToken,
+            first.credential_id(),
+        )
+        .await;
+        bind(
+            &db,
+            &owner,
+            CredentialNamespace::MonoAccount,
+            first.credential_id(),
+        )
+        .await;
+        let policy = snapshot(&[("publisher", "admin")]);
+        let request = |token| TracesAuthRequest {
+            caller: TracesCaller::MonoAccessToken {
+                token,
+                enforcement: Enforcement::Enforce,
+                snapshot: Some(&policy),
+            },
+            action: TracesAction::Read,
+            canonical_target_path: "/team/app",
+            commit_author: Some("another-user"),
+        };
+        assert_eq!(
+            authorize_traces(&db, &request(&first)).await.unwrap(),
+            TracesAuthDecision::Allow {
+                principal_id: owner.clone()
+            }
+        );
+        assert_eq!(
+            authorize_traces(&db, &request(&second)).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+        bind(
+            &db,
+            &owner,
+            CredentialNamespace::MonoAccount,
+            second.credential_id(),
+        )
+        .await;
+        trace_credential_binding::Entity::update_many()
+            .col_expr(
+                trace_credential_binding::Column::RetiredAt,
+                sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+            )
+            .filter(trace_credential_binding::Column::Namespace.eq("mono_account"))
+            .filter(trace_credential_binding::Column::CredentialId.eq(first.credential_id()))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            authorize_traces(&db, &request(&first)).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+        assert_eq!(
+            authorize_traces(&db, &request(&second)).await.unwrap(),
+            TracesAuthDecision::Allow {
+                principal_id: owner
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn mono_token_publication_rejects_deleted_or_replaced_source() {
+        use crate::callisto::access_token;
+        for mutation in 0..3 {
+            let (_temp, db) = migrated_db().await;
+            let fixture = publish_fixture(&db).await;
+            let token = authenticated_token(&db, 7100 + mutation, "publisher").await;
+            bind(
+                &db,
+                &fixture.principal_id,
+                CredentialNamespace::MonoAccount,
+                token.credential_id(),
+            )
+            .await;
+            let store = SharedEntityStore::new();
+            store.swap(&policy_json(&[("publisher", "admin")])).unwrap();
+            let authority = mono_authority(&fixture, &token, &store);
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap();
+            match mutation {
+                0 => {
+                    access_token::Entity::delete_by_id(token.id())
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+                1 => {
+                    access_token::Entity::update_many()
+                        .col_expr(
+                            access_token::Column::Token,
+                            sea_orm::sea_query::Expr::value("synthetic-replaced-secret"),
+                        )
+                        .filter(access_token::Column::Id.eq(token.id()))
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    access_token::Entity::update_many()
+                        .col_expr(
+                            access_token::Column::Username,
+                            sea_orm::sea_query::Expr::value("other"),
+                        )
+                        .filter(access_token::Column::Id.eq(token.id()))
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+            }
+            assert_rejected(
+                recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                    .await
+                    .unwrap_err(),
+            );
+            let policy = store.snapshot().unwrap();
+            let request = TracesAuthRequest {
+                caller: TracesCaller::MonoAccessToken {
+                    token: &token,
+                    enforcement: Enforcement::Enforce,
+                    snapshot: Some(&policy),
+                },
+                action: TracesAction::Read,
+                canonical_target_path: &fixture.path,
+                commit_author: None,
+            };
+            assert_eq!(
+                authorize_traces(&db, &request).await.unwrap(),
+                TracesAuthDecision::NotFound
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mono_token_publication_uses_live_policy_and_binding() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let token = authenticated_token(&db, 7201, "publisher").await;
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::MonoAccount,
+            token.credential_id(),
+        )
+        .await;
+        let store = SharedEntityStore::new();
+        store.swap(&policy_json(&[("publisher", "admin")])).unwrap();
+        let stale = store.snapshot().unwrap();
+        let mut authority = mono_authority(&fixture, &token, &store);
+        authority.caller = TracesCaller::MonoAccessToken {
+            token: &token,
+            enforcement: Enforcement::Enforce,
+            snapshot: Some(&stale),
+        };
+        recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .unwrap();
+        store
+            .swap(&policy_json(&[("publisher", "reader")]))
+            .unwrap();
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+        authority.caller = TracesCaller::MonoAccessToken {
+            token: &token,
+            enforcement: Enforcement::Shadow,
+            snapshot: Some(&stale),
+        };
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+        store.swap(&policy_json(&[("publisher", "admin")])).unwrap();
+        authority.caller = TracesCaller::MonoAccessToken {
+            token: &token,
+            enforcement: Enforcement::Off,
+            snapshot: Some(&stale),
+        };
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+        authority.caller = TracesCaller::MonoAccessToken {
+            token: &token,
+            enforcement: Enforcement::Enforce,
+            snapshot: Some(&stale),
+        };
+        store.mark_dirty();
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+        store.swap(&policy_json(&[("publisher", "admin")])).unwrap();
+        trace_credential_binding::Entity::update_many()
+            .col_expr(
+                trace_credential_binding::Column::RetiredAt,
+                sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+            )
+            .filter(trace_credential_binding::Column::Namespace.eq("mono_account"))
+            .filter(trace_credential_binding::Column::CredentialId.eq(token.credential_id()))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    #[tokio::test]
+    async fn mono_token_publication_holds_source_lock_until_commit() {
+        use std::time::Duration;
+
+        use sea_orm::TransactionTrait;
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let token = authenticated_token(&db, 7301, "publisher").await;
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::MonoAccount,
+            token.credential_id(),
+        )
+        .await;
+        let store = SharedEntityStore::new();
+        store.swap(&policy_json(&[("publisher", "admin")])).unwrap();
+        let authority = mono_authority(&fixture, &token, &store);
+        let publication = db.begin().await.unwrap();
+        let publisher: i32 = publication
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT pg_backend_pid() AS pid",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "pid")
+            .unwrap();
+        recheck_publish_authority(&publication, &fixture.stream_id, &authority)
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let delete = async {
+            let deleting = db.begin().await.unwrap();
+            let deleter: i32 = deleting
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT pg_backend_pid() AS pid",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "pid")
+                .unwrap();
+            tx.send(deleter).unwrap();
+            let result = deleting
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "DELETE FROM access_token WHERE id = $1",
+                    [token.id().into()],
+                ))
+                .await
+                .unwrap();
+            deleting.commit().await.unwrap();
+            result.rows_affected()
+        };
+        let observe_and_release = async {
+            let deleter = rx.await.unwrap();
+            let blocked = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let row = db
+                        .query_one_raw(Statement::from_sql_and_values(
+                            DatabaseBackend::Postgres,
+                            "SELECT $1::integer = ANY(pg_blocking_pids($2::integer)) AS blocked",
+                            [publisher.into(), deleter.into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if row.try_get::<bool>("", "blocked").unwrap() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            publication.commit().await.unwrap();
+            blocked
+        };
+        let (deleted, blocked) = tokio::join!(delete, observe_and_release);
+        assert!(
+            blocked.is_ok(),
+            "the real deletion must wait on the publication backend"
+        );
+        assert_eq!(deleted, 1);
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
     }
 }

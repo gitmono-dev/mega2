@@ -10,12 +10,12 @@ use git_internal::{
         pack::entry::Entry,
     },
 };
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::{
-    callisto::{trace_stream, trace_target},
+    callisto::{access_token, trace_stream, trace_target},
     ceres::{
         pack::RepoHandler,
         protocol::{
@@ -111,6 +111,7 @@ pub(crate) async fn resolve_trace_discovery(
         } => {
             return Err(TracesError::Unauthenticated.into());
         }
+        #[cfg(test)]
         TracesCaller::MonoAccount {
             credential_id,
             username,
@@ -268,7 +269,13 @@ async fn resolve_trace_fetch_capture(
 ) -> Result<TraceFetchGrant, MegaError> {
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
-    let live_snapshot = if matches!(caller, TracesCaller::MonoAccount { .. }) {
+    let account = match caller {
+        TracesCaller::MonoAccessToken { .. } => true,
+        #[cfg(test)]
+        TracesCaller::MonoAccount { .. } => true,
+        _ => false,
+    };
+    let live_snapshot = if account {
         let policy = policy.ok_or(TracesError::UnknownScope)?;
         if policy.is_dirty() {
             return Err(TracesError::UnknownScope.into());
@@ -278,6 +285,14 @@ async fn resolve_trace_fetch_capture(
         None
     };
     let caller = match caller {
+        TracesCaller::MonoAccessToken {
+            token, enforcement, ..
+        } => TracesCaller::MonoAccessToken {
+            token,
+            enforcement,
+            snapshot: live_snapshot.as_deref(),
+        },
+        #[cfg(test)]
         TracesCaller::MonoAccount {
             credential_id,
             username,
@@ -325,8 +340,14 @@ async fn resolve_trace_fetch_capture(
         .map_err(fetch_authority_error)?;
     let (namespace, credential) = match caller {
         TracesCaller::StaticPushToken { credential_id, .. } => ("static_push_token", credential_id),
+        TracesCaller::MonoAccessToken { token, .. } => ("mono_account", token.credential_id()),
+        #[cfg(test)]
         TracesCaller::MonoAccount { credential_id, .. } => ("mono_account", credential_id),
         TracesCaller::Anonymous => return Err(TracesError::Unauthenticated.into()),
+    };
+    let authenticated_token = match caller {
+        TracesCaller::MonoAccessToken { token, .. } => Some(token),
+        _ => None,
     };
     after_authorization.await;
     // One PostgreSQL statement observes target, stream and current credential
@@ -334,10 +355,13 @@ async fn resolve_trace_fetch_capture(
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT s.tip_oid FROM trace_stream s \
+            "SELECT s.tip_oid, a.id AS credential_id, a.username AS credential_username, \
+             a.token AS credential_token, a.created_at AS credential_created_at \
+             FROM trace_stream s \
              JOIN trace_target t ON t.id = s.target_id \
              JOIN trace_credential_binding b ON b.namespace = $1 AND b.credential_id = $2 \
              AND b.retired_at IS NULL AND b.principal_id = $3 \
+             LEFT JOIN access_token a ON a.id = $8 \
              WHERE s.id = $4 AND s.target_id = $5 AND s.hash_kind = $6 \
              AND t.project_path = $7 AND t.active = TRUE",
             [
@@ -348,11 +372,19 @@ async fn resolve_trace_fetch_capture(
                 target.id.into(),
                 stream.hash_kind.into(),
                 target.project_path.into(),
+                authenticated_token.map(|token| token.id()).into(),
             ],
         ))
         .await
         .map_err(|_| MegaError::Traces(TracesError::QueryTimeout))?
         .ok_or(TracesError::UnknownScope)?;
+    if let Some(token) = authenticated_token {
+        let current = access_token::Model::from_query_result(&row, "credential_")
+            .map_err(|_| MegaError::Traces(TracesError::UnknownScope))?;
+        if !token.matches_record(&current) {
+            return Err(TracesError::UnknownScope.into());
+        }
+    }
     let tip_oid: Option<String> = row
         .try_get("", "tip_oid")
         .map_err(|_| MegaError::Traces(TracesError::QueryTimeout))?;
@@ -1507,6 +1539,214 @@ pub(crate) mod tests {
             TracesError::UnknownScope,
         );
         store.mark_dirty();
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+    }
+    async fn mono_fetch_token(
+        f: &DiscoveryFixture,
+    ) -> crate::jupiter::storage::user_storage::AuthenticatedAccessToken {
+        use crate::jupiter::storage::{base_storage::BaseStorage, user_storage::UserStorage};
+        let secret = "synthetic-fetch-mono-secret";
+        access_token::ActiveModel {
+            id: Set(8101),
+            username: Set("publisher".into()),
+            token: Set(secret.into()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(&f.db)
+        .await
+        .unwrap();
+        let token = UserStorage {
+            base: BaseStorage::new(std::sync::Arc::new(f.db.clone())),
+        }
+        .authenticate_traces_access_token(secret)
+        .await
+        .unwrap()
+        .unwrap();
+        discovery_binding(
+            &f.db,
+            &f.principal_id,
+            "mono_account",
+            token.credential_id(),
+        )
+        .await;
+        token
+    }
+
+    fn mono_fetch_policy(group: Option<&str>) -> String {
+        use crate::contract::policy::entitystore::generate_entity;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&generate_entity(&[], "/").unwrap()).unwrap();
+        if let Some(group) = group {
+            value["users"].as_object_mut().unwrap().insert("User::\"publisher\"".into(),
+                serde_json::json!({"euid":"User::\"publisher\"", "parents":[format!("UserGroup::\"{group}\"")]}));
+        }
+        value.to_string()
+    }
+
+    #[tokio::test]
+    async fn mono_token_fetch_snapshot_rechecks_revocation_and_replacement() {
+        use crate::contract::policy::enforcement::Enforcement;
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            for mutation in 0..4 {
+                let f = DiscoveryFixture::new(kind, true).await;
+                let token = mono_fetch_token(&f).await;
+                let store = SharedEntityStore::new();
+                store.swap(&mono_fetch_policy(Some("reader"))).unwrap();
+                let caller = TracesCaller::MonoAccessToken {
+                    token: &token,
+                    enforcement: Enforcement::Enforce,
+                    snapshot: None,
+                };
+                let first_tip = "a".repeat(kind.hex_len());
+                trace_stream::Entity::update_many()
+                    .col_expr(
+                        trace_stream::Column::TipOid,
+                        sea_orm::sea_query::Expr::value(first_tip.clone()),
+                    )
+                    .filter(trace_stream::Column::Id.eq(&f.stream_id))
+                    .exec(&f.db)
+                    .await
+                    .unwrap();
+                let grant =
+                    resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store))
+                        .await
+                        .unwrap();
+                assert_eq!(grant.tip_oid(), Some(first_tip.as_str()));
+                let rejected = resolve_trace_fetch_capture(
+                    &f.db,
+                    &f.config,
+                    &f.by_scope(),
+                    caller,
+                    Some(&store),
+                    async {
+                        match mutation {
+                            0 => {
+                                access_token::Entity::delete_by_id(token.id())
+                                    .exec(&f.db)
+                                    .await
+                                    .unwrap();
+                            }
+                            1 => {
+                                access_token::Entity::update_many()
+                                    .col_expr(
+                                        access_token::Column::Token,
+                                        sea_orm::sea_query::Expr::value(
+                                            "synthetic-new-fetch-secret",
+                                        ),
+                                    )
+                                    .filter(access_token::Column::Id.eq(token.id()))
+                                    .exec(&f.db)
+                                    .await
+                                    .unwrap();
+                            }
+                            2 => {
+                                access_token::Entity::update_many()
+                                    .col_expr(
+                                        access_token::Column::Username,
+                                        sea_orm::sea_query::Expr::value("other"),
+                                    )
+                                    .filter(access_token::Column::Id.eq(token.id()))
+                                    .exec(&f.db)
+                                    .await
+                                    .unwrap();
+                            }
+                            _ => {
+                                access_token::Entity::update_many()
+                                    .col_expr(
+                                        access_token::Column::CreatedAt,
+                                        sea_orm::sea_query::Expr::value(
+                                            Utc::now().naive_utc() + chrono::Duration::seconds(1),
+                                        ),
+                                    )
+                                    .filter(access_token::Column::Id.eq(token.id()))
+                                    .exec(&f.db)
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                        trace_stream::Entity::update_many()
+                            .col_expr(
+                                trace_stream::Column::TipOid,
+                                sea_orm::sea_query::Expr::value("b".repeat(kind.hex_len())),
+                            )
+                            .filter(trace_stream::Column::Id.eq(&f.stream_id))
+                            .exec(&f.db)
+                            .await
+                            .unwrap();
+                    },
+                )
+                .await;
+                fetch_rejected(rejected, TracesError::UnknownScope);
+                fetch_rejected(
+                    resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store))
+                        .await,
+                    TracesError::UnknownScope,
+                );
+                assert_eq!(
+                    grant.tip_oid(),
+                    Some(first_tip.as_str()),
+                    "an already captured grant keeps its original point-in-time snapshot"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mono_token_fetch_uses_current_policy_and_retirement() {
+        use crate::contract::policy::enforcement::Enforcement;
+        let f = DiscoveryFixture::new(HashKind::Sha256, true).await;
+        let token = mono_fetch_token(&f).await;
+        let store = SharedEntityStore::new();
+        store.swap(&mono_fetch_policy(Some("admin"))).unwrap();
+        let stale = store.snapshot().unwrap();
+        let caller = TracesCaller::MonoAccessToken {
+            token: &token,
+            enforcement: Enforcement::Enforce,
+            snapshot: Some(&stale),
+        };
+        store.swap(&mono_fetch_policy(None)).unwrap();
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+        store.swap(&mono_fetch_policy(Some("reader"))).unwrap();
+        assert!(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store))
+                .await
+                .is_ok()
+        );
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, None).await,
+            TracesError::UnknownScope,
+        );
+        let off = TracesCaller::MonoAccessToken {
+            token: &token,
+            enforcement: Enforcement::Off,
+            snapshot: Some(&stale),
+        };
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), off, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+        store.mark_dirty();
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+        store.swap(&mono_fetch_policy(Some("reader"))).unwrap();
+        trace_credential_binding::Entity::update_many()
+            .col_expr(
+                trace_credential_binding::Column::RetiredAt,
+                sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+            )
+            .filter(trace_credential_binding::Column::Namespace.eq("mono_account"))
+            .filter(trace_credential_binding::Column::CredentialId.eq(token.credential_id()))
+            .exec(&f.db)
+            .await
+            .unwrap();
         fetch_rejected(
             resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store)).await,
             TracesError::UnknownScope,
