@@ -204,6 +204,23 @@ When `[traces].enabled=false`, HTTP GET/POST requests entering the root `.traces
 
 Authorized traces discovery metadata and Git v0/v2 encoders are now implemented. They use the deployment identity from persistent configuration; discovery for an empty scope creates no database records. The HTTP/SSH entry points are not yet wired to these encoders, so enabling the switch does not provide the complete traces Git service. The [traces protocol](./refactoring/traces.md) defines identity, capabilities, and follow-up discovery semantics.
 
+### 5.1 Traces credential maintenance
+
+Run maintenance commands on the server with an explicitly named existing configuration; `MEGA_CONFIG` can also name it. The operator needs access to that configuration's database. Credentials must already exist: pass a name or record ID, never a token or private key. Replace the angle-bracket placeholders below with actual values:
+
+```bash
+mega2 --config config/config.toml traces credentials bind \
+  --principal '<principal-uuid>' --namespace static_push_token \
+  --credential '<configured-token-name>'
+mega2 --config config/config.toml traces credentials rotate \
+  --binding '<binding-uuid>' --namespace mono_account \
+  --credential 'access-token:<record-id>'
+mega2 --config config/config.toml traces credentials retire \
+  --binding '<binding-uuid>'
+```
+
+Keep the binding UUID from successful output for later rotation or retirement. The command requires the database schema to match the current binary and never runs migrations. The [Traces protocol](./refactoring/traces.md), §2.6, defines credential keys, principals, idempotency, conflicts and retirement; these maintenance commands do not enable the HTTP/SSH data surface that is not yet wired up.
+
 ## 6. Using mega2 with Libra
 
 The open-source edition has no Web UI. Libra's `libra mega2 browser` command provides basic remote directory browsing and supported directory and tag operations. These operations do not replace Git client clone, fetch, or push:
@@ -227,6 +244,9 @@ Global flags: `--config <PATH>` (env `MEGA_CONFIG`) and `--profile <NAME>` (env 
 | `mega2 path provision --server <URL> <PATH>` | Provision a monorepo path (before its first push, see §2.5); the token comes only from the environment variable `MEGA2_TOKEN`, no config file is read |
 | `mega2 import-repo remove --path <P> --yes [--cleanup-id <ID>] [--max-rounds <N>]` | Remove an ImportRepo on the server (storage-only; put `--config` before `import-repo` or set `MEGA_CONFIG`); outcome lines and exit codes in §2.6 |
 | `mega2 --config <existing> traces rebind-target --target <UUID> --path <canonical-path>` | Move an existing trace target onto a directory that is already canonical (§5). No default config is generated |
+| `mega2 --config <existing> traces credentials bind --principal <UUID> --namespace <NAMESPACE> --credential <KEY>` | Explicitly bind an existing credential (§5.1) |
+| `mega2 --config <existing> traces credentials rotate --binding <UUID> --namespace <NAMESPACE> --credential <KEY>` | Rotate an existing binding's credential (§5.1) |
+| `mega2 --config <existing> traces credentials retire --binding <UUID>` | Retire a binding while keeping its history (§5.1) |
 | `mega2 config validate [--resolve-secrets] [--show-sources]` | Validate configuration before startup; add `--deny-warnings` in automation |
 | `mega2 config init [-o PATH] [--force]` | Generate a safe starter configuration file |
 | `mega2 config secret ref/set/check/rotate` | Manage vault-backed config secrets (SecretRef) |

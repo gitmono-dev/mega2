@@ -1,3 +1,6 @@
+> **现行收口与执行前沿（2026-10-26）：** 当前状态（2026-10-26，实际收口2026-10-25 22:39:40 UTC）：MTR-102已done/complete；最终C3完整21 targets、3116 PASS、0 failed、3原ignored，nightly fmt、all-target/all-feature严格Clippy及双build全部exit0/0warning；本地Claude自身/执行/发布审查PASS，root在原3600秒内核最终C。签名DCO提交fc48e4efb6a238ce52b5fdb68a1c7688f60fdd00已推main，v0.42.74原生签名标注tag与手写Release已核，main CI40239601722、tag CI40239634117含amd64/arm64/Docker manifest全部实际success，未用Harbor例外。正式Mega22/118、Libra原计划0/26、联合22/144；外部资格1/4。 当前依赖与后续门（2026-10-26）：102的完整C/D已解除103前驱；当前执行前沿MTR-103，in-progress/locally-accepted；候选四生产文件/24新测试已写入，最终源码与A1执行审Claude c2a70c27五PASS，A1七门实际exit0，10/13/3/11/105逐身份通过；root于2026-10-26 00:04:43 UTC在原1800秒内观察验收，596.534秒，无新增资源残留、无需人工清理。自己的ER05已由同一本地Claude1542e9ab补齐四PASS并经root实核148输入/模式采纳；完整C1及发布D仍待，候选0.42.75尚未bump，无本卡提交/push/版本发布。顺序103→11→40→13→39→92→12/H1→LTR10→11→12→LTR01/H2，各卡自身门与跨仓资格/WRITERS/LIVE前置不省略。Libra FIX04 C1仍FAIL/STOP，F1/F2 P1未修；实际Claude2891a30b来源PASS/发布次序FAIL。仅FIX-LTR-05一次release保留现有ingress两方法同一dead_code诊断的具名例外待用户答复，未准入新Libra实现/A/C/发布；PR636已满足旧Rustdoc下一提交要求。旧FIX3诊断3/3、B8失败及8/8 STOP、所有原失败和历史数据库根因未知均保留。
+> 本次真实post-C/D记录由MTR103既有六Mega治理I承载，其最终C/D尚待；原Libra三治理仍仅本地、由LTR01承载。下方更早日期的当前/候选/待审措辞保留为历史，以本段、任务卡现行字段和H0现行列为准；不回改旧FAIL/STOP或消费过的预算。
+
 > **当前C2终态与C3恢复候选（2026-10-25 20:27:14 UTC）：** MTR102 C2实际FAIL/STOP：fmt/strict及全量原生命令exit0，21 targets汇总3116PASS/3原ignored，但stdout/stderr交错导致一例身份解析断言失败，双build未跑，C未通过。经本地Claude退出R2 PASS与root实际50.468/600秒后检，28本轮测试库人工清理、107原库保留，仅两版本面恢复.73；三源码/A2的37例及自身R3原件保留。现仅提出分流原始日志的RB-MTR102-C3，一次3600秒/命令3000/root600，待恢复、carry、最终自身ER05治理增量和具体执行审查；未claim、未新Cargo、未提交发布。正式21/118、0/26、21/144，外部资格1/4；Libra FIX04的F1/F2与H1/LTR01仍待。 依据与预算见[日期计划](../plan/plan-20261015.md)的MTR-102。下方更早的C2待准入/未claim文字保留为历史快照，不能据此重开已消费窗口。
 
 > **MTR102自身审查与C2具体准入前事实（2026-10-25 19:07:25 UTC）：** MTR102实际整合树自身R3本地Claude session f81ea66c-b6cc-4b60-9474-5e15549a542e于2026-10-25 18:45:10 UTC给出ER05/H0/VERDICT三PASS，root实算1144输入并以逐文件HEAD/blob补齐原生diff漏出的计划文件。未变A2的37例限域carry不变，源码不变。独立Libra FIX04失败C1四个未发布版本面已于18:57:47 UTC原生精确退出到b73/.87，七路径失败像/0664模式/stash988ded20/全部源码保持；实际退出R2 Claude session144da72b-958e-46e2-893a-16c289c5ceb4于19:02:37 UTC四PASS，root核85输入及2124+22路径状态后采纳，失败发布占用已关闭。原C1的11阶段0与native四FAIL/root STOP并存，F1/F2 P1仍未修，FIX04仍blocked/locally-accepted；不授新的LibraA/C或聚合。MTR102本机工具/Docker服务/环境与.87 native签名、已发布commit和tag payload已重新核验；具体C2合同现在待审，尚未claim/bump。一次总3600秒不变，命令实际截止3000秒（不超过原3300上限），留600秒root资源后检，依据104实测约306秒开销；不改变测试/断言/并发/内部deadline。当前102→103→11→40→13→39→92→12/H1→LTR10→11→12→LTR01/H2，95/93→102已满足；正式21/118、0/26、21/144与外部资格1/4不变。旧FAIL/STOP/预算/历史C2根因未知保持，尚无本卡新提交、推送、版本CI或发布。
@@ -235,11 +238,28 @@ MTR-94 的源码实现在 HTTP Router 外层增加禁用守卫：`[traces].enabl
 
 当前 helper 是 `ceres::traces::auth::authorize_traces`。静态 push token 的凭据 id 是 token 名称，不是 secret；只匹配 `static_push_token` 命名空间中未退役的绑定，再对 canonical target path 调用 `token_covers_repo`。Mono 账户只匹配 `mono_account` 命名空间，读评估 `viewRepo`，写评估 `pushRepo`，资源是 root Repository 快照。快照缺失、`enforcement` 不消费快照，或 Cedar 拒绝时，traces 拒绝；`off` / `shadow` 对代码推送的放行不放行 traces。匿名调用得到未认证结果。没有绑定、不是 owner，或缺少目标读/写权限时得到不可区分的拒绝。提交作者不参与判定。普通代码读取仍走既有匿名读门，普通代码写入仍走既有 token 路径门和 `decide_push`；没有 traces 绑定不改变这些代码结果。HTTP、SSH 与查询路由接入该 helper 由后续卡完成。
 
-### 2.6 凭据来源与显式绑定管理（2026-10-25候选，102/103准入待）
+### 2.6 凭据来源与显式绑定管理
+
+MTR-102 已随 v0.42.74 发布。以下 MTR-103 维护入口为当前工作树实现，A1 与本地Claude自身审查已通过；完整发布仍待任务卡闭环；H1 必须携带真实 CLI 操作收据，HTTP/SSH wire 仍由 MTR-11/39/12 逐卡验收。
 
 稳定principal始终是`trace_principal.id` UUID。Mono HTTP凭据key为`mono_account`命名空间中的`access-token:<真实access_token行id>`；SSH key由39消费`ssh-key:<真实ssh_keys行id>`。行id不是账户/principal UUID，Cedar username只取认证行且不作为身份key。只有真实token唯一匹配才签出内存sealed witness；重复token记录拒绝，不任取一行。发布事务重查并锁住当前token身份至提交，fetch固定tip的同一SQL快照核token；同id行内容替换不继续接受旧见证。
 
-MTR103的受信本地`traces credentials bind|rotate|retire`通过显式现存配置管理关联，不能自动由用户名/author迁移归属。bind显式选择principal UUID，rotate将新凭据绑定同一UUID并同事务退休旧binding，retire保留历史。静态token按配置name单独namespace；Mono两种key须确认真实源记录。已存在active冲突拒绝；无产品管理入口前不能以人工SQL声称生产轮换能力完成。H1必须携带真实管理CLI操作收据；HTTP/SSH wire仍由11/39/12逐卡验收。
+受信本地入口为 `mega2 --config <existing> traces credentials`；`MEGA_CONFIG` 同样是具名配置，自动发现的 CWD/global 配置不授予维护入口。操作者持有服务配置及数据库访问权限；此入口不提供远端匿名管理 API。命令先验证配置及当前 schema；缺失、落后或存在未知 migration 时拒绝，不生成配置、不迁移、不写 principal/binding。
+
+| 操作 | 参数 | 事务行为 |
+|---|---|---|
+| `bind` | `--principal <UUID> --namespace <NAMESPACE> --credential <KEY>` | 必要时创建指定 principal 并插入绑定；现存同 principal 的 active 绑定原样返回，其它 owner 冲突拒绝，失败时不留下新 principal |
+| `rotate` | `--binding <UUID> --namespace <NAMESPACE> --credential <KEY>` | 将不同的新凭据绑定原 principal，并在同一事务退役旧绑定；同 key、已退役旧绑定或任何已 active 的目标绑定均拒绝，不转移 owner |
+| `retire` | `--binding <UUID>` | 保留历史行并设置退役时间；重复调用保持原时间，提交后新发起的授权拒绝该绑定；不存在的 binding 拒绝 |
+
+principal/binding UUID 可用标准、simple、braced、URN 及大小写形式输入，归一为小写连字符形式；不根据 username 或 commit author 推导 principal。凭据 key 仅为：
+
+- `static_push_token` 命名空间中的现存配置 token 名称，不是 secret 值。
+- `mono_account` 命名空间中的 `access-token:<id>` 或 `ssh-key:<id>`；id 为对应现存记录的规范十进制 i64，无前导零或多余正号。事务只按 id 查源记录并持共享锁至提交，不读取 token/key 内容来推断归属。
+
+两个命名空间独立。部分唯一索引维持每个 namespace/key 最多一个 active 绑定；同一新 principal 的并发 bind 在 active 行未被退役时返回同一 binding UUID，不能因竞争而留下重复 principal。若在冲突检查与重读之间发生退役，返回冲突，命令不自动重试。轮换按 binding UUID 顺序取得旧绑定和已存在目标的行锁；事务失败不能留下半次轮换。若 COMMIT 确认期间连接丢失，错误不证明回滚，操作者应先核对绑定状态再重试；数据库仍保持整次提交或整次回滚。
+
+成功行仅为 `<bind|rotate|retire> <binding-uuid> <principal-uuid> <active|retired>`。失败诊断不回显原始凭据参数、配置内容或数据库错误链。退役不删除历史，也不追溯取消早于退役提交的读取快照。误绑定通过具名 retire 撤销，再显式 bind；人工 SQL 不替代本卡的产品 CLI 验收。
 
 
 ## 3. 原始对象存储、接收与恢复

@@ -19,6 +19,919 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
+struct CredentialCliFixture {
+    root: tempfile::TempDir,
+    config: PathBuf,
+    database_url: String,
+}
+
+impl CredentialCliFixture {
+    async fn new(db: &sea_orm::DatabaseConnection) -> Self {
+        let database: String = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT current_database() AS name",
+            ))
+            .await
+            .expect("database name")
+            .expect("name row")
+            .try_get("", "name")
+            .expect("name");
+        let admin = std::env::var("MEGA_DATABASE__DB_URL").unwrap_or_else(|_| {
+            "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".to_owned()
+        });
+        let mut url = url::Url::parse(&admin).expect("test database URL");
+        url.set_path(&database);
+        let root = tempfile::tempdir().expect("credential fixture");
+        let config = root.path().join("operator.toml");
+        let mut text = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+        )
+        .expect("config template");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim() == "[[git.push_tokens]]")
+        );
+        for name in ["first", "second", "third", "access-token:31"] {
+            text.push_str(&format!("\n[[git.push_tokens]]\nname = \"{name}\"\ntoken = \"synthetic-config-secret-{name}\"\npaths = [\"/project\"]\n"));
+        }
+        std::fs::write(&config, text).expect("named config");
+        Self {
+            root,
+            config,
+            database_url: url.to_string(),
+        }
+    }
+
+    fn command(&self, args: &[&str], named: bool) -> std::process::Command {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_mega2"));
+        command
+            .current_dir(self.root.path())
+            .env_remove("MEGA_CONFIG")
+            .env_remove("MEGA_PROFILE")
+            .env_remove("MEGA_GIT__PUSH_TOKENS")
+            .env("MEGA_DATABASE__DB_TYPE", "postgres")
+            .env("MEGA_DATABASE__DB_URL", &self.database_url)
+            .env("MEGA_DATABASE__MIN_CONNECTION", "0")
+            .env("MEGA_DATABASE__MAX_CONNECTION", "2")
+            .env("MEGA_BASE_DIR", self.root.path().join("base"))
+            .env("MEGA_CACHE_DIR", self.root.path().join("cache"))
+            .env("MEGA_LOG__PRINT_STD", "true");
+        if named {
+            command.arg("--config").arg(&self.config);
+        }
+        command.args(args);
+        command
+    }
+
+    fn spawn(&self, args: &[&str], named: bool) -> CredentialProcess {
+        CredentialProcess::spawn(self.command(args, named), self.root.path())
+    }
+
+    fn run(&self, args: &[&str], named: bool) -> std::process::Output {
+        self.spawn(args, named).finish()
+    }
+}
+
+struct CredentialProcess {
+    child: std::process::Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl CredentialProcess {
+    fn spawn(mut command: std::process::Command, root: &std::path::Path) -> Self {
+        let id = Uuid::new_v4();
+        let stdout = root.join(format!("{id}.stdout"));
+        let stderr = root.join(format!("{id}.stderr"));
+        command
+            .stdout(std::fs::File::create(&stdout).expect("stdout file"))
+            .stderr(std::fs::File::create(&stderr).expect("stderr file"));
+        Self {
+            child: command.spawn().expect("credential CLI"),
+            stdout,
+            stderr,
+        }
+    }
+
+    fn finish(mut self) -> std::process::Output {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll credential CLI") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "credential CLI did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        std::process::Output {
+            status,
+            stdout: std::fs::read(&self.stdout).expect("CLI stdout"),
+            stderr: std::fs::read(&self.stderr).expect("CLI stderr"),
+        }
+    }
+}
+
+impl Drop for CredentialProcess {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn credential_output(output: &std::process::Output, success: bool) -> String {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.success(), success, "{text}");
+    for secret in [
+        "synthetic-config-secret-",
+        "synthetic-access-secret",
+        "synthetic-database-secret",
+        "synthetic-private-key-value",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "credential diagnostic leaked a synthetic secret"
+        );
+    }
+    text
+}
+
+fn credential_success(output: &std::process::Output, action: &str) -> (String, String, String) {
+    credential_output(output, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with(&format!("{action} ")))
+        .expect("credential success row");
+    let fields: Vec<_> = line.split_whitespace().collect();
+    assert_eq!(fields.len(), 4);
+    for id in &fields[1..3] {
+        assert_eq!(Uuid::parse_str(id).expect("UUID").to_string(), *id);
+    }
+    (
+        fields[1].to_owned(),
+        fields[2].to_owned(),
+        fields[3].to_owned(),
+    )
+}
+
+async fn credential_row(
+    db: &sea_orm::DatabaseConnection,
+    id: &str,
+) -> trace_credential_binding::Model {
+    trace_credential_binding::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .expect("binding query")
+        .expect("binding retained")
+}
+
+async fn credential_counts(db: &sea_orm::DatabaseConnection) -> (i64, i64) {
+    let row = db.query_one_raw(Statement::from_string(DatabaseBackend::Postgres,
+        "SELECT (SELECT count(*) FROM trace_principal)::bigint AS principals, (SELECT count(*) FROM trace_credential_binding)::bigint AS bindings"
+    )).await.expect("identity counts").expect("counts row");
+    (
+        row.try_get("", "principals").expect("principals"),
+        row.try_get("", "bindings").expect("bindings"),
+    )
+}
+
+async fn credential_sources(db: &sea_orm::DatabaseConnection) {
+    mega2_core::access_token::ActiveModel {
+        id: Set(31),
+        username: Set("same-synthetic-account".to_owned()),
+        token: Set("synthetic-access-secret".to_owned()),
+        created_at: Set(Utc::now().naive_utc()),
+    }
+    .insert(db)
+    .await
+    .expect("access-token source");
+    mega2_core::ssh_keys::ActiveModel {
+        id: Set(31),
+        username: Set("same-synthetic-account".to_owned()),
+        title: Set("fixture".to_owned()),
+        ssh_key: Set("synthetic-public-key".to_owned()),
+        finger: Set("fixture-fingerprint".to_owned()),
+        created_at: Set(Utc::now().naive_utc()),
+    }
+    .insert(db)
+    .await
+    .expect("SSH source");
+}
+
+#[test]
+fn credential_binding_cli_help_exposes_only_lifecycle_inputs() {
+    let root = tempfile::tempdir().expect("help fixture");
+    for operation in [None, Some("bind"), Some("rotate"), Some("retire")] {
+        let mut args = vec!["traces", "credentials"];
+        if let Some(operation) = operation {
+            args.push(operation);
+        }
+        args.push("--help");
+        let output = rebind_output(root.path(), &args, &[]);
+        let text = credential_output(&output, true);
+        match operation {
+            None => {
+                for child in ["bind", "rotate", "retire"] {
+                    assert!(text.contains(child));
+                }
+            }
+            Some("bind") => {
+                assert!(text.contains("--principal"));
+                assert!(text.contains("--namespace"));
+                assert!(text.contains("--credential"));
+            }
+            Some("rotate") => {
+                assert!(text.contains("--binding"));
+                assert!(text.contains("--namespace"));
+                assert!(text.contains("--credential"));
+            }
+            _ => {
+                assert!(text.contains("--binding"));
+                assert!(!text.contains("--credential"));
+            }
+        }
+        assert!(!text.contains("--secret"));
+    }
+}
+
+#[tokio::test]
+async fn credential_binding_cli_requires_named_existing_configuration() {
+    let (_traces, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    let principal = Uuid::new_v4().to_string();
+    let args = [
+        "traces",
+        "credentials",
+        "bind",
+        "--principal",
+        &principal,
+        "--namespace",
+        "static_push_token",
+        "--credential",
+        "first",
+    ];
+    let unnamed = fixture.run(&args, false);
+    credential_output(&unnamed, false);
+    assert!(!fixture.root.path().join("base/etc/config.toml").exists());
+    let discovered = fixture.root.path().join("config");
+    std::fs::create_dir(&discovered).expect("discovered config directory");
+    std::fs::copy(&fixture.config, discovered.join("config.toml")).expect("discovered config");
+    assert!(credential_output(&fixture.run(&args, false), false).contains("was not named"));
+    let mut missing = vec!["--config", "missing.toml"];
+    missing.extend(args);
+    credential_output(&fixture.run(&missing, false), false);
+    assert_eq!(credential_counts(&db).await, (0, 0));
+    let mut command = fixture.command(&args, false);
+    command.env("MEGA_CONFIG", &fixture.config);
+    let output = CredentialProcess::spawn(command, fixture.root.path()).finish();
+    let (_, owner, state) = credential_success(&output, "bind");
+    assert_eq!(owner, principal);
+    assert_eq!(state, "active");
+    assert_eq!(credential_counts(&db).await, (1, 1));
+    db.close().await.expect("close database");
+}
+
+#[tokio::test]
+async fn credential_binding_cli_rejects_old_and_unknown_schema_without_writes() {
+    let (_traces, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    let principal = Uuid::new_v4().to_string();
+    let args = [
+        "traces",
+        "credentials",
+        "bind",
+        "--principal",
+        &principal,
+        "--namespace",
+        "static_push_token",
+        "--credential",
+        "first",
+    ];
+    let removed = db.query_one_raw(Statement::from_string(DatabaseBackend::Postgres,
+        "DELETE FROM seaql_migrations WHERE version = (SELECT version FROM seaql_migrations ORDER BY version DESC LIMIT 1) RETURNING version, applied_at"
+    )).await.expect("old ledger fixture").expect("removed row");
+    let version: String = removed.try_get("", "version").expect("version");
+    let applied_at: i64 = removed
+        .try_get("", "applied_at")
+        .expect("applied timestamp");
+    assert!(credential_output(&fixture.run(&args, true), false).contains("schema is behind"));
+    assert_eq!(credential_counts(&db).await, (0, 0));
+    let still_absent = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT version FROM seaql_migrations WHERE version = $1",
+            [version.clone().into()],
+        ))
+        .await
+        .expect("unchanged old ledger");
+    assert!(still_absent.is_none());
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO seaql_migrations(version, applied_at) VALUES ($1, $2)",
+        [version.into(), applied_at.into()],
+    ))
+    .await
+    .expect("restore fixture ledger");
+    db.execute_unprepared("INSERT INTO seaql_migrations(version, applied_at) VALUES ('m99999999_synthetic-private-key-value', 0)").await.expect("unknown migration fixture");
+    assert!(credential_output(&fixture.run(&args, true), false).contains("cannot confirm"));
+    assert_eq!(credential_counts(&db).await, (0, 0));
+    assert!(db.query_one_raw(Statement::from_string(DatabaseBackend::Postgres,
+        "SELECT version FROM seaql_migrations WHERE version = 'm99999999_synthetic-private-key-value'"
+    )).await.expect("unknown ledger retained").is_some());
+    db.close().await.expect("close database");
+}
+
+#[tokio::test]
+async fn credential_binding_cli_accepts_real_sources_with_explicit_principals() {
+    let (_traces, db) = traces_db::TracesDb::migrated().await;
+    credential_sources(&db).await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    for (namespace, key) in [
+        ("static_push_token", "access-token:31"),
+        ("mono_account", "access-token:31"),
+        ("mono_account", "ssh-key:31"),
+    ] {
+        let principal = Uuid::new_v4();
+        let form = principal.urn().to_string();
+        let args = [
+            "traces",
+            "credentials",
+            "bind",
+            "--principal",
+            &form,
+            "--namespace",
+            namespace,
+            "--credential",
+            key,
+        ];
+        let (id, owner, state) = credential_success(&fixture.run(&args, true), "bind");
+        assert_eq!(owner, principal.to_string());
+        assert_eq!(state, "active");
+        let row = credential_row(&db, &id).await;
+        assert_eq!(row.principal_id, owner);
+        assert_eq!(row.namespace, namespace);
+        assert_eq!(row.credential_id, key);
+        assert!(row.retired_at.is_none());
+        let repeated = credential_success(&fixture.run(&args, true), "bind");
+        assert_eq!(repeated.0, id);
+        assert_eq!(credential_row(&db, &id).await, row);
+    }
+    assert_eq!(credential_counts(&db).await, (3, 3));
+    db.close().await.expect("close database");
+}
+
+#[tokio::test]
+async fn credential_binding_cli_invalid_credentials_and_config_do_not_leak_or_write() {
+    let (_traces, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    let principal = Uuid::new_v4().to_string();
+    for (owner, namespace, key) in [
+        ("synthetic-private-key-value", "static_push_token", "first"),
+        (principal.as_str(), "unknown", "synthetic-private-key-value"),
+        (
+            principal.as_str(),
+            "static_push_token",
+            "synthetic-config-secret-first",
+        ),
+        (principal.as_str(), "mono_account", "access-token:31"),
+        (principal.as_str(), "mono_account", "ssh-key:31"),
+        (principal.as_str(), "mono_account", "access-token:01"),
+        (
+            principal.as_str(),
+            "mono_account",
+            "access-token:9223372036854775808",
+        ),
+        (
+            principal.as_str(),
+            "mono_account",
+            "username:synthetic-private-key-value",
+        ),
+    ] {
+        credential_output(
+            &fixture.run(
+                &[
+                    "traces",
+                    "credentials",
+                    "bind",
+                    "--principal",
+                    owner,
+                    "--namespace",
+                    namespace,
+                    "--credential",
+                    key,
+                ],
+                true,
+            ),
+            false,
+        );
+        assert_eq!(credential_counts(&db).await, (0, 0));
+    }
+    let mut text = std::fs::read_to_string(&fixture.config).expect("fixture config");
+    text.push_str(
+        "\n[[git.push_tokens]]\nname = \"first\"\ntoken = \"synthetic-private-key-value\"\n",
+    );
+    std::fs::write(&fixture.config, text).expect("invalid duplicate token config");
+    assert!(
+        credential_output(
+            &fixture.run(
+                &[
+                    "traces",
+                    "credentials",
+                    "bind",
+                    "--principal",
+                    &principal,
+                    "--namespace",
+                    "static_push_token",
+                    "--credential",
+                    "first"
+                ],
+                true
+            ),
+            false
+        )
+        .contains("invalid maintenance configuration")
+    );
+    assert_eq!(credential_counts(&db).await, (0, 0));
+    db.close().await.expect("close database");
+}
+
+#[tokio::test]
+async fn credential_binding_cli_rotation_conflicts_and_retirement_keep_history() {
+    let (_traces, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    let principal = Uuid::new_v4().to_string();
+    let (old_id, _, _) = credential_success(
+        &fixture.run(
+            &[
+                "traces",
+                "credentials",
+                "bind",
+                "--principal",
+                &principal,
+                "--namespace",
+                "static_push_token",
+                "--credential",
+                "first",
+            ],
+            true,
+        ),
+        "bind",
+    );
+    let old = credential_row(&db, &old_id).await;
+    let losing_principal = Uuid::new_v4().to_string();
+    credential_output(
+        &fixture.run(
+            &[
+                "traces",
+                "credentials",
+                "bind",
+                "--principal",
+                &losing_principal,
+                "--namespace",
+                "static_push_token",
+                "--credential",
+                "first",
+            ],
+            true,
+        ),
+        false,
+    );
+    assert!(
+        trace_principal::Entity::find_by_id(losing_principal)
+            .one(&db)
+            .await
+            .expect("losing principal")
+            .is_none()
+    );
+    assert_eq!(credential_counts(&db).await, (1, 1));
+    let (destination, _, _) = credential_success(
+        &fixture.run(
+            &[
+                "traces",
+                "credentials",
+                "bind",
+                "--principal",
+                &principal,
+                "--namespace",
+                "static_push_token",
+                "--credential",
+                "second",
+            ],
+            true,
+        ),
+        "bind",
+    );
+    for key in ["first", "second"] {
+        credential_output(
+            &fixture.run(
+                &[
+                    "traces",
+                    "credentials",
+                    "rotate",
+                    "--binding",
+                    &old_id,
+                    "--namespace",
+                    "static_push_token",
+                    "--credential",
+                    key,
+                ],
+                true,
+            ),
+            false,
+        );
+        assert_eq!(credential_row(&db, &old_id).await, old);
+    }
+    credential_success(
+        &fixture.run(
+            &["traces", "credentials", "retire", "--binding", &destination],
+            true,
+        ),
+        "retire",
+    );
+    let (replacement, owner, state) = credential_success(
+        &fixture.run(
+            &[
+                "traces",
+                "credentials",
+                "rotate",
+                "--binding",
+                &old_id,
+                "--namespace",
+                "static_push_token",
+                "--credential",
+                "third",
+            ],
+            true,
+        ),
+        "rotate",
+    );
+    assert_eq!(owner, principal);
+    assert_eq!(state, "active");
+    assert_ne!(replacement, old_id);
+    let retired_old = credential_row(&db, &old_id).await;
+    assert!(retired_old.retired_at.is_some());
+    assert_eq!(retired_old.credential_id, old.credential_id);
+    assert_eq!(retired_old.created_at, old.created_at);
+    assert_eq!(
+        credential_row(&db, &replacement).await.principal_id,
+        principal
+    );
+    credential_output(
+        &fixture.run(
+            &[
+                "traces",
+                "credentials",
+                "rotate",
+                "--binding",
+                &old_id,
+                "--namespace",
+                "static_push_token",
+                "--credential",
+                "second",
+            ],
+            true,
+        ),
+        false,
+    );
+    let missing = Uuid::new_v4().to_string();
+    credential_output(
+        &fixture.run(
+            &["traces", "credentials", "retire", "--binding", &missing],
+            true,
+        ),
+        false,
+    );
+    credential_output(
+        &fixture.run(
+            &[
+                "traces",
+                "credentials",
+                "rotate",
+                "--binding",
+                &missing,
+                "--namespace",
+                "static_push_token",
+                "--credential",
+                "second",
+            ],
+            true,
+        ),
+        false,
+    );
+    let (_, _, state) = credential_success(
+        &fixture.run(
+            &["traces", "credentials", "retire", "--binding", &replacement],
+            true,
+        ),
+        "retire",
+    );
+    assert_eq!(state, "retired");
+    let retired = credential_row(&db, &replacement).await;
+    credential_success(
+        &fixture.run(
+            &["traces", "credentials", "retire", "--binding", &replacement],
+            true,
+        ),
+        "retire",
+    );
+    assert_eq!(credential_row(&db, &replacement).await, retired);
+    assert_eq!(credential_row(&db, &old_id).await, retired_old);
+    assert!(
+        trace_credential_binding::Entity::find()
+            .filter(trace_credential_binding::Column::RetiredAt.is_null())
+            .all(&db)
+            .await
+            .expect("active bindings")
+            .is_empty()
+    );
+    assert_eq!(credential_counts(&db).await, (1, 3));
+    db.close().await.expect("close database");
+}
+
+#[tokio::test]
+async fn credential_binding_cli_database_failure_rolls_back_rotation_and_redacts_error() {
+    let (_traces, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    let principal = Uuid::new_v4().to_string();
+    let (id, _, _) = credential_success(
+        &fixture.run(
+            &[
+                "traces",
+                "credentials",
+                "bind",
+                "--principal",
+                &principal,
+                "--namespace",
+                "static_push_token",
+                "--credential",
+                "first",
+            ],
+            true,
+        ),
+        "bind",
+    );
+    let old = credential_row(&db, &id).await;
+    db.execute_unprepared("CREATE FUNCTION reject_fixture_retire() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic-database-secret'; END $$; CREATE TRIGGER reject_fixture_retire BEFORE UPDATE ON trace_credential_binding FOR EACH ROW EXECUTE FUNCTION reject_fixture_retire()")
+        .await.expect("transaction failure fixture");
+    let text = credential_output(
+        &fixture.run(
+            &[
+                "traces",
+                "credentials",
+                "rotate",
+                "--binding",
+                &id,
+                "--namespace",
+                "static_push_token",
+                "--credential",
+                "second",
+            ],
+            true,
+        ),
+        false,
+    );
+    assert!(text.contains("credential storage failed"));
+    assert_eq!(credential_row(&db, &id).await, old);
+    assert_eq!(credential_counts(&db).await, (1, 1));
+    db.close().await.expect("close database");
+}
+
+async fn credential_barrier_pid(txn: &sea_orm::DatabaseTransaction) -> i32 {
+    txn.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "SELECT pg_backend_pid() AS pid",
+    ))
+    .await
+    .expect("barrier PID")
+    .expect("PID row")
+    .try_get("", "pid")
+    .expect("PID")
+}
+
+async fn credential_wait_for_cli_lock_waiters(db: &sea_orm::DatabaseConnection, blocker: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let count: i64 = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "WITH RECURSIVE waits(pid, blocker) AS ( \
+             SELECT pid, unnest(pg_blocking_pids(pid)) FROM pg_stat_activity \
+             WHERE datname = current_database() UNION \
+             SELECT waits.pid, unnest(pg_blocking_pids(waits.blocker)) FROM waits) \
+             SELECT count(DISTINCT pid)::bigint AS n FROM waits WHERE blocker = $1",
+                [blocker.into()],
+            ))
+            .await
+            .expect("CLI wait graph")
+            .expect("wait count")
+            .try_get("", "n")
+            .expect("wait count");
+        if count >= 2 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both CLI transactions must reach the lock barrier"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn credential_concurrent_bind_case(same_principal: bool) {
+    use sea_orm::TransactionTrait;
+
+    let (_traces, db) = traces_db::TracesDb::migrated().await;
+    credential_sources(&db).await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    let first = Uuid::new_v4().to_string();
+    let second = if same_principal {
+        first.clone()
+    } else {
+        Uuid::new_v4().to_string()
+    };
+    let barrier = db.begin().await.expect("source barrier");
+    assert!(
+        barrier
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM access_token WHERE id = 31 FOR UPDATE"
+            ))
+            .await
+            .expect("hold source")
+            .is_some()
+    );
+    let pid = credential_barrier_pid(&barrier).await;
+    let left = fixture.spawn(
+        &[
+            "traces",
+            "credentials",
+            "bind",
+            "--principal",
+            &first,
+            "--namespace",
+            "mono_account",
+            "--credential",
+            "access-token:31",
+        ],
+        true,
+    );
+    let right = fixture.spawn(
+        &[
+            "traces",
+            "credentials",
+            "bind",
+            "--principal",
+            &second,
+            "--namespace",
+            "mono_account",
+            "--credential",
+            "access-token:31",
+        ],
+        true,
+    );
+    assert_ne!(left.child.id(), right.child.id());
+    credential_wait_for_cli_lock_waiters(&db, pid).await;
+    barrier.rollback().await.expect("release source barrier");
+    let left = left.finish();
+    let right = right.finish();
+    if same_principal {
+        let left = credential_success(&left, "bind");
+        let right = credential_success(&right, "bind");
+        assert_eq!(left, right);
+        assert_eq!(left.1, first);
+        assert_eq!(credential_row(&db, &left.0).await.principal_id, first);
+    } else {
+        assert_ne!(left.status.success(), right.status.success());
+        let (success, failure, loser) = if left.status.success() {
+            (&left, &right, &second)
+        } else {
+            (&right, &left, &first)
+        };
+        let (_, winner, state) = credential_success(success, "bind");
+        assert_eq!(state, "active");
+        assert_ne!(winner, *loser);
+        assert!(credential_output(failure, false).contains("active binding"));
+        assert!(
+            trace_principal::Entity::find_by_id(loser.as_str())
+                .one(&db)
+                .await
+                .expect("losing principal")
+                .is_none()
+        );
+    }
+    assert_eq!(credential_counts(&db).await, (1, 1));
+    db.close().await.expect("close database");
+}
+
+#[tokio::test]
+async fn credential_binding_cli_concurrent_new_principal_bind_is_idempotent() {
+    credential_concurrent_bind_case(true).await;
+}
+
+#[tokio::test]
+async fn credential_binding_cli_concurrent_owner_conflict_rolls_back_loser() {
+    credential_concurrent_bind_case(false).await;
+}
+
+#[tokio::test]
+async fn credential_binding_cli_concurrent_rotations_commit_only_one_replacement() {
+    use sea_orm::TransactionTrait;
+
+    let (_traces, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    let principal = Uuid::new_v4().to_string();
+    let (id, _, _) = credential_success(
+        &fixture.run(
+            &[
+                "traces",
+                "credentials",
+                "bind",
+                "--principal",
+                &principal,
+                "--namespace",
+                "static_push_token",
+                "--credential",
+                "first",
+            ],
+            true,
+        ),
+        "bind",
+    );
+    let barrier = db.begin().await.expect("binding barrier");
+    assert!(
+        barrier
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM trace_credential_binding WHERE id = $1 FOR UPDATE",
+                [id.clone().into()],
+            ))
+            .await
+            .expect("hold binding")
+            .is_some()
+    );
+    let pid = credential_barrier_pid(&barrier).await;
+    let left = fixture.spawn(
+        &[
+            "traces",
+            "credentials",
+            "rotate",
+            "--binding",
+            &id,
+            "--namespace",
+            "static_push_token",
+            "--credential",
+            "second",
+        ],
+        true,
+    );
+    let right = fixture.spawn(
+        &[
+            "traces",
+            "credentials",
+            "rotate",
+            "--binding",
+            &id,
+            "--namespace",
+            "static_push_token",
+            "--credential",
+            "third",
+        ],
+        true,
+    );
+    assert_ne!(left.child.id(), right.child.id());
+    credential_wait_for_cli_lock_waiters(&db, pid).await;
+    barrier.rollback().await.expect("release binding barrier");
+    let left = left.finish();
+    let right = right.finish();
+    assert_ne!(left.status.success(), right.status.success());
+    let (success, failure) = if left.status.success() {
+        (&left, &right)
+    } else {
+        (&right, &left)
+    };
+    let (replacement, owner, state) = credential_success(success, "rotate");
+    assert_eq!(owner, principal);
+    assert_eq!(state, "active");
+    assert_ne!(replacement, id);
+    assert!(credential_output(failure, false).contains("already been retired"));
+    assert!(credential_row(&db, &id).await.retired_at.is_some());
+    let replacement = credential_row(&db, &replacement).await;
+    assert_eq!(replacement.principal_id, principal);
+    assert!(replacement.retired_at.is_none());
+    assert_eq!(credential_counts(&db).await, (1, 2));
+    db.close().await.expect("close database");
+}
+
 async fn table_exists(db: &sea_orm::DatabaseConnection, table: &str) -> bool {
     let row = db
         .query_one_raw(Statement::from_string(

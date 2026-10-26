@@ -204,6 +204,23 @@ Monorepo 路径禁止 Git 客户端推送 Tag，Tag 经此入口管理（ImportR
 
 授权后的 traces discovery 元数据和 Git v0/v2 编码器现已实现。它们使用持久配置中的部署身份；空 scope 的 discovery 不创建数据库记录。真实 HTTP/SSH 入口尚未接入这些编码器，因此当前不能通过打开开关来使用完整 traces Git 服务。身份、能力和二次 discovery 语义以 [traces 协议](./refactoring/traces.md) 为准。
 
+### 5.1 Traces 凭据维护
+
+在服务器上使用显式指定的现存配置运行维护命令；也可用 `MEGA_CONFIG` 指定配置。操作者需要该配置对应的数据库权限。凭据必须已经存在，参数只填写名称或记录 ID，不填写 token 或私钥。将以下带尖括号的占位符替换为实际值：
+
+```bash
+mega2 --config config/config.toml traces credentials bind \
+  --principal '<principal-uuid>' --namespace static_push_token \
+  --credential '<configured-token-name>'
+mega2 --config config/config.toml traces credentials rotate \
+  --binding '<binding-uuid>' --namespace mono_account \
+  --credential 'access-token:<record-id>'
+mega2 --config config/config.toml traces credentials retire \
+  --binding '<binding-uuid>'
+```
+
+保存成功输出中的 binding UUID，供后续轮换或退役使用。命令要求数据库 schema 与当前二进制一致，不执行迁移。凭据 key、principal、幂等、冲突与退役的完整规则以 [Traces 协议](./refactoring/traces.md) 第 2.6 节为准；这些维护命令不会启用尚未接入的 HTTP/SSH 数据面。
+
 ## 6. 配合 Libra 使用
 
 mega2 开源版不提供 Web UI。Libra 的 `libra mega2 browser` 在终端提供基础远程目录浏览，以及受支持的目录和 Tag 列出、创建、删除等操作；这些操作不替代 Git 客户端的 clone、fetch、push:
@@ -227,6 +244,9 @@ libra mega2 browser
 | `mega2 path provision --server <URL> <PATH>` | 开通 Monorepo 路径(首次推送前,见 2.5);token 只从环境变量 `MEGA2_TOKEN` 读取,不读配置文件 |
 | `mega2 import-repo remove --path <P> --yes [--cleanup-id <ID>] [--max-rounds <N>]` | 在服务器上清理 ImportRepo(storage-only;`--config` 放在 `import-repo` 之前或设 `MEGA_CONFIG`);结局行与退出码见 2.6 |
 | `mega2 --config <现存配置> traces rebind-target --target <UUID> --path <canonical-path>` | 把已有 trace target 指到已经是目录的 canonical 路径（第 5 节）。不生成默认配置 |
+| `mega2 --config <现存配置> traces credentials bind --principal <UUID> --namespace <NAMESPACE> --credential <KEY>` | 显式绑定已有凭据（第 5.1 节） |
+| `mega2 --config <现存配置> traces credentials rotate --binding <UUID> --namespace <NAMESPACE> --credential <KEY>` | 轮换已有绑定的凭据（第 5.1 节） |
+| `mega2 --config <现存配置> traces credentials retire --binding <UUID>` | 退役绑定并保留历史（第 5.1 节） |
 | `mega2 config validate [--resolve-secrets] [--show-sources]` | 启动前校验配置;自动化加 `--deny-warnings` |
 | `mega2 config init [-o PATH] [--force]` | 生成安全的起始配置文件 |
 | `mega2 config secret ref/set/check/rotate` | 管理 vault 承载的配置密文(SecretRef) |
