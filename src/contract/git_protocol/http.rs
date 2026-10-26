@@ -1,4 +1,4 @@
-use std::{borrow::Cow, convert::Infallible, str::FromStr};
+use std::{borrow::Cow, convert::Infallible, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use axum::{
@@ -10,31 +10,63 @@ use axum::{
 };
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
+use git_internal::hash::HashKind;
 use http::header::AUTHORIZATION;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::{io::StreamReader, sync::CancellationToken};
+use tower::ServiceExt;
+use tower_http::decompression::RequestDecompression;
 
 use crate::{
     api::oauth::{bearer_token_from_authorization_value, login_user_from_mono_access_token},
     ceres::{
         api_service::state::ProtocolApiState,
+        pack::traces_repo::{resolve_trace_discovery, resolve_trace_fetch, resolve_trace_receive},
         protocol::{ServiceType, SmartSession, TransportProtocol, smart, v2},
+        traces::{
+            admission::TRACE_REQUEST_CAPACITY,
+            auth::{PublishAuthority, TracesCaller},
+            checkpoint_history::validate_checkpoint_history,
+            ingest::decode_wire_pack,
+            pack_encode::RawPackStream,
+            publication::{PublicationProposal, prepare},
+        },
     },
-    common::errors::ProtocolError,
-    config::PushAuth,
-    contract::git_protocol::{
-        InfoRefsParams, check_push_permission, check_upload_pack_access, lookup_push_token,
-        path::ViewLocator, receive_pack_requires_http_auth, resolve_view_target,
+    common::errors::{MegaError, ProtocolError, TracesError},
+    config::{PushAuth, PushTokenConfig},
+    contract::{
+        git_protocol::{
+            InfoRefsParams, check_push_permission, check_upload_pack_access, lookup_push_token,
+            path::{TracesLocator, ViewLocator, parse_git_protocol_path, parse_traces_locator},
+            receive_pack_requires_http_auth, resolve_view_target,
+        },
+        policy::{builder::EntitySnapshot, enforcement::Enforcement},
     },
-    jupiter::storage::Storage,
+    jupiter::{
+        service::{
+            trace_fetch_service::fetch_raw_objects,
+            trace_object_service::TraceObjectService,
+            trace_publish_service::{PreparedScopeRequest, TracePublishService},
+        },
+        storage::{
+            Storage,
+            base_storage::StorageConnector,
+            trace_stream_storage::{ExpectedOldTip, ScopeFacts},
+            user_storage::AuthenticatedAccessToken,
+        },
+    },
 };
 
 #[derive(Clone)]
 pub(crate) struct OriginalGitHttpUri(pub(crate) Uri);
 
+#[derive(Clone)]
+struct TraceContentEncoding(Option<HeaderValue>);
+
 pub(crate) async fn reject_disabled_traces(
     State(storage): State<Storage>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
     if (request.method() == Method::GET || request.method() == Method::POST)
@@ -46,6 +78,17 @@ pub(crate) async fn reject_disabled_traces(
                 .is_some_and(|original| reserved_traces_http_path(original.0.path())))
     {
         return ProtocolError::NotFound("traces locator not found".to_owned()).into_response();
+    }
+    if request.method() == Method::POST
+        && parse_git_protocol_path(request.method(), request.uri().path())
+            .map(|parsed| parsed.traces.is_some())
+            .unwrap_or_else(|_| parse_traces_locator(request.uri().path()).is_err())
+    {
+        // The outer decompressor must not inspect traces bodies before authentication.
+        let encoding = request.headers_mut().remove(http::header::CONTENT_ENCODING);
+        request
+            .extensions_mut()
+            .insert(TraceContentEncoding(encoding));
     }
     next.run(request).await
 }
@@ -108,6 +151,9 @@ pub async fn git_info_refs(
         .ok_or_else(|| ProtocolError::InvalidInput("missing service parameter".to_owned()))?;
     let service_type = ServiceType::from_str(&service_name)
         .map_err(|err| ProtocolError::InvalidInput(err.to_string()))?;
+    if let Some(locator) = trace_http_locator(&repo_path)? {
+        return trace_http_result(trace_info_refs(state, &locator, service_type, headers).await);
+    }
     let mut session =
         SmartSession::from_state(repo_path, service_type, TransportProtocol::Http, state)?;
     match service_type {
@@ -226,6 +272,744 @@ fn presented_git_http_token(headers: &http::HeaderMap) -> Option<String> {
         .or_else(|| basic_auth_password_from_authorization_value(auth_header))
 }
 
+const TRACE_COMMAND_BYTES: usize = 64 * 1024;
+const TRACE_PKT_BYTES: usize = 65_520;
+const TRACE_REF: &str = "refs/libra/traces";
+
+fn trace_http_locator(path: &std::path::Path) -> Result<Option<TracesLocator>, ProtocolError> {
+    parse_traces_locator(
+        path.to_str()
+            .ok_or(ProtocolError::Traces(TracesError::UnknownScope))?,
+    )
+}
+
+fn trace_invalid() -> MegaError {
+    TracesError::InvalidParameter.into()
+}
+
+fn trace_http_result(
+    result: Result<Response<Body>, MegaError>,
+) -> Result<Response<Body>, ProtocolError> {
+    match result {
+        Ok(response) => Ok(response),
+        Err(MegaError::Traces(TracesError::Unauthenticated)) => auth_failed(),
+        Err(MegaError::Traces(error)) => Err(ProtocolError::Traces(error)),
+        // Database and transport diagnostics must not enter a public Git response.
+        Err(_) => Err(ProtocolError::Traces(TracesError::QueryTimeout)),
+    }
+}
+
+fn trace_response(body: Body, content_type: &'static str) -> Response<Body> {
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+enum TraceCredential {
+    Static(PushTokenConfig),
+    Mono(AuthenticatedAccessToken),
+}
+
+struct TraceHttpAuth {
+    credential: TraceCredential,
+    enforcement: Enforcement,
+    snapshot: Option<Arc<EntitySnapshot>>,
+}
+
+impl TraceHttpAuth {
+    fn caller(&self) -> TracesCaller<'_> {
+        match &self.credential {
+            TraceCredential::Static(token) => TracesCaller::StaticPushToken {
+                credential_id: &token.name,
+                token,
+            },
+            TraceCredential::Mono(token) => TracesCaller::MonoAccessToken {
+                token,
+                enforcement: self.enforcement,
+                snapshot: self.snapshot.as_deref(),
+            },
+        }
+    }
+}
+
+async fn trace_http_auth(
+    state: &ProtocolApiState,
+    headers: &http::HeaderMap,
+) -> Result<TraceHttpAuth, MegaError> {
+    let token = presented_git_http_token(headers).ok_or(TracesError::Unauthenticated)?;
+    let config = state.storage.config();
+    let credential = if config.git.push_auth == Some(PushAuth::Token) {
+        TraceCredential::Static(
+            lookup_push_token(&config.git.push_tokens, &token)
+                .ok_or(TracesError::Unauthenticated)?
+                .clone(),
+        )
+    } else {
+        TraceCredential::Mono(
+            state
+                .storage
+                .user_storage()
+                .authenticate_traces_access_token(&token)
+                .await?
+                .ok_or(TracesError::Unauthenticated)?,
+        )
+    };
+    let snapshot = if state.entity_store.is_dirty() {
+        None
+    } else {
+        state.entity_store.snapshot()
+    };
+    Ok(TraceHttpAuth {
+        credential,
+        enforcement: Enforcement::parse(&config.cedar.enforcement)
+            .ok_or(TracesError::UnknownScope)?,
+        snapshot,
+    })
+}
+
+async fn trace_read_tip(
+    state: &ProtocolApiState,
+    locator: &TracesLocator,
+    auth: &TraceHttpAuth,
+) -> Result<(HashKind, Option<String>), MegaError> {
+    let config = state.storage.config();
+    let mono = state.storage.mono_storage();
+    let db = mono.get_connection();
+    let discovery = resolve_trace_discovery(
+        db,
+        &config.traces,
+        locator,
+        auth.caller(),
+        ServiceType::UploadPack,
+    )
+    .await?;
+    if discovery.scope_id().is_none() {
+        return Ok((discovery.hash_kind(), None));
+    }
+    let grant = resolve_trace_fetch(
+        db,
+        &config.traces,
+        locator,
+        auth.caller(),
+        Some(&state.entity_store),
+    )
+    .await?;
+    Ok((grant.hash_kind(), grant.tip_oid().map(str::to_owned)))
+}
+
+async fn trace_info_refs(
+    state: &ProtocolApiState,
+    locator: &TracesLocator,
+    service: ServiceType,
+    headers: &http::HeaderMap,
+) -> Result<Response<Body>, MegaError> {
+    let auth = trace_http_auth(state, headers).await?;
+    let (kind, tip) = match service {
+        ServiceType::UploadPack => trace_read_tip(state, locator, &auth).await?,
+        ServiceType::ReceivePack => {
+            let mono = state.storage.mono_storage();
+            let scope = resolve_trace_receive(
+                mono.get_connection(),
+                &state.storage.config().traces,
+                locator,
+                auth.caller(),
+            )
+            .await?;
+            (scope.hash_kind, scope.tip_oid)
+        }
+    };
+    let mut body = BytesMut::new();
+    let content_type = match service {
+        ServiceType::UploadPack => "application/x-git-upload-pack-advertisement",
+        ServiceType::ReceivePack => "application/x-git-receive-pack-advertisement",
+    };
+    if service == ServiceType::UploadPack && is_v2_request(headers) {
+        for line in ["version 2\n", "ls-refs\n", "fetch\n"] {
+            smart::add_pkt_line_string(&mut body, line.to_owned());
+        }
+        smart::add_pkt_line_string(&mut body, format!("object-format={}\n", kind.as_str()));
+    } else {
+        let (service_name, capabilities) = match service {
+            ServiceType::UploadPack => ("git-upload-pack", "allow-reachable-sha1-in-want"),
+            ServiceType::ReceivePack => ("git-receive-pack", "report-status no-thin"),
+        };
+        smart::add_pkt_line_string(&mut body, format!("# service={service_name}\n"));
+        body.extend_from_slice(b"0000");
+        let (oid, reference) = match tip {
+            Some(tip) => (tip, TRACE_REF),
+            None => ("0".repeat(kind.hex_len()), "capabilities^{}"),
+        };
+        smart::add_pkt_line_string(
+            &mut body,
+            format!(
+                "{oid} {reference}\0{capabilities} object-format={}\n",
+                kind.as_str()
+            ),
+        );
+    }
+    body.extend_from_slice(b"0000");
+    Ok(trace_response(Body::from(body.freeze()), content_type))
+}
+
+fn trace_oid(raw: &str, kind: HashKind) -> Result<String, MegaError> {
+    if raw.len() != kind.hex_len() || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(trace_invalid());
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+fn trace_capabilities<'a>(
+    caps: impl Iterator<Item = &'a str>,
+    kind: HashKind,
+    allowed: &[&str],
+    require_sha256_format: bool,
+) -> Result<(), MegaError> {
+    let mut format = None;
+    for cap in caps {
+        if let Some(value) = cap.strip_prefix("object-format=") {
+            if format.replace(value).is_some() || value != kind.as_str() {
+                return Err(trace_invalid());
+            }
+        } else if !allowed.contains(&cap) {
+            return Err(trace_invalid());
+        }
+    }
+    if format.is_none() && kind != HashKind::Sha1 && require_sha256_format {
+        return Err(trace_invalid());
+    }
+    Ok(())
+}
+
+struct TraceReceiveCommand {
+    old: String,
+    new: String,
+    report: bool,
+}
+
+async fn trace_receive_commands(
+    reader: &mut (impl AsyncRead + Unpin),
+    kind: HashKind,
+) -> Result<Option<TraceReceiveCommand>, MegaError> {
+    let mut consumed = 0usize;
+    let mut command = None;
+    loop {
+        let mut header = [0; 4];
+        reader
+            .read_exact(&mut header)
+            .await
+            .map_err(|_| trace_invalid())?;
+        consumed += header.len();
+        if !header.iter().all(u8::is_ascii_hexdigit) {
+            return Err(trace_invalid());
+        }
+        let length = usize::from_str_radix(
+            std::str::from_utf8(&header).map_err(|_| trace_invalid())?,
+            16,
+        )
+        .map_err(|_| trace_invalid())?;
+        if consumed > TRACE_COMMAND_BYTES {
+            return Err(TracesError::ResponseBudget.into());
+        }
+        if length == 0 {
+            if command.is_none() {
+                let mut trailing = [0];
+                if reader
+                    .read(&mut trailing)
+                    .await
+                    .map_err(|_| trace_invalid())?
+                    != 0
+                {
+                    return Err(trace_invalid());
+                }
+            }
+            return Ok(command);
+        }
+        if !(4..=TRACE_PKT_BYTES).contains(&length) || command.is_some() {
+            return Err(trace_invalid());
+        }
+        consumed += length - 4;
+        if consumed > TRACE_COMMAND_BYTES {
+            return Err(TracesError::ResponseBudget.into());
+        }
+        let mut bytes = vec![0; length - 4];
+        reader
+            .read_exact(&mut bytes)
+            .await
+            .map_err(|_| trace_invalid())?;
+        let line = std::str::from_utf8(&bytes).map_err(|_| trace_invalid())?;
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let (update, caps) = line.split_once('\0').unwrap_or((line, ""));
+        let mut fields = update.split(' ');
+        let old = trace_oid(fields.next().ok_or_else(trace_invalid)?, kind)?;
+        let new = trace_oid(fields.next().ok_or_else(trace_invalid)?, kind)?;
+        if fields.next() != Some(TRACE_REF)
+            || fields.next().is_some()
+            || new.bytes().all(|b| b == b'0')
+        {
+            return Err(trace_invalid());
+        }
+        trace_capabilities(
+            caps.split_ascii_whitespace(),
+            kind,
+            &["report-status", "no-thin"],
+            true,
+        )?;
+        command = Some(TraceReceiveCommand {
+            old,
+            new,
+            report: caps
+                .split_ascii_whitespace()
+                .any(|cap| cap == "report-status"),
+        });
+    }
+}
+
+async fn trace_receive_pack(
+    state: &ProtocolApiState,
+    locator: &TracesLocator,
+    request: Request<Body>,
+) -> Result<Response<Body>, MegaError> {
+    let auth = trace_http_auth(state, request.headers()).await?;
+    let config = state.storage.config();
+    let mono = state.storage.mono_storage();
+    let db = mono.get_connection();
+    let scope = resolve_trace_receive(db, &config.traces, locator, auth.caller()).await?;
+    let mut admission = TRACE_REQUEST_CAPACITY.try_receive()?;
+    if trace_content_encoding(&request).is_some_and(|value| value != "identity") {
+        return Err(trace_invalid());
+    }
+    let input = request
+        .into_body()
+        .into_data_stream()
+        .map_err(|_| std::io::Error::other("traces request interrupted"));
+    let mut reader = StreamReader::new(input);
+    let command = admission
+        .read_commands(trace_receive_commands(&mut reader, scope.hash_kind))
+        .await?;
+    let Some(command) = command else {
+        return Ok(trace_response(
+            Body::empty(),
+            "application/x-git-receive-pack-result",
+        ));
+    };
+    let old = if command.old.bytes().all(|b| b == b'0') {
+        "absent"
+    } else {
+        &command.old
+    };
+    let proposal = PublicationProposal {
+        stream_id: scope.stream_id.clone(),
+        expected_old_tip: if old == "absent" {
+            ExpectedOldTip::Absent
+        } else {
+            ExpectedOldTip::At(command.old.clone())
+        },
+        new_tip: command.new.clone(),
+        ref_names: vec![TRACE_REF.to_owned()],
+        delete: false,
+        idempotency_key: format!("git:{}:{old}:{}", scope.stream_id, command.new),
+    };
+    let objects = TraceObjectService::new(state.storage.git_service.obj_storage.clone());
+    let decoded = decode_wire_pack(&mut admission, scope.hash_kind, reader).await?;
+    let prepared =
+        validate_checkpoint_history(prepare(db, &objects, decoded, proposal).await?).await?;
+    let authority = PublishAuthority {
+        caller: auth.caller(),
+        principal_id: &scope.principal_id,
+        target_id: &scope.target_id,
+        authorized_path: &scope.target_path,
+        expected_generation: scope.expected_generation,
+        policy: Some(&state.entity_store),
+    };
+    let publisher = TracePublishService::new(state.storage.git_service.obj_storage.clone());
+    if scope.first_scope {
+        let facts = ScopeFacts {
+            stream_id: &scope.stream_id,
+            principal_id: &scope.principal_id,
+            target_id: &scope.target_id,
+            source_repo_id: &scope.source_repo_id,
+            epoch_id: &scope.epoch_id,
+            hash_kind: scope.hash_kind.as_str(),
+        };
+        publisher
+            .publish_prepared_first_scope(
+                &config.monorepo,
+                db,
+                &mono,
+                &PreparedScopeRequest {
+                    path: &scope.target_path,
+                    facts: &facts,
+                    prepared: &prepared,
+                    authority: &authority,
+                },
+            )
+            .await?;
+    } else {
+        publisher
+            .publish_prepared(db, &prepared, &authority)
+            .await?;
+    }
+    drop(prepared);
+    drop(admission);
+    let mut report = BytesMut::new();
+    if command.report {
+        smart::add_pkt_line_string(&mut report, "unpack ok\n".to_owned());
+        smart::add_pkt_line_string(&mut report, format!("ok {TRACE_REF}\n"));
+        report.extend_from_slice(b"0000");
+    }
+    Ok(trace_response(
+        Body::from(report.freeze()),
+        "application/x-git-receive-pack-result",
+    ))
+}
+
+fn trace_content_encoding(request: &Request<Body>) -> Option<&HeaderValue> {
+    request
+        .extensions()
+        .get::<TraceContentEncoding>()
+        .and_then(|encoding| encoding.0.as_ref())
+        .or_else(|| request.headers().get(http::header::CONTENT_ENCODING))
+}
+
+async fn trace_upload_body(mut request: Request<Body>) -> Result<Bytes, MegaError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let encoding = trace_content_encoding(&request).cloned();
+    if encoding
+        .as_ref()
+        .is_some_and(|value| value != "identity" && value != "gzip")
+    {
+        return Err(trace_invalid());
+    }
+    if let Some(encoding) = encoding {
+        request
+            .headers_mut()
+            .insert(http::header::CONTENT_ENCODING, encoding);
+    }
+    let (parts, body) = request.into_parts();
+    let mut input = body.into_data_stream();
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let input_exceeded = exceeded.clone();
+    let bounded = async_stream::stream! {
+        let mut total = 0usize;
+        while let Some(chunk) = input.next().await {
+            match chunk {
+                Ok(chunk) if chunk.len() <= TRACE_COMMAND_BYTES.saturating_sub(total) => {
+                    total += chunk.len();
+                    yield Ok::<_, std::io::Error>(chunk);
+                }
+                Ok(_) => {
+                    input_exceeded.store(true, Ordering::Release);
+                    yield Err(std::io::Error::other("traces request budget exceeded"));
+                    return;
+                }
+                Err(_) => {
+                    yield Err(std::io::Error::other("traces request interrupted"));
+                    return;
+                }
+            }
+        }
+    };
+    let request = Request::from_parts(parts, Body::from_stream(bounded));
+    let decompressor =
+        RequestDecompression::new(tower::service_fn(|request: Request<_>| async move {
+            Ok::<_, Infallible>(Response::new(request.into_body()))
+        }));
+    let response = match decompressor.oneshot(request).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    };
+    if !response.status().is_success() {
+        return Err(trace_invalid());
+    }
+    let mut decoded = Body::new(response.into_body()).into_data_stream();
+    let mut bytes = BytesMut::new();
+    while let Some(chunk) = decoded.next().await {
+        let chunk = chunk.map_err(|_| {
+            if exceeded.load(Ordering::Acquire) {
+                MegaError::Traces(TracesError::ResponseBudget)
+            } else {
+                trace_invalid()
+            }
+        })?;
+        if chunk.len() > TRACE_COMMAND_BYTES.saturating_sub(bytes.len()) {
+            return Err(TracesError::ResponseBudget.into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes.freeze())
+}
+
+fn trace_packet(input: &mut Bytes) -> Result<smart::PktLine, MegaError> {
+    let header = input.get(..4).ok_or_else(trace_invalid)?;
+    if !header.iter().all(u8::is_ascii_hexdigit) {
+        return Err(trace_invalid());
+    }
+    let length = usize::from_str_radix(
+        std::str::from_utf8(header).map_err(|_| trace_invalid())?,
+        16,
+    )
+    .map_err(|_| trace_invalid())?;
+    match length {
+        0..=2 => {
+            let _ = input.split_to(4);
+            Ok(match length {
+                0 => smart::PktLine::Flush,
+                1 => smart::PktLine::Delim,
+                _ => smart::PktLine::ResponseEnd,
+            })
+        }
+        4..=TRACE_PKT_BYTES if length <= input.len() => {
+            let _ = input.split_to(4);
+            Ok(smart::PktLine::Data(input.split_to(length - 4)))
+        }
+        _ => Err(trace_invalid()),
+    }
+}
+
+fn trace_line(bytes: &[u8]) -> Result<&str, MegaError> {
+    let line = std::str::from_utf8(bytes).map_err(|_| trace_invalid())?;
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    if line.is_empty() || line.contains(['\0', '\n', '\r']) {
+        return Err(trace_invalid());
+    }
+    Ok(line)
+}
+
+enum TraceUploadCommand {
+    Empty,
+    LsRefs(Vec<String>),
+    Fetch {
+        wants: Vec<String>,
+        haves: Vec<String>,
+        done: bool,
+        v2: bool,
+    },
+}
+
+fn trace_upload_command(mut input: Bytes, kind: HashKind) -> Result<TraceUploadCommand, MegaError> {
+    let first = trace_packet(&mut input)?;
+    let smart::PktLine::Data(first) = first else {
+        return if first == smart::PktLine::Flush && input.is_empty() {
+            Ok(TraceUploadCommand::Empty)
+        } else {
+            Err(trace_invalid())
+        };
+    };
+    let first = trace_line(&first)?;
+    if let Some(command) = first.strip_prefix("command=") {
+        let mut caps = Vec::new();
+        loop {
+            match trace_packet(&mut input)? {
+                smart::PktLine::Data(bytes) => caps.push(trace_line(&bytes)?.to_owned()),
+                smart::PktLine::Delim => break,
+                _ => return Err(trace_invalid()),
+            }
+        }
+        trace_capabilities(caps.iter().map(String::as_str), kind, &[], true)?;
+        if command != "ls-refs" && command != "fetch" {
+            return Err(trace_invalid());
+        }
+        let mut prefixes = Vec::new();
+        let mut wants = Vec::new();
+        let mut haves = Vec::new();
+        let mut done = false;
+        loop {
+            let bytes = match trace_packet(&mut input)? {
+                smart::PktLine::Data(bytes) => bytes,
+                smart::PktLine::Flush if input.is_empty() => break,
+                _ => return Err(trace_invalid()),
+            };
+            let line = trace_line(&bytes)?;
+            if command == "ls-refs" {
+                match line {
+                    "peel" | "symrefs" => {}
+                    _ => prefixes.push(
+                        line.strip_prefix("ref-prefix ")
+                            .ok_or_else(trace_invalid)?
+                            .to_owned(),
+                    ),
+                }
+            } else if let Some(oid) = line.strip_prefix("want ") {
+                wants.push(trace_oid(oid, kind)?);
+            } else if let Some(oid) = line.strip_prefix("have ") {
+                haves.push(trace_oid(oid, kind)?);
+            } else {
+                match line {
+                    "done" if !done => done = true,
+                    "thin-pack" | "ofs-delta" | "no-progress" | "include-tag" => {}
+                    _ => return Err(trace_invalid()),
+                }
+            }
+        }
+        return if command == "ls-refs" {
+            Ok(TraceUploadCommand::LsRefs(prefixes))
+        } else if wants.is_empty() {
+            Err(trace_invalid())
+        } else {
+            Ok(TraceUploadCommand::Fetch {
+                wants,
+                haves,
+                done,
+                v2: true,
+            })
+        };
+    }
+    let mut fields = first
+        .strip_prefix("want ")
+        .ok_or_else(trace_invalid)?
+        .split(' ');
+    let mut wants = vec![trace_oid(fields.next().ok_or_else(trace_invalid)?, kind)?];
+    trace_capabilities(fields, kind, &["allow-reachable-sha1-in-want"], false)?;
+    loop {
+        match trace_packet(&mut input)? {
+            smart::PktLine::Data(bytes) => wants.push(trace_oid(
+                trace_line(&bytes)?
+                    .strip_prefix("want ")
+                    .ok_or_else(trace_invalid)?,
+                kind,
+            )?),
+            smart::PktLine::Flush => break,
+            _ => return Err(trace_invalid()),
+        }
+    }
+    let mut haves = Vec::new();
+    let mut done = false;
+    while !input.is_empty() {
+        match trace_packet(&mut input)? {
+            smart::PktLine::Data(bytes) => {
+                let line = trace_line(&bytes)?;
+                if line == "done" && input.is_empty() {
+                    done = true;
+                } else {
+                    haves.push(trace_oid(
+                        line.strip_prefix("have ").ok_or_else(trace_invalid)?,
+                        kind,
+                    )?);
+                }
+            }
+            smart::PktLine::Flush if input.is_empty() => {}
+            _ => return Err(trace_invalid()),
+        }
+    }
+    Ok(TraceUploadCommand::Fetch {
+        wants,
+        haves,
+        done,
+        v2: false,
+    })
+}
+
+async fn trace_upload_pack(
+    state: &ProtocolApiState,
+    locator: &TracesLocator,
+    request: Request<Body>,
+) -> Result<Response<Body>, MegaError> {
+    let auth = trace_http_auth(state, request.headers()).await?;
+    let (kind, _) = trace_read_tip(state, locator, &auth).await?;
+    let body = trace_upload_body(request).await?;
+    let command = trace_upload_command(body, kind)?;
+    let mut response = BytesMut::new();
+    let (wants, haves, done, v2) = match command {
+        TraceUploadCommand::Empty => {
+            return Ok(trace_response(
+                Body::from("0000"),
+                "application/x-git-upload-pack-result",
+            ));
+        }
+        TraceUploadCommand::LsRefs(prefixes) => {
+            let (_, tip) = trace_read_tip(state, locator, &auth).await?;
+            if let Some(tip) = tip
+                && (prefixes.is_empty()
+                    || prefixes.iter().any(|prefix| TRACE_REF.starts_with(prefix)))
+            {
+                smart::add_pkt_line_string(&mut response, format!("{tip} {TRACE_REF}\n"));
+            }
+            response.extend_from_slice(b"0000");
+            return Ok(trace_response(
+                Body::from(response.freeze()),
+                "application/x-git-upload-pack-result",
+            ));
+        }
+        TraceUploadCommand::Fetch {
+            wants,
+            haves,
+            done,
+            v2,
+        } => (wants, haves, done, v2),
+    };
+    let permit = TRACE_REQUEST_CAPACITY.try_fetch()?;
+    let mono = state.storage.mono_storage();
+    let grant = resolve_trace_fetch(
+        mono.get_connection(),
+        &state.storage.config().traces,
+        locator,
+        auth.caller(),
+        Some(&state.entity_store),
+    )
+    .await?;
+    let kind = grant.hash_kind();
+    let objects = TraceObjectService::new(state.storage.git_service.obj_storage.clone());
+    let source =
+        fetch_raw_objects(grant, &objects, &wants, &haves, CancellationToken::new()).await?;
+    if !done {
+        drop(source);
+        drop(permit);
+        if v2 {
+            smart::add_pkt_line_string(&mut response, "acknowledgments\n".to_owned());
+        }
+        smart::add_pkt_line_string(&mut response, "NAK\n".to_owned());
+        if v2 {
+            response.extend_from_slice(b"0000");
+        }
+        return Ok(trace_response(
+            Body::from(response.freeze()),
+            "application/x-git-upload-pack-result",
+        ));
+    }
+    let mut pack = RawPackStream::new(source, kind, permit)?;
+    smart::add_pkt_line_string(
+        &mut response,
+        if v2 { "packfile\n" } else { "NAK\n" }.to_owned(),
+    );
+    let body = async_stream::stream! {
+        yield Ok::<_, std::io::Error>(response.freeze());
+        loop {
+            match pack.next().await {
+                Ok(Some(chunk)) if v2 => {
+                    for payload in chunk.chunks(TRACE_PKT_BYTES - 5) {
+                        let mut framed = BytesMut::with_capacity(payload.len() + 5);
+                        framed.extend_from_slice(format!("{:04x}", payload.len() + 5).as_bytes());
+                        framed.extend_from_slice(&[1]);
+                        framed.extend_from_slice(payload);
+                        yield Ok(framed.freeze());
+                    }
+                }
+                Ok(Some(chunk)) => yield Ok(chunk),
+                Ok(None) => {
+                    if v2 { yield Ok(Bytes::from_static(b"0000")); }
+                    break;
+                }
+                Err(_) => {
+                    yield Err(std::io::Error::other("traces pack stream failed"));
+                    break;
+                }
+            }
+        }
+    };
+    Ok(trace_response(
+        Body::from_stream(body),
+        "application/x-git-upload-pack-result",
+    ))
+}
+
 /// Maximum body size accepted for Git HTTP upload-pack / receive-pack requests.
 /// This bounds memory consumption on the server and prevents unbounded buffering
 /// of malformed or malicious requests. Monorepo initial pushes carry gigabytes
@@ -290,6 +1074,9 @@ pub async fn git_upload_pack(
     repo_path: std::path::PathBuf,
     view: Option<ViewLocator>,
 ) -> Result<Response<Body>, ProtocolError> {
+    if let Some(locator) = trace_http_locator(&repo_path)? {
+        return trace_http_result(trace_upload_pack(state, &locator, req).await);
+    }
     let mut pack_protocol = SmartSession::from_state(
         repo_path,
         ServiceType::UploadPack,
@@ -445,6 +1232,9 @@ pub async fn git_receive_pack(
     req: Request<Body>,
     repo_path: std::path::PathBuf,
 ) -> Result<Response<Body>, ProtocolError> {
+    if let Some(locator) = trace_http_locator(&repo_path)? {
+        return trace_http_result(trace_receive_pack(state, &locator, req).await);
+    }
     let mut pack_protocol = SmartSession::from_state(
         repo_path,
         ServiceType::ReceivePack,
@@ -552,8 +1342,50 @@ pub(crate) fn pack_rejected_response(message: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use futures::stream;
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    #[test]
+    fn sha256_capability_negotiation_distinguishes_v0_upload() {
+        let kind = HashKind::Sha256;
+        assert!(trace_capabilities(std::iter::empty(), kind, &[], false).is_ok());
+        assert!(trace_capabilities(["object-format=sha256"].into_iter(), kind, &[], false).is_ok());
+        for capabilities in [
+            vec!["object-format=sha1"],
+            vec!["object-format=sha256", "object-format=sha256"],
+            vec!["server-option=unknown"],
+        ] {
+            assert!(trace_capabilities(capabilities.into_iter(), kind, &[], false).is_err());
+        }
+        assert!(trace_capabilities(std::iter::empty(), kind, &[], true).is_err());
+        assert!(trace_capabilities(["object-format=sha256"].into_iter(), kind, &[], true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn sha256_receive_command_requires_explicit_format() {
+        let old = "0".repeat(64);
+        let new = "a".repeat(64);
+        for (capabilities, accepted) in [
+            ("report-status", false),
+            ("report-status object-format=sha256", true),
+        ] {
+            let mut command = BytesMut::new();
+            smart::add_pkt_line_string(
+                &mut command,
+                format!("{old} {new} {TRACE_REF}\0{capabilities}\n"),
+            );
+            command.extend_from_slice(b"0000");
+            let (mut writer, mut reader) = tokio::io::duplex(512);
+            writer.write_all(&command).await.unwrap();
+            drop(writer);
+            let result = trace_receive_commands(&mut reader, HashKind::Sha256).await;
+            assert_eq!(result.is_ok(), accepted, "capabilities {capabilities}");
+            if accepted {
+                assert!(result.unwrap().is_some());
+            }
+        }
+    }
 
     #[test]
     fn disabled_traces_namespace_rejects_root_aliases() {

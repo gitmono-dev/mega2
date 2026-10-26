@@ -2160,6 +2160,8 @@ mod disabled_http {
         source: String,
         tip: String,
         pack: Vec<u8>,
+        traces_auth: bool,
+        static_auth: bool,
     }
 
     impl Fixture {
@@ -2214,6 +2216,8 @@ mod disabled_http {
                 source: "mtr94-source".to_owned(),
                 tip: String::new(),
                 pack: Vec::new(),
+                traces_auth: false,
+                static_auth: false,
             }
         }
 
@@ -2255,7 +2259,14 @@ mod disabled_http {
                     "third-party,project,%2etraces,.traces-backup,.tracesx,.TRACES,.traces.git",
                 )
                 .env("MEGA_GIT__ANONYMOUS_ACCESS", "true")
-                .env("MEGA_CEDAR__ENFORCEMENT", "off")
+                .env(
+                    "MEGA_CEDAR__ENFORCEMENT",
+                    if self.traces_auth && !self.static_auth {
+                        "enforce"
+                    } else {
+                        "off"
+                    },
+                )
                 .env("MEGA_TRACES__ENABLED", enabled.to_string())
                 .env("MEGA_TRACES__SERVER_ID", TRACE_SERVER_ID)
                 .env("MEGA_NOTIFICATION__ENABLED", "false")
@@ -2282,7 +2293,15 @@ mod disabled_http {
                         .expect("stderr file"),
                 ));
             if policy == "trunk" {
-                command.env("MEGA_GIT__PUSH_AUTH", "none");
+                command.env(
+                    "MEGA_GIT__PUSH_AUTH",
+                    if self.static_auth { "token" } else { "none" },
+                );
+            }
+            if self.traces_auth {
+                let spool = self.temp.path().join("owned-spool");
+                fs::create_dir_all(&spool).expect("owned HTTP spool");
+                command.env("TMPDIR", spool);
             }
             command
         }
@@ -3036,6 +3055,37 @@ mod disabled_http {
                 .expect("relocated import clone bytes before disabling traces"),
                 SENTINEL
             );
+            let tip = self.git_text(&["-C", "relocated-import-check", "rev-parse", "HEAD"]);
+            let mut command = Vec::new();
+            pkt(&mut command, &format!("want {tip}\n"));
+            command.extend_from_slice(b"0000");
+            pkt(&mut command, "done\n");
+            let response = raw_request(
+                self.port,
+                "POST",
+                &format!("/%2etraces/by-scope/{}.git/git-upload-pack", self.scope),
+                Endpoint::Upload.content_type(),
+                &http_git_gzip(&command),
+                &[("Content-Encoding", "gzip")],
+                false,
+            )
+            .await;
+            assert_eq!(
+                response.status, 200,
+                "enabled literal alias keeps ordinary gzip decompression"
+            );
+            let pack = http_git_unpack_response(&response.body, false);
+            let pack = pack
+                .strip_suffix(b"0000")
+                .expect("ordinary v0 response includes a trailing flush");
+            fs::write(self.shared.path().join("alias-gzip.pack"), pack)
+                .expect("ordinary gzip response PACK");
+            self.git(&[
+                "-C",
+                "relocated-import-check",
+                "index-pack",
+                "../alias-gzip.pack",
+            ]);
             self.start(false, "trunk", "/%2etraces").await;
             self.converge(db).await;
         }
@@ -3056,56 +3106,20 @@ mod disabled_http {
                     false,
                 )
                 .await;
-                match endpoint {
-                    Endpoint::Discovery | Endpoint::ReceiveDiscovery => {
-                        assert_eq!(response.status, 200);
-                        assert!(
-                            !response
-                                .body
-                                .windows(self.tip.len())
-                                .any(|w| w == self.tip.as_bytes())
-                        );
-                        assert!(
-                            !response
-                                .body
-                                .windows(b"refs/heads/main".len())
-                                .any(|w| w == b"refs/heads/main")
-                        );
-                        let advertised = if v2 && matches!(endpoint, Endpoint::Discovery) {
-                            b"version 2".as_slice()
-                        } else {
-                            b"capabilities^{}".as_slice()
-                        };
-                        assert!(
-                            response
-                                .body
-                                .windows(advertised.len())
-                                .any(|w| w == advertised)
-                        );
-                    }
-                    Endpoint::Upload => {
-                        assert_eq!(response.status, 400, "enabled trace fetch remains closed");
-                        assert!(!response.body.windows(4).any(|w| w == b"PACK"));
-                    }
-                    Endpoint::Receive => {
-                        assert_eq!(response.status, 200);
-                        assert!(response.body.windows(4).any(|w| w == b"ERR "));
-                        assert!(
-                            !response
-                                .body
-                                .windows(b"ok refs/libra/traces".len())
-                                .any(|w| w == b"ok refs/libra/traces")
-                        );
-                    }
-                }
+                assert_eq!(response.status, 401);
+                assert!(
+                    response
+                        .headers
+                        .to_ascii_lowercase()
+                        .contains("www-authenticate:")
+                );
+                assert!(
+                    response.body.is_empty(),
+                    "anonymous traces must not advertise or decode"
+                );
                 unchanged(&before, &snapshot(db).await);
             }
             if matches!(endpoint, Endpoint::Receive) {
-                let response =
-                    request(self.port, endpoint, &locator, false, b"0000", None, false).await;
-                assert_eq!(response.status, 200);
-                assert_eq!(response.body, b"0000");
-                unchanged(&before, &snapshot(db).await);
                 let mut no_pack = Vec::new();
                 pkt(
                     &mut no_pack,
@@ -3116,12 +3130,19 @@ mod disabled_http {
                     ),
                 );
                 no_pack.extend_from_slice(b"0000");
-                let response =
-                    request(self.port, endpoint, &locator, false, &no_pack, None, false).await;
-                assert_eq!(response.status, 200);
-                assert!(response.body.windows(4).any(|w| w == b"ng r"));
-                assert!(!response.body.windows(4).any(|w| w == b"ok r"));
-                unchanged(&before, &snapshot(db).await);
+                for body in [b"0000".as_slice(), self.pack.as_slice(), no_pack.as_slice()] {
+                    let response =
+                        request(self.port, endpoint, &locator, false, body, None, false).await;
+                    assert_eq!(response.status, 401);
+                    assert!(
+                        response
+                            .headers
+                            .to_ascii_lowercase()
+                            .contains("www-authenticate:")
+                    );
+                    assert!(response.body.is_empty());
+                    unchanged(&before, &snapshot(db).await);
+                }
                 let output = git_cli::git_cli_no_auth(
                     self.shared.path(),
                     &[
@@ -3134,14 +3155,14 @@ mod disabled_http {
                 );
                 assert!(
                     !output.status.success(),
-                    "enabled trace push must remain closed"
+                    "anonymous trace push must be rejected"
                 );
-                let error = String::from_utf8_lossy(&output.stderr);
+                let error = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
                 assert!(
-                    error.contains("ERR")
-                        || error.contains("remote rejected")
-                        || error.contains("traces"),
-                    "Git rejection must identify protocol refusal"
+                    error.contains("authentication")
+                        || error.contains("401")
+                        || error.contains("could not read username"),
+                    "Git must report authentication refusal: {error}"
                 );
                 unchanged(&before, &snapshot(db).await);
             }
@@ -3891,6 +3912,1201 @@ mod disabled_http {
         }).await.expect("raw HTTP response deadline (body deliberately omitted when requested)")
     }
 
+    fn http_git_commit(fixture: &Fixture, message: &str) -> String {
+        fixture.git(&["-C", "trace-source", "add", "."]);
+        fixture.git(&[
+            "-C",
+            "trace-source",
+            "-c",
+            "user.name=HTTP Traces",
+            "-c",
+            "user.email=http@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            message,
+        ]);
+        fixture.git_text(&["-C", "trace-source", "rev-parse", "HEAD"])
+    }
+
+    fn http_git_gzip(bytes: &[u8]) -> Vec<u8> {
+        let zlib =
+            git_internal::internal::object::utils::compress_zlib(bytes).expect("fixture deflate");
+        assert!(
+            zlib.len() >= 6 && zlib[1] & 0x20 == 0,
+            "zlib without dictionary"
+        );
+        let mut gzip = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+        gzip.extend_from_slice(&zlib[2..zlib.len() - 4]);
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320u32 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        gzip.extend_from_slice(&(!crc).to_le_bytes());
+        gzip.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .expect("fixture length")
+                .to_le_bytes(),
+        );
+        gzip
+    }
+
+    fn http_git_rejected_history(push: &std::process::Output) {
+        assert!(
+            !push.status.success(),
+            "checkpoint history rewrite must reject the whole push"
+        );
+        assert!(
+            String::from_utf8_lossy(&push.stderr).contains("The requested URL returned error: 409"),
+            "history rejection must be the typed HTTP conflict: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+    }
+
+    fn http_git_authenticated(
+        fixture: &Fixture,
+        token: &str,
+        args: &[&str],
+    ) -> std::process::Output {
+        git_cli::git_cli(fixture.shared.path(), token, args)
+    }
+
+    async fn http_git_body(
+        fixture: &Fixture,
+        locator: &str,
+        token: &str,
+        v2: bool,
+        body: &[u8],
+    ) -> Response {
+        let authorization = format!("Bearer {token}");
+        let mut headers = vec![("Authorization", authorization.as_str())];
+        if v2 {
+            headers.push(("Git-Protocol", "version=2"));
+        }
+        raw_request(
+            fixture.port,
+            "POST",
+            &format!("{locator}/git-upload-pack"),
+            Endpoint::Upload.content_type(),
+            body,
+            &headers,
+            false,
+        )
+        .await
+    }
+
+    fn http_git_unpack_response(body: &[u8], v2: bool) -> Vec<u8> {
+        let prefix = if v2 {
+            b"000dpackfile\n".as_slice()
+        } else {
+            b"0008NAK\n".as_slice()
+        };
+        assert!(
+            body.starts_with(prefix),
+            "standard acknowledgment/section header"
+        );
+        let mut rest = &body[prefix.len()..];
+        if !v2 {
+            return rest.to_vec();
+        }
+        let mut pack = Vec::new();
+        while rest != b"0000" {
+            assert!(rest.len() >= 5, "complete v2 band packet");
+            let length =
+                usize::from_str_radix(std::str::from_utf8(&rest[..4]).expect("band header"), 16)
+                    .expect("band length");
+            assert!((5..=65520).contains(&length) && length <= rest.len());
+            assert_eq!(rest[4], 1, "only PACK band 1");
+            pack.extend_from_slice(&rest[5..length]);
+            rest = &rest[length..];
+        }
+        pack
+    }
+
+    async fn http_git_failed_stream(
+        fixture: &Fixture,
+        locator: &str,
+        token: &str,
+        tip: &str,
+        first: &str,
+    ) {
+        use futures::StreamExt;
+
+        let client = reqwest::Client::builder()
+            .timeout(LIMIT)
+            .build()
+            .expect("stream failure client");
+        for v2 in [false, true] {
+            let mut command = Vec::new();
+            if v2 {
+                pkt(&mut command, "command=fetch\n");
+                pkt(&mut command, "object-format=sha1\n");
+                command.extend_from_slice(b"0001");
+                pkt(&mut command, &format!("want {tip}\n"));
+            } else {
+                pkt(&mut command, &format!("want {tip} object-format=sha1\n"));
+                command.extend_from_slice(b"0000");
+            }
+            pkt(&mut command, "done\n");
+            if v2 {
+                command.extend_from_slice(b"0000");
+            }
+            let response = client
+                .post(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    &format!("{locator}/git-upload-pack"),
+                ))
+                .bearer_auth(token)
+                .header("Git-Protocol", if v2 { "version=2" } else { "version=0" })
+                .header("Content-Type", "application/x-git-upload-pack-request")
+                .body(command.clone())
+                .send()
+                .await
+                .expect("fetch headers before reading its large body");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let overloaded = http_git_body(fixture, locator, token, v2, &command).await;
+            assert_eq!(
+                overloaded.status, 503,
+                "in-flight body retains the sole fetch permit"
+            );
+            let spools: Vec<_> = fs::read_dir(fixture.temp.path().join("owned-spool"))
+                .expect("owned spools")
+                .map(|entry| entry.expect("owned entry").path())
+                .filter(|path| {
+                    path.file_name()
+                        .expect("name")
+                        .to_string_lossy()
+                        .starts_with("mega2-traces-fetch-")
+                })
+                .collect();
+            assert_eq!(
+                spools.len(),
+                1,
+                "exactly this response owns an unfinished spool"
+            );
+            let mut removed = 0;
+            for entry in fs::read_dir(&spools[0]).expect("owned response objects") {
+                let payload = entry.expect("object entry").path().join("payload");
+                if payload.is_file() {
+                    fs::remove_file(payload).expect("inject loss only in the owned response spool");
+                    removed += 1;
+                }
+            }
+            assert!(
+                removed > 1,
+                "fault injection removed response-owned object files"
+            );
+            let mut body = response.bytes_stream();
+            let mut received = Vec::new();
+            let mut failed = false;
+            while let Some(chunk) = body.next().await {
+                match chunk {
+                    Ok(chunk) => received.extend_from_slice(&chunk),
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                failed,
+                "source failure must abort HTTP body, not produce successful EOF"
+            );
+            drop(body);
+            let prefix = if v2 {
+                b"000dpackfile\n".as_slice()
+            } else {
+                b"0008NAK\n".as_slice()
+            };
+            assert!(received.starts_with(prefix));
+            let mut rest = &received[prefix.len()..];
+            let mut pack = Vec::new();
+            if v2 {
+                while rest.len() >= 4 {
+                    let size = usize::from_str_radix(
+                        std::str::from_utf8(&rest[..4]).expect("band header"),
+                        16,
+                    )
+                    .expect("packet size");
+                    assert_ne!(size, 0, "failed response must not emit a successful flush");
+                    assert!((5..=65520).contains(&size));
+                    if rest.len() < size {
+                        break;
+                    }
+                    assert_eq!(rest[4], 1);
+                    pack.extend_from_slice(&rest[5..size]);
+                    rest = &rest[size..];
+                }
+            } else {
+                pack.extend_from_slice(rest);
+            }
+            fs::write(fixture.shared.path().join("interrupted.pack"), pack)
+                .expect("interrupted wire bytes");
+            let index = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &["-C", "trace-source", "index-pack", "../interrupted.pack"],
+            );
+            assert!(
+                !index.status.success(),
+                "interrupted stream must not contain a valid complete PACK"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while spools[0].exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "failed response spool was not released"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let mut probe = Vec::new();
+            pkt(&mut probe, &format!("want {first} object-format=sha1\n"));
+            probe.extend_from_slice(b"0000");
+            pkt(&mut probe, "done\n");
+            loop {
+                let response = http_git_body(fixture, locator, token, false, &probe).await;
+                if response.status == 200 {
+                    assert!(http_git_unpack_response(&response.body, false).starts_with(b"PACK"));
+                    break;
+                }
+                assert_eq!(response.status, 503);
+                assert!(
+                    Instant::now() < deadline,
+                    "failed response permit was not released"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    async fn http_git_roundtrip_inner(
+        fixture: &mut Fixture,
+        db: &sea_orm::DatabaseConnection,
+        kind: &str,
+    ) {
+        let mut init = fixture.command(false, "trunk", "/third-party");
+        init.args(["service", "init", "--yes"]);
+        OwnedChild::spawn(&mut init).require_success().await;
+        let token = format!("mtr11-synthetic-{}", Uuid::new_v4());
+        mega2_core::access_token::ActiveModel {
+            id: Set(1001),
+            username: Set("mega2".to_owned()),
+            token: Set(token.clone()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .expect("seed fixture token using the existing async connection");
+        let token_id = mega2_core::access_token::Entity::find()
+            .filter(mega2_core::access_token::Column::Token.eq(&token))
+            .one(db)
+            .await
+            .expect("seeded token")
+            .expect("one token")
+            .id;
+        let principal = Uuid::new_v4().to_string();
+        trace_principal::ActiveModel {
+            id: Set(principal.clone()),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(db)
+        .await
+        .expect("principal fixture");
+        trace_credential_binding::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal.clone()),
+            namespace: Set("mono_account".to_owned()),
+            credential_id: Set(format!("access-token:{token_id}")),
+            created_at: Set(Utc::now().fixed_offset()),
+            retired_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("credential fixture binding");
+        fixture.traces_auth = true;
+        fixture.start(true, "review", "/third-party").await;
+        let locator = format!(
+            "/.traces/by-path/{}/self/{}/{}/{kind}.git",
+            URL_SAFE_NO_PAD.encode(b"/project"),
+            URL_SAFE_NO_PAD.encode(b"http-source"),
+            fixture.epoch
+        );
+        let unknown = format!("/.traces/by-scope/{}.git", Uuid::new_v4());
+        let before = snapshot(db).await;
+        for path in [&locator, &unknown] {
+            for endpoint in [
+                Endpoint::Discovery,
+                Endpoint::ReceiveDiscovery,
+                Endpoint::Upload,
+                Endpoint::Receive,
+            ] {
+                let response = request(
+                    fixture.port,
+                    endpoint,
+                    path,
+                    false,
+                    b"invalid PACK",
+                    Some("gzip"),
+                    true,
+                )
+                .await;
+                assert_eq!(
+                    response.status, 401,
+                    "authenticate before body/decompression/lookup"
+                );
+                assert!(
+                    response
+                        .headers
+                        .to_ascii_lowercase()
+                        .contains("www-authenticate:")
+                );
+                assert!(response.body.is_empty());
+            }
+        }
+        unchanged(&before, &snapshot(db).await);
+        let authorization = format!("Bearer {token}");
+        let headers = [("Authorization", authorization.as_str())];
+        let unbound = format!("mtr11-unbound-{}", Uuid::new_v4());
+        mega2_core::access_token::ActiveModel {
+            id: Set(1002),
+            username: Set("mega2".to_owned()),
+            token: Set(unbound.clone()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .expect("seed unbound token using the existing async connection");
+        let unbound_authorization = format!("Bearer {unbound}");
+        let mut denied_bodies = Vec::new();
+        for path in [&locator, &unknown] {
+            let invalid = raw_request(
+                fixture.port,
+                "POST",
+                &format!("{path}/git-receive-pack"),
+                Endpoint::Receive.content_type(),
+                b"",
+                &[("Authorization", SYNTHETIC_BEARER)],
+                true,
+            )
+            .await;
+            assert_eq!(invalid.status, 401);
+            assert!(
+                invalid
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate:")
+            );
+            let denied = raw_request(
+                fixture.port,
+                "GET",
+                &format!("{path}/info/refs?service=git-upload-pack"),
+                None,
+                b"",
+                &[("Authorization", unbound_authorization.as_str())],
+                false,
+            )
+            .await;
+            assert_eq!(denied.status, 404);
+            denied_bodies.push(denied.body);
+        }
+        assert_eq!(
+            denied_bodies[0], denied_bodies[1],
+            "valid unbound credentials cannot distinguish scope existence"
+        );
+        let before = snapshot(db).await;
+        let probe = raw_request(
+            fixture.port,
+            "POST",
+            &format!("{locator}/git-receive-pack"),
+            Endpoint::Receive.content_type(),
+            b"0000",
+            &headers,
+            false,
+        )
+        .await;
+        assert_eq!(probe.status, 200);
+        assert!(probe.body.is_empty());
+        unchanged(&before, &snapshot(db).await);
+
+        fixture.git(&[
+            "init",
+            "--initial-branch=main",
+            &format!("--object-format={kind}"),
+            "trace-source",
+        ]);
+        fixture.git(&["-C", "trace-source", "config", "pack.window", "0"]);
+        fixture.git(&["-C", "trace-source", "config", "gc.auto", "0"]);
+        let checkpoint = fixture.shared.path().join("trace-source/checkpoint/ab/cd");
+        fs::create_dir_all(&checkpoint).expect("checkpoint fixture");
+        let metadata = b"{\"schema_version\":2}\n";
+        fs::write(checkpoint.join("metadata.json"), metadata).expect("checkpoint metadata");
+        fs::write(checkpoint.join("raw.bin"), b"raw\0bytes\xff\n").expect("non-text raw blob");
+        let first = http_git_commit(fixture, "first checkpoint");
+        let url = git_cli::mega2_http_url(fixture.port, &locator);
+        let push = http_git_authenticated(
+            fixture,
+            &token,
+            &[
+                "-C",
+                "trace-source",
+                "-c",
+                "protocol.version=0",
+                "push",
+                &url,
+                "HEAD:refs/libra/traces",
+            ],
+        );
+        assert!(
+            push.status.success(),
+            "standard Git first push: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+        let stream = trace_stream::Entity::find()
+            .filter(trace_stream::Column::EpochId.eq(&fixture.epoch))
+            .one(db)
+            .await
+            .expect("new stream")
+            .expect("first push created scope");
+        assert_eq!(stream.tip_oid.as_deref(), Some(first.as_str()));
+        assert_eq!(stream.hash_kind, kind);
+        let by_scope = format!("/.traces/by-scope/{}.git", stream.id);
+        let outsider = Uuid::new_v4().to_string();
+        trace_principal::ActiveModel {
+            id: Set(outsider.clone()),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(db)
+        .await
+        .expect("different bound principal");
+        trace_credential_binding::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(outsider),
+            namespace: Set("mono_account".to_owned()),
+            credential_id: Set("access-token:1002".to_owned()),
+            created_at: Set(Utc::now().fixed_offset()),
+            retired_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("bind outsider token");
+        let before = snapshot(db).await;
+        for endpoint in [Endpoint::ReceiveDiscovery, Endpoint::Receive] {
+            let mut bodies = Vec::new();
+            for path in [&by_scope, &unknown] {
+                let denied = raw_request(
+                    fixture.port,
+                    endpoint.method(),
+                    &format!("{path}{}", endpoint.suffix()),
+                    endpoint.content_type(),
+                    b"",
+                    &[("Authorization", unbound_authorization.as_str())],
+                    true,
+                )
+                .await;
+                assert_eq!(
+                    denied.status, 404,
+                    "non-owner writes are denied before reading the body"
+                );
+                bodies.push(denied.body);
+            }
+            assert_eq!(
+                bodies[0], bodies[1],
+                "unauthorized existing scope is indistinguishable from unknown"
+            );
+        }
+        let mut fetch_command = Vec::new();
+        pkt(
+            &mut fetch_command,
+            &format!("want {first} object-format={kind}\n"),
+        );
+        fetch_command.extend_from_slice(b"0000");
+        pkt(&mut fetch_command, "done\n");
+        let plain = http_git_body(fixture, &by_scope, &token, false, &fetch_command).await;
+        assert_eq!(plain.status, 200);
+        let shared_read = raw_request(
+            fixture.port,
+            "GET",
+            &format!("{by_scope}/info/refs?service=git-upload-pack"),
+            None,
+            b"",
+            &[("Authorization", unbound_authorization.as_str())],
+            false,
+        )
+        .await;
+        assert_eq!(
+            shared_read.status, 200,
+            "project read permission includes another principal's active traces"
+        );
+        assert!(
+            shared_read
+                .body
+                .windows(first.len())
+                .any(|part| part == first.as_bytes())
+        );
+        let shared_fetch = http_git_body(fixture, &by_scope, &unbound, false, &fetch_command).await;
+        assert_eq!(shared_fetch.status, 200);
+        assert_eq!(
+            shared_fetch.body, plain.body,
+            "project-authorized readers receive the same raw objects"
+        );
+        let compressed = raw_request(
+            fixture.port,
+            "POST",
+            &format!("{by_scope}/git-upload-pack"),
+            Endpoint::Upload.content_type(),
+            &http_git_gzip(&fetch_command),
+            &[
+                ("Authorization", authorization.as_str()),
+                ("Content-Encoding", "gzip"),
+            ],
+            false,
+        )
+        .await;
+        assert_eq!(compressed.status, 200, "authenticated gzip fetch");
+        assert_eq!(
+            compressed.body, plain.body,
+            "gzip and identity preserve exact PACK bytes"
+        );
+        let mut random = vec![0; 64 * 1024];
+        let mut state = 0x4ca1_a784_5633_4acdu64;
+        for byte in &mut random {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        let encoded_overflow = http_git_gzip(&random);
+        assert!(encoded_overflow.len() > 64 * 1024 && random.len() == 64 * 1024);
+        let decoded_overflow = http_git_gzip(&vec![b'x'; 64 * 1024 + 1]);
+        assert!(decoded_overflow.len() < 64 * 1024);
+        for (endpoint, encoding, body, status, code) in [
+            (
+                Endpoint::Upload,
+                "br",
+                fetch_command.clone(),
+                400,
+                "invalid_parameter",
+            ),
+            (
+                Endpoint::Upload,
+                "gzip",
+                b"malformed gzip".to_vec(),
+                400,
+                "invalid_parameter",
+            ),
+            (
+                Endpoint::Upload,
+                "gzip",
+                encoded_overflow,
+                413,
+                "response_budget",
+            ),
+            (
+                Endpoint::Upload,
+                "gzip",
+                decoded_overflow,
+                413,
+                "response_budget",
+            ),
+            (
+                Endpoint::Upload,
+                "identity",
+                vec![b'x'; 64 * 1024 + 1],
+                413,
+                "response_budget",
+            ),
+            (
+                Endpoint::Receive,
+                "gzip",
+                http_git_gzip(b"0000"),
+                400,
+                "invalid_parameter",
+            ),
+        ] {
+            let response = raw_request(
+                fixture.port,
+                "POST",
+                &format!("{by_scope}{}", endpoint.suffix()),
+                endpoint.content_type(),
+                &body,
+                &[
+                    ("Authorization", authorization.as_str()),
+                    ("Content-Encoding", encoding),
+                ],
+                false,
+            )
+            .await;
+            assert_eq!(
+                response.status, status,
+                "encoding {encoding}, expected {code}"
+            );
+            assert!(
+                response
+                    .body
+                    .windows(code.len())
+                    .any(|part| part == code.as_bytes())
+            );
+        }
+        unchanged(&before, &snapshot(db).await);
+        for (index, path) in [&locator, &by_scope].into_iter().enumerate() {
+            for version in ["0", "2"] {
+                let remote = git_cli::mega2_http_url(fixture.port, path);
+                let refs = http_git_authenticated(
+                    fixture,
+                    &token,
+                    &[
+                        "-c",
+                        &format!("protocol.version={version}"),
+                        "ls-remote",
+                        &remote,
+                    ],
+                );
+                assert!(
+                    refs.status.success(),
+                    "ls-remote: {}",
+                    String::from_utf8_lossy(&refs.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8(refs.stdout).expect("refs"),
+                    format!("{first}\trefs/libra/traces\n")
+                );
+                let destination = format!("fetch-{index}-{version}");
+                fixture.git(&["init", &format!("--object-format={kind}"), &destination]);
+                let fetch = http_git_authenticated(
+                    fixture,
+                    &token,
+                    &[
+                        "-C",
+                        &destination,
+                        "-c",
+                        &format!("protocol.version={version}"),
+                        "fetch",
+                        "--no-tags",
+                        &remote,
+                        "refs/libra/traces:refs/libra/traces",
+                    ],
+                );
+                assert!(
+                    fetch.status.success(),
+                    "standard Git fetch: {}",
+                    String::from_utf8_lossy(&fetch.stderr)
+                );
+                assert_eq!(
+                    fixture.git_text(&["-C", &destination, "rev-parse", "refs/libra/traces"]),
+                    first
+                );
+            }
+        }
+        for v2 in [false, true] {
+            let mut command = Vec::new();
+            if v2 {
+                pkt(&mut command, "command=fetch\n");
+                pkt(&mut command, &format!("object-format={kind}\n"));
+                command.extend_from_slice(b"0001");
+                for option in ["thin-pack", "ofs-delta", "no-progress", "include-tag"] {
+                    pkt(&mut command, &format!("{option}\n"));
+                }
+                pkt(&mut command, &format!("want {first}\n"));
+            } else if kind == "sha256" {
+                pkt(&mut command, &format!("want {first}\n"));
+                command.extend_from_slice(b"0000");
+            } else {
+                pkt(
+                    &mut command,
+                    &format!("want {first} object-format={kind}\n"),
+                );
+                command.extend_from_slice(b"0000");
+            }
+            pkt(&mut command, "done\n");
+            if v2 {
+                command.extend_from_slice(b"0000");
+            }
+            let response = http_git_body(fixture, &by_scope, &token, v2, &command).await;
+            assert_eq!(response.status, 200);
+            let pack = http_git_unpack_response(&response.body, v2);
+            assert_eq!(&pack[..8], b"PACK\0\0\0\x02");
+            let trailer = if kind == "sha1" { 20 } else { 32 };
+            let payload = &pack[..pack.len() - trailer];
+            let digest = if kind == "sha1" {
+                sha1::Sha1::digest(payload).to_vec()
+            } else {
+                Sha256::digest(payload).to_vec()
+            };
+            assert_eq!(
+                digest,
+                pack[pack.len() - trailer..],
+                "independent PACK checksum"
+            );
+            let dir = format!("raw-{v2}");
+            fixture.git(&["init", &format!("--object-format={kind}"), &dir]);
+            let pack_path = format!("{dir}/.git/objects/pack/http.pack");
+            fs::write(fixture.shared.path().join(&pack_path), pack).expect("raw PACK oracle input");
+            fixture.git(&["-C", &dir, "index-pack", ".git/objects/pack/http.pack"]);
+            let oids = fixture.git_text(&["-C", "trace-source", "rev-list", "--objects", "--all"]);
+            for line in oids.lines() {
+                let oid = line.split_whitespace().next().expect("OID");
+                let object_type = fixture.git_text(&["-C", "trace-source", "cat-file", "-t", oid]);
+                assert_eq!(
+                    fixture.git(&["-C", &dir, "cat-file", &object_type, oid]),
+                    fixture.git(&["-C", "trace-source", "cat-file", &object_type, oid]),
+                    "raw object {oid}"
+                );
+            }
+            let denied_oid = "f".repeat(first.len());
+            let denied = String::from_utf8(command)
+                .expect("command text")
+                .replace(&first, &denied_oid);
+            let denied = http_git_body(fixture, &by_scope, &token, v2, denied.as_bytes()).await;
+            assert_eq!(denied.status, 404, "unpublished want denied");
+            assert!(!denied.body.windows(4).any(|part| part == b"PACK"));
+        }
+
+        if kind == "sha256" {
+            let before_invalid = snapshot(db).await;
+            for capability in [
+                "object-format=sha1",
+                "object-format=sha256 object-format=sha256",
+                "server-option=unknown",
+            ] {
+                let mut command = Vec::new();
+                pkt(&mut command, &format!("want {first} {capability}\n"));
+                command.extend_from_slice(b"0000");
+                pkt(&mut command, "done\n");
+                let rejected = http_git_body(fixture, &by_scope, &token, false, &command).await;
+                assert_eq!(rejected.status, 400, "v0 capability {capability}");
+                assert!(
+                    rejected
+                        .body
+                        .windows(17)
+                        .any(|part| part == b"invalid_parameter")
+                );
+            }
+            let mut short_oid = Vec::new();
+            pkt(&mut short_oid, &format!("want {}\n", &first[..40]));
+            short_oid.extend_from_slice(b"0000");
+            pkt(&mut short_oid, "done\n");
+            let rejected = http_git_body(fixture, &by_scope, &token, false, &short_oid).await;
+            assert_eq!(rejected.status, 400, "v0 SHA-256 OID width");
+            assert!(
+                rejected
+                    .body
+                    .windows(17)
+                    .any(|part| part == b"invalid_parameter")
+            );
+
+            let mut v2_missing_format = Vec::new();
+            pkt(&mut v2_missing_format, "command=fetch\n");
+            v2_missing_format.extend_from_slice(b"0001");
+            pkt(&mut v2_missing_format, &format!("want {first}\n"));
+            pkt(&mut v2_missing_format, "done\n");
+            v2_missing_format.extend_from_slice(b"0000");
+            let rejected =
+                http_git_body(fixture, &by_scope, &token, true, &v2_missing_format).await;
+            assert_eq!(rejected.status, 400, "v2 SHA-256 format remains required");
+            assert!(
+                rejected
+                    .body
+                    .windows(17)
+                    .any(|part| part == b"invalid_parameter")
+            );
+
+            let mut receive_missing_format = Vec::new();
+            pkt(
+                &mut receive_missing_format,
+                &format!("{first} {first} refs/libra/traces\0report-status\n"),
+            );
+            receive_missing_format.extend_from_slice(b"0000");
+            let rejected = raw_request(
+                fixture.port,
+                "POST",
+                &format!("{by_scope}/git-receive-pack"),
+                Endpoint::Receive.content_type(),
+                &receive_missing_format,
+                &headers,
+                false,
+            )
+            .await;
+            assert_eq!(
+                rejected.status, 400,
+                "receive SHA-256 format remains required"
+            );
+            assert!(
+                rejected
+                    .body
+                    .windows(17)
+                    .any(|part| part == b"invalid_parameter")
+            );
+            unchanged(&before_invalid, &snapshot(db).await);
+        }
+
+        let second_checkpoint = fixture.shared.path().join("trace-source/checkpoint/ef/01");
+        fs::create_dir_all(&second_checkpoint).expect("second checkpoint");
+        fs::write(second_checkpoint.join("metadata.json"), metadata).expect("second metadata");
+        let second = http_git_commit(fixture, "preserve and append checkpoint");
+        let by_scope_url = git_cli::mega2_http_url(fixture.port, &by_scope);
+        let push = http_git_authenticated(
+            fixture,
+            &token,
+            &[
+                "-C",
+                "trace-source",
+                "push",
+                &by_scope_url,
+                "HEAD:refs/libra/traces",
+            ],
+        );
+        assert!(
+            push.status.success(),
+            "second push: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+        assert_eq!(
+            trace_stream::Entity::find_by_id(&stream.id)
+                .one(db)
+                .await
+                .expect("stream")
+                .expect("scope")
+                .tip_oid
+                .as_deref(),
+            Some(second.as_str())
+        );
+        let second = if kind == "sha1" {
+            #[cfg(target_os = "linux")]
+            {
+                let maximum = |name: &str| -> usize {
+                    fs::read_to_string(format!("/proc/sys/net/ipv4/{name}"))
+                        .expect("socket buffer qualification")
+                        .split_whitespace()
+                        .last()
+                        .expect("maximum socket buffer")
+                        .parse()
+                        .expect("numeric buffer size")
+                };
+                assert!(
+                    maximum("tcp_rmem") + maximum("tcp_wmem") + 8 * 1024 * 1024 < 64 * 1024 * 1024,
+                    "64MiB fixture must exceed qualified socket buffers plus application buffering"
+                );
+            }
+            let mut state = 0x1234_5678_9abc_def0u64;
+            for index in 0..128 {
+                let mut bytes = vec![0; 512 * 1024];
+                for byte in &mut bytes {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    *byte = state as u8;
+                }
+                fs::write(
+                    fixture
+                        .shared
+                        .path()
+                        .join(format!("trace-source/stream-{index:02}.bin")),
+                    bytes,
+                )
+                .expect("backpressure fixture");
+            }
+            let large_tip = http_git_commit(fixture, "large pull-driven stream fixture");
+            let push = http_git_authenticated(
+                fixture,
+                &token,
+                &["-C", "trace-source", "push", &url, "HEAD:refs/libra/traces"],
+            );
+            assert!(
+                push.status.success(),
+                "large stream fixture push: {}",
+                String::from_utf8_lossy(&push.stderr)
+            );
+            let before = snapshot(db).await;
+            http_git_failed_stream(fixture, &by_scope, &token, &large_tip, &first).await;
+            unchanged(&before, &snapshot(db).await);
+            large_tip
+        } else {
+            second
+        };
+        let before = snapshot(db).await;
+        fs::write(
+            checkpoint.join("metadata.json"),
+            b"{\"schema_version\":2,\"mutation\":true}\n",
+        )
+        .expect("intermediate mutation");
+        http_git_commit(fixture, "mutate existing checkpoint");
+        fs::write(checkpoint.join("metadata.json"), metadata).expect("restore final bytes");
+        http_git_commit(fixture, "restore checkpoint at final tip");
+        let push = http_git_authenticated(
+            fixture,
+            &token,
+            &["-C", "trace-source", "push", &url, "HEAD:refs/libra/traces"],
+        );
+        http_git_rejected_history(&push);
+        unchanged(&before, &snapshot(db).await);
+
+        for (new_checkpoint, remove) in [(false, true), (true, false), (true, true)] {
+            fixture.git(&["-C", "trace-source", "switch", "--detach", &second]);
+            let leaf = if new_checkpoint {
+                fixture.shared.path().join("trace-source/checkpoint/aa/bb")
+            } else {
+                checkpoint.clone()
+            };
+            if new_checkpoint {
+                fs::create_dir_all(&leaf).expect("new checkpoint in same push");
+                fs::write(leaf.join("metadata.json"), metadata).expect("same-push metadata");
+                http_git_commit(fixture, "introduce checkpoint in batch");
+            }
+            let original = fs::read(leaf.join("metadata.json")).expect("original metadata");
+            if remove {
+                fs::remove_file(leaf.join("metadata.json")).expect("intermediate removal");
+            } else {
+                fs::write(
+                    leaf.join("metadata.json"),
+                    b"{\"schema_version\":2,\"mutation\":true}",
+                )
+                .expect("intermediate edit");
+            }
+            http_git_commit(fixture, "intermediate checkpoint change");
+            fs::create_dir_all(&leaf).expect("restore checkpoint directory");
+            fs::write(leaf.join("metadata.json"), &original).expect("restore checkpoint metadata");
+            http_git_commit(fixture, "restore final checkpoint bytes");
+            let push = http_git_authenticated(
+                fixture,
+                &token,
+                &["-C", "trace-source", "push", &url, "HEAD:refs/libra/traces"],
+            );
+            http_git_rejected_history(&push);
+            unchanged(&before, &snapshot(db).await);
+        }
+
+        fixture.git(&["-C", "trace-source", "switch", "--detach", &second]);
+        let repeated = b"standard Git delta candidate payload\n".repeat(4096);
+        fs::write(
+            fixture.shared.path().join("trace-source/delta-a.bin"),
+            &repeated,
+        )
+        .expect("delta base");
+        let mut similar = repeated.clone();
+        similar[1024] ^= 1;
+        fs::write(
+            fixture.shared.path().join("trace-source/delta-b.bin"),
+            &similar,
+        )
+        .expect("delta target");
+        let delta_tip = http_git_commit(fixture, "default delta negative fixture");
+        fs::write(
+            fixture
+                .shared
+                .path()
+                .join("trace-source/.git/mtr11-pack-revisions"),
+            format!("{delta_tip}\n^{second}\n"),
+        )
+        .expect("pack only new objects relative to the published tip");
+        let pack_alias = "alias.mtr11-pack=!git pack-objects --stdout --revs --no-reuse-delta --no-reuse-object < .git/mtr11-pack-revisions";
+        fixture.git(&["-C", "trace-source", "config", "--unset", "pack.window"]);
+        let delta_pack = fixture.git(&["-C", "trace-source", "-c", pack_alias, "mtr11-pack"]);
+        assert!(
+            delta_pack.len() < 512 * 1024,
+            "early delta rejection must not block a large request writer"
+        );
+        fixture.git(&["-C", "trace-source", "config", "pack.window", "0"]);
+        fs::write(fixture.shared.path().join("delta.pack"), &delta_pack)
+            .expect("actual Git delta PACK");
+        fixture.git(&["-C", "trace-source", "index-pack", "../delta.pack"]);
+        let inspected =
+            fixture.git_text(&["-C", "trace-source", "verify-pack", "-v", "../delta.idx"]);
+        assert!(
+            inspected.lines().any(|line| {
+                let columns: Vec<_> = line.split_whitespace().collect();
+                columns.len() == 7
+                    && columns[0].len() == first.len()
+                    && columns[5].parse::<u32>().is_ok_and(|depth| depth > 0)
+            }),
+            "negative fixture must actually contain a delta"
+        );
+        let mut receive = Vec::new();
+        pkt(
+            &mut receive,
+            &format!(
+                "{second} {delta_tip} refs/libra/traces\0report-status object-format={kind}\n"
+            ),
+        );
+        receive.extend_from_slice(b"0000");
+        receive.extend_from_slice(&delta_pack);
+        let rejected = raw_request(
+            fixture.port,
+            "POST",
+            &format!("{locator}/git-receive-pack"),
+            Endpoint::Receive.content_type(),
+            &receive,
+            &headers,
+            false,
+        )
+        .await;
+        assert_eq!(
+            rejected.status, 400,
+            "PackError::Delta retains the existing InvalidParameter mapping"
+        );
+        assert!(
+            rejected
+                .body
+                .windows(b"invalid_parameter".len())
+                .any(|bytes| bytes == b"invalid_parameter")
+        );
+        unchanged(&before, &snapshot(db).await);
+
+        let pack = fixture.git(&["-C", "trace-source", "-c", pack_alias, "mtr11-pack"]);
+        let mut receive = Vec::new();
+        pkt(
+            &mut receive,
+            &format!(
+                "{second} {delta_tip} refs/libra/traces\0report-status object-format={kind}\n"
+            ),
+        );
+        receive.extend_from_slice(b"0000");
+        receive.extend_from_slice(&pack);
+        let mut socket = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", fixture.port)).await.expect("stalled receive connection");
+            let head = format!("POST {locator}/git-receive-pack HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/x-git-receive-pack-request\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n", fixture.port, receive.len());
+            socket.write_all(head.as_bytes()).await.expect("stalled receive headers");
+            let mut interim = Vec::new();
+            while !interim.ends_with(b"\r\n\r\n") {
+                interim.push(socket.read_u8().await.expect("continue after authenticated body poll"));
+                assert!(interim.len() < 64 * 1024, "bounded interim response");
+            }
+            assert_eq!(interim, b"HTTP/1.1 100 Continue\r\n\r\n", "body polling follows authentication and capacity acquisition");
+            socket
+        }).await.expect("authenticated receive barrier deadline");
+        let probe = raw_request(
+            fixture.port,
+            "POST",
+            &format!("{locator}/git-receive-pack"),
+            Endpoint::Receive.content_type(),
+            b"0000",
+            &headers,
+            false,
+        )
+        .await;
+        assert_eq!(
+            probe.status, 503,
+            "one probe after the stalled receive owns its permit"
+        );
+        let mut fetch = Vec::new();
+        pkt(&mut fetch, &format!("want {first} object-format={kind}\n"));
+        fetch.extend_from_slice(b"0000");
+        pkt(&mut fetch, "done\n");
+        let response = http_git_body(fixture, &by_scope, &token, false, &fetch).await;
+        assert_eq!(
+            response.status, 200,
+            "fetch capacity is independent of a stalled receive"
+        );
+        assert!(http_git_unpack_response(&response.body, false).starts_with(b"PACK"));
+        mega2_core::access_token::Entity::delete_by_id(token_id)
+            .exec(db)
+            .await
+            .expect("revoke after authorization");
+        let revoked_state = snapshot(db).await;
+        let response = tokio::time::timeout(LIMIT, async {
+            socket
+                .write_all(&receive)
+                .await
+                .expect("supply previously authorized request body");
+            let mut response = Vec::new();
+            socket
+                .take(64 * 1024)
+                .read_to_end(&mut response)
+                .await
+                .expect("revoked receive response");
+            assert!(response.len() < 64 * 1024);
+            response
+        })
+        .await
+        .expect("revoked receive deadline");
+        assert!(
+            response.starts_with(b"HTTP/1.1 404 "),
+            "publication rechecks the live token witness"
+        );
+        assert!(
+            response
+                .windows(b"unknown_scope".len())
+                .any(|part| part == b"unknown_scope")
+        );
+        assert!(
+            !response
+                .windows(b"unpack ok".len())
+                .any(|part| part == b"unpack ok")
+        );
+        unchanged(&revoked_state, &snapshot(db).await);
+
+        fixture.stop();
+        let static_token = format!("mtr11-static-{}", Uuid::new_v4());
+        let config_path = fixture.temp.path().join("config.toml");
+        let config = fs::read_to_string(&config_path).expect("fixture config");
+        fs::write(&config_path, format!("{config}\n[[git.push_tokens]]\nname = \"mtr11-static\"\ntoken = \"{static_token}\"\npaths = [\"/project\"]\n")).expect("static token fixture config");
+        trace_credential_binding::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(principal),
+            namespace: Set("static_push_token".to_owned()),
+            credential_id: Set("mtr11-static".to_owned()),
+            created_at: Set(Utc::now().fixed_offset()),
+            retired_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("bind configured static credential to same principal");
+        fixture.static_auth = true;
+        fixture.start(true, "trunk", "/third-party").await;
+        let remote = git_cli::mega2_http_url(fixture.port, &by_scope);
+        let push = http_git_authenticated(
+            fixture,
+            &static_token,
+            &[
+                "-C",
+                "trace-source",
+                "push",
+                &remote,
+                "HEAD:refs/libra/traces",
+            ],
+        );
+        assert!(
+            push.status.success(),
+            "static credential by-scope update: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+        assert_eq!(
+            trace_stream::Entity::find_by_id(&stream.id)
+                .one(db)
+                .await
+                .expect("static push stream")
+                .expect("scope")
+                .tip_oid
+                .as_deref(),
+            Some(delta_tip.as_str())
+        );
+        let refs = http_git_authenticated(fixture, &static_token, &["ls-remote", &remote]);
+        assert!(refs.status.success());
+        assert_eq!(
+            String::from_utf8(refs.stdout).expect("static refs"),
+            format!("{delta_tip}\trefs/libra/traces\n")
+        );
+    }
+
+    pub async fn http_git_roundtrip(kind: &str) {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = Fixture::new(&db).await;
+        let result = AssertUnwindSafe(http_git_roundtrip_inner(&mut fixture, &db, kind))
+            .catch_unwind()
+            .await;
+        fixture.stop();
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            let logs = fixture.temp.keep();
+            eprintln!("HTTP traces fixture logs retained at {}", logs.display());
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close HTTP traces pool");
+    }
+
     pub async fn run(endpoint: Endpoint) {
         let (guard, db) = traces_db::TracesDb::migrated().await;
         let mut fixture = None;
@@ -3986,6 +5202,16 @@ mod disabled_http {
         }
         closed.expect("close HTTP fixture pool before database guard");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_git_sha1_roundtrip() {
+    disabled_http::http_git_roundtrip("sha1").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_git_sha256_roundtrip() {
+    disabled_http::http_git_roundtrip("sha256").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

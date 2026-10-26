@@ -33,6 +33,13 @@ fn integrity() -> MegaError {
     TracesError::ObjectIntegrity.into()
 }
 
+fn stored_syntax_error(error: MegaError) -> MegaError {
+    match error {
+        MegaError::Traces(TracesError::InvalidParameter) => integrity(),
+        other => other,
+    }
+}
+
 struct FetchControl(CancellationToken);
 
 impl RawReadControl for FetchControl {
@@ -485,7 +492,8 @@ async fn fetch_into_spool(
             stack.push(&Frame::new(frame.oid.clone(), frame.kind, true, &residency))?;
             match frame.kind {
                 RawObjectType::Commit => {
-                    let links = verified_commit_links(raw.bytes(), width, &control)?;
+                    let links = verified_commit_links(raw.bytes(), width, &control)
+                        .map_err(stored_syntax_error)?;
                     for oid in std::iter::once(links.tree).chain(links.parents) {
                         control.checkpoint().await?;
                         // The first edge is the tree; subsequent edges are parents.
@@ -501,7 +509,9 @@ async fn fetch_into_spool(
                     }
                 }
                 RawObjectType::Tree => {
-                    for entry in verified_tree_entries(raw.bytes(), width / 2, &control)? {
+                    for entry in verified_tree_entries(raw.bytes(), width / 2, &control)
+                        .map_err(stored_syntax_error)?
+                    {
                         control.checkpoint().await?;
                         let kind = match entry.mode {
                             RawTreeMode::Tree => RawObjectType::Tree,
@@ -1289,10 +1299,35 @@ mod tests {
             f.save(&malformed).await;
             rejected(
                 f.fetch(std::slice::from_ref(&malformed), &[]).await,
-                TracesError::InvalidParameter,
+                TracesError::ObjectIntegrity,
+            );
+            let malformed_tree = f.git.object("tree", b"100644 broken\0short");
+            let malformed_tree_tip = f.git.commit(&malformed_tree, None);
+            f.save(&malformed_tree_tip).await;
+            rejected(
+                f.fetch(std::slice::from_ref(&malformed_tree_tip), &[])
+                    .await,
+                TracesError::ObjectIntegrity,
             );
             let tag = f.git.object("tag", format!("object {first}\ntype commit\ntag v1\ntagger Test <test@example.test> 0 +0000\n\ntag").as_bytes());
             f.save(&first).await;
+            rejected(
+                f.fetch(&["not-an-object-id".to_owned()], &[]).await,
+                TracesError::InvalidParameter,
+            );
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            rejected(
+                fetch_raw_objects(
+                    f.grant().await,
+                    &f.objects,
+                    std::slice::from_ref(&first),
+                    &[],
+                    cancel,
+                )
+                .await,
+                TracesError::QueryTimeout,
+            );
             rejected(
                 f.fetch(std::slice::from_ref(&tag), &[]).await,
                 TracesError::UnknownScope,

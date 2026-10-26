@@ -194,15 +194,15 @@ Monorepo 路径禁止 Git 客户端推送 Tag，Tag 经此入口管理（ImportR
 
 ## 5. 可选服务面
 
-两个已挂载面均为**双重门控**(storage-only 形态 + 各自开关),缺一则整面不存在(裸 404);在非 storage-only 形态下打开开关会拒绝启动。下面的 traces 开关只是配置，不挂载路由。
+两个已挂载面均为**双重门控**(storage-only 形态 + 各自开关),缺一则整面不存在(裸 404);在非 storage-only 形态下打开开关会拒绝启动。Traces HTTP Git 另由 `[traces].enabled` 控制，启用前须配置部署身份、凭据绑定和目标授权。
 
 - **OCI Distribution `/v2`**:storage-only 且 `[oci].enabled=true` 时挂载,可作容器镜像仓库(`docker login` 复用 push token,无独立 token 服务)。架构与端点事实源见 [`refactoring/oci.md`](./refactoring/oci.md),启用步骤见 [`deploy-trunk.md`](./deploy-trunk.md) 第 10 节。
 - **Agent Session Capture `/api/v1/agent-capture`**：可选能力，接收并查询 Agent 会话、事件、checkpoint、transcript 与文件操作记录。仅在 storage-only 且 `[agent_capture].enabled=true`、配置至少一个 `[[agent_capture.ingest_tokens]]` 时挂载；使用独立 ingest token，不复用 Git push token，也不会由 Git push 自动产生会话记录。配置与配额事实源见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
-- **Traces 归档**：示例配置里的 `[traces].enabled` 保持 `false`。打开它必须由操作者写入 `server_id` UUID，mega2 不会在启动时生成这个 id。这个开关本身不挂载 traces 的 Git 或 HTTP 面。traces 失败使用稳定错误码：缺认证是 401 `unauthenticated`；未知或无权限的 scope 是 404 `unknown_scope`；非法参数或 cursor 是 400 `invalid_parameter` 或 `invalid_cursor`；`unsupported_schema`、`invalid_capture`、`object_integrity` 和 `trace_history_in_code` 是 409；`response_budget` 是 413；`query_timeout` 和 `search_unavailable` 是 503。错误文本不包含对象 key 或 transcript 正文。具名维护操作者用 `mega2 --config <现存配置> traces rebind-target --target <UUID> --path <canonical-path>` 把已有 target 指到新路径（也可以用 `MEGA_CONFIG` 点名配置）。路径必须已经是 canonical 形式，并且当前已经是目录。目标不存在、路径不是 canonical、或目录不存在时都不写库。该命令不生成默认配置，只在工作目录里发现的配置也会被拒绝。同一次数据库事务在发布前重查 credential 仍有效、target 仍在授权路径上处于 active、binding generation 未变，以及调用者对当前路径仍有写权限。解包期间退役 credential 或改绑 target 会拒绝这次发布，tip、membership 和 journal 都保持不变。没有出示 credential 时是 `unauthenticated`。其余重查失败是 `unknown_scope`。Mono 账户的写权限在这次事务里读取进程当前的 Cedar 快照。解包前复制的快照不能放行这次发布；快照缺失或被标记为 dirty 时拒绝。`off` 不放行这次写权限。`shadow` 按当前 Cedar 决定，不会把代码推送里的 shadow 放行当成 traces 写权限。见[配置指南](./configuration.zh.md)。
+- **Traces 归档**：示例配置里的 `[traces].enabled` 保持 `false`。打开它必须由操作者写入 `server_id` UUID，mega2 不会在启动时生成这个 id。该开关启用 scoped traces HTTP Git；SSH traces 接线仍待交付。traces 失败使用稳定错误码：缺认证是 401 `unauthenticated`；未知或无权限的 scope 是 404 `unknown_scope`；非法参数或 cursor 是 400 `invalid_parameter` 或 `invalid_cursor`；`unsupported_schema`、`invalid_capture`、`object_integrity` 和 `trace_history_in_code` 是 409；`response_budget` 是 413；`query_timeout` 和 `search_unavailable` 是 503。错误文本不包含对象 key 或 transcript 正文。具名维护操作者用 `mega2 --config <现存配置> traces rebind-target --target <UUID> --path <canonical-path>` 把已有 target 指到新路径（也可以用 `MEGA_CONFIG` 点名配置）。路径必须已经是 canonical 形式，并且当前已经是目录。目标不存在、路径不是 canonical、或目录不存在时都不写库。该命令不生成默认配置，只在工作目录里发现的配置也会被拒绝。同一次数据库事务在发布前重查 credential 仍有效、target 仍在授权路径上处于 active、binding generation 未变，以及调用者对当前路径仍有写权限。解包期间退役 credential 或改绑 target 会拒绝这次发布，tip、membership 和 journal 都保持不变。没有出示 credential 时是 `unauthenticated`。其余重查失败是 `unknown_scope`。Mono 账户的写权限在这次事务里读取进程当前的 Cedar 快照。解包前复制的快照不能放行这次发布；快照缺失或被标记为 dirty 时拒绝。`off` 不放行这次写权限。`shadow` 按当前 Cedar 决定，不会把代码推送里的 shadow 放行当成 traces 写权限。见[配置指南](./configuration.zh.md)。
 
-当 `[traces].enabled=false` 时，HTTP 的 GET/POST 请求若进入根 `.traces` 保留命名空间，会在业务鉴权、请求解压和读取请求体之前返回 HTTP 404，JSON 错误消息为 `traces locator not found`。此规则覆盖 discovery、upload-pack、receive-pack 及单次百分号解码或点段折叠进入该命名空间的别名；它不查 scope 是否存在，也不会回落到普通 Native/Import 仓库。未进入保留根的普通代码路径保持原分派。规则也检查 LFS 重写前由服务端保留的原始 URL：即使已有代码仓的根名字面为 `%2etraces`，其 `/%2etraces/…` URL 在关闭 traces 时仍按一次解码的保留别名返回 404。启用时本禁用守卫保持该字面根的既有分派。SSH 在已有连接认证之后检查 exec 的字面仓库路径；关闭 traces 时，进入根 `.traces` 的 upload-pack/receive-pack 在协议广告、读取 stdin 和普通仓库分派之前返回 `ERR traces locator not found`，exit status 为 1，并结束通道。SSH 路径不作 HTTP 百分号解码；普通嵌套、近似根名及字面 `%2etraces` 保持原分派。普通 SSH 认证和 storage-only 写入限制保持原语义。启用开关也不代表 traces Git 数据面已经可用。详见 [traces 协议](./refactoring/traces.md)。
+当 `[traces].enabled=false` 时，HTTP 的 GET/POST 请求若进入根 `.traces` 保留命名空间，会在业务鉴权、请求解压和读取请求体之前返回 HTTP 404，JSON 错误消息为 `traces locator not found`。此规则覆盖 discovery、upload-pack、receive-pack 及单次百分号解码或点段折叠进入该命名空间的别名；它不查 scope 是否存在，也不会回落到普通 Native/Import 仓库。未进入保留根的普通代码路径保持原分派。规则也检查 LFS 重写前由服务端保留的原始 URL：即使已有代码仓的根名字面为 `%2etraces`，其 `/%2etraces/…` URL 在关闭 traces 时仍按一次解码的保留别名返回 404。启用时本禁用守卫保持该字面根的既有分派。SSH 在已有连接认证之后检查 exec 的字面仓库路径；关闭 traces 时，进入根 `.traces` 的 upload-pack/receive-pack 在协议广告、读取 stdin 和普通仓库分派之前返回 `ERR traces locator not found`，exit status 为 1，并结束通道。SSH 路径不作 HTTP 百分号解码；普通嵌套、近似根名及字面 `%2etraces` 保持原分派。普通 SSH 认证和 storage-only 写入限制保持原语义。启用后的 HTTP Git 使用下述认证与 scope 边界；SSH traces 数据面仍未接入。详见 [traces 协议](./refactoring/traces.md)。
 
-授权后的 traces discovery 元数据和 Git v0/v2 编码器现已实现。它们使用持久配置中的部署身份；空 scope 的 discovery 不创建数据库记录。真实 HTTP/SSH 入口尚未接入这些编码器，因此当前不能通过打开开关来使用完整 traces Git 服务。身份、能力和二次 discovery 语义以 [traces 协议](./refactoring/traces.md) 为准。
+HTTP traces 支持标准 Git v0 推送以及 v0/v2 引用查询和 fetch。有效凭据必须先通过认证、principal 绑定与目标授权，之后才广告引用或读取请求体；没有凭据或凭据无效时返回带 `WWW-Authenticate` 的 401，已认证但无权限与未知 scope 均返回 404。空 scope 的 discovery 不创建数据库记录。SHA-1 和 SHA-256 使用该 scope 的实际对象格式，fetch 保留原始对象字节。身份与 locator 语法以 [traces 协议](./refactoring/traces.md) 为准；`libra-traces-*` 扩展广告和 SSH 接线另行交付。
 
 ### 5.1 Traces 凭据维护
 
@@ -219,7 +219,17 @@ mega2 --config config/config.toml traces credentials retire \
   --binding '<binding-uuid>'
 ```
 
-保存成功输出中的 binding UUID，供后续轮换或退役使用。命令要求数据库 schema 与当前二进制一致，不执行迁移。凭据 key、principal、幂等、冲突与退役的完整规则以 [Traces 协议](./refactoring/traces.md) 第 2.6 节为准；这些维护命令不会启用尚未接入的 HTTP/SSH 数据面。
+保存成功输出中的 binding UUID，供后续轮换或退役使用。命令要求数据库 schema 与当前二进制一致，不执行迁移。凭据 key、principal、幂等、冲突与退役的完整规则以 [Traces 协议](./refactoring/traces.md) 第 2.6 节为准；这些维护命令不改变 `[traces].enabled` 开关。
+
+### 5.2 HTTP traces Git
+
+HTTP upload-pack 只接受未压缩（identity）或 gzip 的请求体；压缩字节和解压后的命令各不得超过 64 KiB。receive-pack 只接受未压缩请求体。其它编码或损坏的 gzip 返回 400，超过请求预算返回 413。Mono 账户的读取和写入都要求有效 Cedar 授权；`cedar.enforcement=off` 不会放行 traces。
+
+Traces v1 只接收无 delta 的 PACK。为推送仓库设置 `git config pack.window 0`，保持对象为 loose 状态并避免在推送前运行 gc/repack；`--no-thin` 本身不保证没有内部 delta。包含 delta 的请求会整批拒绝，不发布部分引用。每次只允许更新 `refs/libra/traces`；删除和其它引用被拒绝。首次成功推送创建 scope。
+
+显式 fetch traces 引用，例如 `git -c protocol.version=2 fetch <traces-url> refs/libra/traces:refs/libra/traces`；验证 v0 时将版本设为 `0`。普通 clone 默认只选择 heads，不能用它判断 traces 引用是否存在。按凭据管理方式向 Git 提供 Basic 密码或 Bearer token，勿把真实 token 写进 URL 或日志。
+
+接收与 fetch 分别有独立容量限制。503 `query_timeout` 是可重试的过载或暂时不可用；退避后重试，并检查服务端容量。连接中断或 PACK 校验失败不能视为 fetch 成功。部署条件及占用恢复见[部署指南](./deployment.zh.md)。
 
 ## 6. 配合 Libra 使用
 

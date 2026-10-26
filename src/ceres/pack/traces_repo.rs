@@ -217,6 +217,121 @@ pub(crate) async fn resolve_trace_discovery(
     })
 }
 
+pub(crate) struct TraceReceiveScope {
+    pub(crate) stream_id: String,
+    pub(crate) principal_id: String,
+    pub(crate) target_id: String,
+    pub(crate) target_path: String,
+    pub(crate) source_repo_id: String,
+    pub(crate) epoch_id: String,
+    pub(crate) hash_kind: HashKind,
+    pub(crate) tip_oid: Option<String>,
+    pub(crate) expected_generation: i64,
+    pub(crate) first_scope: bool,
+}
+
+/// Request-local facts; the publication transaction must recheck the authority.
+pub(crate) async fn resolve_trace_receive(
+    db: &DatabaseConnection,
+    config: &TracesConfig,
+    locator: &TracesLocator,
+    caller: TracesCaller<'_>,
+) -> Result<TraceReceiveScope, MegaError> {
+    let discovery =
+        resolve_trace_discovery(db, config, locator, caller, ServiceType::ReceivePack).await?;
+    let stream = match discovery.scope_id() {
+        Some(id) => Some(
+            trace_stream::Entity::find_by_id(id.to_string())
+                .one(db)
+                .await?
+                .ok_or(TracesError::UnknownScope)?,
+        ),
+        None => None,
+    };
+    let (target, target_path, source_repo_id, epoch_id) = match locator {
+        TracesLocator::ByPath {
+            target_path,
+            source_id,
+            epoch,
+            ..
+        } => {
+            let target = trace_target::Entity::find()
+                .filter(trace_target::Column::ProjectPath.eq(target_path))
+                .filter(trace_target::Column::Active.eq(true))
+                .one(db)
+                .await?;
+            (
+                target,
+                target_path.clone(),
+                source_id.clone(),
+                epoch.clone(),
+            )
+        }
+        TracesLocator::ByScope { .. } => {
+            let stream = stream.as_ref().ok_or(TracesError::UnknownScope)?;
+            let target = trace_target::Entity::find_by_id(&stream.target_id)
+                .filter(trace_target::Column::Active.eq(true))
+                .one(db)
+                .await?
+                .ok_or(TracesError::UnknownScope)?;
+            let path = target.project_path.clone();
+            (
+                Some(target),
+                path,
+                stream.source_repo_id.clone(),
+                stream.epoch_id.clone(),
+            )
+        }
+    };
+    let action = match &stream {
+        Some(stream) => TracesAction::Update {
+            owner_principal_id: &stream.principal_id,
+        },
+        None => TracesAction::Create,
+    };
+    let principal_id = discovery_principal(db, caller, action, &target_path).await?;
+    let target_id = target
+        .as_ref()
+        .map(|target| target.id.clone())
+        .unwrap_or_default();
+    let expected_generation = if target_id.is_empty() {
+        crate::jupiter::service::trace_target_service::INITIAL_BINDING_GENERATION
+    } else {
+        crate::jupiter::service::trace_target_service::binding_generation(db, &target_id).await?
+    };
+    if let Some(stream) = &stream
+        && (stream.principal_id != principal_id
+            || stream.target_id != target_id
+            || stream.source_repo_id != source_repo_id
+            || stream.epoch_id != epoch_id
+            || stream.hash_kind != discovery.hash_kind().as_str())
+    {
+        return Err(TracesError::UnknownScope.into());
+    }
+    let tip_oid = stream.as_ref().and_then(|stream| stream.tip_oid.clone());
+    if tip_oid.as_ref().is_some_and(|oid| {
+        oid.len() != discovery.hash_kind().hex_len()
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(TracesError::ObjectIntegrity.into());
+    }
+    Ok(TraceReceiveScope {
+        stream_id: stream
+            .as_ref()
+            .map(|stream| stream.id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        principal_id,
+        target_id,
+        target_path,
+        source_repo_id,
+        epoch_id,
+        hash_kind: discovery.hash_kind(),
+        tip_oid: tip_oid.map(|oid| oid.to_ascii_lowercase()),
+        expected_generation,
+        first_scope: stream.is_none(),
+    })
+}
+
 /// A single request's authorized, published snapshot. No public constructor,
 /// deserialization, or cloning: advertisement and bare locators are not grants.
 pub(crate) struct TraceFetchGrant {

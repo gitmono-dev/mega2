@@ -4,24 +4,68 @@
 //! [`crate::config::TracesProtocolLimits`]. A cancelled attempt drops its
 //! counters and must not continue.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
+};
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     common::errors::{MegaError, TracesError},
     config::TracesProtocolLimits,
 };
 
+pub(crate) static TRACE_REQUEST_CAPACITY: LazyLock<TraceRequestCapacity> =
+    LazyLock::new(TraceRequestCapacity::new);
+
+pub(crate) struct TraceRequestCapacity {
+    receive: Arc<Semaphore>,
+    fetch: Arc<Semaphore>,
+}
+
+impl TraceRequestCapacity {
+    fn new() -> Self {
+        Self {
+            receive: Arc::new(Semaphore::new(1)),
+            fetch: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    pub(crate) fn try_receive(&self) -> Result<IngestAdmission, MegaError> {
+        let permit = self
+            .receive
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| timeout())?;
+        let mut admission = IngestAdmission::start();
+        admission.capacity = Some(Arc::new(permit));
+        Ok(admission)
+    }
+
+    pub(crate) fn try_fetch(&self) -> Result<OwnedSemaphorePermit, MegaError> {
+        self.fetch
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| timeout())
+    }
+}
+
 /// Running complexity for one ingest worker.
 #[derive(Debug, Clone)]
 pub struct IngestAdmission {
     started: Instant,
     continuation_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // A started blocking decoder keeps its clone after the request is dropped.
+    capacity: Option<Arc<OwnedSemaphorePermit>>,
     #[cfg(test)]
     worker_done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     worker_started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     input_dropped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)]
+    worker_exit_gate: Option<Arc<WorkerExitGate>>,
     compressed_bytes: u64,
     decoded_bytes: u64,
     elapsed_secs: u64,
@@ -40,12 +84,15 @@ impl IngestAdmission {
         Self {
             started: Instant::now(),
             continuation_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            capacity: None,
             #[cfg(test)]
             worker_done: None,
             #[cfg(test)]
             worker_started: None,
             #[cfg(test)]
             input_dropped: None,
+            #[cfg(test)]
+            worker_exit_gate: None,
             compressed_bytes: 0,
             decoded_bytes: 0,
             elapsed_secs: 0,
@@ -91,6 +138,28 @@ impl IngestAdmission {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled
+    }
+
+    pub(crate) async fn read_commands<T>(
+        &mut self,
+        future: impl std::future::Future<Output = Result<T, MegaError>>,
+    ) -> Result<T, MegaError> {
+        admit_ingest(self, 0)?;
+        let elapsed = Duration::from_secs(self.elapsed_secs).max(self.started.elapsed());
+        let remaining = Duration::from_secs(TracesProtocolLimits::INGEST_TIMEOUT_SECONDS)
+            .checked_sub(elapsed)
+            .ok_or_else(timeout)?;
+        let control = IngestContinuation {
+            deadline: Instant::now() + remaining,
+            cancelled: self.continuation_cancel.clone(),
+            external_cancel: None,
+        };
+        let result = control.run(future).await;
+        self.record_wall_clock();
+        if result.is_err() {
+            self.cancel();
+        }
+        result
     }
 }
 
@@ -140,6 +209,84 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn request_capacity_keeps_receive_and_fetch_independent() {
+        let capacity = TraceRequestCapacity::new();
+        let mut receive = capacity.try_receive().expect("receive slot");
+        let fetch = capacity.try_fetch().expect("separate fetch slot");
+        assert!(matches!(
+            capacity.try_receive(),
+            Err(MegaError::Traces(TracesError::QueryTimeout))
+        ));
+        assert!(matches!(
+            capacity.try_fetch(),
+            Err(MegaError::Traces(TracesError::QueryTimeout))
+        ));
+        receive.cancel();
+        assert!(capacity.try_receive().is_err(), "cancellation is not exit");
+        drop(fetch);
+        assert!(capacity.try_fetch().is_ok());
+        assert!(capacity.try_receive().is_err());
+        drop(receive);
+        assert!(capacity.try_receive().is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_capacity_waits_for_the_actual_blocking_worker_exit() {
+        struct ReleaseExit(Arc<WorkerExitGate>);
+        impl Drop for ReleaseExit {
+            fn drop(&mut self) {
+                *self.0.released.lock().expect("worker gate") = true;
+                self.0.wake.notify_all();
+            }
+        }
+
+        let capacity = TraceRequestCapacity::new();
+        let gate = Arc::new(WorkerExitGate::default());
+        let release = ReleaseExit(gate.clone());
+        let done = Arc::new(AtomicBool::new(false));
+        let mut admission = capacity.try_receive().expect("receive slot");
+        admission.worker_exit_gate = Some(gate.clone());
+        admission.worker_done = Some(done.clone());
+        let pack = synthetic_pack();
+        {
+            let request = super::super::ingest::decode_wire_pack(
+                &mut admission,
+                git_internal::hash::HashKind::Sha1,
+                &pack[..],
+            );
+            tokio::pin!(request);
+            tokio::select! {
+                result = &mut request => panic!("worker exited through its gate: {result:?}"),
+                _ = wait_for_signal(&gate.entered) => {}
+            }
+        }
+        assert!(admission.is_cancelled());
+        drop(admission);
+        assert!(!done.load(Ordering::Acquire));
+        assert!(
+            capacity.try_receive().is_err(),
+            "worker still owns its slot"
+        );
+        assert!(
+            capacity.try_fetch().is_ok(),
+            "fetch pool remains independent"
+        );
+        drop(release);
+        wait_for_signal(&done).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(next) = capacity.try_receive() {
+                    drop(next);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker has released the final permit clone");
+    }
 
     async fn wait_for_signal(signal: &AtomicBool) {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1349,6 +1496,17 @@ async fn run_wire_pack<R: tokio::io::AsyncRead + Unpin>(
         }
         let control = input.control.clone();
         let outcome = decode_worker(&mut state, kind, input, budget, control);
+        #[cfg(test)]
+        if let Some(gate) = &state.worker_exit_gate {
+            gate.entered
+                .store(true, std::sync::atomic::Ordering::Release);
+            let released = gate.released.lock().expect("worker exit gate");
+            drop(
+                gate.wake
+                    .wait_while(released, |released| !*released)
+                    .expect("worker exit gate"),
+            );
+        }
         Some((outcome, state))
     });
     guard.abort = Some(worker.abort_handle());
@@ -1434,6 +1592,14 @@ async fn run_wire_pack<R: tokio::io::AsyncRead + Unpin>(
     }
     control.check()?;
     outcome
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WorkerExitGate {
+    entered: std::sync::atomic::AtomicBool,
+    released: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
 }
 
 #[cfg(test)]

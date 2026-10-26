@@ -136,6 +136,8 @@ cargo build --release -p mega2   # 产物 target/release/mega2
 - [ ] `[traces].enabled` 保持 false，直到操作者写入持久的 `server_id` UUID。进程不会生成这个 id。配置重载和新进程都保留它。轮换 TLS 证书或凭据不会替换它。
 - [ ] 备份三件套：Postgres dump、对象存储 bucket、`mega2 --config <path> config vault backup <destination>`（Vault core key；恢复用 `config vault restore`，见 [`src/commands/config.rs`](../src/commands/config.rs)）。
 
+HTTP traces 每进程分别允许一个接收请求和一个 fetch；过载返回可重试的 503。接收请求取消后，实际解码 worker 退出之前仍占用接收许可。为进程至少预留 4 GiB 可用内存，并用最大允许推送的实测 RSS 核定部署容量；该预留值不等于生产环境已经通过资格验收。为 `TMPDIR` 配置专用可写磁盘，按完整历史对象字节及约每对象 4–5 个 inode 预留空间并监控剩余量。fetch 不以固定历史大小或 300 秒截断；完整 tip 闭包读取、同步压缩、文件 IO 和清理仍可能占用运行时。尚未发送 `done` 的每轮 fetch 协商也会读取并暂存完整 tip 闭包以验证 want 的可达性，随后返回 NAK；已有历史的客户端可能多次产生该成本。发布事务的既有锁等待或 rollback 卡住时，单个接收许可可能持续被占用，其余推送均返回 503；监测数据库锁与活动事务，排查占用后再恢复流量。容量限制不会自动解决该数据库等待。固定协议限制和对象存储条件创建资格见 [traces 协议](./refactoring/traces.md)。
+
 ## 6. 升级与形态切换
 
 - 升级：替换镜像 / 二进制并重启。标注 `restart_required` 的配置变更必须重启才生效。

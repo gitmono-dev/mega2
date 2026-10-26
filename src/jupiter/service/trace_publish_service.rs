@@ -50,11 +50,11 @@ enum ScopeUpdate<'a> {
     Legacy(&'a PublishRef),
 }
 
-pub(in crate::jupiter) struct PreparedScopeRequest<'a> {
-    pub(in crate::jupiter) path: &'a str,
-    pub(in crate::jupiter) facts: &'a ScopeFacts<'a>,
-    pub(in crate::jupiter) prepared: &'a CheckpointValidatedPublication,
-    pub(in crate::jupiter) authority: &'a PublishAuthority<'a>,
+pub(crate) struct PreparedScopeRequest<'a> {
+    pub(crate) path: &'a str,
+    pub(crate) facts: &'a ScopeFacts<'a>,
+    pub(crate) prepared: &'a CheckpointValidatedPublication,
+    pub(crate) authority: &'a PublishAuthority<'a>,
 }
 
 /// Stores raw bytes, then publishes membership, the tip, and the journal.
@@ -96,7 +96,7 @@ impl TracePublishService {
     }
 
     // Publication requires the sealed history-policy witness.
-    pub(in crate::jupiter) async fn publish_prepared(
+    pub(crate) async fn publish_prepared(
         &self,
         db: &DatabaseConnection,
         prepared: &CheckpointValidatedPublication,
@@ -108,7 +108,7 @@ impl TracePublishService {
             .map_err(super::trace_object_service::raw_storage_error)
     }
 
-    pub(in crate::jupiter) async fn publish_prepared_first_scope(
+    pub(crate) async fn publish_prepared_first_scope(
         &self,
         config: &crate::config::MonoConfig,
         db: &DatabaseConnection,
