@@ -486,6 +486,7 @@ pub trait RepoHandler: Send + Sync + 'static {
         exist_objs: &mut HashSet<String>,
         sender: Option<&tokio::sync::mpsc::Sender<MetaAttached<Entry, EntryMeta>>>,
     ) -> Result<(), MegaError> {
+        let hash_kind = self.object_hash_kind()?;
         let mut search_tree_ids = vec![];
         let mut search_blob_ids = vec![];
 
@@ -515,7 +516,8 @@ pub trait RepoHandler: Send + Sync + 'static {
                             Ok(acc)
                         })
                         .await?;
-                    let blob = Blob::from_content_bytes(data);
+                    let blob = Blob::from_content_bytes_with_kind(hash_kind, data)
+                        .map_err(|_| IoOrbitError::Other("native blob hashing failed".into()))?;
                     let ext_data = blobs_ext_data
                         .get(&blob.id.to_string())
                         .unwrap_or(&default_meta);

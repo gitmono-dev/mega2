@@ -49,7 +49,9 @@ use crate::{
     jupiter::{
         service::push_queue_service::PushPayload,
         storage::{Storage, base_storage::StorageConnector, blob_path_index::BlobPathIndexMode},
-        utils::converter::FromMegaModel,
+        utils::converter::{
+            FromMegaModel, commit_from_mega_model_with_kind, tree_from_mega_model_with_kind,
+        },
     },
 };
 #[rustfmt::skip]
@@ -260,6 +262,7 @@ impl RepoHandler for Monorepo {
         depth: u32,
         _deepen_relative: bool,
     ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        let hash_kind = self.object_hash_kind()?;
         let pack_config = &self.storage.config().pack;
         let storage = self.storage.mono_storage();
         let obj_num = AtomicUsize::new(0);
@@ -268,11 +271,10 @@ impl RepoHandler for Monorepo {
 
         let want_commits: Vec<Commit> = storage
             .get_commits_by_hashes(&want)
-            .await
-            .unwrap()
+            .await?
             .into_iter()
-            .map(Commit::from_mega_model)
-            .collect();
+            .map(|model| commit_from_mega_model_with_kind(model, hash_kind))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut shallow_commits: Vec<String> = Vec::new();
         let mut visited: HashSet<String> = want.iter().cloned().collect();
@@ -293,9 +295,9 @@ impl RepoHandler for Monorepo {
                 for p_commit_id in &commit.parent_commit_ids {
                     let p_id = p_commit_id.to_string();
                     if visited.insert(p_id.clone())
-                        && let Some(model) = storage.get_commit_by_hash(&p_id).await.unwrap()
+                        && let Some(model) = storage.get_commit_by_hash(&p_id).await?
                     {
-                        let parent = Commit::from_mega_model(model);
+                        let parent = commit_from_mega_model_with_kind(model, hash_kind)?;
                         next_level.push(parent.clone());
                         all_commits.push(parent);
                     }
@@ -304,20 +306,16 @@ impl RepoHandler for Monorepo {
             current_level = next_level;
         }
 
-        let hash_kind = self.object_hash_kind()?;
         let want_tree_ids = all_commits.iter().map(|c| c.tree_id.to_string()).collect();
         let want_trees: HashMap<ObjectHash, Tree> = storage
             .get_trees_by_hashes(want_tree_ids)
-            .await
-            .unwrap()
+            .await?
             .into_iter()
-            .map(|m| {
-                (
-                    ObjectHash::from_hex_for_kind(hash_kind, &m.tree_id).unwrap(),
-                    Tree::from_mega_model(m),
-                )
+            .map(|model| {
+                let tree = tree_from_mega_model_with_kind(model, hash_kind)?;
+                Ok((tree.id, tree))
             })
-            .collect();
+            .collect::<Result<HashMap<_, _>, MegaError>>()?;
 
         obj_num.fetch_add(all_commits.len(), Ordering::SeqCst);
 
@@ -329,7 +327,10 @@ impl RepoHandler for Monorepo {
                 continue;
             }
             self.traverse_for_count(
-                want_trees.get(&c.tree_id).unwrap().clone(),
+                want_trees
+                    .get(&c.tree_id)
+                    .ok_or_else(|| MegaError::Other("native commit tree missing".into()))?
+                    .clone(),
                 &exist_objs,
                 &mut counted_obj,
                 &obj_num,
@@ -355,7 +356,10 @@ impl RepoHandler for Monorepo {
         for c in all_commits {
             if exist_objs.insert(c.tree_id.to_string()) {
                 self.traverse(
-                    want_trees.get(&c.tree_id).unwrap().clone(),
+                    want_trees
+                        .get(&c.tree_id)
+                        .ok_or_else(|| MegaError::Other("native commit tree missing".into()))?
+                        .clone(),
                     &mut exist_objs,
                     Some(&entry_tx),
                 )
@@ -384,6 +388,7 @@ impl RepoHandler for Monorepo {
         have: Vec<String>,
         filter_spec: &str,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        let hash_kind = self.object_hash_kind()?;
         if filter_spec != "blob:none" {
             return Err(GitError::CustomError(format!(
                 "unsupported filter spec: {filter_spec}"
@@ -399,11 +404,10 @@ impl RepoHandler for Monorepo {
 
         let mut want_commits: Vec<Commit> = storage
             .get_commits_by_hashes(&want_clone)
-            .await
-            .unwrap()
+            .await?
             .into_iter()
-            .map(Commit::from_mega_model)
-            .collect();
+            .map(|model| commit_from_mega_model_with_kind(model, hash_kind))
+            .collect::<Result<Vec<_>, _>>()?;
         if want_commits.is_empty() {
             return self.direct_object_pack(want).await;
         }
@@ -414,13 +418,15 @@ impl RepoHandler for Monorepo {
                 let p_commit_id = p_commit_id.to_string();
 
                 if !have.contains(&p_commit_id) && !want_clone.contains(&p_commit_id) {
-                    let parent: Commit = Commit::from_mega_model(
+                    let parent: Commit = commit_from_mega_model_with_kind(
                         storage
                             .get_commit_by_hash(&p_commit_id)
-                            .await
-                            .unwrap()
-                            .unwrap(),
-                    );
+                            .await?
+                            .ok_or_else(|| {
+                                MegaError::Other("native parent commit missing".into())
+                            })?,
+                        hash_kind,
+                    )?;
                     want_commits.push(parent.clone());
                     want_clone.push(p_commit_id);
                     traversal_list.push(parent);
@@ -428,37 +434,39 @@ impl RepoHandler for Monorepo {
             }
         }
 
-        let hash_kind = self.object_hash_kind()?;
         let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
         let want_trees: HashMap<ObjectHash, Tree> = storage
             .get_trees_by_hashes(want_tree_ids)
-            .await
-            .unwrap()
+            .await?
             .into_iter()
-            .map(|m| {
-                (
-                    ObjectHash::from_hex_for_kind(hash_kind, &m.tree_id).unwrap(),
-                    Tree::from_mega_model(m),
-                )
+            .map(|model| {
+                let tree = tree_from_mega_model_with_kind(model, hash_kind)?;
+                Ok((tree.id, tree))
             })
-            .collect();
+            .collect::<Result<HashMap<_, _>, MegaError>>()?;
 
         obj_num.fetch_add(want_commits.len(), Ordering::SeqCst);
 
-        let have_commits = storage.get_commits_by_hashes(&have).await.unwrap();
+        let have_commits = storage.get_commits_by_hashes(&have).await?;
         let have_trees = storage
             .get_trees_by_hashes(have_commits.iter().map(|x| x.tree.clone()).collect())
-            .await
-            .unwrap();
+            .await?;
         for have_tree in have_trees {
-            self.traverse(Tree::from_mega_model(have_tree), &mut exist_objs, None)
-                .await?;
+            self.traverse(
+                tree_from_mega_model_with_kind(have_tree, hash_kind)?,
+                &mut exist_objs,
+                None,
+            )
+            .await?;
         }
 
         let mut counted_obj = HashSet::new();
         for c in want_commits.clone() {
             self.traverse_trees_only_for_count(
-                want_trees.get(&c.tree_id).unwrap().clone(),
+                want_trees
+                    .get(&c.tree_id)
+                    .ok_or_else(|| MegaError::Other("native commit tree missing".into()))?
+                    .clone(),
                 &exist_objs,
                 &mut counted_obj,
                 &obj_num,
@@ -481,7 +489,10 @@ impl RepoHandler for Monorepo {
 
         for c in want_commits {
             self.traverse_trees_only(
-                want_trees.get(&c.tree_id).unwrap().clone(),
+                want_trees
+                    .get(&c.tree_id)
+                    .ok_or_else(|| MegaError::Other("native commit tree missing".into()))?
+                    .clone(),
                 &mut exist_objs,
                 Some(&entry_tx),
             )
@@ -504,6 +515,7 @@ impl RepoHandler for Monorepo {
         want: Vec<String>,
         have: Vec<String>,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        let hash_kind = self.object_hash_kind()?;
         let mut want_clone = want.clone();
         let pack_config = &self.storage.config().pack;
         let storage = self.storage.mono_storage();
@@ -513,11 +525,10 @@ impl RepoHandler for Monorepo {
 
         let mut want_commits: Vec<Commit> = storage
             .get_commits_by_hashes(&want_clone)
-            .await
-            .unwrap()
+            .await?
             .into_iter()
-            .map(Commit::from_mega_model)
-            .collect();
+            .map(|model| commit_from_mega_model_with_kind(model, hash_kind))
+            .collect::<Result<Vec<_>, _>>()?;
         if want_commits.is_empty() {
             return self.direct_object_pack(want).await;
         }
@@ -529,13 +540,15 @@ impl RepoHandler for Monorepo {
                 let p_commit_id = p_commit_id.to_string();
 
                 if !have.contains(&p_commit_id) && !want_clone.contains(&p_commit_id) {
-                    let parent: Commit = Commit::from_mega_model(
+                    let parent: Commit = commit_from_mega_model_with_kind(
                         storage
                             .get_commit_by_hash(&p_commit_id)
-                            .await
-                            .unwrap()
-                            .unwrap(),
-                    );
+                            .await?
+                            .ok_or_else(|| {
+                                MegaError::Other("native parent commit missing".into())
+                            })?,
+                        hash_kind,
+                    )?;
                     want_commits.push(parent.clone());
                     want_clone.push(p_commit_id);
                     traversal_list.push(parent);
@@ -543,31 +556,30 @@ impl RepoHandler for Monorepo {
             }
         }
 
-        let hash_kind = self.object_hash_kind()?;
         let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
         let want_trees: HashMap<ObjectHash, Tree> = storage
             .get_trees_by_hashes(want_tree_ids)
-            .await
-            .unwrap()
+            .await?
             .into_iter()
-            .map(|m| {
-                (
-                    ObjectHash::from_hex_for_kind(hash_kind, &m.tree_id).unwrap(),
-                    Tree::from_mega_model(m),
-                )
+            .map(|model| {
+                let tree = tree_from_mega_model_with_kind(model, hash_kind)?;
+                Ok((tree.id, tree))
             })
-            .collect();
+            .collect::<Result<HashMap<_, _>, MegaError>>()?;
 
         obj_num.fetch_add(want_commits.len(), Ordering::SeqCst);
 
-        let have_commits = storage.get_commits_by_hashes(&have).await.unwrap();
+        let have_commits = storage.get_commits_by_hashes(&have).await?;
         let have_trees = storage
             .get_trees_by_hashes(have_commits.iter().map(|x| x.tree.clone()).collect())
-            .await
-            .unwrap();
+            .await?;
         for have_tree in have_trees {
-            self.traverse(Tree::from_mega_model(have_tree), &mut exist_objs, None)
-                .await?;
+            self.traverse(
+                tree_from_mega_model_with_kind(have_tree, hash_kind)?,
+                &mut exist_objs,
+                None,
+            )
+            .await?;
         }
 
         let mut counted_obj = HashSet::new();
@@ -578,7 +590,10 @@ impl RepoHandler for Monorepo {
                 continue;
             }
             self.traverse_for_count(
-                want_trees.get(&c.tree_id).unwrap().clone(),
+                want_trees
+                    .get(&c.tree_id)
+                    .ok_or_else(|| MegaError::Other("native commit tree missing".into()))?
+                    .clone(),
                 &exist_objs,
                 &mut counted_obj,
                 &obj_num,
@@ -603,7 +618,10 @@ impl RepoHandler for Monorepo {
         for c in want_commits {
             if exist_objs.insert(c.tree_id.to_string()) {
                 self.traverse(
-                    want_trees.get(&c.tree_id).unwrap().clone(),
+                    want_trees
+                        .get(&c.tree_id)
+                        .ok_or_else(|| MegaError::Other("native commit tree missing".into()))?
+                        .clone(),
                     &mut exist_objs,
                     Some(&entry_tx),
                 )
@@ -623,15 +641,14 @@ impl RepoHandler for Monorepo {
     }
 
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError> {
-        Ok(self
-            .storage
+        let hash_kind = self.object_hash_kind()?;
+        self.storage
             .mono_storage()
             .get_trees_by_hashes(hashes)
-            .await
-            .unwrap()
+            .await?
             .into_iter()
-            .map(Tree::from_mega_model)
-            .collect())
+            .map(|model| tree_from_mega_model_with_kind(model, hash_kind))
+            .collect()
     }
 
     async fn get_blobs_by_hashes(
@@ -754,6 +771,7 @@ impl Monorepo {
         &self,
         want: Vec<String>,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        let hash_kind = self.object_hash_kind()?;
         let pack_config = &self.storage.config().pack;
         let storage = self.storage.mono_storage();
 
@@ -805,7 +823,7 @@ impl Monorepo {
         for tree_model in tree_models {
             entry_tx
                 .send(MetaAttached {
-                    inner: Tree::from_mega_model(tree_model).into(),
+                    inner: tree_from_mega_model_with_kind(tree_model, hash_kind)?.into(),
                     meta: EntryMeta::new(),
                 })
                 .await
@@ -826,7 +844,8 @@ impl Monorepo {
                             Ok(acc)
                         })
                         .await?;
-                    let blob = Blob::from_content_bytes(data);
+                    let blob = Blob::from_content_bytes_with_kind(hash_kind, data)
+                        .map_err(|_| IoOrbitError::Other("native blob hashing failed".into()))?;
                     let meta = blob_meta
                         .get(&blob.id.to_string())
                         .unwrap_or(default_meta)
@@ -3961,5 +3980,251 @@ mod tests {
             "every object must appear exactly once (shared commit trees)"
         );
         assert!(ids.contains(&tree.id.to_string()));
+    }
+
+    type NativeHashObjects =
+        HashMap<ObjectHash, (git_internal::internal::object::types::ObjectType, Vec<u8>)>;
+
+    fn native_hash_assert_pack(
+        kind: git_internal::hash::HashKind,
+        pack: Vec<u8>,
+        expected: &NativeHashObjects,
+        cache: &std::path::Path,
+    ) {
+        assert_eq!(&pack[..8], b"PACK\0\0\0\x02");
+        assert_eq!(
+            u32::from_be_bytes(pack[8..12].try_into().expect("count")) as usize,
+            expected.len()
+        );
+        let content_end = pack.len() - kind.size();
+        assert_eq!(
+            &pack[content_end..],
+            ObjectHash::new_for_kind(kind, &pack[..content_end]).as_ref(),
+            "exact PACK trailer"
+        );
+        let mut decoder = Pack::new_with_hash_kind(
+            kind,
+            Some(1),
+            Some(64 * 1024 * 1024),
+            Some(cache.to_path_buf()),
+            true,
+        );
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        decoder
+            .decode(
+                &mut std::io::Cursor::new(pack),
+                move |entry| sink.lock().expect("sink").push(entry.inner),
+                None::<fn(ObjectHash)>,
+            )
+            .expect("strict PACK decode");
+        let entries = observed.lock().expect("entries");
+        assert_eq!(
+            entries.len(),
+            expected.len(),
+            "no duplicate or missing objects"
+        );
+        let mut actual = HashMap::new();
+        for entry in entries.iter() {
+            assert_eq!(entry.hash.kind(), kind);
+            assert_eq!(
+                entry.hash,
+                ObjectHash::from_type_and_data_for_kind(kind, entry.obj_type, &entry.data)
+                    .expect("canonical object hash")
+            );
+            assert!(
+                actual
+                    .insert(entry.hash, (entry.obj_type, entry.data.clone()))
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            &actual, expected,
+            "exact object identities, types and bytes"
+        );
+    }
+
+    async fn native_hash_pack_modes(
+        kind: git_internal::hash::HashKind,
+        format: crate::config::MonoObjectFormat,
+    ) {
+        use git_internal::{
+            hash::{HashKind, get_hash_kind, set_hash_kind_for_test},
+            internal::object::{ObjectTrait, types::ObjectType},
+        };
+        let other = if kind == HashKind::Sha1 {
+            HashKind::Sha256
+        } else {
+            HashKind::Sha1
+        };
+        let _guard = set_hash_kind_for_test(other);
+        let temp = TempDir::new().expect("private fixture");
+        let mut config = isolated_config(temp.path().join("config"));
+        config.monorepo.object_format = format;
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let mono = storage.mono_storage();
+        let mut commits = Vec::new();
+        let mut generations = Vec::new();
+        for n in 0..2 {
+            let blob = Blob::from_content_bytes_with_kind(
+                kind,
+                format!("native generation {n}\n").into_bytes(),
+            )
+            .expect("explicit blob");
+            let child = Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem::new(
+                    TreeItemMode::Blob,
+                    blob.id,
+                    "data.txt".to_owned(),
+                )],
+            )
+            .expect("explicit subtree");
+            let tree = Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem::new(
+                    TreeItemMode::Tree,
+                    child.id,
+                    "project".to_owned(),
+                )],
+            )
+            .expect("explicit root tree");
+            let author =
+                Signature::from_data(b"author Fixture <native@example.invalid> 1 +0000".to_vec())
+                    .expect("author");
+            let committer = Signature::from_data(
+                b"committer Fixture <native@example.invalid> 1 +0000".to_vec(),
+            )
+            .expect("committer");
+            let commit = Commit::new_with_kind(
+                kind,
+                author,
+                committer,
+                tree.id,
+                commits
+                    .last()
+                    .map(|c: &Commit| vec![c.id])
+                    .unwrap_or_default(),
+                &format!("\ngeneration {n}\n"),
+            )
+            .expect("explicit commit");
+            let expected = HashMap::from([
+                (
+                    blob.id,
+                    (ObjectType::Blob, blob.to_data().expect("blob bytes")),
+                ),
+                (
+                    child.id,
+                    (ObjectType::Tree, child.to_data().expect("subtree bytes")),
+                ),
+                (
+                    tree.id,
+                    (ObjectType::Tree, tree.to_data().expect("tree bytes")),
+                ),
+                (
+                    commit.id,
+                    (ObjectType::Commit, commit.to_data().expect("commit bytes")),
+                ),
+            ]);
+            crate::callisto::mega_blob::Entity::insert(
+                blob.clone()
+                    .into_mega_model(EntryMeta::default())
+                    .into_active_model(),
+            )
+            .exec(mono.get_connection())
+            .await
+            .expect("store blob metadata");
+            storage
+                .git_service
+                .put_objects(vec![blob])
+                .await
+                .expect("store blob");
+            mono.save_mega_trees(vec![child, tree], commit.id, None)
+                .await
+                .expect("store trees");
+            mono.save_mega_commits(vec![commit.clone()], None)
+                .await
+                .expect("store commit");
+            commits.push(commit);
+            generations.push(expected);
+        }
+        let repo = test_monorepo(&storage, vec![], HashSet::new(), HashSet::new());
+        let want = vec![commits[1].id.to_string()];
+        let all: NativeHashObjects = generations
+            .iter()
+            .flat_map(|objects| objects.iter().map(|(id, value)| (*id, value.clone())))
+            .collect();
+        let full = repo
+            .full_pack(want.clone())
+            .await
+            .expect("full pack")
+            .concat()
+            .await;
+        native_hash_assert_pack(kind, full, &all, temp.path());
+        let incremental = repo
+            .incremental_pack(want.clone(), vec![commits[0].id.to_string()])
+            .await
+            .expect("incremental pack")
+            .concat()
+            .await;
+        native_hash_assert_pack(kind, incremental, &generations[1], temp.path());
+        let (shallow, boundaries) = repo
+            .shallow_pack(want.clone(), 1, false)
+            .await
+            .expect("shallow pack");
+        assert_eq!(boundaries, want);
+        native_hash_assert_pack(kind, shallow.concat().await, &generations[1], temp.path());
+        let filtered = repo
+            .filtered_pack(want, vec![], "blob:none")
+            .await
+            .expect("filtered pack")
+            .concat()
+            .await;
+        let no_blobs: NativeHashObjects = all
+            .iter()
+            .filter(|(_, (kind, _))| *kind != ObjectType::Blob)
+            .map(|(id, object)| (*id, object.clone()))
+            .collect();
+        native_hash_assert_pack(kind, filtered, &no_blobs, temp.path());
+        let direct: NativeHashObjects = generations[1]
+            .iter()
+            .filter(|(_, (kind, _))| matches!(kind, ObjectType::Tree | ObjectType::Blob))
+            .map(|(id, object)| (*id, object.clone()))
+            .collect();
+        let direct_pack = repo
+            .incremental_pack(direct.keys().map(ToString::to_string).collect(), vec![])
+            .await
+            .expect("direct object pack")
+            .concat()
+            .await;
+        native_hash_assert_pack(kind, direct_pack, &direct, temp.path());
+        assert_eq!(get_hash_kind(), other, "read chain preserves caller TLS");
+    }
+
+    #[tokio::test]
+    async fn native_hash_sha1_pack_modes() {
+        native_hash_pack_modes(
+            git_internal::hash::HashKind::Sha1,
+            crate::config::MonoObjectFormat::Sha1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_hash_sha256_pack_modes() {
+        native_hash_pack_modes(
+            git_internal::hash::HashKind::Sha256,
+            crate::config::MonoObjectFormat::Sha256,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_hash_blake3_pack_modes() {
+        native_hash_pack_modes(
+            git_internal::hash::HashKind::Blake3,
+            crate::config::MonoObjectFormat::Blake3,
+        )
+        .await;
     }
 }

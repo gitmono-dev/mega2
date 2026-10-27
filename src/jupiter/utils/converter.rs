@@ -79,6 +79,47 @@ pub trait FromGitModel {
     fn from_git_model(model: Self::GitSource) -> Self;
 }
 
+pub fn tree_from_mega_model_with_kind(
+    model: mega_tree::Model,
+    kind: HashKind,
+) -> Result<Tree, MegaError> {
+    let id = ObjectHash::from_hex_for_kind(kind, &model.tree_id)
+        .map_err(|_| MegaError::Other("invalid native tree identity".into()))?;
+    Tree::from_bytes(&model.sub_trees, id)
+        .map_err(|_| MegaError::Other("invalid native tree body".into()))
+}
+
+pub fn commit_from_mega_model_with_kind(
+    model: mega_commit::Model,
+    kind: HashKind,
+) -> Result<Commit, MegaError> {
+    let parse_hash = |value: &str| {
+        ObjectHash::from_hex_for_kind(kind, value)
+            .map_err(|_| MegaError::Other("invalid native commit identity".into()))
+    };
+    let parents: Vec<String> = serde_json::from_value(model.parents_id)
+        .map_err(|_| MegaError::Other("invalid native commit parents".into()))?;
+    let signature = |value: Option<String>| {
+        let value =
+            value.ok_or_else(|| MegaError::Other("missing native commit signature".into()))?;
+        Signature::from_data(value.into_bytes())
+            .map_err(|_| MegaError::Other("invalid native commit signature".into()))
+    };
+    Ok(Commit {
+        id: parse_hash(&model.commit_id)?,
+        tree_id: parse_hash(&model.tree)?,
+        parent_commit_ids: parents
+            .iter()
+            .map(|value| parse_hash(value))
+            .collect::<Result<_, _>>()?,
+        author: signature(model.author)?,
+        committer: signature(model.committer)?,
+        message: model
+            .content
+            .ok_or_else(|| MegaError::Other("missing native commit body".into()))?,
+    })
+}
+
 #[derive(PartialEq, Debug, Clone)]
 pub enum GitObject {
     Commit(Commit),
@@ -1184,5 +1225,132 @@ mod test {
             "\nInit Mega Directory",
         );
         println!("{commit}");
+    }
+}
+
+#[cfg(test)]
+mod native_hash_tests {
+    use git_internal::{
+        hash::{get_hash_kind, set_hash_kind_for_test},
+        internal::object::ObjectTrait,
+    };
+
+    use super::*;
+
+    fn models(kind: HashKind) -> (mega_tree::Model, mega_commit::Model) {
+        let blob = Blob::from_content_bytes_with_kind(kind, b"native converter fixture".to_vec())
+            .expect("explicit blob");
+        let tree = Tree::from_tree_items_with_kind(
+            kind,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                blob.id,
+                "fixture.txt".to_owned(),
+            )],
+        )
+        .expect("explicit tree");
+        let author =
+            Signature::from_data(b"author Fixture <native@example.invalid> 1 +0000".to_vec())
+                .expect("author");
+        let committer =
+            Signature::from_data(b"committer Fixture <native@example.invalid> 1 +0000".to_vec())
+                .expect("committer");
+        let commit =
+            Commit::new_with_kind(kind, author, committer, tree.id, Vec::new(), "\nfixture\n")
+                .expect("explicit commit");
+        (
+            tree.into_mega_model(EntryMeta::default()),
+            commit.into_mega_model(EntryMeta::default()),
+        )
+    }
+
+    fn check_conversion(kind: HashKind) {
+        let other = if kind == HashKind::Sha1 {
+            HashKind::Sha256
+        } else {
+            HashKind::Sha1
+        };
+        let _guard = set_hash_kind_for_test(other);
+        let (tree_model, commit_model) = models(kind);
+        let tree = tree_from_mega_model_with_kind(tree_model, kind).expect("tree conversion");
+        let commit =
+            commit_from_mega_model_with_kind(commit_model, kind).expect("commit conversion");
+        assert_eq!(tree.id.kind(), kind);
+        assert_eq!(commit.id.kind(), kind);
+        assert_eq!(commit.tree_id, tree.id);
+        assert_eq!(
+            tree.id,
+            ObjectHash::from_type_and_data_for_kind(
+                kind,
+                ObjectType::Tree,
+                &tree.to_data().expect("tree bytes")
+            )
+            .expect("tree hash")
+        );
+        assert_eq!(
+            commit.id,
+            ObjectHash::from_type_and_data_for_kind(
+                kind,
+                ObjectType::Commit,
+                &commit.to_data().expect("commit bytes")
+            )
+            .expect("commit hash")
+        );
+        assert_eq!(
+            get_hash_kind(),
+            other,
+            "conversion must not change thread TLS"
+        );
+    }
+
+    #[test]
+    fn native_hash_conversion_on_opposite_thread_defaults() {
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            std::thread::spawn(move || check_conversion(kind))
+                .join()
+                .expect("conversion thread");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_hash_conversion_on_tokio_workers() {
+        let tasks = [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3].map(|kind| {
+            tokio::spawn(async move {
+                check_conversion(kind);
+            })
+        });
+        for task in tasks {
+            task.await.expect("conversion worker");
+        }
+    }
+
+    #[test]
+    fn native_hash_malformed_metadata_is_fallible_and_redacted() {
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let (tree, commit) = models(kind);
+            let mut invalid = tree.clone();
+            invalid.tree_id = "invalid-native-oid".to_owned();
+            assert!(tree_from_mega_model_with_kind(invalid, kind).is_err());
+            let mut invalid = tree;
+            invalid.sub_trees = b"100644 x\0short".to_vec();
+            assert!(tree_from_mega_model_with_kind(invalid, kind).is_err());
+            for field in 0..8 {
+                let mut invalid = commit.clone();
+                match field {
+                    0 => invalid.commit_id = "bad".to_owned(),
+                    1 => invalid.tree = "bad".to_owned(),
+                    2 => invalid.parents_id = serde_json::json!(["bad"]),
+                    3 => invalid.parents_id = serde_json::json!({"parent": "bad"}),
+                    4 => invalid.author = Some("private-invalid-signature".to_owned()),
+                    5 => invalid.committer = Some("private-invalid-signature".to_owned()),
+                    6 => invalid.author = None,
+                    7 => invalid.content = None,
+                    _ => unreachable!(),
+                }
+                let error = commit_from_mega_model_with_kind(invalid, kind)
+                    .expect_err("malformed metadata must fail");
+                assert!(!error.to_string().contains("private-invalid-signature"));
+            }
+        }
     }
 }

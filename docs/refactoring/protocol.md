@@ -1,4 +1,52 @@
-> **当前H0与MTR01自身审查事实（2026-10-27 01:49:08 UTC）：** 本地Claude H0 R5及MTR01自身ER05/H0增量R1均四项PASS、P0/P1=0、输入无漂移；MTR01 R1 session `ff56448a-ad5d-43b2-9428-eef13a34d3cb`，manifest `e0a574e801952437a48dadd7f61695e1a850578dbde95ee0352a5db261cb97bb`、output `f8b3a7d438f6556df6a96730de8106f79057146fb0d7d16f045be6cf4dd397ad`。本次审后勾选与事实记账须通过新B及独立增量复核后才提交；自身R1 PASS不代MTR40自己的ER05或任何C/D。正式Mega24/118、Libra原计划0/26。
+> **FIX-MTR-15自身ER05通过与C前置记账（2026-10-27T10:59:24.365358+00:00，版本化C/D待）：** 现行Mega122/Libra26，完成25/0、联合25/148；MTR40→FIX-MTR-15→FIX-MTR-16→FIX-MTR-17→MTR13→FIX-MTR-14→MTR39→MTR92→MTR12/H1→LTR10→LTR11→LTR12→LTR01/H2。FIX15源码、A及增量B已核，自身本机Claude R1 ER05/H0/VERDICT三PASS；现in-progress/locally-accepted，版本化全量C/D待；MTR13 blocked/空，FIX16/17 pending。 LTR10仍分别等待H0、QUALIFICATION、H1、WRITERS、LIVE五门；root已只读核Grok交接db331cd，资格仍incoming，F2 P1/unknown、原始C/最终资格、来源Claude及受控整合证据未闭合。原Libra由Grok独占；Libra独立692464e后的三治理只本地签名、由LTR01承载，未push。 本机Claude自身R1 session2573ef00-d676-4597-acce-08e26034bda7明确ER05/H0/VERDICT三PASS、P0/P1=0；root已核1056最终输入SHA/mode及实际exit0采纳。post-A3增量B真实PASS，收据SHA256 5a771b78ab2fdb845eb437c6a5783430d75be72938ee81e72fa4e2de29da551c。A3完整target6/24case、pack170、fmt/strict/VER6 exit0，lib10按779原运行时pin carry，root原窗口3102.229/3600秒完成且107旧DB及所有自有资源闭合、无手工清理。原A1/A2 FAIL/STOP保留。root具名P2在本次前滚消除旧“B待核”陈述；新九治理必须经增量ER05/H0审查并进入版本后完整C，不能借旧B/旧review冒充已覆盖。R1报告首条把integration目标写成各A阶段同hash是措辞错误：只有五生产文件跨A不变，integration分别经历A2类型和A3 oracle修订，最终实际与A3绑定；原RED函数/前缀不变，最终增量审查须明确订正。P3保留无效parents严格拒绝、未调用TLS旧pub入口债务、未增加tree正文/ID一致性保证；ViewRepo不调用默认traverse，VER5按实际调用说明。C具体执行器仍待真实审查，无bump/提交/推送/tag/Release/D完成声明。 无版本/提交/推送/发布；不扩大Harbor例外，旧FIX3 STOP/预算及历史C2根因未知不变。以下早期准入/待审文字按其时点保留。
+
+> **FIX-MTR-15源码及A后置记账（2026-10-27T10:50:33.541442+00:00，自身ER05/C/D待）：** 现行Mega122/Libra26，完成25/0、联合25/148；MTR40→FIX-MTR-15→FIX-MTR-16→FIX-MTR-17→MTR13→FIX-MTR-14→MTR39→MTR92→MTR12/H1→LTR10→LTR11→LTR12→LTR01/H2。FIX15源码候选及自身A/结构B已核，仍in-progress/空，自身ER05与版本化C/D待；MTR13 blocked/空，FIX16/17 pending。 LTR10仍分别等待H0、QUALIFICATION、H1、WRITERS、LIVE五门；root已只读核Grok交接db331cd，资格仍incoming，F2 P1/unknown、原始C/最终资格、来源Claude及受控整合证据未闭合。原Libra由Grok独占；Libra独立692464e后的三治理只本地签名、由LTR01承载，未push。 恢复计划98b6c605六PASS；RED执行R3 eedba716四PASS；A3恢复/ER03/H0/执行本机Claude8aa1b673七PASS。A1编译及记录器FAIL、A2新oracle错误FAIL/STOP均保留；A3按公开原模式验证v0忽略filter/全量及v2实际过滤，未增加v0功能，未减少24场景或放松对象断言。受控RED两例各101/0pass1fail；同一测试在最终A变GREEN。lib10仅从A1按779运行时输入及原始日志精确carry；A3 target6(24真实Git场景)/pack170均0失败0忽略，fmt/strict exit0。全部执行仍受A1原09:58:15.249031–10:58:15.249031Z窗口及末300秒root约束。A root收据`/tmp/fix-mtr15-acceptance-R3-20261027/root-adoption.json` SHA256 `c50da1779118a5377d19209b9929f4beae10a729a69f0ab4b51c553fd3c16adf`；本次后置治理新字节仍待结构B及自身Claude/跨仓H0复审。 无版本/提交/推送/发布；不扩大Harbor例外，旧FIX3 STOP/预算及历史C2根因未知不变。以下早期准入/待审文字按其时点保留。
+
+> **FIX15 A2失败与原协议oracle恢复候选（2026-10-27T10:35:40.817643+00:00）：** 现行Mega122/Libra26、完成25/0、联合25/148；MTR40→FIX-MTR-15→FIX-MTR-16→FIX-MTR-17→MTR13→FIX-MTR-14→MTR39→MTR92→MTR12/H1→LTR10→LTR11→LTR12→LTR01/H2。FIX15 A2实际FAIL/STOP，fmt通过、集成6例4PASS/2FAIL、24场景仅4完成，pack170/strict/audit未执行；源码候选未提交，仍in-progress/空，自身ER05/C/D待。MTR13 blocked，FIX16/17 pending。 LTR10的H0、QUALIFICATION、H1、WRITERS、LIVE五门仍分别核验；root只读核Grok交接db331cd，资格仍incoming，F2 P1/unknown及原件、来源Claude、受控整合证据未闭合。root仅写独立Libra692464e后治理，由LTR01承载，不push、不覆盖Grok原目录。 A2执行本地Claude65c90ef4六PASS只准其合同；A2 10:27:26.914510Z claim、10:29:13.139207Z外层exit1，matrix实际exit101；两hash的v0 root blob:none均收到8而测试期望6。root10:30:49独立核107旧DB及自有进程/端口/容器无变化、无人工清理，A2仍FAIL。原件`/tmp/fix-mtr15-acceptance-R2-20261027/terminal.json` SHA256 `a8d38511764c62f68a41d7d3f9deb775c0e8e41962cc8f291945db906590c820`；A1失败、两受控RED和lib10通过不改。失败case的packet/pack未在断言前落盘，已随fixture销毁，不声称已观察其协商或warning。公开4ed7b25的smart.rs无v0 filter广告/解析/dispatch，protocol.md明确仅v2 blob:none，双语guide亦说明v0回退全量；错误在本卡新增oracle把v0视作过滤成功。A3候选维持6例/24场景、五命令一次，v0必须同时证明无filter广告/无filter请求、Git明确忽略提示、精确完整对象及fsck；v2仍精确无blob对象、真实filter请求，三算法lib10仅核未变输入后carry。无新增v0产品功能、无减少矩阵/放松集合/提高timeout。候选及执行器`/tmp/fix-mtr15-acceptance-R3-20261027/`尚未准入或执行，须本地Claude恢复/ER03/H0审查PASS后才应用测试并重新冻结实际输入。原窗口09:58:15.249031–10:58:15.249031Z、命令截止10:53:15.249031Z及root末300秒不变；不足即STOP，不自动另开窗口。 旧FIX3全部预算/STOP、历史C2根因未知保留；无ER05/C/D、提交/推送/发布完成声明。以下旧段保留其时点。
+
+> **FIX-MTR-15 A1失败及同窗恢复候选（2026-10-27T10:15:35.805378+00:00，自身ER05/C/D待）：** 现行Mega122/Libra26，完成25/0、联合25/148；MTR40→FIX-MTR-15→FIX-MTR-16→FIX-MTR-17→MTR13→FIX-MTR-14→MTR39→MTR92→MTR12/H1→LTR10→LTR11→LTR12→LTR01/H2。FIX15源码候选已实现；A1 fmt及lib10通过，matrix编译E0277且终态记录器FileNotFoundError，A1 STOP；fixture参数和退出记录器已修，A2恢复/沿用lib10待真实Claude准入。仍in-progress/空，自身ER05与版本化C/D待；MTR13 blocked/空，FIX16/17 pending。 LTR10仍分别等待H0、QUALIFICATION、H1、WRITERS、LIVE五门；Grok独占原Libra资格交接，root未消费、未重复。Libra独立692464e后的三治理只本地签名、由LTR01承载，未push。 恢复计划98b6c605六PASS；RED执行R3 eedba716与A1执行R2 0d669305各四PASS仅准其合同。受控RED两例各101/0pass1fail；A1 lib10/0/0及fmt exit0，matrix未运行、child exit未保存不猜测，外层实际exit1，后续门未执行。root于10:11:46核107旧库owner/oid/comment不变、无残留，未手工清理。A1原件`/tmp/fix-mtr15-acceptance-20261027/terminal.json` SHA256 `ae4be33871f009f221b429be578f517cd2ce07a5a5dfaae4bde85a325e627117`。A2修订只改集成测试一行及记录器，拟沿用未变lib10；原3600秒时钟自09:58:15.249031 UTC开始，绝对10:58:15.249031 UTC截止、最后300秒留root，不重置预算。A2五命令和治理H0待本地Claude复审，本次无新的执行claim。 无版本/提交/推送/发布；不扩大Harbor例外，旧FIX3 STOP/预算及历史C2根因未知不变。以下早期准入/待审文字按其时点保留。
+
+> **恢复计划R2实际采纳（2026-10-27 08:49:51 UTC）：** 本地Claude98b6c605六PASS，root核720输入无漂移；FIX-MTR-15现in-progress/空，准源码及自身测试实施，A/RED/C资源合同与自身ER05仍待。MTR13保持blocked/空，FIX16/17尚未开工；无本轮bump/提交/推送/发布，25/122与0/26不变。以下待审文字为此前时点，原R1 FAIL及预算保持。Grok原Libra独占不变。
+
+> **恢复登记R1 FAIL后的R2候选（2026-10-27 08:42:45 UTC）：** P1为两仓现行H0/状态字段滞后；已前滚并保留旧值为历史，三卡粒度/发布规则未放宽。当前现行122/26恢复候选，完成Mega25/122、Libra0/26、联合25/148；MTR40→FIX-MTR-15→FIX-MTR-16→FIX-MTR-17→MTR13→FIX-MTR-14→MTR39→MTR92→MTR12/H1→LTR10→LTR11→LTR12→LTR01/H2。MTR13 blocked/空，FIX15正式计划/H0待本地Claude增量审查；Libra独立副本692464e及未提交三治理候选，LTR01承载，未push；Grok原目录独占，资格消费待其交接。 正式R2终态前源码不实施；不授A/C窗口。
+
+> **原生算法恢复登记候选（2026-10-27 08:29:16 UTC）：** 新增恢复登记候选Mega122/26、完成25/0、联合25/148；当前前沿FIX-MTR-15（正式计划/H0待Claude，未实施），MTR13 blocked/空。串行MTR40→FIX-MTR-15→FIX-MTR-16→FIX-MTR-17→MTR13→FIX-MTR-14→MTR39→MTR92→MTR12/H1→LTR10→LTR11→LTR12→LTR01/H2；各FIX独立patch/自身完整C-D，不聚合、不提前搬运MTR13。Grok独占原Libra资格交接，root未消费；LTR10五门与LTR01发布边界保留。 MTR13 SHA1 R5仅旧源32场景PASS，SHA256 R1/R2真实FAIL；最新strict Clippy R2 exit0只覆盖其冻结输入，不补完整验收。scope审查f8840a43/e7254190有限PASS不代表本次计划准入；所有旧失败/STOP及预算保留。
+
+> **MTR13 ER10外轴阻断（2026-10-27 07:57:31 UTC）：** SHA1 R5实际32场景PASS；SHA256 R1/R2在native fixture克隆阶段实际FAIL，R2定位converter.rs:896按worker线程默认Sha1解析64位tree OID而panic。MTR13 blocked/空，候选保留；必须另登记/审查前置FIX，当前只读审计最小闭合范围，未改native源码、不削减SHA256覆盖。正式恢复DAG/H0待修订与审查，不据旧PASS准入。完整验收/最终ER05/C-D与发布仍待，正式完成数25/0不变；Grok继续独占原Libra。
+
+> **MTR13矩阵R4失败后测试oracle修订（2026-10-27 07:35:19 UTC）：** 源预审 `c919519d` 四PASS仅静态；实际R4 exit101，incremental v0首包通过后normal v0未请求include-tag，错误的全mode协商断言失败。现按真实wants保留精确E/ODB，具名正控仍强制协商，新增仓外packet/PACK留存及完整have集合oracle；R5正在执行。未取得完整A/B、最终ER05或C/D，未提交/推送/发布；旧失败保留。既有广告缺陷登记为open债务DEBT-MTR13-V2-PEEL，后续单轴FIX须另审。Grok独占原Libra不变。
+
+> **MTR13 tag ER03 R2有限准入PASS（2026-10-27 07:01:21 UTC）：** 本地Claude `b501fc98` 五PASS、P0/P1=0；root复算32项输入并具名采纳八P2。准许在原同轴5生产文件/4落点I中实施，不等于完整A/B、源码ER05或C/D。commit预算诊断R1实际1PASS；其它诊断/失败按原件保留，未提交、推送或发布。原Libra仍由Grok独占，未消费资格交接。下方此前候选/FAIL均为历史时点。
+
+> **MTR13 tag计划R1失败后R2候选（2026-10-27 06:53:21 UTC）：** 本地Claude R1 `b169ea17`明确ER03/TAG_SEMANTICS/VERDICT FAIL（P0=0、P1=1）；当前仅前滚精确pack/ODB集合、tag负控与八P2，新增接口源码未实施，R2待审。ref容量R1真实exit101，v2列表计数8196/预期4098，尚未判根因；读失败R1与ref race R1各1PASS仅端点诊断，race仍须成功正控。MTR13完整A/B、ER05、C/D、提交/推送/发布均待；旧FAIL/STOP预算保留，Grok独占原Libra交接工作区。
+
+> **历史候选：MTR13 tag协商修订（2026-10-27 06:38:26 UTC）：** 当前源码编译exit0且哈希无漂移；SHA1矩阵R3真实exit101，HTTP v0 shallow缺失annotated tag，原始日志 `/tmp/mtr13-matrix-diag-R3-20261027/raw.log` SHA256 `74f7e357f513c1121b200ef1054749931187ab4721525d566c2faac812f26d6f` 保留。标准Docker Git v0/v2浅克隆均保留该tag；拟在原code-only pack行为轴加入请求级include-tag传递，I新增pack/mod.rs，规模4落点/5生产文件/M，独立patch边界不变。新的ER03及本地Claude计划审查通过前不实施新增写集；本卡完整A/B、自身ER05、C/D及提交/发布均未完成。原FAIL/STOP及预算不变，Libra资格交接仍由另一Agent负责。
+
+> **历史快照：MTR13实施中（2026-10-27 06:08 UTC）：** ER01/02/03及本地Claude入场审查 `92d5c3d0-7347-4488-b4b5-5347ad8a1c54` 五项PASS，root采纳收据 `/tmp/mtr13-entry-20261027/root-adoption.json` SHA256 `13686c6095f82b667bba3a948d88ec047eb6b11e69d4c9279b2ab2dfe5740428`；MTR13为in-progress/空。受控旧树泄漏RED及旧局部修复GREEN只覆盖当时输入；扩展矩阵R1/R2因测试夹具假定客户端保留pack而exit101，原件分别为 `/tmp/mtr13-matrix-diag-20261027/terminal.json` SHA256 `a5cadb3210aca44cc1c828680cc25c7126cf5680f2008b0143347ad990ee67db`、`/tmp/mtr13-matrix-diag-R2-20261027/terminal.json` SHA256 `30051d4047c7f70f071f292ea96bec37d70562daa88f34eb8dfd81971ac89ba0`。原始接收流oracle修订尚未验收。MTR13全部AC/VER、自身ER05、C/D、提交及发布均待；C资源合同仍须事前另审。Libra资格交接由另一Agent负责，root尚未消费；独立副本 `692464e` 未推送。所有历史FAIL/STOP及预算不变，回滚端到端300秒债务仍open。
+
+> **历史快照：MTR13开工核对候选（2026-10-27 05:27:56 UTC）：** 119/26跨仓H0与MTR01治理自身本地Claude R5 `780c9ce6-84e2-46f7-a60a-25b9af1eeff5` 五项PASS、P0/P1=0，root具名采纳；独立Libra副本三治理已精确签名+DCO提交 `692464ea35acd20dac269a732a2f54cec9081dcf`，树与受审字节相同，资格文件/行保留远端，未push，仍由LTR01覆盖。用户指定的另一Agent负责原目录资格交接，root未消费。Mega现行前沿为MTR13的ER01/02/03；本次六治理及卡片事实修订须自身结构B和本地Claude审查后才能实施，不代A/B、ER05、完整C/D或H1。原FAIL/STOP及所有预算不变；MTR13 C前资源合同须事前另审。
+
+> **历史快照：H0 R4采纳与P2处置（2026-10-27 05:21:40 UTC）：** 跨仓治理增量本地Claude R4 `87c47d25-ce39-4c28-b6f8-0e88c8523323` 五项PASS、P0/P1=0，仅覆盖其冻结输入；B-R4 `/tmp/mtr40-cross-repo-B-R4-20261027/receipt.json` SHA256 `7c64ee891aa480f2c70599ef3c8bda3a6a1d293ffb5a6080721245e419b63e34` 只证明该轮结构。root逐项处置P2：前滚现行索引；纠正前一历史横幅及修订行的计数笔误，H0 R3实际上是五项PASS（含MTR01_ER05），原历史字节保留；独立Libra副本HEAD/index/三写集后检 `/tmp/mtr40-h0-r4-adoption-20261027/libra-postcheck.json` SHA256 `fd4046f703fa46a713d38c69b842e042e55bfd31a8400246b7ea69510e97c090`；资格交接表述改为另一Agent负责、root未消费。本次新字节须结构B及本地Claude复核，未通过前不授MTR13开工；Libra三治理由LTR01承载，原目录由另一Agent负责。旧FAIL/STOP、资格文件及五门不变。
+
+> **历史快照：H0 R3审查采纳与独立副本边界（2026-10-27 05:16:33 UTC）：** 119/26跨仓H0 R3真实本地Claude session `3628ca85-bb51-4dfd-8ae5-9d6feed88a57` 四项PASS，P0/P1为0；仅覆盖当时冻结输入。root具名处置两项P2：两日期计划补04:33:58修订行；结构B-R3 `/tmp/mtr40-cross-repo-B-R3-20261027/receipt.json` SHA256 `e4874305decda6eab0f052c0ec1858695753e67a3c7d536c302f1af2a6db18b9` 对应119/26、25/0、165节点335边及778链接，仅证明其当时结构。本次九文档事实与边界新字节仍须重新结构B和真实本地Claude联合增量审查；未审通过不授MTR13开工。当前H0候选中的Libra `86553fc` 属独立副本 `/media/eli/data/libra-h0-sync-20261026`，不代表原目录HEAD；原目录当次rebase为 `ecd6150`，现由用户指定的另一Agent负责资格交接，root不在该目录写入，不重复其任务。资格文件/行继续保护，LTR10五门、LTR01承载、旧FAIL/STOP和预算不变。
+
+> **历史快照：H0 R2审查与P2处置（2026-10-27 04:33:58 UTC）：** 119/26两仓实际冻结输入的本地Claude H0 R2 `66282b4f-b4f1-4ec8-88ec-574e1e83f2af` 四项PASS，root核33项输入并采纳；此前H0 R1 `32332df7` FAIL保留。本次仅处置R2的六项具名P2并补事实记录，九个本地治理文件仍未提交，新字节须结构复扫与真实Claude增量复审，不能用R2 PASS覆盖新字节。上次实际结构B原件 `/tmp/mtr40-cross-repo-B-R2-20261027/receipt.json` SHA256 `b945bd1423d520e3839913b307bff620fda2330eab69a40bf25e42c6cd775892`，绑定当时119/26、25/0、165节点335边及10个指向受审副本的跨仓链接。Mega MTR40完整C/D；Libra双父86553fc已整合，资格原文保留，三治理仍由LTR01承载、未push；资格交接另由用户安排的Agent处理。
+
+> **历史快照：H0首轮FAIL后前滚（2026-10-27 04:26:54 UTC）：** MTR40 `4ed7b25` / `v0.42.77` 完整C/D已核；Mega登记候选119卡/25 done、Libra26卡/0 done。Libra本地双父signed+DCO提交 `86553fcea658c789ae61bfca7e3cba39d83cee09` 已非破坏整合d04与远端380，资格文件及其状态行与远端逐字一致；三Libra治理尚未提交，LTR01承载、未push。119/26 H0首轮本地Claude `32332df7-effe-49a7-a8fd-b3d37efd6e1b` FAIL（登记和发布边界PASS，H0现行字段两项P1）；本轮按真实终态统一两仓现行字段、保留旧时点记录并处置P2，最终增量审查待，不授后继开工或声称H1/资格完成。旧FIX3 STOP与预算不变。
+
+> **历史快照：登记复审R2后的修订（2026-10-27 04:12:53 UTC）：** Mega实际登记候选119卡、25张done，Libra26卡、0张done；结构B-R3确认为165节点335边无环。登记复审R1 `197bf484`、R2 `5dfe38c4` 均FAIL，R2确认责任卡登记PASS但发现里程碑旧链，现前滚修订并保留失败；六Mega治理仍未提交，当前字节须新本地Claude复审，两仓H0及Libra整合仍待。原FIX3 STOP/预算、MTR40真实完整C/D与资格另机责任不变。
+
+> **历史快照：登记增量修订（2026-10-27 04:04:58 UTC）：** 实际B-R2扫描Mega119/Libra26、完成25/0、165节点335边无环；FIX14方案R7五PASS，实际登记审查R1 `197bf484-bdc7-434f-8d5c-843e80ba1715` FAIL，原失败保留。本轮前滚现行状态索引与MTR13→FIX14→MTR39依赖文字、逐项处置P2；本地六治理尚未提交，新的最终审查及Libra整合后H0仍待，不授后继实施。MTR40实际C/D完成；不重置FIX3预算或声称数据库历史根因。
+
+> **历史快照：FIX14登记候选（2026-10-27 03:59:56 UTC）：** MTR40 C/D完成、六文件收口Claude R3及责任卡方案R7 `3258f432-1803-4b23-b328-21811c4662ca` 五PASS，root分别采纳；R1–R6失败保留。按R7 P2写入FIX-MTR-14、MTR13六治理I、MTR39串行边与窗口交还要求；本轮修改是本地待最终真实Claude审查的治理候选，尚未提交或授权卡开工。实际扫描应为Mega25/119、Libra0/26、联合25/145；两仓H0新字节及Libra非破坏整合仍待。当前代码前沿先完成治理终审，再MTR13→FIX14→MTR39→92→12/H1。FIX14未知时只能按受审ER10及具名DEFER前滚，不把历史FIX3根因或预算重置。
+
+> **历史快照：MTR40收口审查（2026-10-27 03:50:47 UTC）：** MTR40以 `4ed7b25` / `v0.42.77` 完成全部真实C/D，正式Mega25/118、Libra原计划0/26。本地六治理文件经Claude增量R3 session `51136865-89ec-4390-8217-0a37a591c398` 四PASS、root采纳；六文件仍未提交或推送，候选由MTR13承载，需后续正式I变更与审查。本次按R3 P2前滚整理，增量复审待；MTR13开工前须先登记并审查测试数据库责任卡，该卡候选R1–R5 FAIL保持，未知根因不归因FIX3。Libra本地d04与远端380待非破坏整合，三治理由LTR01承载；full pack保密由MTR13实现和验收。
+
+> **历史快照：MTR40收口增量候选（2026-10-27 03:45:27 UTC）：** 发布提交 `4ed7b25` / `v0.42.77` 的完整C及main/tag D均已真实通过，MTR40 done/complete；Mega25/118、Libra0/26。收口Claude R1 `bc65abe8` 与R2 `caf0445c` 均确认C/D PASS但因状态同步FAIL，原失败保留；本轮补齐现行H0/环境/阶段/MTR01字段，六文件仍未提交且增量复审待。后置六Mega治理拟由MTR13 C/D承载：MTR13的治理I已登记候选，须经ER03和真实Claude审查后才能实施；责任卡候选R1–R4均FAIL，尚未登记，MTR13开工前须完成其登记及审查。Libra本地d04与远端380待非破坏整合，三治理由LTR01承载，qualification文件只读。D核验SHA256 `58f511b03e6ec8deca74eec286b7a9b37595fa10d5b48633378d9e959f4900ea`；不宣称full pack保密或测试库根因已证。
+
+> **历史快照：MTR40实际C/D闭合（2026-10-27 03:39:11 UTC）：** MTR40经自身真实Claude审查、完整本地C、签名DCO提交 `4ed7b25a3922a966c9baad033b1c09ebccdf739a` 与 `v0.42.77` 发布后，main D `40442697837` 和tag D `40442760772` 的双架构及docker合成均实际success；Mega正式25/118、Libra原计划0/26。后置治理状态仅在本地，需复审及合法后续承载；Libra计数待非破坏整合后由LTR01承载。MTR40不提供full pack内容保密，MTR13仍需完成对象闭包；测试DB残留责任卡登记审查是后继实施前P2条件，未知根因不归因FIX3。
+
+> **历史快照：H0与MTR01自身审查事实（2026-10-27 01:49:08 UTC）：** 本地Claude H0 R5及MTR01自身ER05/H0增量R1均四项PASS、P0/P1=0、输入无漂移；MTR01 R1 session `ff56448a-ad5d-43b2-9428-eef13a34d3cb`，manifest `e0a574e801952437a48dadd7f61695e1a850578dbde95ee0352a5db261cb97bb`、output `f8b3a7d438f6556df6a96730de8106f79057146fb0d7d16f045be6cf4dd397ad`。本次审后勾选与事实记账须通过新B及独立增量复核后才提交；自身R1 PASS不代MTR40自己的ER05或任何C/D。正式Mega24/118、Libra原计划0/26。
 
 > **历史快照：MTR01事实编辑时点（2026-10-27 01:42:24 UTC；B-R6实际终态2026-10-27T01:43:06Z）：** 本地Claude H0 R5对冻结输入四项PASS、P0/P1=0、无漂移（session `3e1108ae-c79c-4c0c-8bda-cc5971ba8f48`；manifest `f468629c63bfef8c4d6d1ced30462470bd1cf983377e45d19d0152a98c7528fe`，output `ba6fd7a2f98d80bf6ea466d705e5f726de9a797486b0a894163c6ff28e16cea9`）。本段、P2状态索引及资格事实为审后增量，B-R6已实际通过，仍须本卡自身ER05/增量H0审查绑定当前SSOT；MTR01/MTR40自身ER05、精确提交及各自C/D尚未取得。正式Mega24/118、Libra原计划0/26；MTR40 A3/A4/smoke19及源R4 PASS，仍in-progress/locally-accepted。
 
@@ -164,6 +212,13 @@
 
 # Git Protocol 兼容性改进计划
 
+## 原生读取对象算法（FIX-MTR-15实现边界）
+
+发布资格以[任务卡及C/D收据](../plan/plan-20261015.md#task-fix-mtr-15-原生读取与惰性物化的显式对象算法)为准。原生advertise惰性物化及upload-pack以monorepo配置算法解析tree/commit，并在首次或tombstone续接时构造同算法提交。full、incremental、shallow、blob:none与直接对象PACK使用该显式算法；协议模式不变：v0不宣告filter，Git带--filter时明确提示忽略并完整下载，v2 blob:none实际过滤blob；无效metadata通过既有错误类型拒绝，错误不包含原始signature正文。
+
+本卡不改变锁/CAS、物化时机或已有对象，不修复存量混合格式对象。原生trunk写入由FIX-MTR-16、ImportRepo往返由FIX-MTR-17分别恢复，MST2 publication与其余TLS债务仍保留；不能从读取测试推导全流程SHA256/Blake3支持。共享协议及跨仓依赖仍以[traces契约](traces.md)为唯一事实源。
+
+
 本文档记录 `mega2` 当前 Git SSH/HTTP 协议实现的现状分析、主要兼容性问题、风险点和分阶段改进计划，用于提升与标准 Git 客户端的兼容性。
 
 > **治理规范**：本文档遵循 **`../general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
@@ -264,7 +319,7 @@
 
 4. **认证上下文已统一（HTTP/SSH）。** HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，commit binding 绑定到 authenticated actor。receive-pack 尚未做 repo/path 级 push 权限校验。
 
-5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 重新 advertise 已由 HTTP CL delete smoke 覆盖的 `delete-refs`，但不再 advertise 未验证的 atomic、report-status-v2、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag；v2 不再 advertise 未 act-on 的 `server-option`。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format` 落地 SHA-1 默认策略；**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 `.github/workflows/git-protocol-smoke.yml` 在 CI 中自动化执行**。用户可见的分支与 Tag 规则见 [`../user-guide.zh.md`](../user-guide.zh.md)。
+5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 重新 advertise 已由 HTTP CL delete smoke 覆盖的 `delete-refs`，但不再 advertise 未验证的 atomic、report-status-v2、quiet、no-thin；upload-pack当前发布版不advertise include-tag；MTR13候选拟仅为支持该语义的ImportRepo按handler通告，Monorepo/ViewRepo保持不通告，须自身C/D后生效；v2 不再 advertise 未 act-on 的 `server-option`。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format` 落地 SHA-1 默认策略；**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 `.github/workflows/git-protocol-smoke.yml` 在 CI 中自动化执行**。用户可见的分支与 Tag 规则见 [`../user-guide.zh.md`](../user-guide.zh.md)。
 
 6. **SSH 多 channel 状态已隔离，并已支持 protocol v2。** `SshServer` 按 `ChannelId` 保存独立 `GitSshChannelState`；SSH client 通过 `GIT_PROTOCOL=version=2` 请求 v2 时，server 返回 v2 capability advertisement，并在 upload-pack data 阶段分发 `ls-refs` / `fetch` command。
 
@@ -279,7 +334,7 @@
 | SSH git-receive-pack | 已实现（per-channel state） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；每个 SSH channel 拥有独立的 receive-pack 缓冲区，多 channel 不再共享状态。 |
 | SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
 | 权限与认证 | 已统一（读写策略化） | HTTP receive-pack 有 Bearer/Basic token 认证；review SSH 走 publickey，storage-only `push_auth=token` 时 SSH `auth_password` 命中 `lookup_push_token` 后将 token `name` 写入 `authenticated_user`。HTTP/SSH commit binding 均绑定到 authenticated actor（`set_authenticated_user`）。upload-pack 匿名访问已策略化：`check_upload_pack_access` 按 `git.anonymous_access`（默认 `true`）放行匿名 clone/fetch，关闭时无 token 返回 `Forbidden`（3 个单测覆盖），HTTP（`http.rs:53/217`）与 SSH（`ssh.rs:149`）共用。receive-pack 通过 `check_push_permission` 走 Cedar `pushRepo` 授权：未认证 push 直接 `Forbidden`（不进入 unpack），已认证时按 `state.entity_store` 策略裁决（策略库为空则放行），HTTP（`http.rs:64/355`）与 SSH（`ssh.rs:140`）共用。更细粒度 repo/path ACL 与基于策略的 push-deny 协议层单测待后续。 |
-| Capability advertise | 保守收敛 + truth table 已建立 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`；v2 移除 `server-option`。`side-band-64k`/`ofs-delta` 已覆盖 advertise/parse（ofs-delta pack decode 委托 `git-internal`）；`object-format` 落地 SHA-1 默认策略；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控非 Monorepo handler。**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 CI smoke gate 覆盖**。 |
+| Capability advertise | 保守收敛 + truth table 已建立 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack当前发布版移除 `include-tag`，MTR13候选仅ImportRepo按handler通告（待C/D），其余handler保持移除；v2 移除 `server-option`。`side-band-64k`/`ofs-delta` 已覆盖 advertise/parse（ofs-delta pack decode 委托 `git-internal`）；`object-format` 落地 SHA-1 默认策略；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控非 Monorepo handler。**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 CI smoke gate 覆盖**。 |
 | 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()`、`git-lfs-authenticate` response serialization `.unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23/24）；**2026-06-28 更新**：`Repo::new` 的非 UTF-8 path/file_name `unwrap()` 已改为 `ProtocolError::InvalidInput`，`SmartSession::git_upload_pack` 中 `full_pack`/`incremental_pack` 的 `unwrap()` 已映射为协议错误；**2026-06-28 更新 2**：HTTP Git 路由已抽出 `GitProtocolPath` parser，移除内联 `.git` 替换与 404 `unwrap()`；**2026-06-28 更新 3**：`contract/git_protocol/http.rs` 中 response builder、`HeaderValue::from_str`、upload-pack sideband `read_buf` 的 `unwrap()` 已收敛；**2026-06-28 更新 4**：`contract/git_protocol/ssh.rs` 中 LFS `Duration::try_seconds(...).unwrap()` 与 `channel_eof` 的 `expect("state just found")` 已移除。Protocol 当前范围内剩余 `unwrap()` 已基本收敛；vault/legacy 路径与数据迁移工具不在本次范围。 |
 
 ## 硬约束与不可违反的原则
@@ -691,7 +746,7 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 
 历史风险：曾 advertise 一些未完整实现或解析不足的能力。当前状态（均已解决）：
 
-- `include-tag`：已从 upload-pack advertise 移除（pack 生成未按 include-tag 语义验证）。
+- `include-tag`：当前发布版已从upload-pack advertise移除；MTR13候选通过`supports_include_tag`仅向ImportRepo通告，v0从首want能力、v2从fetch参数传递请求级选项，默认handler不通告、不附带。附带集合与负向限制唯一事实源见[traces契约§6](traces.md#6-普通代码-clone-与旧-git-traces)，须完整验收/C-D后生效。
 - `delete-refs`：已重新 advertise（HTTP smoke 覆盖 CL delete；Monorepo 拒绝 Git-client tag；SSH delete 矩阵仍待补齐）。
 - `atomic`：已从 advertise 移除（未实现原子 ref 更新）。
 - `quiet`：已从 advertise 移除（未实现 progress 抑制语义）。
@@ -703,7 +758,7 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 
 - 建立 capability truth table：advertise、parse、act-on、test 四列。
 - 没有行为支持和测试的 capability 先不要 advertise。
-- 已完成首批：`atomic`、`report-status-v2`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；`delete-refs` 已在 HTTP CL delete smoke 覆盖后重新声明（Monorepo Tag 通过 API 管理）。
+- 历史已完成首批（MTR13 include-tag候选另见上条）：`atomic`、`report-status-v2`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；`delete-refs` 已在 HTTP CL delete smoke 覆盖后重新声明（Monorepo Tag 通过 API 管理）。
 - ✅ 对 `object-format=sha1` 明确策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；mega2 策略对 SHA-1-only repo 不 advertise），由单测 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 ### pkt-line parser 错误模型已收敛，streaming reader 仍待后续
@@ -981,7 +1036,7 @@ LFS:
 工作项：
 
 1. 建立 capability truth table。
-2. 移除或补齐 `atomic`、`report-status-v2`、`quiet`、`include-tag`、`delete-refs` 等能力。
+2. 移除或补齐 `atomic`、`report-status-v2`、`quiet`、`delete-refs` 等能力；include-tag按上文MTR13候选区分handler，待自身C/D。
 3. 明确 `ofs-delta`、`no-thin`、`side-band-64k` 的 encode/decode 测试。（✅ 2026-09-16：`no-thin` 由 advertise 断言 + RCV-01 端到端回归覆盖，见上表与 truth table）
 4. ✅ 对 SHA-1 object format 做显式策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；mega2 策略对 SHA-1-only repo 不 advertise），由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
@@ -1008,7 +1063,7 @@ LFS:
 | `delete-refs` | ✅ 已声明 | ✅ HTTP CL delete + Monorepo tag-reject smoke | ❌ | N/A | HTTP smoke 已覆盖 CL delete；Monorepo 禁止 Git-client Tag；SSH delete 矩阵仍未补齐 |
 | `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
 | `no-thin` | ✅ receive-pack（2026-09-16 重新 advertise） | ❌（客户端侧语义，服务端无需 parse） | ✅ 依赖客户端不发送 thin pack；服务端解码器对残余 thin/malformed pack fail-closed 并经 `unpack_stream` 转为 typed 错误（2026-09-16） | ✅ `receive_pack_advertises_only_supported_baseline_capabilities` + RCV-01 端到端回归（默认 delta push） | 移除期间 thin pack 触发解码 panic/断连（RCV-01）；重 advertise 以匹配解码器 fail-closed 契约 |
-| `include-tag` | ❌ 已移除 (upload) | ❌ | ❌ | N/A | pack 生成未按 include-tag 语义验证，已从 advertise 移除 |
+| `include-tag` | 发布版移除；MTR13候选仅ImportRepo通告 | 候选v0首want/v2 fetch解析 | 候选按请求附带T(B) | MTR13精确集合/负控待验 | Monorepo/ViewRepo保持不通告、不附带；候选未通过自身C/D |
 | `server-option` | ❌ 已移除 (v2) | ✅ | ❌ | ✅ `v2_capability_advertisement_does_not_advertise_server_option` | v2 parsed capabilities 未被 inspect/act-on，advertise 会误导客户端；2026-06-30 从 v2 advertise 移除 |
 | `object-format` | ❌ protocol v1；✅ protocol v2 `object-format=sha1` | ✅ v2 capability advertisement | N/A | ✅ v1 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` + v2 capability 单测 | v1 保持 SHA-1 默认不 advertise；v2 capability list 显式声明 `sha1` |
 

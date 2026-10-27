@@ -6,7 +6,7 @@ use std::{
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash, get_hash_kind},
     internal::{
         metadata::EntryMeta,
         object::{
@@ -596,6 +596,21 @@ impl MonoStorage {
         txn: &DatabaseTransaction,
     ) -> Result<Vec<ObjectHash>, MegaError> {
         self.materialize_parents_on(txn, path, ref_name).await
+    }
+
+    pub async fn materialize_parents_in_txn_for_kind(
+        &self,
+        path: &str,
+        ref_name: &str,
+        txn: &DatabaseTransaction,
+        kind: HashKind,
+    ) -> Result<Vec<ObjectHash>, MegaError> {
+        let Some(row) = self.get_tombstone_in_txn(path, ref_name, txn).await? else {
+            return Ok(Vec::new());
+        };
+        let hash = ObjectHash::from_hex_for_kind(kind, &row.last_commit_hash)
+            .map_err(|_| MegaError::Other("invalid native tombstone parent identity".into()))?;
+        Ok(vec![hash])
     }
 
     async fn materialize_parents_on<C: ConnectionTrait>(
