@@ -73,10 +73,31 @@ fn encode_ls_refs_response(
 
     if !is_protocol_zero_id(head_hash) {
         if symrefs {
-            add_pkt_line_string(
-                &mut buf,
-                format!("{head_hash} HEAD symref-target:refs/heads/main\n"),
-            );
+            let target = git_refs
+                .iter()
+                .find(|git_ref| {
+                    git_ref.default_branch
+                        && git_ref.ref_hash == head_hash
+                        && git_ref.ref_name.starts_with("refs/heads/")
+                })
+                .or_else(|| {
+                    git_refs.iter().find(|git_ref| {
+                        git_ref.ref_name == "refs/heads/main" && git_ref.ref_hash == head_hash
+                    })
+                })
+                .or_else(|| {
+                    git_refs.iter().find(|git_ref| {
+                        git_ref.ref_name.starts_with("refs/heads/") && git_ref.ref_hash == head_hash
+                    })
+                });
+            if let Some(target) = target {
+                add_pkt_line_string(
+                    &mut buf,
+                    format!("{head_hash} HEAD symref-target:{}\n", target.ref_name),
+                );
+            } else {
+                add_pkt_line_string(&mut buf, format!("{head_hash} HEAD\n"));
+            }
         } else {
             add_pkt_line_string(&mut buf, format!("{head_hash} HEAD\n"));
         }
@@ -292,7 +313,7 @@ pub(crate) async fn handle_v2_fetch_with_handler(
         ));
     }
 
-    repo_handler.check_wants_and_ready(&want).await?;
+    let have = repo_handler.authorize_fetch(&want, &have).await?;
 
     let mut protocol_buf = BytesMut::new();
     let mut shallow_commits: Vec<String> = Vec::new();
@@ -1017,6 +1038,18 @@ mod tests {
             format!("{feature} refs/heads/feature\n"),
         ]);
         assert_eq!(without_symrefs, expected_without_symrefs);
+    }
+
+    #[test]
+    fn ls_refs_nonmain_default_names_visible_target() {
+        let head = "3333333333333333333333333333333333333333";
+        let refs = vec![git_ref("refs/heads/dev", head, true)];
+        let response = encode_ls_refs_response(head, &refs, &[], true, false);
+        let expected = expected_pkt_lines(&[
+            format!("{head} HEAD symref-target:refs/heads/dev\n"),
+            format!("{head} refs/heads/dev\n"),
+        ]);
+        assert_eq!(response, expected);
     }
 
     #[tokio::test]

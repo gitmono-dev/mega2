@@ -111,7 +111,10 @@ impl SmartSession {
         let service_type = self.service_type;
 
         // The stream MUST include capability declarations behind a NUL on the first ref.
-        let (head_hash, git_refs) = repo_handler.refs_with_head_hash().await?;
+        let (head_hash, git_refs) = match service_type {
+            ServiceType::UploadPack => repo_handler.refs_with_head_hash().await?,
+            ServiceType::ReceivePack => repo_handler.receive_refs_with_head_hash().await?,
+        };
         self.ensure_advertised_object_ids(&head_hash, &git_refs)?;
         let name = if is_protocol_zero_id(&head_hash) {
             "capabilities^{}"
@@ -309,7 +312,7 @@ impl SmartSession {
             ));
         }
 
-        repo_handler.check_wants_and_ready(&want).await?;
+        let have = repo_handler.authorize_fetch(&want, &have).await?;
 
         if have.is_empty() {
             repo_handler.prepare_pack(&want, &have).await?;

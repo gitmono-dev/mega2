@@ -12,6 +12,7 @@ mega2 是面向 Agent 的第二代 Mega 引擎，主要提供 Monorepo 引擎与
 
 - **Monorepo 路径**（根路径及 `import_dir` 之外的路径）只公开 `main` 分支。Git 客户端推送其它分支或 Tag 都会被拒绝。请通过 HTTP API（见第 4.2 节）或 Libra 命令 `libra mega2 browser`（见第 6 节）创建、查看和删除 Tag。
 - **ImportRepo 路径**位于 `[monorepo].import_dir`（默认 `/third-party`）下，遵循常规 Git 语义，允许多个分支和 Git 客户端 Tag 操作，可以持续推送更新，也可以清理（见第 2.6 节）。迁移或托管第三方仓库时可使用这类路径。
+- 旧 ImportRepo 中的 `refs/libra/traces` 不在普通代码引用列表中，也不作为代码 `HEAD`；只有该旧引用的仓库呈现 unborn 代码 `HEAD`。若某个代码引用的祖先混入旧 traces 提交，普通读取隔离该引用，其余干净引用仍可发现；显式请求受污染提交返回 409 `trace_history_in_code`。有代码推送权限的维护者可通过 receive-pack 显式删除或重置污染引用；receive 广告只向通过推送权限检查者显示该引用，标准 Git 客户端无法从广告取得隐藏旧 traces ref 的更新旧值。现阶段普通 clone 的 PACK **实际仍包含同仓的 traces 专属及受污染对象**，want/have 守卫不提供内容保密性；完整隔离必须等 [traces 协议](./refactoring/traces.md#6-普通代码-clone-与旧-git-traces)中的 MTR-13 完成。 旧视图的代码引用或 Tag、提交与授权对象超过已公布预算时返回 413 `response_budget`；读预算超时或数据库读取失败返回 503 `query_timeout`。没有旧 traces 引用的 ImportRepo 在普通代码广告中使用限量引用读取替代原读取，fetch 校验会新增一次引用读取；引用达到 4098 个时可能再按名探测并回退为完整读取。相关读取视图限时 10 秒；读超时或数据库读取失败返回 503 `query_timeout`，receive 广告的数据库读取失败也返回 503。缺失祖先或非提交分支顶点按 409 `object_integrity` 整仓拒绝，修复数据后重试。
 - 随仓库提供的 storage-only 服务不提供 Web UI，也不包含 Change List（CL）。其 OpenAPI 文档不包含 CL、issue、reviewer 和 user 路由。
 - Monorepo 路径上的 Git push 与产品 API 写入共用写入队列和路径 tip 权威；存活 ImportRepo 内部的编辑保存直接写该仓库，见第 4.1 节。写入流程见[架构设计](./architecture.zh.md)。
 

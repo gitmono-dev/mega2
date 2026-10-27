@@ -5107,6 +5107,601 @@ mod disabled_http {
         closed.expect("close HTTP traces pool");
     }
 
+    pub async fn code_ref_boundary_legacy_advertisement() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = Fixture::new(&db).await;
+        let result = AssertUnwindSafe(async {
+            fixture.prepare(&db).await;
+            let import_url =
+                git_cli::mega2_http_url(fixture.port, "/third-party/mtr94-control.git");
+            let code_tip = fixture.git_text(&["-C", "import", "rev-parse", "HEAD"]);
+            let code_shared_blob = fixture.git_text(&[
+                "-C",
+                "import",
+                "rev-parse",
+                &format!("{code_tip}:sentinel.txt"),
+            ]);
+            fixture.git(&["-C", "import", "switch", "--orphan", "trace-records"]);
+            fs::write(fixture.shared.path().join("import/sentinel.txt"), SENTINEL)
+                .expect("shared code and traces blob");
+            fs::write(
+                fixture.shared.path().join("import/trace-only.txt"),
+                b"legacy trace-only sentinel\n",
+            )
+            .expect("trace-only source file");
+            fixture.git(&["-C", "import", "add", "-A"]);
+            fixture.git(&[
+                "-C",
+                "import",
+                "-c",
+                "user.name=Traces Test",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "legacy traces orphan history",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &import_url,
+                "HEAD:refs/libra/traces",
+            ]);
+            let traces_tip = fixture.git_text(&["-C", "import", "rev-parse", "HEAD"]);
+            let traces_tree =
+                fixture.git_text(&["-C", "import", "rev-parse", "HEAD^{tree}"]);
+            let traces_blob =
+                fixture.git_text(&["-C", "import", "rev-parse", "HEAD:trace-only.txt"]);
+            let traces_shared_blob =
+                fixture.git_text(&["-C", "import", "rev-parse", "HEAD:sentinel.txt"]);
+            assert_eq!(
+                traces_shared_blob, code_shared_blob,
+                "fixture must really share a blob across code and legacy traces history"
+            );
+            for version in ["0", "2"] {
+                let refs = fixture.git_text(&[
+                    "-c",
+                    &format!("protocol.version={version}"),
+                    "ls-remote",
+                    &import_url,
+                ]);
+                assert!(
+                    !refs.contains("refs/libra/traces"),
+                    "ordinary code advertisement exposed legacy traces in v{version}: {refs}"
+                );
+                assert!(
+                    refs.lines()
+                        .any(|line| line == format!("{code_tip}\tHEAD")),
+                    "ordinary code HEAD did not remain at its authorized tip in v{version}: {refs}"
+                );
+            }
+            let traces_only_url =
+                git_cli::mega2_http_url(fixture.port, "/third-party/mtr40-traces-only.git");
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &traces_only_url,
+                "HEAD:refs/libra/traces",
+            ]);
+            for version in ["0", "2"] {
+                let refs = fixture.git_text(&[
+                    "-c",
+                    &format!("protocol.version={version}"),
+                    "ls-remote",
+                    &traces_only_url,
+                ]);
+                assert!(
+                    refs.is_empty(),
+                    "traces-only legacy repository must have no code HEAD or advertised code refs in v{version}: {refs}"
+                );
+            }
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &traces_only_url,
+                &format!("{code_tip}:refs/heads/main"),
+            ]);
+            for version in ["0", "2"] {
+                let refs = fixture.git_text(&[
+                    "-c",
+                    &format!("protocol.version={version}"),
+                    "ls-remote",
+                    &traces_only_url,
+                ]);
+                assert!(
+                    refs.lines()
+                        .any(|line| line == format!("{code_tip}\tHEAD")),
+                    "code HEAD must recover after a legacy traces ref was the first and default ref in v{version}: {refs}"
+                );
+            }
+            for (kind, oid) in [
+                ("commit", &traces_tip),
+                ("tree", &traces_tree),
+                ("blob", &traces_blob),
+            ] {
+                for v2 in [false, true] {
+                    let mut body = Vec::new();
+                    if v2 {
+                        pkt(&mut body, "command=fetch\n");
+                        body.extend_from_slice(b"0001");
+                        pkt(&mut body, &format!("want {oid}\n"));
+                        pkt(&mut body, "done\n");
+                        body.extend_from_slice(b"0000");
+                    } else {
+                        pkt(&mut body, &format!("want {oid}\n"));
+                        body.extend_from_slice(b"0000");
+                        pkt(&mut body, "done\n");
+                    }
+                    let response = request(
+                        fixture.port,
+                        Endpoint::Upload,
+                        "/third-party/mtr94-control.git",
+                        v2,
+                        &body,
+                        None,
+                        false,
+                    )
+                    .await;
+                    assert_eq!(
+                        response.status, 404,
+                        "traces-only {kind} want must be rejected in v{v2}"
+                    );
+                    assert!(
+                        response
+                            .body
+                            .windows(b"unknown_scope".len())
+                            .any(|window| window == b"unknown_scope"),
+                        "traces-only {kind} want must report the stable unknown_scope code"
+                    );
+                    assert!(
+                        !response.body.windows(4).any(|window| window == b"PACK"),
+                        "traces-only {kind} want must not produce a code pack"
+                    );
+                }
+            }
+            for v2 in [false, true] {
+                let mut body = Vec::new();
+                if v2 {
+                    pkt(&mut body, "command=fetch\n");
+                    body.extend_from_slice(b"0001");
+                    pkt(&mut body, &format!("want {code_tip}\n"));
+                    pkt(&mut body, &format!("have {traces_tip}\n"));
+                    body.extend_from_slice(b"0000");
+                } else {
+                    pkt(&mut body, &format!("want {code_tip} multi_ack_detailed\n"));
+                    body.extend_from_slice(b"0000");
+                    pkt(&mut body, &format!("have {traces_tip}\n"));
+                    pkt(&mut body, "done\n");
+                }
+                let response = request(
+                    fixture.port,
+                    Endpoint::Upload,
+                    "/third-party/mtr94-control.git",
+                    v2,
+                    &body,
+                    None,
+                    false,
+                )
+                .await;
+                assert_eq!(response.status, 200, "a trace-only local have must not break code fetch in v{v2}");
+                assert_eq!(
+                    response.body.windows(4).any(|window| window == b"PACK"),
+                    !v2,
+                    "v0 done fetch gets a full pack; v2 no-done round gets only NAK"
+                );
+                assert!(
+                    !response.body.windows(format!("ACK {traces_tip}").len()).any(|window| window == format!("ACK {traces_tip}").as_bytes()),
+                    "trace-only have must be dropped before ACK and pack generation"
+                );
+            }
+            let unknown_have = "f".repeat(40);
+            for v2 in [false, true] {
+                let mut body = Vec::new();
+                if v2 {
+                    pkt(&mut body, "command=fetch\n");
+                    body.extend_from_slice(b"0001");
+                    pkt(&mut body, &format!("want {code_tip}\n"));
+                    pkt(&mut body, &format!("have {unknown_have}\n"));
+                    pkt(&mut body, "done\n");
+                    body.extend_from_slice(b"0000");
+                } else {
+                    pkt(&mut body, &format!("want {code_tip} multi_ack_detailed\n"));
+                    body.extend_from_slice(b"0000");
+                    pkt(&mut body, &format!("have {unknown_have}\n"));
+                    pkt(&mut body, "done\n");
+                }
+                let response = request(
+                    fixture.port,
+                    Endpoint::Upload,
+                    "/third-party/mtr94-control.git",
+                    v2,
+                    &body,
+                    None,
+                    false,
+                )
+                .await;
+                assert_eq!(
+                    response.status, 200,
+                    "an unknown local have must not break an ordinary code fetch in v{v2}"
+                );
+                assert!(
+                    response.body.windows(4).any(|window| window == b"PACK"),
+                    "an unknown local have still permits a code pack"
+                );
+            }
+            for v2 in [false, true] {
+                let mut body = Vec::new();
+                if v2 {
+                    pkt(&mut body, "command=fetch\n");
+                    body.extend_from_slice(b"0001");
+                    pkt(&mut body, &format!("want {code_tip}\n"));
+                    pkt(&mut body, &format!("have {code_tip}\n"));
+                    body.extend_from_slice(b"0000");
+                } else {
+                    pkt(&mut body, &format!("want {code_tip} multi_ack_detailed\n"));
+                    body.extend_from_slice(b"0000");
+                    pkt(&mut body, &format!("have {code_tip}\n"));
+                    pkt(&mut body, "done\n");
+                }
+                let response = request(
+                    fixture.port,
+                    Endpoint::Upload,
+                    "/third-party/mtr94-control.git",
+                    v2,
+                    &body,
+                    None,
+                    false,
+                )
+                .await;
+                let expected_ack = format!("ACK {code_tip}");
+                assert_eq!(response.status, 200, "authorized code have remains usable in v{v2}");
+                assert!(response.body.windows(expected_ack.len()).any(|window| window == expected_ack.as_bytes()));
+                assert!(response.body.windows(4).any(|window| window == b"PACK"));
+            }
+            for v2 in [false, true] {
+                let mut body = Vec::new();
+                if v2 {
+                    pkt(&mut body, "command=fetch\n");
+                    body.extend_from_slice(b"0001");
+                    pkt(&mut body, &format!("want {code_shared_blob}\n"));
+                    pkt(&mut body, "done\n");
+                    body.extend_from_slice(b"0000");
+                } else {
+                    pkt(&mut body, &format!("want {code_shared_blob}\n"));
+                    body.extend_from_slice(b"0000");
+                    pkt(&mut body, "done\n");
+                }
+                let response = request(
+                    fixture.port,
+                    Endpoint::Upload,
+                    "/third-party/mtr94-control.git",
+                    v2,
+                    &body,
+                    None,
+                    false,
+                )
+                .await;
+                assert_eq!(
+                    response.status, 200,
+                    "a shared blob reachable from a code ref remains fetchable in v{v2}"
+                );
+                assert!(response.body.windows(4).any(|window| window == b"PACK"));
+            }
+            fixture.git(&["clone", &import_url, "mtr40-code-check"]);
+            assert_eq!(
+                fs::read(fixture.shared.path().join("mtr40-code-check/sentinel.txt"))
+                    .expect("authorized code blob after trace history"),
+                SENTINEL,
+                "a blob shared by code and traces remains readable in the code view"
+            );
+            fixture.git(&["-C", "import", "switch", "-c", "mixed-code"]);
+            fs::write(
+                fixture.shared.path().join("import/mixed-code.txt"),
+                b"code commit descended from legacy traces\n",
+            )
+            .expect("mixed code source file");
+            fixture.git(&["-C", "import", "add", "mixed-code.txt"]);
+            fixture.git(&[
+                "-C",
+                "import",
+                "-c",
+                "user.name=Traces Test",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "code history mixed with legacy traces",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &import_url,
+                "HEAD:refs/heads/mixed-code",
+            ]);
+            let mixed_tip = fixture.git_text(&["-C", "import", "rev-parse", "HEAD"]);
+            for v2 in [false, true] {
+                let mut command = Vec::new();
+                if v2 {
+                    pkt(&mut command, "command=ls-refs\n");
+                    command.extend_from_slice(b"0001");
+                    pkt(&mut command, "symrefs\n");
+                    command.extend_from_slice(b"0000");
+                }
+                let response = request(
+                    fixture.port,
+                    if v2 {
+                        Endpoint::Upload
+                    } else {
+                        Endpoint::Discovery
+                    },
+                    "/third-party/mtr94-control.git",
+                    v2,
+                    &command,
+                    None,
+                    false,
+                )
+                .await;
+                assert_eq!(response.status, 200, "clean code refs remain visible in v{v2}");
+                assert!(
+                    response
+                        .body
+                        .windows(code_tip.len())
+                        .any(|window| window == code_tip.as_bytes()),
+                    "clean main must remain discoverable"
+                );
+                assert!(
+                    !response.body.windows(b"refs/heads/mixed-code".len()).any(|window| window == b"refs/heads/mixed-code"),
+                    "contaminated ref must be isolated from upload discovery"
+                );
+                let mut want = Vec::new();
+                if v2 {
+                    pkt(&mut want, "command=fetch\n");
+                    want.extend_from_slice(b"0001");
+                    pkt(&mut want, &format!("want {mixed_tip}\n"));
+                    pkt(&mut want, "done\n");
+                    want.extend_from_slice(b"0000");
+                } else {
+                    pkt(&mut want, &format!("want {mixed_tip}\n"));
+                    want.extend_from_slice(b"0000");
+                    pkt(&mut want, "done\n");
+                }
+                let rejected = request(
+                    fixture.port,
+                    Endpoint::Upload,
+                    "/third-party/mtr94-control.git",
+                    v2,
+                    &want,
+                    None,
+                    false,
+                )
+                .await;
+                assert_eq!(rejected.status, 409, "mixed tip want must be rejected");
+                assert!(rejected.body.windows(b"trace_history_in_code".len()).any(|window| window == b"trace_history_in_code"));
+                assert!(!rejected.body.windows(4).any(|window| window == b"PACK"));
+
+                let mut trace_want = Vec::new();
+                if v2 {
+                    pkt(&mut trace_want, "command=fetch\n");
+                    trace_want.extend_from_slice(b"0001");
+                    pkt(&mut trace_want, &format!("want {traces_tip}\n"));
+                    pkt(&mut trace_want, "done\n");
+                    trace_want.extend_from_slice(b"0000");
+                } else {
+                    pkt(&mut trace_want, &format!("want {traces_tip}\n"));
+                    trace_want.extend_from_slice(b"0000");
+                    pkt(&mut trace_want, "done\n");
+                }
+                let trace_rejected = request(
+                    fixture.port,
+                    Endpoint::Upload,
+                    "/third-party/mtr94-control.git",
+                    v2,
+                    &trace_want,
+                    None,
+                    false,
+                )
+                .await;
+                assert_eq!(trace_rejected.status, 404, "legacy trace tip remains outside the code view after contamination");
+                assert!(trace_rejected.body.windows(b"unknown_scope".len()).any(|window| window == b"unknown_scope"));
+            }
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &import_url,
+                ":refs/heads/mixed-code",
+            ]);
+            for version in ["0", "2"] {
+                let refs = fixture.git_text(&[
+                    "-c",
+                    &format!("protocol.version={version}"),
+                    "ls-remote",
+                    &import_url,
+                ]);
+                assert!(
+                    refs.lines()
+                        .any(|line| line == format!("{code_tip}\tHEAD")),
+                    "explicit contaminated-ref deletion must restore the clean code view in v{version}: {refs}"
+                );
+                assert!(!refs.contains("refs/heads/mixed-code"), "repair must actually remove the polluted ref");
+                let v2 = version == "2";
+                let mut stale_have = Vec::new();
+                if v2 {
+                    pkt(&mut stale_have, "command=fetch\n");
+                    stale_have.extend_from_slice(b"0001");
+                    pkt(&mut stale_have, &format!("want {code_tip}\n"));
+                    pkt(&mut stale_have, &format!("have {mixed_tip}\n"));
+                    pkt(&mut stale_have, "done\n");
+                    stale_have.extend_from_slice(b"0000");
+                } else {
+                    pkt(&mut stale_have, &format!("want {code_tip} multi_ack_detailed\n"));
+                    stale_have.extend_from_slice(b"0000");
+                    pkt(&mut stale_have, &format!("have {mixed_tip}\n"));
+                    pkt(&mut stale_have, "done\n");
+                }
+                let response = request(
+                    fixture.port,
+                    Endpoint::Upload,
+                    "/third-party/mtr94-control.git",
+                    v2,
+                    &stale_have,
+                    None,
+                    false,
+                )
+                .await;
+                assert_eq!(response.status, 200, "stale local have must not break fetch after repair");
+                assert!(response.body.windows(4).any(|window| window == b"PACK"));
+                let stale_ack = format!("ACK {mixed_tip}");
+                assert!(!response.body.windows(stale_ack.len()).any(|window| window == stale_ack.as_bytes()));
+
+                let mut stale_want = Vec::new();
+                if v2 {
+                    pkt(&mut stale_want, "command=fetch\n");
+                    stale_want.extend_from_slice(b"0001");
+                    pkt(&mut stale_want, &format!("want {mixed_tip}\n"));
+                    pkt(&mut stale_want, "done\n");
+                    stale_want.extend_from_slice(b"0000");
+                } else {
+                    pkt(&mut stale_want, &format!("want {mixed_tip}\n"));
+                    stale_want.extend_from_slice(b"0000");
+                    pkt(&mut stale_want, "done\n");
+                }
+                let response = request(
+                    fixture.port,
+                    Endpoint::Upload,
+                    "/third-party/mtr94-control.git",
+                    v2,
+                    &stale_want,
+                    None,
+                    false,
+                )
+                .await;
+                assert_eq!(response.status, 404, "deleted polluted tip is no longer code-reachable");
+                assert!(response.body.windows(b"unknown_scope".len()).any(|window| window == b"unknown_scope"));
+                assert!(!response.body.windows(4).any(|window| window == b"PACK"));
+            }
+            assert_eq!(fixture.git_text(&["-C", "import", "rev-parse", "refs/heads/trace-records"]), traces_tip);
+            assert_eq!(fixture.git_text(&["-C", "import", "rev-parse", "refs/heads/mixed-code"]), mixed_tip);
+            fixture.git(&["clone", &import_url, "mtr40-code-writer"]);
+            for version in ["0", "2"] {
+                let filename = format!("fetch-v{version}.txt");
+                fs::write(fixture.shared.path().join("mtr40-code-writer").join(&filename), version)
+                    .expect("new remote code commit");
+                fixture.git(&["-C", "mtr40-code-writer", "add", &filename]);
+                fixture.git(&[
+                    "-C", "mtr40-code-writer", "-c", "user.name=Traces Test",
+                    "-c", "user.email=traces@example.invalid", "-c", "commit.gpgsign=false",
+                    "commit", "-m", &format!("code fetch v{version} positive control"),
+                ]);
+                fixture.git(&[
+                    "-C", "mtr40-code-writer", "push", "--no-thin", &import_url,
+                    "HEAD:refs/heads/main",
+                ]);
+                let expected = fixture.git_text(&["-C", "mtr40-code-writer", "rev-parse", "HEAD"]);
+                fixture.git(&[
+                    "-C", "import", "-c", &format!("protocol.version={version}"),
+                    "fetch", &import_url, "refs/heads/main",
+                ]);
+                assert_eq!(
+                    fixture.git_text(&["-C", "import", "rev-parse", "FETCH_HEAD"]),
+                    expected,
+                    "real Git fetch must succeed with local traces and stale polluted refs in v{version}"
+                );
+            }
+            let polluted_only_url =
+                git_cli::mega2_http_url(fixture.port, "/third-party/mtr40-polluted-only.git");
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &polluted_only_url,
+                &format!("{mixed_tip}:refs/heads/mixed-code"),
+            ]);
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &polluted_only_url,
+                &format!("{traces_tip}:refs/libra/traces"),
+            ]);
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &polluted_only_url,
+                ":refs/heads/mixed-code",
+            ]);
+            for version in ["0", "2"] {
+                let refs = fixture.git_text(&[
+                    "-c",
+                    &format!("protocol.version={version}"),
+                    "ls-remote",
+                    &polluted_only_url,
+                ]);
+                assert!(refs.is_empty(), "delete-only repair must leave an unborn code HEAD in v{version}: {refs}");
+            }
+            let dev_only_url =
+                git_cli::mega2_http_url(fixture.port, "/third-party/mtr40-dev-only.git");
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &dev_only_url,
+                &format!("{traces_tip}:refs/libra/traces"),
+            ]);
+            fixture.git(&[
+                "-C",
+                "import",
+                "push",
+                "--no-thin",
+                &dev_only_url,
+                &format!("{code_tip}:refs/heads/dev"),
+            ]);
+            let symrefs = fixture.git_text(&[
+                "-c",
+                "protocol.version=2",
+                "ls-remote",
+                "--symref",
+                &dev_only_url,
+            ]);
+            assert!(symrefs.lines().any(|line| line == "ref: refs/heads/dev\tHEAD"), "v2 HEAD symref must name the visible fallback branch: {symrefs}");
+        })
+        .catch_unwind()
+        .await;
+        fixture.stop();
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            for name in ["process.out", "process.err"] {
+                if let Ok(bytes) = fs::read(fixture.temp.path().join(name)) {
+                    eprintln!(
+                        "legacy fixture failure log: file={name} sha256={}",
+                        hex::encode(Sha256::digest(&bytes))
+                    );
+                }
+            }
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close legacy ref fixture pool before database guard");
+    }
+
     pub async fn run(endpoint: Endpoint) {
         let (guard, db) = traces_db::TracesDb::migrated().await;
         let mut fixture = None;
@@ -5202,6 +5797,11 @@ mod disabled_http {
         }
         closed.expect("close HTTP fixture pool before database guard");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_ref_boundary_legacy_advertisement() {
+    disabled_http::code_ref_boundary_legacy_advertisement().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

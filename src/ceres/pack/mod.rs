@@ -103,11 +103,27 @@ pub trait RepoHandler: Send + Sync + 'static {
 
     async fn refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError>;
 
+    /// A writable ref can require repair even when upload-pack must hide it.
+    async fn receive_refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError> {
+        self.refs_with_head_hash().await
+    }
+
     /// Check that the requested objects are readable and the repository is ready
     /// before upload-pack writes negotiation bytes. View-backed handlers override
     /// this; existing repository handlers preserve their current behavior.
     async fn check_wants_and_ready(&self, _want: &[String]) -> Result<(), MegaError> {
         Ok(())
+    }
+
+    /// Validate wants and return only haves usable by this repository view.
+    /// The default preserves the existing view precheck and all haves.
+    async fn authorize_fetch(
+        &self,
+        want: &[String],
+        have: &[String],
+    ) -> Result<Vec<String>, MegaError> {
+        self.check_wants_and_ready(want).await?;
+        Ok(have.to_vec())
     }
 
     /// Perform final validation immediately before upload-pack starts building a

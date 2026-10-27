@@ -119,6 +119,19 @@ impl GitDbStorage {
         Ok(result)
     }
 
+    pub async fn get_ref_limited(
+        &self,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<import_refs::Model>, MegaError> {
+        Ok(import_refs::Entity::find()
+            .filter(import_refs::Column::RepoId.eq(repo_id))
+            .order_by_asc(import_refs::Column::RefName)
+            .limit(limit)
+            .all(self.get_connection())
+            .await?)
+    }
+
     /// The refs of `repo_id` named in `names` (at most one row per name, by
     /// the unique index); bounded by the caller's command count.
     pub async fn get_refs_by_names(
@@ -629,8 +642,7 @@ impl GitDbStorage {
             .filter(git_commit::Column::RepoId.eq(repo_id))
             .filter(git_commit::Column::CommitId.is_in(hashes))
             .all(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_commits_by_repo_id(
@@ -724,8 +736,19 @@ impl GitDbStorage {
         Ok(git_tag::Entity::find()
             .filter(git_tag::Column::RepoId.eq(repo_id))
             .all(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
+    }
+
+    pub async fn get_tags_by_repo_id_limited(
+        &self,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<git_tag::Model>, MegaError> {
+        Ok(git_tag::Entity::find()
+            .filter(git_tag::Column::RepoId.eq(repo_id))
+            .limit(limit)
+            .all(self.get_connection())
+            .await?)
     }
 
     /// Paginated annotated tags for a given import repo id.
@@ -1493,6 +1516,28 @@ mod tests {
             created_at: chrono::Utc::now().naive_utc(),
             updated_at: chrono::Utc::now().naive_utc(),
         }
+    }
+
+    #[tokio::test]
+    async fn limited_ref_query_stops_at_requested_row_count() {
+        let git_db = storage().await;
+        let repo_id = 43i64;
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for name in ["refs/heads/a", "refs/heads/b", "refs/heads/c"] {
+            git_db
+                .save_ref(repo_id, sample_ref(repo_id, name, hash))
+                .await
+                .unwrap();
+        }
+        let limited = git_db.get_ref_limited(repo_id, 2).await.unwrap();
+        assert_eq!(
+            limited
+                .iter()
+                .map(|row| row.ref_name.as_str())
+                .collect::<Vec<_>>(),
+            ["refs/heads/a", "refs/heads/b"]
+        );
+        assert_eq!(git_db.get_ref(repo_id).await.unwrap().len(), 3);
     }
 
     async fn storage() -> GitDbStorage {

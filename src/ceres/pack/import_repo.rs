@@ -5,7 +5,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use async_recursion::async_recursion;
@@ -16,7 +16,12 @@ use git_internal::{
     hash::{HashKind, ObjectHash},
     internal::{
         metadata::{EntryMeta, MetaAttached},
-        object::{blob::Blob, commit::Commit, tag::Tag, tree::Tree},
+        object::{
+            blob::Blob,
+            commit::Commit,
+            tag::Tag,
+            tree::{Tree, TreeItemMode},
+        },
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
@@ -26,6 +31,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     callisto::{
+        git_commit, import_refs,
         import_repo_cleanups::{self, CleanupState},
         sea_orm_active_enums::{ActorTypeEnum, AuditActionEnum, RefTypeEnum, TargetTypeEnum},
     },
@@ -38,7 +44,7 @@ use crate::{
         },
     },
     common::{
-        errors::{ImportRepoError, MegaError},
+        errors::{ImportRepoError, MegaError, TracesError},
         utils::{ZERO_ID, is_protocol_zero_id},
     },
     jupiter::{
@@ -63,6 +69,26 @@ use crate::{
 };
 #[rustfmt::skip]
 use crate::orbit_api::object_storage::MultiObjectByteStream;
+
+const LEGACY_TRACES_REF: &str = "refs/libra/traces";
+const LEGACY_VIEW_MAX_REFS: usize = 4096;
+const LEGACY_VIEW_MAX_COMMITS: usize = 200_000;
+const LEGACY_VIEW_MAX_OBJECTS: usize = 1_000_000;
+const LEGACY_VIEW_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct CommitGraph {
+    models: HashMap<String, git_commit::Model>,
+    parents: HashMap<String, Vec<String>>,
+}
+
+struct CodeRefView {
+    refs: Vec<import_refs::Model>,
+    has_legacy_traces: bool,
+    commits: Vec<git_commit::Model>,
+    tag_ids: HashSet<String>,
+    direct_objects: Vec<String>,
+    contaminated_commits: HashSet<String>,
+}
 
 pub struct ImportRepo {
     pub storage: Storage,
@@ -103,14 +129,41 @@ impl RepoHandler for ImportRepo {
     }
 
     async fn refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError> {
-        let result = self
+        let view = tokio::time::timeout(LEGACY_VIEW_TIMEOUT, self.code_refs())
+            .await
+            .map_err(|_| TracesError::QueryTimeout)?
+            .map_err(Self::legacy_view_error)?;
+        let refs = view.refs.into_iter().map(Into::into).collect();
+        Ok(self.code_head(refs, view.has_legacy_traces))
+    }
+
+    async fn receive_refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError> {
+        let raw_refs = self
             .storage
             .git_db_storage()
             .get_ref(self.repo.repo_id)
-            .await?;
-        let refs: Vec<Refs> = result.into_iter().map(|x| x.into()).collect();
+            .await
+            .map_err(Self::legacy_view_error)?;
+        let has_legacy_traces = raw_refs
+            .iter()
+            .any(|git_ref| git_ref.ref_name == LEGACY_TRACES_REF);
+        let refs = raw_refs
+            .into_iter()
+            .filter(|git_ref| git_ref.ref_name != LEGACY_TRACES_REF)
+            .map(Into::into)
+            .collect();
+        Ok(self.code_head(refs, has_legacy_traces))
+    }
 
-        Ok(self.find_head_hash(refs))
+    async fn authorize_fetch(
+        &self,
+        want: &[String],
+        have: &[String],
+    ) -> Result<Vec<String>, MegaError> {
+        tokio::time::timeout(LEGACY_VIEW_TIMEOUT, self.check_code_objects(want, have))
+            .await
+            .map_err(|_| TracesError::QueryTimeout)?
+            .map_err(Self::legacy_view_error)
     }
 
     async fn finalize_receive_pack(&self) -> Result<(), MegaError> {
@@ -487,6 +540,319 @@ pub(crate) async fn collect_git_blob_filepaths(
 }
 
 impl ImportRepo {
+    fn legacy_view_error(error: MegaError) -> MegaError {
+        match error {
+            MegaError::Db(_) => TracesError::QueryTimeout.into(),
+            other => other,
+        }
+    }
+
+    fn code_head(&self, refs: Vec<Refs>, fallback: bool) -> (String, Vec<Refs>) {
+        let (mut head, refs) = self.find_head_hash(refs);
+        if fallback
+            && is_protocol_zero_id(&head)
+            && let Some(code_ref) = refs
+                .iter()
+                .find(|git_ref| git_ref.ref_name == "refs/heads/main")
+                .or_else(|| {
+                    refs.iter()
+                        .find(|git_ref| git_ref.ref_name.starts_with("refs/heads/"))
+                })
+        {
+            head.clone_from(&code_ref.ref_hash);
+        }
+        (head, refs)
+    }
+
+    async fn load_commit_graph(&self, roots: Vec<String>) -> Result<CommitGraph, MegaError> {
+        let storage = self.storage.git_db_storage();
+        let mut pending = roots;
+        let mut queried = HashSet::new();
+        let mut graph = CommitGraph {
+            models: HashMap::new(),
+            parents: HashMap::new(),
+        };
+        while !pending.is_empty() {
+            let mut batch = Vec::new();
+            while batch.len() < 512 {
+                let Some(hash) = pending.pop() else {
+                    break;
+                };
+                if queried.insert(hash.clone()) {
+                    batch.push(hash);
+                }
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            if queried.len() > LEGACY_VIEW_MAX_COMMITS {
+                return Err(TracesError::ResponseBudget.into());
+            }
+            let commits = storage
+                .get_commits_by_hashes(self.repo.repo_id, &batch)
+                .await?;
+            if commits.len() != batch.len() {
+                return Err(TracesError::ObjectIntegrity.into());
+            }
+            for commit in commits {
+                let parents = serde_json::from_value::<Vec<String>>(commit.parents_id.clone())
+                    .map_err(|_| TracesError::ObjectIntegrity)?;
+                pending.extend(parents.iter().cloned());
+                graph.parents.insert(commit.commit_id.clone(), parents);
+                graph.models.insert(commit.commit_id.clone(), commit);
+            }
+        }
+        Ok(graph)
+    }
+
+    fn reachable_commits(
+        roots: &[String],
+        parents: &HashMap<String, Vec<String>>,
+    ) -> HashSet<String> {
+        let mut seen = HashSet::new();
+        let mut pending = roots.to_vec();
+        while let Some(hash) = pending.pop() {
+            if seen.insert(hash.clone())
+                && let Some(ancestors) = parents.get(&hash)
+            {
+                pending.extend(ancestors.iter().cloned());
+            }
+        }
+        seen
+    }
+
+    async fn code_refs(&self) -> Result<CodeRefView, MegaError> {
+        let storage = self.storage.git_db_storage();
+        let mut refs = storage
+            .get_ref_limited(self.repo.repo_id, (LEGACY_VIEW_MAX_REFS + 2) as u64)
+            .await?;
+        let mut trace_tip = refs
+            .iter()
+            .find(|row| row.ref_name == LEGACY_TRACES_REF)
+            .map(|row| row.ref_git_id.clone());
+        if refs.len() == LEGACY_VIEW_MAX_REFS + 2 && trace_tip.is_none() {
+            trace_tip = storage
+                .get_refs_by_names(self.repo.repo_id, &[LEGACY_TRACES_REF.to_owned()])
+                .await?
+                .into_iter()
+                .next()
+                .map(|row| row.ref_git_id);
+            if trace_tip.is_none() {
+                refs = storage.get_ref(self.repo.repo_id).await?;
+                trace_tip = refs
+                    .iter()
+                    .find(|row| row.ref_name == LEGACY_TRACES_REF)
+                    .map(|row| row.ref_git_id.clone());
+            }
+        }
+        refs.retain(|row| row.ref_name != LEGACY_TRACES_REF);
+        let has_legacy_traces = trace_tip.is_some();
+        if !has_legacy_traces {
+            return Ok(CodeRefView {
+                refs,
+                has_legacy_traces: false,
+                commits: Vec::new(),
+                tag_ids: HashSet::new(),
+                direct_objects: Vec::new(),
+                contaminated_commits: HashSet::new(),
+            });
+        }
+        if refs.len() > LEGACY_VIEW_MAX_REFS {
+            return Err(TracesError::ResponseBudget.into());
+        }
+        let tags: HashMap<_, _> = storage
+            .get_tags_by_repo_id_limited(self.repo.repo_id, (LEGACY_VIEW_MAX_REFS + 1) as u64)
+            .await?
+            .into_iter()
+            .map(|tag| (tag.tag_id.clone(), tag))
+            .collect();
+        if tags.len() > LEGACY_VIEW_MAX_REFS {
+            return Err(TracesError::ResponseBudget.into());
+        }
+        let mut resolved = Vec::with_capacity(refs.len());
+        for git_ref in refs {
+            let mut target = git_ref.ref_git_id.clone();
+            let mut tag_ids = HashSet::new();
+            if git_ref.ref_type == RefTypeEnum::Tag {
+                while let Some(tag) = tags.get(&target) {
+                    if !tag_ids.insert(target.clone()) {
+                        return Err(TracesError::ObjectIntegrity.into());
+                    }
+                    target = tag.object_id.clone();
+                }
+            }
+            resolved.push((git_ref, target, tag_ids));
+        }
+        let targets: Vec<String> = resolved
+            .iter()
+            .map(|(_, target, _)| target.clone())
+            .collect();
+        let mut commit_targets = HashSet::new();
+        for batch in targets.chunks(512) {
+            commit_targets.extend(
+                storage
+                    .get_commits_by_hashes(self.repo.repo_id, &batch.to_vec())
+                    .await?
+                    .into_iter()
+                    .map(|commit| commit.commit_id),
+            );
+        }
+        let trace_tip = trace_tip.ok_or(TracesError::ObjectIntegrity)?;
+        let mut roots = vec![trace_tip.clone()];
+        roots.extend(commit_targets.iter().cloned());
+        let graph = self.load_commit_graph(roots).await?;
+        let trace_commits = Self::reachable_commits(&[trace_tip], &graph.parents);
+        let mut descendants = HashMap::<String, Vec<String>>::new();
+        for (child, parents) in &graph.parents {
+            for parent in parents {
+                descendants
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(child.clone());
+            }
+        }
+        let mut contaminated = trace_commits.clone();
+        let mut pending: Vec<String> = trace_commits.iter().cloned().collect();
+        while let Some(hash) = pending.pop() {
+            if let Some(children) = descendants.get(&hash) {
+                for child in children {
+                    if contaminated.insert(child.clone()) {
+                        pending.push(child.clone());
+                    }
+                }
+            }
+        }
+        let mut view = CodeRefView {
+            refs: Vec::new(),
+            has_legacy_traces,
+            commits: Vec::new(),
+            tag_ids: HashSet::new(),
+            direct_objects: Vec::new(),
+            contaminated_commits: HashSet::new(),
+        };
+        let mut clean_roots = Vec::new();
+        let mut polluted_roots = Vec::new();
+        for (git_ref, target, tag_ids) in resolved {
+            if commit_targets.contains(&target) {
+                if contaminated.contains(&target) {
+                    polluted_roots.push(target);
+                    continue;
+                }
+                clean_roots.push(target);
+            } else if git_ref.ref_type == RefTypeEnum::Branch {
+                return Err(TracesError::ObjectIntegrity.into());
+            } else if storage.object_exists(self.repo.repo_id, &target).await? {
+                view.direct_objects.push(target);
+            } else {
+                return Err(TracesError::ObjectIntegrity.into());
+            }
+            view.refs.push(git_ref);
+            view.tag_ids.extend(tag_ids);
+        }
+        let clean_ids = Self::reachable_commits(&clean_roots, &graph.parents);
+        let polluted_ids = Self::reachable_commits(&polluted_roots, &graph.parents);
+        view.commits = clean_ids
+            .iter()
+            .filter_map(|hash| graph.models.get(hash).cloned())
+            .collect();
+        view.contaminated_commits = polluted_ids
+            .difference(&trace_commits)
+            .filter(|hash| contaminated.contains(*hash) && !clean_ids.contains(*hash))
+            .cloned()
+            .collect();
+        Ok(view)
+    }
+
+    #[async_recursion]
+    async fn collect_code_tree_objects(
+        &self,
+        tree: Tree,
+        authorized: &mut HashSet<String>,
+    ) -> Result<(), MegaError> {
+        let storage = self.storage.git_db_storage();
+        for item in tree.tree_items {
+            let hash = item.id.to_string();
+            match item.mode {
+                TreeItemMode::Tree if authorized.insert(hash.clone()) => {
+                    let child = storage
+                        .get_tree_by_hash(self.repo.repo_id, &hash)
+                        .await?
+                        .ok_or(TracesError::ObjectIntegrity)?;
+                    self.collect_code_tree_objects(Tree::from_git_model(child), authorized)
+                        .await?;
+                }
+                TreeItemMode::Blob | TreeItemMode::BlobExecutable | TreeItemMode::Link => {
+                    authorized.insert(hash);
+                }
+                TreeItemMode::Tree | TreeItemMode::Commit => {}
+            }
+            if authorized.len() > LEGACY_VIEW_MAX_OBJECTS {
+                return Err(TracesError::ResponseBudget.into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn check_code_objects(
+        &self,
+        want: &[String],
+        have: &[String],
+    ) -> Result<Vec<String>, MegaError> {
+        let view = self.code_refs().await?;
+        if !view.has_legacy_traces || (want.is_empty() && have.is_empty()) {
+            return Ok(have.to_vec());
+        }
+        let code_commits: HashSet<_> = view
+            .commits
+            .iter()
+            .map(|commit| commit.commit_id.as_str())
+            .collect();
+        if want.iter().all(|hash| code_commits.contains(hash.as_str())) {
+            return Ok(have
+                .iter()
+                .filter(|hash| code_commits.contains(hash.as_str()))
+                .cloned()
+                .collect());
+        }
+        let mut authorized = view.tag_ids;
+        let storage = self.storage.git_db_storage();
+        for object_id in view.direct_objects {
+            if authorized.insert(object_id.clone())
+                && let Some(tree) = storage
+                    .get_tree_by_hash(self.repo.repo_id, &object_id)
+                    .await?
+            {
+                self.collect_code_tree_objects(Tree::from_git_model(tree), &mut authorized)
+                    .await?;
+            }
+        }
+        for commit in &view.commits {
+            authorized.insert(commit.commit_id.clone());
+            if authorized.insert(commit.tree.clone()) {
+                let tree = storage
+                    .get_tree_by_hash(self.repo.repo_id, &commit.tree)
+                    .await?
+                    .ok_or(TracesError::ObjectIntegrity)?;
+                self.collect_code_tree_objects(Tree::from_git_model(tree), &mut authorized)
+                    .await?;
+            }
+        }
+        for hash in want {
+            if authorized.contains(hash) {
+                continue;
+            }
+            if view.contaminated_commits.contains(hash) {
+                return Err(TracesError::TraceHistoryInCode.into());
+            }
+            return Err(TracesError::UnknownScope.into());
+        }
+        Ok(have
+            .iter()
+            .filter(|hash| code_commits.contains(hash.as_str()))
+            .cloned()
+            .collect())
+    }
+
     /// One receive-pack tag write inside `txn`: the liveness lock, then
     /// exactly one CAS statement; whether the CAS applied.
     pub(crate) async fn write_tag_ref_in_txn(
@@ -537,10 +903,12 @@ impl ImportRepo {
                 .find(|c| c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id))
                 .map(|c| c.new_id.clone())
         };
-        let current_head = match from_commands {
-            Some(h) => h,
-            None => self.refs_with_head_hash().await?.0,
+        let Some(current_head) = from_commands else {
+            return Ok(Vec::new());
         };
+        if is_protocol_zero_id(&current_head) {
+            return Ok(Vec::new());
+        }
         let git_db = self.storage.git_db_storage();
         let commit = Commit::from_git_model(
             git_db
@@ -1387,6 +1755,17 @@ mod tests {
             utils::converter::{FromGitModel, FromMegaModel},
         },
     };
+
+    #[test]
+    fn legacy_view_db_error_has_stable_public_reason() {
+        let private = MegaError::Db(sea_orm::DbErr::Custom("private-db-canary".to_owned()));
+        let public = ImportRepo::legacy_view_error(private);
+        assert!(matches!(
+            &public,
+            MegaError::Traces(crate::common::errors::TracesError::QueryTimeout)
+        ));
+        assert_eq!(public.to_string(), "query_timeout");
+    }
 
     async fn wired_storage_with_monorepo(temp: &tempfile::TempDir) -> Storage {
         let mut storage = test_storage(temp.path()).await;
