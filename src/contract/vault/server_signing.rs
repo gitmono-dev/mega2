@@ -187,7 +187,7 @@ impl ServerSigningContext {
     /// Sign a synthetic commit: stamp the reserved server identity as
     /// author/committer, detach-sign the canonical payload with the active
     /// key, embed the armor as a `gpgsig` header, and rebuild the commit so
-    /// its id is computed over the signed bytes (`Commit::new` hashes
+    /// its id is computed over the signed bytes (`Commit::new_with_kind` hashes
     /// `to_data()` once).
     pub(crate) fn sign_commit(
         &self,
@@ -236,13 +236,15 @@ impl ServerSigningContext {
         if !message.ends_with('\n') {
             message.push('\n');
         }
-        Ok(Commit::new(
+        Commit::new_with_kind(
+            commit.id.kind(),
             author,
             committer,
             commit.tree_id,
             commit.parent_commit_ids.clone(),
             &message,
-        ))
+        )
+        .map_err(MegaError::from)
     }
 }
 
@@ -1012,6 +1014,238 @@ mod tests {
             if let Some(line) = verify_log.lines().find(|l| l.contains("Good signature")) {
                 eprintln!("VER3 {shape} commit {git_sha}: {}", line.trim());
             }
+        }
+    }
+
+    fn native_signing_key() -> ServerSigningKey {
+        let secret_key = SecretKeyParamsBuilder::default()
+            .version(KeyVersion::V4)
+            .key_type(KeyType::Ed25519Legacy)
+            .can_certify(true)
+            .can_sign(true)
+            .primary_user_id("FIX19 fixture <signing@example.invalid>".to_owned())
+            .build()
+            .expect("fixture key parameters")
+            .generate(rand08::thread_rng())
+            .expect("fixture key");
+        let public_key = SignedPublicKey::from(secret_key.clone());
+        ServerSigningKey {
+            key_id: format!("{:?}", public_key.fingerprint()),
+            public_key,
+            secret_key,
+        }
+    }
+
+    fn native_signing_commit(kind: git_internal::hash::HashKind) -> Commit {
+        use git_internal::{hash::ObjectHash, internal::object::types::ObjectType};
+
+        let tree = ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Tree, b"")
+            .expect("fixture tree");
+        let parents = [b"first parent".as_slice(), b"second parent".as_slice()]
+            .into_iter()
+            .map(|bytes| {
+                ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Commit, bytes)
+                    .expect("fixture parent")
+            })
+            .collect();
+        Commit::new_with_kind(
+            kind,
+            Signature::from_data(
+                b"author Fixture Author <author@example.invalid> 1 +0000".to_vec(),
+            )
+            .expect("fixture author"),
+            Signature::from_data(
+                b"committer Fixture Committer <committer@example.invalid> 2 +0800".to_vec(),
+            )
+            .expect("fixture committer"),
+            tree,
+            parents,
+            "\nFIX19 signing fixture\n",
+        )
+        .expect("explicit fixture commit")
+    }
+
+    fn native_signing_assert_valid(key: &ServerSigningKey, unsigned: &Commit, signed: &Commit) {
+        use git_internal::{
+            hash::ObjectHash,
+            internal::object::{ObjectTrait, types::ObjectType},
+        };
+
+        use crate::ceres::merge_checker::gpg_signature_checker::extract_from_commit_content;
+
+        let bytes = signed.to_data().expect("signed canonical bytes");
+        let expected =
+            ObjectHash::from_type_and_data_for_kind(unsigned.id.kind(), ObjectType::Commit, &bytes)
+                .expect("explicit signed object hash");
+        assert_eq!(signed.id, expected, "FIX19_SIGNED_OBJECT_ID");
+        assert_eq!(signed.tree_id, unsigned.tree_id);
+        assert_eq!(signed.parent_commit_ids, unsigned.parent_commit_ids);
+        let raw = String::from_utf8(bytes).expect("fixture UTF-8");
+        let (payload, armor) = extract_from_commit_content(&raw);
+        assert_eq!(
+            payload.as_bytes(),
+            canonical_commit_payload(unsigned, &signed.author, &signed.committer)
+                .expect("original signing payload"),
+        );
+        let (signature, _) = DetachedSignature::from_string(&armor.expect("signature header"))
+            .expect("detached signature");
+        signature
+            .verify(&key.public_key, payload.as_bytes())
+            .expect("real PGP verification");
+    }
+
+    fn native_signing_opposite_tls(
+        kind: git_internal::hash::HashKind,
+        other: git_internal::hash::HashKind,
+    ) {
+        use git_internal::hash::{get_hash_kind, set_hash_kind_for_test};
+
+        let _guard = set_hash_kind_for_test(other);
+        let key = native_signing_key();
+        let unsigned = native_signing_commit(kind);
+        let signed = ServerSigningContext::sign_with_identities(
+            &key,
+            &unsigned,
+            unsigned.author.clone(),
+            unsigned.committer.clone(),
+        )
+        .expect("sign typed commit");
+        native_signing_assert_valid(&key, &unsigned, &signed);
+        assert_eq!(signed.author, unsigned.author);
+        assert_eq!(signed.committer, unsigned.committer);
+        assert_eq!(get_hash_kind(), other, "signing must preserve caller TLS");
+    }
+
+    #[test]
+    fn native_signing_red_sha256_oid() {
+        use git_internal::hash::HashKind;
+
+        native_signing_opposite_tls(HashKind::Sha256, HashKind::Sha1);
+    }
+
+    #[test]
+    fn native_signing_sha1_opposite_tls() {
+        use git_internal::hash::HashKind;
+
+        native_signing_opposite_tls(HashKind::Sha1, HashKind::Sha256);
+    }
+
+    #[test]
+    fn native_signing_blake3_opposite_tls() {
+        use git_internal::hash::HashKind;
+
+        native_signing_opposite_tls(HashKind::Blake3, HashKind::Sha256);
+    }
+
+    #[tokio::test]
+    async fn native_signing_identity_modes() {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        let temp = TempDir::new().expect("private signing fixture");
+        let vault = test_vault(&temp).await;
+        let signing = ServerSigningContext::new(vault, test_redis().await);
+        let key = native_signing_key();
+        for (kind, other) in [
+            (HashKind::Sha1, HashKind::Sha256),
+            (HashKind::Sha256, HashKind::Sha1),
+            (HashKind::Blake3, HashKind::Sha256),
+        ] {
+            let _guard = set_hash_kind_for_test(other);
+            let unsigned = native_signing_commit(kind);
+            let preserved = signing
+                .sign_commit_preserving_identities(&key, &unsigned)
+                .expect("trunk signing");
+            native_signing_assert_valid(&key, &unsigned, &preserved);
+            assert_eq!(preserved.author, unsigned.author);
+            assert_eq!(preserved.committer, unsigned.committer);
+            let server = signing
+                .sign_commit(&key, &unsigned)
+                .expect("server signing");
+            native_signing_assert_valid(&key, &unsigned, &server);
+            assert_eq!(server.author.signature_type, SignatureType::Author);
+            assert_eq!(server.author.name, SERVER_SIGNING_NAME);
+            assert_eq!(server.author.email, SERVER_SIGNING_EMAIL);
+            assert_eq!(server.committer.signature_type, SignatureType::Committer);
+            assert_eq!(server.committer.name, SERVER_SIGNING_NAME);
+            assert_eq!(server.committer.email, SERVER_SIGNING_EMAIL);
+            assert_eq!(get_hash_kind(), other);
+        }
+    }
+
+    fn native_signing_mismatched_reference(tree: bool) {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        let key = native_signing_key();
+        for (kind, other) in [
+            (HashKind::Sha1, HashKind::Sha256),
+            (HashKind::Sha256, HashKind::Blake3),
+            (HashKind::Blake3, HashKind::Sha256),
+        ] {
+            let _guard = set_hash_kind_for_test(other);
+            let mut invalid = native_signing_commit(kind);
+            let foreign = native_signing_commit(other);
+            if tree {
+                invalid.tree_id = foreign.tree_id;
+            } else {
+                invalid.parent_commit_ids[1] = foreign.parent_commit_ids[1];
+            }
+            let result = ServerSigningContext::sign_with_identities(
+                &key,
+                &invalid,
+                invalid.author.clone(),
+                invalid.committer.clone(),
+            );
+            assert!(matches!(result, Err(MegaError::Git(_))));
+            assert_eq!(get_hash_kind(), other);
+        }
+    }
+
+    #[test]
+    fn native_signing_rejects_mixed_tree() {
+        native_signing_mismatched_reference(true);
+    }
+
+    #[test]
+    fn native_signing_rejects_mixed_parent() {
+        native_signing_mismatched_reference(false);
+    }
+
+    #[test]
+    fn native_signing_worker_survives_rejection() {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        std::thread::spawn(|| {
+            let original = get_hash_kind();
+            {
+                let _guard = set_hash_kind_for_test(HashKind::Sha1);
+                native_signing_mismatched_reference(false);
+                native_signing_opposite_tls(HashKind::Sha256, HashKind::Sha1);
+                assert_eq!(get_hash_kind(), HashKind::Sha1);
+            }
+            assert_eq!(get_hash_kind(), original);
+        })
+        .join()
+        .expect("same worker signs successfully after rejection");
+    }
+
+    #[test]
+    fn native_signing_message_termination() {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let key = native_signing_key();
+        for message in ["fixture", "fixture\n", "fixture\n\n", "\nfixture\nbody\n"] {
+            let mut unsigned = native_signing_commit(HashKind::Sha256);
+            unsigned.message = message.to_owned();
+            let signed = ServerSigningContext::sign_with_identities(
+                &key,
+                &unsigned,
+                unsigned.author.clone(),
+                unsigned.committer.clone(),
+            )
+            .expect("sign message shape");
+            native_signing_assert_valid(&key, &unsigned, &signed);
+            assert_eq!(get_hash_kind(), HashKind::Sha1);
         }
     }
 }
