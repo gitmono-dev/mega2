@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use git_internal::hash::HashKind;
 use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -686,6 +687,7 @@ pub struct PushQueueService {
     poll_interval: Duration,
     metrics: PushQueueMetrics,
     view_signal: Option<ViewSignal>,
+    blob_path_hash_kind: Option<HashKind>,
 }
 
 impl PushQueueService {
@@ -699,6 +701,7 @@ impl PushQueueService {
             poll_interval: DEFAULT_POLL_INTERVAL,
             metrics: PushQueueMetrics::default(),
             view_signal: None,
+            blob_path_hash_kind: None,
         }
     }
 
@@ -710,6 +713,11 @@ impl PushQueueService {
 
     pub(crate) fn with_native_publication(mut self, enabled: bool) -> Self {
         self.push_queue_storage = self.push_queue_storage.with_native_publication(enabled);
+        self
+    }
+
+    pub(crate) fn with_blob_path_hash_kind(mut self, kind: HashKind) -> Self {
+        self.blob_path_hash_kind = Some(kind);
         self
     }
 
@@ -765,18 +773,31 @@ impl PushQueueService {
     pub fn blob_path_compensator(
         &self,
     ) -> crate::jupiter::storage::blob_path_index::BlobPathCompensator {
-        crate::jupiter::storage::blob_path_index::BlobPathCompensator::new(
+        let compensator = crate::jupiter::storage::blob_path_index::BlobPathCompensator::new(
             self.mono_storage.clone(),
-        )
+        );
+        match self.blob_path_hash_kind {
+            Some(kind) => compensator.with_hash_kind(kind),
+            None => compensator,
+        }
     }
 
     /// C-segment (ADR-TP-11): after B3 commit, index `main@path` off the lock.
     async fn run_c_segment_index(&self, id: i64, path: &str) {
-        match self
-            .mono_storage
-            .index_blob_paths_c_segment(path, BlobPathIndexMode::Queue { push_id: id })
-            .await
-        {
+        let mode = BlobPathIndexMode::Queue { push_id: id };
+        let result = match self.blob_path_hash_kind {
+            Some(kind) => {
+                self.mono_storage
+                    .index_blob_paths_c_segment_with_kind(path, mode, kind)
+                    .await
+            }
+            None => {
+                self.mono_storage
+                    .index_blob_paths_c_segment(path, mode)
+                    .await
+            }
+        };
+        match result {
             Ok(stats) if stats.skipped => {
                 tracing::info!(
                     id,
@@ -10392,5 +10413,496 @@ mod tests {
         assert_eq!(import_target_generation(&storage, &new_id).await, 1);
         assert!(!import_target_row(&storage, &old_id).await.active);
         assert_eq!(import_target_generation(&storage, &old_id).await, 2);
+    }
+
+    mod native_blob_index_tests {
+        use std::collections::BTreeSet;
+
+        use git_internal::{
+            hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind_for_test},
+            internal::object::ObjectTrait,
+        };
+        use sea_orm::{EntityTrait, IntoActiveModel, QueryOrder, Set};
+        use tokio_util::sync::CancellationToken;
+
+        use super::*;
+        use crate::{
+            callisto::{blob_paths, mega_blob},
+            config::MonoObjectFormat,
+            jupiter::{storage::Storage, tests::TestSchemaGuard},
+        };
+
+        struct Fixture {
+            storage: Storage,
+            expected: BTreeSet<(String, String)>,
+            root: Tree,
+            child: Tree,
+            tree_reads: Arc<AtomicU64>,
+            _schema: TestSchemaGuard,
+        }
+
+        fn opposing_kind(kind: HashKind) -> HashKind {
+            if kind == HashKind::Sha1 {
+                HashKind::Sha256
+            } else {
+                HashKind::Sha1
+            }
+        }
+
+        async fn fixture(temp: &std::path::Path, kind: HashKind) -> Fixture {
+            let (db_config, schema) = crate::jupiter::tests::test_db_config(temp).await;
+            let mut db = crate::jupiter::storage::init::database_connection(&db_config)
+                .await
+                .unwrap();
+            apply_migrations(&db, true).await.unwrap();
+            let tree_reads = Arc::new(AtomicU64::new(0));
+            let observed = tree_reads.clone();
+            db.set_metric_callback(move |info| {
+                let sql = info.statement.to_string();
+                if sql.starts_with("SELECT") && sql.contains("FROM \"mega_tree\"") {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let mut config = crate::config::testing::isolated_config(temp.join("config"));
+            config.database = db_config;
+            config.monorepo.push_policy = PushPolicy::Trunk;
+            config.monorepo.object_format = match kind {
+                HashKind::Sha1 => MonoObjectFormat::Sha1,
+                HashKind::Sha256 => MonoObjectFormat::Sha256,
+                HashKind::Blake3 => MonoObjectFormat::Blake3,
+            };
+            let storage = Storage::new_with_connection(
+                Arc::new(config),
+                Arc::new(db),
+                crate::jupiter::storage::object_storage::mock_object_storage(),
+            )
+            .await
+            .unwrap();
+            let shared = Blob::from_content_with_kind(kind, "FIX18 shared").unwrap();
+            let top = Blob::from_content_with_kind(kind, "FIX18 top").unwrap();
+            let child = Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem::new(
+                    TreeItemMode::Blob,
+                    shared.id,
+                    "leaf.txt".into(),
+                )],
+            )
+            .unwrap();
+            let root = Tree::from_tree_items_with_kind(
+                kind,
+                vec![
+                    TreeItem::new(TreeItemMode::Tree, child.id, "dir".into()),
+                    TreeItem::new(TreeItemMode::Tree, child.id, "mirror".into()),
+                    TreeItem::new(TreeItemMode::Blob, top.id, "top.txt".into()),
+                ],
+            )
+            .unwrap();
+            let mono = storage.mono_storage();
+            for blob in [&shared, &top] {
+                blob.clone()
+                    .into_mega_model(EntryMeta::default())
+                    .into_active_model()
+                    .insert(mono.get_connection())
+                    .await
+                    .unwrap();
+            }
+            let commit_id = ObjectHash::new_for_kind(kind, b"FIX18 fixture commit");
+            mono.save_mega_trees(vec![child.clone(), root.clone()], commit_id, None)
+                .await
+                .unwrap();
+            mono.save_refs(
+                mega_refs::Model::new(
+                    "/",
+                    MEGA_BRANCH_NAME.into(),
+                    commit_id.to_string(),
+                    root.id.to_string(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(mono.list_blob_paths().await.unwrap().is_empty());
+            Fixture {
+                storage,
+                expected: [
+                    (shared.id.to_string(), "/dir/leaf.txt".into()),
+                    (shared.id.to_string(), "/mirror/leaf.txt".into()),
+                    (top.id.to_string(), "/top.txt".into()),
+                ]
+                .into_iter()
+                .collect(),
+                root,
+                child,
+                tree_reads,
+                _schema: schema,
+            }
+        }
+
+        async fn rows(f: &Fixture) -> BTreeSet<(String, String, Option<i64>)> {
+            f.storage
+                .mono_storage()
+                .list_blob_paths()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.blob_id, row.path, row.indexed_push_id))
+                .collect()
+        }
+
+        async fn pairs(f: &Fixture) -> BTreeSet<(String, String)> {
+            rows(f)
+                .await
+                .into_iter()
+                .map(|(blob, path, _)| (blob, path))
+                .collect()
+        }
+
+        async fn seed_stale(f: &Fixture) {
+            let blob = &f.expected.first().unwrap().0;
+            assert!(
+                f.storage
+                    .mono_storage()
+                    .upsert_blob_path(blob, "/gone.txt", BlobPathIndexMode::Queue { push_id: 9 })
+                    .await
+                    .unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn native_blob_index_red_c_segment() {
+            let _tls = set_hash_kind_for_test(HashKind::Sha1);
+            for kind in [HashKind::Sha1, HashKind::Sha256] {
+                let temp = tempfile::TempDir::new().unwrap();
+                let f = fixture(temp.path(), kind).await;
+                assert_eq!(get_hash_kind(), HashKind::Sha1);
+                f.storage
+                    .push_queue_service
+                    .run_c_segment_index(77, "/")
+                    .await;
+                assert_eq!(pairs(&f).await, f.expected, "FIX18_C_SEGMENT_APPEARANCES");
+                assert!(rows(&f).await.iter().all(|row| row.2 == Some(77)));
+                assert_eq!(get_hash_kind(), HashKind::Sha1);
+                println!("FIX18_RED_CONTROL_C_SEGMENT {kind:?} PASS");
+            }
+        }
+
+        #[tokio::test]
+        async fn native_blob_index_red_compensator() {
+            let _tls = set_hash_kind_for_test(HashKind::Sha1);
+            for kind in [HashKind::Sha1, HashKind::Sha256] {
+                let temp = tempfile::TempDir::new().unwrap();
+                let f = fixture(temp.path(), kind).await;
+                seed_stale(&f).await;
+                assert_eq!(get_hash_kind(), HashKind::Sha1);
+                let stats = f
+                    .storage
+                    .push_queue_service
+                    .blob_path_compensator()
+                    .compensate_once()
+                    .await
+                    .unwrap();
+                assert_eq!(stats.deleted, 1);
+                assert_eq!(pairs(&f).await, f.expected, "FIX18_COMPENSATOR_APPEARANCES");
+                assert!(rows(&f).await.iter().all(|row| row.2.is_none()));
+                assert_eq!(get_hash_kind(), HashKind::Sha1);
+                println!("FIX18_RED_CONTROL_COMPENSATOR {kind:?} PASS");
+            }
+        }
+
+        #[tokio::test]
+        async fn native_blob_index_c_segment_matrix_and_watermarks() {
+            for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+                let other = opposing_kind(kind);
+                let _tls = set_hash_kind_for_test(other);
+                let temp = tempfile::TempDir::new().unwrap();
+                let f = fixture(temp.path(), kind).await;
+                let (blob, path) = f.expected.first().unwrap();
+                let mono = f.storage.mono_storage();
+                mono.upsert_blob_path(blob, path, BlobPathIndexMode::Queue { push_id: 200 })
+                    .await
+                    .unwrap();
+                f.storage
+                    .push_queue_service
+                    .run_c_segment_index(100, "/")
+                    .await;
+                assert_eq!(pairs(&f).await, f.expected);
+                for (id, p, watermark) in rows(&f).await {
+                    let expected = if id == *blob && p == *path { 200 } else { 100 };
+                    assert_eq!(watermark, Some(expected));
+                }
+                assert!(
+                    !mono
+                        .upsert_blob_path(blob, path, BlobPathIndexMode::Review)
+                        .await
+                        .unwrap()
+                );
+                f.storage
+                    .push_queue_service
+                    .run_c_segment_index(300, "/")
+                    .await;
+                assert!(rows(&f).await.iter().all(|row| row.2 == Some(300)));
+                assert_eq!(get_hash_kind(), other);
+            }
+        }
+
+        #[tokio::test]
+        async fn native_blob_index_compensator_matrix_removes_stale() {
+            for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+                let other = opposing_kind(kind);
+                let _tls = set_hash_kind_for_test(other);
+                let temp = tempfile::TempDir::new().unwrap();
+                let f = fixture(temp.path(), kind).await;
+                f.storage
+                    .push_queue_service
+                    .run_c_segment_index(100, "/")
+                    .await;
+                seed_stale(&f).await;
+                let stats = f
+                    .storage
+                    .push_queue_service
+                    .blob_path_compensator()
+                    .compensate_once()
+                    .await
+                    .unwrap();
+                assert_eq!(stats.deleted, 1);
+                assert_eq!(pairs(&f).await, f.expected);
+                assert!(rows(&f).await.iter().all(|row| row.2 == Some(100)));
+                assert_eq!(get_hash_kind(), other);
+            }
+        }
+
+        #[tokio::test]
+        async fn native_blob_index_invalid_metadata_preserves_snapshot() {
+            let _tls = set_hash_kind_for_test(HashKind::Sha1);
+            let temp = tempfile::TempDir::new().unwrap();
+            let f = fixture(temp.path(), HashKind::Sha256).await;
+            seed_stale(&f).await;
+            let before = rows(&f).await;
+            let mono = f.storage.mono_storage();
+            let mut tree = mono
+                .get_tree_by_hash(&f.root.id.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+            tree.tree_id = Set("invalid-tree-identity".into());
+            tree.update(mono.get_connection()).await.unwrap();
+            let mut root = mono
+                .get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+            root.ref_tree_hash = Set("invalid-tree-identity".into());
+            root.update(mono.get_connection()).await.unwrap();
+            let err = f
+                .storage
+                .push_queue_service
+                .blob_path_compensator()
+                .compensate_once()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, MegaError::Other(ref message) if message == "invalid native tree identity")
+            );
+            assert_eq!(rows(&f).await, before);
+            assert_eq!(get_hash_kind(), HashKind::Sha1);
+        }
+
+        async fn set_child_body(f: &Fixture, body: Vec<u8>) {
+            let mono = f.storage.mono_storage();
+            let mut model = mono
+                .get_tree_by_hash(&f.child.id.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+            model.sub_trees = Set(body);
+            model.update(mono.get_connection()).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn native_blob_index_nested_error_preserves_snapshot() {
+            let _tls = set_hash_kind_for_test(HashKind::Sha1);
+            let temp = tempfile::TempDir::new().unwrap();
+            let f = fixture(temp.path(), HashKind::Sha256).await;
+            seed_stale(&f).await;
+            let before = rows(&f).await;
+            let mono = f.storage.mono_storage();
+            let blobs_before = mega_blob::Entity::find()
+                .order_by_asc(mega_blob::Column::BlobId)
+                .all(mono.get_connection())
+                .await
+                .unwrap();
+            set_child_body(&f, vec![b'x']).await;
+            let err = f
+                .storage
+                .push_queue_service
+                .blob_path_compensator()
+                .compensate_once()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, MegaError::Other(ref message) if message == "invalid native tree body")
+            );
+            assert_eq!(rows(&f).await, before);
+            assert_eq!(
+                mega_blob::Entity::find()
+                    .order_by_asc(mega_blob::Column::BlobId)
+                    .all(mono.get_connection())
+                    .await
+                    .unwrap(),
+                blobs_before
+            );
+            assert_eq!(get_hash_kind(), HashKind::Sha1);
+        }
+
+        #[tokio::test]
+        async fn native_blob_index_background_error_then_next_tick_converges() {
+            let _tls = set_hash_kind_for_test(HashKind::Sha1);
+            let temp = tempfile::TempDir::new().unwrap();
+            let f = fixture(temp.path(), HashKind::Sha256).await;
+            seed_stale(&f).await;
+            let before = rows(&f).await;
+            set_child_body(&f, vec![b'x']).await;
+            assert!(
+                f.storage
+                    .push_queue_service
+                    .blob_path_compensator()
+                    .compensate_once()
+                    .await
+                    .is_err()
+            );
+            f.tree_reads.store(0, Ordering::SeqCst);
+            let connection = &f.storage.push_queue_service.mono_storage.base.connection;
+            let owners_before = Arc::strong_count(connection);
+            let shutdown = CancellationToken::new();
+            let _cancel_on_drop = shutdown.clone().drop_guard();
+            f.storage
+                .push_queue_service
+                .blob_path_compensator()
+                .spawn_background(Duration::from_millis(25), shutdown.clone());
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while f.tree_reads.load(Ordering::SeqCst) < 4 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("two failed compensator ticks");
+            assert_eq!(rows(&f).await, before);
+            set_child_body(&f, f.child.to_data().unwrap()).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while pairs(&f).await != f.expected {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("following tick converges");
+            assert!(f.tree_reads.load(Ordering::SeqCst) >= 7);
+            assert!(rows(&f).await.iter().all(|row| row.2.is_none()));
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while Arc::strong_count(connection) != owners_before {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("compensator relinquishes its DB owner");
+            assert_eq!(get_hash_kind(), HashKind::Sha1);
+        }
+
+        #[tokio::test]
+        async fn native_blob_index_later_done_skips_before_tree_walk() {
+            for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+                let other = opposing_kind(kind);
+                let _tls = set_hash_kind_for_test(other);
+                let temp = tempfile::TempDir::new().unwrap();
+                let f = fixture(temp.path(), kind).await;
+                let old_id = ObjectHash::zero_str(kind);
+                let new_id =
+                    ObjectHash::new_for_kind(kind, b"FIX18 later queue commit").to_string();
+                let EnqueueOutcome::Inserted { id } = f
+                    .storage
+                    .push_queue_service
+                    .storage()
+                    .enqueue_atomic(EnqueueParams {
+                        kind: PushQueueKindEnum::Push,
+                        operation_id: "FIX18 later Done",
+                        path: "/",
+                        old_id: &old_id,
+                        new_id: &new_id,
+                        requester: None,
+                        payload: json!({}),
+                    })
+                    .await
+                    .unwrap()
+                else {
+                    panic!("later queue row must be inserted")
+                };
+                assert!(id > 0);
+                let mono = f.storage.mono_storage();
+                let mut later = push_queue::Entity::find_by_id(id)
+                    .one(mono.get_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_active_model();
+                later.status = Set(PushQueueStatusEnum::Done);
+                later.update(mono.get_connection()).await.unwrap();
+                assert!(mono.same_path_has_later_done("/", id - 1).await.unwrap());
+                f.tree_reads.store(0, Ordering::SeqCst);
+                let before = rows(&f).await;
+                f.storage
+                    .push_queue_service
+                    .run_c_segment_index(id - 1, "/")
+                    .await;
+                assert_eq!(rows(&f).await, before);
+                assert_eq!(f.tree_reads.load(Ordering::SeqCst), 0);
+                assert_eq!(get_hash_kind(), other);
+            }
+        }
+
+        #[tokio::test]
+        async fn native_blob_index_legacy_entry_compatibility() {
+            for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+                let _tls = set_hash_kind_for_test(kind);
+                let temp = tempfile::TempDir::new().unwrap();
+                let f = fixture(temp.path(), kind).await;
+                let mono = f.storage.mono_storage();
+                let appearances = mono
+                    .collect_blob_appearances(&f.root.id.to_string(), "/")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    appearances
+                        .into_iter()
+                        .map(|row| (row.blob_id, row.path))
+                        .collect::<BTreeSet<_>>(),
+                    f.expected
+                );
+                mono.index_tree_blob_paths(&f.root.id.to_string(), "/", BlobPathIndexMode::Review)
+                    .await
+                    .unwrap();
+                assert_eq!(pairs(&f).await, f.expected);
+                blob_paths::Entity::delete_many()
+                    .exec(mono.get_connection())
+                    .await
+                    .unwrap();
+                let legacy = PushQueueService::new(mono.base.clone(), PushPolicy::Trunk);
+                legacy.run_c_segment_index(81, "/").await;
+                assert_eq!(pairs(&f).await, f.expected);
+                assert!(rows(&f).await.iter().all(|row| row.2 == Some(81)));
+                seed_stale(&f).await;
+                legacy
+                    .blob_path_compensator()
+                    .compensate_once()
+                    .await
+                    .unwrap();
+                assert_eq!(pairs(&f).await, f.expected);
+                assert_eq!(get_hash_kind(), kind);
+            }
+        }
     }
 }

@@ -365,6 +365,7 @@ impl Storage {
         };
         let push_queue_service =
             PushQueueService::new(base.clone(), config.monorepo.push_policy.clone())
+                .with_blob_path_hash_kind(config.monorepo.object_format.hash_kind()?)
                 .with_view_signal(view_runtime.signal())
                 .with_max_push_commits(config.monorepo.max_push_commits)
                 .with_native_publication(config.mst2.publication_enabled);

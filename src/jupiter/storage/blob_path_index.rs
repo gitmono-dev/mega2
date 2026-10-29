@@ -7,7 +7,7 @@
 
 use std::{collections::HashSet, time::Duration};
 
-use git_internal::internal::object::tree::Tree;
+use git_internal::{hash::HashKind, internal::object::tree::Tree};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement,
     sea_query::LikeExpr,
@@ -19,7 +19,7 @@ use crate::{
     common::{errors::MegaError, utils::escape_like},
     jupiter::{
         storage::{base_storage::StorageConnector, mono_storage::MonoStorage},
-        utils::converter::FromMegaModel,
+        utils::converter::{FromMegaModel, tree_from_mega_model_with_kind},
     },
 };
 
@@ -55,15 +55,27 @@ pub struct BlobPathAppearance {
 #[derive(Clone)]
 pub struct BlobPathCompensator {
     mono: MonoStorage,
+    hash_kind: Option<HashKind>,
 }
 
 impl BlobPathCompensator {
     pub fn new(mono: MonoStorage) -> Self {
-        Self { mono }
+        Self {
+            mono,
+            hash_kind: None,
+        }
+    }
+
+    pub(crate) fn with_hash_kind(mut self, kind: HashKind) -> Self {
+        self.hash_kind = Some(kind);
+        self
     }
 
     pub async fn compensate_once(&self) -> Result<BlobPathIndexStats, MegaError> {
-        self.mono.compensate_blob_paths().await
+        match self.hash_kind {
+            Some(kind) => self.mono.compensate_blob_paths_with_kind(kind).await,
+            None => self.mono.compensate_blob_paths().await,
+        }
     }
 
     pub fn spawn_background(self, interval: Duration, shutdown: CancellationToken) {
@@ -117,6 +129,26 @@ impl MonoStorage {
         tree_hash: &str,
         path_prefix: &str,
     ) -> Result<Vec<BlobPathAppearance>, MegaError> {
+        self.collect_blob_appearances_inner(tree_hash, path_prefix, None)
+            .await
+    }
+
+    pub(crate) async fn collect_blob_appearances_with_kind(
+        &self,
+        tree_hash: &str,
+        path_prefix: &str,
+        kind: HashKind,
+    ) -> Result<Vec<BlobPathAppearance>, MegaError> {
+        self.collect_blob_appearances_inner(tree_hash, path_prefix, Some(kind))
+            .await
+    }
+
+    async fn collect_blob_appearances_inner(
+        &self,
+        tree_hash: &str,
+        path_prefix: &str,
+        kind: Option<HashKind>,
+    ) -> Result<Vec<BlobPathAppearance>, MegaError> {
         let prefix = normalize_index_prefix(path_prefix);
         let mut appearances = Vec::new();
         let mut stack = vec![(tree_hash.to_owned(), prefix)];
@@ -125,7 +157,10 @@ impl MonoStorage {
                 tracing::debug!(tree = %hash, "blob_path walk: tree missing, skip subtree");
                 continue;
             };
-            let tree = Tree::from_mega_model(model);
+            let tree = match kind {
+                Some(kind) => tree_from_mega_model_with_kind(model, kind)?,
+                None => Tree::from_mega_model(model),
+            };
             for item in tree.tree_items {
                 let child = join_blob_path(&path, &item.name);
                 if item.is_tree() {
@@ -163,6 +198,27 @@ impl MonoStorage {
             .await
     }
 
+    pub(crate) async fn index_blob_paths_c_segment_with_kind(
+        &self,
+        path: &str,
+        mode: BlobPathIndexMode,
+        kind: HashKind,
+    ) -> Result<BlobPathIndexStats, MegaError> {
+        if let BlobPathIndexMode::Queue { push_id } = mode
+            && self.same_path_has_later_done(path, push_id).await?
+        {
+            return Ok(BlobPathIndexStats {
+                skipped: true,
+                ..BlobPathIndexStats::default()
+            });
+        }
+        let Some(r) = self.get_main_ref(path).await? else {
+            return Ok(BlobPathIndexStats::default());
+        };
+        self.index_tree_blob_paths_with_kind(&r.ref_tree_hash, path, mode, kind)
+            .await
+    }
+
     /// Index a known tree under `path_prefix` (review / tests / compensator).
     pub async fn index_tree_blob_paths(
         &self,
@@ -185,6 +241,28 @@ impl MonoStorage {
             .await
     }
 
+    pub(crate) async fn index_tree_blob_paths_with_kind(
+        &self,
+        tree_hash: &str,
+        path_prefix: &str,
+        mode: BlobPathIndexMode,
+        kind: HashKind,
+    ) -> Result<BlobPathIndexStats, MegaError> {
+        if let BlobPathIndexMode::Queue { push_id } = mode
+            && self.same_path_has_later_done(path_prefix, push_id).await?
+        {
+            return Ok(BlobPathIndexStats {
+                skipped: true,
+                ..BlobPathIndexStats::default()
+            });
+        }
+        let appearances = self
+            .collect_blob_appearances_with_kind(tree_hash, path_prefix, kind)
+            .await?;
+        self.apply_blob_path_index(&appearances, path_prefix, mode)
+            .await
+    }
+
     /// Rescan `main@/` and converge `blob_paths` to the current tip subtree.
     pub async fn compensate_blob_paths(&self) -> Result<BlobPathIndexStats, MegaError> {
         let Some(root) = self.get_main_ref("/").await? else {
@@ -192,6 +270,22 @@ impl MonoStorage {
         };
         self.index_tree_blob_paths(&root.ref_tree_hash, "/", BlobPathIndexMode::Compensate)
             .await
+    }
+
+    pub(crate) async fn compensate_blob_paths_with_kind(
+        &self,
+        kind: HashKind,
+    ) -> Result<BlobPathIndexStats, MegaError> {
+        let Some(root) = self.get_main_ref("/").await? else {
+            return Ok(BlobPathIndexStats::default());
+        };
+        self.index_tree_blob_paths_with_kind(
+            &root.ref_tree_hash,
+            "/",
+            BlobPathIndexMode::Compensate,
+            kind,
+        )
+        .await
     }
 
     pub async fn same_path_has_later_done(
