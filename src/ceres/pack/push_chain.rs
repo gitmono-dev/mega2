@@ -19,7 +19,9 @@ use crate::{
     callisto::{mega_cl, sea_orm_active_enums::RefTypeEnum},
     ceres::protocol::import_refs::{CommandType, RefCommand},
     common::{errors::MegaError, utils::is_protocol_zero_id},
-    jupiter::{storage::mono_storage::MonoStorage, utils::converter::FromMegaModel},
+    jupiter::{
+        storage::mono_storage::MonoStorage, utils::converter::commit_from_mega_model_with_kind,
+    },
 };
 
 /// The rejection for a new-branch push (`old_id` = zero) whose first-parent
@@ -240,7 +242,7 @@ impl PushChain {
                                     current.id
                                 ))
                             })?;
-                    let parent_commit = Commit::from_mega_model(parent);
+                    let parent_commit = commit_from_mega_model_with_kind(parent, tip.id.kind())?;
                     // Claimed-segment merge rule (see the tip check above for
                     // why merge detection must precede junk classification).
                     let claimed = if tip_is_new { parent_is_new } else { true };
@@ -393,7 +395,7 @@ impl PushChain {
                         current.id
                     ))
                 })?;
-            current = Commit::from_mega_model(parent);
+            current = commit_from_mega_model_with_kind(parent, tip.id.kind())?;
             path.push(current.clone());
         }
 

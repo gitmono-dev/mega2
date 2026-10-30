@@ -1195,7 +1195,12 @@ impl Monorepo {
         };
         let txn = mono.get_connection().begin().await?;
         let resolved = mono
-            .resolve_path_tree_hash_in_txn(&root.ref_tree_hash, path, &txn)
+            .resolve_path_tree_hash_in_txn_with_kind(
+                &root.ref_tree_hash,
+                path,
+                &txn,
+                self.object_hash_kind()?,
+            )
             .await?;
         txn.rollback().await?;
         Ok(resolved.is_none().then(|| path.to_owned()))
@@ -1255,7 +1260,8 @@ impl Monorepo {
             .mono_storage()
             .get_commit_by_hash(&cmd.new_id)
             .await?
-            .map(Commit::from_mega_model);
+            .map(|model| commit_from_mega_model_with_kind(model, self.object_hash_kind()?))
+            .transpose()?;
         let chain = match PushChain::resolve(
             cmd,
             &pack_commit_ids,
@@ -4222,6 +4228,656 @@ mod tests {
     #[tokio::test]
     async fn native_hash_blake3_pack_modes() {
         native_hash_pack_modes(
+            git_internal::hash::HashKind::Blake3,
+            crate::config::MonoObjectFormat::Blake3,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_red_sha256_tip_with_sha1_tls() {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let temp = TempDir::new().expect("private fixture");
+        let mut config = isolated_config(temp.path().join("config"));
+        config.monorepo.object_format = crate::config::MonoObjectFormat::Sha256;
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let parent = ObjectHash::new_for_kind(HashKind::Sha256, b"known parent");
+        let tree = Tree::from_tree_items_with_kind(
+            HashKind::Sha256,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                ObjectHash::new_for_kind(HashKind::Sha256, b"tip blob"),
+                "red.txt".to_owned(),
+            )],
+        )
+        .expect("explicit tree");
+        let author =
+            Signature::from_data(b"author Fixture <native@example.invalid> 1 +0000".to_vec())
+                .expect("author");
+        let committer =
+            Signature::from_data(b"committer Fixture <native@example.invalid> 1 +0000".to_vec())
+                .expect("committer");
+        let tip = Commit::new_with_kind(
+            HashKind::Sha256,
+            author,
+            committer,
+            tree.id,
+            vec![parent],
+            "\nnative tip\n",
+        )
+        .expect("explicit commit");
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![tip.clone()], None)
+            .await
+            .expect("store tip");
+        let tip_id = tip.id.to_string();
+        let cmd = RefCommand::new(
+            parent.to_string(),
+            tip_id.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = test_monorepo(
+            &storage,
+            vec![cmd.clone()],
+            id_set(&[&tip_id]),
+            id_set(&[&tip_id]),
+        );
+        let chain = repo
+            .build_push_chain(&cmd)
+            .await
+            .expect("explicit SHA-256 tip decode")
+            .expect("new tip makes a chain");
+        assert_eq!(chain.tip.id, tip.id);
+        assert_eq!(chain.base, parent.to_string());
+        assert_eq!(chain.ordered_commits.len(), 1);
+        assert_eq!(chain.ordered_commits[0].id, tip.id);
+        assert_eq!(get_hash_kind(), HashKind::Sha1, "caller TLS is unchanged");
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_red_sha256_creation_path_with_sha1_tls() {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let temp = TempDir::new().expect("private fixture");
+        let mut config = isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        config.monorepo.object_format = crate::config::MonoObjectFormat::Sha256;
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let child = Tree::from_tree_items_with_kind(
+            HashKind::Sha256,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                ObjectHash::new_for_kind(HashKind::Sha256, b"path blob"),
+                "leaf.txt".to_owned(),
+            )],
+        )
+        .expect("explicit child");
+        let root = Tree::from_tree_items_with_kind(
+            HashKind::Sha256,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                child.id,
+                "project".to_owned(),
+            )],
+        )
+        .expect("explicit root");
+        let root_commit_id = ObjectHash::new_for_kind(HashKind::Sha256, b"root commit");
+        let mono = storage.mono_storage();
+        mono.save_mega_trees(vec![child, root.clone()], root_commit_id, None)
+            .await
+            .expect("store trees");
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/",
+                MEGA_BRANCH_NAME.to_owned(),
+                root_commit_id.to_string(),
+                root.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .expect("store root ref");
+        let cmd = RefCommand::new(
+            ZERO_ID.to_string(),
+            root_commit_id.to_string(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let mut repo = test_monorepo(&storage, vec![cmd.clone()], HashSet::new(), HashSet::new());
+        repo.path = PathBuf::from("/project");
+        assert_eq!(
+            repo.trunk_creation_path(&cmd)
+                .await
+                .expect("explicit SHA-256 path decode"),
+            None,
+            "an existing tree is not a new repository path"
+        );
+        assert_eq!(get_hash_kind(), HashKind::Sha1, "caller TLS is unchanged");
+    }
+
+    fn native_push_chain_commit(
+        kind: git_internal::hash::HashKind,
+        parents: Vec<ObjectHash>,
+        message: &str,
+    ) -> Commit {
+        Commit::new_with_kind(
+            kind,
+            Signature::from_data(b"author Fixture <native@example.invalid> 1 +0000".to_vec())
+                .unwrap(),
+            Signature::from_data(b"committer Fixture <native@example.invalid> 1 +0000".to_vec())
+                .unwrap(),
+            ObjectHash::new_for_kind(kind, b"fixture tree"),
+            parents,
+            message,
+        )
+        .unwrap()
+    }
+
+    async fn native_push_chain_storage(
+        format: crate::config::MonoObjectFormat,
+        policy: PushPolicy,
+    ) -> (TempDir, Storage) {
+        let temp = TempDir::new().unwrap();
+        let mut config = isolated_config(temp.path().join("config"));
+        config.monorepo.object_format = format;
+        config.monorepo.push_policy = policy;
+        let storage = test_storage_with_config(temp.path(), config).await;
+        (temp, storage)
+    }
+
+    async fn native_push_chain_matrix(
+        kind: git_internal::hash::HashKind,
+        format: crate::config::MonoObjectFormat,
+    ) {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+        use sea_orm::ActiveModelTrait;
+
+        let other = if kind == HashKind::Sha1 {
+            HashKind::Sha256
+        } else {
+            HashKind::Sha1
+        };
+        let _guard = set_hash_kind_for_test(other);
+        let (_temp, storage) = native_push_chain_storage(format, PushPolicy::Trunk).await;
+        let mono = storage.mono_storage();
+        let ancestor = native_push_chain_commit(kind, vec![], "ancestor");
+        let base = native_push_chain_commit(kind, vec![ancestor.id], "base");
+        let middle = native_push_chain_commit(kind, vec![base.id], "middle");
+        let tip = native_push_chain_commit(kind, vec![middle.id], "tip");
+        mono.save_mega_commits(
+            vec![ancestor.clone(), base.clone(), middle.clone(), tip.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+        let cmd = RefCommand::new(
+            base.id.to_string(),
+            tip.id.to_string(),
+            MEGA_BRANCH_NAME.to_owned(),
+        );
+        let pack = id_set(&[&middle.id.to_string(), &tip.id.to_string()]);
+        for new_ids in [pack.clone(), HashSet::new()] {
+            let repo = test_monorepo(&storage, vec![cmd.clone()], pack.clone(), new_ids.clone());
+            let chain = repo.build_push_chain(&cmd).await.unwrap().unwrap();
+            assert_eq!(chain.base, base.id.to_string());
+            assert_eq!(
+                chain
+                    .ordered_commits
+                    .iter()
+                    .map(|c| c.id)
+                    .collect::<Vec<_>>(),
+                vec![tip.id, middle.id]
+            );
+            assert!(
+                chain
+                    .ordered_commits
+                    .iter()
+                    .all(|c| c.id.kind() == kind && c.tree_id.kind() == kind)
+            );
+            chain.validate(&cmd, &mono, None, 2).await.unwrap();
+            assert!(
+                chain
+                    .validate(&cmd, &mono, None, 1)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("more than 1")
+            );
+            let limited =
+                super::PushChain::resolve(&cmd, &pack, &new_ids, Some(tip.clone()), &mono, 1).await;
+            assert!(limited.unwrap_err().to_string().contains("more than 1"));
+            assert_eq!(
+                repo.build_push_chain(&cmd).await.unwrap().unwrap().tip.id,
+                tip.id
+            );
+        }
+        let new_branch = RefCommand::new(
+            "0".repeat(tip.id.to_string().len()),
+            tip.id.to_string(),
+            MEGA_BRANCH_NAME.to_owned(),
+        );
+        let mixed = test_monorepo(
+            &storage,
+            vec![new_branch.clone()],
+            pack.clone(),
+            id_set(&[&tip.id.to_string()]),
+        );
+        let chain = mixed.build_push_chain(&new_branch).await.unwrap().unwrap();
+        assert_eq!(chain.base, middle.id.to_string());
+        assert_eq!(
+            chain
+                .ordered_commits
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            vec![tip.id]
+        );
+        chain.validate(&new_branch, &mono, None, 2).await.unwrap();
+        let known = test_monorepo(&storage, vec![cmd.clone()], HashSet::new(), HashSet::new());
+        let bridge = known.build_push_chain(&cmd).await.unwrap().unwrap();
+        assert_eq!(
+            bridge
+                .ordered_commits
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            vec![tip.id, middle.id]
+        );
+        bridge.validate(&cmd, &mono, None, 2).await.unwrap();
+        let cl = mega_cl::Model {
+            id: 1,
+            link: "native-chain".to_owned(),
+            title: "native chain".to_owned(),
+            merge_date: None,
+            status: crate::callisto::sea_orm_active_enums::MergeStatusEnum::Open,
+            path: "/".to_owned(),
+            from_hash: ancestor.id.to_string(),
+            to_hash: base.id.to_string(),
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+            username: "fixture".to_owned(),
+            base_branch: "main".to_owned(),
+            revision: 0,
+        };
+        bridge.validate(&cmd, &mono, Some(&cl), 3).await.unwrap();
+        assert!(
+            bridge
+                .validate(&cmd, &mono, Some(&cl), 2)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cumulative")
+        );
+        let same = RefCommand::new(
+            tip.id.to_string(),
+            tip.id.to_string(),
+            MEGA_BRANCH_NAME.to_owned(),
+        );
+        let noop = test_monorepo(&storage, vec![same.clone()], HashSet::new(), HashSet::new());
+        assert_eq!(
+            noop.build_push_chain(&same)
+                .await
+                .unwrap()
+                .unwrap()
+                .ordered_commits
+                .len(),
+            1
+        );
+
+        let mut model = mono
+            .get_commit_by_hash(&middle.id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        model.parents_id = serde_json::json!([base.id.to_string(), tip.id.to_string()]);
+        model
+            .clone()
+            .into_active_model()
+            .reset_all()
+            .update(mono.get_connection())
+            .await
+            .unwrap();
+        for new_ids in [pack.clone(), HashSet::new()] {
+            let repo = test_monorepo(&storage, vec![cmd.clone()], pack.clone(), new_ids.clone());
+            assert!(
+                repo.build_push_chain(&cmd)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("merge commit")
+            );
+        }
+        model.parents_id = serde_json::json!([tip.id.to_string()]);
+        model
+            .clone()
+            .into_active_model()
+            .reset_all()
+            .update(mono.get_connection())
+            .await
+            .unwrap();
+        for new_ids in [pack.clone(), HashSet::new()] {
+            let repo = test_monorepo(&storage, vec![cmd.clone()], pack.clone(), new_ids.clone());
+            assert!(
+                repo.build_push_chain(&cmd)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cycle")
+            );
+        }
+        assert!(
+            super::PushChain::from_known_tip(&cmd, tip.clone(), &mono, 3)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("more than 3")
+        );
+        model.parents_id = serde_json::json!([base.id.to_string()]);
+        model.tree = ObjectHash::new_for_kind(other, b"wrong algorithm").to_string();
+        model
+            .into_active_model()
+            .reset_all()
+            .update(mono.get_connection())
+            .await
+            .unwrap();
+        for new_ids in [pack.clone(), HashSet::new()] {
+            let repo = test_monorepo(&storage, vec![cmd.clone()], pack.clone(), new_ids.clone());
+            assert!(
+                repo.build_push_chain(&cmd)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid native commit identity")
+            );
+        }
+        assert!(
+            super::PushChain::from_known_tip(&cmd, tip, &mono, 3)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid native commit identity")
+        );
+        assert_eq!(get_hash_kind(), other);
+    }
+
+    async fn native_push_chain_metadata(
+        kind: git_internal::hash::HashKind,
+        format: crate::config::MonoObjectFormat,
+    ) {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+        use sea_orm::ActiveModelTrait;
+
+        let other = if kind == HashKind::Sha1 {
+            HashKind::Sha256
+        } else {
+            HashKind::Sha1
+        };
+        let _guard = set_hash_kind_for_test(other);
+        let (_temp, storage) = native_push_chain_storage(format, PushPolicy::Review).await;
+        let mono = storage.mono_storage();
+        let base = ObjectHash::new_for_kind(kind, b"base");
+        let tip = native_push_chain_commit(kind, vec![base], "tip");
+        mono.save_mega_commits(vec![tip.clone()], None)
+            .await
+            .unwrap();
+        let cmd = RefCommand::new(
+            base.to_string(),
+            tip.id.to_string(),
+            MEGA_BRANCH_NAME.to_owned(),
+        );
+        let noop = test_monorepo(&storage, vec![cmd.clone()], HashSet::new(), HashSet::new());
+        assert!(noop.build_push_chain(&cmd).await.unwrap().is_none());
+        assert!(
+            noop.no_op_notice
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .contains("no new commit")
+        );
+        let original = mono
+            .get_commit_by_hash(&tip.id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        for (case, expected) in [
+            (0, "identity"),
+            (1, "parents"),
+            (2, "identity"),
+            (3, "signature"),
+            (4, "signature"),
+            (5, "body"),
+        ] {
+            let mut bad = original.clone();
+            match case {
+                0 => bad.tree = ObjectHash::new_for_kind(other, b"wrong tree").to_string(),
+                1 => bad.parents_id = serde_json::json!({"not": "an array"}),
+                2 => {
+                    bad.parents_id =
+                        serde_json::json!([
+                            ObjectHash::new_for_kind(other, b"wrong parent").to_string()
+                        ])
+                }
+                3 => bad.author = None,
+                4 => bad.committer = None,
+                _ => bad.content = None,
+            }
+            bad.into_active_model()
+                .reset_all()
+                .update(mono.get_connection())
+                .await
+                .unwrap();
+            let pack = id_set(&[&tip.id.to_string()]);
+            let repo = test_monorepo(&storage, vec![cmd.clone()], pack.clone(), pack);
+            assert!(
+                repo.build_push_chain(&cmd)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected),
+                "case {case}"
+            );
+            assert!(repo.push_chain_cache.lock().unwrap().is_empty());
+            assert_eq!(get_hash_kind(), other);
+        }
+    }
+
+    async fn native_push_chain_paths(
+        kind: git_internal::hash::HashKind,
+        format: crate::config::MonoObjectFormat,
+    ) {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+        use sea_orm::ActiveModelTrait;
+
+        let other = if kind == HashKind::Sha1 {
+            HashKind::Sha256
+        } else {
+            HashKind::Sha1
+        };
+        let _guard = set_hash_kind_for_test(other);
+        let (_temp, storage) = native_push_chain_storage(format, PushPolicy::Trunk).await;
+        let mono = storage.mono_storage();
+        let child = Tree::from_tree_items_with_kind(
+            kind,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                ObjectHash::new_for_kind(kind, b"blob"),
+                "leaf.txt".to_owned(),
+            )],
+        )
+        .unwrap();
+        let root = Tree::from_tree_items_with_kind(
+            kind,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                child.id,
+                "project".to_owned(),
+            )],
+        )
+        .unwrap();
+        let commit_id = ObjectHash::new_for_kind(kind, b"root commit");
+        mono.save_mega_trees(vec![child.clone(), root.clone()], commit_id, None)
+            .await
+            .unwrap();
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/",
+                MEGA_BRANCH_NAME.to_owned(),
+                commit_id.to_string(),
+                root.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let cmd = RefCommand::new(
+            "0".repeat(commit_id.to_string().len()),
+            commit_id.to_string(),
+            MEGA_BRANCH_NAME.to_owned(),
+        );
+        let mut repo = test_monorepo(&storage, vec![cmd.clone()], HashSet::new(), HashSet::new());
+        for (path, expected) in [
+            ("/project", None),
+            ("/missing", Some("/missing")),
+            ("/project/leaf.txt", Some("/project/leaf.txt")),
+        ] {
+            repo.path = PathBuf::from(path);
+            assert_eq!(
+                repo.trunk_creation_path(&cmd).await.unwrap().as_deref(),
+                expected
+            );
+            assert_eq!(get_hash_kind(), other);
+        }
+        let txn = mono.get_connection().begin().await.unwrap();
+        assert_eq!(
+            mono.resolve_path_tree_hash_in_txn_with_kind(
+                &root.id.to_string(),
+                "/project",
+                &txn,
+                kind
+            )
+            .await
+            .unwrap(),
+            Some(child.id.to_string())
+        );
+        assert!(
+            mono.resolve_path_tree_hash_in_txn_with_kind("invalid", "/project", &txn, kind)
+                .await
+                .is_err()
+        );
+        if kind == HashKind::Sha1 {
+            let _same = set_hash_kind_for_test(HashKind::Sha1);
+            assert_eq!(
+                mono.resolve_path_tree_hash_in_txn(&root.id.to_string(), "/project", &txn)
+                    .await
+                    .unwrap(),
+                Some(child.id.to_string())
+            );
+        }
+        txn.rollback().await.unwrap();
+        let mut corrupt = mono
+            .get_tree_by_hash(&child.id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        corrupt.sub_trees = vec![0];
+        corrupt
+            .into_active_model()
+            .reset_all()
+            .update(mono.get_connection())
+            .await
+            .unwrap();
+        repo.path = PathBuf::from("/project");
+        assert!(
+            repo.trunk_creation_path(&cmd)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid native tree body")
+        );
+        assert_eq!(get_hash_kind(), other);
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_sha1_matrix() {
+        native_push_chain_matrix(
+            git_internal::hash::HashKind::Sha1,
+            crate::config::MonoObjectFormat::Sha1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_sha1_metadata() {
+        native_push_chain_metadata(
+            git_internal::hash::HashKind::Sha1,
+            crate::config::MonoObjectFormat::Sha1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_sha1_paths() {
+        native_push_chain_paths(
+            git_internal::hash::HashKind::Sha1,
+            crate::config::MonoObjectFormat::Sha1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_sha256_matrix() {
+        native_push_chain_matrix(
+            git_internal::hash::HashKind::Sha256,
+            crate::config::MonoObjectFormat::Sha256,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_sha256_metadata() {
+        native_push_chain_metadata(
+            git_internal::hash::HashKind::Sha256,
+            crate::config::MonoObjectFormat::Sha256,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_sha256_paths() {
+        native_push_chain_paths(
+            git_internal::hash::HashKind::Sha256,
+            crate::config::MonoObjectFormat::Sha256,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_blake3_matrix() {
+        native_push_chain_matrix(
+            git_internal::hash::HashKind::Blake3,
+            crate::config::MonoObjectFormat::Blake3,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_blake3_metadata() {
+        native_push_chain_metadata(
+            git_internal::hash::HashKind::Blake3,
+            crate::config::MonoObjectFormat::Blake3,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_push_chain_blake3_paths() {
+        native_push_chain_paths(
             git_internal::hash::HashKind::Blake3,
             crate::config::MonoObjectFormat::Blake3,
         )

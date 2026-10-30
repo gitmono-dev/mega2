@@ -40,7 +40,7 @@ use crate::{
             commit_binding_storage::CommitBindingStorage,
             user_storage::UserStorage,
         },
-        utils::converter::{FromMegaModel, IntoMegaModel},
+        utils::converter::{FromMegaModel, IntoMegaModel, tree_from_mega_model_with_kind},
     },
 };
 #[derive(Clone)]
@@ -1767,6 +1767,41 @@ impl MonoStorage {
                 return Ok(None);
             };
             tree = Tree::from_mega_model(next);
+        }
+        Ok(Some(tree.id.to_string()))
+    }
+
+    /// Resolve a receive-pack creation path using the repository object algorithm.
+    pub(crate) async fn resolve_path_tree_hash_in_txn_with_kind(
+        &self,
+        root_tree_hash: &str,
+        path: &str,
+        txn: &DatabaseTransaction,
+        kind: HashKind,
+    ) -> Result<Option<String>, MegaError> {
+        ObjectHash::from_hex_for_kind(kind, root_tree_hash)
+            .map_err(|_| MegaError::Other("invalid native root tree identity".into()))?;
+        if path.is_empty() || path == "/" {
+            return Ok(Some(root_tree_hash.to_owned()));
+        }
+        let Some(model) = self.get_tree_by_hash_in_txn(root_tree_hash, txn).await? else {
+            return Ok(None);
+        };
+        let mut tree = tree_from_mega_model_with_kind(model, kind)?;
+        for component in path.split('/').filter(|c| !c.is_empty()) {
+            let Some(item) = tree.tree_items.iter().find(|x| x.name == component) else {
+                return Ok(None);
+            };
+            if item.mode != TreeItemMode::Tree {
+                return Ok(None);
+            }
+            let Some(next) = self
+                .get_tree_by_hash_in_txn(&item.id.to_string(), txn)
+                .await?
+            else {
+                return Ok(None);
+            };
+            tree = tree_from_mega_model_with_kind(next, kind)?;
         }
         Ok(Some(tree.id.to_string()))
     }
