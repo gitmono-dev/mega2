@@ -2151,6 +2151,7 @@ mod disabled_http {
         temp: tempfile::TempDir,
         shared: tempfile::TempDir,
         database_url: String,
+        db: sea_orm::DatabaseConnection,
         service: OwnedChild,
         port: u16,
         scope: String,
@@ -2207,6 +2208,7 @@ mod disabled_http {
                 temp,
                 shared,
                 database_url: url.to_string(),
+                db: db.clone(),
                 service: OwnedChild(None),
                 port: 0,
                 scope: Uuid::new_v4().to_string(),
@@ -2350,6 +2352,134 @@ mod disabled_http {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                while !self.initial_index_ready().await {
+                    assert!(
+                        self.service
+                            .0
+                            .as_mut()
+                            .expect("child")
+                            .try_wait()
+                            .expect("poll service")
+                            .is_none(),
+                        "HTTP service exited before initial index readiness"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("HTTP listener and initial index readiness exceeded 90s");
+        }
+
+        async fn initial_index_ready(&self) -> bool {
+            let txn = self
+                .db
+                .begin_with_config(
+                    Some(IsolationLevel::RepeatableRead),
+                    Some(AccessMode::ReadOnly),
+                )
+                .await
+                .expect("initial index snapshot");
+            let root: String = txn
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT ref_tree_hash FROM mega_refs WHERE path='/' AND ref_name='refs/heads/main'",
+                ))
+                .await
+                .expect("fixture root query")
+                .expect("initialized fixture root")
+                .try_get("", "ref_tree_hash")
+                .expect("fixture root tree");
+            let oid_bytes = match root.len() {
+                40 => 20,
+                64 => 32,
+                _ => panic!("invalid fixture root tree identity"),
+            };
+            let mut stack = vec![(root, String::new())];
+            let mut expected = BTreeSet::new();
+            let mut final_paths = BTreeMap::new();
+            while let Some((oid, parent)) = stack.pop() {
+                let body: Vec<u8> = txn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "SELECT sub_trees FROM mega_tree WHERE tree_id=$1",
+                        [oid.into()],
+                    ))
+                    .await
+                    .expect("fixture raw tree query")
+                    .expect("fixture tree exists")
+                    .try_get("", "sub_trees")
+                    .expect("fixture raw tree bytes");
+                let mut remaining = body.as_slice();
+                while !remaining.is_empty() {
+                    let nul = remaining
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .expect("fixture tree entry terminator");
+                    let (mode, name) = std::str::from_utf8(&remaining[..nul])
+                        .expect("fixture tree entry text")
+                        .split_once(' ')
+                        .expect("fixture tree mode/name");
+                    let end = nul + 1 + oid_bytes;
+                    assert!(end <= remaining.len(), "fixture tree object identity");
+                    let child = hex::encode(&remaining[nul + 1..end]);
+                    let path = format!("{parent}/{name}");
+                    if mode == "40000" || mode == "040000" {
+                        stack.push((child, path));
+                    } else {
+                        expected.insert((child.clone(), path.clone()));
+                        final_paths.insert(child, path);
+                    }
+                    remaining = &remaining[end..];
+                }
+            }
+            assert!(!expected.is_empty(), "initialized fixture root has blobs");
+            let actual: BTreeSet<(String, String)> = txn
+                .query_all_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT blob_id, path FROM blob_paths",
+                ))
+                .await
+                .expect("initial blob paths query")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.try_get("", "blob_id").expect("initial blob identity"),
+                        row.try_get("", "path").expect("initial blob path"),
+                    )
+                })
+                .collect();
+            let legacy: BTreeMap<String, String> = txn
+                .query_all_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT blob_id, file_path FROM mega_blob",
+                ))
+                .await
+                .expect("initial legacy paths query")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.try_get("", "blob_id").expect("legacy blob identity"),
+                        row.try_get("", "file_path").expect("legacy blob path"),
+                    )
+                })
+                .collect();
+            let pending: i64 = txn
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT count(*) AS pending FROM push_queue WHERE status::text IN ('Queued','Running')",
+                ))
+                .await
+                .expect("initial queue query")
+                .expect("initial queue row")
+                .try_get("", "pending")
+                .expect("initial queue count");
+            txn.commit().await.expect("finish initial index snapshot");
+            pending == 0
+                && actual == expected
+                && final_paths
+                    .iter()
+                    .all(|(oid, path)| legacy.get(oid) == Some(path))
         }
 
         fn stop(&mut self) {
@@ -5090,6 +5220,283 @@ mod disabled_http {
         );
     }
 
+    type BootstrapIndex = (BTreeSet<(String, String)>, BTreeMap<String, String>);
+
+    fn bootstrap_git_index(fixture: &Fixture) -> BootstrapIndex {
+        let listing = fixture.git_text(&[
+            "-C",
+            "bootstrap-index-oracle",
+            "ls-tree",
+            "-r",
+            "-t",
+            "HEAD",
+        ]);
+        let mut children: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+        for line in listing.lines() {
+            let (header, path) = line.split_once('\t').expect("Git tree record");
+            let fields: Vec<_> = header.split_whitespace().collect();
+            assert_eq!(fields.len(), 3);
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            children.entry(parent.to_owned()).or_default().push((
+                fields[1].to_owned(),
+                fields[2].to_owned(),
+                path.to_owned(),
+            ));
+        }
+        let mut stack = vec![String::new()];
+        let mut paths = BTreeSet::new();
+        let mut legacy = BTreeMap::new();
+        while let Some(parent) = stack.pop() {
+            for (kind, oid, path) in children.get(&parent).into_iter().flatten() {
+                if kind == "tree" {
+                    stack.push(path.clone());
+                } else {
+                    assert_eq!(kind, "blob");
+                    let absolute = format!("/{path}");
+                    paths.insert((oid.clone(), absolute.clone()));
+                    legacy.insert(oid.clone(), absolute);
+                }
+            }
+        }
+        assert!(!paths.is_empty(), "Git oracle must contain real root blobs");
+        (paths, legacy)
+    }
+
+    async fn bootstrap_index_matches(
+        db: &sea_orm::DatabaseConnection,
+        expected: &BootstrapIndex,
+    ) -> bool {
+        let paths: BTreeSet<(String, String)> = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT blob_id, path FROM blob_paths",
+            ))
+            .await
+            .expect("controlled index rows")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get("", "blob_id")
+                        .expect("controlled blob identity"),
+                    row.try_get("", "path").expect("controlled blob path"),
+                )
+            })
+            .collect();
+        let legacy: BTreeMap<String, String> = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT blob_id, file_path FROM mega_blob",
+            ))
+            .await
+            .expect("controlled legacy rows")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get("", "blob_id")
+                        .expect("controlled legacy identity"),
+                    row.try_get("", "file_path")
+                        .expect("controlled legacy path"),
+                )
+            })
+            .collect();
+        paths == expected.0
+            && expected
+                .1
+                .iter()
+                .all(|(oid, path)| legacy.get(oid) == Some(path))
+    }
+
+    pub async fn bootstrap_index_readiness(case: &str) {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = Fixture::new(&db).await;
+        let mut lock = None;
+        let result = AssertUnwindSafe(async {
+            if case == "shared" {
+                fixture.prepare(&db).await;
+            } else {
+                let mut init = fixture.command(false, "trunk", "/third-party");
+                init.args(["service", "init", "--yes"]);
+                OwnedChild::spawn(&mut init).require_success().await;
+                fixture.start(true, "trunk", "/third-party").await;
+            }
+            fixture.git(&[
+                "clone",
+                &git_cli::mega2_http_url(fixture.port, "/"),
+                "bootstrap-index-oracle",
+            ]);
+            let expected = bootstrap_git_index(&fixture);
+            let setup_deadline = Instant::now() + LIMIT;
+            while !bootstrap_index_matches(&db, &expected).await {
+                assert!(Instant::now() < setup_deadline, "initial oracle setup deadline");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            fixture.stop();
+            let (table, mutation, writer_pattern) = match case {
+                "empty" => (
+                    "blob_paths",
+                    "DELETE FROM blob_paths",
+                    "%INSERT INTO blob_paths%",
+                ),
+                "wrong" => (
+                    "blob_paths",
+                    "UPDATE blob_paths SET path='/fix23-wrong'||path",
+                    "%INSERT INTO blob_paths%",
+                ),
+                "shared" => {
+                    let mut appearances = BTreeMap::new();
+                    for (oid, _) in &expected.0 {
+                        *appearances.entry(oid).or_insert(0) += 1;
+                    }
+                    assert!(
+                        appearances.values().any(|count| *count > 1),
+                        "shared-blob case must contain actual multiple paths"
+                    );
+                    (
+                        "mega_blob",
+                        "UPDATE mega_blob SET file_path='/fix23-stale/'||blob_id",
+                        "%UPDATE%mega_blob%",
+                    )
+                }
+                _ => panic!("unknown bootstrap index case"),
+            };
+            db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, mutation))
+                .await
+                .expect("seed controlled incomplete index");
+            let count: usize = scalar(&db, "SELECT count(*)::text AS value FROM blob_paths")
+                .await
+                .parse()
+                .expect("controlled index count");
+            assert_eq!(count, if case == "empty" { 0 } else { expected.0.len() });
+            assert!(!bootstrap_index_matches(&db, &expected).await);
+
+            lock = Some(db.begin().await.expect("index blocker transaction"));
+            let txn = lock.as_ref().expect("held index blocker");
+            let lock_timeout: String = txn
+                .query_one_raw(Statement::from_string(DatabaseBackend::Postgres, "SHOW lock_timeout"))
+                .await
+                .expect("read lock timeout")
+                .expect("lock timeout row")
+                .try_get("", "lock_timeout")
+                .expect("lock timeout setting");
+            assert_eq!(lock_timeout, "0");
+            let locker: i32 = txn
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT pg_backend_pid() AS pid",
+                ))
+                .await
+                .expect("blocker backend")
+                .expect("blocker row")
+                .try_get("", "pid")
+                .expect("blocker pid");
+            txn.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("LOCK TABLE {table} IN SHARE MODE"),
+            ))
+            .await
+            .expect("hold read-compatible index blocker");
+            let log = fixture.temp.path().join("process.out");
+            let offset = fs::read(&log).expect("prior service log").len();
+            let premature = tokio::time::timeout(LIMIT, async {
+                let mut start = Box::pin(fixture.start(true, "trunk", "/third-party"));
+                let mut witness = Box::pin(async {
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(2))
+                        .build()
+                        .expect("controlled listener client");
+                    loop {
+                        let blocked: bool = db
+                            .query_one_raw(Statement::from_sql_and_values(
+                                DatabaseBackend::Postgres,
+                                "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.datname=current_database() AND l.relation=$1::regclass AND NOT l.granted AND l.mode='RowExclusiveLock' AND $2=ANY(pg_blocking_pids(a.pid)) AND a.query LIKE $3) AS blocked",
+                                [table.into(), locker.into(), writer_pattern.into()],
+                            ))
+                            .await
+                            .expect("observe actual blocked index writer")
+                            .expect("blocked writer row")
+                            .try_get("", "blocked")
+                            .expect("blocked writer boolean");
+                        let bytes = fs::read(&log).expect("controlled service log");
+                        let lines = String::from_utf8_lossy(&bytes[offset..]);
+                        let port = lines.lines().find_map(|line| {
+                            if !line.contains("HTTP server started up") {
+                                return None;
+                            }
+                            line.split_once("address=")?
+                                .1
+                                .split_whitespace()
+                                .next()?
+                                .rsplit_once(':')?
+                                .1
+                                .parse::<u16>()
+                                .ok()
+                        });
+                        if blocked
+                            && let Some(port) = port
+                            && let Ok(response) = client
+                                .get(git_cli::mega2_host_http_url(port, "/api/openapi.json"))
+                                .send()
+                                .await
+                            && response.status() == reqwest::StatusCode::OK
+                        {
+                            eprintln!("FIX23_WITNESS case={case} listener=200 blocked_writer=true lock_timeout=0");
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                });
+                let mut premature = tokio::select! {
+                    () = &mut start => {
+                        witness.await;
+                        true
+                    }
+                    () = &mut witness => false,
+                };
+                if !premature {
+                    premature = tokio::time::timeout(Duration::from_secs(2), &mut start)
+                        .await
+                        .is_ok();
+                }
+                lock.take()
+                    .expect("release exact blocker")
+                    .rollback()
+                    .await
+                    .expect("release index blocker");
+                if !premature {
+                    start.await;
+                }
+                while !bootstrap_index_matches(&db, &expected).await {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                eprintln!("FIX23_COMPLETION case={case} real_index=true premature={premature}");
+                premature
+            })
+            .await
+            .expect("controlled startup and real index completion exceeded 90s");
+            assert!(!premature, "fixture returned before initial index readiness");
+        })
+        .catch_unwind()
+        .await;
+        let rolled_back = if let Some(txn) = lock.take() {
+            txn.rollback().await
+        } else {
+            Ok(())
+        };
+        let stopped = std::panic::catch_unwind(AssertUnwindSafe(|| fixture.stop()));
+        let closed = db.close().await;
+        drop(guard);
+        rolled_back.expect("release blocker on failed readiness");
+        if let Err(panic) = stopped {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close controlled readiness database pool");
+        if let Err(panic) = result {
+            let logs = fixture.temp.keep();
+            eprintln!("FIX23 retained fixture: {}", logs.display());
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     pub async fn http_git_roundtrip(kind: &str) {
         let (guard, db) = traces_db::TracesDb::migrated().await;
         let mut fixture = Fixture::new(&db).await;
@@ -5802,6 +6209,21 @@ mod disabled_http {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_ref_boundary_legacy_advertisement() {
     disabled_http::code_ref_boundary_legacy_advertisement().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_git_bootstrap_index_empty() {
+    disabled_http::bootstrap_index_readiness("empty").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_git_bootstrap_index_wrong_paths() {
+    disabled_http::bootstrap_index_readiness("wrong").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_git_bootstrap_index_shared_blob_file_paths() {
+    disabled_http::bootstrap_index_readiness("shared").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
