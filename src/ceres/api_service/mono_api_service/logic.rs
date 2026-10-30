@@ -1,3 +1,5 @@
+use git_internal::hash::HashKind;
+
 use super::{RefUpdate, TreeUpdateResult, prelude::*};
 
 /// `MonoServiceLogic` is a helper struct for `MonoApiService` containing stateless logic.
@@ -122,7 +124,8 @@ impl MonoServiceLogic {
         // sequence and does not sort. Re-sorting here would change review-path
         // tree ids (hard constraint 8). Sorting belongs only on the new
         // insert-or-replace create primitives via tree_from_items_checked.
-        Tree::from_tree_items(items).map_err(|_| GitError::CustomError("Invalid tree".to_string()))
+        Tree::from_tree_items_with_kind(tree.id.kind(), items)
+            .map_err(|_| GitError::CustomError("Invalid tree".to_string()))
     }
 
     /// Insert or replace a named tree entry, then rebuild with Git tree sort order.
@@ -154,7 +157,7 @@ impl MonoServiceLogic {
                 name: name.to_owned(),
             });
         }
-        Self::tree_from_items_checked(items)
+        Self::tree_from_items_checked_with_kind(tree.id.kind(), items)
     }
 
     /// Like [`Self::update_tree_hash`], but inserts a `TreeItemMode::Tree` entry when missing.
@@ -167,7 +170,14 @@ impl MonoServiceLogic {
     }
 
     /// Build a [`Tree`] after rejecting duplicate names and applying Git sort order.
-    pub fn tree_from_items_checked(mut items: Vec<TreeItem>) -> Result<Tree, GitError> {
+    pub fn tree_from_items_checked(items: Vec<TreeItem>) -> Result<Tree, GitError> {
+        Self::tree_from_items_checked_with_kind(get_hash_kind(), items)
+    }
+
+    pub fn tree_from_items_checked_with_kind(
+        kind: HashKind,
+        mut items: Vec<TreeItem>,
+    ) -> Result<Tree, GitError> {
         let mut seen = std::collections::HashSet::with_capacity(items.len());
         for item in &items {
             if !seen.insert(item.name.clone()) {
@@ -178,7 +188,8 @@ impl MonoServiceLogic {
             }
         }
         crate::jupiter::utils::converter::sort_git_tree_items(&mut items);
-        Tree::from_tree_items(items).map_err(|_| GitError::CustomError("Invalid tree".to_string()))
+        Tree::from_tree_items_with_kind(kind, items)
+            .map_err(|_| GitError::CustomError("Invalid tree".to_string()))
     }
 
     /// Insert `leaf` at the end of `chain` path components, creating missing Tree
@@ -210,6 +221,11 @@ impl MonoServiceLogic {
             ));
         }
 
+        let kind = chain[0].id.kind();
+        if leaf.id.kind() != kind || chain.iter().any(|tree| tree.id.kind() != kind) {
+            return Err(GitError::CustomError("Invalid tree".to_string()));
+        }
+
         let mut produced = Vec::new();
         produced.push(leaf.clone());
         let mut child_hash = leaf.id;
@@ -218,11 +234,14 @@ impl MonoServiceLogic {
         // Build brand-new intermediate trees for all but the first missing component
         // (the first missing attaches into the deepest existing tree).
         for name in missing_components.iter().rev().skip(1) {
-            let intermediate = Self::tree_from_items_checked(vec![TreeItem {
-                mode: TreeItemMode::Tree,
-                id: child_hash,
-                name: child_name.to_owned(),
-            }])?;
+            let intermediate = Self::tree_from_items_checked_with_kind(
+                kind,
+                vec![TreeItem {
+                    mode: TreeItemMode::Tree,
+                    id: child_hash,
+                    name: child_name.to_owned(),
+                }],
+            )?;
             child_hash = intermediate.id;
             child_name = name;
             produced.push(intermediate);

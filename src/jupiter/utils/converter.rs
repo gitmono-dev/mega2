@@ -1,6 +1,7 @@
 use std::{cell::RefCell, collections::HashMap, str::FromStr};
 
 use git_internal::{
+    errors::GitError,
     hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
     internal::{
         metadata::EntryMeta,
@@ -451,11 +452,18 @@ pub fn generate_git_keep() -> Blob {
 }
 
 pub fn generate_git_keep_with_timestamp() -> Blob {
-    let git_keep_content = format!(
+    Blob::from_content(&git_keep_content_with_timestamp())
+}
+
+fn git_keep_content_with_timestamp() -> String {
+    format!(
         "This file was used to maintain the git tree, generate at:{}",
         chrono::Utc::now().naive_utc()
-    );
-    Blob::from_content(&git_keep_content)
+    )
+}
+
+pub fn generate_git_keep_with_timestamp_for_kind(kind: HashKind) -> Result<Blob, GitError> {
+    Blob::from_content_with_kind(kind, &git_keep_content_with_timestamp())
 }
 
 /// Root tree entries `init_trees` adds besides `root_dirs`; a `root_dirs`

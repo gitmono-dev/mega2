@@ -601,7 +601,8 @@ impl ApiHandler for super::MonoApiService {
         }
 
         // condition 2: commit hash
-        if refs.len() == 40 && refs.chars().all(|c| c.is_ascii_hexdigit()) {
+        let kind = self.storage.config().monorepo.object_hash_kind()?;
+        if refs.len() == kind.hex_len() && refs.chars().all(|c| c.is_ascii_hexdigit()) {
             let commit = self.get_commit_by_hash(refs).await?;
             return self.get_tree_by_hash(&commit.tree_id.to_string()).await;
         }
@@ -626,7 +627,10 @@ impl ApiHandler for super::MonoApiService {
             .get_tree_by_hash(hash)
             .await?
             .ok_or_else(|| MegaError::NotFound(format!("tree not found: {}", hash)))?;
-        Ok(Tree::from_mega_model(model))
+        crate::jupiter::utils::converter::tree_from_mega_model_with_kind(
+            model,
+            self.storage.config().monorepo.object_hash_kind()?,
+        )
     }
 
     async fn get_commit_by_hash(&self, hash: &str) -> Result<Commit, MegaError> {
@@ -636,7 +640,10 @@ impl ApiHandler for super::MonoApiService {
             .get_commit_by_hash(hash)
             .await?
             .ok_or_else(|| MegaError::NotFound(format!("commit not found: {}", hash)))?;
-        Ok(Commit::from_mega_model(model))
+        crate::jupiter::utils::converter::commit_from_mega_model_with_kind(
+            model,
+            self.storage.config().monorepo.object_hash_kind()?,
+        )
     }
 
     async fn item_to_commit_map(

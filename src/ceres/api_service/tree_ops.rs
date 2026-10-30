@@ -19,7 +19,9 @@ use crate::{
         model::git::{TreeBriefItem, TreeCommitItem, TreeHashItem},
     },
     common::errors::MegaError,
-    jupiter::utils::converter::generate_git_keep_with_timestamp,
+    jupiter::utils::converter::{
+        generate_git_keep_with_timestamp, generate_git_keep_with_timestamp_for_kind,
+    },
 };
 
 pub async fn get_tree_commit_info<T: ApiHandler + ?Sized>(
@@ -430,6 +432,15 @@ pub async fn search_tree_for_update_or_create_from_root<T: ApiHandler + ?Sized>(
     path: &Path,
     root_tree: Tree,
 ) -> Result<(Vec<Arc<Tree>>, Option<Blob>), GitError> {
+    let kind = root_tree.id.kind();
+    let validate = |tree: &Tree| {
+        if tree.id.kind() != kind || tree.tree_items.iter().any(|item| item.id.kind() != kind) {
+            Err(GitError::CustomError("Invalid tree".to_string()))
+        } else {
+            Ok(())
+        }
+    };
+    validate(&root_tree)?;
     let relative_path = handler
         .strip_relative(path)
         .map_err(|e| GitError::CustomError(e.to_string()))?;
@@ -458,6 +469,7 @@ pub async fn search_tree_for_update_or_create_from_root<T: ApiHandler + ?Sized>(
             Some(item) if item.mode == TreeItemMode::Tree => {
                 existing_names.push(target_name);
                 cursor = handler.get_tree_by_hash(&item.id.to_string()).await?;
+                validate(&cursor)?;
                 existing_chain.push(cursor.clone());
             }
             Some(_) => {
@@ -471,16 +483,17 @@ pub async fn search_tree_for_update_or_create_from_root<T: ApiHandler + ?Sized>(
         }
     }
 
-    let blob = generate_git_keep_with_timestamp();
-
     if missing.is_empty() {
         let chain = existing_chain.into_iter().map(Arc::new).collect();
         // Path already exists: no placeholder blob is referenced.
         return Ok((chain, None));
     }
 
+    let blob = generate_git_keep_with_timestamp_for_kind(root_tree.id.kind())?;
+
     let leaf =
-        crate::ceres::api_service::mono_api_service::MonoServiceLogic::tree_from_items_checked(
+        crate::ceres::api_service::mono_api_service::MonoServiceLogic::tree_from_items_checked_with_kind(
+            root_tree.id.kind(),
             vec![TreeItem {
                 mode: TreeItemMode::Blob,
                 id: blob.id,
@@ -575,6 +588,385 @@ mod tests {
             utils::converter::generate_git_keep_with_timestamp,
         },
     };
+
+    #[tokio::test]
+    async fn native_path_tree_red_missing_path_uses_root_kind() {
+        use futures::FutureExt;
+        use git_internal::{
+            hash::{HashKind, get_hash_kind, set_hash_kind_for_test},
+            internal::object::blob::Blob,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.monorepo.object_format = crate::config::MonoObjectFormat::Sha256;
+        let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+        let handler = MonoApiService {
+            storage,
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: init_connection(&RedisConfig {
+                    url: std::env::var("MEGA_REDIS__URL")
+                        .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string()),
+                })
+                .await
+                .expect("redis connection"),
+                prefix: "disabled".to_string(),
+            }),
+        };
+        let existing = Blob::from_content_with_kind(HashKind::Sha256, "existing").unwrap();
+        let child = super::Tree::from_tree_items_with_kind(
+            HashKind::Sha256,
+            vec![TreeItem {
+                mode: TreeItemMode::Blob,
+                id: existing.id,
+                name: "existing".into(),
+            }],
+        )
+        .unwrap();
+        handler
+            .storage
+            .mono_storage()
+            .save_mega_trees(vec![child.clone()], existing.id, None)
+            .await
+            .expect("store SHA256 subtree");
+        let root = super::Tree::from_tree_items_with_kind(
+            HashKind::Sha256,
+            vec![TreeItem {
+                mode: TreeItemMode::Tree,
+                id: child.id,
+                name: "nested".into(),
+            }],
+        )
+        .unwrap();
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let operation = super::search_tree_for_update_or_create_from_root(
+            &handler,
+            Path::new("/nested/newdir"),
+            root,
+        );
+        let (chain, placeholder) = std::panic::AssertUnwindSafe(operation)
+            .catch_unwind()
+            .await
+            .expect("RED stored SHA256 subtree must decode without panic")
+            .expect("SHA256 path creation must succeed");
+        assert_eq!(
+            placeholder
+                .expect("missing path needs a placeholder")
+                .id
+                .kind(),
+            HashKind::Sha256,
+            "RED missing-path placeholder must use root kind"
+        );
+        assert!(
+            chain.iter().all(|tree| tree.id.kind() == HashKind::Sha256),
+            "path trees must use root kind"
+        );
+        assert_eq!(get_hash_kind(), HashKind::Sha1);
+    }
+
+    #[test]
+    fn native_path_tree_red_rebuild_uses_parent_kind() {
+        use git_internal::{
+            hash::{HashKind, get_hash_kind, set_hash_kind_for_test},
+            internal::object::blob::Blob,
+        };
+
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let old_blob = Blob::from_content_with_kind(HashKind::Sha256, "old").unwrap();
+        let new_blob = Blob::from_content_with_kind(HashKind::Sha256, "new").unwrap();
+        let child = |id| {
+            super::Tree::from_tree_items_with_kind(
+                HashKind::Sha256,
+                vec![TreeItem {
+                    mode: TreeItemMode::Blob,
+                    id,
+                    name: "file".into(),
+                }],
+            )
+            .unwrap()
+        };
+        let old_child = child(old_blob.id);
+        let new_child = child(new_blob.id);
+        let parent = |id| {
+            super::Tree::from_tree_items_with_kind(
+                HashKind::Sha256,
+                vec![TreeItem {
+                    mode: TreeItemMode::Tree,
+                    id,
+                    name: "nested".into(),
+                }],
+            )
+            .unwrap()
+        };
+        let result = MonoServiceLogic::build_result_by_chain(
+            "/nested".into(),
+            vec![Arc::new(parent(old_child.id))],
+            new_child.id,
+        )
+        .expect("SHA256 path rebuild must succeed");
+        assert_eq!(
+            result.updated_trees[0].id,
+            parent(new_child.id).id,
+            "RED rebuilt parent must use its typed kind"
+        );
+        assert_eq!(get_hash_kind(), HashKind::Sha1);
+    }
+
+    #[test]
+    fn native_path_tree_rebuild_preserves_kind_and_order_and_rejects_mixed_ids() {
+        use git_internal::{
+            hash::{HashKind, get_hash_kind, set_hash_kind_for_test},
+            internal::object::blob::Blob,
+        };
+
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let other = if kind == HashKind::Sha1 {
+                HashKind::Sha256
+            } else {
+                HashKind::Sha1
+            };
+            let _guard = set_hash_kind_for_test(other);
+            let blob = Blob::from_content_with_kind(kind, "content").unwrap();
+            let child = super::Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem {
+                    mode: TreeItemMode::Blob,
+                    id: blob.id,
+                    name: "file".into(),
+                }],
+            )
+            .unwrap();
+            let original = super::Tree::from_tree_items_with_kind(
+                kind,
+                vec![
+                    TreeItem {
+                        mode: TreeItemMode::Tree,
+                        id: child.id,
+                        name: "z".into(),
+                    },
+                    TreeItem {
+                        mode: TreeItemMode::Blob,
+                        id: blob.id,
+                        name: "a".into(),
+                    },
+                ],
+            )
+            .unwrap();
+            let result = MonoServiceLogic::build_result_by_chain(
+                "/z".into(),
+                vec![Arc::new(original.clone())],
+                child.id,
+            )
+            .unwrap();
+            assert_eq!(result.updated_trees[0].id, original.id);
+            assert_eq!(
+                result.updated_trees[0]
+                    .tree_items
+                    .iter()
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["z", "a"]
+            );
+            let foreign = Blob::from_content_with_kind(other, "foreign").unwrap();
+            assert!(
+                MonoServiceLogic::update_tree_hash(Arc::new(original), "z", foreign.id).is_err()
+            );
+            assert_eq!(get_hash_kind(), other);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_path_tree_missing_path_keeps_kind_sort_and_placeholder() {
+        use git_internal::{
+            hash::{HashKind, get_hash_kind, set_hash_kind_for_test},
+            internal::object::blob::Blob,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let handler = wired_handler(&temp).await;
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let other = if kind == HashKind::Sha1 {
+                HashKind::Sha256
+            } else {
+                HashKind::Sha1
+            };
+            let _guard = set_hash_kind_for_test(other);
+            let existing = Blob::from_content_with_kind(kind, "existing").unwrap();
+            let root = super::Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem {
+                    mode: TreeItemMode::Blob,
+                    id: existing.id,
+                    name: "z".into(),
+                }],
+            )
+            .unwrap();
+            let (existing_chain, no_placeholder) =
+                super::search_tree_for_update_or_create_from_root(
+                    &handler,
+                    Path::new("/"),
+                    root.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(existing_chain[0].id, root.id);
+            assert!(no_placeholder.is_none());
+            let foreign = Blob::from_content_with_kind(other, "foreign").unwrap();
+            let mut invalid = root.clone();
+            invalid.tree_items[0].id = foreign.id;
+            assert!(
+                super::search_tree_for_update_or_create_from_root(
+                    &handler,
+                    Path::new("/"),
+                    invalid
+                )
+                .await
+                .is_err()
+            );
+            let (chain, placeholder) = super::search_tree_for_update_or_create_from_root(
+                &handler,
+                Path::new("/a/b"),
+                root,
+            )
+            .await
+            .unwrap();
+            let placeholder = placeholder.unwrap();
+            assert_eq!(placeholder.id.kind(), kind);
+            assert_eq!(
+                placeholder.id,
+                Blob::from_content_bytes_with_kind(kind, placeholder.data.clone())
+                    .unwrap()
+                    .id
+            );
+            assert!(
+                String::from_utf8_lossy(&placeholder.data)
+                    .starts_with("This file was used to maintain the git tree, generate at:")
+            );
+            assert!(chain.iter().all(|tree| tree.id.kind() == kind));
+            for tree in &chain {
+                assert_eq!(
+                    tree.id,
+                    super::Tree::from_tree_items_with_kind(kind, tree.tree_items.clone())
+                        .unwrap()
+                        .id
+                );
+            }
+            assert_eq!(
+                chain[0]
+                    .tree_items
+                    .iter()
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["a", "z"]
+            );
+            assert_eq!(chain.last().unwrap().tree_items[0].name, ".gitkeep");
+            assert_eq!(get_hash_kind(), other);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_path_tree_stored_subtree_uses_configured_kind() {
+        use git_internal::{
+            hash::{HashKind, get_hash_kind, set_hash_kind_for_test},
+            internal::object::{
+                blob::Blob,
+                commit::Commit,
+                signature::{Signature, SignatureType},
+            },
+        };
+
+        use crate::ceres::api_service::ApiHandler;
+
+        for (kind, format) in [
+            (HashKind::Sha1, crate::config::MonoObjectFormat::Sha1),
+            (HashKind::Sha256, crate::config::MonoObjectFormat::Sha256),
+            (HashKind::Blake3, crate::config::MonoObjectFormat::Blake3),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+            config.monorepo.object_format = format;
+            let storage =
+                crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+            let handler = MonoApiService {
+                storage,
+                git_object_cache: Arc::new(GitObjectCache {
+                    connection: init_connection(&RedisConfig {
+                        url: std::env::var("MEGA_REDIS__URL")
+                            .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string()),
+                    })
+                    .await
+                    .unwrap(),
+                    prefix: "disabled".into(),
+                }),
+            };
+            let blob = Blob::from_content_with_kind(kind, "stored").unwrap();
+            let child = super::Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem {
+                    mode: TreeItemMode::Blob,
+                    id: blob.id,
+                    name: "file".into(),
+                }],
+            )
+            .unwrap();
+            handler
+                .storage
+                .mono_storage()
+                .save_mega_trees(vec![child.clone()], blob.id, None)
+                .await
+                .unwrap();
+            let signature = Signature::new(
+                SignatureType::Author,
+                "Test".into(),
+                "test@example.invalid".into(),
+            );
+            let commit = Commit::new_with_kind(
+                kind,
+                signature.clone(),
+                signature,
+                child.id,
+                vec![],
+                "fixture",
+            )
+            .unwrap();
+            handler
+                .storage
+                .mono_storage()
+                .save_mega_commits(vec![commit.clone()], None)
+                .await
+                .unwrap();
+            let root = super::Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem {
+                    mode: TreeItemMode::Tree,
+                    id: child.id,
+                    name: "nested".into(),
+                }],
+            )
+            .unwrap();
+            let other = if kind == HashKind::Sha1 {
+                HashKind::Sha256
+            } else {
+                HashKind::Sha1
+            };
+            let _guard = set_hash_kind_for_test(other);
+            let commit_tree = handler
+                .get_root_tree(Some(&commit.id.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(commit_tree.id, child.id);
+            let (chain, placeholder) = super::search_tree_for_update_or_create_from_root(
+                &handler,
+                Path::new("/nested"),
+                root,
+            )
+            .await
+            .unwrap();
+            assert_eq!(chain.last().unwrap().id, child.id);
+            assert!(placeholder.is_none());
+            assert_eq!(get_hash_kind(), other);
+        }
+    }
 
     fn dir(items: Vec<(&str, git_internal::internal::object::tree::Tree)>) -> super::Tree {
         super::Tree::from_tree_items(
