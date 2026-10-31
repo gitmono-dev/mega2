@@ -29,10 +29,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     ceres::protocol::import_refs::{RefCommand, Refs},
-    common::{
-        errors::{MegaError, ProtocolError},
-        utils::ZERO_ID,
-    },
+    common::errors::{MegaError, ProtocolError},
     config::PackConfig,
 };
 #[rustfmt::skip]
@@ -358,14 +355,14 @@ pub trait RepoHandler: Send + Sync + 'static {
 
     async fn check_default_branch(&self) -> bool;
 
-    fn find_head_hash(&self, refs: Vec<Refs>) -> (String, Vec<Refs>) {
-        let mut head_hash = ZERO_ID.to_string();
+    fn find_head_hash(&self, refs: Vec<Refs>) -> Result<(String, Vec<Refs>), MegaError> {
+        let mut head_hash = ObjectHash::zero_for_kind(self.object_hash_kind()?).to_string();
         for git_ref in refs.iter() {
             if git_ref.default_branch {
                 head_hash.clone_from(&git_ref.ref_hash);
             }
         }
-        (head_hash, refs)
+        Ok((head_hash, refs))
     }
 
     async fn unpack_stream(

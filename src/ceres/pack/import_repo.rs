@@ -134,7 +134,7 @@ impl RepoHandler for ImportRepo {
             .map_err(|_| TracesError::QueryTimeout)?
             .map_err(Self::legacy_view_error)?;
         let refs = view.refs.into_iter().map(Into::into).collect();
-        Ok(self.code_head(refs, view.has_legacy_traces))
+        self.code_head(refs, view.has_legacy_traces)
     }
 
     async fn receive_refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError> {
@@ -152,7 +152,7 @@ impl RepoHandler for ImportRepo {
             .filter(|git_ref| git_ref.ref_name != LEGACY_TRACES_REF)
             .map(Into::into)
             .collect();
-        Ok(self.code_head(refs, has_legacy_traces))
+        self.code_head(refs, has_legacy_traces)
     }
 
     async fn authorize_fetch(
@@ -547,8 +547,8 @@ impl ImportRepo {
         }
     }
 
-    fn code_head(&self, refs: Vec<Refs>, fallback: bool) -> (String, Vec<Refs>) {
-        let (mut head, refs) = self.find_head_hash(refs);
+    fn code_head(&self, refs: Vec<Refs>, fallback: bool) -> Result<(String, Vec<Refs>), MegaError> {
+        let (mut head, refs) = self.find_head_hash(refs)?;
         if fallback
             && is_protocol_zero_id(&head)
             && let Some(code_ref) = refs
@@ -561,7 +561,7 @@ impl ImportRepo {
         {
             head.clone_from(&code_ref.ref_hash);
         }
-        (head, refs)
+        Ok((head, refs))
     }
 
     async fn load_commit_graph(&self, roots: Vec<String>) -> Result<CommitGraph, MegaError> {
@@ -1722,7 +1722,7 @@ mod tests {
             api_service::cache::GitObjectCache,
             pack::RepoHandler,
             protocol::{
-                import_refs::{CommandType, RefCommand},
+                import_refs::{CommandType, RefCommand, Refs},
                 repo::Repo,
             },
         },
@@ -1730,7 +1730,7 @@ mod tests {
             errors::{ImportRepoError, MegaError},
             utils::{ZERO_ID, generate_id},
         },
-        config::RedisConfig,
+        config::{MonoObjectFormat, RedisConfig, testing::isolated_config},
         jupiter::{
             migration::apply_migrations,
             redis::init_connection,
@@ -1751,7 +1751,7 @@ mod tests {
                 object_storage::mock_object_storage,
                 push_queue_storage::EnqueueOutcome,
             },
-            tests::{test_db_connection, test_storage},
+            tests::{test_db_connection, test_storage, test_storage_with_config},
             utils::converter::{FromGitModel, FromMegaModel},
         },
     };
@@ -1765,6 +1765,53 @@ mod tests {
             MegaError::Traces(crate::common::errors::TracesError::QueryTimeout)
         ));
         assert_eq!(public.to_string(), "query_timeout");
+    }
+
+    #[tokio::test]
+    async fn native_empty_ref_advertise_import_hash_kinds_and_legacy_fallback() {
+        for (format, width) in [
+            (MonoObjectFormat::Sha1, 40),
+            (MonoObjectFormat::Sha256, 64),
+            (MonoObjectFormat::Blake3, 64),
+        ] {
+            let temp = tempfile::tempdir().expect("fixture directory");
+            let mut config = isolated_config(temp.path().join("config"));
+            config.monorepo.object_format = format;
+            let storage = test_storage_with_config(temp.path(), config).await;
+            let repo = ImportRepo {
+                storage,
+                repo: Repo::new(PathBuf::from("/third-party/fix24.git"), false)
+                    .expect("import repository"),
+                command_list: Mutex::new(Vec::new()),
+                git_object_cache: disabled_cache().await,
+                receive_pack_extra_timings_ms: Mutex::new(Vec::new()),
+            };
+            let (head, refs) = repo.code_head(Vec::new(), false).expect("empty code HEAD");
+            assert_eq!(head, "0".repeat(width));
+            assert!(refs.is_empty());
+
+            let main = Refs {
+                id: 1,
+                ref_name: "refs/heads/main".to_owned(),
+                ref_hash: "a".repeat(width),
+                default_branch: false,
+            };
+            let topic = Refs {
+                id: 2,
+                ref_name: "refs/heads/topic".to_owned(),
+                ref_hash: "b".repeat(width),
+                default_branch: false,
+            };
+            let (head, refs) = repo
+                .code_head(vec![topic.clone(), main.clone()], true)
+                .expect("legacy branch fallback");
+            assert_eq!(head, main.ref_hash);
+            assert_eq!(refs.len(), 2);
+            assert_eq!(refs[0].ref_name, topic.ref_name);
+            assert_eq!(refs[0].ref_hash, topic.ref_hash);
+            assert_eq!(refs[1].ref_name, main.ref_name);
+            assert_eq!(refs[1].ref_hash, main.ref_hash);
+        }
     }
 
     async fn wired_storage_with_monorepo(temp: &tempfile::TempDir) -> Storage {

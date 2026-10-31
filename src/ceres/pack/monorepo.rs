@@ -149,7 +149,7 @@ impl RepoHandler for Monorepo {
             .filter(|r| !trunk || !r.is_cl)
             .map(Into::into)
             .collect();
-        Ok(self.find_head_hash(refs))
+        self.find_head_hash(refs)
     }
 
     async fn finalize_receive_pack(&self) -> Result<(), MegaError> {
@@ -1452,13 +1452,13 @@ mod tests {
         ceres::{
             api_service::cache::GitObjectCache,
             pack::{api_tip_lander::trunk_nff_align_message, materialize},
-            protocol::import_refs::RefCommand,
+            protocol::import_refs::{RefCommand, Refs},
         },
         common::{
             errors::{MegaError, PathPolicyError, ProtocolError},
             utils::{MEGA_BRANCH_NAME, ZERO_ID, commit_body_subject, split_commit_message},
         },
-        config::{PushPolicy, testing::isolated_config},
+        config::{MonoObjectFormat, PushPolicy, testing::isolated_config},
         jupiter::{
             storage::{Storage, base_storage::StorageConnector},
             tests::{test_storage, test_storage_with_config, with_test_vault},
@@ -1517,6 +1517,46 @@ mod tests {
             cl_link: Arc::new(RwLock::new(None)),
             username: Some("tester".to_string()),
             command_list: Mutex::new(commands),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_empty_ref_advertise_monorepo_hash_kinds() {
+        for (format, width) in [
+            (MonoObjectFormat::Sha1, 40),
+            (MonoObjectFormat::Sha256, 64),
+            (MonoObjectFormat::Blake3, 64),
+        ] {
+            let temp = TempDir::new().expect("fixture directory");
+            let mut config = isolated_config(temp.path().join("config"));
+            config.monorepo.object_format = format;
+            let storage = test_storage_with_config(temp.path(), config).await;
+            let repo = test_monorepo(&storage, Vec::new(), HashSet::new(), HashSet::new());
+            let (head, refs) = repo.find_head_hash(Vec::new()).expect("empty HEAD");
+            assert_eq!(head, "0".repeat(width));
+            assert!(refs.is_empty());
+
+            let main = Refs {
+                id: 1,
+                ref_name: MEGA_BRANCH_NAME.to_owned(),
+                ref_hash: "a".repeat(width),
+                default_branch: true,
+            };
+            let topic = Refs {
+                id: 2,
+                ref_name: "refs/heads/topic".to_owned(),
+                ref_hash: "b".repeat(width),
+                default_branch: false,
+            };
+            let (head, refs) = repo
+                .find_head_hash(vec![topic.clone(), main.clone()])
+                .expect("nonempty HEAD");
+            assert_eq!(head, main.ref_hash);
+            assert_eq!(refs.len(), 2);
+            assert_eq!(refs[0].ref_name, topic.ref_name);
+            assert_eq!(refs[0].ref_hash, topic.ref_hash);
+            assert_eq!(refs[1].ref_name, main.ref_name);
+            assert_eq!(refs[1].ref_hash, main.ref_hash);
         }
     }
 

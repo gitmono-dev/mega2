@@ -313,6 +313,287 @@ async fn native_hash_sha256_materialize() {
     db.close().await.expect("close fixture pool");
 }
 
+#[tokio::test]
+async fn native_hash_empty_discovery_red_sha256_mono_receive() {
+    let (_database, db) = traces_db::TracesDb::migrated().await;
+    let mut fixture = Fixture::new(&db, "sha256").await;
+    fixture.start().await;
+    fixture.require_clone("0", "/project.git", "fix24-src");
+
+    let git = |args: &[&str]| {
+        let output = git_cli::git_cli_no_auth(fixture.shared.path(), args);
+        assert!(
+            output.status.success(),
+            "FIX24 Git setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let format = git_cli::git_cli_no_auth(
+        fixture.shared.path(),
+        &["-C", "fix24-src", "rev-parse", "--show-object-format"],
+    );
+    assert_eq!(format.stdout, b"sha256\n", "FIX24 source object format");
+    fs::write(
+        fixture.shared.path().join("fix24-src/create.txt"),
+        b"FIX24 empty discovery\n",
+    )
+    .expect("write FIX24 source file");
+    git(&["-C", "fix24-src", "add", "create.txt"]);
+    git(&[
+        "-C",
+        "fix24-src",
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "FIX24 empty discovery",
+    ]);
+    let head_output = git_cli::git_cli_no_auth(
+        fixture.shared.path(),
+        &["-C", "fix24-src", "rev-parse", "HEAD"],
+    );
+    assert!(head_output.status.success(), "FIX24 source HEAD query");
+    let head = String::from_utf8_lossy(&head_output.stdout)
+        .trim()
+        .to_owned();
+    assert_eq!(head.len(), 64, "FIX24 source HEAD width");
+    assert!(head.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let remote = git_cli::mega2_http_url(fixture.port, "/project/fix24-probe.git");
+    let push = git_cli::git_cli_no_auth(
+        fixture.shared.path(),
+        &[
+            "-c",
+            "alias.fix24probe=!GIT_TRACE_PACKET=\"$PWD/fix24-create.packet\" git",
+            "fix24probe",
+            "-C",
+            "fix24-src",
+            "push",
+            &remote,
+            "HEAD:refs/heads/main",
+        ],
+    );
+    let packet = fs::read_to_string(fixture.shared.path().join("fix24-create.packet"))
+        .expect("FIX24 Git packet trace");
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT path, old_id, new_id, status::text AS status FROM push_queue WHERE kind='push' AND path='/project/fix24-probe' ORDER BY id".to_owned(),
+        ))
+        .await
+        .expect("FIX24 queue observation");
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    println!(
+        "FIX24_DISCOVERY push_status={} queue_rows={} packet_bytes={}",
+        push.status,
+        rows.len(),
+        packet.len(),
+    );
+    if let Some(dir) = std::env::var_os("MEGA2_IT_FIX24_RED_EVIDENCE_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        fs::create_dir_all(&dir).expect("FIX24 evidence directory");
+        fs::write(dir.join("packet.txt"), &packet).expect("save FIX24 packet trace");
+        fs::write(dir.join("push.stdout"), &push.stdout).expect("save FIX24 push stdout");
+        fs::write(dir.join("push.stderr"), &push.stderr).expect("save FIX24 push stderr");
+        fs::write(dir.join("push-status.txt"), push.status.to_string())
+            .expect("save FIX24 push status");
+        fs::write(dir.join("queue-count.txt"), rows.len().to_string())
+            .expect("save FIX24 queue count");
+    }
+    assert!(
+        packet.lines().any(|line| {
+            line.contains("packet:")
+                && line.contains("git< ")
+                && line.contains(&format!("{} capabilities^{{}}", "0".repeat(64)))
+                && line.contains("object-format=sha256")
+        }),
+        "FIX24 SHA-256 empty receive advertisement must contain 64 zeroes"
+    );
+    assert!(
+        packet.lines().any(|line| {
+            line.contains("packet:")
+                && line.contains("git> ")
+                && line.contains(&format!("{} {head} refs/heads/main", "0".repeat(64)))
+        }),
+        "FIX24 SHA-256 client must send a 64-zero create command"
+    );
+    assert!(!stderr.contains("protocol error: unexpected"));
+    fixture.stop();
+    db.close().await.expect("close fixture pool");
+}
+
+#[tokio::test]
+async fn native_hash_empty_discovery_sha1_mono_receive() {
+    let (_database, db) = traces_db::TracesDb::migrated().await;
+    let mut fixture = Fixture::new(&db, "sha1").await;
+    fixture.start().await;
+    fixture.require_clone("0", "/project.git", "fix24-sha1-src");
+
+    let git = |args: &[&str]| {
+        let output = git_cli::git_cli_no_auth(fixture.shared.path(), args);
+        assert!(
+            output.status.success(),
+            "FIX24 SHA-1 Git setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let format = git_cli::git_cli_no_auth(
+        fixture.shared.path(),
+        &["-C", "fix24-sha1-src", "rev-parse", "--show-object-format"],
+    );
+    assert_eq!(format.stdout, b"sha1\n", "FIX24 SHA-1 source format");
+    fs::write(
+        fixture.shared.path().join("fix24-sha1-src/create.txt"),
+        b"FIX24 SHA-1 empty discovery\n",
+    )
+    .expect("write SHA-1 source file");
+    git(&["-C", "fix24-sha1-src", "add", "create.txt"]);
+    git(&[
+        "-C",
+        "fix24-sha1-src",
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "FIX24 SHA-1 empty discovery",
+    ]);
+    let head_output = git_cli::git_cli_no_auth(
+        fixture.shared.path(),
+        &["-C", "fix24-sha1-src", "rev-parse", "HEAD"],
+    );
+    assert!(head_output.status.success(), "FIX24 SHA-1 HEAD query");
+    let head = String::from_utf8_lossy(&head_output.stdout)
+        .trim()
+        .to_owned();
+    assert_eq!(head.len(), 40, "FIX24 SHA-1 HEAD width");
+    assert!(head.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let remote = git_cli::mega2_http_url(fixture.port, "/project/fix24-sha1-probe.git");
+    let push = git_cli::git_cli_no_auth(
+        fixture.shared.path(),
+        &[
+            "-c",
+            "alias.fix24sha1=!GIT_TRACE_PACKET=\"$PWD/fix24-sha1-create.packet\" git",
+            "fix24sha1",
+            "-C",
+            "fix24-sha1-src",
+            "push",
+            &remote,
+            "HEAD:refs/heads/main",
+        ],
+    );
+    let packet = fs::read_to_string(fixture.shared.path().join("fix24-sha1-create.packet"))
+        .expect("FIX24 SHA-1 packet trace");
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT path, old_id, new_id, status::text AS status FROM push_queue WHERE kind='push' AND path='/project/fix24-sha1-probe' ORDER BY id".to_owned(),
+        ))
+        .await
+        .expect("FIX24 SHA-1 queue observation");
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    println!(
+        "FIX24_SHA1_DISCOVERY push_status={} queue_rows={} packet_bytes={}",
+        push.status,
+        rows.len(),
+        packet.len(),
+    );
+    if let Some(dir) = std::env::var_os("MEGA2_IT_FIX24_A_EVIDENCE_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        fs::create_dir_all(&dir).expect("FIX24 A evidence directory");
+        fs::write(dir.join("sha1-receive.packet"), &packet).expect("save SHA-1 packet");
+        fs::write(dir.join("sha1-receive.stderr"), &push.stderr).expect("save SHA-1 stderr");
+        fs::write(dir.join("sha1-receive.status"), push.status.to_string())
+            .expect("save SHA-1 status");
+        fs::write(dir.join("sha1-receive.queue-count"), rows.len().to_string())
+            .expect("save SHA-1 queue count");
+    }
+    assert!(
+        packet.lines().any(|line| {
+            line.contains("packet:")
+                && line.contains("git< ")
+                && line.contains(&format!("{} capabilities^{{}}", "0".repeat(40)))
+                && line.contains("object-format=sha1")
+        }),
+        "FIX24 SHA-1 empty receive advertisement must contain 40 zeroes"
+    );
+    assert!(
+        packet.lines().any(|line| {
+            line.contains("packet:")
+                && line.contains("git> ")
+                && line.contains(&format!("{} {head} refs/heads/main", "0".repeat(40)))
+        }),
+        "FIX24 SHA-1 client must send a 40-zero create command"
+    );
+    assert!(!stderr.contains("protocol error: unexpected"));
+    fixture.stop();
+    db.close().await.expect("close fixture pool");
+}
+
+#[tokio::test]
+async fn native_hash_empty_discovery_mono_upload_formats() {
+    for (format, width) in [("sha1", 40), ("sha256", 64)] {
+        let (_database, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = Fixture::new(&db, format).await;
+        fixture.start().await;
+        let remote = git_cli::mega2_http_url(fixture.port, "/project/fix24-empty-upload.git");
+        let trace = format!("fix24-{format}-upload.packet");
+        let alias = format!("alias.fix24upload=!GIT_TRACE_PACKET=\"$PWD/{trace}\" git");
+        let clone = git_cli::git_cli_no_auth(
+            fixture.shared.path(),
+            &[
+                "-c",
+                "protocol.version=0",
+                "-c",
+                &alias,
+                "fix24upload",
+                "clone",
+                "--no-checkout",
+                &remote,
+                &format!("fix24-{format}-empty"),
+            ],
+        );
+        let packet = fs::read_to_string(fixture.shared.path().join(&trace))
+            .expect("FIX24 upload packet trace");
+        if let Some(dir) = std::env::var_os("MEGA2_IT_FIX24_A_EVIDENCE_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            fs::create_dir_all(&dir).expect("FIX24 A evidence directory");
+            fs::write(dir.join(&trace), &packet).expect("save upload packet");
+            fs::write(dir.join(format!("{format}-upload.stderr")), &clone.stderr)
+                .expect("save upload stderr");
+            fs::write(
+                dir.join(format!("{format}-upload.status")),
+                clone.status.to_string(),
+            )
+            .expect("save upload status");
+        }
+        assert!(
+            clone.status.success(),
+            "FIX24 {format} empty upload clone failed: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        assert!(
+            packet.lines().any(|line| {
+                line.contains("packet:")
+                    && line.contains("git< ")
+                    && line.contains(&format!("{} capabilities^{{}}", "0".repeat(width)))
+                    && line.contains(&format!("object-format={format}"))
+            }),
+            "FIX24 {format} empty upload advertisement width/capabilities"
+        );
+        fixture.stop();
+        db.close().await.expect("close fixture pool");
+    }
+}
+
 mod native_matrix {
     use std::{
         collections::HashMap,

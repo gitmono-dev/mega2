@@ -29,7 +29,7 @@ use crate::{
     },
     common::{
         errors::{MegaError, ViewUnavailableReason},
-        utils::{MEGA_BRANCH_NAME, ZERO_ID},
+        utils::MEGA_BRANCH_NAME,
     },
     config::Config,
     jupiter::{
@@ -445,7 +445,10 @@ impl RepoHandler for ViewRepo {
                     default_branch: true,
                 }],
             )),
-            None => Ok((ZERO_ID.to_owned(), Vec::new())),
+            None => Ok((
+                ObjectHash::zero_for_kind(self.object_hash_kind()?).to_string(),
+                Vec::new(),
+            )),
         }
     }
 
@@ -642,7 +645,8 @@ mod tests {
             mega_blob, mega_tree, mega_view_filter, mega_view_object, mega_view_root_chain,
         },
         ceres::view::filter::parse_for_registration,
-        config::testing::isolated_config,
+        common::utils::ZERO_ID,
+        config::{MonoObjectFormat, testing::isolated_config},
         jupiter::{
             storage::{
                 init::database_connection,
@@ -2108,6 +2112,25 @@ mod tests {
         assert_eq!(refs[0].ref_name, MEGA_BRANCH_NAME);
         assert_eq!(refs[0].ref_hash, head);
         assert!(refs[0].default_branch);
+    }
+
+    #[tokio::test]
+    async fn native_empty_ref_advertise_view_hash_kinds() {
+        let empty = Fixture::new(2, ":/never-seen").await;
+        empty.catch_up(2).await;
+        assert!(empty.state().await.ready_seq.is_some());
+        for (format, width) in [
+            (MonoObjectFormat::Sha1, 40),
+            (MonoObjectFormat::Sha256, 64),
+            (MonoObjectFormat::Blake3, 64),
+        ] {
+            let mut config = empty.storage.config().as_ref().clone();
+            config.monorepo.object_format = format;
+            let repo = empty.repo(Arc::new(config));
+            let (head, refs) = repo.refs_with_head_hash().await.expect("ready empty view");
+            assert_eq!(head, "0".repeat(width));
+            assert!(refs.is_empty());
+        }
     }
 
     fn assert_not_our_ref(error: MegaError, oid: &str) {
