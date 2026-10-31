@@ -1,4 +1,6 @@
-**现行 FIX24 C4 本地完整 C 已核（2026-10-31 15:44:56 UTC）：** 原五门均exit0，全量22目标3212通过/3原忽略/0失败；独立根核 `accepted_C_local=true`，本轮21个零连接测试库精确清理、原107库保持、无owned活进程。根核 SHA256 `3f43577cc86e1808d6d9264f3ab8c8b5128239530bb599c64b7b06b73c73b1fe`；C1/C2/C3 STOP与Claude OAuth无判词保留，用户明确免本卡后续审查。当前 `in-progress/locally-accepted`，提交/推送/tag/Release/适用D待；C4后置文档只作事实记录，产品/测试/版本字节须核同冻结源。详见日期计划 FIX24 卡。
+**现行 FIX24 已发布且 D 闭合（2026-10-31 UTC）：** `f483f57`/`v0.42.84` 精确13路径签名+DCO、main及签名标注tag/人工Release已核；C4原五门22目标3212通过/3原忽略/0失败、根核清理21库且保留原107库。main Harbor `41216534878` success；tag Docker `41216553926` 的amd64/arm64/manifest三job全部success，本卡 `done/complete`。A1及C1/C2/C3 STOP与Claude OAuth无判词保留，用户本卡免后续审查；本段后置证据仅文档收口，不重开FIX16或扩大跨仓权限。详见日期计划 FIX24 卡。
+
+**历史 FIX24 C4 本地完整 C 已核（2026-10-31 15:44:56 UTC）：** 原五门均exit0，全量22目标3212通过/3原忽略/0失败；独立根核 `accepted_C_local=true`，本轮21个零连接测试库精确清理、原107库保持、无owned活进程。根核 SHA256 `3f43577cc86e1808d6d9264f3ab8c8b5128239530bb599c64b7b06b73c73b1fe`；C1/C2/C3 STOP与Claude OAuth无判词保留，用户明确免本卡后续审查。当前 `in-progress/locally-accepted`，提交/推送/tag/Release/适用D待；C4后置文档只作事实记录，产品/测试/版本字节须核同冻结源。详见日期计划 FIX24 卡。
 
 **历史 FIX24 C3 STOP（2026-10-31 UTC）：** C3 格式/严格 Clippy exit0，原 full 在既有 SSH 迁移启动进程 SIGINT 后以一项真实失败 exit101，控制器 exit1/STOP，双 build/根核未跑。35个本轮零连接测试库精确清理、原107库与五服务保持；同一原测试单次聚焦诊断 exit0仅说明间歇性，不证明根因。C1/C2/C3 的失败与预算保留，FIX24 仍 `blocked/locally-accepted`；C4 只准一次完整五门及根核，未提交/推送/tag/Release/D。详见日期计划 FIX24 卡。
 
