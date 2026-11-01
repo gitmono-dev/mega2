@@ -297,11 +297,12 @@ impl Fixture {
         let output = git_cli::git_cli_no_auth(self.shared.path(), args);
         assert!(
             output.status.success(),
-            "Docker Git {:?} failed: status={} stdout={} stderr={}",
+            "Docker Git {:?} failed: status={} stdout={} stderr={} log={}",
             args,
             output.status,
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr),
+            self.tail_server_log()
         );
         output
     }
