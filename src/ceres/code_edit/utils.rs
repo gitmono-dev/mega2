@@ -19,7 +19,7 @@ use crate::{
         model::change_list::ClDiffFile,
     },
     common::{errors::MegaError, utils::ZERO_ID},
-    jupiter::{storage::Storage, utils::converter::FromMegaModel},
+    jupiter::storage::Storage,
 };
 
 pub async fn cl_files_list(
@@ -65,12 +65,16 @@ pub async fn get_repo_main_latest_commit(
         Ok(Some(refs)) => refs.ref_commit_hash,
         _ => create_repo_commit(storage, repo_path).await?,
     };
-    Ok(Commit::from_mega_model(
+    // Parse the tip commit under the configured object algorithm; the
+    // thread-local reader panics on a SHA-256 identity.
+    let kind = storage.config().monorepo.object_hash_kind()?;
+    crate::jupiter::utils::converter::commit_from_mega_model_with_kind(
         mono_storage
             .get_commit_by_hash(&commit_hash)
             .await?
             .expect("can't fetch commit by hash"),
-    ))
+        kind,
+    )
 }
 
 fn has_buck_root_markers(tree: &Tree) -> bool {
@@ -123,6 +127,10 @@ pub async fn resolve_build_repo_root(storage: &Storage, path: &str) -> Result<St
         }
     }
 
+    // Parse the candidate trees under the configured object algorithm: a
+    // thread-local SHA-1 reader panics on a SHA-256 identity, which surfaced as
+    // a 500 on path provisioning.
+    let kind = storage.config().monorepo.object_hash_kind()?;
     let mono_storage = storage.mono_storage();
     for candidate in candidates {
         let Some(refs) = mono_storage.get_main_ref(&candidate).await? else {
@@ -131,7 +139,8 @@ pub async fn resolve_build_repo_root(storage: &Storage, path: &str) -> Result<St
         let Some(tree_model) = mono_storage.get_tree_by_hash(&refs.ref_tree_hash).await? else {
             continue;
         };
-        let tree = Tree::from_mega_model(tree_model);
+        let tree =
+            crate::jupiter::utils::converter::tree_from_mega_model_with_kind(tree_model, kind)?;
         if has_buck_root_markers(&tree) {
             return Ok(candidate);
         }

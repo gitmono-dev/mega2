@@ -1,6 +1,6 @@
 use super::{
     CreateEntryUpdate, MonoServiceLogic, PROVISION_STALE_SNAPSHOT, RefUpdate, TreeCommitInput,
-    TreeCommitOutcome, TreeUpdateResult, gitkeep_placeholder, logic::PATH_NOT_EXIST_RE, prelude::*,
+    TreeCommitOutcome, TreeUpdateResult, logic::PATH_NOT_EXIST_RE, prelude::*,
 };
 impl super::MonoApiService {
     /// `search_tree_for_update` with the ADR-LB-03 error mapping: a missing
@@ -36,6 +36,7 @@ impl super::MonoApiService {
     pub(in crate::ceres::api_service::mono_api_service) fn rewrite_parent_chains(
         ancestors: Vec<(PathBuf, Vec<Arc<Tree>>)>,
         edits: Vec<(PathBuf, Vec<TreeItem>)>,
+        kind: git_internal::hash::HashKind,
     ) -> Result<TreeUpdateResult, GitError> {
         let mut known: HashMap<PathBuf, Arc<Tree>> = HashMap::new();
         for (parent, chain) in ancestors {
@@ -68,7 +69,7 @@ impl super::MonoApiService {
             let Some(items) = pending.remove(&path) else {
                 break;
             };
-            let tree = Tree::from_tree_items(items)
+            let tree = Tree::from_tree_items_with_kind(kind, items)
                 .map_err(|_| GitError::CustomError("Invalid tree".to_string()))?;
             let clean_path = MonoServiceLogic::clean_path_str(&path.to_string_lossy());
             let ref_path = if clean_path == "/" || clean_path.starts_with('/') {
@@ -126,6 +127,12 @@ impl super::MonoApiService {
         input: TreeCommitInput,
         requester: Option<String>,
     ) -> Result<TreeCommitOutcome, GitError> {
+        let kind = self
+            .storage
+            .config()
+            .monorepo
+            .object_hash_kind()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
         let TreeCommitInput {
             update_result,
             mut save_trees,
@@ -173,20 +180,22 @@ impl super::MonoApiService {
             return Err(GitError::CustomError(PROVISION_STALE_SNAPSHOT.to_owned()));
         }
         let base_commit =
-            ObjectHash::from_hex_for_kind(get_hash_kind(), &src_commit.id.to_string()).map_err(
-                |e| GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id)),
-            )?;
+            ObjectHash::from_hex_for_kind(kind, &src_commit.id.to_string()).map_err(|e| {
+                GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id))
+            })?;
         let target_tree_id = Self::ref_update_tree_id_for_path(&update_result, &tip_path)
             .ok_or_else(|| {
                 GitError::CustomError(format!(
                     "Missing updated tree for build repo root {tip_path}"
                 ))
             })?;
-        let dst_commit = Commit::from_tree_id(
+        let dst_commit = Commit::from_tree_id_with_kind(
+            kind,
             target_tree_id,
             vec![base_commit],
             &format_commit_msg(&commit_msg, None),
-        );
+        )
+        .map_err(|e| GitError::CustomError(e.to_string()))?;
         let new_commit_id = dst_commit.id.to_string();
 
         let username = author_username.unwrap_or("Anonymous".to_string());
@@ -272,6 +281,12 @@ impl super::MonoApiService {
         &self,
         entry_info: &CreateEntryInfo,
     ) -> Result<CreateEntryUpdate, GitError> {
+        let kind = self
+            .storage
+            .config()
+            .monorepo
+            .object_hash_kind()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
         let path = PathBuf::from(&entry_info.path);
         let mut save_trees = vec![];
         let file_content = if entry_info.is_directory {
@@ -369,8 +384,8 @@ impl super::MonoApiService {
                 // directory can be represented as a tree with at least
                 // one blob entry. The blob contains a timestamp so it's
                 // unique.
-                let (blob, tree_item) = gitkeep_placeholder();
-                let new_dir_tree = Tree::from_tree_items(vec![tree_item]).unwrap();
+                let (blob, tree_item) = super::gitkeep_placeholder_for_kind(kind)?;
+                let new_dir_tree = Tree::from_tree_items_with_kind(kind, vec![tree_item]).unwrap();
                 save_trees.push(new_dir_tree.clone());
                 let entry_oid = new_dir_tree.id;
                 (
@@ -385,7 +400,8 @@ impl super::MonoApiService {
             } else {
                 let content = file_content
                     .ok_or_else(|| GitError::CustomError("Missing file content".to_string()))?;
-                let blob = Blob::from_content(content);
+                let blob = Blob::from_content_with_kind(kind, content)
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
                 let entry_oid = blob.id;
                 (
                     TreeItem {
@@ -400,7 +416,7 @@ impl super::MonoApiService {
 
             target_items.push(new_item);
             target_items.sort_by(|a, b| a.name.cmp(&b.name));
-            let target_tree = Tree::from_tree_items(target_items).unwrap();
+            let target_tree = Tree::from_tree_items_with_kind(kind, target_items).unwrap();
             save_trees.push(target_tree.clone());
 
             // Build update instructions for parent trees and refs.
@@ -433,8 +449,8 @@ impl super::MonoApiService {
                 // Create .gitkeep blob and an initial tree for the new
                 // directory leaf. This represents the directory's own
                 // tree object which will be nested under new parent trees.
-                let (blob, tree_item) = gitkeep_placeholder();
-                let new_dir_tree = Tree::from_tree_items(vec![tree_item]).unwrap();
+                let (blob, tree_item) = super::gitkeep_placeholder_for_kind(kind)?;
+                let new_dir_tree = Tree::from_tree_items_with_kind(kind, vec![tree_item]).unwrap();
                 save_trees.push(new_dir_tree.clone());
                 let entry_oid = new_dir_tree.id;
                 (
@@ -449,7 +465,8 @@ impl super::MonoApiService {
             } else {
                 let content = file_content
                     .ok_or_else(|| GitError::CustomError("Missing file content".to_string()))?;
-                let blob = Blob::from_content(content);
+                let blob = Blob::from_content_with_kind(kind, content)
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
                 let entry_oid = blob.id;
                 (
                     TreeItem {
@@ -462,7 +479,7 @@ impl super::MonoApiService {
                 )
             };
 
-            let mut current_tree = Tree::from_tree_items(vec![leaf_item]).unwrap();
+            let mut current_tree = Tree::from_tree_items_with_kind(kind, vec![leaf_item]).unwrap();
             save_trees.push(current_tree.clone());
 
             // Wrap the leaf tree with trees for each missing parent segment.
@@ -477,7 +494,7 @@ impl super::MonoApiService {
                     name: part.to_string(),
                 };
 
-                current_tree = Tree::from_tree_items(vec![sub_item]).unwrap();
+                current_tree = Tree::from_tree_items_with_kind(kind, vec![sub_item]).unwrap();
                 save_trees.push(current_tree.clone());
             }
 
@@ -506,7 +523,7 @@ impl super::MonoApiService {
 
             target_items.push(top_item);
             target_items.sort_by(|a, b| a.name.cmp(&b.name));
-            let target_tree = Tree::from_tree_items(target_items).unwrap();
+            let target_tree = Tree::from_tree_items_with_kind(kind, target_items).unwrap();
             save_trees.push(target_tree.clone());
 
             // After constructing the nested trees, build update instructions
@@ -886,11 +903,17 @@ impl super::MonoApiService {
         tagger_info: String,
         message: Option<String>,
     ) -> Result<(String, String), GitError> {
+        let tag_kind = self
+            .storage
+            .config()
+            .monorepo
+            .object_hash_kind()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
         let tag_target = target
             .as_ref()
             .ok_or(GitError::InvalidCommitObject)
             .and_then(|t| {
-                ObjectHash::from_hex_for_kind(get_hash_kind(), t)
+                ObjectHash::from_hex_for_kind(tag_kind, t)
                     .map_err(|_| GitError::InvalidCommitObject)
             })?;
         let tagger_sig = git_internal::internal::object::signature::Signature::new(
@@ -898,13 +921,17 @@ impl super::MonoApiService {
             tagger_info.clone(),
             String::new(),
         );
-        let git_internal_tag = git_internal::internal::object::tag::Tag::new(
+        // `Tag::new` hashes through the thread-local kind, which would mint a
+        // SHA-1 tag id pointing at a SHA-256 commit.
+        let git_internal_tag = git_internal::internal::object::tag::Tag::new_with_kind(
+            tag_kind,
             tag_target,
             git_internal::internal::object::types::ObjectType::Commit,
             name.clone(),
             tagger_sig,
             message.clone().unwrap_or_default(),
-        );
+        )
+        .map_err(|e| GitError::CustomError(e.to_string()))?;
         Ok((
             git_internal_tag.id.to_string(),
             target.unwrap_or_else(|| "HEAD".to_string()),

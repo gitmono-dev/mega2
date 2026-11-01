@@ -1033,18 +1033,28 @@ impl super::MonoApiService {
                 "push B3 missing trunk provenance/signing".into(),
             ));
         };
+        // FIX-MTR-16: synthesize under the configured object algorithm instead
+        // of the thread-local `HashKind`.
+        let kind = self
+            .storage
+            .config()
+            .monorepo
+            .object_hash_kind()
+            .map_err(|e| GitError::CustomError(format!("configured object kind: {e}")))?;
         let trunk_commit = |tree: ObjectHash,
                             parents: Vec<ObjectHash>,
                             ref_path: &str,
                             prev: Option<&git_internal::internal::object::signature::Signature>|
          -> Result<Commit, GitError> {
-            let unsigned = crate::ceres::pack::trunk_provenance::synthesize(
+            let unsigned = crate::ceres::pack::trunk_provenance::synthesize_with_kind(
+                kind,
                 plan.author.clone(),
                 plan.committer(prev),
                 tree,
                 parents,
                 &plan.layer_message(ref_path),
-            );
+            )
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
             sign(&unsigned)
         };
 
@@ -1074,7 +1084,7 @@ impl super::MonoApiService {
             }
             let parent_ids = match existing.as_ref() {
                 Some(row) => vec![
-                    ObjectHash::from_hex_for_kind(get_hash_kind(), &row.ref_commit_hash)
+                    ObjectHash::from_hex_for_kind(kind, &row.ref_commit_hash)
                         .map_err(|e| GitError::CustomError(e.to_string()))?,
                 ],
                 None => Vec::new(),
@@ -1084,7 +1094,13 @@ impl super::MonoApiService {
                     .get_commit_by_hash(&row.ref_commit_hash)
                     .await
                     .map_err(|e| GitError::CustomError(e.to_string()))?
-                    .map(Commit::from_mega_model)
+                    .map(|model| {
+                        crate::jupiter::utils::converter::commit_from_mega_model_with_kind(
+                            model, kind,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|e| GitError::CustomError(e.to_string()))?
                     .map(|c| c.committer),
                 None => None,
             };
@@ -1114,7 +1130,7 @@ impl super::MonoApiService {
         } else {
             let parent_ids = match expected_root_commit {
                 Some(c) => vec![
-                    ObjectHash::from_hex_for_kind(get_hash_kind(), c)
+                    ObjectHash::from_hex_for_kind(kind, c)
                         .map_err(|e| GitError::CustomError(e.to_string()))?,
                 ],
                 None => Vec::new(),
@@ -1124,7 +1140,13 @@ impl super::MonoApiService {
                     .get_commit_by_hash(c)
                     .await
                     .map_err(|e| GitError::CustomError(e.to_string()))?
-                    .map(Commit::from_mega_model)
+                    .map(|model| {
+                        crate::jupiter::utils::converter::commit_from_mega_model_with_kind(
+                            model, kind,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|e| GitError::CustomError(e.to_string()))?
                     .map(|c| c.committer),
                 None => None,
             };

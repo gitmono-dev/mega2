@@ -696,18 +696,25 @@ impl MonoStorage {
             new_tree_hash,
             old_tree_hash,
             txn,
+            get_hash_kind(),
             DescendantCommitStyle::Legacy,
         )
         .await
     }
 
-    /// Advance descendants with an explicit continuation-commit constructor.
+    /// Advance descendants with an explicit object kind and continuation-commit
+    /// constructor.
+    ///
+    /// `kind` is the configured repository object algorithm. Every dependent
+    /// hash parse and the synthesized continuation commit derive their OID from
+    /// it, so the landed objects never depend on the thread-local [`HashKind`].
     pub async fn advance_descendant_refs_with(
         &self,
         path: &str,
         new_tree_hash: &str,
         old_tree_hash: Option<&str>,
         txn: &DatabaseTransaction,
+        kind: HashKind,
         style: DescendantCommitStyle,
     ) -> Result<(), MegaError> {
         let normalized = if path.is_empty() { "/" } else { path };
@@ -729,7 +736,14 @@ impl MonoStorage {
                 continue;
             };
             match self
-                .resolve_descendant_tree(new_tree_hash, old_tree_hash, relative, &mut cache, txn)
+                .resolve_descendant_tree(
+                    new_tree_hash,
+                    old_tree_hash,
+                    relative,
+                    &mut cache,
+                    txn,
+                    kind,
+                )
                 .await?
             {
                 DescendantResolve::Unchanged => {
@@ -740,29 +754,36 @@ impl MonoStorage {
                         unchanged.insert(row.path.clone());
                         continue;
                     }
-                    let parent =
-                        ObjectHash::from_hex_for_kind(get_hash_kind(), &row.ref_commit_hash)
-                            .map_err(|e| {
-                                MegaError::Other(format!(
-                                    "descendant {} parent hash: {e}",
-                                    row.path
-                                ))
-                            })?;
-                    let tree =
-                        ObjectHash::from_hex_for_kind(get_hash_kind(), &new_hash).map_err(|e| {
-                            MegaError::Other(format!("descendant {} tree hash: {e}", row.path))
+                    let parent = ObjectHash::from_hex_for_kind(kind, &row.ref_commit_hash)
+                        .map_err(|e| {
+                            MegaError::Other(format!("descendant {} parent hash: {e}", row.path))
                         })?;
+                    let tree = ObjectHash::from_hex_for_kind(kind, &new_hash).map_err(|e| {
+                        MegaError::Other(format!("descendant {} tree hash: {e}", row.path))
+                    })?;
                     let commit = match &style {
-                        DescendantCommitStyle::Legacy => Commit::from_tree_id(
+                        DescendantCommitStyle::Legacy => Commit::from_tree_id_with_kind(
+                            kind,
                             tree,
                             vec![parent],
                             &format_commit_msg("trunk descendant continuation", None),
-                        ),
+                        )
+                        .map_err(|e| {
+                            MegaError::Other(format!(
+                                "descendant {} legacy synthesis: {e}",
+                                row.path
+                            ))
+                        })?,
                         DescendantCommitStyle::Trunk { plan, sign } => {
                             let prev = self
                                 .get_commit_by_hash(&row.ref_commit_hash)
                                 .await?
-                                .map(Commit::from_mega_model)
+                                .map(|model| {
+                                    crate::jupiter::utils::converter::commit_from_mega_model_with_kind(
+                                        model, kind,
+                                    )
+                                })
+                                .transpose()?
                                 .map(|c| c.committer);
                             let committer = crate::ceres::pack::trunk_provenance::committer_at_land(
                                 &plan.committer_name,
@@ -770,13 +791,15 @@ impl MonoStorage {
                                 prev.as_ref(),
                                 plan.land_ts,
                             );
-                            let unsigned = crate::ceres::pack::trunk_provenance::synthesize(
-                                plan.author.clone(),
-                                committer,
-                                tree,
-                                vec![parent],
-                                &plan.layer_message(&row.path),
-                            );
+                            let unsigned =
+                                crate::ceres::pack::trunk_provenance::synthesize_with_kind(
+                                    kind,
+                                    plan.author.clone(),
+                                    committer,
+                                    tree,
+                                    vec![parent],
+                                    &plan.layer_message(&row.path),
+                                )?;
                             sign(&unsigned)?
                         }
                     };
@@ -811,11 +834,15 @@ impl MonoStorage {
         relative: &str,
         cache: &mut HashMap<String, Arc<Tree>>,
         txn: &DatabaseTransaction,
+        kind: HashKind,
     ) -> Result<DescendantResolve, MegaError> {
         let mut new_hash = new_tree_hash.to_owned();
         let mut old_hash = old_tree_hash.map(str::to_owned);
         for component in relative.split('/').filter(|c| !c.is_empty()) {
-            let Some(new_tree) = self.load_tree_cached(&new_hash, cache, txn).await? else {
+            let Some(new_tree) = self
+                .load_tree_cached_with_kind(&new_hash, cache, txn, kind)
+                .await?
+            else {
                 return Ok(DescendantResolve::Delete);
             };
             let Some(item) = new_tree.tree_items.iter().find(|x| x.name == component) else {
@@ -826,7 +853,9 @@ impl MonoStorage {
             }
             let next_new = item.id.to_string();
             if let Some(old) = old_hash.as_deref()
-                && let Some(old_tree) = self.load_tree_cached(old, cache, txn).await?
+                && let Some(old_tree) = self
+                    .load_tree_cached_with_kind(old, cache, txn, kind)
+                    .await?
                 && let Some(old_item) = old_tree.tree_items.iter().find(|x| x.name == component)
                 && old_item.mode == TreeItemMode::Tree
                 && old_item.id.to_string() == next_new
@@ -834,7 +863,10 @@ impl MonoStorage {
                 return Ok(DescendantResolve::Unchanged);
             }
             old_hash = match old_hash.as_deref() {
-                Some(old) => match self.load_tree_cached(old, cache, txn).await? {
+                Some(old) => match self
+                    .load_tree_cached_with_kind(old, cache, txn, kind)
+                    .await?
+                {
                     Some(old_tree) => old_tree
                         .tree_items
                         .iter()
@@ -855,13 +887,28 @@ impl MonoStorage {
         cache: &mut HashMap<String, Arc<Tree>>,
         txn: &DatabaseTransaction,
     ) -> Result<Option<Arc<Tree>>, MegaError> {
+        self.load_tree_cached_with_kind(hash, cache, txn, get_hash_kind())
+            .await
+    }
+
+    /// Kind-aware tree load used by the typed descendant walk so the walked
+    /// tree identities never depend on the thread-local `HashKind`.
+    async fn load_tree_cached_with_kind(
+        &self,
+        hash: &str,
+        cache: &mut HashMap<String, Arc<Tree>>,
+        txn: &DatabaseTransaction,
+        kind: HashKind,
+    ) -> Result<Option<Arc<Tree>>, MegaError> {
         if let Some(tree) = cache.get(hash) {
             return Ok(Some(tree.clone()));
         }
         let Some(model) = self.get_tree_by_hash_in_txn(hash, txn).await? else {
             return Ok(None);
         };
-        let tree = Arc::new(Tree::from_mega_model(model));
+        let tree = Arc::new(
+            crate::jupiter::utils::converter::tree_from_mega_model_with_kind(model, kind)?,
+        );
         cache.insert(hash.to_owned(), tree.clone());
         Ok(Some(tree))
     }
@@ -3503,6 +3550,109 @@ mod tests {
         let cl_row = cl.await.unwrap();
         assert!(cl_row.is_some(), "is_cl descendant must be untouched");
         assert_eq!(cl_row.unwrap().ref_commit_hash, c_eq.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn native_push_hash_advance_descendants_uses_configured_kind() {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let child = Tree::from_tree_items(vec![blob_item(
+            "x.txt",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )])
+        .unwrap();
+        let child_new = Tree::from_tree_items(vec![
+            blob_item("x.txt", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            blob_item("y.txt", "cccccccccccccccccccccccccccccccccccccccc"),
+        ])
+        .unwrap();
+        let old_root = Tree::from_tree_items(vec![tree_item_tree("child", &child)]).unwrap();
+        let new_root = Tree::from_tree_items(vec![
+            tree_item_tree("child", &child_new),
+            blob_item("root.txt", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ])
+        .unwrap();
+        let dummy = ObjectHash::from_str(&"1".repeat(40)).unwrap();
+        mono.save_mega_trees(
+            vec![
+                child.clone(),
+                child_new.clone(),
+                old_root.clone(),
+                new_root.clone(),
+            ],
+            dummy,
+            None,
+        )
+        .await
+        .unwrap();
+        let c_child = Commit::from_tree_id(child.id, vec![], "child");
+        let c_root = Commit::from_tree_id(old_root.id, vec![], "root");
+        mono.save_mega_commits(vec![c_child.clone(), c_root.clone()], None)
+            .await
+            .unwrap();
+        save_main_ref(&mono, "/", &c_root, &old_root, false).await;
+        save_main_ref(&mono, "/child", &c_child, &child, false).await;
+
+        // The repository is configured for SHA-1 while the thread-local kind is
+        // the opposing algorithm: the continuation commit must still be a SHA-1
+        // object that parses under the configured kind.
+        let _tls = set_hash_kind_for_test(HashKind::Sha256);
+        assert_eq!(get_hash_kind(), HashKind::Sha256);
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        mono.advance_descendant_refs_with(
+            "/",
+            &new_root.id.to_string(),
+            Some(&old_root.id.to_string()),
+            &txn,
+            HashKind::Sha1,
+            DescendantCommitStyle::Legacy,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let advanced = mono.get_main_ref("/child").await.unwrap().unwrap();
+        assert_ne!(advanced.ref_commit_hash, c_child.id.to_string());
+        assert_eq!(
+            advanced.ref_commit_hash.len(),
+            40,
+            "FIX16_DESCENDANT_WIDTH: continuation commit must keep the configured kind"
+        );
+        assert_eq!(
+            ObjectHash::from_hex_for_kind(HashKind::Sha1, &advanced.ref_commit_hash)
+                .expect("FIX16_DESCENDANT_KIND")
+                .kind(),
+            HashKind::Sha1
+        );
+        assert_eq!(advanced.ref_tree_hash, child_new.id.to_string());
+        let landed = mono
+            .get_commit_by_hash(&advanced.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(landed.tree, child_new.id.to_string());
+        assert_eq!(
+            landed.parents_id,
+            serde_json::json!([c_child.id.to_string()]),
+            "FIX16_AC5: continuation commit keeps the original trunk/descendant edge"
+        );
+        assert!(
+            landed
+                .author
+                .as_deref()
+                .is_some_and(|author| author.contains("mega")),
+            "FIX16_AC3: continuation author follows the existing tip rule"
+        );
+        assert_eq!(
+            get_hash_kind(),
+            HashKind::Sha256,
+            "FIX16 descendant advance must not mutate the thread-local kind"
+        );
     }
 
     #[tokio::test]

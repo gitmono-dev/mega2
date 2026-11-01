@@ -309,6 +309,22 @@ struct TreeCommitOutcome {
 /// The timestamped `.gitkeep` placeholder that represents an empty directory
 /// — create-entry's new directories and delete-entry's emptied parents share
 /// it (GC-02).
+/// Kind-aware `.gitkeep` placeholder: the blob id must belong to the configured
+/// repository algorithm, otherwise inserting it into a SHA-256 tree is a
+/// cross-kind reference that tree construction rejects.
+fn gitkeep_placeholder_for_kind(
+    kind: git_internal::hash::HashKind,
+) -> Result<(Blob, TreeItem), MegaError> {
+    let blob = crate::jupiter::utils::converter::generate_git_keep_with_timestamp_for_kind(kind)
+        .map_err(|e| MegaError::Other(e.to_string()))?;
+    let item = TreeItem {
+        mode: TreeItemMode::Blob,
+        id: blob.id,
+        name: String::from(".gitkeep"),
+    };
+    Ok((blob, item))
+}
+
 fn gitkeep_placeholder() -> (Blob, TreeItem) {
     let blob = generate_git_keep_with_timestamp();
     let item = TreeItem {

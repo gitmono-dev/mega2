@@ -5,7 +5,7 @@
 
 use chrono::{FixedOffset, TimeZone};
 use git_internal::{
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash},
     internal::object::{
         commit::Commit,
         signature::{Signature, SignatureType},
@@ -124,6 +124,9 @@ pub fn committer_at_land(
     }
 }
 
+/// Legacy constructor that derives the commit OID from the thread-local
+/// [`HashKind`]. Kept for callers that already run under the configured kind;
+/// B3 trunk landing must use [`synthesize_with_kind`] instead.
 pub fn synthesize(
     author: Signature,
     committer: Signature,
@@ -132,6 +135,28 @@ pub fn synthesize(
     message: &str,
 ) -> Commit {
     Commit::new(author, committer, tree, parents, message)
+}
+
+/// Fallible explicit-kind synthetic commit constructor used by every B3 trunk
+/// landing path.
+///
+/// The commit OID is derived from `kind` alone and never from the thread-local
+/// [`HashKind`], and `tree` plus every parent must already belong to `kind`.
+/// A cross-kind reference therefore fails closed with [`MegaError::Other`]
+/// rather than silently producing an OID under the wrong algorithm.
+pub fn synthesize_with_kind(
+    kind: HashKind,
+    author: Signature,
+    committer: Signature,
+    tree: ObjectHash,
+    parents: Vec<ObjectHash>,
+    message: &str,
+) -> Result<Commit, MegaError> {
+    Commit::new_with_kind(kind, author, committer, tree, parents, message).map_err(|error| {
+        MegaError::Other(format!(
+            "trunk synthesize under {kind:?} rejected a cross-kind reference: {error}"
+        ))
+    })
 }
 
 pub fn squash_message(
@@ -285,6 +310,8 @@ pub fn load_topo_asc(tip_first: &[Commit]) -> Result<Vec<Commit>, MegaError> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+
+    use git_internal::internal::object::{ObjectTrait, types::ObjectType};
 
     use super::*;
     use crate::config::DEFAULT_MAX_PUSH_COMMITS;
@@ -452,5 +479,154 @@ mod tests {
         assert!(msg.contains("feat: signed subject"), "{msg}");
         assert!(msg.contains("fix: second"), "{msg}");
         assert!(!msg.contains("gpgsig"), "{msg}");
+    }
+
+    fn kind_tree(kind: HashKind) -> ObjectHash {
+        ObjectHash::new_for_kind(kind, b"FIX16 tree")
+    }
+
+    fn kind_parent(kind: HashKind) -> ObjectHash {
+        ObjectHash::new_for_kind(kind, b"FIX16 parent")
+    }
+
+    fn committer(ts: usize) -> Signature {
+        sig(
+            SignatureType::Committer,
+            "trunk",
+            "trunk@example.invalid",
+            ts,
+        )
+    }
+
+    #[test]
+    fn native_push_hash_synthesize_explicit_kind_matches_recomputation() {
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let tree = kind_tree(kind);
+            let parent = kind_parent(kind);
+            let author = alice(1_700_000_000);
+            let committer = committer(1_700_000_001);
+            let message = "land /project at FIX16\n";
+
+            let landed = synthesize_with_kind(
+                kind,
+                author.clone(),
+                committer.clone(),
+                tree,
+                vec![parent],
+                message,
+            )
+            .expect("explicit-kind synthesis must succeed for same-kind references");
+
+            // AC-1: the OID is exactly the configured algorithm's digest of the
+            // canonical commit bytes, never a thread-local fallback.
+            let expected = Commit::new_with_kind(
+                kind,
+                author.clone(),
+                committer.clone(),
+                tree,
+                vec![parent],
+                message,
+            )
+            .expect("reference synthesis");
+            assert_eq!(landed.id.kind(), kind);
+            // Independent oracle: hash the canonical commit bytes directly
+            // instead of delegating to the constructor under test.
+            let canonical = landed.to_data().expect("canonical commit bytes");
+            let independent =
+                ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Commit, &canonical)
+                    .expect("independent commit digest");
+            assert_eq!(landed.id, independent, "FIX16_AC1_INDEPENDENT {kind:?}");
+            assert_eq!(landed.id, expected.id, "FIX16_AC1 {kind:?}");
+            assert_eq!(landed.id.to_string(), expected.id.to_string());
+            let width = match kind {
+                HashKind::Sha1 => 40,
+                HashKind::Sha256 | HashKind::Blake3 => 64,
+            };
+            assert_eq!(
+                landed.id.to_string().len(),
+                width,
+                "FIX16_OID_WIDTH {kind:?}"
+            );
+
+            // AC-3..AC-6: provenance fields pass through unchanged.
+            assert_eq!(landed.author, author);
+            assert_eq!(landed.committer, committer);
+            assert_eq!(landed.parent_commit_ids, vec![parent]);
+            assert_eq!(landed.message, message);
+            assert_eq!(landed.tree_id, tree);
+        }
+    }
+
+    #[test]
+    fn native_push_hash_synthesize_rejects_cross_kind_tree_and_parent() {
+        let author = alice(1_700_000_000);
+        let committer = committer(1_700_000_001);
+
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            // Exercise both a different-width pair (SHA-1 vs 32-byte) and the
+            // same-width pair (SHA-256 vs BLAKE3), so rejection cannot rest on
+            // length alone.
+            for other in [HashKind::Sha256, HashKind::Blake3] {
+                if other == kind || (kind == HashKind::Sha1 && other == HashKind::Blake3) {
+                    continue;
+                }
+
+                // AC-2: a foreign-kind tree fails closed instead of minting an OID
+                // under the wrong algorithm.
+                let foreign_tree = kind_tree(other);
+                assert!(
+                    synthesize_with_kind(
+                        kind,
+                        author.clone(),
+                        committer.clone(),
+                        foreign_tree,
+                        Vec::new(),
+                        "FIX16 cross-kind tree\n",
+                    )
+                    .is_err(),
+                    "FIX16_AC2_TREE {kind:?}"
+                );
+
+                let foreign_parent = kind_parent(other);
+                assert!(
+                    synthesize_with_kind(
+                        kind,
+                        author.clone(),
+                        committer.clone(),
+                        kind_tree(kind),
+                        vec![foreign_parent],
+                        "FIX16 cross-kind parent\n",
+                    )
+                    .is_err(),
+                    "FIX16_AC2_PARENT {kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_push_hash_synthesize_ignores_thread_local_kind() {
+        use git_internal::hash::{get_hash_kind, set_hash_kind_for_test};
+
+        let _tls = set_hash_kind_for_test(HashKind::Sha1);
+        assert_eq!(get_hash_kind(), HashKind::Sha1);
+
+        for kind in [HashKind::Sha256, HashKind::Blake3] {
+            let landed = synthesize_with_kind(
+                kind,
+                alice(1_700_000_000),
+                committer(1_700_000_001),
+                kind_tree(kind),
+                vec![kind_parent(kind)],
+                "FIX16 TLS independence\n",
+            )
+            .expect("explicit kind synthesis");
+            assert_eq!(landed.id.kind(), kind, "FIX16_TLS {kind:?}");
+            assert_eq!(
+                get_hash_kind(),
+                HashKind::Sha1,
+                "FIX16 synthesis must not mutate the thread-local kind"
+            );
+        }
     }
 }

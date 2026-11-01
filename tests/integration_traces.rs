@@ -4043,7 +4043,25 @@ mod disabled_http {
     }
 
     fn http_git_commit(fixture: &Fixture, message: &str) -> String {
-        fixture.git(&["-C", "trace-source", "add", "."]);
+        // The working tree lives on a host path bind-mounted into the Docker Git
+        // container, and a host write can lag behind `git add`. Retry staging
+        // until the index actually differs from HEAD, otherwise `commit` sees a
+        // clean tree and exits 1 with empty stderr (a fixture race, not product
+        // behaviour).
+        let mut staged = false;
+        for _ in 0..40 {
+            fixture.git(&["-C", "trace-source", "add", "."]);
+            let probe = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &["-C", "trace-source", "diff", "--cached", "--quiet"],
+            );
+            if !probe.status.success() {
+                staged = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(staged, "HTTP traces fixture could not stage the mutation");
         fixture.git(&[
             "-C",
             "trace-source",

@@ -151,25 +151,41 @@ impl super::PathProvisioner for super::MonoApiService {
         // New levels, bottom-up: the leaf holds a `.gitkeep` whose content is
         // unique per attempt, so two concurrent rounds never build the same
         // commit (the queue replays an identical (old_id, new_id) pair).
-        let blob = Blob::from_content(&format!(
-            "This file was used to maintain the git tree, provisioned {} ({})",
-            plan.path,
-            uuid::Uuid::new_v4()
-        ));
+        // The provisioned levels must be minted under the configured object
+        // algorithm: a thread-local SHA-1 `.gitkeep` blob or level tree becomes
+        // a cross-kind item that tree construction rejects as `Invalid tree`.
+        let kind = self
+            .storage
+            .config()
+            .monorepo
+            .object_hash_kind()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let blob = Blob::from_content_with_kind(
+            kind,
+            &format!(
+                "This file was used to maintain the git tree, provisioned {} ({})",
+                plan.path,
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .map_err(|e| GitError::CustomError(e.to_string()))?;
         let keep = TreeItem {
             mode: TreeItemMode::Blob,
             id: blob.id,
             name: String::from(".gitkeep"),
         };
-        let mut child = Tree::from_tree_items(vec![keep])
+        let mut child = Tree::from_tree_items_with_kind(kind, vec![keep])
             .map_err(|_| GitError::CustomError("Invalid tree".to_owned()))?;
         let mut save_trees = vec![child.clone()];
         for index in (missing_from..components.len() - 1).rev() {
-            child = Tree::from_tree_items(vec![TreeItem {
-                mode: TreeItemMode::Tree,
-                id: child.id,
-                name: components[index + 1].to_owned(),
-            }])
+            child = Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem {
+                    mode: TreeItemMode::Tree,
+                    id: child.id,
+                    name: components[index + 1].to_owned(),
+                }],
+            )
             .map_err(|_| GitError::CustomError("Invalid tree".to_owned()))?;
             save_trees.push(child.clone());
         }
@@ -183,7 +199,7 @@ impl super::PathProvisioner for super::MonoApiService {
             name: components[missing_from].to_owned(),
         });
         sort_git_tree_items(&mut items);
-        let new_deepest = Tree::from_tree_items(items)
+        let new_deepest = Tree::from_tree_items_with_kind(kind, items)
             .map_err(|_| GitError::CustomError("Invalid tree".to_owned()))?;
         let deepest_path = if deepest.is_empty() {
             "/".to_owned()

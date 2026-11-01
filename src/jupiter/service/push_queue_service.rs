@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use git_internal::hash::HashKind;
+use git_internal::hash::{HashKind, get_hash_kind};
 use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -752,12 +752,14 @@ impl PushQueueService {
         txn: &DatabaseTransaction,
         push_path: &str,
         landed_tree_id: &str,
+        kind: HashKind,
     ) -> Result<Vec<String>, MegaError> {
         crate::jupiter::service::trace_target_service::deactivate_descendants_missing_from_tree(
             txn,
             &self.mono_storage,
             push_path,
             landed_tree_id,
+            kind,
         )
         .await
     }
@@ -1125,6 +1127,20 @@ impl PushQueueService {
         path: &str,
         root_tree_hash: &str,
     ) -> Result<Option<StaleMainRef>, MegaError> {
+        self.assert_main_path_tree_hash_in_txn_with_kind(txn, path, root_tree_hash, get_hash_kind())
+            .await
+    }
+
+    /// Kind-aware stale pre-check (FIX-MTR-16): the stored/resolved tree
+    /// identities are parsed under the configured algorithm, never the
+    /// thread-local one.
+    pub async fn assert_main_path_tree_hash_in_txn_with_kind(
+        &self,
+        txn: &DatabaseTransaction,
+        path: &str,
+        root_tree_hash: &str,
+        kind: HashKind,
+    ) -> Result<Option<StaleMainRef>, MegaError> {
         if path.is_empty() || path == "/" {
             return Ok(None);
         }
@@ -1133,7 +1149,7 @@ impl PushQueueService {
         };
         let resolved = self
             .mono_storage
-            .resolve_path_tree_hash_in_txn(root_tree_hash, path, txn)
+            .resolve_path_tree_hash_in_txn_with_kind(root_tree_hash, path, txn, kind)
             .await?;
         if resolved.as_deref() == Some(pref.ref_tree_hash.as_str()) {
             return Ok(None);
@@ -1500,9 +1516,18 @@ impl PushQueueService {
                     .await;
             }
             PushQueueKindEnum::Push => {
+                let dispatch_kind = match push_ctx {
+                    Some(ctx) => ctx.storage.config().monorepo.object_hash_kind()?,
+                    None => get_hash_kind(),
+                };
                 if let Some(root) = root.as_ref()
                     && self
-                        .assert_main_path_tree_hash_in_txn(&txn, &row.path, &root.ref_tree_hash)
+                        .assert_main_path_tree_hash_in_txn_with_kind(
+                            &txn,
+                            &row.path,
+                            &root.ref_tree_hash,
+                            dispatch_kind,
+                        )
                         .await?
                         .is_some()
                 {
@@ -2563,11 +2588,7 @@ impl PushQueueService {
         } = baseline;
         use std::path::PathBuf;
 
-        use git_internal::{
-            errors::GitError,
-            hash::{ObjectHash, get_hash_kind},
-            internal::object::{commit::Commit, tree::Tree},
-        };
+        use git_internal::{errors::GitError, hash::ObjectHash, internal::object::commit::Commit};
 
         use crate::{
             ceres::{
@@ -2577,13 +2598,16 @@ impl PushQueueService {
                 },
                 pack::trunk_provenance::{self, TrunkProvenance},
             },
-            jupiter::{
-                storage::mono_storage::DescendantCommitStyle, utils::converter::FromMegaModel,
-            },
+            jupiter::storage::mono_storage::DescendantCommitStyle,
         };
 
         let payload: PushPayload = serde_json::from_value(row.payload.clone())
             .map_err(|e| MegaError::Other(format!("push payload deserialize failed: {e}")))?;
+
+        // FIX-MTR-16: every hash parsed or synthesized by this landing path
+        // derives its OID from the configured repository object algorithm, not
+        // from the thread-local `HashKind`.
+        let kind = ctx.storage.config().monorepo.object_hash_kind()?;
 
         let n0 = row.old_id == row.new_id;
         if n0 != (payload.n == 0) {
@@ -2769,13 +2793,14 @@ impl PushQueueService {
             .get_commit_by_hash(&row.new_id)
             .await?
             .ok_or_else(|| MegaError::Other(format!("push new_id {} not found", row.new_id)))?;
-        let tip_commit = Commit::from_mega_model(tip_model);
+        let tip_commit =
+            crate::jupiter::utils::converter::commit_from_mega_model_with_kind(tip_model, kind)?;
         let tip_tree_id = tip_commit.tree_id;
         let creating = path_row.is_none();
 
         let resolved = self
             .mono_storage
-            .resolve_path_tree_hash_in_txn(&root.ref_tree_hash, &row.path, &txn)
+            .resolve_path_tree_hash_in_txn_with_kind(&root.ref_tree_hash, &row.path, &txn, kind)
             .await?;
         if creating
             && let Some(resolved) = resolved.as_deref()
@@ -2808,14 +2833,15 @@ impl PushQueueService {
             storage: ctx.storage.clone(),
             git_object_cache: ctx.git_object_cache.clone(),
         };
-        let root_tree = Tree::from_mega_model(
+        let root_tree = crate::jupiter::utils::converter::tree_from_mega_model_with_kind(
             self.mono_storage
                 .get_tree_by_hash(&root.ref_tree_hash)
                 .await?
                 .ok_or_else(|| {
                     MegaError::Other(format!("root tree {} not found", root.ref_tree_hash))
                 })?,
-        );
+            kind,
+        )?;
         let normalized = MonoServiceLogic::clean_path_str(&row.path);
         let path = PathBuf::from(&normalized);
         let parent = path
@@ -2872,7 +2898,11 @@ impl PushQueueService {
                     .ok_or_else(|| {
                         MegaError::Other(format!("push payload commit {id} not found"))
                     })?;
-                tip_first.push(Commit::from_mega_model(model));
+                tip_first.push(
+                    crate::jupiter::utils::converter::commit_from_mega_model_with_kind(
+                        model, kind,
+                    )?,
+                );
             }
         }
         let topo_asc = trunk_provenance::load_topo_asc(&tip_first)?;
@@ -2883,7 +2913,10 @@ impl PushQueueService {
             self.mono_storage
                 .get_commit_by_hash(&row.old_id)
                 .await?
-                .map(Commit::from_mega_model)
+                .map(|model| {
+                    crate::jupiter::utils::converter::commit_from_mega_model_with_kind(model, kind)
+                })
+                .transpose()?
                 .map(|c| c.committer)
         };
         let range = if creating {
@@ -2898,7 +2931,7 @@ impl PushQueueService {
             let parents = if creating {
                 Vec::new()
             } else {
-                let parent_hash = ObjectHash::from_hex_for_kind(get_hash_kind(), &row.old_id)
+                let parent_hash = ObjectHash::from_hex_for_kind(kind, &row.old_id)
                     .map_err(|e| MegaError::Other(e.to_string()))?;
                 vec![parent_hash]
             };
@@ -2910,13 +2943,14 @@ impl PushQueueService {
                 range.clone(),
                 land_ts,
             );
-            let unsigned = trunk_provenance::synthesize(
+            let unsigned = trunk_provenance::synthesize_with_kind(
+                kind,
                 draft.author.clone(),
                 draft.committer(prev_p.as_ref()),
                 tip_tree_id,
                 parents,
                 &draft.squash_message(&topo_asc),
-            );
+            )?;
             let squash = sign_mega(&unsigned)?;
             (squash.id.to_string(), vec![squash])
         };
@@ -2995,6 +3029,7 @@ impl PushQueueService {
                 &landed_tree,
                 old_tree.as_deref(),
                 &txn,
+                kind,
                 DescendantCommitStyle::Trunk {
                     plan: Box::new(plan.clone()),
                     sign: std::sync::Arc::clone(&sign_mega),
@@ -3029,7 +3064,7 @@ impl PushQueueService {
                 .map_err(|error| MegaError::Other(error.to_string()))?;
         }
 
-        self.publish_target_paths_in_txn(&txn, &normalized, &landed_tree)
+        self.publish_target_paths_in_txn(&txn, &normalized, &landed_tree, kind)
             .await?;
 
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
@@ -9457,6 +9492,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_push_hash_target_publication_uses_configured_kind() {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        // The fixture trees are built under SHA-1. Flip the thread-local kind to
+        // the opposing algorithm and drive publication with the configured kind
+        // explicitly: the resolved target set must not depend on the TLS kind.
+        let (_temp, svc) = publication_service().await;
+        let conn = svc.mono_storage.get_connection();
+        let tree_id = project_tree(conn).await;
+        let push = bind_first_native_write(conn, "/project")
+            .await
+            .expect("push path");
+        let app = bind_first_native_write(conn, "/project/app")
+            .await
+            .expect("present child");
+        let gone = bind_first_native_write(conn, "/project/gone")
+            .await
+            .expect("missing child");
+
+        let _tls = set_hash_kind_for_test(HashKind::Sha256);
+        assert_eq!(get_hash_kind(), HashKind::Sha256);
+
+        let txn = conn.begin().await.expect("typed txn");
+        let deactivated = svc
+            .publish_target_paths_in_txn(&txn, "/project", &tree_id, HashKind::Sha1)
+            .await
+            .expect("typed publish");
+        txn.commit().await.expect("typed commit");
+
+        // AC-7: the surviving active set is exactly the directories that still
+        // exist in the landed tree, resolved under the configured kind.
+        assert!(
+            deactivated.contains(&gone.id),
+            "FIX16_AC7 missing dir retired"
+        );
+        assert!(!deactivated.contains(&push.id), "FIX16_AC7 push path kept");
+        assert!(!deactivated.contains(&app.id), "FIX16_AC7 present dir kept");
+        assert_eq!(
+            active_at(conn, "/project/app")
+                .await
+                .expect("app")
+                .unwrap()
+                .id,
+            app.id
+        );
+        assert!(
+            active_at(conn, "/project/gone")
+                .await
+                .expect("gone")
+                .is_none()
+        );
+        assert_eq!(get_hash_kind(), HashKind::Sha256);
+
+        // AC-2: a kind that does not match the recorded tree fails closed and
+        // leaves the active target set exactly as it was.
+        let before = active_at(conn, "/project/app").await.expect("before");
+        let txn = conn.begin().await.expect("mismatch txn");
+        let err = svc
+            .publish_target_paths_in_txn(&txn, "/project", &tree_id, HashKind::Sha256)
+            .await
+            .expect_err("cross-kind publication must fail closed");
+        txn.rollback().await.expect("mismatch rollback");
+        assert!(
+            matches!(err, MegaError::Other(ref message) if message == "invalid native root tree identity"),
+            "FIX16_AC2 unexpected error: {err}"
+        );
+        assert_eq!(
+            active_at(conn, "/project/app").await.expect("after"),
+            before,
+            "FIX16_AC2 rejected publication must keep the snapshot"
+        );
+        assert_eq!(get_hash_kind(), HashKind::Sha256);
+    }
+
+    #[tokio::test]
     async fn target_path_publication_deactivates_missing_descendants_in_txn() {
         let (_temp, svc) = publication_service().await;
         let conn = svc.mono_storage.get_connection();
@@ -9482,7 +9592,12 @@ mod tests {
 
         let txn = conn.begin().await.expect("txn");
         let deactivated = svc
-            .publish_target_paths_in_txn(&txn, "/project", &tree_id)
+            .publish_target_paths_in_txn(
+                &txn,
+                "/project",
+                &tree_id,
+                git_internal::hash::get_hash_kind(),
+            )
             .await
             .expect("publish");
         txn.commit().await.expect("commit");
@@ -9542,6 +9657,7 @@ mod tests {
                 &txn,
                 "/project",
                 "cccccccccccccccccccccccccccccccccccccccc",
+                git_internal::hash::get_hash_kind(),
             )
             .await
             .expect("missing tree");
@@ -9559,7 +9675,12 @@ mod tests {
         let tree_id = project_tree(conn).await;
         let txn = conn.begin().await.expect("rollback txn");
         let deactivated = svc
-            .publish_target_paths_in_txn(&txn, "/project", &tree_id)
+            .publish_target_paths_in_txn(
+                &txn,
+                "/project",
+                &tree_id,
+                git_internal::hash::get_hash_kind(),
+            )
             .await
             .expect("deactivate in txn");
         assert_eq!(deactivated, vec![kept.id.clone()]);
@@ -9578,6 +9699,7 @@ mod tests {
                 &conn.begin().await.expect("empty txn"),
                 "/unused",
                 &tree_id,
+                git_internal::hash::get_hash_kind(),
             )
             .await
             .expect("no targets");

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use git_internal::hash::HashKind;
 use sea_orm::{
     ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait, Set,
     Statement, TransactionTrait,
@@ -94,12 +95,24 @@ pub(crate) async fn bind_if_still_landed_in_txn(
     txn: &DatabaseTransaction,
     path: &str,
 ) -> Result<Option<String>, MegaError> {
+    bind_if_still_landed_in_txn_with_kind(mono, txn, path, git_internal::hash::get_hash_kind())
+        .await
+}
+
+/// Kind-aware variant used by the directory-create landing path, so the
+/// post-landing binding never parses a tree through the thread-local kind.
+pub(crate) async fn bind_if_still_landed_in_txn_with_kind(
+    mono: &MonoStorage,
+    txn: &DatabaseTransaction,
+    path: &str,
+    kind: HashKind,
+) -> Result<Option<String>, MegaError> {
     let path = trace_target_storage::canonical_project_path(path)?;
     let Some(root) = mono.lock_native_root_in_txn(txn).await? else {
         return Ok(None);
     };
     if mono
-        .resolve_path_tree_hash_in_txn(&root.ref_tree_hash, &path, txn)
+        .resolve_path_tree_hash_in_txn_with_kind(&root.ref_tree_hash, &path, txn, kind)
         .await?
         .is_none()
     {
@@ -110,8 +123,17 @@ pub(crate) async fn bind_if_still_landed_in_txn(
 }
 
 pub(crate) async fn bind_if_still_landed(mono: &MonoStorage, path: &str) -> Result<(), MegaError> {
+    bind_if_still_landed_with_kind(mono, path, git_internal::hash::get_hash_kind()).await
+}
+
+/// Kind-aware variant of [`bind_if_still_landed`].
+pub(crate) async fn bind_if_still_landed_with_kind(
+    mono: &MonoStorage,
+    path: &str,
+    kind: HashKind,
+) -> Result<(), MegaError> {
     let txn = mono.get_connection().begin().await?;
-    match bind_if_still_landed_in_txn(mono, &txn, path).await {
+    match bind_if_still_landed_in_txn_with_kind(mono, &txn, path, kind).await {
         Ok(Some(_)) => {
             txn.commit().await?;
             Ok(())
@@ -222,6 +244,7 @@ pub async fn deactivate_descendants_missing_from_tree(
     mono: &MonoStorage,
     push_path: &str,
     landed_tree_id: &str,
+    kind: HashKind,
 ) -> Result<Vec<String>, MegaError> {
     let push_path = trace_target_storage::canonical_project_path(push_path)?;
     let rows = trace_target_storage::active_at_and_below(txn, &push_path).await?;
@@ -246,7 +269,7 @@ pub async fn deactivate_descendants_missing_from_tree(
             row.project_path[push_path.len()..].to_owned()
         };
         let present = mono
-            .resolve_path_tree_hash_in_txn(landed_tree_id, &relative, txn)
+            .resolve_path_tree_hash_in_txn_with_kind(landed_tree_id, &relative, txn, kind)
             .await?
             .is_some();
         if !present {

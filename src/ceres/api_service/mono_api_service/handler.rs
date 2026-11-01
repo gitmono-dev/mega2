@@ -257,7 +257,18 @@ impl ApiHandler for super::MonoApiService {
             .await;
         let outcome = committed?;
         if entry_info.is_directory && target_follows_landed_commit(&self.storage) {
-            bind_if_still_landed(&self.storage, &entry_path).await?;
+            let bind_kind = self
+                .storage
+                .config()
+                .monorepo
+                .object_hash_kind()
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            crate::jupiter::service::trace_target_service::bind_if_still_landed_with_kind(
+                &self.storage.mono_storage(),
+                &entry_path,
+                bind_kind,
+            )
+            .await?;
         }
         Ok(CreateEntryResult {
             commit_id: outcome.commit_id,
@@ -506,7 +517,13 @@ impl ApiHandler for super::MonoApiService {
                 .ok_or_else(|| GitError::CustomError("Empty update chain".to_string()))?;
             ancestors.push((dest_parent_path.clone(), dest_chain));
             if src_items.is_empty() {
-                let (keep, item) = gitkeep_placeholder();
+                let move_kind = self
+                    .storage
+                    .config()
+                    .monorepo
+                    .object_hash_kind()
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+                let (keep, item) = super::gitkeep_placeholder_for_kind(move_kind)?;
                 src_items.push(item);
                 blobs.push(keep);
             }
@@ -530,7 +547,13 @@ impl ApiHandler for super::MonoApiService {
         sort_git_tree_items(&mut dest_items);
         edits.push((dest_parent_path, dest_items));
 
-        let update_result = Self::rewrite_parent_chains(ancestors, edits)?;
+        let rewrite_kind = self
+            .storage
+            .config()
+            .monorepo
+            .object_hash_kind()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let update_result = Self::rewrite_parent_chains(ancestors, edits, rewrite_kind)?;
         let landing = common_parent_path(&src_parent, &dest_parent);
         let moved_ids = if entry_info.is_directory && target_follows_landed_commit(&self.storage) {
             move_native_directory(&self.storage, &src_full, &dest_full).await?
