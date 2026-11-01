@@ -5651,6 +5651,11 @@ mod disabled_http {
                 3,
                 "FIX13_AC2 incremental fetch must transfer exactly the new objects"
             );
+            // AC-5's tag fixtures cannot be built by pushing a tag: the monorepo
+            // receive-pack refuses them ("tag pushes are not supported on
+            // monorepo; manage tags through the tag API"). The fixture must
+            // create annotated tags through that API instead, which is recorded
+            // in the card as the remaining work for this axis.
         })
         .catch_unwind()
         .await;
