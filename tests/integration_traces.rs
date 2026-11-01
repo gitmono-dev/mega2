@@ -5847,6 +5847,89 @@ mod disabled_http {
                 "FIX13_INCLUDE_TAG the crafted include-tag request must carry the tag object"
             );
 
+            // AC-5 negative: once the tag ref is deleted, the leftover row must not
+            // be attached even though its target is still inside the closure.
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                ":refs/tags/fix13-include-tag",
+            ]);
+            let residue_rows = scalar(
+                &db,
+                "SELECT count(*)::text AS value FROM git_tag WHERE tag_name = 'fix13-include-tag'",
+            )
+            .await;
+            let second = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    "/third-party/mtr94-control.git/git-upload-pack",
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .body({
+                    let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+                    format!(
+                        "{}{}{}",
+                        pkt(&format!("want {want_oid} include-tag side-band-64k\n")),
+                        "0000",
+                        pkt("done\n")
+                    )
+                })
+                .send()
+                .await
+                .expect("second include-tag probe");
+            let second_bytes = second.bytes().await.expect("second probe body");
+            let mut pack: Vec<u8> = Vec::new();
+            let mut offset = 0usize;
+            while offset + 4 <= second_bytes.len() {
+                let header =
+                    String::from_utf8_lossy(&second_bytes[offset..offset + 4]).to_string();
+                offset += 4;
+                if header == "0000" {
+                    continue;
+                }
+                let Ok(len) = usize::from_str_radix(&header, 16) else {
+                    break;
+                };
+                if len == 0 || offset + len - 4 > second_bytes.len() {
+                    break;
+                }
+                let payload = &second_bytes[offset..offset + len - 4];
+                offset += len - 4;
+                if payload.first() == Some(&1) {
+                    pack.extend_from_slice(&payload[1..]);
+                }
+            }
+            std::fs::write(
+                fixture.shared.path().join("deleted-tag-probe.pack"),
+                &pack,
+            )
+            .expect("write deleted-tag pack");
+            fixture.git(&[
+                "-C",
+                "iso-include-tag",
+                "index-pack",
+                "../deleted-tag-probe.pack",
+            ]);
+            let second_listing = fixture.git_text(&[
+                "-C",
+                "iso-include-tag",
+                "verify-pack",
+                "-v",
+                "../deleted-tag-probe.idx",
+            ]);
+            let tag_after_delete = second_listing
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(tag_oid.as_str()));
+            eprintln!(
+                "FIX13_INCLUDE_TAG_DELETED residue_rows={residue_rows} tag_in_pack={tag_after_delete}"
+            );
+            assert!(
+                !tag_after_delete,
+                "FIX13_INCLUDE_TAG a tag whose ref was deleted must not be attached"
+            );
+
             // VER-1's SSH dimension: SSH is a separate service process, so the
             // fixture is switched over only after every HTTP arm has run.
             fixture.start_ssh(true, false).await;
