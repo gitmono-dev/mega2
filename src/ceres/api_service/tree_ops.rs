@@ -189,6 +189,9 @@ pub async fn search_and_create_tree<T: ApiHandler + ?Sized>(
 ) -> Result<(VecDeque<Tree>, Blob), MegaError> {
     let relative_path = handler.strip_relative(path)?;
     let root_tree = handler.get_root_tree(None).await?;
+    // Every tree built below must stay in the root tree's object algorithm;
+    // `Tree::from_tree_items` would hash with the thread-local kind.
+    let kind = root_tree.id.kind();
     let mut search_tree = root_tree.clone();
     let mut update_item_tree = VecDeque::new();
     update_item_tree.push_back((root_tree, Component::RootDir));
@@ -225,12 +228,18 @@ pub async fn search_and_create_tree<T: ApiHandler + ?Sized>(
         )));
     }
 
-    let blob = generate_git_keep_with_timestamp();
-    let mut last_tree = Tree::from_tree_items(vec![TreeItem {
-        mode: TreeItemMode::Blob,
-        id: blob.id,
-        name: String::from(".gitkeep"),
-    }])
+    // The placeholder blob must hash with the same algorithm as the tree it is
+    // inserted into; `generate_git_keep_with_timestamp` uses the thread-local kind.
+    let blob = generate_git_keep_with_timestamp_for_kind(kind)
+        .map_err(|e| MegaError::Other(e.to_string()))?;
+    let mut last_tree = Tree::from_tree_items_with_kind(
+        kind,
+        vec![TreeItem {
+            mode: TreeItemMode::Blob,
+            id: blob.id,
+            name: String::from(".gitkeep"),
+        }],
+    )
     .unwrap();
     let mut last_tree_name = "";
     let mut first_element = true;
@@ -239,11 +248,14 @@ pub async fn search_and_create_tree<T: ApiHandler + ?Sized>(
         if first_element {
             first_element = false;
         } else {
-            last_tree = Tree::from_tree_items(vec![TreeItem {
-                mode: TreeItemMode::Tree,
-                id: last_tree.id,
-                name: last_tree_name.to_owned(),
-            }])
+            last_tree = Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem {
+                    mode: TreeItemMode::Tree,
+                    id: last_tree.id,
+                    name: last_tree_name.to_owned(),
+                }],
+            )
             .unwrap();
         }
         saving_trees.push_back(last_tree.clone());
@@ -256,7 +268,7 @@ pub async fn search_and_create_tree<T: ApiHandler + ?Sized>(
             id: last_tree.id,
             name: last_tree_name.to_owned(),
         });
-        last_tree = Tree::from_tree_items(new_item_tree.tree_items).unwrap();
+        last_tree = Tree::from_tree_items_with_kind(kind, new_item_tree.tree_items).unwrap();
         saving_trees.push_back(last_tree.clone());
 
         let mut replace_hash = last_tree.id;
@@ -264,7 +276,7 @@ pub async fn search_and_create_tree<T: ApiHandler + ?Sized>(
         while let Some((mut tree, component)) = update_item_tree.pop_back() {
             if let Some(index) = tree.tree_items.iter().position(|x| x.name == search_name) {
                 tree.tree_items[index].id = replace_hash;
-                let new_tree = Tree::from_tree_items(tree.tree_items).unwrap();
+                let new_tree = Tree::from_tree_items_with_kind(kind, tree.tree_items).unwrap();
                 replace_hash = new_tree.id;
                 search_name = component.as_os_str().to_str().unwrap();
                 saving_trees.push_back(new_tree);

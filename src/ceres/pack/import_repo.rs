@@ -1635,9 +1635,12 @@ fn attach_refusal(payload: &AttachPayload, id: i64, message: &str) -> MegaError 
     {
         return MegaError::Other(format!("ImportRepo attach failed: {detail}"));
     }
-    // The reason stays in `push_queue.error_message`; not logged here.
+    // The reason stays in `push_queue.error_message` and is not part of the
+    // client-facing message, so log it: without it an operator (and the
+    // acceptance run) has no way to see why the attach was refused.
     tracing::warn!(
         id,
+        reason = message,
         "ImportRepo attach refused without a client-facing reason"
     );
     MegaError::Other(format!(

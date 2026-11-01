@@ -246,17 +246,16 @@ async fn import_leaf_in_txn(
     root_tree: &str,
     path: &str,
     txn: &DatabaseTransaction,
+    kind: HashKind,
 ) -> Result<ImportLeaf, MegaError> {
-    use git_internal::internal::object::tree::{Tree, TreeItemMode};
-
-    use crate::jupiter::utils::converter::FromMegaModel;
+    use git_internal::internal::object::tree::TreeItemMode;
 
     let missing = |hash: &str| MegaError::Other(format!("tree {hash} not found"));
     let model = mono
         .get_tree_by_hash_in_txn(root_tree, txn)
         .await?
         .ok_or_else(|| missing(root_tree))?;
-    let mut tree = Tree::from_mega_model(model);
+    let mut tree = crate::jupiter::utils::converter::tree_from_mega_model_with_kind(model, kind)?;
     for component in path.split('/').filter(|c| !c.is_empty()) {
         let Some(item) = tree.tree_items.iter().find(|x| x.name == component) else {
             return Ok(ImportLeaf::Absent);
@@ -269,7 +268,7 @@ async fn import_leaf_in_txn(
             .get_tree_by_hash_in_txn(&hash, txn)
             .await?
             .ok_or_else(|| missing(&hash))?;
-        tree = Tree::from_mega_model(next);
+        tree = crate::jupiter::utils::converter::tree_from_mega_model_with_kind(next, kind)?;
     }
     Ok(
         if crate::ceres::api_service::tree_ops::is_gitkeep_only(&tree) {
@@ -305,16 +304,16 @@ async fn import_leaf_chain_in_txn(
     root_tree: &str,
     path: &str,
     txn: &DatabaseTransaction,
+    kind: HashKind,
 ) -> Result<(Vec<git_internal::internal::object::tree::Tree>, Vec<String>), MegaError> {
-    use git_internal::internal::object::tree::{Tree, TreeItemMode};
-
-    use crate::jupiter::utils::converter::FromMegaModel;
+    use git_internal::internal::object::tree::TreeItemMode;
 
     let load = |hash: String| async move {
-        mono.get_tree_by_hash_in_txn(&hash, txn)
+        let model = mono
+            .get_tree_by_hash_in_txn(&hash, txn)
             .await?
-            .map(Tree::from_mega_model)
-            .ok_or_else(|| MegaError::Other(format!("tree {hash} not found")))
+            .ok_or_else(|| MegaError::Other(format!("tree {hash} not found")))?;
+        crate::jupiter::utils::converter::tree_from_mega_model_with_kind(model, kind)
     };
     let names: Vec<String> = path
         .split('/')
@@ -1777,10 +1776,7 @@ impl PushQueueService {
         repo_path: &str,
         root: &crate::callisto::mega_refs::Model,
     ) -> Result<ExecuteOutcome, MegaError> {
-        use git_internal::{
-            hash::{ObjectHash, get_hash_kind},
-            internal::object::commit::Commit,
-        };
+        use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
         use sea_orm::{
             ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement,
         };
@@ -1844,7 +1840,14 @@ impl PushQueueService {
         let under_import_dir =
             repo_path.starts_with(&format!("{}/", import_dir.trim_end_matches('/')));
         let owned = under_import_dir
-            && match import_leaf_in_txn(&self.mono_storage, &expected_tree, repo_path, &txn).await?
+            && match import_leaf_in_txn(
+                &self.mono_storage,
+                &expected_tree,
+                repo_path,
+                &txn,
+                ctx.storage.config().monorepo.object_hash_kind()?,
+            )
+            .await?
             {
                 ImportLeaf::Absent | ImportLeaf::NotDirectory => false,
                 leaf @ (ImportLeaf::GitkeepOnly | ImportLeaf::Directory) => {
@@ -1857,9 +1860,14 @@ impl PushQueueService {
         let mut landed_commit_id = expected_commit.clone();
         let mut new_root_tree = None;
         if owned {
-            let (chain, names) =
-                import_leaf_chain_in_txn(&self.mono_storage, &expected_tree, repo_path, &txn)
-                    .await?;
+            let (chain, names) = import_leaf_chain_in_txn(
+                &self.mono_storage,
+                &expected_tree,
+                repo_path,
+                &txn,
+                ctx.storage.config().monorepo.object_hash_kind()?,
+            )
+            .await?;
             let floor = import_dir.split('/').filter(|c| !c.is_empty()).count();
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let (trees, gitkeep) = tree_ops::remove_import_leaf(&chain, &names, floor)?;
@@ -2141,7 +2149,7 @@ impl PushQueueService {
         use std::path::PathBuf;
 
         use git_internal::{
-            hash::{ObjectHash, get_hash_kind},
+            hash::ObjectHash,
             internal::object::{commit::Commit, tree::Tree},
         };
 
@@ -2151,7 +2159,7 @@ impl PushQueueService {
             contract::policy::notify::{
                 after_b3_commit_authz, authz_blob_id, insert_b3_authz_outbox_if_builds,
             },
-            jupiter::utils::converter::{FromGitModel, FromMegaModel},
+            jupiter::utils::converter::FromMegaModel,
         };
 
         let payload: AttachPayload = serde_json::from_value(row.payload.clone())
@@ -2268,7 +2276,15 @@ impl PushQueueService {
                 .b3_attach_update_refs(txn, row, &payload, &git_db, &expected_commit)
                 .await;
         }
-        match import_leaf_in_txn(&self.mono_storage, &expected_tree, &repo_path, &txn).await? {
+        match import_leaf_in_txn(
+            &self.mono_storage,
+            &expected_tree,
+            &repo_path,
+            &txn,
+            ctx.storage.config().monorepo.object_hash_kind()?,
+        )
+        .await?
+        {
             ImportLeaf::Absent => {}
             leaf @ (ImportLeaf::GitkeepOnly | ImportLeaf::Directory) => {
                 let recorded =
@@ -2335,26 +2351,31 @@ impl PushQueueService {
             .map(|c| c.new_id.clone())
             .ok_or_else(|| MegaError::Other("attach payload has no branch tip".into()))?;
 
-        let latest_commit: Commit = Commit::from_git_model(
-            ctx.storage
-                .git_db_storage()
-                .get_commit_by_hash(payload.repo_id, &tip_commit_id)
-                .await?
-                .ok_or_else(|| MegaError::Other(format!("commit {tip_commit_id} not found")))?,
-        );
+        let attach_kind = ctx.storage.config().monorepo.object_hash_kind()?;
+        let latest_commit: Commit =
+            crate::jupiter::utils::converter::commit_from_git_model_with_kind(
+                ctx.storage
+                    .git_db_storage()
+                    .get_commit_by_hash(payload.repo_id, &tip_commit_id)
+                    .await?
+                    .ok_or_else(|| MegaError::Other(format!("commit {tip_commit_id} not found")))?,
+                attach_kind,
+            )?;
         let commit_msg = attach_root_message(&latest_commit.message);
 
-        let new_commit = Commit::from_tree_id(
+        let new_commit = Commit::from_tree_id_with_kind(
+            attach_kind,
             save_trees
                 .back()
                 .ok_or_else(|| MegaError::Other("no tree generated".into()))?
                 .id,
             vec![
-                ObjectHash::from_hex_for_kind(get_hash_kind(), &expected_commit)
+                ObjectHash::from_hex_for_kind(attach_kind, &expected_commit)
                     .map_err(|e| MegaError::Other(format!("invalid expected commit hash: {e}")))?,
             ],
             &commit_msg,
-        );
+        )
+        .map_err(|e| MegaError::Other(e.to_string()))?;
         let new_root_tree_hash = new_commit.tree_id.to_string();
         let landed_commit_id = new_commit.id.to_string();
 
@@ -8353,9 +8374,15 @@ mod tests {
         let mono = storage.mono_storage();
         let root = mono.get_main_ref("/").await.unwrap().unwrap();
         let txn = mono.get_connection().begin().await.unwrap();
-        let leaf = import_leaf_in_txn(&mono, &root.ref_tree_hash, path, &txn)
-            .await
-            .unwrap();
+        let leaf = import_leaf_in_txn(
+            &mono,
+            &root.ref_tree_hash,
+            path,
+            &txn,
+            git_internal::hash::HashKind::Sha1,
+        )
+        .await
+        .unwrap();
         txn.rollback().await.unwrap();
         leaf
     }
