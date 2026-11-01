@@ -13,10 +13,7 @@ use crate::{
         push_queue,
         sea_orm_active_enums::{PushQueueKindEnum, PushQueuePendingEnum},
     },
-    common::{
-        errors::MegaError,
-        utils::{MEGA_BRANCH_NAME, ZERO_ID},
-    },
+    common::{errors::MegaError, utils::MEGA_BRANCH_NAME},
     jupiter::{
         service::push_queue_service::PushQueueService,
         storage::{
@@ -363,6 +360,7 @@ mod tests {
             mega_refs,
             sea_orm_active_enums::{PushQueueFailureEnum, PushQueueKindEnum, PushQueueStatusEnum},
         },
+        common::utils::ZERO_ID,
         config::PushPolicy,
         jupiter::{
             migration::apply_migrations,

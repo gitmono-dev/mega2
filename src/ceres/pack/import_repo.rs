@@ -1,10 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 
@@ -571,9 +568,9 @@ impl ImportRepo {
             .get_trees_by_hashes(repo_id, tree_ids)
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let obj_num = AtomicUsize::new(0);
         let mut counted: HashSet<String> = HashSet::new();
         let nothing: HashSet<String> = HashSet::new();
+        let obj_num = AtomicUsize::new(0);
         for model in trees {
             let tree = crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
                 .map_err(|e| GitError::CustomError(e.to_string()))?;
@@ -640,7 +637,6 @@ impl ImportRepo {
         let kind = self.object_hash_kind()?;
         let pack_config = &self.storage.config().pack;
         let storage = self.storage.git_db_storage();
-        let obj_num = AtomicUsize::new(0);
 
         let mut exist_objs = HashSet::new();
 
@@ -726,8 +722,6 @@ impl ImportRepo {
             })
             .collect::<Result<HashMap<_, _>, GitError>>()?;
 
-        obj_num.fetch_add(want_commits.len(), Ordering::SeqCst);
-
         let have_commits = storage
             .get_commits_by_hashes(self.repo.repo_id, &have)
             .await
@@ -806,20 +800,28 @@ impl ImportRepo {
             }
         }
 
-        let mut counted_obj = HashSet::new();
-        let mut counted_roots = HashSet::new();
-        // traverse for get obj nums; shared commit trees counted once
+        // One pass decides both the content and the size: build the entries, drop
+        // duplicates by object id, then size the encoder from that list. Counting
+        // in a separate pass is what previously let a header disagree with the
+        // payload (an explicit tree plus its blob was counted twice, a wanted root
+        // that is another root's subtree was overcounted).
+        let (tree_tx, mut tree_rx) =
+            mpsc::channel::<MetaAttached<Entry, EntryMeta>>(pack_config.channel_message_size);
+        let collector = tokio::spawn(async move {
+            let mut collected: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
+            while let Some(entry) = tree_rx.recv().await {
+                collected.push(entry);
+            }
+            collected
+        });
+
+        let mut emitted: HashSet<String> = exist_objs.clone();
         for c in want_commits.clone() {
-            if !counted_roots.insert(c.tree_id.to_string()) {
+            if emitted.contains(&c.tree_id.to_string()) {
                 continue;
             }
-            // The emission loop skips a tree the client already has, so counting
-            // has to skip it as well; otherwise the header advertises one more
-            // object than the pack carries.
-            if exist_objs.contains(&c.tree_id.to_string()) {
-                continue;
-            }
-            self.traverse_for_count(
+            emitted.insert(c.tree_id.to_string());
+            self.traverse(
                 want_trees
                     .get(&c.tree_id)
                     .ok_or_else(|| {
@@ -829,27 +831,38 @@ impl ImportRepo {
                         ))
                     })?
                     .clone(),
-                &exist_objs,
-                &mut counted_obj,
-                &obj_num,
+                &mut emitted,
+                Some(&tree_tx),
             )
             .await?;
         }
-        obj_num.fetch_add(extra_blobs.len(), Ordering::SeqCst);
-        for blob in &extra_blobs {
-            counted_obj.insert(blob.id.to_string());
-        }
-        for tree in &extra_trees {
-            if exist_objs.contains(&tree.id.to_string()) {
+        for tree in extra_trees {
+            if emitted.contains(&tree.id.to_string()) {
                 continue;
             }
-            self.traverse_for_count(tree.clone(), &exist_objs, &mut counted_obj, &obj_num)
-                .await?;
+            emitted.insert(tree.id.to_string());
+            self.traverse(tree, &mut emitted, Some(&tree_tx)).await?;
+        }
+        drop(tree_tx);
+        let mut entries = collector
+            .await
+            .map_err(|e| GitError::CustomError(format!("entry collector failed: {e}")))?;
+
+        for c in want_commits {
+            entries.push(MetaAttached {
+                inner: c.into(),
+                meta: EntryMeta::new(),
+            });
+        }
+        for blob in extra_blobs {
+            entries.push(MetaAttached {
+                inner: blob.into(),
+                meta: EntryMeta::default(),
+            });
         }
 
-        // Tags attached for `include-tag` must be counted before the encoder is
-        // sized, exactly like the closure objects above.
-        let mut tag_entries: Vec<Tag> = Vec::new();
+        // Tags are chosen against the set this pack actually emits, and attached
+        // to a fixed point so `outer -> inner` chains do not depend on row order.
         if include_tag {
             let refs = storage
                 .get_ref(self.repo.repo_id)
@@ -874,28 +887,37 @@ impl ImportRepo {
                         candidates.push(tag);
                     }
                 }
-                // Fixed point over the evolving emitted set: `outer -> inner`
-                // chains must attach regardless of the order rows come back in,
-                // and an attached tag becomes a valid target for its parent.
+                let mut emitted_ids: HashSet<String> = entries
+                    .iter()
+                    .map(|entry| entry.inner.hash.to_string())
+                    .collect();
                 loop {
                     let mut progressed = false;
                     for tag in candidates.clone() {
-                        if tag_entries.iter().any(|existing| existing.id == tag.id) {
+                        let tag_id = tag.id.to_string();
+                        if emitted_ids.contains(&tag_id)
+                            || !emitted_ids.contains(&tag.object_hash.to_string())
+                        {
                             continue;
                         }
-                        if counted_obj.contains(&tag.object_hash.to_string()) {
-                            counted_obj.insert(tag.id.to_string());
-                            tag_entries.push(tag);
-                            progressed = true;
-                        }
+                        emitted_ids.insert(tag_id);
+                        entries.push(MetaAttached {
+                            inner: tag.into(),
+                            meta: EntryMeta::new(),
+                        });
+                        progressed = true;
                     }
                     if !progressed {
                         break;
                     }
                 }
             }
-            obj_num.fetch_add(tag_entries.len(), Ordering::SeqCst);
         }
+
+        // Deduplicate by object id so the header count matches the payload exactly.
+        let mut seen: HashSet<String> = HashSet::new();
+        entries.retain(|entry| seen.insert(entry.inner.hash.to_string()));
+        let total = entries.len();
 
         let refs_after = Self::ref_fingerprint(&storage, self.repo.repo_id)
             .await
@@ -908,69 +930,19 @@ impl ImportRepo {
 
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new_with_hash_kind(
-            self.object_hash_kind()?,
-            obj_num.into_inner(),
-            0,
-            stream_tx,
-        );
+        let encoder = PackEncoder::new_with_hash_kind(kind, total, 0, stream_tx);
         encoder
             .encode_async(entry_rx)
             .await
             .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
 
-        // Every object must appear exactly once in the pack; two want commits
-        // may share one tree.
-        for c in want_commits {
-            if exist_objs.insert(c.tree_id.to_string()) {
-                self.traverse(
-                    want_trees
-                        .get(&c.tree_id)
-                        .ok_or_else(|| {
-                            GitError::CustomError(format!(
-                                "import tree {} missing from the want set",
-                                c.tree_id
-                            ))
-                        })?
-                        .clone(),
-                    &mut exist_objs,
-                    Some(&entry_tx),
-                )
-                .await?;
+        tokio::spawn(async move {
+            for entry in entries {
+                if entry_tx.send(entry).await.is_err() {
+                    break;
+                }
             }
-            entry_tx
-                .send(MetaAttached {
-                    inner: c.into(),
-                    meta: EntryMeta::new(),
-                })
-                .await
-                .map_err(|e| MegaError::Other(format!("pack commit entry send failed: {e}")))?;
-        }
-        for tree in extra_trees {
-            if exist_objs.insert(tree.id.to_string()) {
-                self.traverse(tree, &mut exist_objs, Some(&entry_tx))
-                    .await?;
-            }
-        }
-        for blob in extra_blobs {
-            entry_tx
-                .send(MetaAttached {
-                    inner: blob.into(),
-                    meta: EntryMeta::default(),
-                })
-                .await
-                .map_err(|e| MegaError::Other(format!("pack blob entry send failed: {e}")))?;
-        }
-        for tag in tag_entries {
-            entry_tx
-                .send(MetaAttached {
-                    inner: tag.into(),
-                    meta: EntryMeta::new(),
-                })
-                .await
-                .map_err(|e| MegaError::Other(format!("pack tag entry send failed: {e}")))?;
-        }
-        drop(entry_tx);
+        });
 
         Ok(ReceiverStream::new(stream_rx))
     }
