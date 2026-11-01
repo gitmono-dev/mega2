@@ -556,6 +556,27 @@ impl ImportRepo {
             self.traverse(have_tree, &mut exist_objs, None).await?;
         }
 
+        // A client may fetch a tree by id; it is not reachable from any wanted
+        // commit, so plan it separately or its children would be missing.
+        let mut extra_trees: Vec<Tree> = Vec::new();
+        for id in &want_clone {
+            if want_trees.values().any(|tree| tree.id.to_string() == *id) {
+                continue;
+            }
+            if let Some(model) = storage
+                .get_tree_by_hash(self.repo.repo_id, id)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?
+            {
+                let tree =
+                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
+                if !extra_trees.iter().any(|existing| existing.id == tree.id) {
+                    extra_trees.push(tree);
+                }
+            }
+        }
+
         let mut counted_obj = HashSet::new();
         let mut counted_roots = HashSet::new();
         // traverse for get obj nums; shared commit trees counted once
@@ -585,6 +606,14 @@ impl ImportRepo {
             )
             .await?;
         }
+        for tree in &extra_trees {
+            if exist_objs.contains(&tree.id.to_string()) {
+                continue;
+            }
+            self.traverse_for_count(tree.clone(), &exist_objs, &mut counted_obj, &obj_num)
+                .await?;
+        }
+
         // Tags attached for `include-tag` must be counted before the encoder is
         // sized, exactly like the closure objects above.
         let mut tag_entries: Vec<Tag> = Vec::new();
@@ -683,6 +712,12 @@ impl ImportRepo {
                 })
                 .await
                 .map_err(|e| MegaError::Other(format!("pack commit entry send failed: {e}")))?;
+        }
+        for tree in extra_trees {
+            if exist_objs.insert(tree.id.to_string()) {
+                self.traverse(tree, &mut exist_objs, Some(&entry_tx))
+                    .await?;
+            }
         }
         for tag in tag_entries {
             entry_tx
