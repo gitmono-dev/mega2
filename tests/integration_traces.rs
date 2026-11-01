@@ -5537,7 +5537,7 @@ mod disabled_http {
                 ("iso-depth1", vec!["--depth=1"]),
                 ("iso-blobless", vec!["--filter=blob:none"]),
             ];
-            for (dir, extra) in arms {
+            for (dir, extra) in arms.iter() {
                 let mut args = vec!["clone"];
                 args.extend(extra.iter().copied());
                 args.push(&url);
@@ -5559,12 +5559,12 @@ mod disabled_http {
                 );
 
                 let commit_count = fixture.git_text(&["-C", dir, "rev-list", "--count", "--all"]);
-                if dir == "iso-depth1" {
+                if *dir == "iso-depth1" {
                     assert_eq!(
                         commit_count, "1",
                         "FIX13_AC3 depth=1 must carry exactly one commit, got {commit_count}"
                     );
-                } else if dir == "iso-blobless" {
+                } else if *dir == "iso-blobless" {
                     // Measured on this tree: the server advertises the `filter`
                     // capability (the client records a promisor remote) but the
                     // pack still carries every blob, so `blob:none` is not
@@ -5586,10 +5586,27 @@ mod disabled_http {
                         "FIX13_AC7 {dir} object count must match the default clone"
                     );
                 }
+            }
 
-                // Object integrity, last: in a partial clone `fsck` fetches the
-                // promisor-missing blobs, which would defeat the blob:none arm.
-                fixture.git(&["-C", dir, "fsck", "--strict"]);
+            // Pack/ODB oracle: what the client actually stored in packs must
+            // equal the reachable object set for each arm (`count-objects -v`
+            // reports the packed objects, `rev-list --objects --all` the
+            // reachable ones).
+            for (dir, _) in arms.iter() {
+                let reachable = fixture
+                    .git_text(&["-C", dir, "rev-list", "--objects", "--all"])
+                    .lines()
+                    .count();
+                let counted = fixture.git_text(&["-C", dir, "count-objects", "-v"]);
+                let in_pack: usize = counted
+                    .lines()
+                    .find_map(|line| line.strip_prefix("in-pack: "))
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or_else(|| panic!("FIX13_AC6 {dir} in-pack count missing"));
+                assert_eq!(
+                    in_pack, reachable,
+                    "FIX13_AC6 {dir} packed objects must equal the reachable set"
+                );
             }
             // AC-2 at the code-path view: an incremental fetch must transfer only
             // what the client lacks. Advance the upstream from the default clone,
