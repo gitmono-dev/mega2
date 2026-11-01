@@ -2988,6 +2988,72 @@ mod tests {
         assert_eq!(root_after.ref_tree_hash, root_before.ref_tree_hash);
     }
 
+    /// Capacity boundary. `code_refs` only enforces the ref budget on the legacy
+    /// view: without a legacy traces ref it returns the code refs directly, so an
+    /// over-budget repository still serves. With the legacy ref present the view
+    /// must fail with a typed `ResponseBudget` (HTTP 413) rather than truncate.
+    #[tokio::test]
+    async fn ref_capacity_budget_applies_to_the_legacy_view() {
+        async fn over_budget_repo(path: &str, legacy: bool) -> (tempfile::TempDir, ImportRepo) {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = wired_storage_with_monorepo(&temp).await;
+            let (repo, _commit, _create) = seed_import_repo_with_main_tip(&storage, path).await;
+            let git_db = storage.git_db_storage();
+            if legacy {
+                let command = RefCommand::new(
+                    ZERO_ID.to_string(),
+                    "b".repeat(40),
+                    super::LEGACY_TRACES_REF.to_owned(),
+                );
+                git_db
+                    .save_ref(repo.repo_id, command.into())
+                    .await
+                    .expect("legacy ref insert");
+            }
+            for index in 0..(super::LEGACY_VIEW_MAX_REFS + 2) {
+                let command = RefCommand::new(
+                    ZERO_ID.to_string(),
+                    "a".repeat(40),
+                    format!("refs/heads/bulk{index}"),
+                );
+                git_db
+                    .save_ref(repo.repo_id, command.into())
+                    .await
+                    .expect("bulk ref insert");
+            }
+            let import_repo = ImportRepo {
+                storage: storage.clone(),
+                repo,
+                command_list: Mutex::new(vec![]),
+                git_object_cache: disabled_cache().await,
+                receive_pack_extra_timings_ms: Mutex::new(vec![]),
+            };
+            (temp, import_repo)
+        }
+
+        let (_temp, legacy) = over_budget_repo("/proj/capacity-legacy", true).await;
+        let error = match legacy.code_refs().await {
+            Ok(_) => panic!("the legacy view must fail once over budget"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                MegaError::Traces(crate::common::errors::TracesError::ResponseBudget)
+            ),
+            "over-budget legacy view must surface as ResponseBudget (HTTP 413)"
+        );
+
+        // Control: without the legacy ref the code view still serves, which is the
+        // behaviour the card requires for a no-legacy repository.
+        let (_temp, plain) = over_budget_repo("/proj/capacity-plain", false).await;
+        let view = plain
+            .code_refs()
+            .await
+            .expect("a no-legacy repository must still serve the code view");
+        assert!(view.refs.len() > super::LEGACY_VIEW_MAX_REFS);
+    }
+
     /// FU-12: an ImportRepo whose tag `refs/tags/v1` points at `"1" * 40`.
     async fn fu12_tag_repo(path: &str) -> (tempfile::TempDir, Storage, ImportRepo) {
         let temp = tempfile::tempdir().unwrap();
