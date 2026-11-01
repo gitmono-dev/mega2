@@ -5890,6 +5890,96 @@ mod disabled_http {
                 "FIX13_AC3 the parent tree must not be present in a depth=1 clone"
             );
 
+            // AC-3: a blob that exists only in the excluded parent must be absent
+            // too. A file is added and then deleted, so the blob is reachable from
+            // the intermediate commit but not from the tip a depth=1 clone takes.
+            std::fs::write(
+                fixture.shared.path().join("import-depth-work/transient.txt"),
+                b"FIX13 transient\n",
+            )
+            .expect("write transient file");
+            fixture.git(&["-C", "import-depth-work", "add", "transient.txt"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "FIX13 add transient",
+            ]);
+            let transient_blob = fixture.git_text(&[
+                "-C",
+                "import-depth-work",
+                "rev-parse",
+                "HEAD:transient.txt",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "HEAD:refs/heads/main",
+            ]);
+            fixture.git(&["-C", "import-depth-work", "rm", "-q", "transient.txt"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "FIX13 drop transient",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "HEAD:refs/heads/main",
+            ]);
+            fixture.git(&[
+                "-c",
+                "protocol.version=0",
+                "clone",
+                "--depth=1",
+                "--no-checkout",
+                &import_url,
+                "iso-import-depth2",
+            ]);
+            let shallow_commits = fixture.git_text(&[
+                "-C",
+                "iso-import-depth2",
+                "rev-list",
+                "--count",
+                "--all",
+            ]);
+            assert_eq!(
+                shallow_commits, "1",
+                "FIX13_AC3 the second shallow clone must carry exactly one commit"
+            );
+            let transient_present = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &["-C", "iso-import-depth2", "cat-file", "-e", &transient_blob],
+            )
+            .status
+            .success();
+            eprintln!(
+                "FIX13_AC3_PARENT_BLOB present={transient_present} blob={transient_blob}"
+            );
+            assert!(
+                !transient_present,
+                "FIX13_AC3 a parent-only blob must not be present in a depth=1 clone"
+            );
+
             // include-tag positive case on the ImportRepo path. Stock git cannot
             // distinguish it: `--no-tags` suppresses the capability and `--tags`
             // fetches the tag ref anyway. So the request is crafted by hand - a
