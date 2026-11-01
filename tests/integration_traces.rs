@@ -5980,6 +5980,62 @@ mod disabled_http {
                 "FIX13_AC3 a parent-only blob must not be present in a depth=1 clone"
             );
 
+            // AC-3: a tag pointing at the excluded parent must not arrive either,
+            // even though the ref exists and the client asks for include-tag.
+            let parent_of_tip =
+                fixture.git_text(&["-C", "import-depth-work", "rev-parse", "HEAD~1"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "fix13-parent-tag",
+                "-m",
+                "FIX13 parent tag",
+                &parent_of_tip,
+            ]);
+            let parent_tag_oid = fixture.git_text(&[
+                "-C",
+                "import-depth-work",
+                "rev-parse",
+                "fix13-parent-tag",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "refs/tags/fix13-parent-tag",
+            ]);
+            fixture.git(&[
+                "-c",
+                "protocol.version=0",
+                "clone",
+                "--depth=1",
+                "--no-checkout",
+                &import_url,
+                "iso-import-depth3",
+            ]);
+            let parent_tag_present = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &["-C", "iso-import-depth3", "cat-file", "-e", &parent_tag_oid],
+            )
+            .status
+            .success();
+            eprintln!(
+                "FIX13_AC3_PARENT_TAG present={parent_tag_present} tag={parent_tag_oid}"
+            );
+            assert!(
+                !parent_tag_present,
+                "FIX13_AC3 a tag on the excluded parent must not be present"
+            );
+
             // include-tag positive case on the ImportRepo path. Stock git cannot
             // distinguish it: `--no-tags` suppresses the capability and `--tags`
             // fetches the tag ref anyway. So the request is crafted by hand - a
@@ -6217,15 +6273,42 @@ mod disabled_http {
                 .lines()
                 .filter_map(|line| line.split_whitespace().next())
                 .collect();
+            // The number of attachable tags depends on what earlier probes left
+            // behind, so it is derived rather than assumed: every authorised tag
+            // whose peeled target is inside the closure must be attached.
+            let tag_refs = fixture.git_text(&[
+                "-C",
+                "import-depth-work",
+                "for-each-ref",
+                "--format=%(objectname) %(*objectname)",
+                "refs/tags",
+            ]);
+            let closure_set: std::collections::HashSet<&str> =
+                closure_ids.iter().copied().collect();
+            let attachable: Vec<&str> = tag_refs
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|_| true)
+                .collect::<Vec<_>>();
+            let attachable_count = tag_refs
+                .lines()
+                .filter(|line| {
+                    let mut parts = line.split_whitespace();
+                    let _tag = parts.next();
+                    let target = parts.next().unwrap_or_default();
+                    closure_set.contains(target)
+                })
+                .count();
+            let _ = attachable;
             eprintln!(
-                "FIX13_AC1_EXACT pack={} closure={}",
+                "FIX13_AC1_EXACT pack={} closure={} attachable_tags={attachable_count}",
                 pack_ids.len(),
                 closure_ids.len()
             );
             assert_eq!(
                 pack_ids.len(),
-                closure_ids.len() + 1,
-                "FIX13_AC1 the pack must be the closure plus exactly the attached tag"
+                closure_ids.len() + attachable_count,
+                "FIX13_AC1 the pack must be the closure plus exactly the attachable tags"
             );
             for oid in &closure_ids {
                 assert!(
