@@ -5620,6 +5620,19 @@ mod disabled_http {
                 }
             }
 
+            // Object integrity per arm. `fsck` must only run on arms that are
+            // not partial clones: in a promisor clone `fsck` lazily fetches the
+            // objects it is asked to check, which would both mask a filtering
+            // bug and change the counts below.
+            for (dir, flags) in arms.iter() {
+                if flags.iter().any(|flag| flag.contains("--filter")) {
+                    eprintln!("FIX13_FSCK {dir} skipped=partial-clone");
+                    continue;
+                }
+                fixture.git(&["-C", dir, "fsck", "--strict"]);
+                eprintln!("FIX13_FSCK {dir} strict=ok");
+            }
+
             // Pack/ODB oracle: what the client actually stored in packs must
             // equal the reachable object set for each arm (`count-objects -v`
             // reports the packed objects, `rev-list --objects --all` the
