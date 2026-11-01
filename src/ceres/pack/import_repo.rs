@@ -603,19 +603,32 @@ impl ImportRepo {
                     .get_tags_by_repo_id(self.repo.repo_id)
                     .await
                     .map_err(|e| GitError::CustomError(e.to_string()))?;
+                let mut candidates: Vec<Tag> = Vec::new();
                 for model in models {
                     let tag: Tag =
                         crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
                             .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    let tag_id = tag.id.to_string();
-                    let target = tag.object_hash.to_string();
-                    // Fixed point over the evolving emitted set, so nested tag
-                    // chains attach regardless of row order.
-                    if authorised_tag_ids.contains(&tag_id)
-                        && counted_obj.contains(&target)
-                        && !tag_entries.iter().any(|existing| existing.id == tag.id)
-                    {
-                        tag_entries.push(tag);
+                    if authorised_tag_ids.contains(&tag.id.to_string()) {
+                        candidates.push(tag);
+                    }
+                }
+                // Fixed point over the evolving emitted set: `outer -> inner`
+                // chains must attach regardless of the order rows come back in,
+                // and an attached tag becomes a valid target for its parent.
+                loop {
+                    let mut progressed = false;
+                    for tag in candidates.clone() {
+                        if tag_entries.iter().any(|existing| existing.id == tag.id) {
+                            continue;
+                        }
+                        if counted_obj.contains(&tag.object_hash.to_string()) {
+                            counted_obj.insert(tag.id.to_string());
+                            tag_entries.push(tag);
+                            progressed = true;
+                        }
+                    }
+                    if !progressed {
+                        break;
                     }
                 }
             }
