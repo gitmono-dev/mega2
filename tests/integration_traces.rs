@@ -5589,10 +5589,11 @@ mod disabled_http {
             let url = git_cli::mega2_http_url(fixture.port, "/project/control.git");
 
             let mut baseline_objects = 0usize;
-            let arms: [(&str, Vec<&str>); 8] = [
+            let arms: [(&str, Vec<&str>); 9] = [
                 ("iso-default", vec![]),
                 ("iso-bare", vec!["--bare"]),
                 ("iso-no-tags", vec!["--no-tags"]),
+                ("iso-mirror", vec!["--mirror"]),
                 ("iso-depth1", vec!["--depth=1"]),
                 ("iso-blobless", vec!["--filter=blob:none"]),
                 // Explicit v0 and v2 arms: the object set and the absence of
@@ -5634,15 +5635,11 @@ mod disabled_http {
                         "FIX13_AC3 depth=1 must carry exactly one commit, got {commit_count}"
                     );
                 } else if *dir == "iso-v2-blobless" {
-                    // This fixture serves an ImportRepo path, whose handler
-                    // reports `supports_filtered_fetch() == false`; v2 then
-                    // refuses the filter (`filter is not supported for this
-                    // repository`) and the client degrades to a full clone. That
-                    // refusal is the contract here, so the arm must match the
-                    // full closure rather than omit blobs. AC-4's positive case
-                    // (`blob:none` really withholds blobs) therefore has to run
-                    // against a native Monorepo path, which this fixture does not
-                    // provide - recorded in the card as remaining work.
+                    // Measured: this arm receives the full closure, so v2
+                    // filtering is not demonstrated here. An earlier version of
+                    // this comment claimed the handler refused the filter, which
+                    // was wrong. AC-4's positive case is asserted separately below
+                    // on the ImportRepo path (`FIX13_AC4_IMPORT_FILTERED`).
                     let count = listing.lines().count();
                     eprintln!("FIX13_AC4_V2_BLOBLESS objects={count} full={baseline_objects}");
                     assert_eq!(
@@ -5678,6 +5675,18 @@ mod disabled_http {
                         "FIX13_AC7 {dir} object count must match the default clone"
                     );
                 }
+            }
+
+            // Object integrity per arm. `fsck` is skipped on promisor arms: it
+            // lazily fetches the objects it is asked to check, which would both
+            // mask a filtering bug and change the counts.
+            for (dir, flags) in arms.iter() {
+                if flags.iter().any(|flag| flag.contains("--filter")) {
+                    eprintln!("FIX13_FSCK {dir} skipped=partial-clone");
+                    continue;
+                }
+                fixture.git(&["-C", dir, "fsck", "--strict"]);
+                eprintln!("FIX13_FSCK {dir} strict=ok");
             }
 
             // AC-4 on the card's own axis: an ImportRepo served from
