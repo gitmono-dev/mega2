@@ -5847,6 +5847,84 @@ mod disabled_http {
                 "FIX13_INCLUDE_TAG the pushed tag must be persisted in git_tag"
             );
 
+            // AC-2: an incremental fetch must deliver exactly the objects the client
+            // lacks. Measured by object identity rather than by a count, so
+            // retransmitting an object the client already owns would fail here.
+            fixture.git(&["clone", &import_url, "ac2-clone"]);
+            // The delta must be measured against the client's pre-fetch tip;
+            // excluding the base commit instead overstates it.
+            let ac2_pre_tip = fixture.git_text(&["-C", "ac2-clone", "rev-parse", "HEAD"]);
+            let before_ids = fixture.git_text(&[
+                "-C",
+                "ac2-clone",
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ]);
+            std::fs::write(
+                fixture.shared.path().join("import-depth-work/incremental.txt"),
+                b"FIX13 incremental\n",
+            )
+            .expect("write incremental file");
+            fixture.git(&["-C", "import-depth-work", "add", "incremental.txt"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "FIX13 incremental advance",
+            ]);
+            let advance_tip = fixture.git_text(&["-C", "import-depth-work", "rev-parse", "HEAD"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "HEAD:refs/heads/main",
+            ]);
+            fixture.git(&["-C", "ac2-clone", "fetch", "origin"]);
+            let after_ids = fixture.git_text(&[
+                "-C",
+                "ac2-clone",
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ]);
+            let before: std::collections::HashSet<&str> = before_ids.lines().collect();
+            let after: std::collections::HashSet<&str> = after_ids.lines().collect();
+            let mut newly: Vec<&str> = after.difference(&before).copied().collect();
+            newly.sort_unstable();
+            let expected_text = fixture.git_text(&[
+                "-C",
+                "ac2-clone",
+                "rev-list",
+                "--objects",
+                &advance_tip,
+                "--not",
+                &ac2_pre_tip,
+            ]);
+            let mut expected: Vec<&str> = expected_text
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .collect();
+            expected.sort_unstable();
+            expected.dedup();
+            eprintln!(
+                "FIX13_AC2_DELTA fetched={} expected={} ids={newly:?}",
+                newly.len(),
+                expected.len()
+            );
+            assert_eq!(
+                newly, expected,
+                "FIX13_AC2 the incremental fetch must transfer exactly the missing objects"
+            );
+
             let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
             let request_body = format!(
                 "{}{}{}",
