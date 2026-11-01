@@ -156,13 +156,16 @@ impl GitDbStorage {
             .filter(import_refs::Column::RepoId.eq(repo_id))
             .filter(import_refs::Column::RefName.eq(ref_name))
             .one(self.get_connection())
-            .await
-            .unwrap()
-            .unwrap();
+            .await?
+            .ok_or_else(|| {
+                MegaError::NotFound(format!(
+                    "import ref {ref_name} not found for repo {repo_id}"
+                ))
+            })?;
         let mut ref_data: import_refs::ActiveModel = ref_data.into();
         ref_data.ref_git_id = Set(new_id.to_string());
         ref_data.updated_at = Set(chrono::Utc::now().naive_utc());
-        ref_data.update(self.get_connection()).await.unwrap();
+        ref_data.update(self.get_connection()).await?;
         Ok(())
     }
 
@@ -652,8 +655,7 @@ impl GitDbStorage {
         let stream = git_commit::Entity::find()
             .filter(git_commit::Column::RepoId.eq(repo_id))
             .stream(self.get_connection())
-            .await
-            .unwrap();
+            .await?;
         Ok(stream)
     }
 
@@ -676,8 +678,7 @@ impl GitDbStorage {
         Ok(git_tree::Entity::find()
             .filter(git_tree::Column::RepoId.eq(repo_id))
             .stream(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_trees_by_hashes(
@@ -712,8 +713,7 @@ impl GitDbStorage {
         Ok(git_blob::Entity::find()
             .filter(git_blob::Column::RepoId.eq(repo_id))
             .stream(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_blobs_by_hashes(
