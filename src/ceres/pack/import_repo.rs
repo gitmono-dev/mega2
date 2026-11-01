@@ -26,7 +26,7 @@ use git_internal::{
     },
 };
 use sea_orm::{DatabaseTransaction, TransactionTrait};
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
@@ -64,7 +64,6 @@ use crate::{
                 CLEANUP_RESUME_BATCH, GitDbStorage, SWEEP_STATEMENT_BUDGET, SweepCounts,
             },
         },
-        utils::converter::FromGitModel,
     },
 };
 #[rustfmt::skip]
@@ -217,20 +216,29 @@ impl RepoHandler for ImportRepo {
 
     async fn full_pack(&self, _: Vec<String>) -> Result<ReceiverStream<Vec<u8>>, GitError> {
         let pack_config = &self.storage.config().pack;
-        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
-        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-
         let storage = self.storage.git_db_storage();
         let git_service = self.storage.git_service.clone();
-        let total = storage.get_obj_count_by_repo_id(self.repo.repo_id).await;
-        let encoder =
-            PackEncoder::new_with_hash_kind(self.object_hash_kind()?, total, 0, stream_tx);
+        let kind = self.object_hash_kind()?;
+        let repo_id = self.repo.repo_id;
+
+        // Materialize the exact object list first: the encoder is sized from this
+        // count, so a row that cannot be converted must fail the request instead
+        // of silently shortening the pack (which the client reports as early EOF).
+        let entries = collect_objects(repo_id, git_service, storage, kind)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let total = entries.len();
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new_with_hash_kind(kind, total, 0, stream_tx);
         encoder.encode_async(entry_rx).await?;
 
-        let repo_id = self.repo.repo_id;
         tokio::spawn(async move {
-            if let Err(e) = process_objects(repo_id, git_service, storage, entry_tx).await {
-                tracing::error!(?e, "process_blobs failed");
+            for entry in entries {
+                if entry_tx.send(entry).await.is_err() {
+                    break;
+                }
             }
         });
 
@@ -253,7 +261,7 @@ impl RepoHandler for ImportRepo {
         let mut want_commits: Vec<Commit> = storage
             .get_commits_by_hashes(self.repo.repo_id, &want_clone)
             .await
-            .unwrap()
+            .map_err(|e| GitError::CustomError(e.to_string()))?
             .into_iter()
             .map(|model| {
                 crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
@@ -268,13 +276,18 @@ impl RepoHandler for ImportRepo {
                 let p_commit_id = p_commit_id.to_string();
 
                 if !have.contains(&p_commit_id) && !want_clone.contains(&p_commit_id) {
+                    let parent_model = storage
+                        .get_commit_by_hash(self.repo.repo_id, &p_commit_id)
+                        .await
+                        .map_err(|e| GitError::CustomError(e.to_string()))?
+                        .ok_or_else(|| {
+                            GitError::CustomError(format!(
+                                "import parent commit {p_commit_id} not found"
+                            ))
+                        })?;
                     let parent: Commit =
                         crate::jupiter::utils::converter::commit_from_git_model_with_kind(
-                            storage
-                                .get_commit_by_hash(self.repo.repo_id, &p_commit_id)
-                                .await
-                                .unwrap()
-                                .unwrap(),
+                            parent_model,
                             kind,
                         )
                         .map_err(|e| GitError::CustomError(e.to_string()))?;
@@ -289,7 +302,7 @@ impl RepoHandler for ImportRepo {
         let want_trees: HashMap<ObjectHash, Tree> = storage
             .get_trees_by_hashes(self.repo.repo_id, want_tree_ids)
             .await
-            .unwrap()
+            .map_err(|e| GitError::CustomError(e.to_string()))?
             .into_iter()
             .map(|m| {
                 Ok((
@@ -306,14 +319,14 @@ impl RepoHandler for ImportRepo {
         let have_commits = storage
             .get_commits_by_hashes(self.repo.repo_id, &have)
             .await
-            .unwrap();
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
         let have_trees = storage
             .get_trees_by_hashes(
                 self.repo.repo_id,
                 have_commits.iter().map(|x| x.tree.clone()).collect(),
             )
             .await
-            .unwrap();
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
         // traverse to get exist_objs
         let kind = self.object_hash_kind()?;
         for have_tree in have_trees {
@@ -331,7 +344,15 @@ impl RepoHandler for ImportRepo {
                 continue;
             }
             self.traverse_for_count(
-                want_trees.get(&c.tree_id).unwrap().clone(),
+                want_trees
+                    .get(&c.tree_id)
+                    .ok_or_else(|| {
+                        GitError::CustomError(format!(
+                            "import tree {} missing from the want set",
+                            c.tree_id
+                        ))
+                    })?
+                    .clone(),
                 &exist_objs,
                 &mut counted_obj,
                 &obj_num,
@@ -356,7 +377,15 @@ impl RepoHandler for ImportRepo {
         for c in want_commits {
             if exist_objs.insert(c.tree_id.to_string()) {
                 self.traverse(
-                    want_trees.get(&c.tree_id).unwrap().clone(),
+                    want_trees
+                        .get(&c.tree_id)
+                        .ok_or_else(|| {
+                            GitError::CustomError(format!(
+                                "import tree {} missing from the want set",
+                                c.tree_id
+                            ))
+                        })?
+                        .clone(),
                     &mut exist_objs,
                     Some(&entry_tx),
                 )
@@ -381,7 +410,7 @@ impl RepoHandler for ImportRepo {
             .git_db_storage()
             .get_trees_by_hashes(self.repo.repo_id, hashes)
             .await
-            .unwrap()
+            .map_err(|e| GitError::CustomError(e.to_string()))?
             .into_iter()
             .map(|model| {
                 crate::jupiter::utils::converter::tree_from_git_model_with_kind(
@@ -498,7 +527,7 @@ impl RepoHandler for ImportRepo {
         storage
             .default_branch_exist(self.repo.repo_id)
             .await
-            .unwrap()
+            .unwrap_or(false)
     }
 
     async fn traverses_tree_and_update_filepath(&self) -> Result<(), MegaError> {
@@ -1648,25 +1677,30 @@ fn attach_refusal(payload: &AttachPayload, id: i64, message: &str) -> MegaError 
     ))
 }
 
-async fn process_objects(
+async fn collect_objects(
     repo_id: i64,
     git_service: GitService,
     storage: GitDbStorage,
-    entry_tx: Sender<MetaAttached<Entry, EntryMeta>>,
-) -> Result<(), MegaError> {
+    kind: HashKind,
+) -> Result<Vec<MetaAttached<Entry, EntryMeta>>, MegaError> {
+    let mut entries: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
     let mut commit_stream = storage.get_commits_by_repo_id(repo_id).await?;
 
     while let Some(model) = commit_stream.next().await {
         match model {
             Ok(m) => {
-                let c: Commit = Commit::from_git_model(m);
+                let c: Commit =
+                    crate::jupiter::utils::converter::commit_from_git_model_with_kind(m, kind)?;
                 let entry = MetaAttached {
                     inner: c.into(),
                     meta: EntryMeta::new(),
                 };
-                entry_tx.send(entry).await.expect("send error");
+                entries.push(entry);
             }
-            Err(err) => eprintln!("Error: {err:?}"),
+            Err(err) => {
+                tracing::error!(?err, "import commit stream failed");
+                return Err(MegaError::Other(format!("import commit stream: {err}")));
+            }
         }
     }
     tracing::info!("send commits end");
@@ -1675,14 +1709,18 @@ async fn process_objects(
     while let Some(model) = tree_stream.next().await {
         match model {
             Ok(m) => {
-                let t: Tree = Tree::from_git_model(m);
+                let t: Tree =
+                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(m, kind)?;
                 let entry = MetaAttached {
                     inner: t.into(),
                     meta: EntryMeta::new(),
                 };
-                entry_tx.send(entry).await.expect("send error");
+                entries.push(entry);
             }
-            Err(err) => eprintln!("Error: {err:?}"),
+            Err(err) => {
+                tracing::error!(?err, "import tree stream failed");
+                return Err(MegaError::Other(format!("import tree stream: {err}")));
+            }
         }
     }
     tracing::info!("send trees end");
@@ -1692,49 +1730,48 @@ async fn process_objects(
     while let Some(model) = bid_stream.next().await {
         match model {
             Ok(m) => bids.push(m.blob_id),
-            Err(err) => eprintln!("Error: {err:?}"),
+            Err(err) => {
+                tracing::error!(?err, "import blob stream failed");
+                return Err(MegaError::Other(format!("import blob stream: {err}")));
+            }
         }
     }
 
-    let entry_tx = entry_tx.clone();
-    git_service
-        .get_objects_stream(bids)
-        .try_for_each_concurrent(16, |(_, stream, _)| {
-            let sender_clone = entry_tx.clone();
-            async move {
-                let data = stream
-                    .try_fold(Vec::new(), |mut acc, bytes| async move {
-                        acc.extend_from_slice(&bytes);
-                        Ok(acc)
-                    })
-                    .await?;
-                let blob = Blob::from_content_bytes(data);
-                sender_clone
-                    .send(MetaAttached {
-                        inner: blob.into(),
-                        meta: EntryMeta::default(),
-                    })
-                    .await
-                    .expect("send error");
-
-                Ok(())
-            }
-        })
-        .await?;
+    // Blobs are collected sequentially: the whole object list has to exist before
+    // the encoder is sized, and a hashing failure must abort the request.
+    let mut blobs = git_service.get_objects_stream(bids);
+    while let Some(item) = blobs.next().await {
+        let (_, stream, _) = item?;
+        let data = stream
+            .try_fold(Vec::new(), |mut acc, bytes| async move {
+                acc.extend_from_slice(&bytes);
+                Ok(acc)
+            })
+            .await?;
+        // Rehashing with the thread-local kind would give the emitted object a
+        // different id than the pack was sized for.
+        let blob = Blob::from_content_bytes_with_kind(kind, data)
+            .map_err(|e| MegaError::Other(e.to_string()))?;
+        entries.push(MetaAttached {
+            inner: blob.into(),
+            meta: EntryMeta::default(),
+        });
+    }
 
     tracing::info!("send blobs end");
 
     let tags = storage.get_tags_by_repo_id(repo_id).await?;
     for m in tags.into_iter() {
-        let c: Tag = Tag::from_git_model(m);
+        let c: Tag = crate::jupiter::utils::converter::tag_from_git_model_with_kind(m, kind)
+            .map_err(|e| MegaError::Other(e.to_string()))?;
         let entry = MetaAttached {
             inner: c.into(),
             meta: EntryMeta::new(),
         };
-        entry_tx.send(entry).await.expect("send error");
+        entries.push(entry);
     }
     tracing::info!("sending all object end...");
-    Ok(())
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -1798,6 +1835,78 @@ mod tests {
             assert_eq!(tree.id.kind(), kind);
             assert_eq!(get_hash_kind(), HashKind::Sha1, "FIX17_AC7 tls unchanged");
         }
+    }
+
+    #[test]
+    fn import_hash_tree_conversion_recomputes_the_canonical_digest() {
+        use git_internal::{
+            hash::{HashKind, ObjectHash},
+            internal::object::types::ObjectType,
+        };
+
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let (row, _) = tree_row(kind, "lib");
+            let body = row.sub_trees.clone();
+            let tree =
+                crate::jupiter::utils::converter::tree_from_git_model_with_kind(row.clone(), kind)
+                    .expect("kind-explicit tree conversion");
+            // The converted id must be the configured algorithm's digest of the
+            // canonical body, not merely the id the fixture stored.
+            let independent =
+                ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Tree, &body)
+                    .expect("independent tree digest");
+            assert_eq!(tree.id, independent, "FIX17_AC1_RECOMPUTE {kind:?}");
+        }
+    }
+
+    #[test]
+    fn import_hash_invalid_commit_and_tag_metadata_are_rejected() {
+        use git_internal::hash::HashKind;
+
+        // A SHA-1 width commit id cannot parse as SHA-256.
+        let commit_row = crate::callisto::git_commit::Model {
+            id: 0,
+            repo_id: 0,
+            commit_id: "0".repeat(40),
+            tree: "0".repeat(64),
+            parents_id: serde_json::json!([]),
+            author: Some("author a <a@example.invalid> 1 +0000".into()),
+            committer: Some("committer c <c@example.invalid> 1 +0000".into()),
+            content: Some("msg".into()),
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        };
+        assert!(
+            crate::jupiter::utils::converter::commit_from_git_model_with_kind(
+                commit_row,
+                HashKind::Sha256
+            )
+            .is_err(),
+            "FIX17_AC2 commit metadata must be rejected"
+        );
+
+        let tag_row = crate::callisto::git_tag::Model {
+            id: 0,
+            repo_id: 0,
+            tag_id: "0".repeat(40),
+            object_id: "0".repeat(64),
+            object_type: "commit".into(),
+            tag_name: "v1".into(),
+            tagger: "tagger t <t@example.invalid> 1 +0000".into(),
+            message: "tag".into(),
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        };
+        assert!(
+            crate::jupiter::utils::converter::tag_from_git_model_with_kind(
+                tag_row,
+                HashKind::Sha256
+            )
+            .is_err(),
+            "FIX17_AC2 tag metadata must be rejected"
+        );
     }
 
     #[test]

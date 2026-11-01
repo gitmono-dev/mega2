@@ -138,6 +138,30 @@ pub fn tree_from_git_model_with_kind(
         .map_err(|_| MegaError::Other("invalid import tree body".into()))
 }
 
+/// Kind-explicit counterpart of `FromGitModel for Tag`.
+pub fn tag_from_git_model_with_kind(
+    model: git_tag::Model,
+    kind: HashKind,
+) -> Result<Tag, MegaError> {
+    let parse = |value: &str, what: &str| {
+        ObjectHash::from_hex_for_kind(kind, value).map_err(|_| {
+            MegaError::Other(format!(
+                "invalid import {what} identity: {value} is not {kind:?}"
+            ))
+        })
+    };
+    Ok(Tag {
+        id: parse(&model.tag_id, "tag")?,
+        object_hash: parse(&model.object_id, "tag target")?,
+        object_type: ObjectType::from_string(&model.object_type)
+            .map_err(|_| MegaError::Other("invalid import tag target type".into()))?,
+        tag_name: model.tag_name,
+        tagger: Signature::from_data(model.tagger.into_bytes())
+            .map_err(|_| MegaError::Other("invalid import tagger".into()))?,
+        message: model.message,
+    })
+}
+
 pub fn commit_from_mega_model_with_kind(
     model: mega_commit::Model,
     kind: HashKind,

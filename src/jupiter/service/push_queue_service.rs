@@ -2159,7 +2159,6 @@ impl PushQueueService {
             contract::policy::notify::{
                 after_b3_commit_authz, authz_blob_id, insert_b3_authz_outbox_if_builds,
             },
-            jupiter::utils::converter::FromMegaModel,
         };
 
         let payload: AttachPayload = serde_json::from_value(row.payload.clone())
@@ -2507,17 +2506,32 @@ impl PushQueueService {
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
         insert_b3_authz_outbox_if_builds(&ctx.storage, &txn, row.id).await?;
         txn.commit().await?;
+        // These two reads happen after `Done`, so a thread-local parse here
+        // would panic outside the transaction and silently skip the authz
+        // notification and the following indexing.
         let blob_ids = async {
-            let old_blob_id = self
-                .mono_storage
-                .get_tree_by_hash(&expected_tree)
-                .await?
-                .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
-            let new_blob_id = self
+            let old_blob_id = match self.mono_storage.get_tree_by_hash(&expected_tree).await? {
+                Some(model) => authz_blob_id(
+                    &crate::jupiter::utils::converter::tree_from_mega_model_with_kind(
+                        model,
+                        attach_kind,
+                    )?,
+                ),
+                None => None,
+            };
+            let new_blob_id = match self
                 .mono_storage
                 .get_tree_by_hash(&new_root_tree_hash)
                 .await?
-                .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+            {
+                Some(model) => authz_blob_id(
+                    &crate::jupiter::utils::converter::tree_from_mega_model_with_kind(
+                        model,
+                        attach_kind,
+                    )?,
+                ),
+                None => None,
+            };
             Ok::<_, MegaError>((old_blob_id, new_blob_id))
         }
         .await;
