@@ -596,9 +596,39 @@ impl ImportRepo {
         // clone also carried unrelated branches and every stored tag - including
         // tags whose refs no longer exist. Objects that were asked for by id
         // (tags, trees, blobs) stay, because a client fetches tags by object id.
+        // A client may fetch a tag or a tree directly. Keeping only the wanted
+        // object would leave its targets missing, so peel tags to their commits
+        // and remember tree wants for traversal below.
+        let all_tag_models = storage
+            .get_tags_by_repo_id(repo_id)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let mut tags_by_id: HashMap<String, Tag> = HashMap::new();
+        for model in all_tag_models {
+            let tag: Tag =
+                crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+            tags_by_id.insert(tag.id.to_string(), tag);
+        }
+        let mut effective_wants: Vec<String> = Vec::new();
+        let mut tree_wants: Vec<String> = Vec::new();
+        for id in &want {
+            let mut cursor = Some(id.clone());
+            while let Some(current) = cursor.take() {
+                if let Some(tag) = tags_by_id.get(&current) {
+                    effective_wants.push(tag.object_hash.to_string());
+                    cursor = tags_by_id
+                        .get(&tag.object_hash.to_string())
+                        .map(|inner| inner.id.to_string());
+                } else {
+                    effective_wants.push(current);
+                }
+            }
+        }
+        effective_wants.dedup();
         let mut keep: HashSet<String> = want.iter().cloned().collect();
         let want_commits: Vec<Commit> = storage
-            .get_commits_by_hashes(repo_id, &want)
+            .get_commits_by_hashes(repo_id, &effective_wants)
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?
             .into_iter()
@@ -659,31 +689,68 @@ impl ImportRepo {
             }
             keep.extend(counted);
         }
+        let tree_candidates: Vec<String> = effective_wants
+            .iter()
+            .filter(|id| !keep.contains(*id))
+            .cloned()
+            .collect();
+        for tree_id in &tree_candidates {
+            if let Some(model) = storage
+                .get_tree_by_hash(repo_id, tree_id)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?
+            {
+                let tree =
+                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
+                let obj_num = AtomicUsize::new(0);
+                let mut counted: HashSet<String> = HashSet::new();
+                let nothing: HashSet<String> = HashSet::new();
+                keep.insert(tree_id.clone());
+                self.traverse_for_count(tree, &nothing, &mut counted, &obj_num)
+                    .await?;
+                keep.extend(counted);
+            } else {
+                tree_wants.push(tree_id.clone());
+            }
+        }
+        let _ = &tree_wants;
         if include_tag {
             // Attach only tags the authorised ref view still advertises and whose
             // target survived the closure filter: a tag behind a deleted ref is
             // absent from `tag_ids`, so it cannot ride along, and a tag can never
             // pull in objects the request did not ask for.
-            let authorised_tag_ids = self
-                .code_refs()
+            // Authorised tag refs come from the refs table itself: `code_refs()`
+            // reports an empty tag set when the repository has no legacy traces
+            // ref, which would silently disable include-tag everywhere else.
+            let refs = storage
+                .get_ref(repo_id)
                 .await
-                .map_err(|e| GitError::CustomError(e.to_string()))?
-                .tag_ids;
-            if !authorised_tag_ids.is_empty() {
-                let tags = storage
-                    .get_tags_by_repo_id(repo_id)
-                    .await
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
-                for model in tags {
-                    let tag: Tag =
-                        crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
-                            .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    let tag_id = tag.id.to_string();
-                    if authorised_tag_ids.contains(&tag_id)
-                        && keep.contains(&tag.object_hash.to_string())
-                    {
-                        keep.insert(tag_id);
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            let authorised_tag_ids: HashSet<String> = refs
+                .iter()
+                .filter(|row| row.ref_name.starts_with("refs/tags/"))
+                .map(|row| row.ref_git_id.clone())
+                .collect();
+            // Fixed point, so `outer -> inner -> commit` attaches regardless of
+            // the order the rows come back in.
+            loop {
+                let mut progressed = false;
+                let candidates: Vec<(String, Tag)> = tags_by_id
+                    .iter()
+                    .map(|(id, tag)| (id.clone(), tag.clone()))
+                    .collect();
+                for (tag_id, tag) in &candidates {
+                    if keep.contains(tag_id) || !authorised_tag_ids.contains(tag_id) {
+                        continue;
                     }
+                    if keep.contains(&tag.object_hash.to_string()) {
+                        keep.insert(tag_id.clone());
+                        progressed = true;
+                    }
+                }
+                if !progressed {
+                    break;
                 }
             }
         }
