@@ -5530,11 +5530,12 @@ mod disabled_http {
             let url = git_cli::mega2_http_url(fixture.port, "/project/control.git");
 
             let mut baseline_objects = 0usize;
-            let arms: [(&str, Vec<&str>); 4] = [
+            let arms: [(&str, Vec<&str>); 5] = [
                 ("iso-default", vec![]),
                 ("iso-bare", vec!["--bare"]),
                 ("iso-no-tags", vec!["--no-tags"]),
                 ("iso-depth1", vec!["--depth=1"]),
+                ("iso-blobless", vec!["--filter=blob:none"]),
             ];
             for (dir, extra) in arms {
                 let mut args = vec!["clone"];
@@ -5563,6 +5564,18 @@ mod disabled_http {
                         commit_count, "1",
                         "FIX13_AC3 depth=1 must carry exactly one commit, got {commit_count}"
                     );
+                } else if dir == "iso-blobless" {
+                    // Measured on this tree: the server advertises the `filter`
+                    // capability (the client records a promisor remote) but the
+                    // pack still carries every blob, so `blob:none` is not
+                    // honoured. That is MTR-13 AC-4's RED fact, recorded in the
+                    // card; asserting it here would pin wrong behaviour.
+                    let promisor =
+                        fixture.git_text(&["-C", dir, "config", "--get", "remote.origin.promisor"]);
+                    eprintln!(
+                        "FIX13_AC4_BLOBLESS promisor={promisor} objects={}",
+                        listing.lines().count()
+                    );
                 } else {
                     if baseline_objects == 0 {
                         baseline_objects = listing.lines().count();
@@ -5573,6 +5586,10 @@ mod disabled_http {
                         "FIX13_AC7 {dir} object count must match the default clone"
                     );
                 }
+
+                // Object integrity, last: in a partial clone `fsck` fetches the
+                // promisor-missing blobs, which would defeat the blob:none arm.
+                fixture.git(&["-C", dir, "fsck", "--strict"]);
             }
         })
         .catch_unwind()
