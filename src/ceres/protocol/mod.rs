@@ -109,6 +109,9 @@ pub enum Capability {
     DeepenSince,
     DeepenNot,
     Shallow,
+    /// Requested by the client on the first `want` line; only handlers that
+    /// report `supports_include_tag()` may advertise it.
+    IncludeTag,
 }
 
 impl FromStr for Capability {
@@ -127,6 +130,7 @@ impl FromStr for Capability {
             "deepen-since" => Ok(Capability::DeepenSince),
             "deepen-not" => Ok(Capability::DeepenNot),
             "shallow" => Ok(Capability::Shallow),
+            "include-tag" => Ok(Capability::IncludeTag),
             _ => Err(()),
         }
     }

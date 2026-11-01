@@ -196,6 +196,9 @@ pub(crate) struct V2FetchRequest {
     deepen_relative: bool,
     done: bool,
     filter_spec: Option<String>,
+    /// `include-tag` argument of the fetch command; honoured only by handlers
+    /// that report support.
+    include_tag: bool,
 }
 
 pub async fn handle_v2_fetch(
@@ -209,6 +212,7 @@ pub async fn handle_v2_fetch(
     let mut deepen_relative = false;
     let mut done = false;
     let mut filter_spec: Option<String> = None;
+    let mut include_tag = false;
 
     loop {
         let pkt_line = try_read_pkt_line(request)?;
@@ -248,6 +252,8 @@ pub async fn handle_v2_fetch(
                     ));
                 } else if let Some(spec) = line.strip_prefix("filter ") {
                     filter_spec = Some(spec.to_owned());
+                } else if line == "include-tag" {
+                    include_tag = true;
                 }
             }
             PktLine::ResponseEnd => break,
@@ -264,6 +270,7 @@ pub async fn handle_v2_fetch(
         deepen_relative,
         done,
         filter_spec,
+        include_tag,
     };
     handle_v2_fetch_with_handler(session, request, repo_handler).await
 }
@@ -280,8 +287,13 @@ pub(crate) async fn handle_v2_fetch_with_handler(
         deepen_relative,
         done,
         filter_spec,
+        include_tag,
     } = request;
 
+    // Clients may send `include-tag` regardless of advertisement; it only takes
+    // effect on handlers that can act on it. Rejecting it would break otherwise
+    // valid clones, so an unsupported argument is ignored.
+    let include_tag = include_tag && repo_handler.supports_include_tag();
     // Capability honesty: `fetch=shallow filter` is advertised globally, but
     // only Monorepo genuinely implements shallow/filter pack generation.
     // ImportRepo's default trait implementations silently fall back to
@@ -369,13 +381,13 @@ pub(crate) async fn handle_v2_fetch_with_handler(
             stream
         } else {
             repo_handler
-                .full_pack(want)
+                .full_pack_with_options(want, include_tag)
                 .await
                 .map_err(|e| ProtocolError::InvalidInput(format!("pack generation failed: {e}")))?
         }
     } else {
         repo_handler
-            .incremental_pack(want.clone(), have)
+            .incremental_pack_with_options(want.clone(), have, include_tag)
             .await
             .map_err(|e| ProtocolError::InvalidInput(format!("pack generation failed: {e}")))?
     };
@@ -542,6 +554,7 @@ mod tests {
             deepen_relative: false,
             done,
             filter_spec: filter_spec.map(str::to_owned),
+            include_tag: false,
         }
     }
 

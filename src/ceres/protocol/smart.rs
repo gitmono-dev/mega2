@@ -121,7 +121,13 @@ impl SmartSession {
         } else {
             "HEAD"
         };
-        let cap_list = advertised_capabilities(service_type, self.hash_kind);
+        let mut cap_list = advertised_capabilities(service_type, self.hash_kind);
+        // `include-tag` is only advertised by handlers that can actually attach
+        // authorised tag chains; advertising it globally would promise behaviour
+        // the other handlers do not provide.
+        if matches!(service_type, ServiceType::UploadPack) && repo_handler.supports_include_tag() {
+            cap_list.push_str(" include-tag");
+        }
         let pkt_line = format!("{head_hash}{SP}{name}{NUL}{cap_list}{LF}");
         let mut ref_list = vec![pkt_line];
 
@@ -313,6 +319,10 @@ impl SmartSession {
         }
 
         let have = repo_handler.authorize_fetch(&want, &have).await?;
+        // The client asks for tag chains on the first `want` line; it only takes
+        // effect when this handler advertised and can honour it.
+        let include_tag = self.capabilities.contains(&Capability::IncludeTag)
+            && repo_handler.supports_include_tag();
 
         if have.is_empty() {
             repo_handler.prepare_pack(&want, &have).await?;
@@ -340,9 +350,12 @@ impl SmartSession {
                     return Ok((ReceiverStream::new(rx), protocol_buf));
                 }
             } else {
-                pack_data = repo_handler.full_pack(want).await.map_err(|e| {
-                    ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
-                })?;
+                pack_data = repo_handler
+                    .full_pack_with_options(want, include_tag)
+                    .await
+                    .map_err(|e| {
+                        ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
+                    })?;
             }
             add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
         } else {
@@ -357,7 +370,7 @@ impl SmartSession {
                     }
                 }
                 pack_data = repo_handler
-                    .incremental_pack(want.clone(), have)
+                    .incremental_pack_with_options(want.clone(), have, include_tag)
                     .await
                     .map_err(|e| {
                         ProtocolError::InvalidInput(format!("pack generation failed: {e}"))

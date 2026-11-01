@@ -329,6 +329,33 @@ pub trait RepoHandler: Send + Sync + 'static {
         self.incremental_pack(want, have).await
     }
 
+    /// Whether this handler can attach authorised tag chains when the client
+    /// asks for `include-tag`. Handlers that return `false` must not advertise
+    /// the capability, matching the `shallow`/`filter` honesty rule.
+    fn supports_include_tag(&self) -> bool {
+        false
+    }
+
+    /// Full pack with the request's `include-tag` option. The default ignores
+    /// the option, so every handler that does not opt in stays byte-identical.
+    async fn full_pack_with_options(
+        &self,
+        want: Vec<String>,
+        _include_tag: bool,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        self.full_pack(want).await
+    }
+
+    /// Incremental pack with the request's `include-tag` option.
+    async fn incremental_pack_with_options(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        _include_tag: bool,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        self.incremental_pack(want, have).await
+    }
+
     /// Whether this handler implements `filter` partial clone (e.g. `blob:none`).
     /// The default trait `filtered_pack` silently falls back to
     /// `incremental_pack`, so the default here is `false`. Handlers that
