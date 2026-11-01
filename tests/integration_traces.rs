@@ -3322,6 +3322,57 @@ mod disabled_http {
     type SshSession = russh::client::Handle<SshClient>;
 
     impl Fixture {
+        /// Issue a v0 upload-pack request whose want line carries `include-tag` and
+        /// which asks for no tag ref, then return the deframed pack bytes. Stock git
+        /// cannot isolate this: `--no-tags` suppresses the capability and
+        /// `--tags`/clone fetch the tag ref anyway.
+        async fn crafted_include_tag_pack(&self, path: &str, want_oid: &str) -> Vec<u8> {
+            let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+            let body = format!(
+                "{}{}{}",
+                pkt(&format!("want {want_oid} include-tag side-band-64k\n")),
+                "0000",
+                pkt("done\n")
+            );
+            let response = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    self.port,
+                    &format!("{path}/git-upload-pack"),
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .body(body)
+                .send()
+                .await
+                .expect("crafted upload-pack request");
+            let status = response.status();
+            let bytes = response.bytes().await.expect("crafted response body");
+            let mut pack: Vec<u8> = Vec::new();
+            let mut offset = 0usize;
+            while offset + 4 <= bytes.len() {
+                let header = String::from_utf8_lossy(&bytes[offset..offset + 4]).to_string();
+                offset += 4;
+                if header == "0000" {
+                    continue;
+                }
+                let Ok(len) = usize::from_str_radix(&header, 16) else {
+                    break;
+                };
+                if len == 0 || offset + len - 4 > bytes.len() {
+                    break;
+                }
+                let payload = &bytes[offset..offset + len - 4];
+                offset += len - 4;
+                if payload.first() == Some(&1) {
+                    pack.extend_from_slice(&payload[1..]);
+                }
+            }
+            assert!(
+                pack.starts_with(b"PACK"),
+                "crafted include-tag request returned no pack (status {status})"
+            );
+            pack
+        }
+
         async fn seed_ssh(&self, db: &sea_orm::DatabaseConnection) {
             let key = self.shared.path().join("ssh/client_ed25519");
             git_cli::generate_client_ed25519(&key);
@@ -6055,6 +6106,80 @@ mod disabled_http {
             assert!(
                 !outside_in_pack,
                 "FIX13_INCLUDE_TAG a tag outside the closure must not be attached"
+            );
+
+            // AC-5: a nested chain (`outer -> inner -> commit`) must attach both
+            // tag objects, and must do so regardless of row order.
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "fix13-inner",
+                "-m",
+                "FIX13 inner",
+                &want_oid,
+            ]);
+            let inner_oid =
+                fixture.git_text(&["-C", "import-depth-work", "rev-parse", "fix13-inner"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "fix13-outer",
+                "-m",
+                "FIX13 outer",
+                &inner_oid,
+            ]);
+            let outer_oid =
+                fixture.git_text(&["-C", "import-depth-work", "rev-parse", "fix13-outer"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "refs/tags/fix13-inner",
+                "refs/tags/fix13-outer",
+            ]);
+            // The previous pushes left a side branch and an outside tag; fetch the
+            // same commit again so the comparison is only about the chain.
+            let nested_pack = fixture
+                .crafted_include_tag_pack("/third-party/mtr94-control.git", &want_oid)
+                .await;
+            std::fs::write(fixture.shared.path().join("nested-tag.pack"), &nested_pack)
+                .expect("write nested pack");
+            fixture.git(&["-C", "iso-include-tag", "index-pack", "../nested-tag.pack"]);
+            let nested_listing = fixture.git_text(&[
+                "-C",
+                "iso-include-tag",
+                "verify-pack",
+                "-v",
+                "../nested-tag.idx",
+            ]);
+            let has = |oid: &str| {
+                nested_listing
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(oid))
+            };
+            let inner_in = has(&inner_oid);
+            let outer_in = has(&outer_oid);
+            eprintln!("FIX13_INCLUDE_TAG_NESTED inner={inner_in} outer={outer_in}");
+            assert!(
+                inner_in && outer_in,
+                "FIX13_INCLUDE_TAG a nested chain must attach both tag objects"
             );
 
             // VER-1's SSH dimension: SSH is a separate service process, so the
