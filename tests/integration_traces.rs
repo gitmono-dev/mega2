@@ -6049,7 +6049,16 @@ mod disabled_http {
             std::fs::write(fixture.shared.path().join("include-tag-probe.pack"), &pack)
                 .expect("write probe pack");
 
-            fixture.git(&["init", "-q", "iso-include-tag"]);
+            // The probe repository must use the same object format as the server,
+            // otherwise `index-pack` rejects the captured pack for a hash mismatch.
+            let probe_format =
+                std::env::var("MEGA_TRACES_TEST_FORMAT").unwrap_or_else(|_| "sha1".to_owned());
+            fixture.git(&[
+                "init",
+                "-q",
+                &format!("--object-format={probe_format}"),
+                "iso-include-tag",
+            ]);
             fixture.git(&[
                 "-C",
                 "iso-include-tag",
@@ -6074,7 +6083,10 @@ mod disabled_http {
                 .lines()
                 .filter_map(|line| {
                     let first = line.split_whitespace().next()?;
-                    if first.len() == 40 && first.chars().all(|c| c.is_ascii_hexdigit()) {
+                    // SHA-1 ids are 40 hex chars, SHA-256 ones are 64.
+                    if matches!(first.len(), 40 | 64)
+                        && first.chars().all(|c| c.is_ascii_hexdigit())
+                    {
                         Some(first)
                     } else {
                         None
