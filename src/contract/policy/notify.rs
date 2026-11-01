@@ -29,9 +29,8 @@ use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 use crate::{
     common::errors::MegaError,
     contract::policy::{enforcement::Enforcement, entitystore::MEGA_CEDAR_PATH},
-    jupiter::{
-        storage::{Storage, base_storage::StorageConnector, push_queue_storage::PushQueueStorage},
-        utils::converter::FromMegaModel,
+    jupiter::storage::{
+        Storage, base_storage::StorageConnector, push_queue_storage::PushQueueStorage,
     },
 };
 
@@ -409,7 +408,14 @@ async fn load_latest_authz_json(storage: &Storage) -> Result<Option<String>, Meg
     else {
         return Ok(None);
     };
-    let Some(blob_id) = authz_blob_id(&Tree::from_mega_model(tree)) else {
+    // Parse the root tree under the repository's configured object algorithm.
+    // `Tree::from_mega_model` derives every entry id from the thread-local
+    // HashKind, so on a SHA-256 monorepo it either panics or yields wrong ids.
+    let tree = crate::jupiter::utils::converter::tree_from_mega_model_with_kind(
+        tree,
+        storage.config().monorepo.object_hash_kind()?,
+    )?;
+    let Some(blob_id) = authz_blob_id(&tree) else {
         return Ok(None);
     };
     let content = match storage.git_service.get_object_as_bytes(&blob_id).await {
