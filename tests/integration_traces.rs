@@ -5515,6 +5515,43 @@ mod disabled_http {
         }
     }
 
+    /// AC-7/AC-8 at the code-path view: a clone of a code path must carry only
+    /// code objects, never trace-plane entries. The root view is a separate
+    /// question because the legacy `%2etraces` alias is served there by design.
+    pub async fn code_clone_isolation_code_path_objects() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = Fixture::new(&db).await;
+        let result = AssertUnwindSafe(async {
+            fixture.prepare(&db).await;
+            let url = git_cli::mega2_http_url(fixture.port, "/project/control.git");
+            fixture.git(&["clone", &url, "iso-code"]);
+            let listing = fixture.git_text(&["-C", "iso-code", "rev-list", "--objects", "--all"]);
+            let traced: Vec<&str> = listing
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().contains("traces"))
+                .collect();
+            assert!(
+                traced.is_empty(),
+                "FIX13_AC7/8 a code-path clone must not contain trace entries: {traced:?}"
+            );
+            assert!(
+                !listing.is_empty(),
+                "FIX13_AC7 the code-path clone must contain the seeded code objects"
+            );
+        })
+        .catch_unwind()
+        .await;
+        fixture.stop();
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            let logs = fixture.temp.keep();
+            eprintln!("code-clone isolation fixture logs: {}", logs.display());
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close isolation pool");
+    }
+
     pub async fn http_git_roundtrip(kind: &str) {
         let (guard, db) = traces_db::TracesDb::migrated().await;
         let mut fixture = Fixture::new(&db).await;
@@ -6252,6 +6289,11 @@ async fn http_git_sha1_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_git_sha256_roundtrip() {
     disabled_http::http_git_roundtrip("sha256").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_clone_isolation_code_path_objects() {
+    disabled_http::code_clone_isolation_code_path_objects().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
