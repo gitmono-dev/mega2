@@ -5755,13 +5755,13 @@ mod disabled_http {
                 "origin",
                 &import_url,
             ]);
+            // No `--no-tags` here: that flag suppresses the capability itself.
             fixture.git(&[
                 "-C",
                 "iso-include-tag",
                 "-c",
                 "protocol.version=0",
                 "fetch",
-                "--no-tags",
                 "origin",
                 &want_oid,
             ]);
