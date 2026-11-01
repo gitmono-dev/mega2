@@ -5747,6 +5747,64 @@ mod disabled_http {
                 no_tags.is_empty(),
                 "FIX13_AC5 a --no-tags clone must not acquire the tag: {no_tags:?}"
             );
+
+            // AC-7's missing control: the same fixed code must clone to the same
+            // object set whether the traces plane is on or off. The fixture ends
+            // `prepare` with traces disabled, so restart it enabled, prove the
+            // trace plane really is being served, and re-clone the code path.
+            // The paired "off" clone is taken here, because the repository has
+            // moved on since the arms ran (the AC-2 arm pushed a commit).
+            fixture.git(&["clone", &url, "iso-traces-off-pair"]);
+            let off_objects = fixture
+                .git_text(&["-C", "iso-traces-off-pair", "rev-list", "--objects", "--all"])
+                .lines()
+                .count();
+            fixture.start(true, "trunk", "/third-party").await;
+            let enabled_code_url = git_cli::mega2_http_url(fixture.port, "/project/control.git");
+            let enabled_trace_url = git_cli::mega2_http_url(
+                fixture.port,
+                &format!("/.traces/by-scope/{}.git", fixture.scope),
+            );
+            // The comparison is only meaningful if the traces plane is actually
+            // being served in this mode. An anonymous ls-remote against the trace
+            // locator is rejected with an authentication failure (401) when the
+            // plane is live; a disabled plane would not answer that locator at
+            // all. Assert the distinction rather than assuming the flag worked.
+            let probe = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &["-c", "protocol.version=0", "ls-remote", &enabled_trace_url],
+            );
+            let probe_stderr = String::from_utf8_lossy(&probe.stderr);
+            eprintln!(
+                "FIX13_AC7_TRACES_ON status={} stderr={:?}",
+                probe.status,
+                probe_stderr.lines().next().unwrap_or("")
+            );
+            assert!(
+                !probe.status.success() && probe_stderr.to_ascii_lowercase().contains("auth"),
+                "FIX13_AC7 the trace locator must require authentication while the plane is on: {probe_stderr}"
+            );
+
+            fixture.git(&["clone", &enabled_code_url, "iso-traces-on"]);
+            let enabled_listing =
+                fixture.git_text(&["-C", "iso-traces-on", "rev-list", "--objects", "--all"]);
+            let enabled_traced: Vec<&str> = enabled_listing
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().contains("traces"))
+                .collect();
+            assert!(
+                enabled_traced.is_empty(),
+                "FIX13_AC8 the enabled-plane code clone must not contain trace entries: {enabled_traced:?}"
+            );
+            eprintln!(
+                "FIX13_AC7_COUNTS off={off_objects} on={}",
+                enabled_listing.lines().count()
+            );
+            assert_eq!(
+                enabled_listing.lines().count(),
+                off_objects,
+                "FIX13_AC7 turning the traces plane on must not change the code clone"
+            );
         })
         .catch_unwind()
         .await;
