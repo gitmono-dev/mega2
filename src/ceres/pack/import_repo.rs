@@ -630,6 +630,9 @@ impl ImportRepo {
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
         // Same binding as the full path: a ref that changes between authorization
         // and pack construction must not be served from the stale view.
+        self.authorize_fetch(&want, &have)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
         let refs_before = Self::ref_fingerprint(&self.storage.git_db_storage(), self.repo.repo_id)
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
@@ -988,6 +991,13 @@ impl ImportRepo {
         // compare it with a fingerprint taken before any pack read, so a ref that
         // disappeared or was retargeted in between cannot be served from a stale
         // authorization: the request fails and the client retries instead.
+        // Re-authorise at planner entry: the protocol authorised before calling
+        // into the pack path, and a ref may have changed in between. Building from
+        // a freshly authorised view closes that window; the fingerprint below then
+        // bounds changes that happen during planning itself.
+        self.authorize_fetch(&want, &[])
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
         let refs_before = Self::ref_fingerprint(&storage, repo_id)
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
