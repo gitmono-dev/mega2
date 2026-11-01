@@ -5867,6 +5867,29 @@ mod disabled_http {
                 "FIX13_AC3 the parent commit must not be present in a depth=1 clone"
             );
 
+            // AC-3 also forbids the parent's objects, not just the commit. The
+            // parent tree differs from the child's (the child added a file), so it
+            // must be absent from the shallow clone as well.
+            let parent_tree = fixture.git_text(&[
+                "-C",
+                "import-depth-work",
+                "rev-parse",
+                &format!("{parent_oid}^{{tree}}"),
+            ]);
+            let parent_tree_present = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &["-C", "iso-import-depth1", "cat-file", "-e", &parent_tree],
+            )
+            .status
+            .success();
+            eprintln!(
+                "FIX13_AC3_PARENT_TREE present={parent_tree_present} tree={parent_tree}"
+            );
+            assert!(
+                !parent_tree_present,
+                "FIX13_AC3 the parent tree must not be present in a depth=1 clone"
+            );
+
             // include-tag positive case on the ImportRepo path. Stock git cannot
             // distinguish it: `--no-tags` suppresses the capability and `--tags`
             // fetches the tag ref anyway. So the request is crafted by hand - a
