@@ -668,3 +668,98 @@ async fn native_push_hash_sha256_matrix() {
     create_scenario("sha256", "/project/fix16-sha256-create").await;
     matrix_scenario("sha256", "/project/fix16-sha256").await;
 }
+
+/// AC-4's client-visible surface on a native Monorepo path: over v2 a
+/// `blob:none` clone must withhold every blob while still resolving the tip,
+/// and the objects it holds must be exactly the full closure minus the blobs.
+async fn filtered_clone_scenario(object_format: &'static str, path: &str) {
+    let (_database, db) = traces_db::TracesDb::migrated().await;
+    let mut fixture = Fixture::new(&db, object_format).await;
+    fixture.start().await;
+    fixture.clone("/project", "root");
+    fixture.clone("/", "monorepo");
+    fixture.provision(path).await;
+    fixture.clone(path, "work");
+    fixture.clone(path, "full");
+
+    let tip = fixture.commit("work", "filter.txt", "FIX13 filter\n", "feat: FIX13 filter");
+    let push = fixture.push("work", path, "HEAD:refs/heads/main", false);
+    assert!(
+        push.status.success(),
+        "FIX13_AC4 seeding push failed for {object_format}: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+
+    let url = git_cli::mega2_http_url(fixture.port, &format!("{path}.git"));
+    fixture.git(&[
+        "-c",
+        "protocol.version=2",
+        "clone",
+        "--no-checkout",
+        "--filter=blob:none",
+        &url,
+        "blobless",
+    ]);
+
+    assert_eq!(
+        fixture.git_text(&["-C", "blobless", "rev-parse", "HEAD"]),
+        tip,
+        "FIX13_AC4 a filtered clone must still resolve the landed tip"
+    );
+
+    let blobless_types = fixture.git_text(&[
+        "-C",
+        "blobless",
+        "cat-file",
+        "--batch-check=%(objecttype)",
+        "--batch-all-objects",
+    ]);
+    let blobless_blobs = blobless_types
+        .lines()
+        .filter(|kind| kind.trim() == "blob")
+        .count();
+    // Count only objects that are actually present: `rev-list --objects` keeps
+    // listing blob OIDs read out of trees even when those blobs were filtered
+    // away, so it overcounts in a partial clone.
+    let blobless_total = blobless_types.lines().count();
+
+    // The full clone is the reference closure for this path.
+    fixture.git(&["-C", "full", "fetch", "--no-tags", "origin"]);
+    fixture.git(&["-C", "full", "reset", "--hard", "origin/main"]);
+    let full_types = fixture.git_text(&[
+        "-C",
+        "full",
+        "cat-file",
+        "--batch-check=%(objecttype)",
+        "--batch-all-objects",
+    ]);
+    let full_total = full_types.lines().count();
+    let full_blobs = full_types
+        .lines()
+        .filter(|kind| kind.trim() == "blob")
+        .count();
+
+    println!(
+        "FIX13_AC4_FILTERED {object_format} blobless_blobs={blobless_blobs} blobless={blobless_total} full={full_total} full_blobs={full_blobs}"
+    );
+    assert_eq!(
+        blobless_blobs, 0,
+        "FIX13_AC4 a v2 blob:none clone must hold no blob objects"
+    );
+    assert_eq!(
+        blobless_total,
+        full_total - full_blobs,
+        "FIX13_AC4 the filtered closure must be the full closure minus the blobs"
+    );
+
+    println!("FIX13_AC4_FILTERED {object_format} {path} PASS");
+    fixture.stop();
+    db.close().await.expect("close fixture pool");
+}
+
+/// AC-4 over the native Monorepo path, both configured algorithms.
+#[tokio::test]
+async fn native_filtered_clone_withholds_blobs() {
+    filtered_clone_scenario("sha1", "/project/fix13-sha1-filter").await;
+    filtered_clone_scenario("sha256", "/project/fix13-sha256-filter").await;
+}
