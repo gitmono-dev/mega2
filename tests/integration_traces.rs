@@ -5530,12 +5530,15 @@ mod disabled_http {
             let url = git_cli::mega2_http_url(fixture.port, "/project/control.git");
 
             let mut baseline_objects = 0usize;
-            let arms: [(&str, Vec<&str>); 5] = [
+            let arms: [(&str, Vec<&str>); 6] = [
                 ("iso-default", vec![]),
                 ("iso-bare", vec!["--bare"]),
                 ("iso-no-tags", vec!["--no-tags"]),
                 ("iso-depth1", vec!["--depth=1"]),
                 ("iso-blobless", vec!["--filter=blob:none"]),
+                // Same view over the v2 wire protocol: the object set and the
+                // absence of trace entries must not depend on it.
+                ("iso-v2", vec!["-c", "protocol.version=2"]),
             ];
             for (dir, extra) in arms.iter() {
                 let mut args = vec!["clone"];
