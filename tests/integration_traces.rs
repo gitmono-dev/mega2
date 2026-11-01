@@ -6006,6 +6006,48 @@ mod disabled_http {
             let tag_in_pack = listing
                 .lines()
                 .any(|line| line.split_whitespace().next() == Some(tag_oid.as_str()));
+
+            // AC-1 exactness: the pack must carry the requested closure plus the
+            // attached tag, and nothing else. The closure is computed from the
+            // server-side work tree with the same object walk a client would see.
+            let pack_ids: Vec<&str> = listing
+                .lines()
+                .filter_map(|line| {
+                    let first = line.split_whitespace().next()?;
+                    if first.len() == 40 && first.chars().all(|c| c.is_ascii_hexdigit()) {
+                        Some(first)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let closure_text = fixture.git_text(&[
+                "-C",
+                "import-depth-work",
+                "rev-list",
+                "--objects",
+                &want_oid,
+            ]);
+            let closure_ids: Vec<&str> = closure_text
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .collect();
+            eprintln!(
+                "FIX13_AC1_EXACT pack={} closure={}",
+                pack_ids.len(),
+                closure_ids.len()
+            );
+            assert_eq!(
+                pack_ids.len(),
+                closure_ids.len() + 1,
+                "FIX13_AC1 the pack must be the closure plus exactly the attached tag"
+            );
+            for oid in &closure_ids {
+                assert!(
+                    pack_ids.contains(oid),
+                    "FIX13_AC1 the pack is missing closure object {oid}"
+                );
+            }
             eprintln!(
                 "FIX13_INCLUDE_TAG status={status} pack_bytes={} tag_in_pack={tag_in_pack}",
                 pack.len()
