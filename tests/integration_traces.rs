@@ -5746,6 +5746,18 @@ mod disabled_http {
                 &import_url,
                 "refs/tags/fix13-include-tag",
             ]);
+            // A tag pushed to an import path must be persisted, otherwise no
+            // fetch-side feature could ever deliver it.
+            let tag_rows = scalar(
+                &db,
+                "SELECT count(*)::text AS value FROM git_tag WHERE tag_name = 'fix13-include-tag'",
+            )
+            .await;
+            eprintln!("FIX13_INCLUDE_TAG db_rows={tag_rows}");
+            assert_eq!(
+                tag_rows, "1",
+                "FIX13_INCLUDE_TAG the pushed tag must be persisted in git_tag"
+            );
             fixture.git(&["init", "-q", "iso-include-tag"]);
             fixture.git(&[
                 "-C",
