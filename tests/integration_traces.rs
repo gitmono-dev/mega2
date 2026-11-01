@@ -2254,7 +2254,10 @@ mod disabled_http {
                     self.temp.path().join("objects"),
                 )
                 .env("MEGA_MONOREPO__PUSH_POLICY", policy)
-                .env("MEGA_MONOREPO__OBJECT_FORMAT", "sha1")
+                .env(
+                    "MEGA_MONOREPO__OBJECT_FORMAT",
+                    std::env::var("MEGA_TRACES_TEST_FORMAT").unwrap_or_else(|_| "sha1".to_owned()),
+                )
                 .env("MEGA_MONOREPO__IMPORT_DIR", import_dir)
                 .env(
                     "MEGA_MONOREPO__ROOT_DIRS",
