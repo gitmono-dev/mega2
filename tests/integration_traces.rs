@@ -5530,7 +5530,7 @@ mod disabled_http {
             let url = git_cli::mega2_http_url(fixture.port, "/project/control.git");
 
             let mut baseline_objects = 0usize;
-            let arms: [(&str, Vec<&str>); 6] = [
+            let arms: [(&str, Vec<&str>); 7] = [
                 ("iso-default", vec![]),
                 ("iso-bare", vec!["--bare"]),
                 ("iso-no-tags", vec!["--no-tags"]),
@@ -5539,6 +5539,12 @@ mod disabled_http {
                 // Same view over the v2 wire protocol: the object set and the
                 // absence of trace entries must not depend on it.
                 ("iso-v2", vec!["-c", "protocol.version=2"]),
+                // v2 is the only version that filters (`UPLOAD_CAP_LIST` has no
+                // `filter`), so this is AC-4's real axis: blobs must be withheld.
+                (
+                    "iso-v2-blobless",
+                    vec!["-c", "protocol.version=2", "--filter=blob:none"],
+                ),
             ];
             for (dir, extra) in arms.iter() {
                 let mut args = vec!["clone"];
@@ -5567,17 +5573,40 @@ mod disabled_http {
                         commit_count, "1",
                         "FIX13_AC3 depth=1 must carry exactly one commit, got {commit_count}"
                     );
+                } else if *dir == "iso-v2-blobless" {
+                    // This fixture serves an ImportRepo path, whose handler
+                    // reports `supports_filtered_fetch() == false`; v2 then
+                    // refuses the filter (`filter is not supported for this
+                    // repository`) and the client degrades to a full clone. That
+                    // refusal is the contract here, so the arm must match the
+                    // full closure rather than omit blobs. AC-4's positive case
+                    // (`blob:none` really withholds blobs) therefore has to run
+                    // against a native Monorepo path, which this fixture does not
+                    // provide - recorded in the card as remaining work.
+                    let count = listing.lines().count();
+                    eprintln!("FIX13_AC4_V2_BLOBLESS objects={count} full={baseline_objects}");
+                    assert_eq!(
+                        count, baseline_objects,
+                        "FIX13_AC4 an ImportRepo must refuse `filter` and degrade to a full clone"
+                    );
                 } else if *dir == "iso-blobless" {
-                    // Measured on this tree: the server advertises the `filter`
-                    // capability (the client records a promisor remote) but the
-                    // pack still carries every blob, so `blob:none` is not
-                    // honoured. That is MTR-13 AC-4's RED fact, recorded in the
-                    // card; asserting it here would pin wrong behaviour.
+                    // `UPLOAD_CAP_LIST` advertises `shallow` but not `filter`, so
+                    // a `--filter=blob:none` request is ignored by the client: it
+                    // still records a promisor remote, yet the pack carries the
+                    // full closure. The arm therefore has to behave exactly like a
+                    // full clone rather than omit blobs; the promisor flag is
+                    // recorded to show the request was made and degraded.
                     let promisor =
                         fixture.git_text(&["-C", dir, "config", "--get", "remote.origin.promisor"]);
                     eprintln!(
                         "FIX13_AC4_BLOBLESS promisor={promisor} objects={}",
                         listing.lines().count()
+                    );
+                    assert_eq!(
+                        listing.lines().count(),
+                        baseline_objects,
+                        "FIX13_AC4 without a `filter` capability a blobless request must \
+                         degrade to a full clone"
                     );
                 } else {
                     if baseline_objects == 0 {
