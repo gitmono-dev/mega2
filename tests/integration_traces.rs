@@ -5930,6 +5930,133 @@ mod disabled_http {
                 "FIX13_INCLUDE_TAG a tag whose ref was deleted must not be attached"
             );
 
+            // AC-5: a tag pointing at a commit outside the requested closure must
+            // not be attached, even though its ref exists and is authorised.
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "checkout",
+                "-q",
+                "-b",
+                "fix13-side",
+            ]);
+            std::fs::write(
+                fixture.shared.path().join("import-depth-work/side.txt"),
+                b"FIX13 side\n",
+            )
+            .expect("write side file");
+            fixture.git(&["-C", "import-depth-work", "add", "side.txt"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "FIX13 side commit",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "HEAD:refs/heads/fix13-side",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "fix13-outside",
+                "-m",
+                "FIX13 outside closure",
+            ]);
+            let outside_oid =
+                fixture.git_text(&["-C", "import-depth-work", "rev-parse", "fix13-outside"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "refs/tags/fix13-outside",
+            ]);
+
+            let outside_bytes = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    "/third-party/mtr94-control.git/git-upload-pack",
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .body({
+                    let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+                    format!(
+                        "{}{}{}",
+                        pkt(&format!("want {want_oid} include-tag side-band-64k\n")),
+                        "0000",
+                        pkt("done\n")
+                    )
+                })
+                .send()
+                .await
+                .expect("outside-closure probe");
+            let outside_raw = outside_bytes.bytes().await.expect("outside probe body");
+            let mut pack: Vec<u8> = Vec::new();
+            let mut offset = 0usize;
+            while offset + 4 <= outside_raw.len() {
+                let header = String::from_utf8_lossy(&outside_raw[offset..offset + 4]).to_string();
+                offset += 4;
+                if header == "0000" {
+                    continue;
+                }
+                let Ok(len) = usize::from_str_radix(&header, 16) else {
+                    break;
+                };
+                if len == 0 || offset + len - 4 > outside_raw.len() {
+                    break;
+                }
+                let payload = &outside_raw[offset..offset + len - 4];
+                offset += len - 4;
+                if payload.first() == Some(&1) {
+                    pack.extend_from_slice(&payload[1..]);
+                }
+            }
+            std::fs::write(
+                fixture.shared.path().join("outside-tag-probe.pack"),
+                &pack,
+            )
+            .expect("write outside-tag pack");
+            fixture.git(&[
+                "-C",
+                "iso-include-tag",
+                "index-pack",
+                "../outside-tag-probe.pack",
+            ]);
+            let outside_listing = fixture.git_text(&[
+                "-C",
+                "iso-include-tag",
+                "verify-pack",
+                "-v",
+                "../outside-tag-probe.idx",
+            ]);
+            let outside_in_pack = outside_listing
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(outside_oid.as_str()));
+            eprintln!("FIX13_INCLUDE_TAG_OUTSIDE tag_in_pack={outside_in_pack}");
+            assert!(
+                !outside_in_pack,
+                "FIX13_INCLUDE_TAG a tag outside the closure must not be attached"
+            );
+
             // VER-1's SSH dimension: SSH is a separate service process, so the
             // fixture is switched over only after every HTTP arm has run.
             fixture.start_ssh(true, false).await;
