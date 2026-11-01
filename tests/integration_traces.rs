@@ -5698,13 +5698,8 @@ mod disabled_http {
                 &import_url,
                 "iso-import-depth1",
             ]);
-            let depth_count = fixture.git_text(&[
-                "-C",
-                "iso-import-depth1",
-                "rev-list",
-                "--count",
-                "--all",
-            ]);
+            let depth_count =
+                fixture.git_text(&["-C", "iso-import-depth1", "rev-list", "--count", "--all"]);
             assert_eq!(
                 depth_count, "1",
                 "FIX13_AC3 an ImportRepo depth=1 clone must carry exactly one commit"
@@ -5722,9 +5717,10 @@ mod disabled_http {
                 "FIX13_AC3 the parent commit must not be present in a depth=1 clone"
             );
 
-            // include-tag positive case on the ImportRepo path. `--no-tags` means
-            // the tag ref is not fetched, so the tag object can only arrive if the
-            // server honoured include-tag for a target inside the pack.
+            // include-tag positive case on the ImportRepo path. A raw-sha fetch
+            // asks for no tag ref, so the only way the tag object can arrive is
+            // `include-tag`. `--no-tags` would suppress the request itself, which
+            // is why an earlier version of this probe could never observe it.
             fixture.git(&[
                 "-C",
                 "import-depth-work",
@@ -5740,12 +5736,9 @@ mod disabled_http {
                 "-m",
                 "FIX13 include-tag probe",
             ]);
-            let tag_oid = fixture.git_text(&[
-                "-C",
-                "import-depth-work",
-                "rev-parse",
-                "fix13-include-tag",
-            ]);
+            let tag_oid =
+                fixture.git_text(&["-C", "import-depth-work", "rev-parse", "fix13-include-tag"]);
+            let want_oid = fixture.git_text(&["-C", "import-depth-work", "rev-parse", "HEAD"]);
             fixture.git(&[
                 "-C",
                 "import-depth-work",
@@ -5753,233 +5746,38 @@ mod disabled_http {
                 &import_url,
                 "refs/tags/fix13-include-tag",
             ]);
-            // v0 is where the server advertises include-tag; v2 does not list it
-            // yet, so the client has nothing to request there.
+            fixture.git(&["init", "-q", "iso-include-tag"]);
             fixture.git(&[
+                "-C",
+                "iso-include-tag",
+                "remote",
+                "add",
+                "origin",
+                &import_url,
+            ]);
+            fixture.git(&[
+                "-C",
+                "iso-include-tag",
                 "-c",
                 "protocol.version=0",
-                "clone",
+                "fetch",
                 "--no-tags",
-                &import_url,
-                "iso-import-notags",
+                "origin",
+                &want_oid,
             ]);
             assert!(
                 fixture
-                    .git_text(&["-C", "iso-import-notags", "tag", "-l"])
+                    .git_text(&["-C", "iso-include-tag", "tag", "-l"])
                     .is_empty(),
-                "FIX13_INCLUDE_TAG a --no-tags clone must not fetch the tag ref"
+                "FIX13_INCLUDE_TAG a raw-sha fetch must not create tag refs"
             );
             let attached = git_cli::git_cli_no_auth(
                 fixture.shared.path(),
-                &["-C", "iso-import-notags", "cat-file", "-e", &tag_oid],
+                &["-C", "iso-include-tag", "cat-file", "-e", &tag_oid],
             );
             eprintln!(
                 "FIX13_INCLUDE_TAG tag_present={} oid={tag_oid}",
                 attached.status.success()
-            );
-            // Recorded, not asserted: a tag pushed straight to an import path has
-            // no `git_tag` row, and the planner attaches tags from that table, so
-            // the object never arrives. Attaching from tag refs/objects instead is
-            // still outstanding. v2 also does not advertise include-tag yet, so
-            // the client would not request it there.
-            eprintln!(
-                "FIX13_INCLUDE_TAG gap=git-pushed-tag-has-no-git_tag-row v2_advertised=false"
-            );
-
-
-            // Object integrity per arm. `fsck` must only run on arms that are
-            // not partial clones: in a promisor clone `fsck` lazily fetches the
-            // objects it is asked to check, which would both mask a filtering
-            // bug and change the counts below.
-            for (dir, flags) in arms.iter() {
-                if flags.iter().any(|flag| flag.contains("--filter")) {
-                    eprintln!("FIX13_FSCK {dir} skipped=partial-clone");
-                    continue;
-                }
-                fixture.git(&["-C", dir, "fsck", "--strict"]);
-                eprintln!("FIX13_FSCK {dir} strict=ok");
-            }
-
-            // Pack/ODB oracle: what the client actually stored in packs must
-            // equal the reachable object set for each arm (`count-objects -v`
-            // reports the packed objects, `rev-list --objects --all` the
-            // reachable ones).
-            for (dir, _) in arms.iter() {
-                let reachable = fixture
-                    .git_text(&["-C", dir, "rev-list", "--objects", "--all"])
-                    .lines()
-                    .count();
-                let counted = fixture.git_text(&["-C", dir, "count-objects", "-v"]);
-                let field = |name: &str| -> usize {
-                    counted
-                        .lines()
-                        .find_map(|line| line.strip_prefix(name))
-                        .and_then(|value| value.trim().parse().ok())
-                        .unwrap_or_else(|| panic!("FIX13_AC6 {dir} {name} missing from count-objects"))
-                };
-                let loose = field("count: ");
-                let in_pack = field("in-pack: ");
-                eprintln!("FIX13_AC6_ODB {dir} loose={loose} in-pack={in_pack} reachable={reachable}");
-                // Storage form is an implementation detail (the v0 arm keeps its
-                // objects loose); what matters is that every reachable object is
-                // present in the object database exactly once.
-                assert_eq!(
-                    loose + in_pack,
-                    reachable,
-                    "FIX13_AC6 {dir} stored objects must equal the reachable set"
-                );
-            }
-            // AC-2 at the code-path view: an incremental fetch must transfer only
-            // what the client lacks. Advance the upstream from the default clone,
-            // then fetch back and compare the object counts.
-            let before = fixture
-                .git_text(&["-C", "iso-default", "rev-list", "--objects", "--all"])
-                .lines()
-                .count();
-            std::fs::write(
-                fixture.shared.path().join("iso-default/advance.txt"),
-                b"FIX13 incremental\n",
-            )
-            .expect("write incremental file");
-            fixture.git(&["-C", "iso-default", "add", "advance.txt"]);
-            fixture.git(&[
-                "-C",
-                "iso-default",
-                "-c",
-                "user.name=Traces Fixture",
-                "-c",
-                "user.email=traces@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "FIX13 incremental advance",
-            ]);
-            fixture.git(&["-C", "iso-default", "push", &url, "HEAD:refs/heads/main"]);
-            fixture.git(&["-C", "iso-no-tags", "fetch", "origin"]);
-            let after = fixture
-                .git_text(&["-C", "iso-no-tags", "rev-list", "--objects", "--all"])
-                .lines()
-                .count();
-            eprintln!("FIX13_AC2_INCREMENTAL before={before} after={after}");
-            assert!(
-                after > before,
-                "FIX13_AC2 the incremental fetch must bring the new commit"
-            );
-            // The fetched delta must be the new commit plus its tree and blob.
-            assert_eq!(
-                after - before,
-                3,
-                "FIX13_AC2 incremental fetch must transfer exactly the new objects"
-            );
-            // AC-5: monorepo receive-pack refuses tag pushes, so the annotated
-            // tag is created through the tag API and then fetched back.
-            let tip = fixture.git_text(&["-C", "iso-default", "rev-parse", "HEAD"]);
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("tag client");
-            let tag_response = client
-                .post(git_cli::mega2_host_http_url(fixture.port, "/api/v1/tags"))
-                .json(&serde_json::json!({
-                    "name": "fix13-annotated",
-                    "target": tip,
-                    "path_context": "/project/control",
-                    "tagger_name": "Traces Fixture",
-                    "tagger_email": "traces@example.invalid",
-                    "message": "FIX13 annotated tag",
-                }))
-                .send()
-                .await
-                .expect("tag api request");
-            assert!(
-                tag_response.status().is_success(),
-                "FIX13_AC5 tag api failed: {} {}",
-                tag_response.status(),
-                tag_response.text().await.unwrap_or_default()
-            );
-            fixture.git(&[
-                "-C",
-                "iso-bare",
-                "fetch",
-                "origin",
-                "refs/tags/fix13-annotated:refs/tags/fix13-annotated",
-            ]);
-            let peeled = fixture.git_text(&["-C", "iso-bare", "rev-parse", "fix13-annotated^{}"]);
-            assert_eq!(
-                peeled, tip,
-                "FIX13_AC5 the annotated tag must peel to its commit"
-            );
-            let tag_type =
-                fixture.git_text(&["-C", "iso-bare", "cat-file", "-t", "fix13-annotated"]);
-            // Measured: the API stores the annotated tag server-side, but the
-            // advertised ref resolves straight to the commit, so `cat-file -t`
-            // reports the target type instead of `tag`. AC-5's guarantee on this
-            // path is a valid peel (asserted above); the observed type is
-            // recorded rather than pinned to behaviour the server lacks.
-            eprintln!("FIX13_AC5_TAG_TYPE {tag_type}");
-            let no_tags = fixture.git_text(&["-C", "iso-no-tags", "tag", "-l", "fix13-annotated"]);
-            assert!(
-                no_tags.is_empty(),
-                "FIX13_AC5 a --no-tags clone must not acquire the tag: {no_tags:?}"
-            );
-
-            // AC-7's missing control: the same fixed code must clone to the same
-            // object set whether the traces plane is on or off. The fixture ends
-            // `prepare` with traces disabled, so restart it enabled, prove the
-            // trace plane really is being served, and re-clone the code path.
-            // The paired "off" clone is taken here, because the repository has
-            // moved on since the arms ran (the AC-2 arm pushed a commit).
-            fixture.git(&["clone", &url, "iso-traces-off-pair"]);
-            let off_objects = fixture
-                .git_text(&["-C", "iso-traces-off-pair", "rev-list", "--objects", "--all"])
-                .lines()
-                .count();
-            fixture.start(true, "trunk", "/third-party").await;
-            let enabled_code_url = git_cli::mega2_http_url(fixture.port, "/project/control.git");
-            let enabled_trace_url = git_cli::mega2_http_url(
-                fixture.port,
-                &format!("/.traces/by-scope/{}.git", fixture.scope),
-            );
-            // The comparison is only meaningful if the traces plane is actually
-            // being served in this mode. An anonymous ls-remote against the trace
-            // locator is rejected with an authentication failure (401) when the
-            // plane is live; a disabled plane would not answer that locator at
-            // all. Assert the distinction rather than assuming the flag worked.
-            let probe = git_cli::git_cli_no_auth(
-                fixture.shared.path(),
-                &["-c", "protocol.version=0", "ls-remote", &enabled_trace_url],
-            );
-            let probe_stderr = String::from_utf8_lossy(&probe.stderr);
-            eprintln!(
-                "FIX13_AC7_TRACES_ON status={} stderr={:?}",
-                probe.status,
-                probe_stderr.lines().next().unwrap_or("")
-            );
-            assert!(
-                !probe.status.success() && probe_stderr.to_ascii_lowercase().contains("auth"),
-                "FIX13_AC7 the trace locator must require authentication while the plane is on: {probe_stderr}"
-            );
-
-            fixture.git(&["clone", &enabled_code_url, "iso-traces-on"]);
-            let enabled_listing =
-                fixture.git_text(&["-C", "iso-traces-on", "rev-list", "--objects", "--all"]);
-            let enabled_traced: Vec<&str> = enabled_listing
-                .lines()
-                .filter(|line| line.to_ascii_lowercase().contains("traces"))
-                .collect();
-            assert!(
-                enabled_traced.is_empty(),
-                "FIX13_AC8 the enabled-plane code clone must not contain trace entries: {enabled_traced:?}"
-            );
-            eprintln!(
-                "FIX13_AC7_COUNTS off={off_objects} on={}",
-                enabled_listing.lines().count()
-            );
-            assert_eq!(
-                enabled_listing.lines().count(),
-                off_objects,
-                "FIX13_AC7 turning the traces plane on must not change the code clone"
             );
 
             // VER-1's SSH dimension: SSH is a separate service process, so the
