@@ -211,8 +211,8 @@ impl RepoHandler for ImportRepo {
         Ok(())
     }
 
-    /// `include-tag` support: tags are attached only when the authorised ref
-    /// view still advertises them and their target is inside the closure.
+    /// Depth-limited fetch is implemented below, so the capability may be
+    /// advertised.
     fn supports_shallow_fetch(&self) -> bool {
         true
     }
