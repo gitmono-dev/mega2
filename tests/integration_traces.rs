@@ -5717,10 +5717,11 @@ mod disabled_http {
                 "FIX13_AC3 the parent commit must not be present in a depth=1 clone"
             );
 
-            // include-tag positive case on the ImportRepo path. A raw-sha fetch
-            // asks for no tag ref, so the only way the tag object can arrive is
-            // `include-tag`. `--no-tags` would suppress the request itself, which
-            // is why an earlier version of this probe could never observe it.
+            // include-tag positive case on the ImportRepo path. Stock git cannot
+            // distinguish it: `--no-tags` suppresses the capability and `--tags`
+            // fetches the tag ref anyway. So the request is crafted by hand - a
+            // want line carrying `include-tag`, no tag ref - and the returned pack
+            // is indexed to see whether the tag object is inside it.
             fixture.git(&[
                 "-C",
                 "import-depth-work",
@@ -5746,50 +5747,104 @@ mod disabled_http {
                 &import_url,
                 "refs/tags/fix13-include-tag",
             ]);
-            // A tag pushed to an import path must be persisted, otherwise no
-            // fetch-side feature could ever deliver it.
             let tag_rows = scalar(
                 &db,
                 "SELECT count(*)::text AS value FROM git_tag WHERE tag_name = 'fix13-include-tag'",
             )
             .await;
-            eprintln!("FIX13_INCLUDE_TAG db_rows={tag_rows}");
             assert_eq!(
                 tag_rows, "1",
                 "FIX13_INCLUDE_TAG the pushed tag must be persisted in git_tag"
             );
+
+            let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+            let request_body = format!(
+                "{}{}{}",
+                pkt(&format!("want {want_oid} include-tag side-band-64k\n")),
+                "0000",
+                pkt("done\n")
+            );
+            let post = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    "/third-party/mtr94-control.git/git-upload-pack",
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .body(request_body)
+                .send()
+                .await
+                .expect("include-tag probe request");
+            let status = post.status();
+            let bytes = post.bytes().await.expect("probe body");
+            // The pack arrives as side-band-64k packets: a 4-hex length, a status
+            // byte (1 = pack data, 2 = progress, 3 = error), then the payload.
+            let mut pack: Vec<u8> = Vec::new();
+            let mut offset = 0usize;
+            let mut error_line = None;
+            while offset + 4 <= bytes.len() {
+                let header = String::from_utf8_lossy(&bytes[offset..offset + 4]).to_string();
+                offset += 4;
+                if header == "0000" {
+                    continue;
+                }
+                let Ok(len) = usize::from_str_radix(&header, 16) else {
+                    break;
+                };
+                if len == 0 || offset + len - 4 > bytes.len() {
+                    break;
+                }
+                let payload = &bytes[offset..offset + len - 4];
+                offset += len - 4;
+                match payload.first() {
+                    Some(1) => pack.extend_from_slice(&payload[1..]),
+                    Some(3) => {
+                        error_line = Some(String::from_utf8_lossy(&payload[1..]).to_string());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let pack = if pack.starts_with(b"PACK") {
+                pack
+            } else {
+                let start = bytes
+                    .windows(4)
+                    .position(|window| window == b"PACK")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "FIX13_INCLUDE_TAG no pack in response (status {status}, {} bytes, error {error_line:?})",
+                            bytes.len()
+                        )
+                    });
+                bytes[start..].to_vec()
+            };
+            std::fs::write(fixture.shared.path().join("include-tag-probe.pack"), &pack)
+                .expect("write probe pack");
+
             fixture.git(&["init", "-q", "iso-include-tag"]);
             fixture.git(&[
                 "-C",
                 "iso-include-tag",
-                "remote",
-                "add",
-                "origin",
-                &import_url,
+                "index-pack",
+                "../include-tag-probe.pack",
             ]);
-            // No `--no-tags` here: that flag suppresses the capability itself.
-            fixture.git(&[
+            let listing = fixture.git_text(&[
                 "-C",
                 "iso-include-tag",
-                "-c",
-                "protocol.version=0",
-                "fetch",
-                "origin",
-                &want_oid,
+                "verify-pack",
+                "-v",
+                "../include-tag-probe.idx",
             ]);
-            assert!(
-                fixture
-                    .git_text(&["-C", "iso-include-tag", "tag", "-l"])
-                    .is_empty(),
-                "FIX13_INCLUDE_TAG a raw-sha fetch must not create tag refs"
-            );
-            let attached = git_cli::git_cli_no_auth(
-                fixture.shared.path(),
-                &["-C", "iso-include-tag", "cat-file", "-e", &tag_oid],
-            );
+            let tag_in_pack = listing
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(tag_oid.as_str()));
             eprintln!(
-                "FIX13_INCLUDE_TAG tag_present={} oid={tag_oid}",
-                attached.status.success()
+                "FIX13_INCLUDE_TAG status={status} pack_bytes={} tag_in_pack={tag_in_pack}",
+                pack.len()
+            );
+            assert!(
+                tag_in_pack,
+                "FIX13_INCLUDE_TAG the crafted include-tag request must carry the tag object"
             );
 
             // VER-1's SSH dimension: SSH is a separate service process, so the
