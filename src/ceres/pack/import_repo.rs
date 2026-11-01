@@ -1117,11 +1117,45 @@ impl ImportRepo {
                 .filter(|row| row.ref_name.starts_with("refs/tags/"))
                 .map(|row| row.ref_git_id.clone())
                 .collect();
+            // A tag pushed straight to a path has no `git_tag` row, so its object
+            // is loaded from the object store by the id its ref points at. Without
+            // this, `include-tag` could never deliver such a tag.
+            let mut known_tags: HashMap<String, Tag> = tags_by_id.clone();
+            for tag_id in &authorised_tag_ids {
+                if known_tags.contains_key(tag_id) || keep.contains(tag_id) || want.contains(tag_id)
+                {
+                    continue;
+                }
+                let mut stream = self
+                    .storage
+                    .git_service
+                    .get_objects_stream(vec![tag_id.clone()]);
+                if let Some(item) = stream.next().await {
+                    let (_, data_stream, _) =
+                        item.map_err(|e| GitError::CustomError(e.to_string()))?;
+                    let data = data_stream
+                        .try_fold(Vec::new(), |mut acc, bytes| async move {
+                            acc.extend_from_slice(&bytes);
+                            Ok(acc)
+                        })
+                        .await
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
+                    let hash = ObjectHash::from_hex_for_kind(kind, tag_id)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
+                    if let Ok(tag) =
+                        <Tag as git_internal::internal::object::ObjectTrait>::from_bytes(
+                            &data, hash,
+                        )
+                    {
+                        known_tags.insert(tag_id.clone(), tag);
+                    }
+                }
+            }
             // Fixed point, so `outer -> inner -> commit` attaches regardless of
             // the order the rows come back in.
             loop {
                 let mut progressed = false;
-                let candidates: Vec<(String, Tag)> = tags_by_id
+                let candidates: Vec<(String, Tag)> = known_tags
                     .iter()
                     .map(|(id, tag)| (id.clone(), tag.clone()))
                     .collect();
