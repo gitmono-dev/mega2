@@ -2625,7 +2625,10 @@ mod disabled_http {
             self.git(&[
                 "init",
                 "--initial-branch=main",
-                "--object-format=sha1",
+                &format!(
+                    "--object-format={}",
+                    std::env::var("MEGA_TRACES_TEST_FORMAT").unwrap_or_else(|_| "sha1".to_owned())
+                ),
                 "import",
             ]);
             fs::write(self.shared.path().join("import/sentinel.txt"), SENTINEL)

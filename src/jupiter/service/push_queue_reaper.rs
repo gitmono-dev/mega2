@@ -304,7 +304,7 @@ impl PushQueueReaper {
                                 id = row.id,
                                 "reaper I3: push missing main@path but tombstone exists"
                             );
-                        } else if row.old_id != ZERO_ID {
+                        } else if !crate::common::utils::is_protocol_zero_id(&row.old_id) {
                             tracing::warn!(
                                 id = row.id,
                                 "reaper I3: push missing main@path with non-ZERO old_id (no tombstone)"

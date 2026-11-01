@@ -1002,7 +1002,7 @@ impl PushQueueService {
             ));
         }
 
-        if req.is_delete || req.new_id == ZERO_ID {
+        if req.is_delete || is_protocol_zero_id(&req.new_id) {
             return Err(MegaError::Other(
                 "trunk push rejects delete commands; remove content via a parent-path commit"
                     .into(),
@@ -1040,7 +1040,7 @@ impl PushQueueService {
         &self,
         req: &EnqueueRequest,
     ) -> Result<(), MegaError> {
-        if req.kind != PushQueueKindEnum::Push || req.old_id != ZERO_ID {
+        if req.kind != PushQueueKindEnum::Push || !is_protocol_zero_id(&req.old_id) {
             return Ok(());
         }
         if self
@@ -2688,7 +2688,7 @@ impl PushQueueService {
                     )
                     .await;
             }
-            if row.old_id != ZERO_ID {
+            if !is_protocol_zero_id(&row.old_id) {
                 return self
                     .b3_fail_merge(
                         txn,
@@ -2708,7 +2708,7 @@ impl PushQueueService {
                     )
                     .await;
             }
-        } else if row.old_id == ZERO_ID {
+        } else if is_protocol_zero_id(&row.old_id) {
             return self
                 .b3_fail_merge(
                     txn,
