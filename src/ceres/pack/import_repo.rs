@@ -2988,6 +2988,57 @@ mod tests {
         assert_eq!(root_after.ref_tree_hash, root_before.ref_tree_hash);
     }
 
+    /// The ref fingerprint is what the planner compares before and after it reads.
+    /// It must ignore ordering, stay stable while refs do not move, and change on
+    /// any retarget, addition or deletion - otherwise the race guard could not
+    /// fire at all.
+    #[tokio::test]
+    async fn ref_fingerprint_tracks_every_ref_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, _commit, _create) =
+            seed_import_repo_with_main_tip(&storage, "/proj/fingerprint").await;
+        let repo_id = repo.repo_id;
+        let git_db = storage.git_db_storage();
+
+        let first = ImportRepo::ref_fingerprint(&git_db, repo_id)
+            .await
+            .expect("fingerprint");
+        let second = ImportRepo::ref_fingerprint(&git_db, repo_id)
+            .await
+            .expect("fingerprint");
+        assert_eq!(
+            first, second,
+            "an unchanged ref view must fingerprint equally"
+        );
+
+        let added = RefCommand::new(
+            ZERO_ID.to_string(),
+            "c".repeat(40),
+            "refs/heads/fingerprint-probe".to_owned(),
+        );
+        git_db
+            .save_ref(repo_id, added.into())
+            .await
+            .expect("add ref");
+        let after_add = ImportRepo::ref_fingerprint(&git_db, repo_id)
+            .await
+            .expect("fingerprint");
+        assert_ne!(first, after_add, "adding a ref must change the fingerprint");
+
+        git_db
+            .update_ref(repo_id, "refs/heads/fingerprint-probe", &"d".repeat(40))
+            .await
+            .expect("retarget ref");
+        let after_move = ImportRepo::ref_fingerprint(&git_db, repo_id)
+            .await
+            .expect("fingerprint");
+        assert_ne!(
+            after_add, after_move,
+            "retargeting a ref must change the fingerprint"
+        );
+    }
+
     /// Capacity boundary. `code_refs` only enforces the ref budget on the legacy
     /// view: without a legacy traces ref it returns the code refs directly, so an
     /// over-budget repository still serves. With the legacy ref present the view
