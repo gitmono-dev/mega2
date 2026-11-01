@@ -237,158 +237,17 @@ impl RepoHandler for ImportRepo {
         want: Vec<String>,
         have: Vec<String>,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        let mut want_clone = want.clone();
-        let kind = self.object_hash_kind()?;
-        let pack_config = &self.storage.config().pack;
-        let storage = self.storage.git_db_storage();
-        let obj_num = AtomicUsize::new(0);
+        self.incremental_pack_with_extra(want, have, false).await
+    }
 
-        let mut exist_objs = HashSet::new();
-
-        let mut want_commits: Vec<Commit> = storage
-            .get_commits_by_hashes(self.repo.repo_id, &want_clone)
+    async fn incremental_pack_with_options(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        include_tag: bool,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        self.incremental_pack_with_extra(want, have, include_tag)
             .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?
-            .into_iter()
-            .map(|model| {
-                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let mut traversal_list: Vec<Commit> = want_commits.clone();
-
-        // traverse commit's all parents to find the commit that client does not have
-        while let Some(temp) = traversal_list.pop() {
-            for p_commit_id in temp.parent_commit_ids {
-                let p_commit_id = p_commit_id.to_string();
-
-                if !have.contains(&p_commit_id) && !want_clone.contains(&p_commit_id) {
-                    let parent_model = storage
-                        .get_commit_by_hash(self.repo.repo_id, &p_commit_id)
-                        .await
-                        .map_err(|e| GitError::CustomError(e.to_string()))?
-                        .ok_or_else(|| {
-                            GitError::CustomError(format!(
-                                "import parent commit {p_commit_id} not found"
-                            ))
-                        })?;
-                    let parent: Commit =
-                        crate::jupiter::utils::converter::commit_from_git_model_with_kind(
-                            parent_model,
-                            kind,
-                        )
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    want_commits.push(parent.clone());
-                    want_clone.push(p_commit_id);
-                    traversal_list.push(parent);
-                }
-            }
-        }
-
-        let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
-        let want_trees: HashMap<ObjectHash, Tree> = storage
-            .get_trees_by_hashes(self.repo.repo_id, want_tree_ids)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?
-            .into_iter()
-            .map(|m| {
-                Ok((
-                    ObjectHash::from_hex_for_kind(kind, &m.tree_id)
-                        .map_err(|e| GitError::CustomError(e.to_string()))?,
-                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(m, kind)
-                        .map_err(|e| GitError::CustomError(e.to_string()))?,
-                ))
-            })
-            .collect::<Result<HashMap<_, _>, GitError>>()?;
-
-        obj_num.fetch_add(want_commits.len(), Ordering::SeqCst);
-
-        let have_commits = storage
-            .get_commits_by_hashes(self.repo.repo_id, &have)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let have_trees = storage
-            .get_trees_by_hashes(
-                self.repo.repo_id,
-                have_commits.iter().map(|x| x.tree.clone()).collect(),
-            )
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        // traverse to get exist_objs
-        let kind = self.object_hash_kind()?;
-        for have_tree in have_trees {
-            let have_tree =
-                crate::jupiter::utils::converter::tree_from_git_model_with_kind(have_tree, kind)
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
-            self.traverse(have_tree, &mut exist_objs, None).await?;
-        }
-
-        let mut counted_obj = HashSet::new();
-        let mut counted_roots = HashSet::new();
-        // traverse for get obj nums; shared commit trees counted once
-        for c in want_commits.clone() {
-            if !counted_roots.insert(c.tree_id.to_string()) {
-                continue;
-            }
-            self.traverse_for_count(
-                want_trees
-                    .get(&c.tree_id)
-                    .ok_or_else(|| {
-                        GitError::CustomError(format!(
-                            "import tree {} missing from the want set",
-                            c.tree_id
-                        ))
-                    })?
-                    .clone(),
-                &exist_objs,
-                &mut counted_obj,
-                &obj_num,
-            )
-            .await?;
-        }
-        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
-        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new_with_hash_kind(
-            self.object_hash_kind()?,
-            obj_num.into_inner(),
-            0,
-            stream_tx,
-        );
-        encoder
-            .encode_async(entry_rx)
-            .await
-            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
-
-        // Every object must appear exactly once in the pack; two want commits
-        // may share one tree.
-        for c in want_commits {
-            if exist_objs.insert(c.tree_id.to_string()) {
-                self.traverse(
-                    want_trees
-                        .get(&c.tree_id)
-                        .ok_or_else(|| {
-                            GitError::CustomError(format!(
-                                "import tree {} missing from the want set",
-                                c.tree_id
-                            ))
-                        })?
-                        .clone(),
-                    &mut exist_objs,
-                    Some(&entry_tx),
-                )
-                .await?;
-            }
-            entry_tx
-                .send(MetaAttached {
-                    inner: c.into(),
-                    meta: EntryMeta::new(),
-                })
-                .await
-                .map_err(|e| MegaError::Other(format!("pack commit entry send failed: {e}")))?;
-        }
-        drop(entry_tx);
-
-        Ok(ReceiverStream::new(stream_rx))
     }
 
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError> {
@@ -580,6 +439,216 @@ pub(crate) async fn collect_git_blob_filepaths(
 }
 
 impl ImportRepo {
+    async fn incremental_pack_with_extra(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        include_tag: bool,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        let mut want_clone = want.clone();
+        let kind = self.object_hash_kind()?;
+        let pack_config = &self.storage.config().pack;
+        let storage = self.storage.git_db_storage();
+        let obj_num = AtomicUsize::new(0);
+
+        let mut exist_objs = HashSet::new();
+
+        let mut want_commits: Vec<Commit> = storage
+            .get_commits_by_hashes(self.repo.repo_id, &want_clone)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?
+            .into_iter()
+            .map(|model| {
+                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let mut traversal_list: Vec<Commit> = want_commits.clone();
+
+        // traverse commit's all parents to find the commit that client does not have
+        while let Some(temp) = traversal_list.pop() {
+            for p_commit_id in temp.parent_commit_ids {
+                let p_commit_id = p_commit_id.to_string();
+
+                if !have.contains(&p_commit_id) && !want_clone.contains(&p_commit_id) {
+                    let parent_model = storage
+                        .get_commit_by_hash(self.repo.repo_id, &p_commit_id)
+                        .await
+                        .map_err(|e| GitError::CustomError(e.to_string()))?
+                        .ok_or_else(|| {
+                            GitError::CustomError(format!(
+                                "import parent commit {p_commit_id} not found"
+                            ))
+                        })?;
+                    let parent: Commit =
+                        crate::jupiter::utils::converter::commit_from_git_model_with_kind(
+                            parent_model,
+                            kind,
+                        )
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
+                    want_commits.push(parent.clone());
+                    want_clone.push(p_commit_id);
+                    traversal_list.push(parent);
+                }
+            }
+        }
+
+        let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
+        let want_trees: HashMap<ObjectHash, Tree> = storage
+            .get_trees_by_hashes(self.repo.repo_id, want_tree_ids)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?
+            .into_iter()
+            .map(|m| {
+                Ok((
+                    ObjectHash::from_hex_for_kind(kind, &m.tree_id)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?,
+                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(m, kind)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?,
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, GitError>>()?;
+
+        obj_num.fetch_add(want_commits.len(), Ordering::SeqCst);
+
+        let have_commits = storage
+            .get_commits_by_hashes(self.repo.repo_id, &have)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let have_trees = storage
+            .get_trees_by_hashes(
+                self.repo.repo_id,
+                have_commits.iter().map(|x| x.tree.clone()).collect(),
+            )
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        // traverse to get exist_objs
+        let kind = self.object_hash_kind()?;
+        for have_tree in have_trees {
+            let have_tree =
+                crate::jupiter::utils::converter::tree_from_git_model_with_kind(have_tree, kind)
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+            // `traverse` records the tree children; the tree itself is owned by
+            // the client too, so it has to be excluded as well or a wanted commit
+            // that reuses it re-emits an object the client already has.
+            exist_objs.insert(have_tree.id.to_string());
+            self.traverse(have_tree, &mut exist_objs, None).await?;
+        }
+
+        let mut counted_obj = HashSet::new();
+        let mut counted_roots = HashSet::new();
+        // traverse for get obj nums; shared commit trees counted once
+        for c in want_commits.clone() {
+            if !counted_roots.insert(c.tree_id.to_string()) {
+                continue;
+            }
+            self.traverse_for_count(
+                want_trees
+                    .get(&c.tree_id)
+                    .ok_or_else(|| {
+                        GitError::CustomError(format!(
+                            "import tree {} missing from the want set",
+                            c.tree_id
+                        ))
+                    })?
+                    .clone(),
+                &exist_objs,
+                &mut counted_obj,
+                &obj_num,
+            )
+            .await?;
+        }
+        // Tags attached for `include-tag` must be counted before the encoder is
+        // sized, exactly like the closure objects above.
+        let mut tag_entries: Vec<Tag> = Vec::new();
+        if include_tag {
+            let refs = storage
+                .get_ref(self.repo.repo_id)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            let authorised_tag_ids: HashSet<String> = refs
+                .iter()
+                .filter(|row| row.ref_name.starts_with("refs/tags/"))
+                .map(|row| row.ref_git_id.clone())
+                .collect();
+            if !authorised_tag_ids.is_empty() {
+                let models = storage
+                    .get_tags_by_repo_id(self.repo.repo_id)
+                    .await
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+                for model in models {
+                    let tag: Tag =
+                        crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
+                            .map_err(|e| GitError::CustomError(e.to_string()))?;
+                    let tag_id = tag.id.to_string();
+                    let target = tag.object_hash.to_string();
+                    // Fixed point over the evolving emitted set, so nested tag
+                    // chains attach regardless of row order.
+                    if authorised_tag_ids.contains(&tag_id)
+                        && (counted_obj.contains(&target) || want_clone.contains(&target))
+                        && !tag_entries.iter().any(|existing| existing.id == tag.id)
+                    {
+                        tag_entries.push(tag);
+                    }
+                }
+            }
+            obj_num.fetch_add(tag_entries.len(), Ordering::SeqCst);
+        }
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new_with_hash_kind(
+            self.object_hash_kind()?,
+            obj_num.into_inner(),
+            0,
+            stream_tx,
+        );
+        encoder
+            .encode_async(entry_rx)
+            .await
+            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
+
+        // Every object must appear exactly once in the pack; two want commits
+        // may share one tree.
+        for c in want_commits {
+            if exist_objs.insert(c.tree_id.to_string()) {
+                self.traverse(
+                    want_trees
+                        .get(&c.tree_id)
+                        .ok_or_else(|| {
+                            GitError::CustomError(format!(
+                                "import tree {} missing from the want set",
+                                c.tree_id
+                            ))
+                        })?
+                        .clone(),
+                    &mut exist_objs,
+                    Some(&entry_tx),
+                )
+                .await?;
+            }
+            entry_tx
+                .send(MetaAttached {
+                    inner: c.into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .map_err(|e| MegaError::Other(format!("pack commit entry send failed: {e}")))?;
+        }
+        for tag in tag_entries {
+            entry_tx
+                .send(MetaAttached {
+                    inner: tag.into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .map_err(|e| MegaError::Other(format!("pack tag entry send failed: {e}")))?;
+        }
+        drop(entry_tx);
+
+        Ok(ReceiverStream::new(stream_rx))
+    }
+
     async fn full_pack_with_extra(
         &self,
         want: Vec<String>,
