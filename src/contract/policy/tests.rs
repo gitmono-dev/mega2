@@ -28,7 +28,7 @@ use crate::{
 
 /// Serializes this module's tests: `set_after_authz_json_load_publish_for_test` /
 /// `set_rebuild_delay_for_test` are process-global and race under `cargo test --all`.
-static POLICY_TEST_SERIAL: Mutex<()> = Mutex::const_new(());
+pub(crate) static POLICY_TEST_SERIAL: Mutex<()> = Mutex::const_new(());
 
 async fn storage_enforce(temp: &std::path::Path) -> crate::jupiter::storage::Storage {
     let mut config = crate::config::testing::isolated_config(temp.join("config"));

@@ -527,6 +527,158 @@ mod tests {
         assert!(authz_blob_id(&tree).is_none());
     }
 
+    // --- FIX-MTR-22: the authorization snapshot loads under the configured kind ---
+
+    /// DB-backed storage whose monorepo uses `kind`, with `main@/` seeded to a
+    /// root tree that carries `/.mega_cedar.json` and an authz blob.
+    async fn seed_authz(
+        temp: &std::path::Path,
+        kind: git_internal::hash::HashKind,
+        json: &str,
+    ) -> (Storage, crate::jupiter::tests::TestSchemaGuard) {
+        use crate::{
+            callisto::mega_refs, common::utils::MEGA_BRANCH_NAME, config::MonoObjectFormat,
+        };
+
+        let (db_config, schema) = crate::jupiter::tests::test_db_config(temp).await;
+        let db = crate::jupiter::storage::init::database_connection(&db_config)
+            .await
+            .expect("db");
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .expect("migrations");
+        let mut config = crate::config::testing::isolated_config(temp.join("config"));
+        config.database = db_config;
+        config.monorepo.object_format = match kind {
+            git_internal::hash::HashKind::Sha1 => MonoObjectFormat::Sha1,
+            git_internal::hash::HashKind::Sha256 => MonoObjectFormat::Sha256,
+            git_internal::hash::HashKind::Blake3 => MonoObjectFormat::Blake3,
+        };
+        let storage = Storage::new_with_connection(
+            std::sync::Arc::new(config),
+            std::sync::Arc::new(db),
+            crate::jupiter::storage::object_storage::mock_object_storage(),
+        )
+        .await
+        .expect("storage");
+
+        // Seed the blob, tree and commit under the repository's own algorithm.
+        let guard = git_internal::hash::set_hash_kind_for_test(kind);
+        let blob_id = save_authz_json(&storage, json).await;
+        let item = TreeItem::new(
+            TreeItemMode::Blob,
+            git_internal::hash::ObjectHash::from_hex_for_kind(kind, &blob_id)
+                .expect("blob id for kind"),
+            MEGA_CEDAR_PATH.trim_start_matches('/').to_string(),
+        );
+        let tree = Tree::from_tree_items_with_kind(kind, vec![item]).expect("authz tree");
+        let mono = storage.mono_storage();
+        mono.save_mega_trees(vec![tree.clone()], ObjectHash::zero_for_kind(kind), None)
+            .await
+            .expect("save tree");
+        let commit = git_internal::internal::object::commit::Commit::from_tree_id_with_kind(
+            kind,
+            tree.id,
+            vec![],
+            "authz snapshot",
+        )
+        .expect("authz commit");
+        mono.save_mega_commits(vec![commit.clone()], None)
+            .await
+            .expect("save commit");
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/",
+                MEGA_BRANCH_NAME.to_owned(),
+                commit.id.to_string(),
+                tree.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .expect("save main ref");
+        drop(guard);
+        (storage, schema)
+    }
+
+    #[tokio::test]
+    async fn native_authz_hash_matrix_reads_configured_kind() {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        // The loader consults the process-global publish/rebuild hooks, so this
+        // module's tests share one serialization lock.
+        let _serial = crate::contract::policy::tests::POLICY_TEST_SERIAL
+            .lock()
+            .await;
+
+        let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let temp = tempfile::TempDir::new().expect("temp");
+            let (storage, _schema) = seed_authz(temp.path(), kind, &json).await;
+
+            // Load with the thread-local kind deliberately set elsewhere: the
+            // loader must still read the configured algorithm's bytes.
+            let opposing = if kind == HashKind::Sha1 {
+                HashKind::Sha256
+            } else {
+                HashKind::Sha1
+            };
+            let _tls = set_hash_kind_for_test(opposing);
+            let loaded = load_latest_authz_json(&storage)
+                .await
+                .expect("load authz json");
+            assert_eq!(
+                loaded.as_deref(),
+                Some(json.as_str()),
+                "FIX16_AC1 authz bytes for {kind:?}"
+            );
+            assert_eq!(get_hash_kind(), opposing, "FIX16_AC6 tls unchanged");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_authz_hash_invalid_tree_metadata_is_rejected() {
+        use git_internal::hash::{HashKind, set_hash_kind_for_test};
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+
+        let _serial = crate::contract::policy::tests::POLICY_TEST_SERIAL
+            .lock()
+            .await;
+
+        let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
+        let temp = tempfile::TempDir::new().expect("temp");
+        let (storage, _schema) = seed_authz(temp.path(), HashKind::Sha256, &json).await;
+
+        // Corrupt the stored root tree id to a SHA-1 width value while the repo
+        // is configured for SHA-256: the loader must return an error.
+        let mono = storage.mono_storage();
+        let root = mono
+            .get_main_ref("/")
+            .await
+            .expect("ref")
+            .expect("main ref");
+        let mut tree = mono
+            .get_tree_by_hash(&root.ref_tree_hash)
+            .await
+            .expect("tree lookup")
+            .expect("tree")
+            .into_active_model();
+        // A tree body whose entry id is SHA-1 width cannot parse as SHA-256.
+        let mut body = b"100644 .mega_cedar.json ".to_vec();
+        body.extend(std::iter::repeat_n(0u8, 20));
+        tree.sub_trees = Set(body);
+        tree.update(mono.get_connection())
+            .await
+            .expect("corrupt tree");
+
+        let _tls = set_hash_kind_for_test(HashKind::Sha1);
+        assert!(
+            load_latest_authz_json(&storage).await.is_err(),
+            "FIX16_AC2 invalid tree metadata must be rejected"
+        );
+    }
+
     // --- UN-16: notify single-source + handle consumption (Storage::mock) ---
 
     async fn save_authz_json(storage: &Storage, json: &str) -> String {
