@@ -5650,6 +5650,69 @@ mod disabled_http {
                 "FIX13_AC4 an ImportRepo must withhold every blob under v2 blob:none"
             );
 
+            // AC-3 on the card's own axis: a depth-limited clone of an ImportRepo
+            // must carry exactly one commit and must not hold the parent commit.
+            fixture.git(&["clone", &import_url, "import-depth-work"]);
+            std::fs::write(
+                fixture.shared.path().join("import-depth-work/depth.txt"),
+                b"FIX13 depth\n",
+            )
+            .expect("write depth file");
+            fixture.git(&["-C", "import-depth-work", "add", "depth.txt"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "FIX13 depth advance",
+            ]);
+            let parent_oid = fixture.git_text(&["-C", "import-depth-work", "rev-parse", "HEAD~1"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "HEAD:refs/heads/main",
+            ]);
+            fixture.git(&[
+                "-c",
+                "protocol.version=0",
+                "clone",
+                "--depth=1",
+                "--no-checkout",
+                &import_url,
+                "iso-import-depth1",
+            ]);
+            let depth_count = fixture.git_text(&[
+                "-C",
+                "iso-import-depth1",
+                "rev-list",
+                "--count",
+                "--all",
+            ]);
+            assert_eq!(
+                depth_count, "1",
+                "FIX13_AC3 an ImportRepo depth=1 clone must carry exactly one commit"
+            );
+            let parent = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &["-C", "iso-import-depth1", "cat-file", "-e", &parent_oid],
+            );
+            eprintln!(
+                "FIX13_AC3_IMPORT_DEPTH1 parent_present={} parent={parent_oid}",
+                parent.status.success()
+            );
+            assert!(
+                !parent.status.success(),
+                "FIX13_AC3 the parent commit must not be present in a depth=1 clone"
+            );
+
             // Object integrity per arm. `fsck` must only run on arms that are
             // not partial clones: in a promisor clone `fsck` lazily fetches the
             // objects it is asked to check, which would both mask a filtering

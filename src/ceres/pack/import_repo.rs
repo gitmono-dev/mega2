@@ -509,7 +509,6 @@ impl ImportRepo {
             seen.insert(commit.id.to_string());
         }
         let mut commits: Vec<Commit> = level.clone();
-        let mut boundary: Vec<String> = Vec::new();
 
         for step in 0..depth {
             let mut next: Vec<Commit> = Vec::new();
@@ -520,9 +519,9 @@ impl ImportRepo {
                         continue;
                     }
                     if step + 1 == depth {
-                        // The parent lies beyond the requested depth: it becomes a
-                        // shallow boundary and is not packed.
-                        boundary.push(parent_id);
+                        // The parent lies beyond the requested depth and is not
+                        // packed; the commit that loses it is the shallow point,
+                        // which is computed after the walk.
                         continue;
                     }
                     let model = storage
@@ -548,6 +547,20 @@ impl ImportRepo {
             }
             level = next;
         }
+
+        // `shallow <oid>` names commits whose parents were withheld, so the
+        // boundary is every included commit that lost a parent.
+        let included: HashSet<String> = commits.iter().map(|c| c.id.to_string()).collect();
+        let boundary: Vec<String> = commits
+            .iter()
+            .filter(|commit| {
+                commit
+                    .parent_commit_ids
+                    .iter()
+                    .any(|parent| !included.contains(&parent.to_string()))
+            })
+            .map(|commit| commit.id.to_string())
+            .collect();
 
         let mut keep: HashSet<String> = commits.iter().map(|c| c.id.to_string()).collect();
         let tree_ids: Vec<String> = commits.iter().map(|c| c.tree_id.to_string()).collect();
