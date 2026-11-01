@@ -5689,6 +5689,36 @@ mod disabled_http {
                 eprintln!("FIX13_FSCK {dir} strict=ok");
             }
 
+            // AC-6 oracle: every reachable object must be present in the client's
+            // object database exactly once. Storage form is not asserted - the v0
+            // arm keeps its objects loose rather than packed.
+            for (dir, _) in arms.iter() {
+                let reachable = fixture
+                    .git_text(&["-C", dir, "rev-list", "--objects", "--all"])
+                    .lines()
+                    .count();
+                let counted = fixture.git_text(&["-C", dir, "count-objects", "-v"]);
+                let field = |name: &str| -> usize {
+                    counted
+                        .lines()
+                        .find_map(|line| line.strip_prefix(name))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or_else(|| {
+                            panic!("FIX13_AC6 {dir} missing {name} in count-objects")
+                        })
+                };
+                let loose = field("count: ");
+                let in_pack = field("in-pack: ");
+                eprintln!(
+                    "FIX13_AC6_ODB {dir} loose={loose} in-pack={in_pack} reachable={reachable}"
+                );
+                assert_eq!(
+                    loose + in_pack,
+                    reachable,
+                    "FIX13_AC6 {dir} stored objects must equal the reachable set"
+                );
+            }
+
             // AC-4 on the card's own axis: an ImportRepo served from
             // `/third-party` must also withhold blobs over v2 blob:none.
             let import_url =
