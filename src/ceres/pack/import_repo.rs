@@ -439,6 +439,22 @@ pub(crate) async fn collect_git_blob_filepaths(
 }
 
 impl ImportRepo {
+    /// Stable fingerprint of a repository's refs, used to detect a ref change
+    /// between authorization and pack construction.
+    async fn ref_fingerprint(
+        storage: &crate::jupiter::storage::git_db_storage::GitDbStorage,
+        repo_id: i64,
+    ) -> Result<String, MegaError> {
+        let mut rows: Vec<String> = storage
+            .get_ref(repo_id)
+            .await?
+            .into_iter()
+            .map(|row| format!("{}={}", row.ref_name, row.ref_git_id))
+            .collect();
+        rows.sort();
+        Ok(rows.join("\n"))
+    }
+
     async fn incremental_pack_with_extra(
         &self,
         want: Vec<String>,
@@ -660,6 +676,14 @@ impl ImportRepo {
         let kind = self.object_hash_kind()?;
         let repo_id = self.repo.repo_id;
 
+        // Authorization happens before this point. Re-read the ref view here and
+        // compare it with a fingerprint taken before any pack read, so a ref that
+        // disappeared or was retargeted in between cannot be served from a stale
+        // authorization: the request fails and the client retries instead.
+        let refs_before = Self::ref_fingerprint(&storage, repo_id)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
         // Ship only the closure of what was asked for. The previous behaviour
         // ignored `want` entirely and sent every object in the repository, so a
         // clone also carried unrelated branches and every stored tag - including
@@ -822,6 +846,15 @@ impl ImportRepo {
                     break;
                 }
             }
+        }
+
+        let refs_after = Self::ref_fingerprint(&storage, repo_id)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        if refs_before != refs_after {
+            return Err(GitError::CustomError(
+                "refs changed while building the pack; retry the fetch".to_owned(),
+            ));
         }
 
         // Materialize the exact object list once the closure is known: the
