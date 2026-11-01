@@ -3373,6 +3373,66 @@ mod disabled_http {
             pack
         }
 
+        /// Same crafted request over protocol v2: `command=fetch` with
+        /// `include-tag` in the argument list, then the `packfile` section is
+        /// walked for side-band data.
+        async fn crafted_include_tag_pack_v2(&self, path: &str, want_oid: &str) -> Vec<u8> {
+            let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+            let body = format!(
+                "{}{}0001{}{}{}0000",
+                pkt("command=fetch\n"),
+                pkt("agent=git/2\n"),
+                pkt(&format!("want {want_oid}\n")),
+                pkt("include-tag\n"),
+                pkt("done\n")
+            );
+            let response = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    self.port,
+                    &format!("{path}/git-upload-pack"),
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .header("git-protocol", "version=2")
+                .body(body)
+                .send()
+                .await
+                .expect("crafted v2 request");
+            let status = response.status();
+            let bytes = response.bytes().await.expect("crafted v2 body");
+            let start = bytes
+                .windows(8)
+                .position(|window| window == b"packfile")
+                .unwrap_or_else(|| {
+                    panic!("v2 include-tag response had no packfile section (status {status})")
+                });
+            let mut pack: Vec<u8> = Vec::new();
+            let mut offset = start - 4; // point at the pkt-line length
+            while offset + 4 <= bytes.len() {
+                let header = String::from_utf8_lossy(&bytes[offset..offset + 4]).to_string();
+                offset += 4;
+                if header == "0000" {
+                    break;
+                }
+                let Ok(len) = usize::from_str_radix(&header, 16) else {
+                    break;
+                };
+                // Delimiters are length 1 and carry no payload.
+                if len < 4 || offset + len - 4 > bytes.len() {
+                    continue;
+                }
+                let payload = &bytes[offset..offset + len - 4];
+                offset += len - 4;
+                if payload.first() == Some(&1) {
+                    pack.extend_from_slice(&payload[1..]);
+                }
+            }
+            assert!(
+                pack.starts_with(b"PACK"),
+                "crafted v2 include-tag request returned no pack (status {status})"
+            );
+            pack
+        }
+
         async fn seed_ssh(&self, db: &sea_orm::DatabaseConnection) {
             let key = self.shared.path().join("ssh/client_ed25519");
             git_cli::generate_client_ed25519(&key);
@@ -6055,6 +6115,31 @@ mod disabled_http {
             assert!(
                 tag_in_pack,
                 "FIX13_INCLUDE_TAG the crafted include-tag request must carry the tag object"
+            );
+
+            // v2 end-to-end: the same crafted request over protocol v2 must also
+            // deliver the authorised tag, which is what advertising `include-tag`
+            // in the v2 fetch features is for.
+            let v2_pack = fixture
+                .crafted_include_tag_pack_v2("/third-party/mtr94-control.git", &want_oid)
+                .await;
+            std::fs::write(fixture.shared.path().join("v2-include-tag.pack"), &v2_pack)
+                .expect("write v2 pack");
+            fixture.git(&["-C", "iso-include-tag", "index-pack", "../v2-include-tag.pack"]);
+            let v2_listing = fixture.git_text(&[
+                "-C",
+                "iso-include-tag",
+                "verify-pack",
+                "-v",
+                "../v2-include-tag.idx",
+            ]);
+            let v2_tag = v2_listing
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(tag_oid.as_str()));
+            eprintln!("FIX13_INCLUDE_TAG_V2 tag_in_pack={v2_tag}");
+            assert!(
+                v2_tag,
+                "FIX13_INCLUDE_TAG_V2 the v2 crafted request must attach the tag too"
             );
 
             // AC-5 negative: once the tag ref is deleted, the leftover row must not
