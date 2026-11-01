@@ -604,6 +604,65 @@ mod tests {
         }
     }
 
+    /// VER-5: the B3 trunk composition (provenance plan plus explicit-kind
+    /// synthesis, as `execute_b3` performs it) must mint the configured
+    /// algorithm's OID and never the thread-local one.
+    #[test]
+    fn native_push_hash_hash_red_trunk_composition_uses_configured_kind() {
+        use git_internal::{
+            hash::{get_hash_kind, set_hash_kind_for_test},
+            internal::object::ObjectTrait,
+        };
+
+        let _tls = set_hash_kind_for_test(HashKind::Sha1);
+        for kind in [HashKind::Sha256, HashKind::Blake3] {
+            let tip = Commit::new_with_kind(
+                kind,
+                alice(1_700_000_000),
+                committer(1_700_000_000),
+                kind_tree(kind),
+                vec![kind_parent(kind)],
+                "feat: trunk tip\n",
+            )
+            .expect("typed tip");
+            let plan = TrunkProvenance::from_tip(
+                &tip,
+                2,
+                "/project/app",
+                tip.id.to_string(),
+                None,
+                1_700_000_100,
+            );
+
+            let landed = synthesize_with_kind(
+                kind,
+                plan.author.clone(),
+                plan.committer(None),
+                kind_tree(kind),
+                vec![kind_parent(kind)],
+                &plan.layer_message("/project/app"),
+            )
+            .expect("trunk composition");
+
+            assert_eq!(landed.id.kind(), kind, "FIX16_VER5_KIND {kind:?}");
+            let canonical = landed.to_data().expect("canonical bytes");
+            assert_eq!(
+                landed.id,
+                ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Commit, &canonical)
+                    .expect("independent digest"),
+                "FIX16_VER5_RECOMPUTE {kind:?}"
+            );
+            if let Ok(tls_id) = ObjectHash::from_type_and_data_for_kind(
+                get_hash_kind(),
+                ObjectType::Commit,
+                &canonical,
+            ) {
+                assert_ne!(landed.id, tls_id, "FIX16_VER5_TLS {kind:?}");
+            }
+            assert_eq!(get_hash_kind(), HashKind::Sha1);
+        }
+    }
+
     #[test]
     fn native_push_hash_synthesize_ignores_thread_local_kind() {
         use git_internal::hash::{get_hash_kind, set_hash_kind_for_test};
