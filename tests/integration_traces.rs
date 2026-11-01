@@ -5515,29 +5515,65 @@ mod disabled_http {
         }
     }
 
-    /// AC-7/AC-8 at the code-path view: a clone of a code path must carry only
-    /// code objects, never trace-plane entries. The root view is a separate
-    /// question because the legacy `%2etraces` alias is served there by design.
+    /// AC-7/AC-8 at the code-path view across the fetch modes the card names.
+    ///
+    /// Every arm clones the same seeded code path and must (a) contain no
+    /// trace-plane entry and (b) contain the seeded code objects. `--depth=1`
+    /// additionally must not carry the parent commit. The root view is a
+    /// separate question: the legacy `%2etraces` alias is served there today,
+    /// so it is not asserted here.
     pub async fn code_clone_isolation_code_path_objects() {
         let (guard, db) = traces_db::TracesDb::migrated().await;
         let mut fixture = Fixture::new(&db).await;
         let result = AssertUnwindSafe(async {
             fixture.prepare(&db).await;
             let url = git_cli::mega2_http_url(fixture.port, "/project/control.git");
-            fixture.git(&["clone", &url, "iso-code"]);
-            let listing = fixture.git_text(&["-C", "iso-code", "rev-list", "--objects", "--all"]);
-            let traced: Vec<&str> = listing
-                .lines()
-                .filter(|line| line.to_ascii_lowercase().contains("traces"))
-                .collect();
-            assert!(
-                traced.is_empty(),
-                "FIX13_AC7/8 a code-path clone must not contain trace entries: {traced:?}"
-            );
-            assert!(
-                !listing.is_empty(),
-                "FIX13_AC7 the code-path clone must contain the seeded code objects"
-            );
+
+            let mut baseline_objects = 0usize;
+            let arms: [(&str, Vec<&str>); 4] = [
+                ("iso-default", vec![]),
+                ("iso-bare", vec!["--bare"]),
+                ("iso-no-tags", vec!["--no-tags"]),
+                ("iso-depth1", vec!["--depth=1"]),
+            ];
+            for (dir, extra) in arms {
+                let mut args = vec!["clone"];
+                args.extend(extra.iter().copied());
+                args.push(&url);
+                args.push(dir);
+                fixture.git(&args);
+
+                let listing = fixture.git_text(&["-C", dir, "rev-list", "--objects", "--all"]);
+                let traced: Vec<&str> = listing
+                    .lines()
+                    .filter(|line| line.to_ascii_lowercase().contains("traces"))
+                    .collect();
+                assert!(
+                    traced.is_empty(),
+                    "FIX13_AC7/8 {dir} must not contain trace entries: {traced:?}"
+                );
+                assert!(
+                    !listing.is_empty(),
+                    "FIX13_AC7 {dir} must contain the seeded code objects"
+                );
+
+                let commit_count = fixture.git_text(&["-C", dir, "rev-list", "--count", "--all"]);
+                if dir == "iso-depth1" {
+                    assert_eq!(
+                        commit_count, "1",
+                        "FIX13_AC3 depth=1 must carry exactly one commit, got {commit_count}"
+                    );
+                } else {
+                    if baseline_objects == 0 {
+                        baseline_objects = listing.lines().count();
+                    }
+                    assert_eq!(
+                        listing.lines().count(),
+                        baseline_objects,
+                        "FIX13_AC7 {dir} object count must match the default clone"
+                    );
+                }
+            }
         })
         .catch_unwind()
         .await;
