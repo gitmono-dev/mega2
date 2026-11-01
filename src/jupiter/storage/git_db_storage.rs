@@ -690,8 +690,7 @@ impl GitDbStorage {
             .filter(git_tree::Column::RepoId.eq(repo_id))
             .filter(git_tree::Column::TreeId.is_in(hashes))
             .all(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_tree_by_hash(
@@ -725,8 +724,7 @@ impl GitDbStorage {
             .filter(git_blob::Column::RepoId.eq(repo_id))
             .filter(git_blob::Column::BlobId.is_in(hashes))
             .all(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_tags_by_repo_id(
