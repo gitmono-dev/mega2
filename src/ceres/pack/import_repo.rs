@@ -883,7 +883,9 @@ impl ImportRepo {
                     let tag: Tag =
                         crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
                             .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    if authorised_tag_ids.contains(&tag.id.to_string()) {
+                    if authorised_tag_ids.contains(&tag.id.to_string())
+                        || authorised_tag_ids.contains(&tag.object_hash.to_string())
+                    {
                         candidates.push(tag);
                     }
                 }
@@ -1124,7 +1126,9 @@ impl ImportRepo {
                     .map(|(id, tag)| (id.clone(), tag.clone()))
                     .collect();
                 for (tag_id, tag) in &candidates {
-                    if keep.contains(tag_id) || !authorised_tag_ids.contains(tag_id) {
+                    let authorised = authorised_tag_ids.contains(tag_id)
+                        || authorised_tag_ids.contains(&tag.object_hash.to_string());
+                    if keep.contains(tag_id) || !authorised {
                         continue;
                     }
                     if keep.contains(&tag.object_hash.to_string()) {

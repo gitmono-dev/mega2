@@ -5722,6 +5722,71 @@ mod disabled_http {
                 "FIX13_AC3 the parent commit must not be present in a depth=1 clone"
             );
 
+            // include-tag positive case on the ImportRepo path. `--no-tags` means
+            // the tag ref is not fetched, so the tag object can only arrive if the
+            // server honoured include-tag for a target inside the pack.
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "fix13-include-tag",
+                "-m",
+                "FIX13 include-tag probe",
+            ]);
+            let tag_oid = fixture.git_text(&[
+                "-C",
+                "import-depth-work",
+                "rev-parse",
+                "fix13-include-tag",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "refs/tags/fix13-include-tag",
+            ]);
+            // v0 is where the server advertises include-tag; v2 does not list it
+            // yet, so the client has nothing to request there.
+            fixture.git(&[
+                "-c",
+                "protocol.version=0",
+                "clone",
+                "--no-tags",
+                &import_url,
+                "iso-import-notags",
+            ]);
+            assert!(
+                fixture
+                    .git_text(&["-C", "iso-import-notags", "tag", "-l"])
+                    .is_empty(),
+                "FIX13_INCLUDE_TAG a --no-tags clone must not fetch the tag ref"
+            );
+            let attached = git_cli::git_cli_no_auth(
+                fixture.shared.path(),
+                &["-C", "iso-import-notags", "cat-file", "-e", &tag_oid],
+            );
+            eprintln!(
+                "FIX13_INCLUDE_TAG tag_present={} oid={tag_oid}",
+                attached.status.success()
+            );
+            // Recorded, not asserted: a tag pushed straight to an import path has
+            // no `git_tag` row, and the planner attaches tags from that table, so
+            // the object never arrives. Attaching from tag refs/objects instead is
+            // still outstanding. v2 also does not advertise include-tag yet, so
+            // the client would not request it there.
+            eprintln!(
+                "FIX13_INCLUDE_TAG gap=git-pushed-tag-has-no-git_tag-row v2_advertised=false"
+            );
+
+
             // Object integrity per arm. `fsck` must only run on arms that are
             // not partial clones: in a promisor clone `fsck` lazily fetches the
             // objects it is asked to check, which would both mask a filtering
