@@ -214,108 +214,22 @@ impl RepoHandler for ImportRepo {
         Ok(())
     }
 
+    /// `include-tag` support: tags are attached only when the authorised ref
+    /// view still advertises them and their target is inside the closure.
+    fn supports_include_tag(&self) -> bool {
+        true
+    }
+
     async fn full_pack(&self, want: Vec<String>) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        let pack_config = &self.storage.config().pack;
-        let storage = self.storage.git_db_storage();
-        let git_service = self.storage.git_service.clone();
-        let kind = self.object_hash_kind()?;
-        let repo_id = self.repo.repo_id;
+        self.full_pack_with_extra(want, false).await
+    }
 
-        // Ship only the closure of what was asked for. The previous behaviour
-        // ignored `want` entirely and sent every object in the repository, so a
-        // clone also carried unrelated branches and every stored tag - including
-        // tags whose refs no longer exist. Objects that were asked for by id
-        // (tags, trees, blobs) stay, because a client fetches tags by object id.
-        let mut keep: HashSet<String> = want.iter().cloned().collect();
-        let want_commits: Vec<Commit> = storage
-            .get_commits_by_hashes(repo_id, &want)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?
-            .into_iter()
-            .map(|model| {
-                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        if !want_commits.is_empty() {
-            let mut commits = want_commits;
-            let mut seen: HashSet<String> = commits.iter().map(|c| c.id.to_string()).collect();
-            let mut traversal = commits.clone();
-            while let Some(temp) = traversal.pop() {
-                for parent_id in temp.parent_commit_ids {
-                    let parent_id = parent_id.to_string();
-                    if !seen.insert(parent_id.clone()) {
-                        continue;
-                    }
-                    let parent_model = storage
-                        .get_commit_by_hash(repo_id, &parent_id)
-                        .await
-                        .map_err(|e| GitError::CustomError(e.to_string()))?
-                        .ok_or_else(|| {
-                            GitError::CustomError(format!(
-                                "import parent commit {parent_id} not found"
-                            ))
-                        })?;
-                    let parent: Commit =
-                        crate::jupiter::utils::converter::commit_from_git_model_with_kind(
-                            parent_model,
-                            kind,
-                        )
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    traversal.push(parent.clone());
-                    commits.push(parent);
-                }
-            }
-            for commit in &commits {
-                keep.insert(commit.id.to_string());
-                // `traverse_for_count` records a tree's children, not the tree
-                // itself, so each commit's root tree has to be kept explicitly.
-                keep.insert(commit.tree_id.to_string());
-            }
-            let tree_ids: Vec<String> = commits.iter().map(|c| c.tree_id.to_string()).collect();
-            let trees = storage
-                .get_trees_by_hashes(repo_id, tree_ids)
-                .await
-                .map_err(|e| GitError::CustomError(e.to_string()))?;
-            let obj_num = AtomicUsize::new(0);
-            let mut counted: HashSet<String> = HashSet::new();
-            let nothing: HashSet<String> = HashSet::new();
-            for model in trees {
-                let tree =
-                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                self.traverse_for_count(tree, &nothing, &mut counted, &obj_num)
-                    .await?;
-            }
-            keep.extend(counted);
-        }
-        // Materialize the exact object list once the closure is known: the
-        // encoder is sized from this count, so a row that cannot be converted
-        // must fail the request instead of silently shortening the pack (which
-        // the client reports as early EOF).
-        let all_entries = collect_objects(repo_id, git_service, storage, kind)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let entries: Vec<_> = all_entries
-            .into_iter()
-            .filter(|entry| keep.contains(&entry.inner.hash.to_string()))
-            .collect();
-        let total = entries.len();
-
-        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
-        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new_with_hash_kind(kind, total, 0, stream_tx);
-        encoder.encode_async(entry_rx).await?;
-
-        tokio::spawn(async move {
-            for entry in entries {
-                if entry_tx.send(entry).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok(ReceiverStream::new(stream_rx))
+    async fn full_pack_with_options(
+        &self,
+        want: Vec<String>,
+        include_tag: bool,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        self.full_pack_with_extra(want, include_tag).await
     }
 
     async fn incremental_pack(
@@ -666,6 +580,143 @@ pub(crate) async fn collect_git_blob_filepaths(
 }
 
 impl ImportRepo {
+    async fn full_pack_with_extra(
+        &self,
+        want: Vec<String>,
+        include_tag: bool,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        let pack_config = &self.storage.config().pack;
+        let storage = self.storage.git_db_storage();
+        let git_service = self.storage.git_service.clone();
+        let kind = self.object_hash_kind()?;
+        let repo_id = self.repo.repo_id;
+
+        // Ship only the closure of what was asked for. The previous behaviour
+        // ignored `want` entirely and sent every object in the repository, so a
+        // clone also carried unrelated branches and every stored tag - including
+        // tags whose refs no longer exist. Objects that were asked for by id
+        // (tags, trees, blobs) stay, because a client fetches tags by object id.
+        let mut keep: HashSet<String> = want.iter().cloned().collect();
+        let want_commits: Vec<Commit> = storage
+            .get_commits_by_hashes(repo_id, &want)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?
+            .into_iter()
+            .map(|model| {
+                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        if !want_commits.is_empty() {
+            let mut commits = want_commits;
+            let mut seen: HashSet<String> = commits.iter().map(|c| c.id.to_string()).collect();
+            let mut traversal = commits.clone();
+            while let Some(temp) = traversal.pop() {
+                for parent_id in temp.parent_commit_ids {
+                    let parent_id = parent_id.to_string();
+                    if !seen.insert(parent_id.clone()) {
+                        continue;
+                    }
+                    let parent_model = storage
+                        .get_commit_by_hash(repo_id, &parent_id)
+                        .await
+                        .map_err(|e| GitError::CustomError(e.to_string()))?
+                        .ok_or_else(|| {
+                            GitError::CustomError(format!(
+                                "import parent commit {parent_id} not found"
+                            ))
+                        })?;
+                    let parent: Commit =
+                        crate::jupiter::utils::converter::commit_from_git_model_with_kind(
+                            parent_model,
+                            kind,
+                        )
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
+                    traversal.push(parent.clone());
+                    commits.push(parent);
+                }
+            }
+            for commit in &commits {
+                keep.insert(commit.id.to_string());
+                // `traverse_for_count` records a tree's children, not the tree
+                // itself, so each commit's root tree has to be kept explicitly.
+                keep.insert(commit.tree_id.to_string());
+            }
+            let tree_ids: Vec<String> = commits.iter().map(|c| c.tree_id.to_string()).collect();
+            let trees = storage
+                .get_trees_by_hashes(repo_id, tree_ids)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            let obj_num = AtomicUsize::new(0);
+            let mut counted: HashSet<String> = HashSet::new();
+            let nothing: HashSet<String> = HashSet::new();
+            for model in trees {
+                let tree =
+                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
+                self.traverse_for_count(tree, &nothing, &mut counted, &obj_num)
+                    .await?;
+            }
+            keep.extend(counted);
+        }
+        if include_tag {
+            // Attach only tags the authorised ref view still advertises and whose
+            // target survived the closure filter: a tag behind a deleted ref is
+            // absent from `tag_ids`, so it cannot ride along, and a tag can never
+            // pull in objects the request did not ask for.
+            let authorised_tag_ids = self
+                .code_refs()
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?
+                .tag_ids;
+            if !authorised_tag_ids.is_empty() {
+                let tags = storage
+                    .get_tags_by_repo_id(repo_id)
+                    .await
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+                for model in tags {
+                    let tag: Tag =
+                        crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
+                            .map_err(|e| GitError::CustomError(e.to_string()))?;
+                    let tag_id = tag.id.to_string();
+                    if authorised_tag_ids.contains(&tag_id)
+                        && keep.contains(&tag.object_hash.to_string())
+                    {
+                        keep.insert(tag_id);
+                    }
+                }
+            }
+        }
+
+        // Materialize the exact object list once the closure is known: the
+        // encoder is sized from this count, so a row that cannot be converted
+        // must fail the request instead of silently shortening the pack (which
+        // the client reports as early EOF).
+        let all_entries = collect_objects(repo_id, git_service, storage, kind)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let entries: Vec<_> = all_entries
+            .into_iter()
+            .filter(|entry| keep.contains(&entry.inner.hash.to_string()))
+            .collect();
+        let total = entries.len();
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new_with_hash_kind(kind, total, 0, stream_tx);
+        encoder.encode_async(entry_rx).await?;
+
+        tokio::spawn(async move {
+            for entry in entries {
+                if entry_tx.send(entry).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(ReceiverStream::new(stream_rx))
+    }
+
     fn legacy_view_error(error: MegaError) -> MegaError {
         match error {
             MegaError::Db(_) => TracesError::QueryTimeout.into(),
