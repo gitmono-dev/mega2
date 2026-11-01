@@ -21,7 +21,11 @@ use crate::{
 // tests. `server-option` is intentionally omitted: the parsed capabilities
 // from `parse_v2_command` are not inspected, so advertising it would mislead
 // clients into sending server options that are silently ignored.
-const V2_CAPABILITIES: &[&str] = &["agent=mega/0.1.0", "ls-refs", "fetch=shallow filter"];
+const V2_CAPABILITIES: &[&str] = &[
+    "agent=mega/0.1.0",
+    "ls-refs",
+    "fetch=shallow filter include-tag",
+];
 
 pub fn build_v2_capability_advertisement(hash_kind: HashKind) -> BytesMut {
     let mut buf = BytesMut::new();
@@ -575,6 +579,10 @@ mod tests {
         assert!(adv_str.contains("agent=mega/0.1.0"));
         assert!(adv_str.contains("ls-refs"));
         assert!(adv_str.contains("fetch=shallow"));
+        assert!(
+            adv_str.contains("include-tag"),
+            "v2 must advertise include-tag so a client can ask for it"
+        );
         assert!(adv_str.contains("object-format=sha1"));
         assert!(adv_str.ends_with("0000"));
         // server-option is intentionally not advertised: parsed v2 capabilities
