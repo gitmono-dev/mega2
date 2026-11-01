@@ -90,6 +90,54 @@ pub fn tree_from_mega_model_with_kind(
         .map_err(|_| MegaError::Other("invalid native tree body".into()))
 }
 
+/// Kind-explicit counterpart of `FromGitModel for Commit`.
+///
+/// The git-db row is parsed with `kind` alone, so an ImportRepo finalize or
+/// attach conversion never depends on the thread-local `HashKind`.
+pub fn commit_from_git_model_with_kind(
+    model: git_commit::Model,
+    kind: HashKind,
+) -> Result<Commit, MegaError> {
+    let parse_hash = |value: &str, what: &str| {
+        ObjectHash::from_hex_for_kind(kind, value).map_err(|_| {
+            MegaError::Other(format!(
+                "invalid import {what} identity: {value} is not {kind:?}"
+            ))
+        })
+    };
+    let parents: Vec<String> = serde_json::from_value(model.parents_id)
+        .map_err(|_| MegaError::Other("invalid import commit parents".into()))?;
+    let signature = |value: Option<String>, what: &str| {
+        let value = value.ok_or_else(|| MegaError::Other(format!("missing import {what}")))?;
+        Signature::from_data(value.into_bytes())
+            .map_err(|_| MegaError::Other(format!("invalid import {what}")))
+    };
+    Ok(Commit {
+        id: parse_hash(&model.commit_id, "commit")?,
+        tree_id: parse_hash(&model.tree, "tree")?,
+        parent_commit_ids: parents
+            .iter()
+            .map(|value| parse_hash(value, "parent"))
+            .collect::<Result<_, _>>()?,
+        author: signature(model.author, "author")?,
+        committer: signature(model.committer, "committer")?,
+        message: model
+            .content
+            .ok_or_else(|| MegaError::Other("missing import commit body".into()))?,
+    })
+}
+
+/// Kind-explicit counterpart of `FromGitModel for Tree`.
+pub fn tree_from_git_model_with_kind(
+    model: git_tree::Model,
+    kind: HashKind,
+) -> Result<Tree, MegaError> {
+    let id = ObjectHash::from_hex_for_kind(kind, &model.tree_id)
+        .map_err(|_| MegaError::Other("invalid import tree identity".into()))?;
+    Tree::from_bytes(&model.sub_trees, id)
+        .map_err(|_| MegaError::Other("invalid import tree body".into()))
+}
+
 pub fn commit_from_mega_model_with_kind(
     model: mega_commit::Model,
     kind: HashKind,

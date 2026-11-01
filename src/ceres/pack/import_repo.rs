@@ -243,6 +243,7 @@ impl RepoHandler for ImportRepo {
         have: Vec<String>,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
         let mut want_clone = want.clone();
+        let kind = self.object_hash_kind()?;
         let pack_config = &self.storage.config().pack;
         let storage = self.storage.git_db_storage();
         let obj_num = AtomicUsize::new(0);
@@ -254,8 +255,11 @@ impl RepoHandler for ImportRepo {
             .await
             .unwrap()
             .into_iter()
-            .map(Commit::from_git_model)
-            .collect();
+            .map(|model| {
+                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
         let mut traversal_list: Vec<Commit> = want_commits.clone();
 
         // traverse commit's all parents to find the commit that client does not have
@@ -264,13 +268,16 @@ impl RepoHandler for ImportRepo {
                 let p_commit_id = p_commit_id.to_string();
 
                 if !have.contains(&p_commit_id) && !want_clone.contains(&p_commit_id) {
-                    let parent: Commit = Commit::from_git_model(
-                        storage
-                            .get_commit_by_hash(self.repo.repo_id, &p_commit_id)
-                            .await
-                            .unwrap()
-                            .unwrap(),
-                    );
+                    let parent: Commit =
+                        crate::jupiter::utils::converter::commit_from_git_model_with_kind(
+                            storage
+                                .get_commit_by_hash(self.repo.repo_id, &p_commit_id)
+                                .await
+                                .unwrap()
+                                .unwrap(),
+                            kind,
+                        )
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
                     want_commits.push(parent.clone());
                     want_clone.push(p_commit_id);
                     traversal_list.push(parent);
@@ -278,7 +285,6 @@ impl RepoHandler for ImportRepo {
             }
         }
 
-        let hash_kind = self.object_hash_kind()?;
         let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
         let want_trees: HashMap<ObjectHash, Tree> = storage
             .get_trees_by_hashes(self.repo.repo_id, want_tree_ids)
@@ -286,12 +292,14 @@ impl RepoHandler for ImportRepo {
             .unwrap()
             .into_iter()
             .map(|m| {
-                (
-                    ObjectHash::from_hex_for_kind(hash_kind, &m.tree_id).unwrap(),
-                    Tree::from_git_model(m),
-                )
+                Ok((
+                    ObjectHash::from_hex_for_kind(kind, &m.tree_id)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?,
+                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(m, kind)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?,
+                ))
             })
-            .collect();
+            .collect::<Result<HashMap<_, _>, GitError>>()?;
 
         obj_num.fetch_add(want_commits.len(), Ordering::SeqCst);
 
@@ -307,9 +315,12 @@ impl RepoHandler for ImportRepo {
             .await
             .unwrap();
         // traverse to get exist_objs
+        let kind = self.object_hash_kind()?;
         for have_tree in have_trees {
-            self.traverse(Tree::from_git_model(have_tree), &mut exist_objs, None)
-                .await?;
+            let have_tree =
+                crate::jupiter::utils::converter::tree_from_git_model_with_kind(have_tree, kind)
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+            self.traverse(have_tree, &mut exist_objs, None).await?;
         }
 
         let mut counted_obj = HashSet::new();
@@ -372,8 +383,13 @@ impl RepoHandler for ImportRepo {
             .await
             .unwrap()
             .into_iter()
-            .map(Tree::from_git_model)
-            .collect())
+            .map(|model| {
+                crate::jupiter::utils::converter::tree_from_git_model_with_kind(
+                    model,
+                    self.object_hash_kind()?,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     async fn get_blobs_by_hashes(
@@ -515,19 +531,27 @@ pub(crate) async fn collect_git_blob_filepaths(
     repo_id: i64,
     tree: Tree,
     path: PathBuf,
+    kind: HashKind,
 ) -> Result<Vec<(String, String)>, MegaError> {
     let mut pairs = Vec::new();
     for item in tree.tree_items {
         if item.is_tree() {
-            let child = Tree::from_git_model(
+            let child = crate::jupiter::utils::converter::tree_from_git_model_with_kind(
                 storage
                     .get_tree_by_hash(repo_id, &item.id.to_string())
                     .await?
                     .ok_or_else(|| MegaError::NotFound(format!("tree {}", item.id)))?,
-            );
+                kind,
+            )?;
             pairs.extend(
-                collect_git_blob_filepaths(storage.clone(), repo_id, child, path.join(item.name))
-                    .await?,
+                collect_git_blob_filepaths(
+                    storage.clone(),
+                    repo_id,
+                    child,
+                    path.join(item.name),
+                    kind,
+                )
+                .await?,
             );
         } else {
             pairs.push((
@@ -778,8 +802,11 @@ impl ImportRepo {
                         .get_tree_by_hash(self.repo.repo_id, &hash)
                         .await?
                         .ok_or(TracesError::ObjectIntegrity)?;
-                    self.collect_code_tree_objects(Tree::from_git_model(child), authorized)
-                        .await?;
+                    let child = crate::jupiter::utils::converter::tree_from_git_model_with_kind(
+                        child,
+                        self.object_hash_kind()?,
+                    )?;
+                    self.collect_code_tree_objects(child, authorized).await?;
                 }
                 TreeItemMode::Blob | TreeItemMode::BlobExecutable | TreeItemMode::Link => {
                     authorized.insert(hash);
@@ -822,7 +849,11 @@ impl ImportRepo {
                     .get_tree_by_hash(self.repo.repo_id, &object_id)
                     .await?
             {
-                self.collect_code_tree_objects(Tree::from_git_model(tree), &mut authorized)
+                let tree = crate::jupiter::utils::converter::tree_from_git_model_with_kind(
+                    tree,
+                    self.object_hash_kind()?,
+                )?;
+                self.collect_code_tree_objects(tree, &mut authorized)
                     .await?;
             }
         }
@@ -833,7 +864,11 @@ impl ImportRepo {
                     .get_tree_by_hash(self.repo.repo_id, &commit.tree)
                     .await?
                     .ok_or(TracesError::ObjectIntegrity)?;
-                self.collect_code_tree_objects(Tree::from_git_model(tree), &mut authorized)
+                let tree = crate::jupiter::utils::converter::tree_from_git_model_with_kind(
+                    tree,
+                    self.object_hash_kind()?,
+                )?;
+                self.collect_code_tree_objects(tree, &mut authorized)
                     .await?;
             }
         }
@@ -910,19 +945,29 @@ impl ImportRepo {
             return Ok(Vec::new());
         }
         let git_db = self.storage.git_db_storage();
-        let commit = Commit::from_git_model(
+        let kind = self.object_hash_kind()?;
+        let commit = crate::jupiter::utils::converter::commit_from_git_model_with_kind(
             git_db
                 .get_commit_by_hash(self.repo.repo_id, &current_head)
                 .await?
                 .ok_or_else(|| MegaError::NotFound(format!("commit {current_head}")))?,
-        );
-        let root_tree = Tree::from_git_model(
+            kind,
+        )?;
+        let root_tree = crate::jupiter::utils::converter::tree_from_git_model_with_kind(
             git_db
                 .get_tree_by_hash(self.repo.repo_id, &commit.tree_id.to_string())
                 .await?
                 .ok_or_else(|| MegaError::NotFound(format!("tree {}", commit.tree_id)))?,
-        );
-        collect_git_blob_filepaths(git_db, self.repo.repo_id, root_tree, PathBuf::new()).await
+            kind,
+        )?;
+        collect_git_blob_filepaths(
+            git_db,
+            self.repo.repo_id,
+            root_tree,
+            PathBuf::new(),
+            self.object_hash_kind()?,
+        )
+        .await
     }
 
     /// `IMPORT_REPO_REMOVED` when the repository is gone (the sweep took the
@@ -1709,6 +1754,65 @@ mod tests {
         ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, TransactionTrait,
     };
 
+    // --- FIX-MTR-17: ImportRepo conversion is kind-explicit ---
+
+    /// A `git_tree::Model` row whose body carries one blob entry of `kind`'s
+    /// width, plus the id the configured algorithm must produce.
+    fn tree_row(
+        kind: git_internal::hash::HashKind,
+        name: &str,
+    ) -> (
+        crate::callisto::git_tree::Model,
+        git_internal::hash::ObjectHash,
+    ) {
+        let blob = Blob::from_content_with_kind(kind, "import payload").expect("blob");
+        let item = TreeItem::new(TreeItemMode::Blob, blob.id, name.to_string());
+        let tree = Tree::from_tree_items_with_kind(kind, vec![item]).expect("tree");
+        let row = crate::callisto::git_tree::Model {
+            id: 0,
+            repo_id: 0,
+            tree_id: tree.id.to_string(),
+            sub_trees: tree.to_data().expect("tree body"),
+            size: 0,
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        };
+        (row, tree.id)
+    }
+
+    #[test]
+    fn import_hash_tree_conversion_matches_each_algorithm() {
+        use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+
+        let _tls = set_hash_kind_for_test(HashKind::Sha1);
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let (row, expected) = tree_row(kind, "lib");
+            let tree =
+                crate::jupiter::utils::converter::tree_from_git_model_with_kind(row.clone(), kind)
+                    .expect("kind-explicit tree conversion");
+            assert_eq!(tree.id, expected, "FIX17_AC1 tree id for {kind:?}");
+            assert_eq!(tree.id.kind(), kind);
+            assert_eq!(get_hash_kind(), HashKind::Sha1, "FIX17_AC7 tls unchanged");
+        }
+    }
+
+    #[test]
+    fn import_hash_invalid_tree_metadata_is_rejected() {
+        use git_internal::hash::HashKind;
+
+        let (mut row, _) = tree_row(HashKind::Sha256, "lib");
+        // A SHA-1 width body cannot parse as a SHA-256 tree.
+        let mut body = b"100644 lib\x00".to_vec();
+        body.extend(std::iter::repeat_n(0u8, 20));
+        row.sub_trees = body;
+        assert!(
+            crate::jupiter::utils::converter::tree_from_git_model_with_kind(row, HashKind::Sha256)
+                .is_err(),
+            "FIX17_AC2 invalid tree metadata must be rejected"
+        );
+    }
+
     use super::{
         ImportRepo, RemoveOutcome, RowSweep, SWEEP_STATEMENT_BUDGET, collect_git_blob_filepaths,
         detach_import_repo, remove_import_repo, sweep_ledger_row,
@@ -2012,10 +2116,15 @@ mod tests {
                 .unwrap()
                 .unwrap(),
         );
-        let mut pairs =
-            collect_git_blob_filepaths(stg.clone(), repo_id, loaded_root, PathBuf::new())
-                .await
-                .unwrap();
+        let mut pairs = collect_git_blob_filepaths(
+            stg.clone(),
+            repo_id,
+            loaded_root,
+            PathBuf::new(),
+            git_internal::hash::HashKind::Sha1,
+        )
+        .await
+        .unwrap();
         pairs.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
             pairs,
