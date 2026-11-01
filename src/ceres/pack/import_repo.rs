@@ -216,12 +216,40 @@ impl RepoHandler for ImportRepo {
 
     /// `include-tag` support: tags are attached only when the authorised ref
     /// view still advertises them and their target is inside the closure.
+    fn supports_filtered_fetch(&self) -> bool {
+        true
+    }
+
+    async fn filtered_pack(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        filter_spec: &str,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        if filter_spec != "blob:none" {
+            return Err(GitError::CustomError(format!(
+                "unsupported filter spec: {filter_spec}"
+            )));
+        }
+        // Filtered incremental fetch is not implemented: the incremental planner
+        // subtracts whole trees, so filtering it would silently ship blobs the
+        // client asked not to receive.
+        if !have.is_empty() {
+            return Err(GitError::CustomError(
+                "filtered incremental fetch is not supported".to_owned(),
+            ));
+        }
+        // Tags are not attached under a filter: a tag pointing at a withheld blob
+        // would arrive without its target.
+        self.full_pack_with_extra(want, false, true).await
+    }
+
     fn supports_include_tag(&self) -> bool {
         true
     }
 
     async fn full_pack(&self, want: Vec<String>) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.full_pack_with_extra(want, false).await
+        self.full_pack_with_extra(want, false, false).await
     }
 
     async fn full_pack_with_options(
@@ -229,7 +257,7 @@ impl RepoHandler for ImportRepo {
         want: Vec<String>,
         include_tag: bool,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.full_pack_with_extra(want, include_tag).await
+        self.full_pack_with_extra(want, include_tag, false).await
     }
 
     async fn incremental_pack(
@@ -809,6 +837,7 @@ impl ImportRepo {
         &self,
         want: Vec<String>,
         include_tag: bool,
+        filter_blobs: bool,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
         let pack_config = &self.storage.config().pack;
         let storage = self.storage.git_db_storage();
@@ -1007,6 +1036,11 @@ impl ImportRepo {
         let entries: Vec<_> = all_entries
             .into_iter()
             .filter(|entry| keep.contains(&entry.inner.hash.to_string()))
+            .filter(|entry| {
+                !filter_blobs
+                    || entry.inner.obj_type
+                        != git_internal::internal::object::types::ObjectType::Blob
+            })
             .collect();
         let total = entries.len();
 

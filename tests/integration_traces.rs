@@ -5620,6 +5620,36 @@ mod disabled_http {
                 }
             }
 
+            // AC-4 on the card's own axis: an ImportRepo served from
+            // `/third-party` must also withhold blobs over v2 blob:none.
+            let import_url =
+                git_cli::mega2_http_url(fixture.port, "/third-party/mtr94-control.git");
+            fixture.git(&[
+                "-c",
+                "protocol.version=2",
+                "clone",
+                "--no-checkout",
+                "--filter=blob:none",
+                &import_url,
+                "iso-import-blobless",
+            ]);
+            let import_types = fixture.git_text(&[
+                "-C",
+                "iso-import-blobless",
+                "cat-file",
+                "--batch-check=%(objecttype)",
+                "--batch-all-objects",
+            ]);
+            let import_blobs = import_types
+                .lines()
+                .filter(|kind| kind.trim() == "blob")
+                .count();
+            eprintln!("FIX13_AC4_IMPORT_FILTERED blobs={import_blobs}");
+            assert_eq!(
+                import_blobs, 0,
+                "FIX13_AC4 an ImportRepo must withhold every blob under v2 blob:none"
+            );
+
             // Object integrity per arm. `fsck` must only run on arms that are
             // not partial clones: in a promisor clone `fsck` lazily fetches the
             // objects it is asked to check, which would both mask a filtering
