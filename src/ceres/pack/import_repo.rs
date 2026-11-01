@@ -563,6 +563,12 @@ impl ImportRepo {
             if !counted_roots.insert(c.tree_id.to_string()) {
                 continue;
             }
+            // The emission loop skips a tree the client already has, so counting
+            // has to skip it as well; otherwise the header advertises one more
+            // object than the pack carries.
+            if exist_objs.contains(&c.tree_id.to_string()) {
+                continue;
+            }
             self.traverse_for_count(
                 want_trees
                     .get(&c.tree_id)
@@ -606,7 +612,7 @@ impl ImportRepo {
                     // Fixed point over the evolving emitted set, so nested tag
                     // chains attach regardless of row order.
                     if authorised_tag_ids.contains(&tag_id)
-                        && (counted_obj.contains(&target) || want_clone.contains(&target))
+                        && counted_obj.contains(&target)
                         && !tag_entries.iter().any(|existing| existing.id == tag.id)
                     {
                         tag_entries.push(tag);
