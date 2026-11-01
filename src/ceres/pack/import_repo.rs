@@ -216,6 +216,19 @@ impl RepoHandler for ImportRepo {
 
     /// `include-tag` support: tags are attached only when the authorised ref
     /// view still advertises them and their target is inside the closure.
+    fn supports_shallow_fetch(&self) -> bool {
+        true
+    }
+
+    async fn shallow_pack(
+        &self,
+        want: Vec<String>,
+        depth: u32,
+        _deepen_relative: bool,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        self.shallow_pack_inner(want, depth).await
+    }
+
     fn supports_filtered_fetch(&self) -> bool {
         true
     }
@@ -467,6 +480,119 @@ pub(crate) async fn collect_git_blob_filepaths(
 }
 
 impl ImportRepo {
+    /// Depth-limited pack: only the commits within `depth` levels of the wants are
+    /// planned, and the commits just beyond that boundary are reported so the
+    /// protocol can advertise them as shallow points.
+    async fn shallow_pack_inner(
+        &self,
+        want: Vec<String>,
+        depth: u32,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        let pack_config = &self.storage.config().pack;
+        let storage = self.storage.git_db_storage();
+        let git_service = self.storage.git_service.clone();
+        let kind = self.object_hash_kind()?;
+        let repo_id = self.repo.repo_id;
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut level: Vec<Commit> = storage
+            .get_commits_by_hashes(repo_id, &want)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?
+            .into_iter()
+            .map(|model| {
+                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        for commit in &level {
+            seen.insert(commit.id.to_string());
+        }
+        let mut commits: Vec<Commit> = level.clone();
+        let mut boundary: Vec<String> = Vec::new();
+
+        for step in 0..depth {
+            let mut next: Vec<Commit> = Vec::new();
+            for commit in &level {
+                for parent_id in &commit.parent_commit_ids {
+                    let parent_id = parent_id.to_string();
+                    if !seen.insert(parent_id.clone()) {
+                        continue;
+                    }
+                    if step + 1 == depth {
+                        // The parent lies beyond the requested depth: it becomes a
+                        // shallow boundary and is not packed.
+                        boundary.push(parent_id);
+                        continue;
+                    }
+                    let model = storage
+                        .get_commit_by_hash(repo_id, &parent_id)
+                        .await
+                        .map_err(|e| GitError::CustomError(e.to_string()))?
+                        .ok_or_else(|| {
+                            GitError::CustomError(format!(
+                                "import parent commit {parent_id} not found"
+                            ))
+                        })?;
+                    let parent: Commit =
+                        crate::jupiter::utils::converter::commit_from_git_model_with_kind(
+                            model, kind,
+                        )
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
+                    next.push(parent.clone());
+                    commits.push(parent);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            level = next;
+        }
+
+        let mut keep: HashSet<String> = commits.iter().map(|c| c.id.to_string()).collect();
+        let tree_ids: Vec<String> = commits.iter().map(|c| c.tree_id.to_string()).collect();
+        for commit in &commits {
+            keep.insert(commit.tree_id.to_string());
+        }
+        let trees = storage
+            .get_trees_by_hashes(repo_id, tree_ids)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let obj_num = AtomicUsize::new(0);
+        let mut counted: HashSet<String> = HashSet::new();
+        let nothing: HashSet<String> = HashSet::new();
+        for model in trees {
+            let tree = crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            self.traverse_for_count(tree, &nothing, &mut counted, &obj_num)
+                .await?;
+        }
+        keep.extend(counted);
+
+        let all_entries = collect_objects(repo_id, git_service, storage, kind)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let entries: Vec<_> = all_entries
+            .into_iter()
+            .filter(|entry| keep.contains(&entry.inner.hash.to_string()))
+            .collect();
+        let total = entries.len();
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new_with_hash_kind(kind, total, 0, stream_tx);
+        encoder.encode_async(entry_rx).await?;
+        tokio::spawn(async move {
+            for entry in entries {
+                if entry_tx.send(entry).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok((ReceiverStream::new(stream_rx), boundary))
+    }
+
     /// Stable fingerprint of a repository's refs, used to detect a ref change
     /// between authorization and pack construction.
     async fn ref_fingerprint(
