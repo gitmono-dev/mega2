@@ -461,6 +461,11 @@ impl ImportRepo {
         have: Vec<String>,
         include_tag: bool,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        // Same binding as the full path: a ref that changes between authorization
+        // and pack construction must not be served from the stale view.
+        let refs_before = Self::ref_fingerprint(&self.storage.git_db_storage(), self.repo.repo_id)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
         let mut want_clone = want.clone();
         let kind = self.object_hash_kind()?;
         let pack_config = &self.storage.config().pack;
@@ -609,6 +614,15 @@ impl ImportRepo {
                 }
             }
             obj_num.fetch_add(tag_entries.len(), Ordering::SeqCst);
+        }
+
+        let refs_after = Self::ref_fingerprint(&storage, self.repo.repo_id)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        if refs_before != refs_after {
+            return Err(GitError::CustomError(
+                "refs changed while building the pack; retry the fetch".to_owned(),
+            ));
         }
 
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
