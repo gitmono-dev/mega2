@@ -5591,6 +5591,49 @@ mod disabled_http {
                 // promisor-missing blobs, which would defeat the blob:none arm.
                 fixture.git(&["-C", dir, "fsck", "--strict"]);
             }
+            // AC-2 at the code-path view: an incremental fetch must transfer only
+            // what the client lacks. Advance the upstream from the default clone,
+            // then fetch back and compare the object counts.
+            let before = fixture
+                .git_text(&["-C", "iso-default", "rev-list", "--objects", "--all"])
+                .lines()
+                .count();
+            std::fs::write(
+                fixture.shared.path().join("iso-default/advance.txt"),
+                b"FIX13 incremental\n",
+            )
+            .expect("write incremental file");
+            fixture.git(&["-C", "iso-default", "add", "advance.txt"]);
+            fixture.git(&[
+                "-C",
+                "iso-default",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "FIX13 incremental advance",
+            ]);
+            fixture.git(&["-C", "iso-default", "push", &url, "HEAD:refs/heads/main"]);
+            fixture.git(&["-C", "iso-no-tags", "fetch", "origin"]);
+            let after = fixture
+                .git_text(&["-C", "iso-no-tags", "rev-list", "--objects", "--all"])
+                .lines()
+                .count();
+            eprintln!("FIX13_AC2_INCREMENTAL before={before} after={after}");
+            assert!(
+                after > before,
+                "FIX13_AC2 the incremental fetch must bring the new commit"
+            );
+            // The fetched delta must be the new commit plus its tree and blob.
+            assert_eq!(
+                after - before,
+                3,
+                "FIX13_AC2 incremental fetch must transfer exactly the new objects"
+            );
         })
         .catch_unwind()
         .await;
