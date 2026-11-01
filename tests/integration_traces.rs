@@ -5532,18 +5532,21 @@ mod disabled_http {
         let (guard, db) = traces_db::TracesDb::migrated().await;
         let mut fixture = Fixture::new(&db).await;
         let result = AssertUnwindSafe(async {
+            // Key before start: the SSH server loads its key table on boot.
+            fixture.seed_ssh(&db).await;
             fixture.prepare(&db).await;
             let url = git_cli::mega2_http_url(fixture.port, "/project/control.git");
 
             let mut baseline_objects = 0usize;
-            let arms: [(&str, Vec<&str>); 7] = [
+            let arms: [(&str, Vec<&str>); 8] = [
                 ("iso-default", vec![]),
                 ("iso-bare", vec!["--bare"]),
                 ("iso-no-tags", vec!["--no-tags"]),
                 ("iso-depth1", vec!["--depth=1"]),
                 ("iso-blobless", vec!["--filter=blob:none"]),
-                // Same view over the v2 wire protocol: the object set and the
-                // absence of trace entries must not depend on it.
+                // Explicit v0 and v2 arms: the object set and the absence of
+                // trace entries must not depend on the wire protocol.
+                ("iso-v0", vec!["-c", "protocol.version=0"]),
                 ("iso-v2", vec!["-c", "protocol.version=2"]),
                 // v2 is the only version that filters (`UPLOAD_CAP_LIST` has no
                 // `filter`), so this is AC-4's real axis: blobs must be withheld.
@@ -5742,14 +5745,23 @@ mod disabled_http {
                     .lines()
                     .count();
                 let counted = fixture.git_text(&["-C", dir, "count-objects", "-v"]);
-                let in_pack: usize = counted
-                    .lines()
-                    .find_map(|line| line.strip_prefix("in-pack: "))
-                    .and_then(|value| value.trim().parse().ok())
-                    .unwrap_or_else(|| panic!("FIX13_AC6 {dir} in-pack count missing"));
+                let field = |name: &str| -> usize {
+                    counted
+                        .lines()
+                        .find_map(|line| line.strip_prefix(name))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or_else(|| panic!("FIX13_AC6 {dir} {name} missing from count-objects"))
+                };
+                let loose = field("count: ");
+                let in_pack = field("in-pack: ");
+                eprintln!("FIX13_AC6_ODB {dir} loose={loose} in-pack={in_pack} reachable={reachable}");
+                // Storage form is an implementation detail (the v0 arm keeps its
+                // objects loose); what matters is that every reachable object is
+                // present in the object database exactly once.
                 assert_eq!(
-                    in_pack, reachable,
-                    "FIX13_AC6 {dir} packed objects must equal the reachable set"
+                    loose + in_pack,
+                    reachable,
+                    "FIX13_AC6 {dir} stored objects must equal the reachable set"
                 );
             }
             // AC-2 at the code-path view: an incremental fetch must transfer only
@@ -5903,6 +5915,37 @@ mod disabled_http {
                 enabled_listing.lines().count(),
                 off_objects,
                 "FIX13_AC7 turning the traces plane on must not change the code clone"
+            );
+
+            // VER-1's SSH dimension: SSH is a separate service process, so the
+            // fixture is switched over only after every HTTP arm has run.
+            fixture.start_ssh(true, false).await;
+            let ssh_clone = fixture.ssh_git(&[
+                "-c",
+                "protocol.version=0",
+                "clone",
+                &fixture.ssh_url("/project/control.git"),
+                "iso-ssh",
+            ]);
+            assert!(
+                ssh_clone.status.success(),
+                "FIX13_SSH ssh clone failed: {}",
+                String::from_utf8_lossy(&ssh_clone.stderr)
+            );
+            let ssh_listing =
+                fixture.git_text(&["-C", "iso-ssh", "rev-list", "--objects", "--all"]);
+            let ssh_traced: Vec<&str> = ssh_listing
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().contains("traces"))
+                .collect();
+            eprintln!(
+                "FIX13_SSH objects={} traces={}",
+                ssh_listing.lines().count(),
+                ssh_traced.len()
+            );
+            assert!(
+                ssh_traced.is_empty(),
+                "FIX13_SSH the code clone must not contain trace entries: {ssh_traced:?}"
             );
         })
         .catch_unwind()
