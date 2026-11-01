@@ -474,6 +474,32 @@ impl ImportRepo {
 
         let mut exist_objs = HashSet::new();
 
+        // A client may fetch a tag directly; peel it so the commit behind it is
+        // planned and emitted rather than arriving as an unaccompanied tag.
+        let tag_models = storage
+            .get_tags_by_repo_id(self.repo.repo_id)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let mut tags_by_id: HashMap<String, Tag> = HashMap::new();
+        for model in tag_models {
+            let tag: Tag =
+                crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+            tags_by_id.insert(tag.id.to_string(), tag);
+        }
+        for id in want.clone() {
+            let mut cursor = Some(id);
+            while let Some(current) = cursor.take() {
+                if let Some(tag) = tags_by_id.get(&current) {
+                    let target = tag.object_hash.to_string();
+                    if !want_clone.contains(&target) {
+                        want_clone.push(target.clone());
+                    }
+                    cursor = tags_by_id.get(&target).map(|inner| inner.id.to_string());
+                }
+            }
+        }
+
         let mut want_commits: Vec<Commit> = storage
             .get_commits_by_hashes(self.repo.repo_id, &want_clone)
             .await
@@ -577,6 +603,39 @@ impl ImportRepo {
             }
         }
 
+        // A client may fetch a blob directly. Materialise it before the encoder
+        // is sized, exactly like the full path, so an id that cannot be loaded
+        // fails the request instead of truncating the pack mid-stream.
+        let known: HashSet<String> = want_commits
+            .iter()
+            .map(|c| c.id.to_string())
+            .chain(want_trees.values().map(|t| t.id.to_string()))
+            .chain(extra_trees.iter().map(|t| t.id.to_string()))
+            .chain(tags_by_id.keys().cloned())
+            .collect();
+        let blob_want_ids: Vec<String> = want_clone
+            .iter()
+            .filter(|id| !known.contains(*id))
+            .cloned()
+            .collect();
+        let mut extra_blobs: Vec<Blob> = Vec::new();
+        if !blob_want_ids.is_empty() {
+            let mut blobs = self.storage.git_service.get_objects_stream(blob_want_ids);
+            while let Some(item) = blobs.next().await {
+                let (_, stream, _) = item.map_err(|e| GitError::CustomError(e.to_string()))?;
+                let data = stream
+                    .try_fold(Vec::new(), |mut acc, bytes| async move {
+                        acc.extend_from_slice(&bytes);
+                        Ok(acc)
+                    })
+                    .await
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+                let blob = Blob::from_content_bytes_with_kind(kind, data)
+                    .map_err(|e| MegaError::Other(e.to_string()))?;
+                extra_blobs.push(blob);
+            }
+        }
+
         let mut counted_obj = HashSet::new();
         let mut counted_roots = HashSet::new();
         // traverse for get obj nums; shared commit trees counted once
@@ -605,6 +664,10 @@ impl ImportRepo {
                 &obj_num,
             )
             .await?;
+        }
+        obj_num.fetch_add(extra_blobs.len(), Ordering::SeqCst);
+        for blob in &extra_blobs {
+            counted_obj.insert(blob.id.to_string());
         }
         for tree in &extra_trees {
             if exist_objs.contains(&tree.id.to_string()) {
@@ -718,6 +781,15 @@ impl ImportRepo {
                 self.traverse(tree, &mut exist_objs, Some(&entry_tx))
                     .await?;
             }
+        }
+        for blob in extra_blobs {
+            entry_tx
+                .send(MetaAttached {
+                    inner: blob.into(),
+                    meta: EntryMeta::default(),
+                })
+                .await
+                .map_err(|e| MegaError::Other(format!("pack blob entry send failed: {e}")))?;
         }
         for tag in tag_entries {
             entry_tx
