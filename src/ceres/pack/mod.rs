@@ -220,7 +220,13 @@ pub trait RepoHandler: Send + Sync + 'static {
                     )));
                 }
                 Err(join_err) => {
-                    tracing::error!("Task {} panic or cancle: {:?}", i, join_err);
+                    // A panicked or cancelled save task must fail the receive: its
+                    // entries were never persisted, and continuing would report a
+                    // success the object store cannot back.
+                    tracing::error!("Task {} panic or cancel: {:?}", i, join_err);
+                    return Err(MegaError::Other(format!(
+                        "save entry task {i} panicked or was cancelled: {join_err}"
+                    )));
                 }
             }
         }
