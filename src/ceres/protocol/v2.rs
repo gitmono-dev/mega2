@@ -368,13 +368,13 @@ pub(crate) async fn handle_v2_fetch_with_handler(
 
     let pack_data = if let Some(ref spec) = filter_spec {
         repo_handler
-            .filtered_pack(want.clone(), have.clone(), spec)
+            .filtered_pack_with_options(want.clone(), have.clone(), spec, include_tag)
             .await
             .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?
     } else if have.is_empty() {
         if let Some(depth) = deepen_depth {
             let (stream, shallows) = repo_handler
-                .shallow_pack(want, depth, deepen_relative)
+                .shallow_pack_with_options(want, depth, deepen_relative, include_tag)
                 .await
                 .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
             shallow_commits = shallows;

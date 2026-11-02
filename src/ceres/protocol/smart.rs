@@ -328,7 +328,7 @@ impl SmartSession {
             repo_handler.prepare_pack(&want, &have).await?;
             if let Some(depth) = deepen_depth {
                 let (stream, shallow_commits) = repo_handler
-                    .shallow_pack(want, depth, deepen_relative)
+                    .shallow_pack_with_options(want, depth, deepen_relative, include_tag)
                     .await
                     .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
                 pack_data = stream;

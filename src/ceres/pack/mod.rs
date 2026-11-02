@@ -389,6 +389,29 @@ pub trait RepoHandler: Send + Sync + 'static {
         self.incremental_pack(want, have).await
     }
 
+    /// Shallow pack carrying the request's `include-tag` option. The default
+    /// ignores the option, so handlers that have not opted in keep their behaviour.
+    async fn shallow_pack_with_options(
+        &self,
+        want: Vec<String>,
+        depth: u32,
+        deepen_relative: bool,
+        _include_tag: bool,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        self.shallow_pack(want, depth, deepen_relative).await
+    }
+
+    /// Filtered pack carrying the request's `include-tag` option.
+    async fn filtered_pack_with_options(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        filter_spec: &str,
+        _include_tag: bool,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        self.filtered_pack(want, have, filter_spec).await
+    }
+
     /// Whether this handler implements `filter` partial clone (e.g. `blob:none`).
     /// The default trait `filtered_pack` silently falls back to
     /// `incremental_pack`, so the default here is `false`. Handlers that
@@ -717,6 +740,7 @@ mod status_mapping_tests {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use std::{
         io::Cursor,

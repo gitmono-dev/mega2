@@ -223,7 +223,17 @@ impl RepoHandler for ImportRepo {
         depth: u32,
         _deepen_relative: bool,
     ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
-        self.shallow_pack_inner(want, depth).await
+        self.shallow_pack_inner(want, depth, false).await
+    }
+
+    async fn shallow_pack_with_options(
+        &self,
+        want: Vec<String>,
+        depth: u32,
+        _deepen_relative: bool,
+        include_tag: bool,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        self.shallow_pack_inner(want, depth, include_tag).await
     }
 
     fn supports_filtered_fetch(&self) -> bool {
@@ -236,22 +246,19 @@ impl RepoHandler for ImportRepo {
         have: Vec<String>,
         filter_spec: &str,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        if filter_spec != "blob:none" {
-            return Err(GitError::CustomError(format!(
-                "unsupported filter spec: {filter_spec}"
-            )));
-        }
-        // Filtered incremental fetch is not implemented: the incremental planner
-        // subtracts whole trees, so filtering it would silently ship blobs the
-        // client asked not to receive.
-        if !have.is_empty() {
-            return Err(GitError::CustomError(
-                "filtered incremental fetch is not supported".to_owned(),
-            ));
-        }
-        // Tags are not attached under a filter: a tag pointing at a withheld blob
-        // would arrive without its target.
-        self.full_pack_with_extra(want, false, true).await
+        self.filtered_pack_inner(want, have, filter_spec, false)
+            .await
+    }
+
+    async fn filtered_pack_with_options(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        filter_spec: &str,
+        include_tag: bool,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        self.filtered_pack_inner(want, have, filter_spec, include_tag)
+            .await
     }
 
     fn supports_include_tag(&self) -> bool {
@@ -477,6 +484,126 @@ pub(crate) async fn collect_git_blob_filepaths(
 }
 
 impl ImportRepo {
+    async fn filtered_pack_inner(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        filter_spec: &str,
+        include_tag: bool,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        if filter_spec != "blob:none" {
+            return Err(GitError::CustomError(format!(
+                "unsupported filter spec: {filter_spec}"
+            )));
+        }
+        // Filtered incremental fetch is not implemented: the incremental planner
+        // subtracts whole trees, so filtering it would silently ship blobs the
+        // client asked not to receive.
+        if !have.is_empty() {
+            return Err(GitError::CustomError(
+                "filtered incremental fetch is not supported".to_owned(),
+            ));
+        }
+        // Tag attachment under a filter is allowed, but the helper skips tags whose
+        // target is a withheld blob, since those would arrive without their target.
+        self.full_pack_with_extra(want, include_tag, true).await
+    }
+
+    /// Attach authorised tags to a set of already-planned object ids.
+    ///
+    /// Roots are tags whose **own ref** is authorised; nested chains come along as
+    /// tag -> tag dependencies of those roots, so an unauthorised tag can never be
+    /// pulled in through its target. Used by the full and shallow planners, which
+    /// both work on an id set rather than on a materialised entry list.
+    async fn attach_authorised_tags(
+        &self,
+        storage: &crate::jupiter::storage::git_db_storage::GitDbStorage,
+        kind: HashKind,
+        repo_id: i64,
+        keep: &mut HashSet<String>,
+        filter_blobs: bool,
+    ) -> Result<(), GitError> {
+        let refs = storage
+            .get_ref(repo_id)
+            .await
+            .map_err(|e| super::pack_error_from_mega(&e))?;
+        let authorised_tag_ids: HashSet<String> = refs
+            .iter()
+            .filter(|row| row.ref_name.starts_with("refs/tags/"))
+            .map(|row| row.ref_git_id.clone())
+            .collect();
+        if authorised_tag_ids.is_empty() {
+            return Ok(());
+        }
+        let models = storage
+            .get_tags_by_repo_id(repo_id)
+            .await
+            .map_err(|e| super::pack_error_from_mega(&e))?;
+        let mut known_tags: HashMap<String, Tag> = HashMap::new();
+        for model in models {
+            let tag: Tag =
+                crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+            known_tags.insert(tag.id.to_string(), tag);
+        }
+        let mut candidates: HashSet<String> = authorised_tag_ids
+            .iter()
+            .filter(|id| known_tags.contains_key(*id))
+            .cloned()
+            .collect();
+        let mut frontier: Vec<String> = candidates.iter().cloned().collect();
+        while let Some(tag_id) = frontier.pop() {
+            let Some(tag) = known_tags.get(&tag_id) else {
+                continue;
+            };
+            let target = tag.object_hash.to_string();
+            if let Some(inner) = known_tags.get(&target) {
+                if candidates.insert(inner.id.to_string()) {
+                    frontier.push(inner.id.to_string());
+                }
+            }
+        }
+        loop {
+            let mut progressed = false;
+            for tag_id in candidates.clone() {
+                let Some(tag) = known_tags.get(&tag_id) else {
+                    continue;
+                };
+                if keep.contains(&tag_id) {
+                    continue;
+                }
+                let target = tag.object_hash.to_string();
+                if !keep.contains(&target) {
+                    continue;
+                }
+                // Under a filter, a tag whose target is a withheld blob must not be
+                // attached: it would arrive without the object it points at.
+                if filter_blobs {
+                    let is_commit = storage
+                        .get_commit_by_hash(repo_id, &target)
+                        .await
+                        .map_err(|e| super::pack_error_from_mega(&e))?
+                        .is_some();
+                    let is_tree = !is_commit
+                        && storage
+                            .get_tree_by_hash(repo_id, &target)
+                            .await
+                            .map_err(|e| super::pack_error_from_mega(&e))?
+                            .is_some();
+                    if !is_commit && !is_tree {
+                        continue;
+                    }
+                }
+                keep.insert(tag_id);
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Depth-limited pack: only the commits within `depth` levels of the wants are
     /// planned, and the commits just beyond that boundary are reported so the
     /// protocol can advertise them as shallow points.
@@ -484,6 +611,7 @@ impl ImportRepo {
         &self,
         want: Vec<String>,
         depth: u32,
+        include_tag: bool,
     ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
         let pack_config = &self.storage.config().pack;
         let storage = self.storage.git_db_storage();
@@ -560,6 +688,10 @@ impl ImportRepo {
             .collect();
 
         let mut keep: HashSet<String> = commits.iter().map(|c| c.id.to_string()).collect();
+        if include_tag {
+            self.attach_authorised_tags(&storage, kind, repo_id, &mut keep, false)
+                .await?;
+        }
         let tree_ids: Vec<String> = commits.iter().map(|c| c.tree_id.to_string()).collect();
         for commit in &commits {
             keep.insert(commit.tree_id.to_string());
@@ -1123,98 +1255,8 @@ impl ImportRepo {
         }
         let _ = &tree_wants;
         if include_tag {
-            // Attach only tags the authorised ref view still advertises and whose
-            // target survived the closure filter: a tag behind a deleted ref is
-            // absent from `tag_ids`, so it cannot ride along, and a tag can never
-            // pull in objects the request did not ask for.
-            // Authorised tag refs come from the refs table itself: `code_refs()`
-            // reports an empty tag set when the repository has no legacy traces
-            // ref, which would silently disable include-tag everywhere else.
-            let refs = storage
-                .get_ref(repo_id)
-                .await
-                .map_err(|e| GitError::CustomError(e.to_string()))?;
-            let authorised_tag_ids: HashSet<String> = refs
-                .iter()
-                .filter(|row| row.ref_name.starts_with("refs/tags/"))
-                .map(|row| row.ref_git_id.clone())
-                .collect();
-            // A tag pushed straight to a path has no `git_tag` row, so its object
-            // is loaded from the object store by the id its ref points at. Without
-            // this, `include-tag` could never deliver such a tag.
-            let mut known_tags: HashMap<String, Tag> = tags_by_id.clone();
-            for tag_id in &authorised_tag_ids {
-                if known_tags.contains_key(tag_id) || keep.contains(tag_id) || want.contains(tag_id)
-                {
-                    continue;
-                }
-                let mut stream = self
-                    .storage
-                    .git_service
-                    .get_objects_stream(vec![tag_id.clone()]);
-                if let Some(item) = stream.next().await {
-                    let (_, data_stream, _) =
-                        item.map_err(|e| GitError::CustomError(e.to_string()))?;
-                    let data = data_stream
-                        .try_fold(Vec::new(), |mut acc, bytes| async move {
-                            acc.extend_from_slice(&bytes);
-                            Ok(acc)
-                        })
-                        .await
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    let hash = ObjectHash::from_hex_for_kind(kind, tag_id)
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    if let Ok(tag) =
-                        <Tag as git_internal::internal::object::ObjectTrait>::from_bytes(
-                            &data, hash,
-                        )
-                    {
-                        known_tags.insert(tag_id.clone(), tag);
-                    }
-                }
-            }
-            // Only tags whose **ref** is in the authorised view are roots. A tag
-            // object that merely points at an authorised ref's target is not
-            // authorised (an earlier version accepted that and was wrong), and a
-            // nested chain is attached by following tag -> tag dependencies from a
-            // root, because an outer tag cannot be used without its inner object.
-            let mut candidates: HashSet<String> = authorised_tag_ids
-                .iter()
-                .filter(|id| known_tags.contains_key(*id))
-                .cloned()
-                .collect();
-            let mut frontier: Vec<String> = candidates.iter().cloned().collect();
-            while let Some(tag_id) = frontier.pop() {
-                let Some(tag) = known_tags.get(&tag_id) else {
-                    continue;
-                };
-                let target = tag.object_hash.to_string();
-                if let Some(inner) = known_tags.get(&target) {
-                    if candidates.insert(inner.id.to_string()) {
-                        frontier.push(inner.id.to_string());
-                    }
-                }
-            }
-            // Fixed point: a tag attaches once its target is already emitted, so
-            // `outer -> inner -> commit` resolves inner first regardless of order.
-            loop {
-                let mut progressed = false;
-                for tag_id in candidates.clone() {
-                    let Some(tag) = known_tags.get(&tag_id) else {
-                        continue;
-                    };
-                    if keep.contains(&tag_id) {
-                        continue;
-                    }
-                    if keep.contains(&tag.object_hash.to_string()) {
-                        keep.insert(tag_id);
-                        progressed = true;
-                    }
-                }
-                if !progressed {
-                    break;
-                }
-            }
+            self.attach_authorised_tags(&storage, kind, repo_id, &mut keep, false)
+                .await?;
         }
 
         let refs_after = Self::ref_fingerprint(&storage, repo_id)
