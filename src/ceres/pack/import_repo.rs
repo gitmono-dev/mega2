@@ -2988,7 +2988,59 @@ mod tests {
         assert_eq!(root_after.ref_tree_hash, root_before.ref_tree_hash);
     }
 
-    /// The ref fingerprint is what the planner compares before and after it reads.
+    /// Read-timeout behaviour. `code_refs` is wrapped in `LEGACY_VIEW_TIMEOUT`; a
+    /// read that cannot complete must surface as the typed `QueryTimeout` (HTTP
+    /// 503) rather than hanging or returning a partial view. The block is created
+    /// by taking an exclusive lock on `import_refs` from a second connection to the
+    /// same test database.
+    #[tokio::test]
+    async fn blocked_ref_read_times_out_with_a_typed_error() {
+        use sea_orm::{ConnectionTrait, TransactionTrait};
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, _commit, _create) =
+            seed_import_repo_with_main_tip(&storage, "/proj/timeout").await;
+        let import_repo = ImportRepo {
+            storage: storage.clone(),
+            repo,
+            command_list: Mutex::new(vec![]),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        };
+
+        // Take the lock from the fixture's own pool: opening a second pool in a
+        // test contends with the per-test connection budget.
+        let blocker = storage.git_db_storage().get_connection().clone();
+        let txn = blocker.begin().await.expect("blocker transaction");
+        txn.execute_unprepared("LOCK TABLE import_refs IN ACCESS EXCLUSIVE MODE")
+            .await
+            .expect("exclusive lock");
+
+        let started = std::time::Instant::now();
+        // `refs_with_head_hash` is the path that maps storage errors to the typed
+        // traces error; calling `code_refs` directly would surface a raw Db error.
+        let error = match import_repo.refs_with_head_hash().await {
+            Ok(_) => panic!("a blocked read must not produce a view"),
+            Err(error) => error,
+        };
+        let waited = started.elapsed();
+        txn.rollback().await.expect("release lock");
+
+        assert!(
+            matches!(
+                error,
+                MegaError::Traces(crate::common::errors::TracesError::QueryTimeout)
+            ),
+            "a blocked ref read must surface as QueryTimeout (HTTP 503), got: {error}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_secs(9),
+            "the timeout must actually be waited out, measured {waited:?}"
+        );
+    }
+
+    /// The ref fingerprint is what the planner compares before and after it reads.    /// The ref fingerprint is what the planner compares before and after it reads.
     /// It must ignore ordering, stay stable while refs do not move, and change on
     /// any retarget, addition or deletion - otherwise the race guard could not
     /// fire at all.
