@@ -3491,6 +3491,69 @@ mod disabled_http {
             pack
         }
 
+        /// Crafted v2 fetch combining a pack filter with include-tag. Used to prove
+        /// that an authorised tag on a *retained* tree still arrives when blobs are
+        /// withheld.
+        async fn crafted_filtered_include_tag_pack_v2(
+            &self,
+            path: &str,
+            want_oid: &str,
+            filter: &str,
+        ) -> Vec<u8> {
+            let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+            let body = format!(
+                "{}{}0001{}{}{}{}0000",
+                pkt("command=fetch\n"),
+                pkt("agent=git/2\n"),
+                pkt(&format!("want {want_oid}\n")),
+                pkt(&format!("filter {filter}\n")),
+                pkt("include-tag\n"),
+                pkt("done\n")
+            );
+            let response = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    self.port,
+                    &format!("{path}/git-upload-pack"),
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .header("git-protocol", "version=2")
+                .body(body)
+                .send()
+                .await
+                .expect("crafted filtered v2 request");
+            let status = response.status();
+            let bytes = response.bytes().await.expect("crafted filtered v2 body");
+            let start = bytes
+                .windows(8)
+                .position(|window| window == b"packfile")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "filtered include-tag response had no packfile section (status {status})"
+                    )
+                });
+            let mut pack: Vec<u8> = Vec::new();
+            let mut offset = start - 4;
+            while offset + 4 <= bytes.len() {
+                let header = String::from_utf8_lossy(&bytes[offset..offset + 4]).to_string();
+                offset += 4;
+                if header == "0000" {
+                    break;
+                }
+                let Ok(len) = usize::from_str_radix(&header, 16) else {
+                    break;
+                };
+                if len < 4 || offset + len - 4 > bytes.len() {
+                    continue;
+                }
+                let payload = &bytes[offset..offset + len - 4];
+                offset += len - 4;
+                if payload.first() == Some(&1) {
+                    pack.extend_from_slice(&payload[1..]);
+                }
+            }
+            pack
+        }
+
         async fn seed_ssh(&self, db: &sea_orm::DatabaseConnection) {
             let key = self.shared.path().join("ssh/client_ed25519");
             git_cli::generate_client_ed25519(&key);
@@ -6453,6 +6516,89 @@ mod disabled_http {
             assert!(
                 shallow_tag_in_pack,
                 "FIX13_INCLUDE_TAG_SHALLOW a tag inside the shallow closure must be attached"
+            );
+
+            // Filtered positive: a tag whose target is a retained tree must still be
+            // attached when blobs are withheld, while a tag on a blob must not.
+            let tree_oid = fixture.git_text(&[
+                "-C",
+                "import-depth-work",
+                "rev-parse",
+                "HEAD^{tree}",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "fix13-tree-tag",
+                "-m",
+                "FIX13 tree tag",
+                &tree_oid,
+            ]);
+            let tree_tag_oid = fixture.git_text(&[
+                "-C",
+                "import-depth-work",
+                "rev-parse",
+                "fix13-tree-tag",
+            ]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "refs/tags/fix13-tree-tag",
+            ]);
+            let filtered_tip =
+                fixture.git_text(&["-C", "import-depth-work", "rev-parse", "HEAD"]);
+            let filtered_pack = fixture
+                .crafted_filtered_include_tag_pack_v2(
+                    "/third-party/mtr94-control.git",
+                    &filtered_tip,
+                    "blob:none",
+                )
+                .await;
+            std::fs::write(
+                fixture.shared.path().join("filtered-include-tag.pack"),
+                &filtered_pack,
+            )
+            .expect("write filtered pack");
+            fixture.git(&[
+                "-C",
+                "iso-include-tag",
+                "index-pack",
+                "../filtered-include-tag.pack",
+            ]);
+            let filtered_listing = fixture.git_text(&[
+                "-C",
+                "iso-include-tag",
+                "verify-pack",
+                "-v",
+                "../filtered-include-tag.idx",
+            ]);
+            let tree_tag_in_pack = filtered_listing
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(tree_tag_oid.as_str()));
+            let blob_count = filtered_listing
+                .lines()
+                .filter(|line| line.split_whitespace().nth(1) == Some("blob"))
+                .count();
+            eprintln!(
+                "FIX13_INCLUDE_TAG_FILTERED tag_in_pack={tree_tag_in_pack} blobs={blob_count}"
+            );
+            assert!(
+                tree_tag_in_pack,
+                "FIX13_INCLUDE_TAG_FILTERED a tag on a retained tree must be attached"
+            );
+            assert_eq!(
+                blob_count, 0,
+                "FIX13_INCLUDE_TAG_FILTERED blob:none must still withhold every blob"
             );
 
             // v2 end-to-end: the same crafted request over protocol v2 must also
