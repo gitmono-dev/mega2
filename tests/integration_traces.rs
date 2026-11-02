@@ -6911,6 +6911,46 @@ mod disabled_http {
             );
 
             // VER-1's SSH dimension: SSH is a separate service process, so the
+
+            // AC-7's control: the code clone must not change when trace data is
+            // actually added between the two observations. The fixture seeds the
+            // stream with `tip_oid = NULL`, so it is populated here and the same
+            // code path is cloned again.
+            let code_before = fixture
+                .git_text(&["-C", "iso-default", "rev-list", "--objects", "--all"])
+                .lines()
+                .count();
+            let populated = scalar(
+                &db,
+                &format!(
+                    "UPDATE trace_stream SET tip_oid = '{}' WHERE id = '{}' RETURNING id AS value",
+                    want_oid, fixture.scope
+                ),
+            )
+            .await;
+            assert_eq!(
+                populated, fixture.scope,
+                "FIX13_AC7 the trace stream must be populated for the comparison"
+            );
+            fixture.git(&["clone", &url, "iso-traces-populated"]);
+            let after_listing =
+                fixture.git_text(&["-C", "iso-traces-populated", "rev-list", "--objects", "--all"]);
+            let code_after = after_listing.lines().count();
+            let populated_traced = after_listing
+                .lines()
+                .any(|line| line.to_ascii_lowercase().contains("traces"));
+            eprintln!(
+                "FIX13_AC7_ADDED before={code_before} after={code_after} traced={populated_traced}"
+            );
+            assert_eq!(
+                code_after, code_before,
+                "FIX13_AC7 adding trace data must not change the code clone"
+            );
+            assert!(
+                !populated_traced,
+                "FIX13_AC8 the code clone must not carry trace entries after data was added"
+            );
+
             // fixture is switched over only after every HTTP arm has run.
             fixture.start_ssh(true, false).await;
             let ssh_clone = fixture.ssh_git(&[
