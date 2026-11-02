@@ -6664,6 +6664,46 @@ mod disabled_http {
                 ssh_traced.is_empty(),
                 "FIX13_SSH the code clone must not contain trace entries: {ssh_traced:?}"
             );
+
+            // The SSH transport must behave like HTTP across modes, not just for a
+            // plain clone: bare and depth-limited clones are checked too.
+            for (dir, mode_flags) in [
+                ("iso-ssh-bare", vec!["--bare"]),
+                ("iso-ssh-depth1", vec!["--depth=1"]),
+            ] {
+                let mut args: Vec<String> = vec!["-c".into(), "protocol.version=0".into()];
+                args.push("clone".into());
+                for flag in &mode_flags {
+                    args.push((*flag).into());
+                }
+                args.push(fixture.ssh_url("/project/control.git"));
+                args.push(dir.into());
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let clone = fixture.ssh_git(&arg_refs);
+                assert!(
+                    clone.status.success(),
+                    "FIX13_SSH {dir} clone failed: {}",
+                    String::from_utf8_lossy(&clone.stderr)
+                );
+                let listing = fixture.git_text(&["-C", dir, "rev-list", "--objects", "--all"]);
+                let traced: Vec<&str> = listing
+                    .lines()
+                    .filter(|line| line.to_ascii_lowercase().contains("traces"))
+                    .collect();
+                let commits = fixture.git_text(&["-C", dir, "rev-list", "--count", "--all"]);
+                eprintln!(
+                    "FIX13_SSH_MODE {dir} objects={} commits={commits} traces={}",
+                    listing.lines().count(),
+                    traced.len()
+                );
+                assert!(
+                    traced.is_empty(),
+                    "FIX13_SSH {dir} must not contain trace entries: {traced:?}"
+                );
+                if dir == "iso-ssh-depth1" {
+                    assert_eq!(commits, "1", "FIX13_SSH depth=1 over SSH must carry one commit");
+                }
+            }
         })
         .catch_unwind()
         .await;
