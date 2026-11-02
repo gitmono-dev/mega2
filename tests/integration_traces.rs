@@ -6912,6 +6912,38 @@ mod disabled_http {
 
             // VER-1's SSH dimension: SSH is a separate service process, so the
 
+            // Endpoint-level 503: while the ref view is locked the service cannot
+            // read it, and the request must answer 503 rather than 400 or a hang.
+            // Previously only the status mapping was proven, not the endpoint.
+            let lock_txn = db.begin().await.expect("lock transaction");
+            sea_orm::ConnectionTrait::execute_unprepared(
+                &lock_txn,
+                "LOCK TABLE import_refs IN ACCESS EXCLUSIVE MODE",
+            )
+            .await
+            .expect("exclusive lock on import_refs");
+            let locked_response = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    "/third-party/mtr94-control.git/git-upload-pack",
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .body({
+                    let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+                    format!("{}{}", pkt(&format!("want {want_oid}\n")), "0000",)
+                })
+                .send()
+                .await
+                .expect("locked fetch request");
+            let locked_status = locked_response.status();
+            lock_txn.rollback().await.expect("release ref lock");
+            eprintln!("FIX13_ENDPOINT_503 status={locked_status}");
+            assert_eq!(
+                locked_status.as_u16(),
+                503,
+                "a blocked ref read must answer 503 at the endpoint"
+            );
+
             // AC-7's control: the code clone must not change when trace data is
             // actually added between the two observations. The fixture seeds the
             // stream with `tip_oid = NULL`, so it is populated here and the same
