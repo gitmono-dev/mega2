@@ -6076,9 +6076,12 @@ mod disabled_http {
                 "FIX13_INCLUDE_TAG the pushed tag must be persisted in git_tag"
             );
 
-            // AC-2: an incremental fetch must deliver exactly the objects the client
-            // lacks. Measured by object identity rather than by a count, so
-            // retransmitting an object the client already owns would fail here.
+            // AC-2: an incremental fetch should deliver exactly the objects the
+            // client lacks. This compares the client's object-id set before and
+            // after the fetch, so it shows the fetch added the right objects - but
+            // it CANNOT detect retransmission of objects the client already owns,
+            // because those never change that set. Capturing the transmitted pack
+            // would be required for that, and is not done here.
             fixture.git(&["clone", &import_url, "ac2-clone"]);
             // The delta must be measured against the client's pre-fetch tip;
             // excluding the base commit instead overstates it.
