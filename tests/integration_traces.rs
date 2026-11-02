@@ -3433,6 +3433,64 @@ mod disabled_http {
             pack
         }
 
+        /// Crafted v0 shallow fetch that also asks for include-tag: the want line
+        /// carries the capability and a `deepen` line limits the walk.
+        async fn crafted_shallow_include_tag_pack(
+            &self,
+            path: &str,
+            want_oid: &str,
+            depth: u32,
+        ) -> Vec<u8> {
+            let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+            let body = format!(
+                "{}{}{}{}{}",
+                pkt(&format!("want {want_oid} include-tag side-band-64k\n")),
+                pkt(&format!("deepen {depth}\n")),
+                "0000",
+                pkt("done\n"),
+                ""
+            );
+            let response = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    self.port,
+                    &format!("{path}/git-upload-pack"),
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .body(body)
+                .send()
+                .await
+                .expect("crafted shallow request");
+            let status = response.status();
+            let bytes = response.bytes().await.expect("crafted shallow body");
+            // The response is side-band framed, so slicing from the PACK magic would
+            // include pkt-line headers and corrupt the pack.
+            let mut pack: Vec<u8> = Vec::new();
+            let mut offset = 0usize;
+            while offset + 4 <= bytes.len() {
+                let header = String::from_utf8_lossy(&bytes[offset..offset + 4]).to_string();
+                offset += 4;
+                if header == "0000" {
+                    continue;
+                }
+                let Ok(len) = usize::from_str_radix(&header, 16) else {
+                    break;
+                };
+                if len < 4 || offset + len - 4 > bytes.len() {
+                    continue;
+                }
+                let payload = &bytes[offset..offset + len - 4];
+                offset += len - 4;
+                if payload.first() == Some(&1) {
+                    pack.extend_from_slice(&payload[1..]);
+                }
+            }
+            assert!(
+                pack.starts_with(b"PACK"),
+                "crafted shallow request returned no pack (status {status})"
+            );
+            pack
+        }
+
         async fn seed_ssh(&self, db: &sea_orm::DatabaseConnection) {
             let key = self.shared.path().join("ssh/client_ed25519");
             git_cli::generate_client_ed25519(&key);
@@ -6326,6 +6384,75 @@ mod disabled_http {
             assert!(
                 tag_in_pack,
                 "FIX13_INCLUDE_TAG the crafted include-tag request must carry the tag object"
+            );
+
+            // include-tag on the shallow path: a tag on the requested tip is inside
+            // a depth-1 closure, so the crafted shallow request must carry it.
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "fix13-shallow-tag",
+                "-m",
+                "FIX13 shallow tag",
+            ]);
+            let shallow_tag_oid = fixture.git_text(&[
+                "-C",
+                "import-depth-work",
+                "rev-parse",
+                "fix13-shallow-tag",
+            ]);
+            let shallow_tip =
+                fixture.git_text(&["-C", "import-depth-work", "rev-parse", "HEAD"]);
+            fixture.git(&[
+                "-C",
+                "import-depth-work",
+                "push",
+                &import_url,
+                "refs/tags/fix13-shallow-tag",
+            ]);
+            let shallow_pack = fixture
+                .crafted_shallow_include_tag_pack(
+                    "/third-party/mtr94-control.git",
+                    &shallow_tip,
+                    1,
+                )
+                .await;
+            std::fs::write(
+                fixture.shared.path().join("shallow-include-tag.pack"),
+                &shallow_pack,
+            )
+            .expect("write shallow pack");
+            fixture.git(&[
+                "-C",
+                "iso-include-tag",
+                "index-pack",
+                "../shallow-include-tag.pack",
+            ]);
+            let shallow_listing = fixture.git_text(&[
+                "-C",
+                "iso-include-tag",
+                "verify-pack",
+                "-v",
+                "../shallow-include-tag.idx",
+            ]);
+            let shallow_tag_in_pack = shallow_listing
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(shallow_tag_oid.as_str()));
+            eprintln!(
+                "FIX13_INCLUDE_TAG_SHALLOW tag_in_pack={shallow_tag_in_pack} bytes={}",
+                shallow_pack.len()
+            );
+            assert!(
+                shallow_tag_in_pack,
+                "FIX13_INCLUDE_TAG_SHALLOW a tag inside the shallow closure must be attached"
             );
 
             // v2 end-to-end: the same crafted request over protocol v2 must also
