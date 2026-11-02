@@ -6721,6 +6721,13 @@ mod disabled_http {
                 if dir == "iso-ssh-depth1" {
                     assert_eq!(commits, "1", "FIX13_SSH depth=1 over SSH must carry one commit");
                 }
+                // The SSH arms must not diverge from the HTTP baseline either: the
+                // code view carries the same objects regardless of transport.
+                assert_eq!(
+                    listing.lines().count(),
+                    baseline_objects,
+                    "FIX13_SSH {dir} object count must match the HTTP default arm"
+                );
             }
         })
         .catch_unwind()
