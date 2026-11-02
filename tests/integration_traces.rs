@@ -6670,12 +6670,30 @@ mod disabled_http {
             for (dir, mode_flags) in [
                 ("iso-ssh-bare", vec!["--bare"]),
                 ("iso-ssh-depth1", vec!["--depth=1"]),
+                ("iso-ssh-no-tags", vec!["--no-tags"]),
+                ("iso-ssh-blobless", vec!["--filter=blob:none"]),
+                (
+                    "iso-ssh-v2-blobless",
+                    vec!["-c", "protocol.version=2", "--filter=blob:none"],
+                ),
             ] {
+                // `-c` options must precede the subcommand, while clone flags like
+                // `--depth=1` must follow it. Split the mode flags accordingly.
                 let mut args: Vec<String> = vec!["-c".into(), "protocol.version=0".into()];
-                args.push("clone".into());
-                for flag in &mode_flags {
-                    args.push((*flag).into());
+                let mut clone_flags: Vec<String> = Vec::new();
+                let mut index = 0;
+                while index < mode_flags.len() {
+                    if mode_flags[index] == "-c" {
+                        args.push("-c".into());
+                        args.push(mode_flags[index + 1].into());
+                        index += 2;
+                    } else {
+                        clone_flags.push(mode_flags[index].into());
+                        index += 1;
+                    }
                 }
+                args.push("clone".into());
+                args.extend(clone_flags);
                 args.push(fixture.ssh_url("/project/control.git"));
                 args.push(dir.into());
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
