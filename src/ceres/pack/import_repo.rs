@@ -874,19 +874,41 @@ impl ImportRepo {
                 .map(|row| row.ref_git_id.clone())
                 .collect();
             if !authorised_tag_ids.is_empty() {
+                // Load every tag row so tag -> tag dependencies are resolvable even
+                // when the inner tag has no ref of its own.
                 let models = storage
                     .get_tags_by_repo_id(self.repo.repo_id)
                     .await
                     .map_err(|e| GitError::CustomError(e.to_string()))?;
-                let mut candidates: Vec<Tag> = Vec::new();
+                let mut by_id: HashMap<String, Tag> = HashMap::new();
                 for model in models {
                     let tag: Tag =
                         crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
                             .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    if authorised_tag_ids.contains(&tag.id.to_string())
-                        || authorised_tag_ids.contains(&tag.object_hash.to_string())
-                    {
-                        candidates.push(tag);
+                    by_id.insert(tag.id.to_string(), tag);
+                }
+                // Roots are tags whose own ref is authorised. A tag that merely
+                // points at an authorised ref's target is not authorised.
+                let mut candidates: Vec<Tag> = by_id
+                    .values()
+                    .filter(|tag| authorised_tag_ids.contains(&tag.id.to_string()))
+                    .cloned()
+                    .collect();
+                // Pull in the dependencies of those roots, so `outer -> inner ->
+                // commit` attaches inner first even when only outer has a ref.
+                let mut frontier: Vec<String> =
+                    candidates.iter().map(|tag| tag.id.to_string()).collect();
+                while let Some(tag_id) = frontier.pop() {
+                    let Some(tag) = by_id.get(&tag_id).cloned() else {
+                        continue;
+                    };
+                    let target = tag.object_hash.to_string();
+                    if let Some(inner) = by_id.get(&target).cloned() {
+                        let inner_id = inner.id.to_string();
+                        if !candidates.iter().any(|existing| existing.id == inner.id) {
+                            candidates.push(inner);
+                            frontier.push(inner_id);
+                        }
                     }
                 }
                 let mut emitted_ids: HashSet<String> = entries
@@ -1151,22 +1173,41 @@ impl ImportRepo {
                     }
                 }
             }
-            // Fixed point, so `outer -> inner -> commit` attaches regardless of
-            // the order the rows come back in.
+            // Only tags whose **ref** is in the authorised view are roots. A tag
+            // object that merely points at an authorised ref's target is not
+            // authorised (an earlier version accepted that and was wrong), and a
+            // nested chain is attached by following tag -> tag dependencies from a
+            // root, because an outer tag cannot be used without its inner object.
+            let mut candidates: HashSet<String> = authorised_tag_ids
+                .iter()
+                .filter(|id| known_tags.contains_key(*id))
+                .cloned()
+                .collect();
+            let mut frontier: Vec<String> = candidates.iter().cloned().collect();
+            while let Some(tag_id) = frontier.pop() {
+                let Some(tag) = known_tags.get(&tag_id) else {
+                    continue;
+                };
+                let target = tag.object_hash.to_string();
+                if let Some(inner) = known_tags.get(&target) {
+                    if candidates.insert(inner.id.to_string()) {
+                        frontier.push(inner.id.to_string());
+                    }
+                }
+            }
+            // Fixed point: a tag attaches once its target is already emitted, so
+            // `outer -> inner -> commit` resolves inner first regardless of order.
             loop {
                 let mut progressed = false;
-                let candidates: Vec<(String, Tag)> = known_tags
-                    .iter()
-                    .map(|(id, tag)| (id.clone(), tag.clone()))
-                    .collect();
-                for (tag_id, tag) in &candidates {
-                    let authorised = authorised_tag_ids.contains(tag_id)
-                        || authorised_tag_ids.contains(&tag.object_hash.to_string());
-                    if keep.contains(tag_id) || !authorised {
+                for tag_id in candidates.clone() {
+                    let Some(tag) = known_tags.get(&tag_id) else {
+                        continue;
+                    };
+                    if keep.contains(&tag_id) {
                         continue;
                     }
                     if keep.contains(&tag.object_hash.to_string()) {
-                        keep.insert(tag_id.clone());
+                        keep.insert(tag_id);
                         progressed = true;
                     }
                 }
