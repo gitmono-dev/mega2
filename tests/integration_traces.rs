@@ -5753,6 +5753,60 @@ mod disabled_http {
         }
     }
 
+    /// Capacity at the endpoint: a legacy view over its ref budget must answer 413
+    /// on the advertisement, not serve a truncated ref list. The budget lives in
+    /// `code_refs`, which the advertisement reaches before any pack is built.
+    pub async fn code_clone_ref_budget_answers_413() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = Fixture::new(&db).await;
+        let result = AssertUnwindSafe(async {
+            fixture.prepare(&db).await;
+            // A legacy traces ref makes the budget apply at all; without it the code
+            // view is returned directly and an over-budget repo still serves.
+            let mut rows = vec![("refs/libra/traces".to_owned(), "b".repeat(40))];
+            for index in 0..4098 {
+                rows.push((format!("refs/heads/bulk{index}"), "a".repeat(40)));
+            }
+            for (index, (name, oid)) in rows.into_iter().enumerate() {
+                scalar(
+                    &db,
+                    &format!(
+                        "INSERT INTO import_refs (id, repo_id, ref_name, ref_git_id, ref_type, default_branch, created_at, updated_at) \
+                         SELECT (SELECT COALESCE(MAX(id), 0) + 1 + {index} FROM import_refs), repo_id, '{name}', '{oid}', 'branch', false, now(), now() \
+                         FROM import_refs WHERE ref_name = 'refs/heads/main' LIMIT 1 RETURNING ref_name AS value"
+                    ),
+                )
+                .await;
+            }
+            let advertisement = reqwest::Client::new()
+                .get(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    "/third-party/mtr94-control.git/info/refs?service=git-upload-pack",
+                ))
+                .send()
+                .await
+                .expect("advertisement request");
+            let status = advertisement.status();
+            eprintln!("FIX13_ENDPOINT_413 status={status}");
+            assert_eq!(
+                status.as_u16(),
+                413,
+                "an over-budget legacy view must answer 413"
+            );
+        })
+        .catch_unwind()
+        .await;
+        fixture.stop();
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            let logs = fixture.temp.keep();
+            eprintln!("ref-budget fixture logs: {}", logs.display());
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close ref-budget pool");
+    }
+
     /// AC-7/AC-8 at the code-path view across the fetch modes the card names.
     ///
     /// Every arm clones the same seeded code path and must (a) contain no
@@ -7833,6 +7887,11 @@ async fn http_git_sha256_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_clone_isolation_code_path_objects() {
     disabled_http::code_clone_isolation_code_path_objects().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_clone_ref_budget_answers_413() {
+    disabled_http::code_clone_ref_budget_answers_413().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
