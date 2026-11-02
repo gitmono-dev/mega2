@@ -370,30 +370,26 @@ pub(crate) async fn handle_v2_fetch_with_handler(
         repo_handler
             .filtered_pack(want.clone(), have.clone(), spec)
             .await
-            .map_err(|e| {
-                ProtocolError::InvalidInput(format!("filtered pack generation failed: {e}"))
-            })?
+            .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?
     } else if have.is_empty() {
         if let Some(depth) = deepen_depth {
             let (stream, shallows) = repo_handler
                 .shallow_pack(want, depth, deepen_relative)
                 .await
-                .map_err(|e| {
-                    ProtocolError::InvalidInput(format!("shallow pack generation failed: {e}"))
-                })?;
+                .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
             shallow_commits = shallows;
             stream
         } else {
             repo_handler
                 .full_pack_with_options(want, include_tag)
                 .await
-                .map_err(|e| ProtocolError::InvalidInput(format!("pack generation failed: {e}")))?
+                .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?
         }
     } else {
         repo_handler
             .incremental_pack_with_options(want.clone(), have, include_tag)
             .await
-            .map_err(|e| ProtocolError::InvalidInput(format!("pack generation failed: {e}")))?
+            .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?
     };
 
     add_shallow_info_section(&mut protocol_buf, &shallow_commits);

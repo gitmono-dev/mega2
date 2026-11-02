@@ -45,6 +45,39 @@ pub mod traces_repo;
 pub mod trunk_provenance;
 pub mod view_repo;
 
+/// Convert a storage error into a `GitError` that keeps its status class.
+///
+/// The pack trait returns `GitError`, which has no typed variant for traces
+/// failures, so a read timeout would otherwise be flattened into a 400 by the
+/// protocol layer. The stable code is carried in the message and restored by
+/// [`protocol_error_from_pack`].
+pub(crate) fn pack_error_from_mega(error: &MegaError) -> GitError {
+    let message = match error {
+        MegaError::Db(_) => format!("[code:503] query_timeout: {error}"),
+        MegaError::Traces(crate::common::errors::TracesError::QueryTimeout) => {
+            format!("[code:503] query_timeout: {error}")
+        }
+        MegaError::Traces(crate::common::errors::TracesError::ResponseBudget) => {
+            format!("[code:413] response_budget: {error}")
+        }
+        other => other.to_string(),
+    };
+    GitError::CustomError(message)
+}
+
+/// Restore the protocol error class from a pack-layer `GitError`.
+pub(crate) fn protocol_error_from_pack(error: &GitError) -> crate::common::errors::ProtocolError {
+    use crate::common::errors::{ProtocolError, TracesError};
+    let message = error.to_string();
+    if message.contains("[code:503]") {
+        return ProtocolError::Traces(TracesError::QueryTimeout);
+    }
+    if message.contains("[code:413]") {
+        return ProtocolError::Traces(TracesError::ResponseBudget);
+    }
+    ProtocolError::InvalidInput(format!("pack generation failed: {message}"))
+}
+
 #[async_trait]
 pub trait RepoHandler: Send + Sync + 'static {
     fn is_monorepo(&self) -> bool;
@@ -645,6 +678,45 @@ pub trait RepoHandler: Send + Sync + 'static {
 }
 
 #[cfg(test)]
+mod status_mapping_tests {
+    use sea_orm::DbErr;
+
+    use super::*;
+    use crate::common::errors::{ProtocolError, TracesError};
+
+    #[test]
+    fn db_errors_survive_as_503() {
+        let git_error = pack_error_from_mega(&MegaError::Db(DbErr::Query(
+            sea_orm::RuntimeErr::Internal("canceling statement due to lock timeout".into()),
+        )));
+        assert!(
+            matches!(
+                protocol_error_from_pack(&git_error),
+                ProtocolError::Traces(TracesError::QueryTimeout)
+            ),
+            "a database read failure must map to the 503 class, not 400"
+        );
+    }
+
+    #[test]
+    fn budget_errors_survive_as_413() {
+        let git_error = pack_error_from_mega(&MegaError::Traces(TracesError::ResponseBudget));
+        assert!(matches!(
+            protocol_error_from_pack(&git_error),
+            ProtocolError::Traces(TracesError::ResponseBudget)
+        ));
+    }
+
+    #[test]
+    fn ordinary_failures_stay_400() {
+        let git_error = GitError::CustomError("import tree missing".to_string());
+        assert!(matches!(
+            protocol_error_from_pack(&git_error),
+            ProtocolError::InvalidInput(_)
+        ));
+    }
+}
+
 mod tests {
     use std::{
         io::Cursor,

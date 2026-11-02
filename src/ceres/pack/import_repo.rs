@@ -629,7 +629,7 @@ impl ImportRepo {
         // and pack construction must not be served from the stale view.
         self.authorize_fetch(&want, &have)
             .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
+            .map_err(|e| super::pack_error_from_mega(&e))?;
         let refs_before = Self::ref_fingerprint(&self.storage.git_db_storage(), self.repo.repo_id)
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
@@ -993,7 +993,7 @@ impl ImportRepo {
         // bounds changes that happen during planning itself.
         self.authorize_fetch(&want, &[])
             .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
+            .map_err(|e| super::pack_error_from_mega(&e))?;
         let refs_before = Self::ref_fingerprint(&storage, repo_id)
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;

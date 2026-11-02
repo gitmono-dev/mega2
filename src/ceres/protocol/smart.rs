@@ -330,9 +330,7 @@ impl SmartSession {
                 let (stream, shallow_commits) = repo_handler
                     .shallow_pack(want, depth, deepen_relative)
                     .await
-                    .map_err(|e| {
-                        ProtocolError::InvalidInput(format!("shallow pack generation failed: {e}"))
-                    })?;
+                    .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
                 pack_data = stream;
                 if !shallow_info_sent {
                     for shallow in &shallow_commits {
@@ -353,9 +351,7 @@ impl SmartSession {
                 pack_data = repo_handler
                     .full_pack_with_options(want, include_tag)
                     .await
-                    .map_err(|e| {
-                        ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
-                    })?;
+                    .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
             }
             add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
         } else {
@@ -372,9 +368,7 @@ impl SmartSession {
                 pack_data = repo_handler
                     .incremental_pack_with_options(want.clone(), have, include_tag)
                     .await
-                    .map_err(|e| {
-                        ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
-                    })?;
+                    .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
 
                 if last_common_commit.is_empty() {
                     add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
