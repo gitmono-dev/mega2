@@ -1027,6 +1027,7 @@ struct TracesIsolatedDatabase {
     admin_url: String,
     name: String,
     dropped: AtomicBool,
+    cleanup: Mutex<()>,
 }
 
 #[cfg(test)]
@@ -1044,18 +1045,35 @@ impl std::fmt::Debug for TracesIsolatedDatabaseGuard {
 
 #[cfg(test)]
 impl TracesIsolatedDatabase {
-    fn claim(&self) -> bool {
-        !self.dropped.swap(true, Ordering::AcqRel)
-    }
-
     fn drop_off_thread(&self) {
+        let _cleanup = self.cleanup.lock().unwrap_or_else(|err| err.into_inner());
+        if self.dropped.load(Ordering::Acquire) {
+            return;
+        }
         let admin_url = self.admin_url.clone();
         let name = self.name.clone();
         let worker = std::thread::Builder::new()
             .name(format!("drop-{name}"))
             .spawn(move || drop_traces_isolated_database(&admin_url, &name));
-        if let Ok(worker) = worker {
-            let _ = worker.join();
+        let removed = match worker {
+            Ok(worker) => worker.join().unwrap_or_else(|_| {
+                eprintln!(
+                    "traces isolated database {} left behind: the drop thread panicked",
+                    self.name
+                );
+                false
+            }),
+            Err(err) => {
+                eprintln!(
+                    "traces isolated database {} left behind: no drop thread: {}",
+                    self.name,
+                    scrub_admin_error(err, &self.admin_url)
+                );
+                false
+            }
+        };
+        if removed {
+            self.dropped.store(true, Ordering::Release);
         }
     }
 }
@@ -1063,9 +1081,7 @@ impl TracesIsolatedDatabase {
 #[cfg(test)]
 impl Drop for TracesIsolatedDatabaseGuard {
     fn drop(&mut self) {
-        if self.0.claim() {
-            self.0.drop_off_thread();
-        }
+        self.0.drop_off_thread();
     }
 }
 
@@ -1082,9 +1098,7 @@ struct HeldIsolatedDatabases(Vec<Arc<TracesIsolatedDatabase>>);
 impl Drop for HeldIsolatedDatabases {
     fn drop(&mut self) {
         for database in self.0.drain(..) {
-            if database.claim() {
-                database.drop_off_thread();
-            }
+            database.drop_off_thread();
         }
     }
 }
@@ -1109,10 +1123,10 @@ fn scrub_admin_error(err: impl std::fmt::Debug, admin_url: &str) -> String {
 }
 
 #[cfg(test)]
-fn drop_traces_isolated_database(admin_url: &str, name: &str) {
+fn drop_traces_isolated_database(admin_url: &str, name: &str) -> bool {
     if !traces_isolated_name_is_owned(name) {
         eprintln!("refusing to drop a database outside the traces_noext_ prefix");
-        return;
+        return false;
     }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1121,7 +1135,7 @@ fn drop_traces_isolated_database(admin_url: &str, name: &str) {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("traces isolated database {name} left behind: no runtime: {err}");
-            return;
+            return false;
         }
     };
     let dropped = runtime.block_on(async {
@@ -1162,14 +1176,45 @@ fn drop_traces_isolated_database(admin_url: &str, name: &str) {
                 .await;
             dropped = admin.execute_unprepared(&drop_sql).await;
         }
-        dropped?;
-        admin.close().await
+        let confirmed = match dropped {
+            Ok(_) => match admin
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT 1 FROM pg_catalog.pg_database WHERE datname = $1",
+                    [Value::from(name)],
+                ))
+                .await
+            {
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => Err(sea_orm::DbErr::Custom(format!(
+                    "database {name} remains after DROP"
+                ))),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        };
+        if let Err(err) = admin.close().await {
+            let status = if confirmed.is_ok() {
+                "removed"
+            } else {
+                "cleanup unconfirmed"
+            };
+            eprintln!(
+                "traces isolated database {name} {status}; admin connection did not close: {}",
+                scrub_admin_error(err, admin_url)
+            );
+        }
+        confirmed
     });
-    if let Err(err) = dropped {
-        eprintln!(
-            "traces isolated database {name} left behind: {}",
-            scrub_admin_error(err, admin_url)
-        );
+    match dropped {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!(
+                "traces isolated database {name} left behind: {}",
+                scrub_admin_error(err, admin_url)
+            );
+            false
+        }
     }
 }
 
@@ -1245,6 +1290,7 @@ async fn create_traces_isolated_database(
         admin_url: admin_url.to_owned(),
         name,
         dropped: AtomicBool::new(false),
+        cleanup: Mutex::new(()),
     });
     let _ = HELD_ISOLATED_DATABASES.try_with(|held| held.borrow_mut().0.push(owned.clone()));
     Ok((connection, TracesIsolatedDatabaseGuard(owned)))
@@ -1409,6 +1455,235 @@ mod traces_isolated_database_tests {
             "failure was not an explicit admin rejection"
         );
     }
+
+    // FIX_MTR25_REPRO_TESTS_BEGIN
+
+    struct Fix25OwnedCleanup {
+        admin_url: String,
+        name: String,
+        armed: bool,
+    }
+
+    impl Fix25OwnedCleanup {
+        fn new(admin_url: &str, name: &str) -> Self {
+            assert!(traces_isolated_name_is_owned(name));
+            Self {
+                admin_url: admin_url.to_owned(),
+                name: name.to_owned(),
+                armed: true,
+            }
+        }
+
+        fn cleanup_owned(&self) {
+            let admin_url = self.admin_url.clone();
+            let name = self.name.clone();
+            let worker = std::thread::Builder::new()
+                .name(format!("fix25-rescue-{name}"))
+                .spawn(move || {
+                    drop_traces_isolated_database(&admin_url, &name);
+                });
+            match worker {
+                Ok(worker) => {
+                    if worker.join().is_err() {
+                        eprintln!("FIX25 owned cleanup worker panicked");
+                    }
+                }
+                Err(_) => eprintln!("FIX25 owned cleanup worker could not start"),
+            }
+        }
+    }
+
+    impl Drop for Fix25OwnedCleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                self.cleanup_owned();
+            }
+        }
+    }
+
+    fn fix25_admin_url() -> String {
+        let _lock = crate::config::testing::env_lock();
+        std::env::var("MEGA2_IT_DB_ADMIN_URL").expect("MEGA2_IT_DB_ADMIN_URL")
+    }
+
+    fn fix25_bad_admin_url(admin_url: &str) -> String {
+        let mut url = Url::parse(admin_url).expect("FIX25 admin URL");
+        assert!(
+            matches!(
+                url.host_str(),
+                Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+            ),
+            "FIX25 auth failure must use the qualified loopback endpoint"
+        );
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        url.set_username(&format!("fix25_rejected_{}_{nonce}", std::process::id()))
+            .expect("synthetic invalid account");
+        url.set_password(Some(&format!("fix25-synthetic-invalid-{nonce}")))
+            .expect("synthetic invalid password");
+        url.to_string()
+    }
+
+    fn fix25_remove_own_creator_tls(guard: &TracesIsolatedDatabaseGuard) {
+        HELD_ISOLATED_DATABASES.with(|held| {
+            let mut held = held.borrow_mut();
+            let index = held
+                .0
+                .iter()
+                .position(|entry| Arc::ptr_eq(entry, &guard.0))
+                .expect("the factory registered this guard on its creator thread");
+            let removed = held.0.remove(index);
+            assert!(Arc::ptr_eq(&removed, &guard.0));
+            drop(removed);
+            assert!(!held.0.iter().any(|entry| Arc::ptr_eq(entry, &guard.0)));
+        });
+        assert_eq!(Arc::strong_count(&guard.0), 1);
+    }
+
+    #[tokio::test]
+    async fn traces_isolated_database_failed_cleanup_remains_retryable() {
+        let admin_url = fix25_admin_url();
+        let control_extensions_before = extension_count(&admin_url).await;
+        let (db, mut guard) = create_traces_isolated_database(&admin_url)
+            .await
+            .expect("FIX25 real isolated database");
+        let name = guard.0.name.clone();
+        let mut recovery = Fix25OwnedCleanup::new(&admin_url, &name);
+        db.close().await.expect("close FIX25 owned database pool");
+        fix25_remove_own_creator_tls(&guard);
+        Arc::get_mut(&mut guard.0)
+            .expect("the real guard is the only owner")
+            .admin_url = fix25_bad_admin_url(&admin_url);
+        let mut owner = Arc::clone(&guard.0);
+        drop(guard);
+        let completed_after_failure = owner.dropped.load(Ordering::Acquire);
+        let existed_after_failure = database_exists(&admin_url, &name).await;
+        assert_eq!(Arc::strong_count(&owner), 1);
+        Arc::get_mut(&mut owner)
+            .expect("the same instance is uniquely owned after guard drop")
+            .admin_url = admin_url.clone();
+
+        // Exercise the same owner's real retry path before checking the
+        // captured completion flag. No completion flag is modified here.
+        owner.drop_off_thread();
+        let removed_by_explicit_retry = !database_exists(&admin_url, &name).await;
+        if !removed_by_explicit_retry {
+            recovery.cleanup_owned();
+        }
+        let absent_after_cleanup = !database_exists(&admin_url, &name).await;
+        if absent_after_cleanup {
+            recovery.armed = false;
+        }
+        let control_extensions_after = extension_count(&admin_url).await;
+        assert!(absent_after_cleanup, "FIX25 owned database cleanup failed");
+        assert_eq!(control_extensions_after, control_extensions_before);
+        assert!(
+            existed_after_failure,
+            "the forced connect failure did not leave the owned database"
+        );
+        assert!(
+            removed_by_explicit_retry,
+            "the same owner's explicit cleanup retry failed"
+        );
+        assert!(
+            owner.dropped.load(Ordering::Acquire),
+            "confirmed absent database must be complete"
+        );
+        assert!(
+            !completed_after_failure,
+            "FIX_MTR25_REPRO_ORACLE: failed cleanup marked complete"
+        );
+    }
+
+    #[test]
+    fn traces_isolated_database_creator_tls_retries_failed_cleanup() {
+        let admin_url = fix25_admin_url();
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("FIX25 independent observer runtime");
+        let control_extensions_before = observer.block_on(extension_count(&admin_url));
+        let creator_admin_url = admin_url.clone();
+        let creator = std::thread::Builder::new()
+            .name("fix25-real-creator".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("FIX25 creator current-thread runtime");
+                let result = runtime.block_on(async {
+                    let (db, mut guard) = create_traces_isolated_database(&creator_admin_url)
+                        .await
+                        .expect("FIX25 creator's real isolated database");
+                    let name = guard.0.name.clone();
+                    let recovery = Fix25OwnedCleanup::new(&creator_admin_url, &name);
+                    db.close()
+                        .await
+                        .expect("close creator's owned database pool");
+                    fix25_remove_own_creator_tls(&guard);
+                    Arc::get_mut(&mut guard.0)
+                        .expect("creator owns the unique real guard")
+                        .admin_url = fix25_bad_admin_url(&creator_admin_url);
+                    let mut owner = Arc::clone(&guard.0);
+                    drop(guard);
+                    let completed_after_failure = owner.dropped.load(Ordering::Acquire);
+                    let existed_after_failure = database_exists(&creator_admin_url, &name).await;
+                    assert_eq!(Arc::strong_count(&owner), 1);
+                    Arc::get_mut(&mut owner)
+                        .expect("creator can restore its own connection parameters")
+                        .admin_url = creator_admin_url.clone();
+                    // Rearm only this factory-created Arc in the actual creator
+                    // TLS. The returned Arc keeps its completion observable.
+                    HELD_ISOLATED_DATABASES.with(|held| {
+                        let mut held = held.borrow_mut();
+                        assert!(!held.0.iter().any(|entry| Arc::ptr_eq(entry, &owner)));
+                        held.0.push(Arc::clone(&owner));
+                    });
+                    assert_eq!(Arc::strong_count(&owner), 2);
+                    (
+                        owner,
+                        recovery,
+                        completed_after_failure,
+                        existed_after_failure,
+                    )
+                });
+                drop(runtime);
+                result
+            })
+            .expect("start the real FIX25 creator OS thread");
+        let (owner, mut recovery, completed_after_failure, existed_after_failure) = creator
+            .join()
+            .expect("join the real creator including TLS exit");
+        assert_eq!(Arc::strong_count(&owner), 1);
+        let removed_by_creator_tls =
+            observer.block_on(async { !database_exists(&admin_url, &recovery.name).await });
+        let completed_after_creator_tls = owner.dropped.load(Ordering::Acquire);
+        // The OLD TLS skips the already-claimed instance. Preserve that
+        // observation, then close only this owned database before the oracle.
+        if !removed_by_creator_tls {
+            recovery.cleanup_owned();
+        }
+        let absent_after_cleanup =
+            observer.block_on(async { !database_exists(&admin_url, &recovery.name).await });
+        if absent_after_cleanup {
+            recovery.armed = false;
+        }
+        let control_extensions_after = observer.block_on(extension_count(&admin_url));
+        assert!(
+            absent_after_cleanup,
+            "FIX25 creator's owned database cleanup failed"
+        );
+        assert_eq!(control_extensions_after, control_extensions_before);
+        assert!(
+            existed_after_failure,
+            "the creator's forced connect failure did not leave its database"
+        );
+        assert!(
+            !completed_after_failure && removed_by_creator_tls && completed_after_creator_tls,
+            "FIX_MTR25_REPRO_ORACLE: failed cleanup marked complete"
+        );
+    }
+
+    // FIX_MTR25_REPRO_TESTS_END
 }
 
 #[cfg(test)]
