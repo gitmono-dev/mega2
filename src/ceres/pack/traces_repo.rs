@@ -15,7 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::{
-    callisto::{access_token, trace_stream, trace_target},
+    callisto::{access_token, ssh_keys, trace_stream, trace_target},
     ceres::{
         pack::RepoHandler,
         protocol::{
@@ -102,6 +102,11 @@ pub(crate) async fn resolve_trace_discovery(
     service_type: ServiceType,
 ) -> Result<TraceDiscovery, MegaError> {
     if !config.enabled {
+        return Err(TracesError::UnknownScope.into());
+    }
+    if let TracesCaller::MonoSshKey { key, .. } = caller
+        && !key.is_current(db, false).await?
+    {
         return Err(TracesError::UnknownScope.into());
     }
     match caller {
@@ -385,7 +390,7 @@ async fn resolve_trace_fetch_capture(
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
     let account = match caller {
-        TracesCaller::MonoAccessToken { .. } => true,
+        TracesCaller::MonoAccessToken { .. } | TracesCaller::MonoSshKey { .. } => true,
         #[cfg(test)]
         TracesCaller::MonoAccount { .. } => true,
         _ => false,
@@ -404,6 +409,13 @@ async fn resolve_trace_fetch_capture(
             token, enforcement, ..
         } => TracesCaller::MonoAccessToken {
             token,
+            enforcement,
+            snapshot: live_snapshot.as_deref(),
+        },
+        TracesCaller::MonoSshKey {
+            key, enforcement, ..
+        } => TracesCaller::MonoSshKey {
+            key,
             enforcement,
             snapshot: live_snapshot.as_deref(),
         },
@@ -456,12 +468,17 @@ async fn resolve_trace_fetch_capture(
     let (namespace, credential) = match caller {
         TracesCaller::StaticPushToken { credential_id, .. } => ("static_push_token", credential_id),
         TracesCaller::MonoAccessToken { token, .. } => ("mono_account", token.credential_id()),
+        TracesCaller::MonoSshKey { key, .. } => ("mono_account", key.credential_id()),
         #[cfg(test)]
         TracesCaller::MonoAccount { credential_id, .. } => ("mono_account", credential_id),
         TracesCaller::Anonymous => return Err(TracesError::Unauthenticated.into()),
     };
     let authenticated_token = match caller {
         TracesCaller::MonoAccessToken { token, .. } => Some(token),
+        _ => None,
+    };
+    let authenticated_key = match caller {
+        TracesCaller::MonoSshKey { key, .. } => Some(key),
         _ => None,
     };
     after_authorization.await;
@@ -471,12 +488,18 @@ async fn resolve_trace_fetch_capture(
         .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT s.tip_oid, a.id AS credential_id, a.username AS credential_username, \
-             a.token AS credential_token, a.created_at AS credential_created_at \
+             a.token AS credential_token, a.created_at AS credential_created_at, \
+             k.id AS ssh_id, k.username AS ssh_username, k.title AS ssh_title, \
+             k.ssh_key AS ssh_ssh_key, k.finger AS ssh_finger, \
+             k.created_at AS ssh_created_at, \
+             (SELECT count(*) FROM ssh_keys k2 WHERE k2.finger = $10) \
+             AS ssh_fingerprint_count \
              FROM trace_stream s \
              JOIN trace_target t ON t.id = s.target_id \
              JOIN trace_credential_binding b ON b.namespace = $1 AND b.credential_id = $2 \
              AND b.retired_at IS NULL AND b.principal_id = $3 \
              LEFT JOIN access_token a ON a.id = $8 \
+             LEFT JOIN ssh_keys k ON k.id = $9 \
              WHERE s.id = $4 AND s.target_id = $5 AND s.hash_kind = $6 \
              AND t.project_path = $7 AND t.active = TRUE",
             [
@@ -488,6 +511,8 @@ async fn resolve_trace_fetch_capture(
                 stream.hash_kind.into(),
                 target.project_path.into(),
                 authenticated_token.map(|token| token.id()).into(),
+                authenticated_key.map(|key| key.id()).into(),
+                authenticated_key.map(|key| key.fingerprint()).into(),
             ],
         ))
         .await
@@ -497,6 +522,16 @@ async fn resolve_trace_fetch_capture(
         let current = access_token::Model::from_query_result(&row, "credential_")
             .map_err(|_| MegaError::Traces(TracesError::UnknownScope))?;
         if !token.matches_record(&current) {
+            return Err(TracesError::UnknownScope.into());
+        }
+    }
+    if let Some(key) = authenticated_key {
+        let current = ssh_keys::Model::from_query_result(&row, "ssh_")
+            .map_err(|_| MegaError::Traces(TracesError::UnknownScope))?;
+        let fingerprint_count: i64 = row
+            .try_get("", "ssh_fingerprint_count")
+            .map_err(|_| MegaError::Traces(TracesError::UnknownScope))?;
+        if fingerprint_count != 1 || !key.matches_record(&current) {
             return Err(TracesError::UnknownScope.into());
         }
     }
@@ -1859,6 +1894,208 @@ pub(crate) mod tests {
             )
             .filter(trace_credential_binding::Column::Namespace.eq("mono_account"))
             .filter(trace_credential_binding::Column::CredentialId.eq(token.credential_id()))
+            .exec(&f.db)
+            .await
+            .unwrap();
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+    }
+
+    async fn mono_fetch_ssh_key(
+        f: &DiscoveryFixture,
+    ) -> crate::ceres::traces::auth::AuthenticatedSshKey {
+        use russh::keys::{HashAlg, PublicKey};
+
+        let text =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqvkVqjzI9K4TDbjKjktkiHFdBzxv88ZUFl/XtNwF";
+        let public_key = PublicKey::from_openssh(text).unwrap();
+        ssh_keys::ActiveModel {
+            id: Set(8201),
+            username: Set("publisher".into()),
+            title: Set("synthetic fetch key".into()),
+            ssh_key: Set(text.into()),
+            finger: Set(public_key.fingerprint(HashAlg::Sha256).to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(&f.db)
+        .await
+        .unwrap();
+        let key = crate::ceres::traces::auth::authenticate_traces_ssh_key(&f.db, &public_key)
+            .await
+            .unwrap()
+            .unwrap();
+        discovery_binding(&f.db, &f.principal_id, "mono_account", key.credential_id()).await;
+        key
+    }
+
+    #[tokio::test]
+    async fn mono_ssh_key_fetch_snapshot_rechecks_source_replacement_and_ambiguity() {
+        use crate::contract::policy::enforcement::Enforcement;
+
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            for mutation in 0..6 {
+                let f = DiscoveryFixture::new(kind, true).await;
+                let key = mono_fetch_ssh_key(&f).await;
+                let store = SharedEntityStore::new();
+                store.swap(&mono_fetch_policy(Some("reader"))).unwrap();
+                let caller = TracesCaller::MonoSshKey {
+                    key: &key,
+                    enforcement: Enforcement::Enforce,
+                    snapshot: None,
+                };
+                let first_tip = "a".repeat(kind.hex_len());
+                trace_stream::Entity::update_many()
+                    .col_expr(
+                        trace_stream::Column::TipOid,
+                        sea_orm::sea_query::Expr::value(first_tip.clone()),
+                    )
+                    .filter(trace_stream::Column::Id.eq(&f.stream_id))
+                    .exec(&f.db)
+                    .await
+                    .unwrap();
+                let grant =
+                    resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store))
+                        .await
+                        .unwrap();
+                assert_eq!(grant.tip_oid(), Some(first_tip.as_str()));
+                let rejected = resolve_trace_fetch_capture(
+                    &f.db,
+                    &f.config,
+                    &f.by_scope(),
+                    caller,
+                    Some(&store),
+                    async {
+                        match mutation {
+                            0 => {
+                                ssh_keys::Entity::delete_by_id(key.id())
+                                    .exec(&f.db)
+                                    .await
+                                    .unwrap();
+                            }
+                            1..=4 => {
+                                let (column, value) = match mutation {
+                                    1 => (
+                                        ssh_keys::Column::SshKey,
+                                        sea_orm::Value::from("synthetic replacement key"),
+                                    ),
+                                    2 => {
+                                        (ssh_keys::Column::Username, sea_orm::Value::from("other"))
+                                    }
+                                    3 => (
+                                        ssh_keys::Column::Finger,
+                                        sea_orm::Value::from("synthetic replacement fingerprint"),
+                                    ),
+                                    _ => (
+                                        ssh_keys::Column::CreatedAt,
+                                        sea_orm::Value::from(
+                                            Utc::now().naive_utc() + chrono::Duration::seconds(1),
+                                        ),
+                                    ),
+                                };
+                                ssh_keys::Entity::update_many()
+                                    .col_expr(column, sea_orm::sea_query::Expr::value(value))
+                                    .filter(ssh_keys::Column::Id.eq(key.id()))
+                                    .exec(&f.db)
+                                    .await
+                                    .unwrap();
+                            }
+                            _ => {
+                                let mut duplicate = ssh_keys::Entity::find_by_id(key.id())
+                                    .one(&f.db)
+                                    .await
+                                    .unwrap()
+                                    .unwrap()
+                                    .into_active_model();
+                                duplicate.id = Set(key.id() + 1);
+                                duplicate.username = Set("other".into());
+                                duplicate.insert(&f.db).await.unwrap();
+                            }
+                        }
+                        trace_stream::Entity::update_many()
+                            .col_expr(
+                                trace_stream::Column::TipOid,
+                                sea_orm::sea_query::Expr::value("b".repeat(kind.hex_len())),
+                            )
+                            .filter(trace_stream::Column::Id.eq(&f.stream_id))
+                            .exec(&f.db)
+                            .await
+                            .unwrap();
+                    },
+                )
+                .await;
+                fetch_rejected(rejected, TracesError::UnknownScope);
+                fetch_rejected(
+                    resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store))
+                        .await,
+                    TracesError::UnknownScope,
+                );
+                assert_eq!(grant.tip_oid(), Some(first_tip.as_str()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mono_ssh_key_fetch_uses_current_policy_and_retirement() {
+        use crate::contract::policy::enforcement::Enforcement;
+
+        let f = DiscoveryFixture::new(HashKind::Sha256, true).await;
+        let key = mono_fetch_ssh_key(&f).await;
+        let store = SharedEntityStore::new();
+        store.swap(&mono_fetch_policy(Some("admin"))).unwrap();
+        let stale = store.snapshot().unwrap();
+        let caller = TracesCaller::MonoSshKey {
+            key: &key,
+            enforcement: Enforcement::Enforce,
+            snapshot: Some(&stale),
+        };
+        store.swap(&mono_fetch_policy(None)).unwrap();
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+        let shadow = TracesCaller::MonoSshKey {
+            key: &key,
+            enforcement: Enforcement::Shadow,
+            snapshot: Some(&stale),
+        };
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), shadow, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+        store.swap(&mono_fetch_policy(Some("reader"))).unwrap();
+        assert!(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store))
+                .await
+                .is_ok()
+        );
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, None).await,
+            TracesError::UnknownScope,
+        );
+        let off = TracesCaller::MonoSshKey {
+            key: &key,
+            enforcement: Enforcement::Off,
+            snapshot: Some(&stale),
+        };
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), off, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+        store.mark_dirty();
+        fetch_rejected(
+            resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, Some(&store)).await,
+            TracesError::UnknownScope,
+        );
+        store.swap(&mono_fetch_policy(Some("reader"))).unwrap();
+        trace_credential_binding::Entity::update_many()
+            .col_expr(
+                trace_credential_binding::Column::RetiredAt,
+                sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+            )
+            .filter(trace_credential_binding::Column::Namespace.eq("mono_account"))
+            .filter(trace_credential_binding::Column::CredentialId.eq(key.credential_id()))
             .exec(&f.db)
             .await
             .unwrap();

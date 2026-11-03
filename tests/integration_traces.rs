@@ -3619,6 +3619,34 @@ mod disabled_http {
             );
         }
 
+        async fn ssh_none_authenticated(&self, user: &str) -> bool {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut session = russh::client::connect(
+                    std::sync::Arc::new(russh::client::Config::default()),
+                    ("127.0.0.1", self.port),
+                    SshClient,
+                )
+                .await
+                .expect("connect fresh SSH none-auth probe");
+                let accepted = session
+                    .authenticate_none(user)
+                    .await
+                    .expect("receive SSH none-auth response")
+                    .success();
+                session
+                    .disconnect(russh::Disconnect::ByApplication, "probe complete", "en")
+                    .await
+                    .expect("disconnect SSH none-auth probe");
+                assert!(
+                    matches!(session.await, Ok(()) | Err(russh::Error::Disconnect)),
+                    "SSH none-auth probe task failed during close"
+                );
+                accepted
+            })
+            .await
+            .expect("SSH none-auth probe deadline")
+        }
+
         async fn ssh_session(&self, storage_only: bool) -> SshSession {
             let (session,) = tokio::time::timeout(Duration::from_secs(10), async {
                 let mut session = russh::client::connect(
@@ -3820,85 +3848,22 @@ mod disabled_http {
             self.start_ssh(true, false).await;
             let session = self.ssh_session(false).await;
             let before = snapshot(db).await;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                let mut channel = session
-                    .channel_open_session()
-                    .await
-                    .expect("enabled SSH channel");
-                let service = if receive {
-                    "git-receive-pack"
-                } else {
-                    "git-upload-pack"
-                };
-                channel
-                    .exec(
-                        true,
-                        format!("{service} '/.traces/by-scope/{}.git'", self.scope),
-                    )
-                    .await
-                    .expect("enabled SSH exec");
-                let mut advertisement = Vec::new();
-                loop {
-                    match channel
-                        .wait()
-                        .await
-                        .expect("enabled existing advertisement")
-                    {
-                        russh::ChannelMsg::Data { data } => {
-                            advertisement.extend_from_slice(&data);
-                            assert!(
-                                advertisement.len() < 1024 * 1024,
-                                "bounded enabled advertisement"
-                            );
-                            if advertisement.ends_with(b"0000") {
-                                break;
-                            }
-                        }
-                        russh::ChannelMsg::Failure | russh::ChannelMsg::Close => {
-                            panic!("enabled path was replaced by disabled refusal")
-                        }
-                        _ => {}
-                    }
-                }
-                assert!(String::from_utf8_lossy(&advertisement).contains("capabilities^{}"));
-                assert!(!String::from_utf8_lossy(&advertisement).contains(&self.tip));
-                let endpoint = if receive {
-                    Endpoint::Receive
-                } else {
-                    Endpoint::Upload
-                };
-                channel
-                    .data(self.request_body(endpoint, false).as_slice())
-                    .await
-                    .expect("enabled real PACK/request");
-                channel.eof().await.expect("finish enabled request");
-                let mut response = Vec::new();
-                while let Some(message) = channel.wait().await {
-                    match message {
-                        russh::ChannelMsg::Data { data }
-                        | russh::ChannelMsg::ExtendedData { data, .. } => {
-                            response.extend_from_slice(&data)
-                        }
-                        russh::ChannelMsg::Close => break,
-                        _ => {}
-                    }
-                }
-                assert!(!response.windows(4).any(|bytes| bytes == b"PACK"));
-                assert!(!String::from_utf8_lossy(&response).contains("ok refs/libra/traces"));
-                assert!(
-                    String::from_utf8_lossy(&response)
-                        .contains("trace repository does not write code objects"),
-                    "enabled fail-closed response: {}",
-                    String::from_utf8_lossy(&response)
-                );
-            })
-            .await
-            .expect("enabled SSH existing refusal deadline");
+            let service = if receive {
+                "git-receive-pack"
+            } else {
+                "git-upload-pack"
+            };
+            // This is an ordinary code-login key with no trace credential
+            // binding. Enabling traces must not authorize it or advertise a
+            // scope. MTR39's separate bound-owner probes cover true admission.
+            ssh_refused(
+                &session,
+                &format!("{service} '/.traces/by-scope/{}.git'", self.scope),
+                false,
+            )
+            .await;
             unchanged(&before, &snapshot(db).await);
-            session
-                .disconnect(russh::Disconnect::ByApplication, "fixture complete", "en")
-                .await
-                .expect("disconnect enabled SSH");
+            close_scope_session(session).await;
         }
 
         async fn ssh_storage_only(&mut self, db: &sea_orm::DatabaseConnection, receive: bool) {
@@ -4024,6 +3989,665 @@ mod disabled_http {
         })
         .await
         .expect("disabled SSH must refuse before stdin/EOF within 10s");
+    }
+
+    // MTR39 drives only the public binary and SSH transport. These identities
+    // are independent: a Cedar account is not a trace principal or a key id.
+    const SCOPE_WRITER: &str = "mtr39-project-writer";
+    const SCOPE_NONWRITER: &str = "mtr39-project-nonwriter";
+
+    struct ScopeKey {
+        id: i64,
+        path: PathBuf,
+        public: String,
+        fingerprint: String,
+    }
+
+    struct WrongScopeSigner {
+        wrong: std::sync::Arc<russh::keys::PrivateKey>,
+        called: bool,
+    }
+
+    impl russh::Signer for WrongScopeSigner {
+        type Error = russh::AgentAuthError;
+
+        async fn auth_sign(
+            &mut self,
+            _key: &russh::keys::agent::AgentIdentity,
+            _hash_alg: Option<russh::keys::HashAlg>,
+            mut data: Vec<u8>,
+        ) -> Result<Vec<u8>, Self::Error> {
+            use russh::keys::ssh_encoding::Encode;
+            self.called = true;
+            let signature: russh::keys::ssh_key::Signature =
+                russh::keys::signature::Signer::try_sign(self.wrong.as_ref(), &data)
+                    .map_err(|_| russh::keys::Error::InvalidSignature)?;
+            let mut encoded_signature = Vec::new();
+            signature
+                .encode(&mut encoded_signature)
+                .map_err(russh::keys::Error::from)?;
+            encoded_signature
+                .encode(&mut data)
+                .map_err(russh::keys::Error::from)?;
+            Ok(data)
+        }
+    }
+
+    struct ScopeAuthFixture {
+        fixture: Fixture,
+        http_port: u16,
+        owner: String,
+        outsider: String,
+        next_key_id: i64,
+    }
+
+    impl ScopeAuthFixture {
+        async fn new(db: &sea_orm::DatabaseConnection) -> Self {
+            let fixture = Fixture::new(db).await;
+            let config_path = fixture.temp.path().join("config.toml");
+            let mut config: toml::Value =
+                toml::from_str(&fs::read_to_string(&config_path).expect("scope config"))
+                    .expect("parse scope config");
+            config["monorepo"]["admin"] =
+                toml::Value::Array(vec![toml::Value::String(SCOPE_WRITER.to_owned())]);
+            fs::write(
+                &config_path,
+                toml::to_string(&config).expect("scope config TOML"),
+            )
+            .expect("write isolated scope config");
+            // Init writes the real main /.mega_cedar.json with this account as
+            // admin. No synthetic policy snapshot or private auth API is used.
+            let mut init = fixture.command(false, "trunk", "/third-party");
+            init.args(["service", "init", "--yes"]);
+            OwnedChild::spawn(&mut init).require_success().await;
+            let owner = Uuid::new_v4().to_string();
+            let outsider = Uuid::new_v4().to_string();
+            assert_ne!(owner, outsider);
+            for id in [&owner, &outsider] {
+                trace_principal::ActiveModel {
+                    id: Set(id.clone()),
+                    created_at: Set(Utc::now().fixed_offset()),
+                }
+                .insert(db)
+                .await
+                .expect("seed independent scope principal");
+            }
+            let target = Uuid::new_v4().to_string();
+            trace_target::ActiveModel {
+                id: Set(target.clone()),
+                target_kind: Set("native".to_owned()),
+                project_path: Set("/project".to_owned()),
+                backing_import_repo_id: Set(None),
+                active: Set(true),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .expect("seed real project target");
+            trace_stream::ActiveModel {
+                id: Set(fixture.scope.clone()),
+                principal_id: Set(owner.clone()),
+                target_id: Set(target),
+                source_repo_id: Set("mtr39-auth-only".to_owned()),
+                epoch_id: Set(fixture.epoch.clone()),
+                hash_kind: Set("sha1".to_owned()),
+                tip_oid: Set(None),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .expect("seed owner scope without PACK");
+            Self {
+                fixture,
+                http_port: 0,
+                owner,
+                outsider,
+                next_key_id: Utc::now().timestamp_micros(),
+            }
+        }
+
+        async fn key(&mut self, username: &str) -> ScopeKey {
+            self.next_key_id += 1;
+            let id = self.next_key_id;
+            let path = self.fixture.shared.path().join(format!("ssh/scope-{id}"));
+            git_cli::generate_client_ed25519(&path);
+            let public = fs::read_to_string(path.with_extension("pub")).expect("scope public key");
+            let fingerprint = git_cli::ssh_fingerprint_sha256_col2(&path.with_extension("pub"));
+            self.fixture.db.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO ssh_keys (id, username, title, ssh_key, finger, created_at) VALUES ($1,$2,$3,$4,$5,now())",
+                [id.into(), username.into(), "MTR39 disposable key".into(), public.clone().into(), fingerprint.clone().into()],
+            )).await.expect("seed source SSH key");
+            let actual: i64 = self
+                .fixture
+                .db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT id FROM ssh_keys WHERE id=$1",
+                    [id.into()],
+                ))
+                .await
+                .expect("read actual key id")
+                .expect("source key row")
+                .try_get("", "id")
+                .expect("source row id");
+            assert_eq!(actual, id);
+            ScopeKey {
+                id: actual,
+                path,
+                public,
+                fingerprint,
+            }
+        }
+
+        async fn bind(&self, principal: &str, namespace: &str, credential_id: &str) {
+            trace_credential_binding::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                principal_id: Set(principal.to_owned()),
+                namespace: Set(namespace.to_owned()),
+                credential_id: Set(credential_id.to_owned()),
+                created_at: Set(Utc::now().fixed_offset()),
+                retired_at: Set(None),
+            }
+            .insert(&self.fixture.db)
+            .await
+            .expect("bind actual credential namespace");
+        }
+
+        fn static_token(&self, name: &str, path: &str) -> String {
+            let token = format!("mtr39-disposable-{}", Uuid::new_v4());
+            let config_path = self.fixture.temp.path().join("config.toml");
+            let mut config = fs::read_to_string(&config_path).expect("static scope config");
+            config.push_str(&format!(
+                "\n[[git.push_tokens]]\nname = {name:?}\ntoken = {token:?}\npaths = [{path:?}]\n"
+            ));
+            fs::write(config_path, config).expect("configure disposable static token");
+            token
+        }
+
+        async fn start(&mut self, storage_only: bool, token: bool, enforcement: &str) {
+            self.stop();
+            self.fixture.traces_auth = true;
+            self.fixture.static_auth = token;
+            self.http_port = git_cli::reserve_ephemeral_port();
+            self.fixture.port = git_cli::reserve_ephemeral_port();
+            git_cli::record_allocated_port(self.http_port);
+            git_cli::record_allocated_port(self.fixture.port);
+            let mut command = self.fixture.command(
+                true,
+                if storage_only { "trunk" } else { "review" },
+                "/third-party",
+            );
+            command
+                .env("MEGA_CEDAR__ENFORCEMENT", enforcement)
+                .env("MEGA_GIT__SSH_RECEIVE_PACK", "false")
+                .env("MEGA_GIT_OBJECT_CACHE_PREFIX", "disabled");
+            git_cli::apply_mega2_public_http_base_env(&mut command, self.http_port);
+            command
+                .args([
+                    "service",
+                    "multi",
+                    "http",
+                    "ssh",
+                    "--host",
+                    git_cli::service_listen_host(),
+                    "-p",
+                ])
+                .arg(self.http_port.to_string())
+                .arg("--ssh-port")
+                .arg(self.fixture.port.to_string());
+            self.fixture.service = OwnedChild::spawn(&mut command);
+            git_cli::record_service_pid(
+                self.fixture
+                    .service
+                    .0
+                    .as_ref()
+                    .expect("scope multi child")
+                    .id(),
+            );
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("scope readiness client");
+            tokio::time::timeout(LIMIT, async {
+                loop {
+                    assert!(self.fixture.service.0.as_mut().expect("scope multi child").try_wait().expect("poll scope multi").is_none(), "scope multi exited before readiness");
+                    let http = matches!(client.get(git_cli::mega2_host_http_url(self.http_port, "/api/openapi.json")).send().await, Ok(response) if response.status() == reqwest::StatusCode::OK);
+                    let ssh = if let Ok(mut socket) = tokio::net::TcpStream::connect(("127.0.0.1", self.fixture.port)).await {
+                        let mut banner = [0;4];
+                        matches!(tokio::time::timeout(Duration::from_secs(2), socket.read_exact(&mut banner)).await, Ok(Ok(_))) && banner == *b"SSH-"
+                    } else { false };
+                    if http && ssh && self.fixture.initial_index_ready().await { break; }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await.expect("scope shared HTTP/SSH readiness deadline");
+        }
+
+        fn stop(&mut self) {
+            self.fixture.stop();
+            if self.http_port != 0 {
+                git_cli::wait_until_port_closed(self.http_port, Duration::from_secs(5));
+                self.http_port = 0;
+            }
+        }
+
+        async fn connect(&self) -> SshSession {
+            let (session,) = tokio::time::timeout(Duration::from_secs(10), async {
+                (russh::client::connect(
+                    std::sync::Arc::new(russh::client::Config::default()),
+                    ("127.0.0.1", self.fixture.port),
+                    SshClient,
+                )
+                .await
+                .expect("fresh scope SSH connection"),)
+            })
+            .await
+            .expect("scope SSH connection deadline");
+            session
+        }
+
+        async fn key_session(&self, login: &str, key: &ScopeKey, expected: bool) -> SshSession {
+            let mut session = self.connect().await;
+            let key = russh::keys::load_secret_key(&key.path, None).expect("scope private key");
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                session.authenticate_publickey(
+                    login,
+                    russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(key), None),
+                ),
+            )
+            .await
+            .expect("scope signed-key deadline")
+            .expect("scope signed-key response");
+            assert_eq!(
+                result.success(),
+                expected,
+                "real key authentication result for requested login"
+            );
+            session
+        }
+
+        async fn password_session(&self, password: &str, expected: bool) -> SshSession {
+            let mut session = self.connect().await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                session.authenticate_password("traces", password),
+            )
+            .await
+            .expect("scope password deadline")
+            .expect("scope password response");
+            assert_eq!(
+                result.success(),
+                expected,
+                "real static-password authentication result"
+            );
+            session
+        }
+
+        fn receive_command(&self) -> String {
+            format!(
+                "git-receive-pack '/.traces/by-scope/{}.git'",
+                self.fixture.scope
+            )
+        }
+
+        async fn receive_allowed(&self, session: &SshSession) {
+            let before = snapshot(&self.fixture.db).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut channel = session
+                    .channel_open_session()
+                    .await
+                    .expect("authorized scope channel");
+                channel
+                    .exec(true, self.receive_command())
+                    .await
+                    .expect("authorized receive exec");
+                let mut data = Vec::new();
+                let mut accepted = false;
+                while let Some(message) = channel.wait().await {
+                    match message {
+                        russh::ChannelMsg::Success => accepted = true,
+                        russh::ChannelMsg::Data { data: bytes } => {
+                            data.extend_from_slice(&bytes);
+                            assert!(data.len() < 64 * 1024, "bounded scope advertisement");
+                        }
+                        russh::ChannelMsg::ExtendedData { data, .. } => assert!(
+                            data.is_empty(),
+                            "authorized receive cannot use code-write refusal"
+                        ),
+                        russh::ChannelMsg::Failure | russh::ChannelMsg::Close => {
+                            panic!("authorized TraceRepo receive was refused")
+                        }
+                        _ => {}
+                    }
+                    if accepted && data.ends_with(b"0000") {
+                        break;
+                    }
+                }
+                assert!(
+                    accepted && data.ends_with(b"0000"),
+                    "real exec success and trace advertisement required"
+                );
+                assert!(
+                    String::from_utf8_lossy(&data).contains("capabilities^{}"),
+                    "empty seeded TraceRepo advertisement"
+                );
+                assert!(!data.windows(4).any(|part| part == b"PACK"));
+                assert!(!String::from_utf8_lossy(&data).contains("refs/heads/main"));
+                // No PACK/data-plane assertion belongs to this card.
+                channel.eof().await.expect("finish auth-only receive");
+                channel.close().await.expect("close auth-only receive");
+            })
+            .await
+            .expect("authorized trace receive advertisement deadline");
+            unchanged(&before, &snapshot(&self.fixture.db).await);
+        }
+
+        async fn receive_refused(&self, session: &SshSession) {
+            let before = snapshot(&self.fixture.db).await;
+            ssh_refused(session, &self.receive_command(), false).await;
+            ssh_refused(
+                session,
+                &format!(
+                    "git-receive-pack '/.traces/by-scope/{}.git'",
+                    Uuid::new_v4()
+                ),
+                false,
+            )
+            .await;
+            unchanged(&before, &snapshot(&self.fixture.db).await);
+        }
+
+        async fn code_receive_refused(&self, session: &SshSession) {
+            let before = snapshot(&self.fixture.db).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut channel = session
+                    .channel_open_session()
+                    .await
+                    .expect("ordinary code receive channel");
+                channel
+                    .exec(true, "git-receive-pack '/project/control.git'")
+                    .await
+                    .expect("ordinary code receive exec");
+                let mut stderr = Vec::new();
+                let mut eof = false;
+                let mut close = false;
+                while let Some(message) = channel.wait().await {
+                    match message {
+                        russh::ChannelMsg::ExtendedData { data, ext } => {
+                            assert_eq!(ext, 1);
+                            stderr.extend_from_slice(&data);
+                        }
+                        russh::ChannelMsg::Data { data } => {
+                            assert!(data.is_empty(), "ordinary code receive must not advertise")
+                        }
+                        russh::ChannelMsg::Failure => {
+                            panic!("ordinary receive requires existing disabled oracle")
+                        }
+                        russh::ChannelMsg::Eof => eof = true,
+                        russh::ChannelMsg::Close => {
+                            close = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(stderr, b"error: SSH receive-pack is disabled\n");
+                assert!(eof && close, "ordinary receive disabled EOF/close");
+            })
+            .await
+            .expect("ordinary code receive refused before stdin");
+            unchanged(&before, &snapshot(&self.fixture.db).await);
+        }
+    }
+
+    async fn close_scope_session(session: SshSession) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            session
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "scope probe complete",
+                    "en",
+                )
+                .await
+                .expect("disconnect scope probe");
+            assert!(
+                matches!(session.await, Ok(()) | Err(russh::Error::Disconnect)),
+                "scope transport close failed"
+            );
+        })
+        .await
+        .expect("scope transport close deadline");
+    }
+
+    #[derive(Clone, Copy)]
+    pub enum ScopeAuthCase {
+        Anonymous,
+        Static,
+        Mono,
+        Deleted,
+        Replaced,
+        Ambiguous,
+        VerifiedKey,
+    }
+
+    pub async fn scope_auth(case: ScopeAuthCase) {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(ScopeAuthFixture::new(&db).await);
+            let f = fixture.as_mut().expect("scope auth fixture");
+            let writer = f.key(SCOPE_WRITER).await;
+            f.bind(&f.owner, "mono_account", &format!("ssh-key:{}", writer.id)).await;
+            match case {
+                ScopeAuthCase::Anonymous => {
+                    f.start(true, false, "off").await;
+                    let mut session = f.connect().await;
+                    assert!(tokio::time::timeout(Duration::from_secs(10), session.authenticate_none("git")).await.expect("ordinary anonymous auth deadline").expect("ordinary anonymous auth").success());
+                    f.receive_refused(&session).await;
+                    let before = snapshot(&db).await;
+                    let path = format!("/.traces/by-scope/{}.git", f.fixture.scope);
+                    for service in ["git-upload-pack", "git-lfs-authenticate", "git-lfs-transfer"] {
+                        let suffix = if service.starts_with("git-lfs") { " download" } else { "" };
+                        ssh_refused(&session, &format!("{service} '{path}'{suffix}"), false).await;
+                    }
+                    unchanged(&before, &snapshot(&db).await);
+                    f.code_receive_refused(&session).await;
+                    close_scope_session(session).await;
+                }
+                ScopeAuthCase::Static => {
+                    // Deliberate textual collision with the actual Mono row id.
+                    let collision = format!("ssh-key:{}", writer.id);
+                    let token = f.static_token(&collision, "/project");
+                    f.bind(&f.outsider, "static_push_token", &collision).await;
+                    let own_token = f.static_token("mtr39-owner", "/project");
+                    f.bind(&f.owner, "static_push_token", "mtr39-owner").await;
+                    let narrow = f.static_token("mtr39-uncovered", "/other-project");
+                    f.bind(&f.owner, "static_push_token", "mtr39-uncovered").await;
+                    let unbound = f.static_token("mtr39-unbound", "/project");
+                    f.start(true, true, "off").await;
+                    for password in [&token, &narrow, &unbound] {
+                        let session = f.password_session(password, true).await;
+                        f.receive_refused(&session).await;
+                        close_scope_session(session).await;
+                    }
+                    let session = f.password_session(&own_token, true).await;
+                    f.receive_allowed(&session).await;
+                    f.code_receive_refused(&session).await;
+                    close_scope_session(session).await;
+                    close_scope_session(f.password_session("mtr39-invalid-password", false).await).await;
+                }
+                ScopeAuthCase::Mono => {
+                    let nonwriter = f.key(SCOPE_NONWRITER).await;
+                    f.bind(&f.owner, "mono_account", &format!("ssh-key:{}", nonwriter.id)).await;
+                    let outsider = f.key(SCOPE_WRITER).await;
+                    f.bind(&f.outsider, "mono_account", &format!("ssh-key:{}", outsider.id)).await;
+                    let unbound = f.key(SCOPE_WRITER).await;
+                    // A same-name static owner binding must not authorize this key.
+                    f.bind(&f.owner, "static_push_token", &format!("ssh-key:{}", unbound.id)).await;
+                    f.start(false, false, "enforce").await;
+                    let session = f.key_session("traces", &writer, true).await;
+                    f.receive_allowed(&session).await;
+                    f.code_receive_refused(&session).await;
+                    close_scope_session(session).await;
+                    for key in [&nonwriter, &outsider, &unbound] {
+                        let session = f.key_session("traces", key, true).await;
+                        f.receive_refused(&session).await;
+                        close_scope_session(session).await;
+                    }
+                    // Login text cannot impersonate a bound trace principal.
+                    let session = f.key_session(SCOPE_WRITER, &unbound, true).await;
+                    f.receive_refused(&session).await;
+                    close_scope_session(session).await;
+                    f.start(false, false, "off").await;
+                    let session = f.key_session("traces", &writer, true).await;
+                    f.receive_refused(&session).await;
+                    close_scope_session(session).await;
+                    // Traces shadow follows the real Cedar decision for this account.
+                    f.start(false, false, "shadow").await;
+                    let session = f.key_session("traces", &writer, true).await;
+                    f.receive_allowed(&session).await;
+                    close_scope_session(session).await;
+                    let session = f.key_session("traces", &nonwriter, true).await;
+                    f.receive_refused(&session).await;
+                    close_scope_session(session).await;
+                }
+                ScopeAuthCase::Deleted | ScopeAuthCase::Replaced => {
+                    f.start(false, false, "enforce").await;
+                    let session = f.key_session("traces", &writer, true).await;
+                    f.receive_allowed(&session).await;
+                    if matches!(case, ScopeAuthCase::Deleted) {
+                        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres, "DELETE FROM ssh_keys WHERE id=$1", [writer.id.into()])).await.expect("delete authenticated source row");
+                    } else {
+                        let replacement = f.key(SCOPE_WRITER).await;
+                        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres, "DELETE FROM ssh_keys WHERE id=$1", [replacement.id.into()])).await.expect("remove temporary replacement source id");
+                        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres, "UPDATE ssh_keys SET ssh_key=$1, finger=$2, created_at=created_at + interval '1 second' WHERE id=$3", [replacement.public.into(), replacement.fingerprint.into(), writer.id.into()])).await.expect("replace same authenticated source id");
+                    }
+                    f.receive_refused(&session).await;
+                    close_scope_session(session).await;
+                    close_scope_session(f.key_session("traces", &writer, false).await).await;
+                }
+                ScopeAuthCase::Ambiguous => {
+                    f.start(false, false, "enforce").await;
+                    for username in [SCOPE_WRITER, SCOPE_NONWRITER] {
+                        let live = f.key_session("traces", &writer, true).await;
+                        f.next_key_id += 1;
+                        let duplicate = f.next_key_id;
+                        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                            "INSERT INTO ssh_keys (id,username,title,ssh_key,finger,created_at) VALUES ($1,$2,$3,$4,$5,now())",
+                            [duplicate.into(), username.into(), "MTR39 ambiguous source".into(), writer.public.clone().into(), writer.fingerprint.clone().into()],
+                        )).await.expect("duplicate real fingerprint source row");
+                        f.receive_refused(&live).await;
+                        close_scope_session(live).await;
+                        close_scope_session(f.key_session("traces", &writer, false).await).await;
+                        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres, "DELETE FROM ssh_keys WHERE id=$1", [duplicate.into()])).await.expect("remove own ambiguous source row");
+                    }
+                    let session = f.key_session("traces", &writer, true).await;
+                    f.receive_allowed(&session).await;
+                    close_scope_session(session).await;
+                }
+                ScopeAuthCase::VerifiedKey => {
+                    let unbound = f.key(SCOPE_WRITER).await;
+                    f.start(false, false, "enforce").await;
+                    let mut session = f.connect().await;
+                    let offered = russh::keys::load_secret_key(&writer.path, None).expect("offered bound public key");
+                    let wrong = std::sync::Arc::new(russh::keys::load_secret_key(&unbound.path, None).expect("different signing key"));
+                    let mut signer = WrongScopeSigner { wrong: wrong.clone(), called: false };
+                    let response = tokio::time::timeout(Duration::from_secs(10), session.authenticate_publickey_with("traces", offered.public_key().clone(), None, &mut signer)).await.expect("wrong-signature response deadline").expect("real wrong-signature response");
+                    assert!(signer.called, "known public key must reach actual signature request");
+                    assert!(!response.success(), "offered key without its signature must not authenticate");
+                    // This is still the same unauthenticated transport. A valid
+                    // different key must not inherit the previously offered A.
+                    assert!(tokio::time::timeout(Duration::from_secs(10), session.authenticate_publickey("traces", russh::keys::PrivateKeyWithHashAlg::new(wrong, None))).await.expect("valid second-key deadline").expect("valid second-key response").success());
+                    f.receive_refused(&session).await;
+                    close_scope_session(session).await;
+                    let session = f.key_session("traces", &writer, true).await;
+                    f.receive_allowed(&session).await;
+                    close_scope_session(session).await;
+                }
+            }
+        }).catch_unwind().await;
+        let cleanup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(fixture) = &mut fixture {
+                fixture.stop();
+            }
+        }));
+        let closed = db.close().await;
+        drop(guard);
+        if (result.is_err() || cleanup.is_err())
+            && let Some(fixture) = fixture.take()
+        {
+            let logs = fixture.fixture.temp.keep();
+            for name in ["process.out", "process.err"] {
+                if let Ok(bytes) = fs::read(logs.join(name)) {
+                    eprintln!(
+                        "SSH scope fixture failure log retained: file={} sha256={}",
+                        logs.join(name).display(),
+                        hex::encode(Sha256::digest(bytes))
+                    );
+                }
+            }
+        }
+        drop(fixture);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close scope auth pool before schema guard");
+    }
+
+    pub async fn reserved_login_rejects_none() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(Fixture::new(&db).await);
+            let fixture = fixture.as_mut().expect("SSH none-auth fixture");
+            let mut init = fixture.command(false, "trunk", "/third-party");
+            init.args(["service", "init", "--yes"]);
+            OwnedChild::spawn(&mut init).require_success().await;
+            fixture.start_ssh(true, true).await;
+            assert!(
+                fixture.ssh_none_authenticated("git").await,
+                "ordinary storage-only git login must retain anonymous authentication"
+            );
+            assert!(
+                !fixture.ssh_none_authenticated("traces").await,
+                "reserved SSH login traces accepted none authentication"
+            );
+        })
+        .catch_unwind()
+        .await;
+        let cleanup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(fixture) = &mut fixture {
+                fixture.stop();
+            }
+        }));
+        let closed = db.close().await;
+        drop(guard);
+        if (result.is_err() || cleanup.is_err())
+            && let Some(fixture) = fixture.take()
+        {
+            let logs = fixture.temp.keep();
+            for name in ["process.out", "process.err"] {
+                if let Ok(bytes) = fs::read(logs.join(name)) {
+                    eprintln!(
+                        "SSH none-auth fixture failure log retained: file={} sha256={}",
+                        logs.join(name).display(),
+                        hex::encode(Sha256::digest(bytes))
+                    );
+                }
+            }
+        }
+        drop(fixture);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close SSH none-auth pool before database guard");
     }
 
     pub async fn run_ssh(receive: bool) {
@@ -9694,6 +10318,46 @@ async fn traces_disabled_http_upload() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn traces_disabled_http_receive() {
     disabled_http::run(disabled_http::Endpoint::Receive).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scope_auth_reserved_login_rejects_none() {
+    disabled_http::reserved_login_rejects_none().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scope_auth_ordinary_anonymous_cannot_exec_traces() {
+    disabled_http::scope_auth(disabled_http::ScopeAuthCase::Anonymous).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scope_auth_static_namespace_owner_and_paths() {
+    disabled_http::scope_auth(disabled_http::ScopeAuthCase::Static).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scope_auth_mono_rowid_owner_and_project_write() {
+    disabled_http::scope_auth(disabled_http::ScopeAuthCase::Mono).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scope_auth_deleted_key_cannot_exec_on_authenticated_session() {
+    disabled_http::scope_auth(disabled_http::ScopeAuthCase::Deleted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scope_auth_replaced_same_key_id_cannot_reuse_authenticated_session() {
+    disabled_http::scope_auth(disabled_http::ScopeAuthCase::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scope_auth_ambiguous_fingerprint_rejects_same_and_distinct_accounts() {
+    disabled_http::scope_auth(disabled_http::ScopeAuthCase::Ambiguous).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scope_auth_requires_verified_key_not_offered_key() {
+    disabled_http::scope_auth(disabled_http::ScopeAuthCase::VerifiedKey).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

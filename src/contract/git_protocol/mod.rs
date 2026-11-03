@@ -514,6 +514,7 @@ mod tests {
             channels: HashMap::new(),
             v2_channels: HashMap::new(),
             authenticated_user: None,
+            authenticated_credential: None,
         };
         assert!(Arc::ptr_eq(
             &ctx_entity_store,

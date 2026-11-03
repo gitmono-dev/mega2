@@ -8,27 +8,33 @@ use russh::{
     keys::{HashAlg, PublicKey},
     server::{self, Auth, ChannelOpenHandle, Msg, Session},
 };
+use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, sync::Mutex};
 
 use crate::{
     ceres::{
         api_service::state::ProtocolApiState,
         lfs::lfs_structs::Link,
+        pack::traces_repo::resolve_trace_discovery,
         protocol::{
             ServiceType, SmartSession, TransportProtocol,
             import_refs::CommandType,
             smart::{self},
             v2,
         },
+        traces::auth::{AuthenticatedSshKey, TracesCaller, authenticate_traces_ssh_key},
     },
-    common::errors::ProtocolError,
-    config::PushAuth,
-    contract::git_protocol::{
-        check_push_permission, check_upload_pack_access, lookup_push_token,
-        path::{LocatorDispatch, RepoLocator, TracesLocator, dispatch_repo_locator},
-        resolve_view_target,
+    common::errors::{MegaError, ProtocolError, TracesError},
+    config::{GitConfig, PushAuth, PushTokenConfig},
+    contract::{
+        git_protocol::{
+            check_push_permission, check_upload_pack_access, ct_eq_bytes, lookup_push_token,
+            path::{LocatorDispatch, RepoLocator, TracesLocator, dispatch_repo_locator},
+            resolve_view_target,
+        },
+        policy::enforcement::Enforcement,
     },
-    jupiter::storage::Storage,
+    jupiter::storage::{Storage, base_storage::StorageConnector},
 };
 
 type ClientMap = HashMap<(usize, ChannelId), Channel<Msg>>;
@@ -354,6 +360,42 @@ fn ssh_pre_dispatch_reply(exec: &SshExecRequest) -> Option<SshErrReply> {
 }
 
 #[derive(Clone)]
+pub(crate) enum SshAuthenticatedCredential {
+    Static {
+        login: String,
+        name: String,
+        secret_digest: [u8; 32],
+    },
+    Key {
+        login: String,
+        key: Arc<AuthenticatedSshKey>,
+    },
+}
+
+impl SshAuthenticatedCredential {
+    fn login(&self) -> &str {
+        match self {
+            Self::Static { login, .. } | Self::Key { login, .. } => login,
+        }
+    }
+
+    fn current_static_token<'a>(&self, git: &'a GitConfig) -> Option<&'a PushTokenConfig> {
+        let Self::Static {
+            name,
+            secret_digest,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        git.push_tokens.iter().find(|token| {
+            token.name == *name
+                && ct_eq_bytes(&Sha256::digest(token.token.as_bytes()), secret_digest)
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct SshServer {
     pub clients: Arc<Mutex<ClientMap>>,
     pub id: usize,
@@ -361,6 +403,7 @@ pub struct SshServer {
     pub v2_channels: HashMap<ChannelId, bool>,
     pub state: ProtocolApiState,
     pub authenticated_user: Option<String>,
+    pub(crate) authenticated_credential: Option<SshAuthenticatedCredential>,
 }
 
 #[derive(Clone, Default)]
@@ -383,13 +426,68 @@ pub struct GitSshChannelState {
 impl server::Server for SshServer {
     type Handler = Self;
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
-        let s = self.clone();
+        let mut s = self.clone();
+        s.clear_authentication();
+        s.channels.clear();
+        s.v2_channels.clear();
         self.id += 1;
         s
     }
 }
 
 impl SshServer {
+    fn clear_authentication(&mut self) {
+        self.authenticated_user = None;
+        self.authenticated_credential = None;
+    }
+
+    async fn authorize_traces_exec(
+        &self,
+        locator: &TracesLocator,
+        service_type: ServiceType,
+    ) -> Result<(), MegaError> {
+        let credential = self
+            .authenticated_credential
+            .as_ref()
+            .filter(|credential| credential.login() == "traces")
+            .ok_or(TracesError::Unauthenticated)?;
+        let config = self.state.storage.config();
+        let mono = self.state.storage.mono_storage();
+        let db = mono.get_connection();
+        if let SshAuthenticatedCredential::Key { key, .. } = credential
+            && !key.is_current(db, false).await?
+        {
+            return Err(TracesError::Unauthenticated.into());
+        }
+        let snapshot = if self.state.entity_store.is_dirty() {
+            None
+        } else {
+            self.state.entity_store.snapshot()
+        };
+        let caller = match credential {
+            SshAuthenticatedCredential::Static { .. } => {
+                if config.git.push_auth != Some(PushAuth::Token) {
+                    return Err(TracesError::Unauthenticated.into());
+                }
+                let token = credential
+                    .current_static_token(&config.git)
+                    .ok_or(TracesError::Unauthenticated)?;
+                TracesCaller::StaticPushToken {
+                    credential_id: &token.name,
+                    token,
+                }
+            }
+            SshAuthenticatedCredential::Key { key, .. } => TracesCaller::MonoSshKey {
+                key,
+                enforcement: Enforcement::parse(&config.cedar.enforcement)
+                    .ok_or(TracesError::UnknownScope)?,
+                snapshot: snapshot.as_deref(),
+            },
+        };
+        resolve_trace_discovery(db, &config.traces, locator, caller, service_type).await?;
+        Ok(())
+    }
+
     async fn send_exec_err(
         &mut self,
         channel: ChannelId,
@@ -512,6 +610,19 @@ impl server::Handler for SshServer {
 
         match exec.kind {
             SshExecKind::Git(service_type) => {
+                let is_trace = exec.traces.is_some();
+                if let Some(locator) = &exec.traces
+                    && let Err(error) = self.authorize_traces_exec(locator, service_type).await
+                {
+                    tracing::debug!(error = %error, "SSH traces exec authorization rejected");
+                    self.send_exec_err(
+                        channel,
+                        session,
+                        &SshErrReply::new("traces locator not found", 1),
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 let mut smart_protocol = SmartSession::from_state(
                     exec.repo_path,
                     service_type,
@@ -522,7 +633,7 @@ impl server::Handler for SshServer {
                 if let Some(username) = self.authenticated_user.clone() {
                     smart_protocol.set_authenticated_user(username);
                 }
-                if service_type == ServiceType::ReceivePack {
+                if service_type == ServiceType::ReceivePack && !is_trace {
                     if !self.state.storage.config().git.ssh_receive_pack_enabled() {
                         // Accept the exec so OpenSSH surfaces the error on the
                         // git channel; CHANNEL_FAILURE only yields "exec request
@@ -545,7 +656,7 @@ impl server::Handler for SshServer {
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
-                if service_type == ServiceType::UploadPack {
+                if service_type == ServiceType::UploadPack && !is_trace {
                     check_upload_pack_access(
                         &self.state.storage.config().git,
                         &smart_protocol.auth,
@@ -649,8 +760,9 @@ impl server::Handler for SshServer {
     }
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        self.clear_authentication();
         let git = &self.state.storage.config().git;
-        let accept = git.storage_only() && git.anonymous_access;
+        let accept = user != "traces" && git.storage_only() && git.anonymous_access;
         tracing::info!(
             user,
             storage_only = git.storage_only(),
@@ -668,7 +780,8 @@ impl server::Handler for SshServer {
         }
     }
 
-    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        self.clear_authentication();
         let git = &self.state.storage.config().git;
         if git.push_auth != Some(PushAuth::Token) {
             return Ok(Auth::Reject {
@@ -680,6 +793,11 @@ impl server::Handler for SshServer {
             Some(token) => {
                 tracing::info!(token_name = %token.name, "auth_password token hit");
                 self.authenticated_user = Some(token.name.clone());
+                self.authenticated_credential = Some(SshAuthenticatedCredential::Static {
+                    login: user.to_owned(),
+                    name: token.name.clone(),
+                    secret_digest: Sha256::digest(token.token.as_bytes()).into(),
+                });
                 Ok(Auth::Accept)
             }
             None => {
@@ -701,11 +819,40 @@ impl server::Handler for SshServer {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        if self.state.storage.config().git.storage_only() {
+        self.clear_authentication();
+        let config = self.state.storage.config();
+        let traces_login = user == "traces" && config.traces.enabled;
+        if config.git.storage_only() && !traces_login {
             return Ok(Auth::Reject {
                 proceed_with_methods: None,
                 partial_success: false,
             });
+        }
+
+        if traces_login {
+            let mono = self.state.storage.mono_storage();
+            let key = match authenticate_traces_ssh_key(mono.get_connection(), public_key).await {
+                Ok(Some(key)) => key,
+                Ok(None) => {
+                    return Ok(Auth::Reject {
+                        proceed_with_methods: None,
+                        partial_success: false,
+                    });
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "SSH traces key source verification failed");
+                    return Ok(Auth::Reject {
+                        proceed_with_methods: None,
+                        partial_success: false,
+                    });
+                }
+            };
+            self.authenticated_user = Some(key.username().to_owned());
+            self.authenticated_credential = Some(SshAuthenticatedCredential::Key {
+                login: user.to_owned(),
+                key: Arc::new(key),
+            });
+            return Ok(Auth::Accept);
         }
 
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
@@ -1254,6 +1401,7 @@ mod tests {
             channels: HashMap::new(),
             v2_channels: HashMap::new(),
             authenticated_user: None,
+            authenticated_credential: None,
         }
     }
 
@@ -2198,6 +2346,100 @@ mod tests {
                 paths: None,
             }],
         }
+    }
+
+    fn prepopulated_static_credential() -> SshAuthenticatedCredential {
+        SshAuthenticatedCredential::Static {
+            login: "traces".to_owned(),
+            name: "agent-ci".to_owned(),
+            secret_digest: Sha256::digest(b"sp02-secret-token").into(),
+        }
+    }
+
+    #[test]
+    fn ssh_static_credential_rechecks_current_source_and_paths() {
+        let credential = prepopulated_static_credential();
+        let mut git = token_git_config(false);
+        assert!(credential.current_static_token(&git).is_some());
+
+        git.push_tokens[0].paths = Some(vec!["/narrower/project".to_owned()]);
+        assert_eq!(
+            credential.current_static_token(&git).unwrap().paths,
+            Some(vec!["/narrower/project".to_owned()])
+        );
+        git.push_tokens[0].token = "rotated-secret".to_owned();
+        assert!(credential.current_static_token(&git).is_none());
+        git.push_tokens[0].token = "sp02-secret-token".to_owned();
+        git.push_tokens[0].name = "different-credential".to_owned();
+        assert!(credential.current_static_token(&git).is_none());
+        git.push_tokens.clear();
+        assert!(credential.current_static_token(&git).is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_new_client_does_not_clone_prepopulated_authentication() {
+        use russh::keys::ssh_encoding::Decode;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut prototype = ssh_server_with_git(dir.path(), token_git_config(true)).await;
+        prototype.authenticated_user = Some("old-display-user".to_owned());
+        prototype.authenticated_credential = Some(prepopulated_static_credential());
+        let encoded = 17_u32.to_be_bytes();
+        let channel = ChannelId::decode(&mut encoded.as_slice()).expect("test channel ID");
+        prototype.v2_channels.insert(channel, true);
+        prototype
+            .channels
+            .insert(channel, receive_pack_test_state());
+
+        let client = russh::server::Server::new_client(&mut prototype, None);
+        assert!(client.authenticated_user.is_none());
+        assert!(client.authenticated_credential.is_none());
+        assert!(client.channels.is_empty());
+        assert!(client.v2_channels.is_empty());
+        assert!(Arc::ptr_eq(&client.clients, &prototype.clients));
+    }
+
+    #[tokio::test]
+    async fn ssh_none_authentication_clears_prepopulated_credential() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(dir.path(), token_git_config(true)).await;
+        server.authenticated_user = Some("old-display-user".to_owned());
+        server.authenticated_credential = Some(prepopulated_static_credential());
+        assert!(matches!(
+            server.auth_none("git").await.expect("ordinary none auth"),
+            Auth::Accept
+        ));
+        assert!(server.authenticated_user.is_none());
+        assert!(server.authenticated_credential.is_none());
+
+        server.authenticated_user = Some("old-display-user".to_owned());
+        server.authenticated_credential = Some(prepopulated_static_credential());
+        assert!(matches!(
+            server
+                .auth_none("traces")
+                .await
+                .expect("reserved none auth"),
+            Auth::Reject { .. }
+        ));
+        assert!(server.authenticated_user.is_none());
+        assert!(server.authenticated_credential.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_rejected_password_clears_prepopulated_credential() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(dir.path(), token_git_config(true)).await;
+        server.authenticated_user = Some("old-display-user".to_owned());
+        server.authenticated_credential = Some(prepopulated_static_credential());
+        assert!(matches!(
+            server
+                .auth_password("traces", "incorrect-secret")
+                .await
+                .expect("invalid password"),
+            Auth::Reject { .. }
+        ));
+        assert!(server.authenticated_user.is_none());
+        assert!(server.authenticated_credential.is_none());
     }
 
     #[tokio::test]

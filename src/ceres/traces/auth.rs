@@ -6,17 +6,19 @@
 //! [`TracesAuthDecision::NotFound`], including a missing binding, a missing
 //! account snapshot, and a target the caller cannot read or write.
 
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use cedar_policy::{Context, EntityId, EntityTypeName, EntityUid};
+use russh::keys::{HashAlg, PublicKey};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
-    Statement, Value,
+    QuerySelect, Statement, Value,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     MegaError,
-    callisto::trace_credential_binding,
+    callisto::{ssh_keys, trace_credential_binding},
     config::PushTokenConfig,
     contract::{
         git_protocol::token_covers_repo,
@@ -27,6 +29,94 @@ use crate::{
     },
     jupiter::storage::user_storage::AuthenticatedAccessToken,
 };
+
+/// An SSH credential resolved from the key verified by the SSH transport.
+/// Only the final, signature-verified authentication callback may request one.
+pub struct AuthenticatedSshKey {
+    id: i64,
+    username: String,
+    credential_id: String,
+    key_digest: [u8; 32],
+    fingerprint: String,
+    created_at: chrono::NaiveDateTime,
+}
+
+impl fmt::Debug for AuthenticatedSshKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthenticatedSshKey")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthenticatedSshKey {
+    pub(crate) fn id(&self) -> i64 {
+        self.id
+    }
+
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(crate) fn matches_record(&self, row: &ssh_keys::Model) -> bool {
+        self.id == row.id
+            && self.username == row.username
+            && self.created_at == row.created_at
+            && self.fingerprint == row.finger
+            && self.key_digest == <[u8; 32]>::from(Sha256::digest(row.ssh_key.as_bytes()))
+    }
+
+    pub(crate) async fn is_current<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        lock: bool,
+    ) -> Result<bool, MegaError> {
+        let query = ssh_keys::Entity::find()
+            .filter(ssh_keys::Column::Finger.eq(&self.fingerprint))
+            .limit(2);
+        let query = if lock { query.lock_shared() } else { query };
+        let rows = query.all(conn).await?;
+        Ok(matches!(rows.as_slice(), [row] if self.matches_record(row)))
+    }
+}
+
+/// Resolve exactly one source row after russh has verified key ownership.
+/// This does not verify a network signature and must not be called by `offered`.
+pub(crate) async fn authenticate_traces_ssh_key(
+    db: &DatabaseConnection,
+    verified_key: &PublicKey,
+) -> Result<Option<AuthenticatedSshKey>, MegaError> {
+    let fingerprint = verified_key.fingerprint(HashAlg::Sha256).to_string();
+    let rows = ssh_keys::Entity::find()
+        .filter(ssh_keys::Column::Finger.eq(&fingerprint))
+        .limit(2)
+        .all(db)
+        .await?;
+    let [row] = rows.as_slice() else {
+        return Ok(None);
+    };
+    if row.username.is_empty()
+        || !PublicKey::from_openssh(&row.ssh_key)
+            .is_ok_and(|key| key.key_data() == verified_key.key_data())
+    {
+        return Ok(None);
+    }
+    Ok(Some(AuthenticatedSshKey {
+        id: row.id,
+        username: row.username.clone(),
+        credential_id: format!("ssh-key:{}", row.id),
+        key_digest: Sha256::digest(row.ssh_key.as_bytes()).into(),
+        fingerprint,
+        created_at: row.created_at,
+    }))
+}
 
 /// Credential namespace stored on `trace_credential_binding.namespace`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +147,11 @@ pub enum TracesCaller<'a> {
     },
     MonoAccessToken {
         token: &'a AuthenticatedAccessToken,
+        enforcement: Enforcement,
+        snapshot: Option<&'a EntitySnapshot>,
+    },
+    MonoSshKey {
+        key: &'a AuthenticatedSshKey,
         enforcement: Enforcement,
         snapshot: Option<&'a EntitySnapshot>,
     },
@@ -145,6 +240,11 @@ pub async fn authorize_traces(
     {
         return Ok(TracesAuthDecision::NotFound);
     }
+    if let TracesCaller::MonoSshKey { key, .. } = request.caller
+        && !key.is_current(db, false).await?
+    {
+        return Ok(TracesAuthDecision::NotFound);
+    }
     let Some(presented) = presented_credential(request) else {
         return Ok(TracesAuthDecision::Unauthenticated);
     };
@@ -189,6 +289,19 @@ fn presented_credential<'a>(request: &TracesAuthRequest<'a>) -> Option<Presented
             credential_id: token.credential_id(),
             kind: PresentedKind::Account {
                 username: token.username(),
+                enforcement,
+                snapshot,
+            },
+        }),
+        TracesCaller::MonoSshKey {
+            key,
+            enforcement,
+            snapshot,
+        } => Some(Presented {
+            namespace: CredentialNamespace::MonoAccount,
+            credential_id: key.credential_id(),
+            kind: PresentedKind::Account {
+                username: key.username(),
                 enforcement,
                 snapshot,
             },
@@ -257,6 +370,11 @@ pub async fn recheck_publish_authority<C: ConnectionTrait>(
     {
         return Err(publish_rejected());
     }
+    if let TracesCaller::MonoSshKey { key, .. } = authority.caller
+        && !key.is_current(conn, true).await?
+    {
+        return Err(publish_rejected());
+    }
     let target = locked_target(conn, &stream.target_id).await?;
     if !target.active || target.project_path != authority.authorized_path {
         return Err(publish_rejected());
@@ -279,7 +397,7 @@ fn live_account_policy(
     authority: &PublishAuthority<'_>,
 ) -> Result<Option<std::sync::Arc<EntitySnapshot>>, MegaError> {
     let account = match authority.caller {
-        TracesCaller::MonoAccessToken { .. } => true,
+        TracesCaller::MonoAccessToken { .. } | TracesCaller::MonoSshKey { .. } => true,
         #[cfg(test)]
         TracesCaller::MonoAccount { .. } => true,
         TracesCaller::Anonymous | TracesCaller::StaticPushToken { .. } => false,
@@ -306,6 +424,17 @@ fn presented_for_publish<'a>(
             credential_id: token.credential_id(),
             kind: PresentedKind::Account {
                 username: token.username(),
+                enforcement,
+                snapshot: Some(live_policy.ok_or_else(publish_rejected)?),
+            },
+        }),
+        TracesCaller::MonoSshKey {
+            key, enforcement, ..
+        } => Ok(Presented {
+            namespace: CredentialNamespace::MonoAccount,
+            credential_id: key.credential_id(),
+            kind: PresentedKind::Account {
+                username: key.username(),
                 enforcement,
                 snapshot: Some(live_policy.ok_or_else(publish_rejected)?),
             },
@@ -360,6 +489,9 @@ fn credential_identity(caller: TracesCaller<'_>) -> Option<(CredentialNamespace,
         TracesCaller::StaticPushToken { .. } => None,
         TracesCaller::MonoAccessToken { token, .. } => {
             Some((CredentialNamespace::MonoAccount, token.credential_id()))
+        }
+        TracesCaller::MonoSshKey { key, .. } => {
+            Some((CredentialNamespace::MonoAccount, key.credential_id()))
         }
         #[cfg(test)]
         TracesCaller::MonoAccount { credential_id, .. } if !credential_id.is_empty() => {
@@ -1913,6 +2045,384 @@ mod tests {
         assert!(
             blocked.is_ok(),
             "the real deletion must wait on the publication backend"
+        );
+        assert_eq!(deleted, 1);
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    fn ssh_public_key() -> PublicKey {
+        PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqvkVqjzI9K4TDbjKjktkiHFdBzxv88ZUFl/XtNwF",
+        )
+        .unwrap()
+    }
+
+    async fn ssh_source(db: &DatabaseConnection, id: i64, username: &str) -> ssh_keys::Model {
+        let key = ssh_public_key();
+        ssh_keys::ActiveModel {
+            id: Set(id),
+            username: Set(username.into()),
+            title: Set("synthetic traces key".into()),
+            ssh_key: Set(key.to_openssh().unwrap()),
+            finger: Set(key.fingerprint(HashAlg::Sha256).to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .unwrap()
+    }
+
+    async fn replace_ssh_source(db: &DatabaseConnection, row: &ssh_keys::Model) {
+        ssh_keys::ActiveModel {
+            id: Set(row.id),
+            username: Set(row.username.clone()),
+            title: Set(row.title.clone()),
+            ssh_key: Set(row.ssh_key.clone()),
+            finger: Set(row.finger.clone()),
+            created_at: Set(row.created_at),
+        }
+        .update(db)
+        .await
+        .unwrap();
+    }
+
+    async fn ssh_witness(db: &DatabaseConnection) -> AuthenticatedSshKey {
+        authenticate_traces_ssh_key(db, &ssh_public_key())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mono_ssh_key_witness_pins_real_source_and_rejects_replacement() {
+        let (_temp, db) = migrated_db().await;
+        let original = ssh_source(&db, 7401, "publisher").await;
+        let key = ssh_witness(&db).await;
+        assert_eq!(key.id(), original.id);
+        assert_eq!(key.username(), "publisher");
+        assert_eq!(key.credential_id(), "ssh-key:7401");
+        assert_eq!(format!("{key:?}"), "AuthenticatedSshKey { .. }");
+        assert!(key.is_current(&db, false).await.unwrap());
+        for mutation in 0..4 {
+            let mut changed = original.clone();
+            match mutation {
+                0 => changed.username = "other".into(),
+                1 => changed.ssh_key.push_str(" replacement-comment"),
+                2 => changed.finger = "synthetic-replacement-fingerprint".into(),
+                _ => changed.created_at += chrono::Duration::seconds(1),
+            }
+            replace_ssh_source(&db, &changed).await;
+            assert!(!key.is_current(&db, false).await.unwrap());
+            replace_ssh_source(&db, &original).await;
+            assert!(key.is_current(&db, false).await.unwrap());
+        }
+        ssh_keys::Entity::delete_by_id(key.id())
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(!key.is_current(&db, false).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mono_ssh_key_authentication_rejects_missing_malformed_and_ambiguous_source() {
+        let (_temp, db) = migrated_db().await;
+        let verified = ssh_public_key();
+        assert!(
+            authenticate_traces_ssh_key(&db, &verified)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut row = ssh_source(&db, 7402, "").await;
+        assert!(
+            authenticate_traces_ssh_key(&db, &verified)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        row.username = "publisher".into();
+        let valid_text = row.ssh_key.clone();
+        row.ssh_key = "not-an-openssh-public-key".into();
+        replace_ssh_source(&db, &row).await;
+        assert!(
+            authenticate_traces_ssh_key(&db, &verified)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        row.ssh_key = valid_text.replace("IOMqqvk", "IOMqqwk");
+        assert_ne!(
+            PublicKey::from_openssh(&row.ssh_key).unwrap().key_data(),
+            verified.key_data()
+        );
+        replace_ssh_source(&db, &row).await;
+        assert!(
+            authenticate_traces_ssh_key(&db, &verified)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        row.ssh_key = valid_text;
+        replace_ssh_source(&db, &row).await;
+        let key = ssh_witness(&db).await;
+        ssh_source(&db, 7403, "publisher").await;
+        assert!(
+            authenticate_traces_ssh_key(&db, &verified)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!key.is_current(&db, false).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mono_ssh_key_authorization_requires_binding_owner_and_cedar() {
+        let (_temp, db) = migrated_db().await;
+        ssh_source(&db, 7404, "publisher").await;
+        let key = ssh_witness(&db).await;
+        let owner = principal(&db).await;
+        let other = principal(&db).await;
+        bind(
+            &db,
+            &other,
+            CredentialNamespace::StaticPushToken,
+            key.credential_id(),
+        )
+        .await;
+        let granted = snapshot(&[("publisher", "admin")]);
+        let mut request = TracesAuthRequest {
+            caller: TracesCaller::MonoSshKey {
+                key: &key,
+                enforcement: Enforcement::Enforce,
+                snapshot: Some(&granted),
+            },
+            action: TracesAction::Create,
+            canonical_target_path: "/team/app",
+            commit_author: Some("unrelated-author"),
+        };
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+        bind(
+            &db,
+            &owner,
+            CredentialNamespace::MonoAccount,
+            key.credential_id(),
+        )
+        .await;
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::Allow {
+                principal_id: owner.clone()
+            }
+        );
+        request.action = TracesAction::Update {
+            owner_principal_id: &other,
+        };
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+        request.action = TracesAction::Update {
+            owner_principal_id: &owner,
+        };
+        let denied = snapshot(&[("unrelated", "admin")]);
+        for (enforcement, snapshot) in [
+            (Enforcement::Off, Some(&granted)),
+            (Enforcement::Shadow, Some(&denied)),
+            (Enforcement::Enforce, None),
+        ] {
+            request.caller = TracesCaller::MonoSshKey {
+                key: &key,
+                enforcement,
+                snapshot,
+            };
+            assert_eq!(
+                authorize_traces(&db, &request).await.unwrap(),
+                TracesAuthDecision::NotFound
+            );
+        }
+        request.caller = TracesCaller::MonoSshKey {
+            key: &key,
+            enforcement: Enforcement::Enforce,
+            snapshot: Some(&granted),
+        };
+        trace_credential_binding::Entity::update_many()
+            .col_expr(
+                trace_credential_binding::Column::RetiredAt,
+                sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+            )
+            .filter(trace_credential_binding::Column::Namespace.eq("mono_account"))
+            .filter(trace_credential_binding::Column::CredentialId.eq(key.credential_id()))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+    }
+
+    fn ssh_authority<'a>(
+        fixture: &'a PublishFixture,
+        key: &'a AuthenticatedSshKey,
+        policy: &'a SharedEntityStore,
+    ) -> PublishAuthority<'a> {
+        PublishAuthority {
+            caller: TracesCaller::MonoSshKey {
+                key,
+                enforcement: Enforcement::Enforce,
+                snapshot: None,
+            },
+            principal_id: &fixture.principal_id,
+            target_id: &fixture.target_id,
+            authorized_path: &fixture.path,
+            expected_generation: 1,
+            policy: Some(policy),
+        }
+    }
+
+    #[tokio::test]
+    async fn mono_ssh_key_publication_uses_current_source_and_live_policy() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let original = ssh_source(&db, 7405, "publisher").await;
+        let key = ssh_witness(&db).await;
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::MonoAccount,
+            key.credential_id(),
+        )
+        .await;
+        let store = SharedEntityStore::new();
+        store.swap(&policy_json(&[("publisher", "admin")])).unwrap();
+        let stale = store.snapshot().unwrap();
+        let mut authority = ssh_authority(&fixture, &key, &store);
+        authority.caller = TracesCaller::MonoSshKey {
+            key: &key,
+            enforcement: Enforcement::Enforce,
+            snapshot: Some(&stale),
+        };
+        recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .unwrap();
+        store
+            .swap(&policy_json(&[("publisher", "reader")]))
+            .unwrap();
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+        store.swap(&policy_json(&[("publisher", "admin")])).unwrap();
+        store.mark_dirty();
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+        store.swap(&policy_json(&[("publisher", "admin")])).unwrap();
+        let mut replaced = original;
+        replaced.ssh_key.push_str(" replacement-comment");
+        replace_ssh_source(&db, &replaced).await;
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    #[tokio::test]
+    async fn mono_ssh_key_publication_holds_source_lock_until_commit() {
+        use std::time::Duration;
+
+        use sea_orm::TransactionTrait;
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        ssh_source(&db, 7406, "publisher").await;
+        let key = ssh_witness(&db).await;
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::MonoAccount,
+            key.credential_id(),
+        )
+        .await;
+        let store = SharedEntityStore::new();
+        store.swap(&policy_json(&[("publisher", "admin")])).unwrap();
+        let authority = ssh_authority(&fixture, &key, &store);
+        let publication = db.begin().await.unwrap();
+        let publisher: i32 = publication
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT pg_backend_pid() AS pid",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "pid")
+            .unwrap();
+        recheck_publish_authority(&publication, &fixture.stream_id, &authority)
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let delete = async {
+            let deleting = db.begin().await.unwrap();
+            let deleter: i32 = deleting
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT pg_backend_pid() AS pid",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "pid")
+                .unwrap();
+            tx.send(deleter).unwrap();
+            let result = deleting
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "DELETE FROM ssh_keys WHERE id = $1",
+                    [key.id().into()],
+                ))
+                .await
+                .unwrap();
+            deleting.commit().await.unwrap();
+            result.rows_affected()
+        };
+        let release = async {
+            let deleter = rx.await.unwrap();
+            let blocked = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let row = db
+                        .query_one_raw(Statement::from_sql_and_values(
+                            DatabaseBackend::Postgres,
+                            "SELECT $1::integer = ANY(pg_blocking_pids($2::integer)) AS blocked",
+                            [publisher.into(), deleter.into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if row.try_get::<bool>("", "blocked").unwrap() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            publication.commit().await.unwrap();
+            blocked
+        };
+        let (deleted, blocked) = tokio::join!(delete, release);
+        assert!(
+            blocked.is_ok(),
+            "source deletion must wait on the publication backend"
         );
         assert_eq!(deleted, 1);
         assert_rejected(
