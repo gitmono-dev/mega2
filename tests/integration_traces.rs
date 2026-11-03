@@ -2163,6 +2163,7 @@ mod disabled_http {
         pack: Vec<u8>,
         traces_auth: bool,
         static_auth: bool,
+        object_format: String,
     }
 
     impl Fixture {
@@ -2220,6 +2221,8 @@ mod disabled_http {
                 pack: Vec::new(),
                 traces_auth: false,
                 static_auth: false,
+                object_format: std::env::var("MEGA_TRACES_TEST_FORMAT")
+                    .unwrap_or_else(|_| "sha1".to_owned()),
             }
         }
 
@@ -2254,10 +2257,7 @@ mod disabled_http {
                     self.temp.path().join("objects"),
                 )
                 .env("MEGA_MONOREPO__PUSH_POLICY", policy)
-                .env(
-                    "MEGA_MONOREPO__OBJECT_FORMAT",
-                    std::env::var("MEGA_TRACES_TEST_FORMAT").unwrap_or_else(|_| "sha1".to_owned()),
-                )
+                .env("MEGA_MONOREPO__OBJECT_FORMAT", &self.object_format)
                 .env("MEGA_MONOREPO__IMPORT_DIR", import_dir)
                 .env(
                     "MEGA_MONOREPO__ROOT_DIRS",
@@ -2625,10 +2625,7 @@ mod disabled_http {
             self.git(&[
                 "init",
                 "--initial-branch=main",
-                &format!(
-                    "--object-format={}",
-                    std::env::var("MEGA_TRACES_TEST_FORMAT").unwrap_or_else(|_| "sha1".to_owned())
-                ),
+                &format!("--object-format={}", self.object_format),
                 "import",
             ]);
             fs::write(self.shared.path().join("import/sentinel.txt"), SENTINEL)
@@ -5753,45 +5750,622 @@ mod disabled_http {
         }
     }
 
-    /// Capacity at the endpoint: a legacy view over its ref budget must answer 413
-    /// on the advertisement, not serve a truncated ref list. The budget lives in
-    /// `code_refs`, which the advertisement reaches before any pack is built.
+    /// Capacity, timeout, and same-barrier ref-race controls at the endpoint:
+    /// 1. No-legacy >4,096 refs (4,099 refs) and >4,096 orphan `git_tag` rows
+    ///    serve advertisement, `git clone`, and `git fetch` without 413.
+    /// 2. Legacy view (`refs/libra/traces` present) with >4,096 refs answers 413.
+    /// 3. Legacy view (`refs/libra/traces` present) with >4,096 tags answers 413.
+    /// 4. Commit budget (>200,000 commits in `B(mode)`) answers 413 at upload-pack.
+    /// 5. Object budget (>1,000,000 objects in `B(mode)`) answers 413 at upload-pack.
+    /// 6. Locked `import_refs` answers 503 (`query_timeout`) at upload-pack.
+    /// 7. Same-barrier upload-pack ref-race control (`LOCK TABLE git_tree IN ACCESS EXCLUSIVE MODE`
+    ///    observed via `pg_stat_activity`): unchanged refs succeed with `PACK` (200),
+    ///    and mutating `import_refs` at the exact same barrier rejects the pack (400).
     pub async fn code_clone_ref_budget_answers_413() {
+        use std::str::FromStr;
+
+        use git_internal::{
+            hash::{HashKind, ObjectHash},
+            internal::object::{
+                ObjectTrait,
+                tree::{Tree, TreeItem, TreeItemMode},
+            },
+        };
+
         let (guard, db) = traces_db::TracesDb::migrated().await;
         let mut fixture = Fixture::new(&db).await;
         let result = AssertUnwindSafe(async {
-            fixture.prepare(&db).await;
-            // A legacy traces ref makes the budget apply at all; without it the code
-            // view is returned directly and an over-budget repo still serves.
-            let mut rows = vec![("refs/libra/traces".to_owned(), "b".repeat(40))];
-            for index in 0..4098 {
-                rows.push((format!("refs/heads/bulk{index}"), "a".repeat(40)));
+            let mut init = fixture.command(false, "trunk", "/third-party");
+            init.args(["service", "init", "--yes"]);
+            OwnedChild::spawn(&mut init).require_success().await;
+            fixture.start(true, "trunk", "/third-party").await;
+
+            fixture.git(&["init", "-q", "--initial-branch=main", "budget-work"]);
+            fs::write(
+                fixture.shared.path().join("budget-work/sentinel.txt"),
+                SENTINEL,
+            )
+            .expect("budget sentinel");
+            fixture.git(&["-C", "budget-work", "add", "sentinel.txt"]);
+            fixture.git(&[
+                "-C",
+                "budget-work",
+                "-c",
+                "user.name=Traces Test",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "MTR13 budget seed",
+            ]);
+            let import_path = "/third-party/mtr94-control.git";
+            let import_url = git_cli::mega2_http_url(fixture.port, import_path);
+            fixture.git(&[
+                "-C",
+                "budget-work",
+                "push",
+                &import_url,
+                "HEAD:refs/heads/main",
+            ]);
+            let main_tip = fixture.git_text(&["-C", "budget-work", "rev-parse", "HEAD"]);
+            let main_tree = fixture.git_text(&["-C", "budget-work", "rev-parse", "HEAD^{tree}"]);
+            let repo_id: i64 = scalar(
+                &db,
+                "SELECT repo_id::text AS value FROM import_refs WHERE ref_name = 'refs/heads/main' LIMIT 1",
+            )
+            .await
+            .parse()
+            .expect("repo_id");
+
+            // 1. No-legacy >4,096 refs (4,099 refs) + >4,096 orphan git_tag rows:
+            // ls-remote advertises all >=4,099 refs, and clone + fetch succeed.
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO import_refs (id, repo_id, ref_name, ref_git_id, ref_type, default_branch, created_at, updated_at) \
+                     SELECT (SELECT COALESCE(MAX(id), 0) FROM import_refs) + g, {repo_id}, \
+                            'refs/heads/bulk' || g::text, '{main_tip}', 'branch', false, now(), now() \
+                     FROM generate_series(1, 4098) g"
+                ),
+            ))
+            .await
+            .expect("insert 4098 no-legacy refs");
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO git_tag (id, repo_id, tag_id, object_id, object_type, tag_name, tagger, message, created_at, pack_id, pack_offset) \
+                     SELECT (SELECT COALESCE(MAX(id), 0) FROM git_tag) + g, {repo_id}, \
+                            'e' || lpad(g::text, 39, '0'), '{main_tip}', 'commit', 'orphan-' || g::text, \
+                            'tagger t <t@example.invalid> 1 +0000', 'orphan tag', now(), '', 0 \
+                     FROM generate_series(1, 4100) g"
+                ),
+            ))
+            .await
+            .expect("insert 4100 orphan git_tag rows");
+
+            let mut expected_refs = BTreeMap::from([
+                ("HEAD".to_owned(), main_tip.clone()),
+                ("refs/heads/main".to_owned(), main_tip.clone()),
+            ]);
+            for index in 1..=4098 {
+                expected_refs.insert(format!("refs/heads/bulk{index}"), main_tip.clone());
             }
-            for (index, (name, oid)) in rows.into_iter().enumerate() {
-                scalar(
-                    &db,
-                    &format!(
-                        "INSERT INTO import_refs (id, repo_id, ref_name, ref_git_id, ref_type, default_branch, created_at, updated_at) \
-                         SELECT (SELECT COALESCE(MAX(id), 0) + 1 + {index} FROM import_refs), repo_id, '{name}', '{oid}', 'branch', false, now(), now() \
-                         FROM import_refs WHERE ref_name = 'refs/heads/main' LIMIT 1 RETURNING ref_name AS value"
-                    ),
-                )
-                .await;
+            for protocol in ["0", "2"] {
+                let protocol_config = format!("protocol.version={protocol}");
+                let no_legacy_ls = fixture.git_text(&[
+                    "-c", &protocol_config, "ls-remote", &import_url,
+                ]);
+                let mut real_refs = BTreeMap::new();
+                let mut pseudo_peels = 0usize;
+                for line in no_legacy_ls.lines() {
+                    let mut fields = line.split_whitespace();
+                    let oid = fields.next().expect("ls-remote object ID");
+                    let name = fields.next().expect("ls-remote ref name");
+                    assert!(fields.next().is_none(), "unexpected ls-remote record: {line}");
+                    if let Some(base_ref) = name.strip_suffix("^{}") {
+                        // DEBT-MTR13-V2-PEEL remains open; branch peeled:self rows
+                        // do not count toward the real-ref completeness oracle.
+                        assert!(expected_refs.contains_key(base_ref), "unexpected peeled base ref: {base_ref}");
+                        assert_eq!(oid, main_tip, "peeled row must name the actual seeded tip");
+                        pseudo_peels += 1;
+                        continue;
+                    }
+                    assert!(
+                        real_refs.insert(name.to_owned(), oid.to_owned()).is_none(),
+                        "duplicate real ref in protocol {protocol} advertisement: {name}"
+                    );
+                }
+                let real_ref_count = real_refs.len();
+                for (name, expected_oid) in &expected_refs {
+                    assert_eq!(
+                        real_refs.remove(name).as_deref(), Some(expected_oid.as_str()),
+                        "missing or wrong real ref in protocol {protocol} advertisement: {name}"
+                    );
+                }
+                assert!(real_refs.is_empty(), "unexpected real refs in protocol {protocol}: {:?}", real_refs.keys());
+                eprintln!(
+                    "MTR13_NO_LEGACY_OVER_4096 requested_protocol=v{protocol} real_refs={} head=1 pseudo_peels={pseudo_peels}",
+                    real_ref_count - 1
+                );
             }
-            let advertisement = reqwest::Client::new()
+            fixture.git(&[
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                &import_url,
+                "no-legacy-over4096-clone",
+            ]);
+            assert_eq!(
+                fixture.git_text(&["-C", "no-legacy-over4096-clone", "rev-parse", "HEAD"]),
+                main_tip
+            );
+            fixture.git(&[
+                "-C",
+                "no-legacy-over4096-clone",
+                "fetch",
+                "origin",
+                "refs/heads/main",
+            ]);
+
+            // 2. Legacy ref budget (>4,096 refs with refs/libra/traces present) -> 413.
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO import_refs (id, repo_id, ref_name, ref_git_id, ref_type, default_branch, created_at, updated_at) \
+                     VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM import_refs), {repo_id}, 'refs/libra/traces', '{}', 'branch', false, now(), now())",
+                    "b".repeat(40)
+                ),
+            ))
+            .await
+            .expect("insert legacy traces ref");
+            let ref_budget_resp = reqwest::Client::new()
                 .get(git_cli::mega2_host_http_url(
                     fixture.port,
                     "/third-party/mtr94-control.git/info/refs?service=git-upload-pack",
                 ))
                 .send()
                 .await
-                .expect("advertisement request");
-            let status = advertisement.status();
-            eprintln!("FIX13_ENDPOINT_413 status={status}");
+                .expect("legacy ref budget request");
+            let ref_budget_status = ref_budget_resp.status();
+            eprintln!("FIX13_ENDPOINT_413_REFS status={ref_budget_status}");
             assert_eq!(
-                status.as_u16(),
+                ref_budget_status.as_u16(),
                 413,
-                "an over-budget legacy view must answer 413"
+                "an over-budget legacy ref view must answer 413"
+            );
+
+            // Remove bulk refs so ref count is 2 (<= 4,096), keeping refs/libra/traces
+            // and the 4,100 git_tag rows to isolate the legacy tag budget (>4,096 tags).
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DELETE FROM import_refs WHERE repo_id = {repo_id} AND ref_name LIKE 'refs/heads/bulk%'"),
+            ))
+            .await
+            .expect("delete bulk refs");
+
+            // 3. Legacy tag budget (>4,096 tags in git_tag with refs/libra/traces) -> 413.
+            let tag_budget_resp = reqwest::Client::new()
+                .get(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    "/third-party/mtr94-control.git/info/refs?service=git-upload-pack",
+                ))
+                .send()
+                .await
+                .expect("legacy tag budget request");
+            let tag_budget_status = tag_budget_resp.status();
+            eprintln!("FIX13_ENDPOINT_413_TAGS status={tag_budget_status}");
+            assert_eq!(
+                tag_budget_status.as_u16(),
+                413,
+                "an over-budget legacy tag view (>4,096 git_tag rows) must answer 413"
+            );
+
+            // Clean up synthetic git_tag rows and refs/libra/traces.
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DELETE FROM git_tag WHERE repo_id = {repo_id} AND tag_name LIKE 'orphan-%'"),
+            ))
+            .await
+            .expect("delete orphan tags");
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DELETE FROM import_refs WHERE repo_id = {repo_id} AND ref_name = 'refs/libra/traces'"),
+            ))
+            .await
+            .expect("delete legacy traces ref");
+
+            // 4. Commit budget (>200,000 commits in B(mode)) -> 413 at upload-pack.
+            // Use a 2-level fan-out DAG (1 hub -> 201 mid commits -> 201,000 leaf commits)
+            // so BFS reaches >200,000 commits in 2 levels of batch queries.
+            let commit_hub = "c".repeat(40);
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO git_commit (id, repo_id, commit_id, tree, parents_id, author, committer, content, created_at, pack_id, pack_offset) \
+                     SELECT (SELECT COALESCE(MAX(id), 0) FROM git_commit) + g, {repo_id}, \
+                            'a' || lpad(g::text, 39, '0'), '{main_tree}', '[]'::jsonb, \
+                            'author a <a@example.invalid> 1 +0000', 'committer c <c@example.invalid> 1 +0000', \
+                            'leaf', now(), '', 0 \
+                     FROM generate_series(1, 201000) g"
+                ),
+            ))
+            .await
+            .expect("insert 201000 leaf commits");
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO git_commit (id, repo_id, commit_id, tree, parents_id, author, committer, content, created_at, pack_id, pack_offset) \
+                     SELECT (SELECT COALESCE(MAX(id), 0) FROM git_commit) + m, {repo_id}, \
+                            'b' || lpad(m::text, 39, '0'), '{main_tree}', \
+                            (SELECT jsonb_agg('a' || lpad((((m - 1) * 1000) + k)::text, 39, '0')) FROM generate_series(1, 1000) k), \
+                            'author a <a@example.invalid> 1 +0000', 'committer c <c@example.invalid> 1 +0000', \
+                            'mid', now(), '', 0 \
+                     FROM generate_series(1, 201) m"
+                ),
+            ))
+            .await
+            .expect("insert 201 mid commits");
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO git_commit (id, repo_id, commit_id, tree, parents_id, author, committer, content, created_at, pack_id, pack_offset) \
+                     VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM git_commit), {repo_id}, '{commit_hub}', '{main_tree}', \
+                             (SELECT jsonb_agg('b' || lpad(m::text, 39, '0')) FROM generate_series(1, 201) m), \
+                             'author a <a@example.invalid> 1 +0000', 'committer c <c@example.invalid> 1 +0000', \
+                             'hub', now(), '', 0)"
+                ),
+            ))
+            .await
+            .expect("insert commit budget hub");
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO import_refs (id, repo_id, ref_name, ref_git_id, ref_type, default_branch, created_at, updated_at) \
+                     VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM import_refs), {repo_id}, 'refs/heads/commit-budget', '{commit_hub}', 'branch', false, now(), now())"
+                ),
+            ))
+            .await
+            .expect("insert commit-budget ref");
+
+            let pkt_line = |line: &str| format!("{:04x}{line}", line.len() + 4);
+            let commit_budget_resp = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    "/third-party/mtr94-control.git/git-upload-pack",
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .body(format!(
+                    "{}0000{}",
+                    pkt_line(&format!("want {commit_hub}\n")),
+                    pkt_line("done\n")
+                ))
+                .send()
+                .await
+                .expect("commit budget upload-pack request");
+            let commit_budget_status = commit_budget_resp.status();
+            eprintln!("FIX13_ENDPOINT_413_COMMITS status={commit_budget_status}");
+            assert_eq!(
+                commit_budget_status.as_u16(),
+                413,
+                "a request exceeding 200,000 commits must answer 413 at upload-pack"
+            );
+
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DELETE FROM import_refs WHERE repo_id = {repo_id} AND ref_name = 'refs/heads/commit-budget'"),
+            ))
+            .await
+            .expect("delete commit-budget ref");
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DELETE FROM git_commit WHERE repo_id = {repo_id} AND commit_id <> '{main_tip}'"),
+            ))
+            .await
+            .expect("delete synthetic commits");
+
+            // 5. Object budget (>1,000,000 objects in B(mode)) -> 413 at upload-pack.
+            // Build 1,001 child git_tree rows each referencing 1,000 distinct blob
+            // OIDs (1,001,000 blobs + 1,002 trees + 1 commit = 1,002,003 > 1,000,000).
+            let mut root_items = Vec::with_capacity(1001);
+            let mut tree_rows_sql = Vec::with_capacity(1002);
+            let base_tree_id: i64 = scalar(
+                &db,
+                "SELECT (COALESCE(MAX(id), 0) + 1)::text AS value FROM git_tree",
+            )
+            .await
+            .parse()
+            .expect("base_tree_id");
+            for s in 0..1001usize {
+                let mut items = Vec::with_capacity(1000);
+                for j in 0..1000usize {
+                    let blob_hex = format!("d{s:04}{j:035}");
+                    items.push(TreeItem::new(
+                        TreeItemMode::Blob,
+                        ObjectHash::from_str(&blob_hex).expect("synthetic blob hash"),
+                        format!("b{j:04}"),
+                    ));
+                }
+                let child_tree =
+                    Tree::from_tree_items_with_kind(HashKind::Sha1, items).expect("child tree");
+                let child_bytes = child_tree.to_data().expect("child tree bytes");
+                root_items.push(TreeItem::new(
+                    TreeItemMode::Tree,
+                    child_tree.id,
+                    format!("s{s:04}"),
+                ));
+                tree_rows_sql.push(format!(
+                    "({}, {repo_id}, '{}', decode('{}', 'hex'), 0, now(), '', 0)",
+                    base_tree_id + s as i64,
+                    child_tree.id,
+                    hex::encode(child_bytes)
+                ));
+            }
+            let obj_root_tree =
+                Tree::from_tree_items_with_kind(HashKind::Sha1, root_items).expect("root tree");
+            let obj_root_bytes = obj_root_tree.to_data().expect("root tree bytes");
+            tree_rows_sql.push(format!(
+                "({}, {repo_id}, '{}', decode('{}', 'hex'), 0, now(), '', 0)",
+                base_tree_id + 1001,
+                obj_root_tree.id,
+                hex::encode(obj_root_bytes)
+            ));
+            for chunk in tree_rows_sql.chunks(250) {
+                db.execute_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "INSERT INTO git_tree (id, repo_id, tree_id, sub_trees, size, created_at, pack_id, pack_offset) VALUES {}",
+                        chunk.join(", ")
+                    ),
+                ))
+                .await
+                .expect("insert synthetic git_tree batch");
+            }
+            let obj_hub = "f".repeat(40);
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO git_commit (id, repo_id, commit_id, tree, parents_id, author, committer, content, created_at, pack_id, pack_offset) \
+                     VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM git_commit), {repo_id}, '{obj_hub}', '{}', '[]'::jsonb, \
+                             'author a <a@example.invalid> 1 +0000', 'committer c <c@example.invalid> 1 +0000', \
+                             'obj-hub', now(), '', 0)",
+                    obj_root_tree.id
+                ),
+            ))
+            .await
+            .expect("insert object budget hub commit");
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO import_refs (id, repo_id, ref_name, ref_git_id, ref_type, default_branch, created_at, updated_at) \
+                     VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM import_refs), {repo_id}, 'refs/heads/obj-budget', '{obj_hub}', 'branch', false, now(), now())"
+                ),
+            ))
+            .await
+            .expect("insert obj-budget ref");
+
+            let obj_budget_resp = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    "/third-party/mtr94-control.git/git-upload-pack",
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .body(format!(
+                    "{}0000{}",
+                    pkt_line(&format!("want {obj_hub}\n")),
+                    pkt_line("done\n")
+                ))
+                .send()
+                .await
+                .expect("object budget upload-pack request");
+            let obj_budget_status = obj_budget_resp.status();
+            eprintln!("FIX13_ENDPOINT_413_OBJECTS status={obj_budget_status}");
+            assert_eq!(
+                obj_budget_status.as_u16(),
+                413,
+                "a request exceeding 1,000,000 objects must answer 413 at upload-pack"
+            );
+
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DELETE FROM import_refs WHERE repo_id = {repo_id} AND ref_name = 'refs/heads/obj-budget'"),
+            ))
+            .await
+            .expect("delete obj-budget ref");
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DELETE FROM git_commit WHERE repo_id = {repo_id} AND commit_id = '{obj_hub}'"),
+            ))
+            .await
+            .expect("delete obj_hub commit");
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DELETE FROM git_tree WHERE repo_id = {repo_id} AND id >= {base_tree_id}"),
+            ))
+            .await
+            .expect("delete synthetic git_tree rows");
+
+            // 6. Endpoint 503 timeout control on locked import_refs.
+            let lock_txn = db.begin().await.expect("lock transaction");
+            sea_orm::ConnectionTrait::execute_unprepared(
+                &lock_txn,
+                "LOCK TABLE import_refs IN ACCESS EXCLUSIVE MODE",
+            )
+            .await
+            .expect("exclusive lock on import_refs");
+            let locked_response = reqwest::Client::new()
+                .post(git_cli::mega2_host_http_url(
+                    fixture.port,
+                    "/third-party/mtr94-control.git/git-upload-pack",
+                ))
+                .header("content-type", "application/x-git-upload-pack-request")
+                .body(format!(
+                    "{}0000{}",
+                    pkt_line(&format!("want {main_tip}\n")),
+                    pkt_line("done\n")
+                ))
+                .send()
+                .await
+                .expect("locked fetch request");
+            let locked_status = locked_response.status();
+            lock_txn.rollback().await.expect("release ref lock");
+            eprintln!("FIX13_ENDPOINT_503 status={locked_status}");
+            assert_eq!(
+                locked_status.as_u16(),
+                503,
+                "a blocked ref read must answer 503 at the endpoint"
+            );
+
+            // 7. Same-barrier upload-pack ref-race control using
+            // `LOCK TABLE git_tree IN ACCESS EXCLUSIVE MODE` + `pg_stat_activity`.
+            // First: positive control at the barrier (no ref mutation -> 200 + PACK).
+            let ok_barrier = db.begin().await.expect("ok barrier txn");
+            sea_orm::ConnectionTrait::execute_unprepared(
+                &ok_barrier,
+                "LOCK TABLE git_tree IN ACCESS EXCLUSIVE MODE",
+            )
+            .await
+            .expect("lock git_tree for positive control");
+            let upload_url = git_cli::mega2_host_http_url(
+                fixture.port,
+                "/third-party/mtr94-control.git/git-upload-pack",
+            );
+            let upload_body = format!(
+                "{}0000{}",
+                pkt_line(&format!("want {main_tip}\n")),
+                pkt_line("done\n")
+            );
+            let ok_url = upload_url.clone();
+            let ok_body = upload_body.clone();
+            let ok_req = tokio::spawn(async move {
+                reqwest::Client::new()
+                    .post(ok_url)
+                    .header("content-type", "application/x-git-upload-pack-request")
+                    .body(ok_body)
+                    .send()
+                    .await
+                    .expect("positive barrier upload-pack")
+            });
+            let mut parked = false;
+            for _ in 0..100 {
+                sea_orm::ConnectionTrait::execute_unprepared(
+                    &ok_barrier,
+                    "SELECT pg_stat_clear_snapshot()",
+                )
+                .await
+                .expect("clear snapshot");
+                let row = ok_barrier
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                         WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                         AND pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS v",
+                    ))
+                    .await
+                    .expect("poll pg_stat_activity")
+                    .expect("pg_stat_activity row");
+                if row.try_get::<bool>("", "v").expect("bool") {
+                    parked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(
+                parked,
+                "upload-pack positive control must park at the git_tree barrier"
+            );
+            ok_barrier.rollback().await.expect("release positive barrier");
+            let ok_resp = ok_req.await.expect("join positive upload-pack");
+            let ok_status = ok_resp.status();
+            let ok_bytes = ok_resp.bytes().await.expect("positive body");
+            eprintln!(
+                "FIX13_RACE_BARRIER_OK status={ok_status} bytes={}",
+                ok_bytes.len()
+            );
+            assert_eq!(ok_status.as_u16(), 200);
+            assert!(
+                ok_bytes.windows(4).any(|w| w == b"PACK"),
+                "unchanged ref view at the barrier must return a valid PACK"
+            );
+
+            // Second: negative control at the exact same `LOCK TABLE git_tree`
+            // barrier (mutate `import_refs` while parked -> 400 and no PACK).
+            let race_barrier = db.begin().await.expect("race barrier txn");
+            sea_orm::ConnectionTrait::execute_unprepared(
+                &race_barrier,
+                "LOCK TABLE git_tree IN ACCESS EXCLUSIVE MODE",
+            )
+            .await
+            .expect("lock git_tree for negative race control");
+            let race_req = tokio::spawn(async move {
+                reqwest::Client::new()
+                    .post(upload_url)
+                    .header("content-type", "application/x-git-upload-pack-request")
+                    .body(upload_body)
+                    .send()
+                    .await
+                    .expect("negative barrier upload-pack")
+            });
+            let mut race_parked = false;
+            for _ in 0..100 {
+                sea_orm::ConnectionTrait::execute_unprepared(
+                    &race_barrier,
+                    "SELECT pg_stat_clear_snapshot()",
+                )
+                .await
+                .expect("clear snapshot");
+                let row = race_barrier
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                         WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                         AND pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS v",
+                    ))
+                    .await
+                    .expect("poll pg_stat_activity")
+                    .expect("pg_stat_activity row");
+                if row.try_get::<bool>("", "v").expect("bool") {
+                    race_parked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(
+                race_parked,
+                "upload-pack race control must park at the exact same git_tree barrier"
+            );
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO import_refs (id, repo_id, ref_name, ref_git_id, ref_type, default_branch, created_at, updated_at) \
+                     VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM import_refs), {repo_id}, 'refs/heads/race-moved', '{main_tip}', 'branch', false, now(), now())"
+                ),
+            ))
+            .await
+            .expect("mutate import_refs while upload-pack is parked at git_tree");
+            race_barrier
+                .rollback()
+                .await
+                .expect("release negative race barrier");
+            let race_resp = race_req.await.expect("join negative upload-pack");
+            let race_status = race_resp.status();
+            let race_bytes = race_resp.bytes().await.expect("negative body");
+            let race_text = String::from_utf8_lossy(&race_bytes);
+            eprintln!("FIX13_RACE_BARRIER_REJECT status={race_status} body={race_text}");
+            assert_eq!(
+                race_status.as_u16(),
+                400,
+                "mutating import_refs between authorization and pack must fail upload-pack"
+            );
+            assert!(
+                race_text.contains("refs changed while building the pack"),
+                "race failure must report ref-view change: {race_text}"
+            );
+            assert!(
+                !race_bytes.windows(4).any(|w| w == b"PACK"),
+                "rejected race response must not emit a PACK"
             );
         })
         .catch_unwind()
@@ -7145,6 +7719,1166 @@ mod disabled_http {
         closed.expect("close isolation pool");
     }
 
+    pub async fn code_clone_isolation_exact_pack_matrix() {
+        for format in ["sha1", "sha256"] {
+            verify_import_repo_exact_pack_matrix(format).await;
+        }
+    }
+
+    async fn verify_import_repo_exact_pack_matrix(format: &str) {
+        const TRACE_SENTINEL: &[u8] = b"MTR13_UNIQUE_TRACES_ONLY_SENTINEL_PAYLOAD\n";
+
+        fn batch_objects(mut bytes: &[u8]) -> BTreeMap<String, (String, Vec<u8>)> {
+            let mut objects = BTreeMap::new();
+            while !bytes.is_empty() {
+                let newline = bytes
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .expect("batch header");
+                let header = std::str::from_utf8(&bytes[..newline]).expect("batch header UTF-8");
+                let fields: Vec<_> = header.split_whitespace().collect();
+                assert_eq!(
+                    fields.len(),
+                    3,
+                    "unexpected cat-file batch header: {header}"
+                );
+                let size: usize = fields[2].parse().expect("batch object size");
+                bytes = &bytes[newline + 1..];
+                assert!(
+                    bytes.len() > size && bytes[size] == b'\n',
+                    "truncated batch object"
+                );
+                assert!(
+                    objects
+                        .insert(
+                            fields[0].to_owned(),
+                            (fields[1].to_owned(), bytes[..size].to_vec())
+                        )
+                        .is_none(),
+                    "duplicate batch object {}",
+                    fields[0]
+                );
+                bytes = &bytes[size + 1..];
+            }
+            objects
+        }
+
+        #[derive(Clone, Default)]
+        struct ClientBefore {
+            pack_fingerprints: BTreeMap<PathBuf, String>,
+            odb: BTreeSet<String>,
+        }
+
+        fn pack_fingerprints(root: &Path, bare: bool) -> BTreeMap<PathBuf, String> {
+            let pack_dir = root.join(if bare {
+                "objects/pack"
+            } else {
+                ".git/objects/pack"
+            });
+            if !pack_dir.exists() {
+                return BTreeMap::new();
+            }
+            fs::read_dir(&pack_dir)
+                .expect("read pre-request pack directory")
+                .map(|entry| entry.expect("pre-request pack entry").path())
+                .filter(|path| {
+                    matches!(
+                        path.extension().and_then(|ext| ext.to_str()),
+                        Some("pack" | "idx")
+                    )
+                })
+                .map(|path| {
+                    let hash = hex::encode(Sha256::digest(
+                        fs::read(&path).expect("read pre-request pack or index"),
+                    ));
+                    (path, hash)
+                })
+                .collect()
+        }
+
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = Fixture::new(&db).await;
+        fixture.object_format = format.to_owned();
+        let result = AssertUnwindSafe(async {
+            fixture.seed_ssh(&db).await;
+            let mut init = fixture.command(false, "trunk", "/third-party");
+            init.args(["service", "init", "--yes"]);
+            OwnedChild::spawn(&mut init).require_success().await;
+            fixture.start(true, "trunk", "/third-party").await;
+
+            let repo_path = "/third-party/mtr13-iso.git";
+            let http_url = git_cli::mega2_http_url(fixture.port, repo_path);
+
+            fixture.git(&[
+                "init",
+                "-q",
+                "--initial-branch=main",
+                &format!("--object-format={format}"),
+                "mtr13-work",
+            ]);
+            let work_dir = fixture.shared.path().join("mtr13-work");
+            fs::create_dir_all(work_dir.join("sub")).expect("create sub dir");
+            fs::write(
+                work_dir.join("sub/transient.txt"),
+                b"MTR13 transient parent-only blob\n",
+            )
+            .expect("write transient.txt");
+            fs::write(
+                work_dir.join("shared.txt"),
+                b"MTR13 shared code and trace blob\n",
+            )
+            .expect("write shared.txt");
+            fixture.git(&["-C", "mtr13-work", "add", "."]);
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "MTR13 c1 base",
+            ]);
+            let c1 = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD"]);
+            let t1 = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD^{tree}"]);
+            let sub1 = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD:sub"]);
+            let b_transient =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD:sub/transient.txt"]);
+            let b_shared =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD:shared.txt"]);
+
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "v1-parent",
+                "-m",
+                "tag on c1",
+                &c1,
+            ]);
+            let v1_parent_oid =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "v1-parent"]);
+
+            // Push c1 + v1-parent first and create loose-object incremental base clones at c1.
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "push",
+                &http_url,
+                "HEAD:refs/heads/main",
+                "refs/tags/v1-parent",
+            ]);
+            fixture.git(&[
+                "-c",
+                "fetch.unpackLimit=999999",
+                "-c",
+                "transfer.unpackLimit=999999",
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                &http_url,
+                "inc-base",
+            ]);
+            fixture.git(&[
+                "-c",
+                "fetch.unpackLimit=999999",
+                "-c",
+                "transfer.unpackLimit=999999",
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                "--no-tags",
+                &http_url,
+                "inc-base-notags",
+            ]);
+
+            // Commit 2 (c2) on main: remove transient.txt, add sub/keep.txt and readme.txt.
+            fixture.git(&["-C", "mtr13-work", "rm", "-q", "sub/transient.txt"]);
+            fs::create_dir_all(work_dir.join("sub")).expect("recreate sub dir");
+            fs::write(work_dir.join("sub/keep.txt"), b"MTR13 keep in c2\n")
+                .expect("write keep.txt");
+            fs::write(work_dir.join("readme.txt"), b"MTR13 readme in c2\n")
+                .expect("write readme.txt");
+            fixture.git(&["-C", "mtr13-work", "add", "."]);
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "MTR13 c2 tip",
+            ]);
+            let c2 = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD"]);
+            let t2 = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD^{tree}"]);
+            let sub2 = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD:sub"]);
+            let b_keep =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD:sub/keep.txt"]);
+            let b_readme =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD:readme.txt"]);
+
+            for (name, target, msg) in [
+                ("v2-commit", c2.as_str(), "tag on c2 commit"),
+                ("v2-nested-inner", c2.as_str(), "inner nested tag on c2"),
+                ("v2-tree", t2.as_str(), "tag on c2 root tree"),
+                ("v2-blob", b_readme.as_str(), "tag on c2 readme blob"),
+                ("v-deleted", c2.as_str(), "tag whose ref will be deleted"),
+            ] {
+                fixture.git(&[
+                    "-C",
+                    "mtr13-work",
+                    "-c",
+                    "user.name=Traces Fixture",
+                    "-c",
+                    "user.email=traces@example.invalid",
+                    "-c",
+                    "tag.gpgsign=false",
+                    "tag",
+                    "-a",
+                    name,
+                    "-m",
+                    msg,
+                    target,
+                ]);
+            }
+            let v2_commit_oid =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "v2-commit"]);
+            let v2_inner_oid =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "v2-nested-inner"]);
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "v2-nested-outer",
+                "-m",
+                "outer nested tag",
+                &v2_inner_oid,
+            ]);
+            let v2_outer_oid =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "v2-nested-outer"]);
+            let v2_tree_oid = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "v2-tree"]);
+            let v2_blob_oid = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "v2-blob"]);
+            let v_deleted_oid =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "v-deleted"]);
+
+            // Unrelated side branch with its own annotated tag `v-outside`.
+            fixture.git(&["-C", "mtr13-work", "checkout", "-q", "--orphan", "side"]);
+            fixture.git(&["-C", "mtr13-work", "rm", "-rf", "-q", "."]);
+            fs::write(work_dir.join("side.txt"), b"MTR13 side branch\n").expect("write side.txt");
+            fixture.git(&["-C", "mtr13-work", "add", "side.txt"]);
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "MTR13 side commit",
+            ]);
+            let c_side = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD"]);
+            let t_side = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD^{tree}"]);
+            let b_side = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD:side.txt"]);
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "v-outside",
+                "-m",
+                "tag on side branch",
+                &c_side,
+            ]);
+            let v_outside_oid =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "v-outside"]);
+
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "push",
+                &http_url,
+                &format!("{c2}:refs/heads/main"),
+                "refs/tags/v2-commit",
+                "refs/tags/v2-nested-inner",
+                "refs/tags/v2-nested-outer",
+                "refs/tags/v2-tree",
+                "refs/tags/v2-blob",
+                "refs/tags/v-outside",
+                "refs/tags/v-deleted",
+            ]);
+            // Delete refs/tags/v-deleted so its row in git_tag is unreferenced.
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "push",
+                &http_url,
+                ":refs/tags/v-deleted",
+            ]);
+
+            let set_of = |items: &[&str]| -> BTreeSet<String> {
+                items.iter().map(|s| (*s).to_owned()).collect()
+            };
+            let union_of = |a: &BTreeSet<String>, b: &BTreeSet<String>| -> BTreeSet<String> {
+                a.union(b).cloned().collect()
+            };
+
+            let c1_objs = set_of(&[&c1, &t1, &sub1, &b_transient, &b_shared]);
+            let c2_only_objs = set_of(&[&c2, &t2, &sub2, &b_keep, &b_readme]);
+            let main_objs = union_of(&c1_objs, &c2_only_objs);
+            let side_objs = set_of(&[&c_side, &t_side, &b_side]);
+            let main_tags = set_of(&[
+                &v1_parent_oid,
+                &v2_commit_oid,
+                &v2_inner_oid,
+                &v2_outer_oid,
+                &v2_tree_oid,
+                &v2_blob_oid,
+            ]);
+            let main_with_tags = union_of(&main_objs, &main_tags);
+            let c2_shallow_objs = set_of(&[&c2, &t2, &sub2, &b_keep, &b_readme, &b_shared]);
+            let c2_shallow_tags = set_of(&[
+                &v2_commit_oid,
+                &v2_inner_oid,
+                &v2_outer_oid,
+                &v2_tree_oid,
+                &v2_blob_oid,
+            ]);
+            let shallow_with_tags = union_of(&c2_shallow_objs, &c2_shallow_tags);
+            let main_blobless_objs = set_of(&[&c1, &c2, &t1, &sub1, &t2, &sub2]);
+            let main_blobless_tags = set_of(&[
+                &v1_parent_oid,
+                &v2_commit_oid,
+                &v2_inner_oid,
+                &v2_outer_oid,
+                &v2_tree_oid,
+            ]);
+            let blobless_v2_with_tags = union_of(&main_blobless_objs, &main_blobless_tags);
+            let mirror_all_objs = {
+                let mut m = union_of(&main_with_tags, &side_objs);
+                m.insert(v_outside_oid.clone());
+                m
+            };
+            let inc_with_tags = union_of(&c2_only_objs, &c2_shallow_tags);
+
+            let source_objects = batch_objects(&fixture.git(&[
+                "-C", "mtr13-work", "cat-file", "--batch-all-objects", "--batch",
+            ]));
+            let wire_packs = std::cell::RefCell::new(BTreeMap::<String, PathBuf>::new());
+            let client_before = std::cell::RefCell::new(BTreeMap::<String, ClientBefore>::new());
+            let verify_pack_and_odb = |fixture: &Fixture,
+                                       dir: &str,
+                                       bare: bool,
+                                       expected_pack: &BTreeSet<String>,
+                                       expected_odb: &BTreeSet<String>,
+                                       forbidden: &[&str],
+                                       check_fsck: bool,
+                                       check_c2_tags: bool,
+                                       has_blob_tag: bool| {
+                let pack_dir = fixture.shared.path().join(dir).join(if bare {
+                    "objects/pack"
+                } else {
+                    ".git/objects/pack"
+                });
+                let before = client_before.borrow().get(dir).cloned().unwrap_or_default();
+                for (path, expected_hash) in &before.pack_fingerprints {
+                    let bytes = fs::read(path).expect("original pack or index must remain present");
+                    assert_eq!(
+                        hex::encode(Sha256::digest(bytes)), *expected_hash,
+                        "MTR13_OLD_PACK {format} {dir} original pack/index changed: {}", path.display()
+                    );
+                }
+                assert_eq!(
+                    before.odb.union(expected_pack).cloned().collect::<BTreeSet<_>>(), *expected_odb,
+                    "MTR13_ODB_UNION {format} {dir} expected ODB must be request-before ODB union exact received E"
+                );
+                let mut pack_files: Vec<PathBuf> = fs::read_dir(&pack_dir)
+                    .unwrap_or_else(|e| panic!("read pack dir {}: {e}", pack_dir.display()))
+                    .filter_map(|entry| {
+                        let path = entry.ok()?.path();
+                        if path.extension().and_then(|s| s.to_str()) == Some("pack")
+                            && !before.pack_fingerprints.contains_key(&path)
+                        {
+                            Some(path)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                pack_files.sort();
+                assert_eq!(
+                    pack_files.len(),
+                    1,
+                    "MTR13_EXACT_PACK {format} {dir} must receive exactly 1 new .pack file, found {pack_files:?}"
+                );
+                let pack_path = &pack_files[0];
+                let pack_bytes = fs::read(pack_path).expect("read .pack bytes");
+                assert!(
+                    pack_bytes.len() >= 12 && &pack_bytes[0..4] == b"PACK",
+                    "MTR13_EXACT_PACK {format} {dir} invalid PACK magic"
+                );
+                if let Some(wire_path) = wire_packs.borrow().get(dir) {
+                    let wire_bytes = fs::read(wire_path).expect("read received wire PACK");
+                    assert!(
+                        wire_bytes == pack_bytes,
+                        "MTR13_WIRE_PACK {format} {dir} received bytes differ from the sole indexed PACK: wire={} stored={}",
+                        wire_bytes.len(), pack_bytes.len()
+                    );
+                } else {
+                    assert!(dir.ends_with("-pre-trace"), "matrix case {dir} lacks wire capture");
+                }
+                let version = u32::from_be_bytes(pack_bytes[4..8].try_into().unwrap());
+                let header_count =
+                    u32::from_be_bytes(pack_bytes[8..12].try_into().unwrap()) as usize;
+                assert_eq!(version, 2, "MTR13_EXACT_PACK {format} {dir} pack version");
+                assert_eq!(
+                    header_count,
+                    expected_pack.len(),
+                    "MTR13_EXACT_PACK {format} {dir} 12-byte PACK header count ({header_count}) != expected ({})",
+                    expected_pack.len()
+                );
+                assert!(
+                    !pack_bytes
+                        .windows(TRACE_SENTINEL.len())
+                        .any(|w| w == TRACE_SENTINEL),
+                    "MTR13_AC8 {format} {dir} raw .pack bytes leaked trace sentinel payload"
+                );
+
+                let idx_name = pack_path
+                    .with_extension("idx")
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let rel_idx = if bare {
+                    format!("objects/pack/{idx_name}")
+                } else {
+                    format!(".git/objects/pack/{idx_name}")
+                };
+                let verify_out = fixture.git_text(&["-C", dir, "verify-pack", "-v", &rel_idx]);
+                let verify_vec: Vec<String> = verify_out
+                    .lines()
+                    .filter_map(|line| {
+                        let first = line.split_whitespace().next()?;
+                        if matches!(first.len(), 40 | 64)
+                            && first.chars().all(|c| c.is_ascii_hexdigit())
+                        {
+                            Some(first.to_owned())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    verify_vec.len(),
+                    header_count,
+                    "MTR13_EXACT_PACK {format} {dir} verify-pack entry count != 12-byte header count"
+                );
+                let verify_set: BTreeSet<String> = verify_vec.into_iter().collect();
+                assert_eq!(
+                    &verify_set, expected_pack,
+                    "MTR13_EXACT_PACK {format} {dir} verify-pack object set mismatch"
+                );
+
+                let odb_out = fixture.git_text(&[
+                    "-C",
+                    dir,
+                    "cat-file",
+                    "--batch-all-objects",
+                    "--batch-check=%(objectname)",
+                ]);
+                let odb_set: BTreeSet<String> = odb_out
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| l.trim().to_owned())
+                    .collect();
+                assert_eq!(
+                    &odb_set, expected_odb,
+                    "MTR13_AC6 {format} {dir} client ODB object set mismatch"
+                );
+                let odb_objects = batch_objects(&fixture.git(&[
+                    "-C", dir, "cat-file", "--batch-all-objects", "--batch",
+                ]));
+                assert_eq!(odb_objects.keys().cloned().collect::<BTreeSet<_>>(), *expected_odb);
+                for (oid, object) in &odb_objects {
+                    assert_eq!(Some(object), source_objects.get(oid), "MTR13_OBJECT_BYTES {format} {dir} {oid}");
+                    assert!(
+                        !object.1.windows(TRACE_SENTINEL.len()).any(|bytes| bytes == TRACE_SENTINEL),
+                        "MTR13_AC8 {format} {dir} decoded object {oid} contains trace sentinel"
+                    );
+                }
+                for bad in forbidden {
+                    assert!(
+                        !verify_set.contains(*bad) && !odb_set.contains(*bad),
+                        "MTR13_ISOLATION {format} {dir} leaked forbidden object {bad}"
+                    );
+                }
+                eprintln!(
+                    "MTR13_CASE_OK format={format} case={dir} pack_objects={} odb_objects={} pack_sha256={}",
+                    verify_set.len(), odb_set.len(), hex::encode(Sha256::digest(&pack_bytes))
+                );
+                if check_fsck {
+                    fixture.git(&["-C", dir, "fsck", "--strict"]);
+                }
+                if check_c2_tags {
+                    assert_eq!(
+                        fixture.git_text(&["-C", dir, "rev-parse", "v2-commit^{}"]),
+                        c2,
+                        "MTR13_AC5 {format} {dir} peel v2-commit"
+                    );
+                    assert_eq!(
+                        fixture.git_text(&["-C", dir, "rev-parse", "v2-nested-outer^{}"]),
+                        c2,
+                        "MTR13_AC5 {format} {dir} peel v2-nested-outer"
+                    );
+                    assert_eq!(
+                        fixture.git_text(&["-C", dir, "rev-parse", "v2-tree^{}"]),
+                        t2,
+                        "MTR13_AC5 {format} {dir} peel v2-tree"
+                    );
+                    if has_blob_tag {
+                        assert_eq!(
+                            fixture.git_text(&["-C", dir, "rev-parse", "v2-blob^{}"]),
+                            b_readme,
+                            "MTR13_AC5 {format} {dir} peel v2-blob"
+                        );
+                    }
+                }
+            };
+
+            // AC-7 baseline clone BEFORE publishing any trace data.
+            let pre_trace_dir = format!("mtr13-{format}-pre-trace");
+            fixture.git(&[
+                "-c",
+                "fetch.unpackLimit=1",
+                "-c",
+                "transfer.unpackLimit=1",
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                &http_url,
+                &pre_trace_dir,
+            ]);
+            verify_pack_and_odb(
+                &fixture,
+                &pre_trace_dir,
+                false,
+                &main_with_tags,
+                &main_with_tags,
+                &[&c_side, &v_outside_oid, &v_deleted_oid],
+                true,
+                true,
+                true,
+            );
+
+            // Publish trace data on both legacy `refs/libra/traces` (sharing `b_shared`
+            // with code while adding `TRACE_SENTINEL`) and `.traces` (`trace_stream.tip_oid`).
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "checkout",
+                "-q",
+                "--orphan",
+                "trace-orphan",
+            ]);
+            fixture.git(&["-C", "mtr13-work", "rm", "-rf", "-q", "."]);
+            fs::write(
+                work_dir.join("shared.txt"),
+                b"MTR13 shared code and trace blob\n",
+            )
+            .expect("write shared trace blob");
+            fs::write(work_dir.join("trace-only.txt"), TRACE_SENTINEL)
+                .expect("write trace sentinel blob");
+            fixture.git(&["-C", "mtr13-work", "add", "."]);
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "MTR13 legacy trace commit",
+            ]);
+            let c_trace = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD"]);
+            let t_trace = fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD^{tree}"]);
+            let b_trace =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD:trace-only.txt"]);
+            let b_trace_shared =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "HEAD:shared.txt"]);
+            assert_eq!(
+                b_trace_shared, b_shared,
+                "trace history must share b_shared with code"
+            );
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "-c",
+                "user.name=Traces Fixture",
+                "-c",
+                "user.email=traces@example.invalid",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "v-trace-tag",
+                "-m",
+                "tag on trace commit",
+                &c_trace,
+            ]);
+            let v_trace_tag_oid =
+                fixture.git_text(&["-C", "mtr13-work", "rev-parse", "v-trace-tag"]);
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "push",
+                "--no-thin",
+                &http_url,
+                &format!("{c_trace}:refs/libra/traces"),
+                "refs/tags/v-trace-tag",
+            ]);
+            fixture.git(&[
+                "-C",
+                "mtr13-work",
+                "push",
+                &http_url,
+                ":refs/tags/v-trace-tag",
+            ]);
+
+            let principal = Uuid::new_v4().to_string();
+            let target = Uuid::new_v4().to_string();
+            let stream_id = Uuid::new_v4().to_string();
+            trace_principal::ActiveModel {
+                id: Set(principal.clone()),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(&db)
+            .await
+            .expect("seed mtr13 trace principal");
+            trace_target::ActiveModel {
+                id: Set(target.clone()),
+                target_kind: Set("import".to_owned()),
+                project_path: Set("/third-party/mtr13-iso".to_owned()),
+                backing_import_repo_id: Set(None),
+                active: Set(true),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(&db)
+            .await
+            .expect("seed mtr13 trace target");
+            trace_stream::ActiveModel {
+                id: Set(stream_id),
+                principal_id: Set(principal),
+                target_id: Set(target),
+                source_repo_id: Set("mtr13-source".to_owned()),
+                epoch_id: Set(Uuid::new_v4().to_string()),
+                hash_kind: Set(format.to_owned()),
+                tip_oid: Set(Some(c_trace.clone())),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(&db)
+            .await
+            .expect("seed mtr13 populated trace stream");
+
+            let forbidden_trace_and_deleted = [
+                c_trace.as_str(),
+                t_trace.as_str(),
+                b_trace.as_str(),
+                v_trace_tag_oid.as_str(),
+                v_deleted_oid.as_str(),
+            ];
+            let forbidden_single_branch = [
+                c_trace.as_str(),
+                t_trace.as_str(),
+                b_trace.as_str(),
+                v_trace_tag_oid.as_str(),
+                v_deleted_oid.as_str(),
+                c_side.as_str(),
+                t_side.as_str(),
+                b_side.as_str(),
+                v_outside_oid.as_str(),
+            ];
+
+            for transport in ["http", "ssh"] {
+                if transport == "ssh" {
+                    fixture.start_ssh(true, false).await;
+                }
+                let remote_url = if transport == "http" {
+                    git_cli::mega2_http_url(fixture.port, repo_path)
+                } else {
+                    fixture.ssh_url(repo_path)
+                };
+                let run_git = |fixture: &Fixture, args: &[&str]| {
+                    let dir = if args.contains(&"fetch") {
+                        let at = args.iter().position(|arg| *arg == "-C").expect("fetch directory");
+                        args[at + 1]
+                    } else {
+                        *args.last().expect("clone directory")
+                    };
+                    let before = if args.contains(&"fetch") {
+                        let root = fixture.shared.path().join(dir);
+                        assert!(root.join(".git").is_dir(), "incremental client must already exist");
+                        let odb = fixture.git_text(&[
+                            "-C", dir, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)",
+                        ]).lines().map(str::to_owned).collect();
+                        ClientBefore { pack_fingerprints: pack_fingerprints(&root, false), odb }
+                    } else {
+                        assert!(!fixture.shared.path().join(dir).exists(), "clone client must be new");
+                        ClientBefore::default()
+                    };
+                    assert!(client_before.borrow_mut().insert(dir.to_owned(), before.clone()).is_none());
+                    let packet_path = fixture.shared.path().join(format!("{dir}.packet"));
+                    let wire_path = fixture.shared.path().join(format!("{dir}.wire-pack"));
+                    let work_root = git_cli::git_cli_workdir().canonicalize().expect("shared work root");
+                    let case_root = fixture.shared.path().canonicalize().expect("case root");
+                    let relative = case_root.strip_prefix(&work_root).expect("case inside shared work root");
+                    let (packet_runner_path, wire_runner_path) =
+                        if git_cli::mega2_reachable_host() == git_cli::HOST_LOOPBACK {
+                            (
+                                packet_path.to_string_lossy().into_owned(),
+                                wire_path.to_string_lossy().into_owned(),
+                            )
+                        } else {
+                            (
+                                format!("/work/{}/{dir}.packet", relative.display()),
+                                format!("/work/{}/{dir}.wire-pack", relative.display()),
+                            )
+                        };
+                    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+                    let alias = format!(
+                        "alias.mtr13-wire=!GIT_TRACE_PACKET={} GIT_TRACE_PACKFILE={} GIT_NO_LAZY_FETCH=1 git",
+                        quote(&packet_runner_path), quote(&wire_runner_path)
+                    );
+                    let mut traced_args = vec!["-c", alias.as_str(), "mtr13-wire"];
+                    traced_args.extend_from_slice(args);
+                    let out = if transport == "http" {
+                        git_cli::git_cli_no_auth(fixture.shared.path(), &traced_args)
+                    } else {
+                        fixture.ssh_git(&traced_args)
+                    };
+                    assert!(
+                        out.status.success(),
+                        "MTR13_WIRE {format} {transport} {args:?} failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let packet = fs::read_to_string(&packet_path).expect("read packet negotiation");
+                    let sent: Vec<_> = packet.lines().filter_map(|line| line.split_once("> ").map(|(_, payload)| payload)).collect();
+                    let version_two = packet.lines().any(|line| line.split_once("< ").is_some_and(|(_, payload)| payload == "version 2"));
+                    let want_count = sent.iter().filter(|payload| payload.starts_with("want ")).count();
+                    let have_oids: BTreeSet<String> = sent.iter().filter_map(|payload| {
+                        payload.strip_prefix("have ").map(|oid| oid.split_whitespace().next().expect("have OID").to_owned())
+                    }).collect();
+                    if args.contains(&"fetch") {
+                        assert_eq!(have_oids, BTreeSet::from([c1.clone()]), "MTR13_ACTUAL_HAVE {dir} incremental request must name the c1 baseline commit");
+                        let mut have_odb = c1_objs.clone();
+                        if !args.contains(&"--no-tags") {
+                            have_odb.insert(v1_parent_oid.clone());
+                        }
+                        assert_eq!(before.odb, have_odb, "MTR13_ACTUAL_HAVE {dir} pre-request ODB must equal the known have closure and original tag objects");
+                    } else {
+                        assert!(have_oids.is_empty(), "MTR13_ACTUAL_HAVE {dir} fresh clone must not negotiate existing objects");
+                    }
+                    assert!(want_count > 0, "MTR13_WIRE {dir} must record actual wants");
+                    let requested_v2 = args.windows(2).any(|pair| pair == ["-c", "protocol.version=2"]);
+                    assert_eq!(version_two, requested_v2, "MTR13_WIRE {dir} negotiated protocol differs from requested protocol");
+                    if requested_v2 {
+                        assert!(sent.contains(&"command=fetch"), "MTR13_WIRE {dir} lacks v2 fetch command");
+                    }
+                    let include_tag = sent.iter().any(|payload| payload.split_whitespace().any(|word| word == "include-tag"));
+                    if args.contains(&"--no-tags") {
+                        assert!(!include_tag, "MTR13_WIRE {dir} --no-tags requested include-tag");
+                    } else if args.contains(&"--depth=1") || args.contains(&"fetch") || (requested_v2 && args.contains(&"--filter=blob:none")) {
+                        assert!(include_tag, "MTR13_WIRE {dir} requires include-tag positive control");
+                    }
+                    if !requested_v2 && args.contains(&"--filter=blob:none") {
+                        assert!(String::from_utf8_lossy(&out.stderr).contains("filtering not recognized"), "MTR13_WIRE {dir} v0 filter fallback must be explicit");
+                    }
+                    assert!(wire_packs.borrow_mut().insert(dir.to_owned(), wire_path).is_none());
+                    eprintln!("MTR13_WIRE_OK format={format} case={dir} negotiated_v2={version_two} wants={want_count} haves={} before_objects={} old_pack_files={} include_tag={include_tag}", have_oids.len(), before.odb.len(), before.pack_fingerprints.len() / 2);
+                };
+
+                for proto in ["0", "2"] {
+                    let p_flag = format!("protocol.version={proto}");
+                    let prefix = format!("mtr13-{format}-{transport}-v{proto}");
+
+                    // 1. normal
+                    let dir_normal = format!("{prefix}-normal");
+                    run_git(
+                        &fixture,
+                        &[
+                            "-c",
+                            &p_flag,
+                            "-c",
+                            "fetch.unpackLimit=1",
+                            "-c",
+                            "transfer.unpackLimit=1",
+                            "clone",
+                            "--single-branch",
+                            "--branch",
+                            "main",
+                            &remote_url,
+                            &dir_normal,
+                        ],
+                    );
+                    verify_pack_and_odb(
+                        &fixture,
+                        &dir_normal,
+                        false,
+                        &main_with_tags,
+                        &main_with_tags,
+                        &forbidden_single_branch,
+                        true,
+                        true,
+                        true,
+                    );
+
+                    // 2. bare
+                    let dir_bare = format!("{prefix}-bare");
+                    run_git(
+                        &fixture,
+                        &[
+                            "-c",
+                            &p_flag,
+                            "-c",
+                            "fetch.unpackLimit=1",
+                            "-c",
+                            "transfer.unpackLimit=1",
+                            "clone",
+                            "--bare",
+                            "--single-branch",
+                            "--branch",
+                            "main",
+                            &remote_url,
+                            &dir_bare,
+                        ],
+                    );
+                    verify_pack_and_odb(
+                        &fixture,
+                        &dir_bare,
+                        true,
+                        &main_with_tags,
+                        &main_with_tags,
+                        &forbidden_single_branch,
+                        true,
+                        true,
+                        true,
+                    );
+
+                    // 3. mirror
+                    let dir_mirror = format!("{prefix}-mirror");
+                    run_git(
+                        &fixture,
+                        &[
+                            "-c",
+                            &p_flag,
+                            "-c",
+                            "fetch.unpackLimit=1",
+                            "-c",
+                            "transfer.unpackLimit=1",
+                            "clone",
+                            "--mirror",
+                            &remote_url,
+                            &dir_mirror,
+                        ],
+                    );
+                    verify_pack_and_odb(
+                        &fixture,
+                        &dir_mirror,
+                        true,
+                        &mirror_all_objs,
+                        &mirror_all_objs,
+                        &forbidden_trace_and_deleted,
+                        true,
+                        true,
+                        true,
+                    );
+
+                    // 4. no-tags
+                    let dir_notags = format!("{prefix}-no-tags");
+                    run_git(
+                        &fixture,
+                        &[
+                            "-c",
+                            &p_flag,
+                            "-c",
+                            "fetch.unpackLimit=1",
+                            "-c",
+                            "transfer.unpackLimit=1",
+                            "clone",
+                            "--no-tags",
+                            &remote_url,
+                            &dir_notags,
+                        ],
+                    );
+                    verify_pack_and_odb(
+                        &fixture,
+                        &dir_notags,
+                        false,
+                        &main_objs,
+                        &main_objs,
+                        &[
+                            c_trace.as_str(),
+                            t_trace.as_str(),
+                            b_trace.as_str(),
+                            v_trace_tag_oid.as_str(),
+                            v_deleted_oid.as_str(),
+                            v1_parent_oid.as_str(),
+                            v2_commit_oid.as_str(),
+                            v2_inner_oid.as_str(),
+                            v2_outer_oid.as_str(),
+                            v2_tree_oid.as_str(),
+                            v2_blob_oid.as_str(),
+                            v_outside_oid.as_str(),
+                        ],
+                        true,
+                        false,
+                        false,
+                    );
+
+                    // 5. shallow (--depth=1)
+                    let dir_shallow = format!("{prefix}-shallow");
+                    run_git(
+                        &fixture,
+                        &[
+                            "-c",
+                            &p_flag,
+                            "-c",
+                            "fetch.unpackLimit=1",
+                            "-c",
+                            "transfer.unpackLimit=1",
+                            "clone",
+                            "--single-branch",
+                            "--branch",
+                            "main",
+                            "--depth=1",
+                            "--no-checkout",
+                            &remote_url,
+                            &dir_shallow,
+                        ],
+                    );
+                    verify_pack_and_odb(
+                        &fixture,
+                        &dir_shallow,
+                        false,
+                        &shallow_with_tags,
+                        &shallow_with_tags,
+                        &[
+                            c_trace.as_str(),
+                            t_trace.as_str(),
+                            b_trace.as_str(),
+                            v_trace_tag_oid.as_str(),
+                            v_deleted_oid.as_str(),
+                            c1.as_str(),
+                            t1.as_str(),
+                            sub1.as_str(),
+                            b_transient.as_str(),
+                            v1_parent_oid.as_str(),
+                            c_side.as_str(),
+                            v_outside_oid.as_str(),
+                        ],
+                        true,
+                        true,
+                        true,
+                    );
+
+                    // 6. blob:none (--filter=blob:none)
+                    let dir_blobless = format!("{prefix}-blobless");
+                    run_git(
+                        &fixture,
+                        &[
+                            "-c",
+                            &p_flag,
+                            "-c",
+                            "fetch.unpackLimit=1",
+                            "-c",
+                            "transfer.unpackLimit=1",
+                            "clone",
+                            "--single-branch",
+                            "--branch",
+                            "main",
+                            "--filter=blob:none",
+                            "--no-checkout",
+                            &remote_url,
+                            &dir_blobless,
+                        ],
+                    );
+                    if proto == "2" {
+                        verify_pack_and_odb(
+                            &fixture,
+                            &dir_blobless,
+                            false,
+                            &blobless_v2_with_tags,
+                            &blobless_v2_with_tags,
+                            &[
+                                c_trace.as_str(),
+                                t_trace.as_str(),
+                                b_trace.as_str(),
+                                v_trace_tag_oid.as_str(),
+                                v_deleted_oid.as_str(),
+                                b_transient.as_str(),
+                                b_shared.as_str(),
+                                b_keep.as_str(),
+                                b_readme.as_str(),
+                                v2_blob_oid.as_str(),
+                                c_side.as_str(),
+                                v_outside_oid.as_str(),
+                            ],
+                            false,
+                            true,
+                            false,
+                        );
+                    } else {
+                        verify_pack_and_odb(
+                            &fixture,
+                            &dir_blobless,
+                            false,
+                            &main_with_tags,
+                            &main_with_tags,
+                            &forbidden_single_branch,
+                            false,
+                            true,
+                            true,
+                        );
+                    }
+
+                    // 7a. incremental fetch from c1 -> c2 WITH include-tag (default fetch)
+                    let dir_inc = format!("{prefix}-incremental");
+                    fixture.git(&[
+                        "-c",
+                        "fetch.unpackLimit=999999",
+                        "-c",
+                        "transfer.unpackLimit=999999",
+                        "clone",
+                        "--no-local",
+                        "inc-base",
+                        &dir_inc,
+                    ]);
+                    run_git(
+                        &fixture,
+                        &[
+                            "-C",
+                            &dir_inc,
+                            "-c",
+                            &p_flag,
+                            "-c",
+                            "fetch.unpackLimit=1",
+                            "-c",
+                            "transfer.unpackLimit=1",
+                            "fetch",
+                            &remote_url,
+                            "refs/heads/main:refs/remotes/origin/main",
+                        ],
+                    );
+                    verify_pack_and_odb(
+                        &fixture,
+                        &dir_inc,
+                        false,
+                        &inc_with_tags,
+                        &main_with_tags,
+                        &forbidden_single_branch,
+                        true,
+                        true,
+                        true,
+                    );
+
+                    // 7b. incremental fetch from c1 -> c2 WITH --no-tags (include-tag=false)
+                    let dir_inc_notags = format!("{prefix}-incremental-notags");
+                    fixture.git(&[
+                        "-c",
+                        "fetch.unpackLimit=999999",
+                        "-c",
+                        "transfer.unpackLimit=999999",
+                        "clone",
+                        "--no-local",
+                        "--no-tags",
+                        "inc-base-notags",
+                        &dir_inc_notags,
+                    ]);
+                    run_git(
+                        &fixture,
+                        &[
+                            "-C",
+                            &dir_inc_notags,
+                            "-c",
+                            &p_flag,
+                            "-c",
+                            "fetch.unpackLimit=1",
+                            "-c",
+                            "transfer.unpackLimit=1",
+                            "fetch",
+                            "--no-tags",
+                            &remote_url,
+                            "refs/heads/main:refs/remotes/origin/main",
+                        ],
+                    );
+                    verify_pack_and_odb(
+                        &fixture,
+                        &dir_inc_notags,
+                        false,
+                        &c2_only_objs,
+                        &main_objs,
+                        &forbidden_single_branch,
+                        true,
+                        false,
+                        false,
+                    );
+                    eprintln!(
+                        "MTR13_MATRIX_OK format={format} transport={transport} proto=v{proto} modes=8"
+                    );
+                }
+            }
+        })
+        .catch_unwind()
+        .await;
+        fixture.stop();
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            let logs = fixture.temp.keep();
+            eprintln!(
+                "code-clone exact matrix ({format}) fixture logs: {}",
+                logs.display()
+            );
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close exact matrix pool");
+    }
+
     pub async fn http_git_roundtrip(kind: &str) {
         let (guard, db) = traces_db::TracesDb::migrated().await;
         let mut fixture = Fixture::new(&db).await;
@@ -7417,9 +9151,52 @@ mod disabled_http {
                 )
                 .await;
                 let expected_ack = format!("ACK {code_tip}");
-                assert_eq!(response.status, 200, "authorized code have remains usable in v{v2}");
-                assert!(response.body.windows(expected_ack.len()).any(|window| window == expected_ack.as_bytes()));
-                assert!(response.body.windows(4).any(|window| window == b"PACK"));
+                let protocol = if v2 { "v2" } else { "v0" };
+                assert_eq!(response.status, 200, "authorized code have remains usable in {protocol}");
+                assert!(response.body.windows(expected_ack.len()).any(|window| window == expected_ack.as_bytes()), "{protocol} must acknowledge the authorized code have");
+                assert!(response.body.windows(4).any(|window| window == b"PACK"), "{protocol} must return a PACK even when want equals have");
+                let pack = if v2 {
+                    let mut acknowledgments = Vec::new();
+                    pkt(&mut acknowledgments, "acknowledgments\n");
+                    pkt(&mut acknowledgments, &format!("{expected_ack}\n"));
+                    pkt(&mut acknowledgments, "ready\n");
+                    acknowledgments.extend_from_slice(b"0001");
+                    assert!(response.body.starts_with(&acknowledgments), "{protocol} negotiation without done must acknowledge the common have and become ready");
+                    http_git_unpack_response(&response.body[acknowledgments.len()..], true)
+                } else {
+                    let mut remaining = response.body.as_slice();
+                    let mut ack_count = 0;
+                    while !remaining.starts_with(b"PACK") {
+                        assert!(remaining.len() >= 4, "{protocol} truncated acknowledgment header");
+                        let length = usize::from_str_radix(std::str::from_utf8(&remaining[..4]).expect("v0 acknowledgment header"), 16).expect("v0 acknowledgment length");
+                        assert!((5..=65520).contains(&length) && length <= remaining.len(), "{protocol} invalid acknowledgment packet length {length}");
+                        let acknowledgment = std::str::from_utf8(&remaining[4..length]).expect("v0 acknowledgment text").trim_end();
+                        assert!(acknowledgment == expected_ack || acknowledgment == format!("{expected_ack} common"), "{protocol} unexpected acknowledgment {acknowledgment:?}");
+                        ack_count += 1;
+                        remaining = &remaining[length..];
+                    }
+                    assert!(ack_count > 0, "{protocol} must precede its raw PACK with an ACK");
+                    remaining
+                        .strip_suffix(b"0000")
+                        .expect("v0 raw PACK must end with the transport flush")
+                        .to_vec()
+                };
+                let checksum_bytes = match fixture.object_format.as_str() {
+                    "sha1" => 20,
+                    "sha256" | "blake3" => 32,
+                    other => panic!("unsupported fixture object format {other}"),
+                };
+                assert_eq!(pack.len(), 12 + checksum_bytes, "{protocol} empty PACK must contain only its header and configured hash trailer");
+                assert_eq!(&pack[..8], b"PACK\0\0\0\x02", "{protocol} empty PACK magic/version");
+                assert_eq!(u32::from_be_bytes(pack[8..12].try_into().expect("PACK count")), 0, "{protocol} want-minus-have must contain zero objects");
+                let checksum = match fixture.object_format.as_str() {
+                    "sha1" => sha1::Sha1::digest(&pack[..12]).to_vec(),
+                    "sha256" => Sha256::digest(&pack[..12]).to_vec(),
+                    "blake3" => blake3::hash(&pack[..12]).as_bytes().to_vec(),
+                    _ => unreachable!("object format validated above"),
+                };
+                assert_eq!(&pack[12..], checksum.as_slice(), "{protocol} empty PACK independent configured-hash checksum");
+                eprintln!("MTR13_EMPTY_PACK protocol={protocol} object_format={} bytes={} count=0 checksum={}", fixture.object_format, pack.len(), hex::encode(checksum));
             }
             for v2 in [false, true] {
                 let mut body = Vec::new();
@@ -7887,6 +9664,16 @@ async fn http_git_sha256_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_clone_isolation_code_path_objects() {
     disabled_http::code_clone_isolation_code_path_objects().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_clone_isolation_exact_pack_matrix() {
+    disabled_http::code_clone_isolation_exact_pack_matrix().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_clone_isolation_capacity_timeout_and_race() {
+    disabled_http::code_clone_ref_budget_answers_413().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

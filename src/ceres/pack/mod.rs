@@ -45,6 +45,15 @@ pub mod traces_repo;
 pub mod trunk_provenance;
 pub mod view_repo;
 
+/// Upload-pack options passed to [`RepoHandler::pack_with_options`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchPackOptions {
+    pub deepen_depth: Option<u32>,
+    pub deepen_relative: bool,
+    pub filter_spec: Option<String>,
+    pub include_tag: bool,
+}
+
 /// Convert a storage error into a `GitError` that keeps its status class.
 ///
 /// The pack trait returns `GitError`, which has no typed variant for traces
@@ -52,13 +61,26 @@ pub mod view_repo;
 /// protocol layer. The stable code is carried in the message and restored by
 /// [`protocol_error_from_pack`].
 pub(crate) fn pack_error_from_mega(error: &MegaError) -> GitError {
+    use crate::common::errors::TracesError;
     let message = match error {
         MegaError::Db(_) => format!("[code:503] query_timeout: {error}"),
-        MegaError::Traces(crate::common::errors::TracesError::QueryTimeout) => {
+        MegaError::Traces(TracesError::QueryTimeout) => {
             format!("[code:503] query_timeout: {error}")
         }
-        MegaError::Traces(crate::common::errors::TracesError::ResponseBudget) => {
+        MegaError::Traces(TracesError::ResponseBudget) => {
             format!("[code:413] response_budget: {error}")
+        }
+        MegaError::Traces(TracesError::UnknownScope) => {
+            format!("[code:404] unknown_scope: {error}")
+        }
+        MegaError::Traces(TracesError::TraceHistoryInCode) => {
+            format!("[code:409:trace_history_in_code] trace_history_in_code: {error}")
+        }
+        MegaError::Traces(TracesError::ObjectIntegrity) => {
+            format!("[code:409:object_integrity] object_integrity: {error}")
+        }
+        MegaError::Traces(TracesError::InvalidParameter) => {
+            format!("[code:400:invalid_parameter] invalid_parameter: {error}")
         }
         other => other.to_string(),
     };
@@ -74,6 +96,18 @@ pub(crate) fn protocol_error_from_pack(error: &GitError) -> crate::common::error
     }
     if message.contains("[code:413]") {
         return ProtocolError::Traces(TracesError::ResponseBudget);
+    }
+    if message.contains("[code:404]") {
+        return ProtocolError::Traces(TracesError::UnknownScope);
+    }
+    if message.contains("[code:409:trace_history_in_code]") {
+        return ProtocolError::Traces(TracesError::TraceHistoryInCode);
+    }
+    if message.contains("[code:409:object_integrity]") {
+        return ProtocolError::Traces(TracesError::ObjectIntegrity);
+    }
+    if message.contains("[code:400:invalid_parameter]") {
+        return ProtocolError::Traces(TracesError::InvalidParameter);
     }
     ProtocolError::InvalidInput(format!("pack generation failed: {message}"))
 }
@@ -369,47 +403,28 @@ pub trait RepoHandler: Send + Sync + 'static {
         false
     }
 
-    /// Full pack with the request's `include-tag` option. The default ignores
-    /// the option, so every handler that does not opt in stays byte-identical.
-    async fn full_pack_with_options(
-        &self,
-        want: Vec<String>,
-        _include_tag: bool,
-    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.full_pack(want).await
-    }
-
-    /// Incremental pack with the request's `include-tag` option.
-    async fn incremental_pack_with_options(
+    /// Unified upload-pack entry point carrying `deepen_depth`, `deepen_relative`,
+    /// `filter_spec`, and `include_tag`. Default forwards to the existing
+    /// `filtered_pack` / `shallow_pack` / `full_pack` / `incremental_pack` methods.
+    async fn pack_with_options(
         &self,
         want: Vec<String>,
         have: Vec<String>,
-        _include_tag: bool,
-    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.incremental_pack(want, have).await
-    }
-
-    /// Shallow pack carrying the request's `include-tag` option. The default
-    /// ignores the option, so handlers that have not opted in keep their behaviour.
-    async fn shallow_pack_with_options(
-        &self,
-        want: Vec<String>,
-        depth: u32,
-        deepen_relative: bool,
-        _include_tag: bool,
+        options: FetchPackOptions,
     ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
-        self.shallow_pack(want, depth, deepen_relative).await
-    }
-
-    /// Filtered pack carrying the request's `include-tag` option.
-    async fn filtered_pack_with_options(
-        &self,
-        want: Vec<String>,
-        have: Vec<String>,
-        filter_spec: &str,
-        _include_tag: bool,
-    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.filtered_pack(want, have, filter_spec).await
+        if let Some(ref spec) = options.filter_spec {
+            let stream = self.filtered_pack(want, have, spec).await?;
+            Ok((stream, Vec::new()))
+        } else if let Some(depth) = options.deepen_depth.filter(|_| have.is_empty()) {
+            self.shallow_pack(want, depth, options.deepen_relative)
+                .await
+        } else if have.is_empty() {
+            let stream = self.full_pack(want).await?;
+            Ok((stream, Vec::new()))
+        } else {
+            let stream = self.incremental_pack(want, have).await?;
+            Ok((stream, Vec::new()))
+        }
     }
 
     /// Whether this handler implements `filter` partial clone (e.g. `blob:none`).
@@ -728,6 +743,22 @@ mod status_mapping_tests {
             protocol_error_from_pack(&git_error),
             ProtocolError::Traces(TracesError::ResponseBudget)
         ));
+    }
+
+    #[test]
+    fn traces_error_classes_survive_round_trip() {
+        for err in [
+            TracesError::UnknownScope,
+            TracesError::TraceHistoryInCode,
+            TracesError::ObjectIntegrity,
+            TracesError::InvalidParameter,
+        ] {
+            let git_error = pack_error_from_mega(&MegaError::Traces(err.clone()));
+            match protocol_error_from_pack(&git_error) {
+                ProtocolError::Traces(restored) => assert_eq!(restored, err),
+                other => panic!("expected TracesError {err:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

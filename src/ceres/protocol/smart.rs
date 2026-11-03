@@ -189,6 +189,7 @@ impl SmartSession {
         let mut deepen_depth: Option<u32> = None;
         let mut deepen_relative = false;
         let mut done = false;
+        let mut client_include_tag = false;
 
         let mut read_first_line = false;
         loop {
@@ -270,6 +271,7 @@ impl SmartSession {
                     let caps = core::str::from_utf8(&dst[caps_at..]).map_err(|_| {
                         ProtocolError::InvalidInput("capabilities are not valid UTF-8".to_owned())
                     })?;
+                    client_include_tag = caps.split_whitespace().any(|c| c == "include-tag");
                     self.parse_capabilities(caps);
                 }
                 read_first_line = true;
@@ -321,17 +323,22 @@ impl SmartSession {
         let have = repo_handler.authorize_fetch(&want, &have).await?;
         // The client asks for tag chains on the first `want` line; it only takes
         // effect when this handler advertised and can honour it.
-        let include_tag = self.capabilities.contains(&Capability::IncludeTag)
-            && repo_handler.supports_include_tag();
+        let include_tag = client_include_tag && repo_handler.supports_include_tag();
+        let pack_options = crate::ceres::pack::FetchPackOptions {
+            deepen_depth,
+            deepen_relative,
+            filter_spec: None,
+            include_tag,
+        };
 
         if have.is_empty() {
             repo_handler.prepare_pack(&want, &have).await?;
-            if let Some(depth) = deepen_depth {
-                let (stream, shallow_commits) = repo_handler
-                    .shallow_pack_with_options(want, depth, deepen_relative, include_tag)
-                    .await
-                    .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
-                pack_data = stream;
+            let (stream, shallow_commits) = repo_handler
+                .pack_with_options(want, Vec::new(), pack_options)
+                .await
+                .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
+            pack_data = stream;
+            if deepen_depth.is_some() {
                 if !shallow_info_sent {
                     for shallow in &shallow_commits {
                         add_pkt_line_string(&mut protocol_buf, format!("shallow {shallow}\n"));
@@ -347,11 +354,6 @@ impl SmartSession {
                     let (_tx, rx) = tokio::sync::mpsc::channel(1);
                     return Ok((ReceiverStream::new(rx), protocol_buf));
                 }
-            } else {
-                pack_data = repo_handler
-                    .full_pack_with_options(want, include_tag)
-                    .await
-                    .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
             }
             add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
         } else {
@@ -365,10 +367,11 @@ impl SmartSession {
                         }
                     }
                 }
-                pack_data = repo_handler
-                    .incremental_pack_with_options(want.clone(), have, include_tag)
+                let (stream, _) = repo_handler
+                    .pack_with_options(want.clone(), have, pack_options)
                     .await
                     .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
+                pack_data = stream;
 
                 if last_common_commit.is_empty() {
                     add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));

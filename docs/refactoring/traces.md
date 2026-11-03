@@ -1,3 +1,7 @@
+**现行执行指令（2026-11-03 UTC）：** 用户要求完成 Mega2 本计划，跳过交叉 Review，直接执行任务卡；本指令适用于当前 MTR-13 及后续卡。旧日期记录中的审查准入或待审要求不再作为本轮交叉 Review 前置，历史 FAIL/STOP 与原始证据保留，不将跳过记为 PASS。逐卡依赖、AC/VER、独立 C/D、签名+DCO、版本与发布门继续执行；Libra 任务仍由用户侧推进。
+
+**现行执行前沿（2026-11-03 UTC）：** MTR-13 `blocked` / `locally-accepted`，候选0.42.88不变。C4 fmt/严格Clippy与完整 `cargo test --all` 均exit0，24个结果目标3148 passed/0 failed/3原ignored（含traces43/43及完整矩阵）；`cargo build` 虽exit0，但Apple ld报1条EH section超过16MiB警告，违反0warning门，C4 STOP，build--tests未跑。5个本轮owned零连接残留库已精确清理，276baseline、roles、四服务保持。D5仅子进程dev opt1重跑build，exit0/0warning，EH实际6,769,380 bytes<16MiB，未改Cargo/global profile或抑制warning，默认opt0限制仍保留。C5准备10800秒（含300秒根后检预留），将在同一冻结局部opt1环境重新执行完整五门与资源后检，不拼接C4 PASS+D5 build；尚未启动、无C5结论或发布，源码5生产文件及测试未改，用户免Review保持。逐卡原件与环境边界见[日期计划](../plan/plan-20261015.md) MTR-13卡。
+
 **现行 FIX24 已发布且 D 闭合（2026-10-31 UTC）：** `f483f57`/`v0.42.84` 精确13路径签名+DCO、main及签名标注tag/人工Release已核；C4原五门22目标3212通过/3原忽略/0失败、根核清理21库且保留原107库。main Harbor `41216534878` success；tag Docker `41216553926` 的amd64/arm64/manifest三job全部success，本卡 `done/complete`。A1及C1/C2/C3 STOP与Claude OAuth无判词保留，用户本卡免后续审查；本段后置证据仅文档收口，不重开FIX16或扩大跨仓权限。详见日期计划 FIX24 卡。
 
 **历史 FIX24 C4 本地完整 C 已核（2026-10-31 15:44:56 UTC）：** 原五门均exit0，全量22目标3212通过/3原忽略/0失败；独立根核 `accepted_C_local=true`，本轮21个零连接测试库精确清理、原107库保持、无owned活进程。根核 SHA256 `3f43577cc86e1808d6d9264f3ab8c8b5128239530bb599c64b7b06b73c73b1fe`；C1/C2/C3 STOP与Claude OAuth无判词保留，用户明确免本卡后续审查。当前 `in-progress/locally-accepted`，提交/推送/tag/Release/适用D待；C4后置文档只作事实记录，产品/测试/版本字节须核同冻结源。详见日期计划 FIX24 卡。
@@ -690,13 +694,13 @@ Mega2 scoped SSH 连接固定使用保留 login `traces`（`traces@host`），�
 
 ## 6. 普通代码 clone 与旧 Git traces
 
-不能只隐藏 `refs/libra/traces`：当前 ImportRepo `full_pack` 忽略 wants、遍历全 repo objects，必须改成所请求且已授权代码 ref 的可达闭包，保留 annotated tag/peel、去重与准确 pack count；full/incremental/shallow/filter/v0/v2/HTTP/SSH 都遵守同一视图边界。普通代码入口不公布 traces ref，不将其选为 HEAD，不能通过已知 traces OID 的 want/delta 绕过边界。
+不能只隐藏 `refs/libra/traces`：普通代码 PACK 必须取所请求且已授权代码 ref 的可达闭包，保留 annotated tag/peel、去重与准确 pack count；full/incremental/shallow/filter/v0/v2/HTTP/SSH 都遵守同一视图边界。MTR13 工作区候选已通过 `FetchPackOptions` 和 `ImportRepo::build_code_pack` 统一这些选项，本地 A/B 已通过、最终 C/D 待；MTR40 阶段 full_pack 忽略 wants、遍历全仓对象的描述只属于其历史发布基线。普通代码入口不公布 traces ref，不将其选为 HEAD，不能通过已知 traces OID 的 want/delta 绕过边界。
 
 对于旧 ImportRepo 同库保存的 `refs/libra/traces`，保留原始 Git 数据但从代码 advertisement/default-selection/pack 全量扫描中隔离；**不纳入旧 Capture purge**，不得凭未知 author/source 自动迁入某个新 owner stream。只有旧 traces ref 的仓库代码 HEAD 应为 unborn/无代码分支，不回退到 traces。对代码 ref 的祖先已经混入 traces commit 的污染，无法安全剪掉祖先而保持原 commit；必须报明确 `trace_history_in_code`、隔离该受污染代码 ref并要求管理者显式修复，不自动改写历史。与代码共用的内容 blob 可作为合法代码闭包的一部分；验收判断的是 traces 专属对象。
 
 分卡边界：MTR-40 负责旧引用广告、代码 HEAD、污染祖先、已知 traces 专属 want 拒绝及 have 在 ACK/pack 前过滤。旧 trace ref 在普通代码 upload 与 receive 广告中均隐藏；受污染代码 ref 只在具有推送权限的 receive 广告中保留，以便有权限的维护者显式删除或重置，标准 Git 客户端无法从广告取得隐藏旧 traces ref 的更新旧值；这条广告规则不新增对已知旧 OID 的原始 receive 命令的写入拒绝策略。缺失祖先或非 commit 分支 tip 按 `object_integrity` 全仓 fail-closed；指向 blob/tree 的代码 tag 将其目标视作代码可达，gitlink 不授权目标 commit；受污染的 annotated tag 对象不在代码视图中，直接 want 返回 404 `unknown_scope`。旧视图单请求最多检查4096个代码ref、4096个tag、200000个commit及1000000个授权对象，超限返回 `response_budget`。普通与旧仓库的upload广告/fetch预检均有10秒超时，超时或数据库读失败返回 `query_timeout`；无旧traces也新增每次fetch的ref读取，超过4097个ref时有一次限量查询、按名探测和完整ref回退，保留原广告集合但增加成本。非commit/未知want仍可能在有界树遍历后才拒绝；MTR13承接其可用性优化与端点容量/并发压力验证，不自动放宽预算。
 
-MTR-13 随后把普通代码 PACK 改为授权代码对象闭包并核准确计数。 其include-tag同轴候选定义本次截断并扣除have后的显式wants闭包为B，只在客户端请求时附带同一授权代码tag ref所指且最终peeled目标属于B的完整tag链T(B)，实际pack为B并T(B)，未请求时为B；不得扫描全部存储tag、附带已删除ref的残留tag，或借tag扩张shallow深度/blob:none输出。新客户端ODB等于实际pack集合，增量客户端ODB等于原ODB并实际pack集合，并单独解析收到的PACK验集合与计数。当前候选未通过自身验收与C/D，不据此宣称生效。**当前 MTR-40 阶段的 ImportRepo `full_pack` 实际会把同仓全部对象（包括 traces 专属和受污染对象）送入普通 clone 的本地 ODB；want/have 守卫不提供内容保密性。** 只有 MTR-13 的自身验收与 C/D 成功后，才能宣称普通代码 PACK 不含这些对象。
+MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数，本地 A/B 已通过、最终 C/D 尚待。其 include-tag 同轴候选定义本次截断并扣除 have 后的显式 wants 闭包为 B，只在客户端请求时附带同一授权代码tag ref所指且最终peeled目标属于B的完整tag链T(B)，实际pack为B并T(B)，未请求时为B；不得扫描全部存储tag、附带已删除ref的残留tag，或借tag扩张shallow深度/blob:none输出。新客户端ODB等于实际pack集合，增量客户端ODB等于原ODB并实际pack集合，并单独解析收到的PACK验集合与计数。候选以同一 `CodeRefView` 进行授权与闭包规划，在对象物化后复核完整 ref 指纹，ref 改变时明确拒绝发包。v0 仅支持的 ImportRepo 通告 include-tag；v2 将其作为基础 fetch 请求参数而不单列广告，仍由 handler 能力门控执行；Monorepo/ViewRepo 不承诺 tag 附带。当前候选本地 A/B 已通过，逐卡证据及测试增量绑定见 MTR13 卡；版本化最终 C/D 尚待，不据本地验收宣称已发布。**MTR40 发布阶段的历史 full_pack 会把同仓全部对象送入普通 clone，单独 want/have 守卫不提供内容保密性；该事实不再描述 MTR13 当前候选源码。** 只有 MTR-13 最终验收与 C/D 成功后，才能对交付版本宣称普通代码 PACK 不含 traces 专属对象。
 
 固定代码 refs 和内容，增加大量 traces 历史后，普通 clone 的 refs、pack 对象集与传输对象量应不变，本地 ODB 中不得出现 traces-only sentinel commit/tree/blob。仅“没有创建 traces ref”不能算通过。
 

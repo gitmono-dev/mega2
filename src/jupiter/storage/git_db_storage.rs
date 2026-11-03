@@ -737,6 +737,21 @@ impl GitDbStorage {
             .await?)
     }
 
+    pub async fn get_tags_by_hashes(
+        &self,
+        repo_id: i64,
+        hashes: Vec<String>,
+    ) -> Result<Vec<git_tag::Model>, MegaError> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(git_tag::Entity::find()
+            .filter(git_tag::Column::RepoId.eq(repo_id))
+            .filter(git_tag::Column::TagId.is_in(hashes))
+            .all(self.get_connection())
+            .await?)
+    }
+
     pub async fn get_tags_by_repo_id_limited(
         &self,
         repo_id: i64,

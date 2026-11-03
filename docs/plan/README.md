@@ -1,3 +1,7 @@
+**现行执行指令（2026-11-03 UTC）：** 用户要求完成 Mega2 本计划，跳过交叉 Review，直接执行任务卡；本指令适用于当前 MTR-13 及后续卡。旧日期记录中的审查准入或待审要求不再作为本轮交叉 Review 前置，历史 FAIL/STOP 与原始证据保留，不将跳过记为 PASS。逐卡依赖、AC/VER、独立 C/D、签名+DCO、版本与发布门继续执行；Libra 任务仍由用户侧推进。
+
+**现行执行前沿（2026-11-03 UTC）：** MTR-13 `blocked` / `locally-accepted`，候选0.42.88不变。C4 fmt/严格Clippy与完整 `cargo test --all` 均exit0，24个结果目标3148 passed/0 failed/3原ignored（含traces43/43及完整矩阵）；`cargo build` 虽exit0，但Apple ld报1条EH section超过16MiB警告，违反0warning门，C4 STOP，build--tests未跑。5个本轮owned零连接残留库已精确清理，276baseline、roles、四服务保持。D5仅子进程dev opt1重跑build，exit0/0warning，EH实际6,769,380 bytes<16MiB，未改Cargo/global profile或抑制warning，默认opt0限制仍保留。C5准备10800秒（含300秒根后检预留），将在同一冻结局部opt1环境重新执行完整五门与资源后检，不拼接C4 PASS+D5 build；尚未启动、无C5结论或发布，源码5生产文件及测试未改，用户免Review保持。逐卡原件与环境边界见[日期计划](plan-20261015.md) MTR-13卡。
+
 **现行 FIX24 已发布且 D 闭合（2026-10-31 UTC）：** `f483f57`/`v0.42.84` 精确13路径签名+DCO、main及签名标注tag/人工Release已核；C4原五门22目标3212通过/3原忽略/0失败、根核清理21库且保留原107库。main Harbor `41216534878` success；tag Docker `41216553926` 的amd64/arm64/manifest三job全部success，本卡 `done/complete`。A1及C1/C2/C3 STOP与Claude OAuth无判词保留，用户本卡免后续审查；本段后置证据仅文档收口，不重开FIX16或扩大跨仓权限。详见日期计划 FIX24 卡。
 
 **历史 FIX24 C4 本地完整 C 已核（2026-10-31 15:44:56 UTC）：** 原五门均exit0，全量22目标3212通过/3原忽略/0失败；独立根核 `accepted_C_local=true`，本轮21个零连接测试库精确清理、原107库保持、无owned活进程。根核 SHA256 `3f43577cc86e1808d6d9264f3ab8c8b5128239530bb599c64b7b06b73c73b1fe`；C1/C2/C3 STOP与Claude OAuth无判词保留，用户明确免本卡后续审查。当前 `in-progress/locally-accepted`，提交/推送/tag/Release/适用D待；C4后置文档只作事实记录，产品/测试/版本字节须核同冻结源。详见日期计划 FIX24 卡。

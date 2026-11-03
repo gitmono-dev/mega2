@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -34,7 +34,7 @@ use crate::{
     },
     ceres::{
         api_service::cache::GitObjectCache,
-        pack::RepoHandler,
+        pack::{FetchPackOptions, RepoHandler},
         protocol::{
             import_refs::{CommandType, RefCommand, Refs},
             repo::Repo,
@@ -45,13 +45,10 @@ use crate::{
         utils::{ZERO_ID, is_protocol_zero_id},
     },
     jupiter::{
-        service::{
-            git_service::GitService,
-            push_queue_service::{
-                AttachCommand, AttachExecContext, AttachOp, AttachPayload, EnqueueRequest,
-                ExecuteOutcome, ExecuteRequest, QueueWaitResult, attach_operation_id,
-                detach_operation_id, normalize_attach_commands,
-            },
+        service::push_queue_service::{
+            AttachCommand, AttachExecContext, AttachOp, AttachPayload, EnqueueRequest,
+            ExecuteOutcome, ExecuteRequest, QueueWaitResult, attach_operation_id,
+            detach_operation_id, normalize_attach_commands,
         },
         storage::{
             Storage,
@@ -70,7 +67,7 @@ const LEGACY_TRACES_REF: &str = "refs/libra/traces";
 const LEGACY_VIEW_MAX_REFS: usize = 4096;
 const LEGACY_VIEW_MAX_COMMITS: usize = 200_000;
 const LEGACY_VIEW_MAX_OBJECTS: usize = 1_000_000;
-const LEGACY_VIEW_TIMEOUT: Duration = Duration::from_secs(10);
+const LEGACY_VIEW_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct CommitGraph {
     models: HashMap<String, git_commit::Model>,
@@ -221,19 +218,19 @@ impl RepoHandler for ImportRepo {
         &self,
         want: Vec<String>,
         depth: u32,
-        _deepen_relative: bool,
+        deepen_relative: bool,
     ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
-        self.shallow_pack_inner(want, depth, false).await
-    }
-
-    async fn shallow_pack_with_options(
-        &self,
-        want: Vec<String>,
-        depth: u32,
-        _deepen_relative: bool,
-        include_tag: bool,
-    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
-        self.shallow_pack_inner(want, depth, include_tag).await
+        self.build_code_pack(
+            want,
+            Vec::new(),
+            FetchPackOptions {
+                deepen_depth: Some(depth),
+                deepen_relative,
+                filter_spec: None,
+                include_tag: false,
+            },
+        )
+        .await
     }
 
     fn supports_filtered_fetch(&self) -> bool {
@@ -246,35 +243,39 @@ impl RepoHandler for ImportRepo {
         have: Vec<String>,
         filter_spec: &str,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.filtered_pack_inner(want, have, filter_spec, false)
-            .await
-    }
-
-    async fn filtered_pack_with_options(
-        &self,
-        want: Vec<String>,
-        have: Vec<String>,
-        filter_spec: &str,
-        include_tag: bool,
-    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.filtered_pack_inner(want, have, filter_spec, include_tag)
-            .await
+        let (stream, _) = self
+            .build_code_pack(
+                want,
+                have,
+                FetchPackOptions {
+                    deepen_depth: None,
+                    deepen_relative: false,
+                    filter_spec: Some(filter_spec.to_owned()),
+                    include_tag: false,
+                },
+            )
+            .await?;
+        Ok(stream)
     }
 
     fn supports_include_tag(&self) -> bool {
         true
     }
 
-    async fn full_pack(&self, want: Vec<String>) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.full_pack_with_extra(want, false, false).await
-    }
-
-    async fn full_pack_with_options(
+    async fn pack_with_options(
         &self,
         want: Vec<String>,
-        include_tag: bool,
-    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.full_pack_with_extra(want, include_tag, false).await
+        have: Vec<String>,
+        options: FetchPackOptions,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        self.build_code_pack(want, have, options).await
+    }
+
+    async fn full_pack(&self, want: Vec<String>) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        let (stream, _) = self
+            .build_code_pack(want, Vec::new(), FetchPackOptions::default())
+            .await?;
+        Ok(stream)
     }
 
     async fn incremental_pack(
@@ -282,17 +283,10 @@ impl RepoHandler for ImportRepo {
         want: Vec<String>,
         have: Vec<String>,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.incremental_pack_with_extra(want, have, false).await
-    }
-
-    async fn incremental_pack_with_options(
-        &self,
-        want: Vec<String>,
-        have: Vec<String>,
-        include_tag: bool,
-    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        self.incremental_pack_with_extra(want, have, include_tag)
-            .await
+        let (stream, _) = self
+            .build_code_pack(want, have, FetchPackOptions::default())
+            .await?;
+        Ok(stream)
     }
 
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError> {
@@ -484,608 +478,640 @@ pub(crate) async fn collect_git_blob_filepaths(
 }
 
 impl ImportRepo {
-    async fn filtered_pack_inner(
-        &self,
-        want: Vec<String>,
-        have: Vec<String>,
-        filter_spec: &str,
-        include_tag: bool,
-    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        if filter_spec != "blob:none" {
-            return Err(GitError::CustomError(format!(
-                "unsupported filter spec: {filter_spec}"
-            )));
-        }
-        // Filtered incremental fetch is not implemented: the incremental planner
-        // subtracts whole trees, so filtering it would silently ship blobs the
-        // client asked not to receive.
-        if !have.is_empty() {
-            return Err(GitError::CustomError(
-                "filtered incremental fetch is not supported".to_owned(),
-            ));
-        }
-        // Tag attachment under a filter is allowed, but the helper skips tags whose
-        // target is a withheld blob, since those would arrive without their target.
-        self.full_pack_with_extra(want, include_tag, true).await
-    }
-
-    /// Attach authorised tags to a set of already-planned object ids.
-    ///
-    /// Roots are tags whose **own ref** is authorised; nested chains come along as
-    /// tag -> tag dependencies of those roots, so an unauthorised tag can never be
-    /// pulled in through its target. Used by the full and shallow planners, which
-    /// both work on an id set rather than on a materialised entry list.
-    async fn attach_authorised_tags(
-        &self,
-        storage: &crate::jupiter::storage::git_db_storage::GitDbStorage,
-        kind: HashKind,
-        repo_id: i64,
-        keep: &mut HashSet<String>,
-        filter_blobs: bool,
-    ) -> Result<(), GitError> {
-        let refs = storage
-            .get_ref(repo_id)
-            .await
-            .map_err(|e| super::pack_error_from_mega(&e))?;
-        let authorised_tag_ids: HashSet<String> = refs
-            .iter()
-            .filter(|row| row.ref_name.starts_with("refs/tags/"))
-            .map(|row| row.ref_git_id.clone())
-            .collect();
-        if authorised_tag_ids.is_empty() {
-            return Ok(());
-        }
-        let models = storage
-            .get_tags_by_repo_id(repo_id)
-            .await
-            .map_err(|e| super::pack_error_from_mega(&e))?;
-        let mut known_tags: HashMap<String, Tag> = HashMap::new();
-        for model in models {
-            let tag: Tag =
-                crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
-            known_tags.insert(tag.id.to_string(), tag);
-        }
-        let mut candidates: HashSet<String> = authorised_tag_ids
-            .iter()
-            .filter(|id| known_tags.contains_key(*id))
-            .cloned()
-            .collect();
-        let mut frontier: Vec<String> = candidates.iter().cloned().collect();
-        while let Some(tag_id) = frontier.pop() {
-            let Some(tag) = known_tags.get(&tag_id) else {
-                continue;
-            };
-            let target = tag.object_hash.to_string();
-            if let Some(inner) = known_tags.get(&target) {
-                if candidates.insert(inner.id.to_string()) {
-                    frontier.push(inner.id.to_string());
-                }
-            }
-        }
-        loop {
-            let mut progressed = false;
-            for tag_id in candidates.clone() {
-                let Some(tag) = known_tags.get(&tag_id) else {
-                    continue;
-                };
-                if keep.contains(&tag_id) {
-                    continue;
-                }
-                let target = tag.object_hash.to_string();
-                if !keep.contains(&target) {
-                    continue;
-                }
-                // Under a filter, a tag whose target is a withheld blob must not be
-                // attached: it would arrive without the object it points at.
-                if filter_blobs {
-                    let is_commit = storage
-                        .get_commit_by_hash(repo_id, &target)
-                        .await
-                        .map_err(|e| super::pack_error_from_mega(&e))?
-                        .is_some();
-                    let is_tree = !is_commit
-                        && storage
-                            .get_tree_by_hash(repo_id, &target)
-                            .await
-                            .map_err(|e| super::pack_error_from_mega(&e))?
-                            .is_some();
-                    if !is_commit && !is_tree {
-                        continue;
-                    }
-                }
-                keep.insert(tag_id);
-                progressed = true;
-            }
-            if !progressed {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// Depth-limited pack: only the commits within `depth` levels of the wants are
-    /// planned, and the commits just beyond that boundary are reported so the
-    /// protocol can advertise them as shallow points.
-    async fn shallow_pack_inner(
-        &self,
-        want: Vec<String>,
-        depth: u32,
-        include_tag: bool,
-    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
-        let pack_config = &self.storage.config().pack;
-        let storage = self.storage.git_db_storage();
-        let git_service = self.storage.git_service.clone();
-        let kind = self.object_hash_kind()?;
-        let repo_id = self.repo.repo_id;
-
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut level: Vec<Commit> = storage
-            .get_commits_by_hashes(repo_id, &want)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?
-            .into_iter()
-            .map(|model| {
-                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        for commit in &level {
-            seen.insert(commit.id.to_string());
-        }
-        let mut commits: Vec<Commit> = level.clone();
-
-        for step in 0..depth {
-            let mut next: Vec<Commit> = Vec::new();
-            for commit in &level {
-                for parent_id in &commit.parent_commit_ids {
-                    let parent_id = parent_id.to_string();
-                    if !seen.insert(parent_id.clone()) {
-                        continue;
-                    }
-                    if step + 1 == depth {
-                        // The parent lies beyond the requested depth and is not
-                        // packed; the commit that loses it is the shallow point,
-                        // which is computed after the walk.
-                        continue;
-                    }
-                    let model = storage
-                        .get_commit_by_hash(repo_id, &parent_id)
-                        .await
-                        .map_err(|e| GitError::CustomError(e.to_string()))?
-                        .ok_or_else(|| {
-                            GitError::CustomError(format!(
-                                "import parent commit {parent_id} not found"
-                            ))
-                        })?;
-                    let parent: Commit =
-                        crate::jupiter::utils::converter::commit_from_git_model_with_kind(
-                            model, kind,
-                        )
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    next.push(parent.clone());
-                    commits.push(parent);
-                }
-            }
-            if next.is_empty() {
-                break;
-            }
-            level = next;
-        }
-
-        // `shallow <oid>` names commits whose parents were withheld, so the
-        // boundary is every included commit that lost a parent.
-        let included: HashSet<String> = commits.iter().map(|c| c.id.to_string()).collect();
-        let boundary: Vec<String> = commits
-            .iter()
-            .filter(|commit| {
-                commit
-                    .parent_commit_ids
-                    .iter()
-                    .any(|parent| !included.contains(&parent.to_string()))
-            })
-            .map(|commit| commit.id.to_string())
-            .collect();
-
-        let mut keep: HashSet<String> = commits.iter().map(|c| c.id.to_string()).collect();
-        if include_tag {
-            self.attach_authorised_tags(&storage, kind, repo_id, &mut keep, false)
-                .await?;
-        }
-        let tree_ids: Vec<String> = commits.iter().map(|c| c.tree_id.to_string()).collect();
-        for commit in &commits {
-            keep.insert(commit.tree_id.to_string());
-        }
-        let trees = storage
-            .get_trees_by_hashes(repo_id, tree_ids)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let mut counted: HashSet<String> = HashSet::new();
-        let nothing: HashSet<String> = HashSet::new();
-        let obj_num = AtomicUsize::new(0);
-        for model in trees {
-            let tree = crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
-                .map_err(|e| GitError::CustomError(e.to_string()))?;
-            self.traverse_for_count(tree, &nothing, &mut counted, &obj_num)
-                .await?;
-        }
-        keep.extend(counted);
-
-        let all_entries = collect_objects(repo_id, git_service, storage, kind)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let entries: Vec<_> = all_entries
-            .into_iter()
-            .filter(|entry| keep.contains(&entry.inner.hash.to_string()))
-            .collect();
-        let total = entries.len();
-
-        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
-        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new_with_hash_kind(kind, total, 0, stream_tx);
-        encoder.encode_async(entry_rx).await?;
-        tokio::spawn(async move {
-            for entry in entries {
-                if entry_tx.send(entry).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok((ReceiverStream::new(stream_rx), boundary))
-    }
-
     /// Stable fingerprint of a repository's refs, used to detect a ref change
     /// between authorization and pack construction.
     async fn ref_fingerprint(
         storage: &crate::jupiter::storage::git_db_storage::GitDbStorage,
         repo_id: i64,
     ) -> Result<String, MegaError> {
-        let mut rows: Vec<String> = storage
-            .get_ref(repo_id)
-            .await?
-            .into_iter()
-            .map(|row| format!("{}={}", row.ref_name, row.ref_git_id))
-            .collect();
-        rows.sort();
-        Ok(rows.join("\n"))
+        let rows = storage.get_ref(repo_id).await?;
+        Ok(Self::fingerprint_from_ref_rows(&rows))
     }
 
-    async fn incremental_pack_with_extra(
+    fn fingerprint_from_ref_rows(rows: &[import_refs::Model]) -> String {
+        let mut entries: Vec<String> = rows
+            .iter()
+            .map(|row| format!("{}={}", row.ref_name, row.ref_git_id))
+            .collect();
+        entries.sort();
+        entries.join("\n")
+    }
+
+    fn peel_tag_chain(
+        start_id: &str,
+        tags_by_id: &HashMap<String, Tag>,
+    ) -> Result<(Vec<String>, String), MegaError> {
+        let mut chain = Vec::new();
+        let mut visited = HashSet::new();
+        let mut cursor = start_id.to_owned();
+        while let Some(tag) = tags_by_id.get(&cursor) {
+            if !visited.insert(cursor.clone()) {
+                return Err(TracesError::ObjectIntegrity.into());
+            }
+            chain.push(cursor);
+            cursor = tag.object_hash.to_string();
+        }
+        Ok((chain, cursor))
+    }
+
+    /// Unified code-pack planner and materializer for `ImportRepo`.
+    ///
+    /// Handles `full`, `incremental`, `shallow` (`deepen_depth`), and `blob:none`
+    /// (`filter_spec`) under a single `LEGACY_VIEW_TIMEOUT` and capacity envelope,
+    /// binds `CodeRefView` and `refs_before` from one ref snapshot, resolves tag
+    /// chains via `get_tags_by_hashes` without full-table scans, subtracts the
+    /// complete `have` commit+tree closure, attaches authorized tag chains when
+    /// `include_tag` is set, materializes only the planned closure objects, and
+    /// verifies `refs_before == refs_after` before encoding.
+    pub(crate) async fn build_code_pack(
         &self,
         want: Vec<String>,
         have: Vec<String>,
-        include_tag: bool,
-    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        // Same binding as the full path: a ref that changes between authorization
-        // and pack construction must not be served from the stale view.
-        self.authorize_fetch(&want, &have)
-            .await
-            .map_err(|e| super::pack_error_from_mega(&e))?;
-        let refs_before = Self::ref_fingerprint(&self.storage.git_db_storage(), self.repo.repo_id)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let mut want_clone = want.clone();
-        let kind = self.object_hash_kind()?;
+        options: FetchPackOptions,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        tokio::time::timeout(
+            LEGACY_VIEW_TIMEOUT,
+            self.build_code_pack_inner(want, have, options),
+        )
+        .await
+        .map_err(|_| super::pack_error_from_mega(&TracesError::QueryTimeout.into()))?
+        .map_err(|e| super::pack_error_from_mega(&Self::legacy_view_error(e)))
+    }
+
+    async fn build_code_pack_inner(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        options: FetchPackOptions,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), MegaError> {
+        if let Some(ref spec) = options.filter_spec
+            && spec != "blob:none"
+        {
+            return Err(MegaError::Other(format!("unsupported filter spec: {spec}")));
+        }
+        let filter_blobs = options.filter_spec.as_deref() == Some("blob:none");
         let pack_config = &self.storage.config().pack;
         let storage = self.storage.git_db_storage();
-
-        let mut exist_objs = HashSet::new();
-
-        // A client may fetch a tag directly; peel it so the commit behind it is
-        // planned and emitted rather than arriving as an unaccompanied tag.
-        let tag_models = storage
-            .get_tags_by_repo_id(self.repo.repo_id)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let mut tags_by_id: HashMap<String, Tag> = HashMap::new();
-        for model in tag_models {
-            let tag: Tag =
-                crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
-            tags_by_id.insert(tag.id.to_string(), tag);
-        }
-        for id in want.clone() {
-            let mut cursor = Some(id);
-            while let Some(current) = cursor.take() {
-                if let Some(tag) = tags_by_id.get(&current) {
-                    let target = tag.object_hash.to_string();
-                    if !want_clone.contains(&target) {
-                        want_clone.push(target.clone());
-                    }
-                    cursor = tags_by_id.get(&target).map(|inner| inner.id.to_string());
-                }
-            }
-        }
-
-        let mut want_commits: Vec<Commit> = storage
-            .get_commits_by_hashes(self.repo.repo_id, &want_clone)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?
-            .into_iter()
-            .map(|model| {
-                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let mut traversal_list: Vec<Commit> = want_commits.clone();
-
-        // traverse commit's all parents to find the commit that client does not have
-        while let Some(temp) = traversal_list.pop() {
-            for p_commit_id in temp.parent_commit_ids {
-                let p_commit_id = p_commit_id.to_string();
-
-                if !have.contains(&p_commit_id) && !want_clone.contains(&p_commit_id) {
-                    let parent_model = storage
-                        .get_commit_by_hash(self.repo.repo_id, &p_commit_id)
-                        .await
-                        .map_err(|e| GitError::CustomError(e.to_string()))?
-                        .ok_or_else(|| {
-                            GitError::CustomError(format!(
-                                "import parent commit {p_commit_id} not found"
-                            ))
-                        })?;
-                    let parent: Commit =
-                        crate::jupiter::utils::converter::commit_from_git_model_with_kind(
-                            parent_model,
-                            kind,
-                        )
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    want_commits.push(parent.clone());
-                    want_clone.push(p_commit_id);
-                    traversal_list.push(parent);
-                }
-            }
-        }
-
-        let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
-        let want_trees: HashMap<ObjectHash, Tree> = storage
-            .get_trees_by_hashes(self.repo.repo_id, want_tree_ids)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?
-            .into_iter()
-            .map(|m| {
-                Ok((
-                    ObjectHash::from_hex_for_kind(kind, &m.tree_id)
-                        .map_err(|e| GitError::CustomError(e.to_string()))?,
-                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(m, kind)
-                        .map_err(|e| GitError::CustomError(e.to_string()))?,
-                ))
-            })
-            .collect::<Result<HashMap<_, _>, GitError>>()?;
-
-        let have_commits = storage
-            .get_commits_by_hashes(self.repo.repo_id, &have)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let have_trees = storage
-            .get_trees_by_hashes(
-                self.repo.repo_id,
-                have_commits.iter().map(|x| x.tree.clone()).collect(),
-            )
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        // traverse to get exist_objs
         let kind = self.object_hash_kind()?;
-        for have_tree in have_trees {
-            let have_tree =
-                crate::jupiter::utils::converter::tree_from_git_model_with_kind(have_tree, kind)
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
-            // `traverse` records the tree children; the tree itself is owned by
-            // the client too, so it has to be excluded as well or a wanted commit
-            // that reuses it re-emits an object the client already has.
-            exist_objs.insert(have_tree.id.to_string());
-            self.traverse(have_tree, &mut exist_objs, None).await?;
-        }
+        let repo_id = self.repo.repo_id;
 
-        // A client may fetch a tree by id; it is not reachable from any wanted
-        // commit, so plan it separately or its children would be missing.
-        let mut extra_trees: Vec<Tree> = Vec::new();
-        for id in &want_clone {
-            if want_trees.values().any(|tree| tree.id.to_string() == *id) {
-                continue;
+        // 1. Single-snapshot authorization and fingerprint binding.
+        let (view, refs_before) = self.code_refs_with_fingerprint().await?;
+        let authorized_have = self
+            .check_code_objects_with_view(&view, &want, &have)
+            .await?;
+
+        // 2. Iteratively load tag chains starting only from `want`, `authorized_have`,
+        // and authorized `refs/tags/*` in `view.refs` (no full-table `get_tags_by_repo_id`).
+        let mut tag_seeds: Vec<String> = want.clone();
+        tag_seeds.extend(authorized_have.iter().cloned());
+        if options.include_tag {
+            for git_ref in &view.refs {
+                if git_ref.ref_type == RefTypeEnum::Tag
+                    || git_ref.ref_name.starts_with("refs/tags/")
+                {
+                    tag_seeds.push(git_ref.ref_git_id.clone());
+                }
             }
-            if let Some(model) = storage
-                .get_tree_by_hash(self.repo.repo_id, id)
-                .await
-                .map_err(|e| GitError::CustomError(e.to_string()))?
-            {
-                let tree =
-                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                if !extra_trees.iter().any(|existing| existing.id == tree.id) {
-                    extra_trees.push(tree);
+        }
+        let mut tags_by_id: HashMap<String, Tag> = HashMap::new();
+        let mut queried_tag_ids: HashSet<String> = HashSet::new();
+        let mut pending_tag_ids: Vec<String> = tag_seeds
+            .into_iter()
+            .filter(|id| queried_tag_ids.insert(id.clone()))
+            .collect();
+        while !pending_tag_ids.is_empty() {
+            let mut batch = Vec::new();
+            while batch.len() < 512 {
+                let Some(id) = pending_tag_ids.pop() else {
+                    break;
+                };
+                batch.push(id);
+            }
+            let models = storage.get_tags_by_hashes(repo_id, batch).await?;
+            for model in models {
+                let tag =
+                    crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)?;
+                let target = tag.object_hash.to_string();
+                let tag_id = tag.id.to_string();
+                tags_by_id.insert(tag_id, tag);
+                if tags_by_id.len() > LEGACY_VIEW_MAX_REFS {
+                    return Err(TracesError::ResponseBudget.into());
+                }
+                if queried_tag_ids.insert(target.clone()) {
+                    pending_tag_ids.push(target);
                 }
             }
         }
 
-        // A client may fetch a blob directly. Materialise it before the encoder
-        // is sized, exactly like the full path, so an id that cannot be loaded
-        // fails the request instead of truncating the pack mid-stream.
-        let known: HashSet<String> = want_commits
+        // 3. Compute the `have` object closure `have_objs` (tags, commits + all ancestors,
+        // and all reachable trees + blobs).
+        let mut have_objs: HashSet<String> = HashSet::new();
+        if !authorized_have.is_empty() {
+            let mut have_terminals: Vec<String> = Vec::new();
+            for id in &authorized_have {
+                let (tag_chain, terminal) = Self::peel_tag_chain(id, &tags_by_id)?;
+                for tag_id in tag_chain {
+                    have_objs.insert(tag_id);
+                }
+                if !have_terminals.contains(&terminal) {
+                    have_terminals.push(terminal);
+                }
+            }
+            let mut seen_have_commits: HashSet<String> = HashSet::new();
+            let mut have_root_trees: Vec<String> = Vec::new();
+            let mut initial_models = Vec::new();
+            for chunk in have_terminals.chunks(512) {
+                initial_models.extend(
+                    storage
+                        .get_commits_by_hashes(repo_id, &chunk.to_vec())
+                        .await?,
+                );
+            }
+            let mut commit_frontier: Vec<git_commit::Model> = Vec::new();
+            for model in initial_models {
+                if seen_have_commits.insert(model.commit_id.clone()) {
+                    have_objs.insert(model.commit_id.clone());
+                    have_root_trees.push(model.tree.clone());
+                    commit_frontier.push(model);
+                }
+            }
+            if seen_have_commits.len() > LEGACY_VIEW_MAX_COMMITS {
+                return Err(TracesError::ResponseBudget.into());
+            }
+            while !commit_frontier.is_empty() {
+                let mut parent_ids: Vec<String> = Vec::new();
+                for model in commit_frontier.drain(..) {
+                    let parents = serde_json::from_value::<Vec<String>>(model.parents_id.clone())
+                        .map_err(|_| TracesError::ObjectIntegrity)?;
+                    for parent_id in parents {
+                        if seen_have_commits.insert(parent_id.clone()) {
+                            parent_ids.push(parent_id);
+                        }
+                    }
+                }
+                if seen_have_commits.len() > LEGACY_VIEW_MAX_COMMITS {
+                    return Err(TracesError::ResponseBudget.into());
+                }
+                for chunk in parent_ids.chunks(512) {
+                    let batch = chunk.to_vec();
+                    let models = storage.get_commits_by_hashes(repo_id, &batch).await?;
+                    if models.len() != batch.len() {
+                        return Err(TracesError::ObjectIntegrity.into());
+                    }
+                    for model in models {
+                        have_objs.insert(model.commit_id.clone());
+                        have_root_trees.push(model.tree.clone());
+                        commit_frontier.push(model);
+                    }
+                }
+            }
+            let non_commit_haves: Vec<String> = have_terminals
+                .into_iter()
+                .filter(|id| !seen_have_commits.contains(id))
+                .collect();
+            for id in &non_commit_haves {
+                have_objs.insert(id.clone());
+            }
+            if !non_commit_haves.is_empty() {
+                let tree_models = storage
+                    .get_trees_by_hashes(repo_id, non_commit_haves)
+                    .await?;
+                for model in tree_models {
+                    have_root_trees.push(model.tree_id);
+                }
+            }
+            let mut visited_have_trees: HashSet<String> = HashSet::new();
+            let mut pending_have_trees: Vec<String> = Vec::new();
+            for tree_id in have_root_trees {
+                if visited_have_trees.insert(tree_id.clone()) {
+                    have_objs.insert(tree_id.clone());
+                    pending_have_trees.push(tree_id);
+                }
+            }
+            if have_objs.len() > LEGACY_VIEW_MAX_OBJECTS {
+                return Err(TracesError::ResponseBudget.into());
+            }
+            while !pending_have_trees.is_empty() {
+                let mut batch = Vec::new();
+                while batch.len() < 512 {
+                    let Some(tree_id) = pending_have_trees.pop() else {
+                        break;
+                    };
+                    batch.push(tree_id);
+                }
+                let models = storage.get_trees_by_hashes(repo_id, batch.clone()).await?;
+                if models.len() != batch.len() {
+                    return Err(TracesError::ObjectIntegrity.into());
+                }
+                for model in models {
+                    let tree = crate::jupiter::utils::converter::tree_from_git_model_with_kind(
+                        model, kind,
+                    )?;
+                    for item in tree.tree_items {
+                        let item_id = item.id.to_string();
+                        have_objs.insert(item_id.clone());
+                        if have_objs.len() > LEGACY_VIEW_MAX_OBJECTS {
+                            return Err(TracesError::ResponseBudget.into());
+                        }
+                        if item.mode == TreeItemMode::Tree
+                            && visited_have_trees.insert(item_id.clone())
+                        {
+                            pending_have_trees.push(item_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Peel `want` tag chains and build the base closure `B(mode)`.
+        let mut b_set: HashSet<String> = HashSet::new();
+        let mut planned_tag_ids: Vec<String> = Vec::new();
+        let mut planned_tag_set: HashSet<String> = HashSet::new();
+        let mut want_terminals: Vec<String> = Vec::new();
+        for id in &want {
+            let (tag_chain, terminal) = Self::peel_tag_chain(id, &tags_by_id)?;
+            for tag_id in tag_chain {
+                if !have_objs.contains(&tag_id) {
+                    b_set.insert(tag_id.clone());
+                    if planned_tag_set.insert(tag_id.clone()) {
+                        planned_tag_ids.push(tag_id);
+                    }
+                }
+            }
+            if !want_terminals.contains(&terminal) {
+                want_terminals.push(terminal);
+            }
+        }
+
+        let mut initial_commit_models = Vec::new();
+        for chunk in want_terminals.chunks(512) {
+            initial_commit_models.extend(
+                storage
+                    .get_commits_by_hashes(repo_id, &chunk.to_vec())
+                    .await?,
+            );
+        }
+        let mut commit_terminal_ids: HashSet<String> = HashSet::new();
+        let mut initial_commits: Vec<Commit> = Vec::new();
+        for model in initial_commit_models {
+            commit_terminal_ids.insert(model.commit_id.clone());
+            let commit =
+                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)?;
+            if !have_objs.contains(&commit.id.to_string()) {
+                initial_commits.push(commit);
+            }
+        }
+
+        let mut planned_commits: Vec<Commit> = Vec::new();
+        let mut shallow_boundary: Vec<String> = Vec::new();
+        if !initial_commits.is_empty() {
+            let mut seen_commits: HashSet<String> = HashSet::new();
+            let mut level: Vec<Commit> = Vec::new();
+            for commit in initial_commits {
+                if seen_commits.insert(commit.id.to_string()) {
+                    planned_commits.push(commit.clone());
+                    level.push(commit);
+                }
+            }
+            if seen_commits.len() > LEGACY_VIEW_MAX_COMMITS {
+                return Err(TracesError::ResponseBudget.into());
+            }
+            if let Some(depth) = options.deepen_depth {
+                for step in 0..depth {
+                    if step + 1 == depth {
+                        break;
+                    }
+                    let mut next_ids: Vec<String> = Vec::new();
+                    for commit in &level {
+                        for parent_id in &commit.parent_commit_ids {
+                            let parent_id = parent_id.to_string();
+                            if !have_objs.contains(&parent_id)
+                                && seen_commits.insert(parent_id.clone())
+                            {
+                                next_ids.push(parent_id);
+                            }
+                        }
+                    }
+                    if seen_commits.len() > LEGACY_VIEW_MAX_COMMITS {
+                        return Err(TracesError::ResponseBudget.into());
+                    }
+                    if next_ids.is_empty() {
+                        break;
+                    }
+                    let mut next_level: Vec<Commit> = Vec::new();
+                    for chunk in next_ids.chunks(512) {
+                        let batch = chunk.to_vec();
+                        let models = storage.get_commits_by_hashes(repo_id, &batch).await?;
+                        if models.len() != batch.len() {
+                            return Err(TracesError::ObjectIntegrity.into());
+                        }
+                        for model in models {
+                            let parent =
+                                crate::jupiter::utils::converter::commit_from_git_model_with_kind(
+                                    model, kind,
+                                )?;
+                            planned_commits.push(parent.clone());
+                            next_level.push(parent);
+                        }
+                    }
+                    level = next_level;
+                }
+                let included: HashSet<String> =
+                    planned_commits.iter().map(|c| c.id.to_string()).collect();
+                shallow_boundary = planned_commits
+                    .iter()
+                    .filter(|commit| {
+                        commit.parent_commit_ids.iter().any(|parent| {
+                            let pid = parent.to_string();
+                            !included.contains(&pid) && !have_objs.contains(&pid)
+                        })
+                    })
+                    .map(|commit| commit.id.to_string())
+                    .collect();
+            } else {
+                let mut frontier = level;
+                while !frontier.is_empty() {
+                    let mut next_ids: Vec<String> = Vec::new();
+                    for commit in frontier.drain(..) {
+                        for parent_id in commit.parent_commit_ids {
+                            let parent_id = parent_id.to_string();
+                            if !have_objs.contains(&parent_id)
+                                && seen_commits.insert(parent_id.clone())
+                            {
+                                next_ids.push(parent_id);
+                            }
+                        }
+                    }
+                    if seen_commits.len() > LEGACY_VIEW_MAX_COMMITS {
+                        return Err(TracesError::ResponseBudget.into());
+                    }
+                    if next_ids.is_empty() {
+                        break;
+                    }
+                    for chunk in next_ids.chunks(512) {
+                        let batch = chunk.to_vec();
+                        let models = storage.get_commits_by_hashes(repo_id, &batch).await?;
+                        if models.len() != batch.len() {
+                            return Err(TracesError::ObjectIntegrity.into());
+                        }
+                        for model in models {
+                            let parent =
+                                crate::jupiter::utils::converter::commit_from_git_model_with_kind(
+                                    model, kind,
+                                )?;
+                            planned_commits.push(parent.clone());
+                            frontier.push(parent);
+                        }
+                    }
+                }
+            }
+            for commit in &planned_commits {
+                b_set.insert(commit.id.to_string());
+            }
+        }
+
+        // Resolve non-commit want terminals (explicit trees or explicit blobs).
+        let non_commit_terminals: Vec<String> = want_terminals
             .iter()
-            .map(|c| c.id.to_string())
-            .chain(want_trees.values().map(|t| t.id.to_string()))
-            .chain(extra_trees.iter().map(|t| t.id.to_string()))
-            .chain(tags_by_id.keys().cloned())
-            .collect();
-        let blob_want_ids: Vec<String> = want_clone
-            .iter()
-            .filter(|id| !known.contains(*id))
+            .filter(|id| !commit_terminal_ids.contains(*id))
             .cloned()
             .collect();
-        let mut extra_blobs: Vec<Blob> = Vec::new();
-        if !blob_want_ids.is_empty() {
-            let mut blobs = self.storage.git_service.get_objects_stream(blob_want_ids);
-            while let Some(item) = blobs.next().await {
-                let (_, stream, _) = item.map_err(|e| GitError::CustomError(e.to_string()))?;
+        let mut tree_terminal_ids: HashSet<String> = HashSet::new();
+        if !non_commit_terminals.is_empty() {
+            for chunk in non_commit_terminals.chunks(512) {
+                let tree_models = storage.get_trees_by_hashes(repo_id, chunk.to_vec()).await?;
+                for model in tree_models {
+                    tree_terminal_ids.insert(model.tree_id);
+                }
+            }
+        }
+        let blob_terminal_ids: Vec<String> = non_commit_terminals
+            .into_iter()
+            .filter(|id| !tree_terminal_ids.contains(id))
+            .collect();
+        if !blob_terminal_ids.is_empty() {
+            let mut found_blobs = 0usize;
+            for chunk in blob_terminal_ids.chunks(512) {
+                let models = storage.get_blobs_by_hashes(repo_id, chunk.to_vec()).await?;
+                found_blobs += models.len();
+            }
+            if found_blobs != blob_terminal_ids.len() {
+                return Err(TracesError::UnknownScope.into());
+            }
+        }
+
+        // Walk root trees and subtrees in batches of 512.
+        let mut root_tree_ids: Vec<String> = planned_commits
+            .iter()
+            .map(|c| c.tree_id.to_string())
+            .collect();
+        root_tree_ids.extend(tree_terminal_ids.iter().cloned());
+
+        let mut planned_trees: Vec<Tree> = Vec::new();
+        let mut visited_trees: HashSet<String> = HashSet::new();
+        let mut planned_blob_ids: Vec<String> = Vec::new();
+        let mut planned_blob_set: HashSet<String> = HashSet::new();
+        let mut traversed_objects: HashSet<String> = b_set.clone();
+
+        let mut pending_tree_ids: Vec<String> = Vec::new();
+        for tree_id in root_tree_ids {
+            traversed_objects.insert(tree_id.clone());
+            if !have_objs.contains(&tree_id) && visited_trees.insert(tree_id.clone()) {
+                b_set.insert(tree_id.clone());
+                pending_tree_ids.push(tree_id);
+            }
+        }
+        if traversed_objects.len() > LEGACY_VIEW_MAX_OBJECTS {
+            return Err(TracesError::ResponseBudget.into());
+        }
+
+        while !pending_tree_ids.is_empty() {
+            let mut batch = Vec::new();
+            while batch.len() < 512 {
+                let Some(tree_id) = pending_tree_ids.pop() else {
+                    break;
+                };
+                batch.push(tree_id);
+            }
+            let models = storage.get_trees_by_hashes(repo_id, batch.clone()).await?;
+            if models.len() != batch.len() {
+                return Err(TracesError::ObjectIntegrity.into());
+            }
+            for model in models {
+                let tree =
+                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)?;
+                for item in &tree.tree_items {
+                    let item_id = item.id.to_string();
+                    traversed_objects.insert(item_id.clone());
+                    if traversed_objects.len() > LEGACY_VIEW_MAX_OBJECTS {
+                        return Err(TracesError::ResponseBudget.into());
+                    }
+                    if have_objs.contains(&item_id) {
+                        continue;
+                    }
+                    match item.mode {
+                        TreeItemMode::Tree => {
+                            if visited_trees.insert(item_id.clone()) {
+                                b_set.insert(item_id.clone());
+                                pending_tree_ids.push(item_id);
+                            }
+                        }
+                        TreeItemMode::Blob | TreeItemMode::BlobExecutable | TreeItemMode::Link => {
+                            if !filter_blobs {
+                                b_set.insert(item_id.clone());
+                                if planned_blob_set.insert(item_id.clone()) {
+                                    planned_blob_ids.push(item_id);
+                                }
+                            }
+                        }
+                        TreeItemMode::Commit => {}
+                    }
+                }
+                planned_trees.push(tree);
+            }
+        }
+
+        for blob_id in blob_terminal_ids {
+            traversed_objects.insert(blob_id.clone());
+            if traversed_objects.len() > LEGACY_VIEW_MAX_OBJECTS {
+                return Err(TracesError::ResponseBudget.into());
+            }
+            if !have_objs.contains(&blob_id) {
+                b_set.insert(blob_id.clone());
+                if planned_blob_set.insert(blob_id.clone()) {
+                    planned_blob_ids.push(blob_id);
+                }
+            }
+        }
+
+        // 5. Attach authorized tag chains `T(B)` when `options.include_tag` is set.
+        // Only chains rooted at an authorized `refs/tags/*` in `view.refs` whose
+        // peeled target is in the base closure `B(mode)` (`b_base`) are attached.
+        if options.include_tag {
+            let b_base = b_set.clone();
+            for git_ref in &view.refs {
+                if git_ref.ref_type == RefTypeEnum::Tag
+                    || git_ref.ref_name.starts_with("refs/tags/")
+                {
+                    let (tag_chain, terminal) =
+                        Self::peel_tag_chain(&git_ref.ref_git_id, &tags_by_id)?;
+                    if !tag_chain.is_empty() && b_base.contains(&terminal) {
+                        for tag_id in tag_chain {
+                            if !have_objs.contains(&tag_id) {
+                                b_set.insert(tag_id.clone());
+                                if planned_tag_set.insert(tag_id.clone()) {
+                                    planned_tag_ids.push(tag_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if b_set.len() > LEGACY_VIEW_MAX_OBJECTS {
+            return Err(TracesError::ResponseBudget.into());
+        }
+
+        // 6. Materialize only the planned closure objects (commits, trees, blobs, tags).
+        let mut entries: Vec<MetaAttached<Entry, EntryMeta>> = Vec::with_capacity(b_set.len());
+        for commit in planned_commits {
+            entries.push(MetaAttached {
+                inner: commit.into(),
+                meta: EntryMeta::new(),
+            });
+        }
+        for tree in planned_trees {
+            entries.push(MetaAttached {
+                inner: tree.into(),
+                meta: EntryMeta::new(),
+            });
+        }
+        if !planned_blob_ids.is_empty() {
+            let mut blob_meta: HashMap<String, EntryMeta> = HashMap::new();
+            for chunk in planned_blob_ids.chunks(512) {
+                blob_meta.extend(self.get_blob_metadata_by_hashes(chunk.to_vec()).await?);
+            }
+            let default_meta = EntryMeta::default();
+            let mut blobs_stream = self
+                .storage
+                .git_service
+                .get_objects_stream(planned_blob_ids.clone());
+            let mut loaded_blobs: HashMap<String, MetaAttached<Entry, EntryMeta>> =
+                HashMap::with_capacity(planned_blob_ids.len());
+            while let Some(item) = blobs_stream.next().await {
+                let (_, stream, _) =
+                    item.map_err(|e| MegaError::Other(format!("blob stream read failed: {e}")))?;
                 let data = stream
                     .try_fold(Vec::new(), |mut acc, bytes| async move {
                         acc.extend_from_slice(&bytes);
                         Ok(acc)
                     })
                     .await
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+                    .map_err(|e| MegaError::Other(format!("blob stream fold failed: {e}")))?;
                 let blob = Blob::from_content_bytes_with_kind(kind, data)
                     .map_err(|e| MegaError::Other(e.to_string()))?;
-                extra_blobs.push(blob);
+                let blob_id = blob.id.to_string();
+                let meta = blob_meta.get(&blob_id).unwrap_or(&default_meta).clone();
+                loaded_blobs.insert(
+                    blob_id,
+                    MetaAttached {
+                        inner: blob.into(),
+                        meta,
+                    },
+                );
+            }
+            for blob_id in &planned_blob_ids {
+                let entry = loaded_blobs
+                    .remove(blob_id)
+                    .ok_or(TracesError::ObjectIntegrity)?;
+                entries.push(entry);
             }
         }
-
-        // One pass decides both the content and the size: build the entries, drop
-        // duplicates by object id, then size the encoder from that list. Counting
-        // in a separate pass is what previously let a header disagree with the
-        // payload (an explicit tree plus its blob was counted twice, a wanted root
-        // that is another root's subtree was overcounted).
-        let (tree_tx, mut tree_rx) =
-            mpsc::channel::<MetaAttached<Entry, EntryMeta>>(pack_config.channel_message_size);
-        let collector = tokio::spawn(async move {
-            let mut collected: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
-            while let Some(entry) = tree_rx.recv().await {
-                collected.push(entry);
-            }
-            collected
-        });
-
-        let mut emitted: HashSet<String> = exist_objs.clone();
-        for c in want_commits.clone() {
-            if emitted.contains(&c.tree_id.to_string()) {
-                continue;
-            }
-            emitted.insert(c.tree_id.to_string());
-            self.traverse(
-                want_trees
-                    .get(&c.tree_id)
-                    .ok_or_else(|| {
-                        GitError::CustomError(format!(
-                            "import tree {} missing from the want set",
-                            c.tree_id
-                        ))
-                    })?
-                    .clone(),
-                &mut emitted,
-                Some(&tree_tx),
-            )
-            .await?;
-        }
-        for tree in extra_trees {
-            if emitted.contains(&tree.id.to_string()) {
-                continue;
-            }
-            emitted.insert(tree.id.to_string());
-            self.traverse(tree, &mut emitted, Some(&tree_tx)).await?;
-        }
-        drop(tree_tx);
-        let mut entries = collector
-            .await
-            .map_err(|e| GitError::CustomError(format!("entry collector failed: {e}")))?;
-
-        for c in want_commits {
+        for tag_id in planned_tag_ids {
+            let tag = tags_by_id
+                .get(&tag_id)
+                .cloned()
+                .ok_or(TracesError::ObjectIntegrity)?;
             entries.push(MetaAttached {
-                inner: c.into(),
+                inner: tag.into(),
                 meta: EntryMeta::new(),
             });
         }
-        for blob in extra_blobs {
-            entries.push(MetaAttached {
-                inner: blob.into(),
-                meta: EntryMeta::default(),
-            });
-        }
 
-        // Tags are chosen against the set this pack actually emits, and attached
-        // to a fixed point so `outer -> inner` chains do not depend on row order.
-        if include_tag {
-            let refs = storage
-                .get_ref(self.repo.repo_id)
-                .await
-                .map_err(|e| GitError::CustomError(e.to_string()))?;
-            let authorised_tag_ids: HashSet<String> = refs
-                .iter()
-                .filter(|row| row.ref_name.starts_with("refs/tags/"))
-                .map(|row| row.ref_git_id.clone())
-                .collect();
-            if !authorised_tag_ids.is_empty() {
-                // Load every tag row so tag -> tag dependencies are resolvable even
-                // when the inner tag has no ref of its own.
-                let models = storage
-                    .get_tags_by_repo_id(self.repo.repo_id)
-                    .await
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
-                let mut by_id: HashMap<String, Tag> = HashMap::new();
-                for model in models {
-                    let tag: Tag =
-                        crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
-                            .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    by_id.insert(tag.id.to_string(), tag);
-                }
-                // Roots are tags whose own ref is authorised. A tag that merely
-                // points at an authorised ref's target is not authorised.
-                let mut candidates: Vec<Tag> = by_id
-                    .values()
-                    .filter(|tag| authorised_tag_ids.contains(&tag.id.to_string()))
-                    .cloned()
-                    .collect();
-                // Pull in the dependencies of those roots, so `outer -> inner ->
-                // commit` attaches inner first even when only outer has a ref.
-                let mut frontier: Vec<String> =
-                    candidates.iter().map(|tag| tag.id.to_string()).collect();
-                while let Some(tag_id) = frontier.pop() {
-                    let Some(tag) = by_id.get(&tag_id).cloned() else {
-                        continue;
-                    };
-                    let target = tag.object_hash.to_string();
-                    if let Some(inner) = by_id.get(&target).cloned() {
-                        let inner_id = inner.id.to_string();
-                        if !candidates.iter().any(|existing| existing.id == inner.id) {
-                            candidates.push(inner);
-                            frontier.push(inner_id);
-                        }
-                    }
-                }
-                let mut emitted_ids: HashSet<String> = entries
-                    .iter()
-                    .map(|entry| entry.inner.hash.to_string())
-                    .collect();
-                loop {
-                    let mut progressed = false;
-                    for tag in candidates.clone() {
-                        let tag_id = tag.id.to_string();
-                        if emitted_ids.contains(&tag_id)
-                            || !emitted_ids.contains(&tag.object_hash.to_string())
-                        {
-                            continue;
-                        }
-                        emitted_ids.insert(tag_id);
-                        entries.push(MetaAttached {
-                            inner: tag.into(),
-                            meta: EntryMeta::new(),
-                        });
-                        progressed = true;
-                    }
-                    if !progressed {
-                        break;
-                    }
-                }
-            }
+        let mut emitted_ids: HashSet<String> = HashSet::with_capacity(entries.len());
+        entries.retain(|entry| emitted_ids.insert(entry.inner.hash.to_string()));
+        if emitted_ids != b_set {
+            return Err(TracesError::ObjectIntegrity.into());
         }
-
-        // Deduplicate by object id so the header count matches the payload exactly.
-        let mut seen: HashSet<String> = HashSet::new();
-        entries.retain(|entry| seen.insert(entry.inner.hash.to_string()));
         let total = entries.len();
+        if total > LEGACY_VIEW_MAX_OBJECTS {
+            return Err(TracesError::ResponseBudget.into());
+        }
+        let _header_count = u32::try_from(total).map_err(|_| TracesError::ResponseBudget)?;
 
-        let refs_after = Self::ref_fingerprint(&storage, self.repo.repo_id)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        // 7. Post-materialization ref-fingerprint check against the initial snapshot.
+        let refs_after = Self::ref_fingerprint(&storage, repo_id).await?;
         if refs_before != refs_after {
-            return Err(GitError::CustomError(
+            return Err(MegaError::Other(
                 "refs changed while building the pack; retry the fetch".to_owned(),
             ));
         }
 
-        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        // 8. Stream encoded pack entries. The dependency encoder requires a
+        // nonzero object count, but a fully satisfied incremental request must
+        // still return a valid empty PACK after all authorization/ref checks.
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        if total == 0 {
+            stream_tx
+                .send(Self::empty_code_pack(kind))
+                .await
+                .map_err(|e| MegaError::Other(format!("empty pack stream closed: {e}")))?;
+            drop(stream_tx);
+            return Ok((ReceiverStream::new(stream_rx), shallow_boundary));
+        }
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let encoder = PackEncoder::new_with_hash_kind(kind, total, 0, stream_tx);
         encoder
             .encode_async(entry_rx)
@@ -1100,206 +1126,14 @@ impl ImportRepo {
             }
         });
 
-        Ok(ReceiverStream::new(stream_rx))
+        Ok((ReceiverStream::new(stream_rx), shallow_boundary))
     }
 
-    async fn full_pack_with_extra(
-        &self,
-        want: Vec<String>,
-        include_tag: bool,
-        filter_blobs: bool,
-    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
-        let pack_config = &self.storage.config().pack;
-        let storage = self.storage.git_db_storage();
-        let git_service = self.storage.git_service.clone();
-        let kind = self.object_hash_kind()?;
-        let repo_id = self.repo.repo_id;
-
-        // Authorization happens before this point. Re-read the ref view here and
-        // compare it with a fingerprint taken before any pack read, so a ref that
-        // disappeared or was retargeted in between cannot be served from a stale
-        // authorization: the request fails and the client retries instead.
-        // Re-authorise at planner entry: the protocol authorised before calling
-        // into the pack path, and a ref may have changed in between. Building from
-        // a freshly authorised view closes that window; the fingerprint below then
-        // bounds changes that happen during planning itself.
-        self.authorize_fetch(&want, &[])
-            .await
-            .map_err(|e| super::pack_error_from_mega(&e))?;
-        let refs_before = Self::ref_fingerprint(&storage, repo_id)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-
-        // Ship only the closure of what was asked for. The previous behaviour
-        // ignored `want` entirely and sent every object in the repository, so a
-        // clone also carried unrelated branches and every stored tag - including
-        // tags whose refs no longer exist. Objects that were asked for by id
-        // (tags, trees, blobs) stay, because a client fetches tags by object id.
-        // A client may fetch a tag or a tree directly. Keeping only the wanted
-        // object would leave its targets missing, so peel tags to their commits
-        // and remember tree wants for traversal below.
-        let all_tag_models = storage
-            .get_tags_by_repo_id(repo_id)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let mut tags_by_id: HashMap<String, Tag> = HashMap::new();
-        for model in all_tag_models {
-            let tag: Tag =
-                crate::jupiter::utils::converter::tag_from_git_model_with_kind(model, kind)
-                    .map_err(|e| GitError::CustomError(e.to_string()))?;
-            tags_by_id.insert(tag.id.to_string(), tag);
-        }
-        let mut effective_wants: Vec<String> = Vec::new();
-        let mut tree_wants: Vec<String> = Vec::new();
-        for id in &want {
-            let mut cursor = Some(id.clone());
-            while let Some(current) = cursor.take() {
-                if let Some(tag) = tags_by_id.get(&current) {
-                    effective_wants.push(tag.object_hash.to_string());
-                    cursor = tags_by_id
-                        .get(&tag.object_hash.to_string())
-                        .map(|inner| inner.id.to_string());
-                } else {
-                    effective_wants.push(current);
-                }
-            }
-        }
-        effective_wants.dedup();
-        let mut keep: HashSet<String> = want.iter().cloned().collect();
-        let want_commits: Vec<Commit> = storage
-            .get_commits_by_hashes(repo_id, &effective_wants)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?
-            .into_iter()
-            .map(|model| {
-                crate::jupiter::utils::converter::commit_from_git_model_with_kind(model, kind)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        if !want_commits.is_empty() {
-            let mut commits = want_commits;
-            let mut seen: HashSet<String> = commits.iter().map(|c| c.id.to_string()).collect();
-            let mut traversal = commits.clone();
-            while let Some(temp) = traversal.pop() {
-                for parent_id in temp.parent_commit_ids {
-                    let parent_id = parent_id.to_string();
-                    if !seen.insert(parent_id.clone()) {
-                        continue;
-                    }
-                    let parent_model = storage
-                        .get_commit_by_hash(repo_id, &parent_id)
-                        .await
-                        .map_err(|e| GitError::CustomError(e.to_string()))?
-                        .ok_or_else(|| {
-                            GitError::CustomError(format!(
-                                "import parent commit {parent_id} not found"
-                            ))
-                        })?;
-                    let parent: Commit =
-                        crate::jupiter::utils::converter::commit_from_git_model_with_kind(
-                            parent_model,
-                            kind,
-                        )
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                    traversal.push(parent.clone());
-                    commits.push(parent);
-                }
-            }
-            for commit in &commits {
-                keep.insert(commit.id.to_string());
-                // `traverse_for_count` records a tree's children, not the tree
-                // itself, so each commit's root tree has to be kept explicitly.
-                keep.insert(commit.tree_id.to_string());
-            }
-            let tree_ids: Vec<String> = commits.iter().map(|c| c.tree_id.to_string()).collect();
-            let trees = storage
-                .get_trees_by_hashes(repo_id, tree_ids)
-                .await
-                .map_err(|e| GitError::CustomError(e.to_string()))?;
-            let obj_num = AtomicUsize::new(0);
-            let mut counted: HashSet<String> = HashSet::new();
-            let nothing: HashSet<String> = HashSet::new();
-            for model in trees {
-                let tree =
-                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                self.traverse_for_count(tree, &nothing, &mut counted, &obj_num)
-                    .await?;
-            }
-            keep.extend(counted);
-        }
-        let tree_candidates: Vec<String> = effective_wants
-            .iter()
-            .filter(|id| !keep.contains(*id))
-            .cloned()
-            .collect();
-        for tree_id in &tree_candidates {
-            if let Some(model) = storage
-                .get_tree_by_hash(repo_id, tree_id)
-                .await
-                .map_err(|e| GitError::CustomError(e.to_string()))?
-            {
-                let tree =
-                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(model, kind)
-                        .map_err(|e| GitError::CustomError(e.to_string()))?;
-                let obj_num = AtomicUsize::new(0);
-                let mut counted: HashSet<String> = HashSet::new();
-                let nothing: HashSet<String> = HashSet::new();
-                keep.insert(tree_id.clone());
-                self.traverse_for_count(tree, &nothing, &mut counted, &obj_num)
-                    .await?;
-                keep.extend(counted);
-            } else {
-                tree_wants.push(tree_id.clone());
-            }
-        }
-        let _ = &tree_wants;
-        if include_tag {
-            self.attach_authorised_tags(&storage, kind, repo_id, &mut keep, false)
-                .await?;
-        }
-
-        let refs_after = Self::ref_fingerprint(&storage, repo_id)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        if refs_before != refs_after {
-            return Err(GitError::CustomError(
-                "refs changed while building the pack; retry the fetch".to_owned(),
-            ));
-        }
-
-        // Materialize the exact object list once the closure is known: the
-        // encoder is sized from this count, so a row that cannot be converted
-        // must fail the request instead of silently shortening the pack (which
-        // the client reports as early EOF).
-        let all_entries = collect_objects(repo_id, git_service, storage, kind)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let entries: Vec<_> = all_entries
-            .into_iter()
-            .filter(|entry| keep.contains(&entry.inner.hash.to_string()))
-            .filter(|entry| {
-                !filter_blobs
-                    || entry.inner.obj_type
-                        != git_internal::internal::object::types::ObjectType::Blob
-            })
-            .collect();
-        let total = entries.len();
-
-        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
-        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new_with_hash_kind(kind, total, 0, stream_tx);
-        encoder.encode_async(entry_rx).await?;
-
-        tokio::spawn(async move {
-            for entry in entries {
-                if entry_tx.send(entry).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok(ReceiverStream::new(stream_rx))
+    fn empty_code_pack(kind: HashKind) -> Vec<u8> {
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\0".to_vec();
+        let checksum = ObjectHash::new_for_kind(kind, &pack);
+        pack.extend_from_slice(&checksum.to_data());
+        pack
     }
 
     fn legacy_view_error(error: MegaError) -> MegaError {
@@ -1384,6 +1218,10 @@ impl ImportRepo {
     }
 
     async fn code_refs(&self) -> Result<CodeRefView, MegaError> {
+        Ok(self.code_refs_with_fingerprint().await?.0)
+    }
+
+    async fn code_refs_with_fingerprint(&self) -> Result<(CodeRefView, String), MegaError> {
         let storage = self.storage.git_db_storage();
         let mut refs = storage
             .get_ref_limited(self.repo.repo_id, (LEGACY_VIEW_MAX_REFS + 2) as u64)
@@ -1407,17 +1245,21 @@ impl ImportRepo {
                     .map(|row| row.ref_git_id.clone());
             }
         }
+        let fingerprint = Self::fingerprint_from_ref_rows(&refs);
         refs.retain(|row| row.ref_name != LEGACY_TRACES_REF);
         let has_legacy_traces = trace_tip.is_some();
         if !has_legacy_traces {
-            return Ok(CodeRefView {
-                refs,
-                has_legacy_traces: false,
-                commits: Vec::new(),
-                tag_ids: HashSet::new(),
-                direct_objects: Vec::new(),
-                contaminated_commits: HashSet::new(),
-            });
+            return Ok((
+                CodeRefView {
+                    refs,
+                    has_legacy_traces: false,
+                    commits: Vec::new(),
+                    tag_ids: HashSet::new(),
+                    direct_objects: Vec::new(),
+                    contaminated_commits: HashSet::new(),
+                },
+                fingerprint,
+            ));
         }
         if refs.len() > LEGACY_VIEW_MAX_REFS {
             return Err(TracesError::ResponseBudget.into());
@@ -1522,9 +1364,13 @@ impl ImportRepo {
             .filter(|hash| contaminated.contains(*hash) && !clean_ids.contains(*hash))
             .cloned()
             .collect();
-        Ok(view)
+        Ok((view, fingerprint))
     }
 
+    #[allow(
+        clippy::double_must_use,
+        reason = "async_recursion adds must_use to the generated boxed Future"
+    )]
     #[async_recursion]
     async fn collect_code_tree_objects(
         &self,
@@ -1564,6 +1410,15 @@ impl ImportRepo {
         have: &[String],
     ) -> Result<Vec<String>, MegaError> {
         let view = self.code_refs().await?;
+        self.check_code_objects_with_view(&view, want, have).await
+    }
+
+    async fn check_code_objects_with_view(
+        &self,
+        view: &CodeRefView,
+        want: &[String],
+        have: &[String],
+    ) -> Result<Vec<String>, MegaError> {
         if !view.has_legacy_traces || (want.is_empty() && have.is_empty()) {
             return Ok(have.to_vec());
         }
@@ -1575,16 +1430,16 @@ impl ImportRepo {
         if want.iter().all(|hash| code_commits.contains(hash.as_str())) {
             return Ok(have
                 .iter()
-                .filter(|hash| code_commits.contains(hash.as_str()))
+                .filter(|hash| code_commits.contains(hash.as_str()) || view.tag_ids.contains(*hash))
                 .cloned()
                 .collect());
         }
-        let mut authorized = view.tag_ids;
+        let mut authorized = view.tag_ids.clone();
         let storage = self.storage.git_db_storage();
-        for object_id in view.direct_objects {
+        for object_id in &view.direct_objects {
             if authorized.insert(object_id.clone())
                 && let Some(tree) = storage
-                    .get_tree_by_hash(self.repo.repo_id, &object_id)
+                    .get_tree_by_hash(self.repo.repo_id, object_id)
                     .await?
             {
                 let tree = crate::jupiter::utils::converter::tree_from_git_model_with_kind(
@@ -1621,7 +1476,7 @@ impl ImportRepo {
         }
         Ok(have
             .iter()
-            .filter(|hash| code_commits.contains(hash.as_str()))
+            .filter(|hash| code_commits.contains(hash.as_str()) || authorized.contains(*hash))
             .cloned()
             .collect())
     }
@@ -2386,103 +2241,6 @@ fn attach_refusal(payload: &AttachPayload, id: i64, message: &str) -> MegaError 
     ))
 }
 
-async fn collect_objects(
-    repo_id: i64,
-    git_service: GitService,
-    storage: GitDbStorage,
-    kind: HashKind,
-) -> Result<Vec<MetaAttached<Entry, EntryMeta>>, MegaError> {
-    let mut entries: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
-    let mut commit_stream = storage.get_commits_by_repo_id(repo_id).await?;
-
-    while let Some(model) = commit_stream.next().await {
-        match model {
-            Ok(m) => {
-                let c: Commit =
-                    crate::jupiter::utils::converter::commit_from_git_model_with_kind(m, kind)?;
-                let entry = MetaAttached {
-                    inner: c.into(),
-                    meta: EntryMeta::new(),
-                };
-                entries.push(entry);
-            }
-            Err(err) => {
-                tracing::error!(?err, "import commit stream failed");
-                return Err(MegaError::Other(format!("import commit stream: {err}")));
-            }
-        }
-    }
-    tracing::info!("send commits end");
-
-    let mut tree_stream = storage.get_trees_by_repo_id(repo_id).await?;
-    while let Some(model) = tree_stream.next().await {
-        match model {
-            Ok(m) => {
-                let t: Tree =
-                    crate::jupiter::utils::converter::tree_from_git_model_with_kind(m, kind)?;
-                let entry = MetaAttached {
-                    inner: t.into(),
-                    meta: EntryMeta::new(),
-                };
-                entries.push(entry);
-            }
-            Err(err) => {
-                tracing::error!(?err, "import tree stream failed");
-                return Err(MegaError::Other(format!("import tree stream: {err}")));
-            }
-        }
-    }
-    tracing::info!("send trees end");
-
-    let mut bid_stream = storage.get_blobs_by_repo_id(repo_id).await?;
-    let mut bids = vec![];
-    while let Some(model) = bid_stream.next().await {
-        match model {
-            Ok(m) => bids.push(m.blob_id),
-            Err(err) => {
-                tracing::error!(?err, "import blob stream failed");
-                return Err(MegaError::Other(format!("import blob stream: {err}")));
-            }
-        }
-    }
-
-    // Blobs are collected sequentially: the whole object list has to exist before
-    // the encoder is sized, and a hashing failure must abort the request.
-    let mut blobs = git_service.get_objects_stream(bids);
-    while let Some(item) = blobs.next().await {
-        let (_, stream, _) = item?;
-        let data = stream
-            .try_fold(Vec::new(), |mut acc, bytes| async move {
-                acc.extend_from_slice(&bytes);
-                Ok(acc)
-            })
-            .await?;
-        // Rehashing with the thread-local kind would give the emitted object a
-        // different id than the pack was sized for.
-        let blob = Blob::from_content_bytes_with_kind(kind, data)
-            .map_err(|e| MegaError::Other(e.to_string()))?;
-        entries.push(MetaAttached {
-            inner: blob.into(),
-            meta: EntryMeta::default(),
-        });
-    }
-
-    tracing::info!("send blobs end");
-
-    let tags = storage.get_tags_by_repo_id(repo_id).await?;
-    for m in tags.into_iter() {
-        let c: Tag = crate::jupiter::utils::converter::tag_from_git_model_with_kind(m, kind)
-            .map_err(|e| MegaError::Other(e.to_string()))?;
-        let entry = MetaAttached {
-            inner: c.into(),
-            meta: EntryMeta::new(),
-        };
-        entries.push(entry);
-    }
-    tracing::info!("sending all object end...");
-    Ok(entries)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -3118,12 +2876,12 @@ mod tests {
             "a blocked ref read must surface as QueryTimeout (HTTP 503), got: {error}"
         );
         assert!(
-            waited >= std::time::Duration::from_secs(9),
+            waited >= std::time::Duration::from_secs(4),
             "the timeout must actually be waited out, measured {waited:?}"
         );
     }
 
-    /// The ref fingerprint is what the planner compares before and after it reads.    /// The ref fingerprint is what the planner compares before and after it reads.
+    /// The ref fingerprint is what the planner compares before and after it reads.
     /// It must ignore ordering, stay stable while refs do not move, and change on
     /// any retarget, addition or deletion - otherwise the race guard could not
     /// fire at all.
@@ -3238,6 +2996,224 @@ mod tests {
             .await
             .expect("a no-legacy repository must still serve the code view");
         assert!(view.refs.len() > super::LEGACY_VIEW_MAX_REFS);
+    }
+
+    #[test]
+    fn empty_code_pack_uses_the_configured_hash_and_is_accepted_by_git() {
+        use git_internal::hash::HashKind;
+
+        for (kind, format) in [(HashKind::Sha1, "sha1"), (HashKind::Sha256, "sha256")] {
+            let temp = tempfile::tempdir().unwrap();
+            let initialized = std::process::Command::new("git")
+                .args(["init", "--bare", &format!("--object-format={format}")])
+                .arg(temp.path())
+                .output()
+                .unwrap();
+            assert!(initialized.status.success());
+            let pack = ImportRepo::empty_code_pack(kind);
+            assert_eq!(&pack[..12], b"PACK\0\0\0\x02\0\0\0\0");
+            assert_eq!(pack.len(), 12 + kind.size());
+            let path = temp.path().join("objects/pack/empty.pack");
+            std::fs::write(&path, pack).unwrap();
+            let indexed = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(temp.path())
+                .arg("index-pack")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                indexed.status.success(),
+                "Git rejected {format} empty PACK: {}",
+                String::from_utf8_lossy(&indexed.stderr)
+            );
+        }
+        let pack = ImportRepo::empty_code_pack(HashKind::Blake3);
+        assert_eq!(pack.len(), 44);
+        assert_eq!(&pack[12..], blake3::hash(&pack[..12]).as_bytes());
+    }
+
+    #[tokio::test]
+    async fn incremental_pack_with_no_missing_objects_emits_empty_pack() {
+        use futures::StreamExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, commit, create_cmd) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/mtr13-empty-pack").await;
+        storage
+            .git_db_storage()
+            .save_ref(repo.repo_id, create_cmd.into())
+            .await
+            .unwrap();
+        let import_repo = ImportRepo {
+            storage,
+            repo,
+            command_list: Mutex::new(vec![]),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        };
+        let tip = commit.id.to_string();
+        let stream = import_repo
+            .incremental_pack(vec![tip.clone()], vec![tip])
+            .await
+            .expect("an authorized, already-present tip must produce a pack");
+        let pack: Vec<u8> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(
+            pack.starts_with(b"PACK"),
+            "the empty object set still needs a PACK"
+        );
+        assert_eq!(&pack[4..12], &[0, 0, 0, 2, 0, 0, 0, 0]);
+        assert_eq!(pack.len(), 32, "empty SHA-1 pack includes its checksum");
+        let bare = temp.path().join("empty-pack.git");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--bare", "--object-format=sha1"])
+                .arg(&bare)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let pack_path = bare.join("objects/pack/empty.pack");
+        std::fs::write(&pack_path, pack).unwrap();
+        let indexed = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare)
+            .arg("index-pack")
+            .arg(&pack_path)
+            .output()
+            .unwrap();
+        assert!(
+            indexed.status.success(),
+            "Git rejected the empty pack: {}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+    }
+
+    /// Same-barrier race and non-scan unit control for `build_code_pack`.
+    ///
+    /// Both the positive control (refs unchanged while parked at `git_tree`) and
+    /// the negative race control (refs mutated while parked at the exact same
+    /// `LOCK TABLE git_tree IN ACCESS EXCLUSIVE MODE` barrier) are exercised,
+    /// along with a no-legacy >4,096 unreferenced `git_tag` non-scan control.
+    #[tokio::test]
+    async fn ref_change_between_authorization_and_pack_is_rejected_and_unchanged_succeeds() {
+        use futures::StreamExt;
+        use sea_orm::{ConnectionTrait, TransactionTrait};
+
+        use crate::{
+            ceres::pack::FetchPackOptions,
+            jupiter::storage::git_db_storage::import_fence_support::blocked_by_me,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, commit, create_cmd) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/mtr13-race-unit").await;
+        let repo_id = repo.repo_id;
+        let tip = commit.id.to_string();
+        let git_db = storage.git_db_storage();
+        git_db.save_ref(repo_id, create_cmd.into()).await.unwrap();
+
+        // Seed >4,096 unreferenced git_tag rows in this no-legacy repository to
+        // verify `build_code_pack` resolves tags by hash (`get_tags_by_hashes`)
+        // instead of scanning all repository tags.
+        let conn = git_db.get_connection().clone();
+        let tag_base = generate_id();
+        conn.execute_unprepared(&format!(
+            "INSERT INTO git_tag (id, repo_id, tag_id, object_id, object_type, tag_name, tagger, message, created_at, pack_id, pack_offset) \
+             SELECT {tag_base} + g, {repo_id}, 'e' || lpad(g::text, 39, '0'), '{tip}', 'commit', 'orphan-' || g::text, \
+                    'tagger t <t@example.invalid> 1 +0000', 'orphan tag', now(), '', 0 \
+             FROM generate_series(1, 4100) g"
+        ))
+        .await
+        .unwrap();
+
+        let import_repo = Arc::new(ImportRepo {
+            storage: storage.clone(),
+            repo: repo.clone(),
+            command_list: Mutex::new(vec![]),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        });
+
+        // 1. Positive control: park `build_code_pack` at `LOCK TABLE git_tree`
+        // after initial ref snapshot + authorization, leave `import_refs`
+        // untouched, release the barrier, and verify a valid PACK is returned.
+        let holder = conn.begin().await.unwrap();
+        holder
+            .execute_unprepared("LOCK TABLE git_tree IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let ok_repo = import_repo.clone();
+        let ok_tip = tip.clone();
+        let ok_task = tokio::spawn(async move {
+            ok_repo
+                .build_code_pack(vec![ok_tip], Vec::new(), FetchPackOptions::default())
+                .await
+        });
+        assert!(
+            blocked_by_me(&holder, false).await,
+            "positive control must park at the git_tree read barrier"
+        );
+        holder.rollback().await.unwrap();
+        let (stream, shallow) = ok_task
+            .await
+            .unwrap()
+            .expect("unchanged ref view at the same barrier must succeed");
+        assert!(shallow.is_empty());
+        let chunks: Vec<Vec<u8>> = stream.collect().await;
+        let pack_bytes: Vec<u8> = chunks.into_iter().flatten().collect();
+        assert!(
+            pack_bytes.starts_with(b"PACK"),
+            "positive control must emit a valid PACK header"
+        );
+
+        // 2. Negative control: park `build_code_pack` at the exact same
+        // `LOCK TABLE git_tree` barrier, mutate `import_refs` while parked,
+        // release the barrier, and verify the pack is rejected.
+        let holder = conn.begin().await.unwrap();
+        holder
+            .execute_unprepared("LOCK TABLE git_tree IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let race_repo = import_repo.clone();
+        let race_tip = tip.clone();
+        let race_task = tokio::spawn(async move {
+            race_repo
+                .build_code_pack(vec![race_tip], Vec::new(), FetchPackOptions::default())
+                .await
+        });
+        assert!(
+            blocked_by_me(&holder, false).await,
+            "race control must park at the exact same git_tree read barrier"
+        );
+        let concurrent_ref = RefCommand::new(
+            ZERO_ID.to_string(),
+            tip.clone(),
+            "refs/heads/concurrent-move".to_owned(),
+        );
+        git_db
+            .save_ref(repo_id, concurrent_ref.into())
+            .await
+            .unwrap();
+        holder.rollback().await.unwrap();
+        let race_err = match race_task.await.unwrap() {
+            Ok(_) => panic!("ref mutation between authorization and pack must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            race_err
+                .to_string()
+                .contains("refs changed while building the pack"),
+            "unexpected race error: {race_err}"
+        );
     }
 
     /// FU-12: an ImportRepo whose tag `refs/tags/v1` points at `"1" * 40`.

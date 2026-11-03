@@ -21,11 +21,7 @@ use crate::{
 // tests. `server-option` is intentionally omitted: the parsed capabilities
 // from `parse_v2_command` are not inspected, so advertising it would mislead
 // clients into sending server options that are silently ignored.
-const V2_CAPABILITIES: &[&str] = &[
-    "agent=mega/0.1.0",
-    "ls-refs",
-    "fetch=shallow filter include-tag",
-];
+const V2_CAPABILITIES: &[&str] = &["agent=mega/0.1.0", "ls-refs", "fetch=shallow filter"];
 
 pub fn build_v2_capability_advertisement(hash_kind: HashKind) -> BytesMut {
     let mut buf = BytesMut::new();
@@ -298,11 +294,8 @@ pub(crate) async fn handle_v2_fetch_with_handler(
     // effect on handlers that can act on it. Rejecting it would break otherwise
     // valid clones, so an unsupported argument is ignored.
     let include_tag = include_tag && repo_handler.supports_include_tag();
-    // Capability honesty: `fetch=shallow filter` is advertised globally, but
-    // only Monorepo genuinely implements shallow/filter pack generation.
-    // ImportRepo's default trait implementations silently fall back to
-    // full/incremental packs, which would mislead clients. Return an explicit
-    // protocol error instead of silently producing a wrong pack.
+    // Shallow/filter support is handler-specific. Reject unsupported modes
+    // instead of silently using the default full/incremental fallback.
     if filter_spec.is_some() && !repo_handler.supports_filtered_fetch() {
         return Err(ProtocolError::InvalidInput(
             "filter is not supported for this repository".to_owned(),
@@ -332,7 +325,6 @@ pub(crate) async fn handle_v2_fetch_with_handler(
     let have = repo_handler.authorize_fetch(&want, &have).await?;
 
     let mut protocol_buf = BytesMut::new();
-    let mut shallow_commits: Vec<String> = Vec::new();
 
     // Protocol v2 negotiation. When the client has *not* sent `done` this is a
     // negotiation round, and the response must open with an `acknowledgments`
@@ -366,31 +358,19 @@ pub(crate) async fn handle_v2_fetch_with_handler(
 
     repo_handler.prepare_pack(&want, &have).await?;
 
-    let pack_data = if let Some(ref spec) = filter_spec {
-        repo_handler
-            .filtered_pack_with_options(want.clone(), have.clone(), spec, include_tag)
-            .await
-            .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?
-    } else if have.is_empty() {
-        if let Some(depth) = deepen_depth {
-            let (stream, shallows) = repo_handler
-                .shallow_pack_with_options(want, depth, deepen_relative, include_tag)
-                .await
-                .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
-            shallow_commits = shallows;
-            stream
-        } else {
-            repo_handler
-                .full_pack_with_options(want, include_tag)
-                .await
-                .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?
-        }
-    } else {
-        repo_handler
-            .incremental_pack_with_options(want.clone(), have, include_tag)
-            .await
-            .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?
-    };
+    let (pack_data, shallow_commits) = repo_handler
+        .pack_with_options(
+            want,
+            have,
+            crate::ceres::pack::FetchPackOptions {
+                deepen_depth,
+                deepen_relative,
+                filter_spec,
+                include_tag,
+            },
+        )
+        .await
+        .map_err(|e| crate::ceres::pack::protocol_error_from_pack(&e))?;
 
     add_shallow_info_section(&mut protocol_buf, &shallow_commits);
 
@@ -576,8 +556,8 @@ mod tests {
         assert!(adv_str.contains("ls-refs"));
         assert!(adv_str.contains("fetch=shallow"));
         assert!(
-            adv_str.contains("include-tag"),
-            "v2 must advertise include-tag so a client can ask for it"
+            !adv_str.contains("include-tag"),
+            "include-tag is a fetch argument, not a global handler capability"
         );
         assert!(adv_str.contains("object-format=sha1"));
         assert!(adv_str.ends_with("0000"));

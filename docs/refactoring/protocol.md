@@ -1,3 +1,7 @@
+**现行执行指令（2026-11-03 UTC）：** 用户要求完成 Mega2 本计划，跳过交叉 Review，直接执行任务卡；本指令适用于当前 MTR-13 及后续卡。旧日期记录中的审查准入或待审要求不再作为本轮交叉 Review 前置，历史 FAIL/STOP 与原始证据保留，不将跳过记为 PASS。逐卡依赖、AC/VER、独立 C/D、签名+DCO、版本与发布门继续执行；Libra 任务仍由用户侧推进。
+
+**现行执行前沿（2026-11-03 UTC）：** MTR-13 `blocked` / `locally-accepted`，候选0.42.88不变。C4 fmt/严格Clippy与完整 `cargo test --all` 均exit0，24个结果目标3148 passed/0 failed/3原ignored（含traces43/43及完整矩阵）；`cargo build` 虽exit0，但Apple ld报1条EH section超过16MiB警告，违反0warning门，C4 STOP，build--tests未跑。5个本轮owned零连接残留库已精确清理，276baseline、roles、四服务保持。D5仅子进程dev opt1重跑build，exit0/0warning，EH实际6,769,380 bytes<16MiB，未改Cargo/global profile或抑制warning，默认opt0限制仍保留。C5准备10800秒（含300秒根后检预留），将在同一冻结局部opt1环境重新执行完整五门与资源后检，不拼接C4 PASS+D5 build；尚未启动、无C5结论或发布，源码5生产文件及测试未改，用户免Review保持。逐卡原件与环境边界见[日期计划](../plan/plan-20261015.md) MTR-13卡。
+
 **现行 FIX24 已发布且 D 闭合（2026-10-31 UTC）：** `f483f57`/`v0.42.84` 精确13路径签名+DCO、main及签名标注tag/人工Release已核；C4原五门22目标3212通过/3原忽略/0失败、根核清理21库且保留原107库。main Harbor `41216534878` success；tag Docker `41216553926` 的amd64/arm64/manifest三job全部success，本卡 `done/complete`。A1及C1/C2/C3 STOP与Claude OAuth无判词保留，用户本卡免后续审查；本段后置证据仅文档收口，不重开FIX16或扩大跨仓权限。详见日期计划 FIX24 卡。
 
 **历史 FIX24 C4 本地完整 C 已核（2026-10-31 15:44:56 UTC）：** 原五门均exit0，全量22目标3212通过/3原忽略/0失败；独立根核 `accepted_C_local=true`，本轮21个零连接测试库精确清理、原107库保持、无owned活进程。根核 SHA256 `3f43577cc86e1808d6d9264f3ab8c8b5128239530bb599c64b7b06b73c73b1fe`；C1/C2/C3 STOP与Claude OAuth无判词保留，用户明确免本卡后续审查。当前 `in-progress/locally-accepted`，提交/推送/tag/Release/适用D待；C4后置文档只作事实记录，产品/测试/版本字节须核同冻结源。详见日期计划 FIX24 卡。
@@ -504,7 +508,7 @@ Libra最新开发标准是/media/eli/Sea/libra；原root三治理已以7987c989�
 
 4. **认证上下文已统一（HTTP/SSH）。** HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，commit binding 绑定到 authenticated actor。receive-pack 尚未做 repo/path 级 push 权限校验。
 
-5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 重新 advertise 已由 HTTP CL delete smoke 覆盖的 `delete-refs`，但不再 advertise 未验证的 atomic、report-status-v2、quiet、no-thin；upload-pack当前发布版不advertise include-tag；MTR13候选拟仅为支持该语义的ImportRepo按handler通告，Monorepo/ViewRepo保持不通告，须自身C/D后生效；v2 不再 advertise 未 act-on 的 `server-option`。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format=sha1` 在 v0/v1 upload/receive 明确通告的现行策略；**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 `.github/workflows/git-protocol-smoke.yml` 在 CI 中自动化执行**。用户可见的分支与 Tag 规则见 [`../user-guide.zh.md`](../user-guide.zh.md)。
+5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 重新 advertise 已由 HTTP CL delete smoke 覆盖的 `delete-refs`，但不再 advertise 未验证的 atomic、report-status-v2、quiet、no-thin；upload-pack 已发布基线未通告 include-tag；MTR13 工作区候选已实现 ImportRepo 请求级附带，v0 仅支持的 handler 通告，v2 将其作为基础 fetch 参数而不单列广告；Monorepo/ViewRepo 不执行附带，候选本地 A/B 已通过，最终 C/D 待；v2 不再 advertise 未 act-on 的 `server-option`。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format=sha1` 在 v0/v1 upload/receive 明确通告的现行策略；**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 `.github/workflows/git-protocol-smoke.yml` 在 CI 中自动化执行**。用户可见的分支与 Tag 规则见 [`../user-guide.zh.md`](../user-guide.zh.md)。
 
 6. **SSH 多 channel 状态已隔离，并已支持 protocol v2。** `SshServer` 按 `ChannelId` 保存独立 `GitSshChannelState`；SSH client 通过 `GIT_PROTOCOL=version=2` 请求 v2 时，server 返回 v2 capability advertisement，并在 upload-pack data 阶段分发 `ls-refs` / `fetch` command。
 
@@ -519,7 +523,7 @@ Libra最新开发标准是/media/eli/Sea/libra；原root三治理已以7987c989�
 | SSH git-receive-pack | 已实现（per-channel state） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；每个 SSH channel 拥有独立的 receive-pack 缓冲区，多 channel 不再共享状态。 |
 | SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
 | 权限与认证 | 已统一（读写策略化） | HTTP receive-pack 有 Bearer/Basic token 认证；review SSH 走 publickey，storage-only `push_auth=token` 时 SSH `auth_password` 命中 `lookup_push_token` 后将 token `name` 写入 `authenticated_user`。HTTP/SSH commit binding 均绑定到 authenticated actor（`set_authenticated_user`）。upload-pack 匿名访问已策略化：`check_upload_pack_access` 按 `git.anonymous_access`（默认 `true`）放行匿名 clone/fetch，关闭时无 token 返回 `Forbidden`（3 个单测覆盖），HTTP（`http.rs:53/217`）与 SSH（`ssh.rs:149`）共用。receive-pack 通过 `check_push_permission` 走 Cedar `pushRepo` 授权：未认证 push 直接 `Forbidden`（不进入 unpack），已认证时按 `state.entity_store` 策略裁决（策略库为空则放行），HTTP（`http.rs:64/355`）与 SSH（`ssh.rs:140`）共用。更细粒度 repo/path ACL 与基于策略的 push-deny 协议层单测待后续。 |
-| Capability advertise | 保守收敛 + truth table 已建立 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack当前发布版移除 `include-tag`，MTR13候选仅ImportRepo按handler通告（待C/D），其余handler保持移除；v2 移除 `server-option`。`side-band-64k`/`ofs-delta` 已覆盖 advertise/parse（ofs-delta pack decode 委托 `git-internal`）；`object-format=sha1` 在 v0/v1 upload/receive 明确通告的现行策略；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控非 Monorepo handler。**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 CI smoke gate 覆盖**。 |
+| Capability advertise | 保守收敛 + truth table 已建立 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 已发布基线移除 `include-tag`；MTR13 候选已实现 v0 ImportRepo 动态通告及 v2 基础 fetch 参数解析，附带仅由支持的 ImportRepo 执行（本地 A/B 已通过、最终 C/D 待）；v2 移除 `server-option`。`side-band-64k`/`ofs-delta` 已覆盖 advertise/parse（ofs-delta pack decode 委托 `git-internal`）；`object-format=sha1` 在 v0/v1 upload/receive 明确通告的现行策略；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 按 handler 门控；MTR13 候选 ImportRepo 与 Monorepo 支持，ViewRepo 拒绝。**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 CI smoke gate 覆盖**。 |
 | 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()`、`git-lfs-authenticate` response serialization `.unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23/24）；**2026-06-28 更新**：`Repo::new` 的非 UTF-8 path/file_name `unwrap()` 已改为 `ProtocolError::InvalidInput`，`SmartSession::git_upload_pack` 中 `full_pack`/`incremental_pack` 的 `unwrap()` 已映射为协议错误；**2026-06-28 更新 2**：HTTP Git 路由已抽出 `GitProtocolPath` parser，移除内联 `.git` 替换与 404 `unwrap()`；**2026-06-28 更新 3**：`contract/git_protocol/http.rs` 中 response builder、`HeaderValue::from_str`、upload-pack sideband `read_buf` 的 `unwrap()` 已收敛；**2026-06-28 更新 4**：`contract/git_protocol/ssh.rs` 中 LFS `Duration::try_seconds(...).unwrap()` 与 `channel_eof` 的 `expect("state just found")` 已移除。Protocol 当前范围内剩余 `unwrap()` 已基本收敛；vault/legacy 路径与数据迁移工具不在本次范围。 |
 
 ## 硬约束与不可违反的原则
@@ -689,7 +693,7 @@ SSH 和 HTTP 最终共用 `SmartSession` 与 `src/ceres/protocol/smart.rs` 中�
 - `build_side_band_format`：按 side-band / side-band-64k 包装 pack 数据。
 - `read_pkt_line` / `add_pkt_line_string`：pkt-line 编解码辅助。
 
-当前 advertise 的 capability：
+静态 advertisement 基线（MTR13 候选的请求级差异见代码块下方）：
 
 ```text
 upload-pack:
@@ -701,6 +705,8 @@ receive-pack:
 protocol v2 upload-pack:
   agent=mega/0.1.0 ls-refs fetch=shallow filter object-format=sha1
 ```
+
+MTR13 工作区候选在 v0 upload-pack 中仅对 `supports_include_tag()` 为 true 的 ImportRepo 动态追加 `include-tag`。v2 的 `include-tag` 是基础 fetch 请求参数，不加入 `fetch=shallow filter` 广告行；执行仍由 handler 能力门控，Monorepo/ViewRepo 不承诺附带 tag。上述候选本地 A/B 已通过，最终 C/D 待。
 
 `Capability` enum 当前只解析部分 capability：
 
@@ -931,7 +937,7 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 
 历史风险：曾 advertise 一些未完整实现或解析不足的能力。当前状态（均已解决）：
 
-- `include-tag`：当前发布版已从upload-pack advertise移除；MTR13候选通过`supports_include_tag`仅向ImportRepo通告，v0从首want能力、v2从fetch参数传递请求级选项，默认handler不通告、不附带。附带集合与负向限制唯一事实源见[traces契约§6](traces.md#6-普通代码-clone-与旧-git-traces)，须完整验收/C-D后生效。
+- `include-tag`：MTR13 工作区候选已从 v0 首 want 能力和 v2 fetch 参数解析请求级选项，并经 `FetchPackOptions` 传入 ImportRepo 的统一闭包规划器。v0 仅对支持的 ImportRepo 通告；v2 将其作为基础 fetch 参数，不单列广告。Monorepo/ViewRepo 不执行 tag 附带。附带集合与负向限制唯一事实源见[traces 契约§6](traces.md#6-普通代码-clone-与旧-git-traces)；候选本地 A/B 已通过，最终 C/D 待，不据源码存在宣称已发布。
 - `delete-refs`：已重新 advertise（HTTP smoke 覆盖 CL delete；Monorepo 拒绝 Git-client tag；SSH delete 矩阵仍待补齐）。
 - `atomic`：已从 advertise 移除（未实现原子 ref 更新）。
 - `quiet`：已从 advertise 移除（未实现 progress 抑制语义）。
@@ -969,7 +975,9 @@ buffer。
 
 ### upload-pack negotiation 已支持 shallow / protocol v2 / blob:none
 
-早期实现只处理 `want`、`have`、`done`。当前已补齐现代客户端常用的部分扩展：
+早期实现只处理 `want`、`have`、`done`。当前已补齐现代客户端常用的部分扩展。MTR13 工作区候选通过 `FetchPackOptions` 统一传递 `deepen_depth`、`deepen_relative`、`filter_spec`、`include_tag`，ImportRepo 的 full/incremental/shallow/filter 均进入同一 `build_code_pack`；默认 handler 桥接保持原分派，只有 have 为空时才使用 depth。候选本地 A/B 已通过，最终 C/D 待。
+
+已实现的协议边界：
 
 - protocol v1 upload-pack 解析 `deepen` / `deepen-relative`，并返回 `shallow` response。
 - `deepen-since` / `deepen-not` 会明确返回 `ProtocolError::InvalidInput`，不 silent misbehave。
@@ -978,7 +986,7 @@ buffer。
   `capabilities^{}` 伪 ref 或 `symref-target`；
   `ls_refs_zero_head_flush_only` 锁定空 ref 列表只返回 flush。v0 `info/refs`
   保留伪 ref，以承载 capability 列表。
-- protocol v2 `fetch` 支持 `filter blob:none`，pack 只发送 commits + trees，不发送 blob objects。
+- protocol v2 `fetch` 支持 `filter blob:none`，过滤未显式请求的 blob；MTR13 候选 ImportRepo 可按 `include-tag` 附带最终目标已在输出闭包内的授权 tag 链，精确集合见 [traces 契约§6](traces.md#6-普通代码-clone-与旧-git-traces)。ImportRepo/Monorepo 支持 shallow/filter，ViewRepo 继续明确拒绝；combined filter+shallow 和 deepen+非空 have 仍明确拒绝。
 
 仍需后续确认或扩展：
 
@@ -1221,7 +1229,7 @@ LFS:
 工作项：
 
 1. 建立 capability truth table。
-2. 移除或补齐 `atomic`、`report-status-v2`、`quiet`、`delete-refs` 等能力；include-tag按上文MTR13候选区分handler，待自身C/D。
+2. 移除或补齐 `atomic`、`report-status-v2`、`quiet`、`delete-refs` 等能力；MTR13 的 include-tag 请求级实现已在工作区候选中，按上文区分 v0 通告、v2 基础参数与 handler 执行，本地 A/B 已通过，最终 C/D 待。
 3. 明确 `ofs-delta`、`no-thin`、`side-band-64k` 的 encode/decode 测试。（✅ 2026-09-16：`no-thin` 由 advertise 断言 + RCV-01 端到端回归覆盖，见上表与 truth table）
 4. ✅ 对 SHA-1 object format 做显式策略：当前 v0/v1 upload/receive 的 `advertised_capabilities` 也追加 `object-format=sha1`，由现有 `b3_02_capability_uses_injected_sha1_kind` 验证；旧“省略 SHA-1 格式”的表述不符合当前代码。
 
@@ -1239,16 +1247,16 @@ LFS:
 | `ofs-delta` | ✅ both | ✅ | ✅ pack decode 委托 `git-internal`（支持 offset delta 编解码，见 `git-internal::internal::pack::decode`） | ✅ advertise/parse：`parse_capabilities_recognizes_ofs_delta` + advertise 断言（pack decode 由 `git-internal` 自测） | OFS_DELTA pack 编解码由 `git-internal` 实现并自测；mega2 侧仅覆盖 advertise/parse |
 | `multi_ack_detailed` | ✅ upload-pack | ✅ | ✅ negotiation ACK 逻辑 | ✅ `parse_capabilities` 单测 | upload-pack negotiation |
 | `no-done` | ✅ upload-pack | ✅ | ✅ 与 multi_ack_detailed 联动 | ✅ negotiation 单测 | 允许在 multi_ack_detailed 下提前发 pack |
-| `shallow` | ✅ upload-pack | ✅ | ✅ `deepen` / `deepen-relative` 生成 shallow pack 和 `shallow` response；ViewRepo（P0）不覆写 `supports_shallow_fetch`，HTTP v0/v2 depth 返回 400；SSH 同样拒绝但写裸文本 `error: …`（DEFER-HP-17） | ✅ capability parse/advertise 单测 + shallow traversal 单测 | protocol v1 shallow clone 基础语义 |
+| `shallow` | ✅ upload-pack | ✅ | ✅ `deepen` / `deepen-relative` 生成 shallow pack 和 `shallow` response；MTR13 候选 ImportRepo 与 Monorepo 支持，ViewRepo（P0）不覆写 `supports_shallow_fetch`，HTTP v0/v2 depth 返回 400；SSH 同样拒绝但写裸文本 `error: …`（DEFER-HP-17） | ✅ capability parse/advertise 单测 + shallow traversal 单测 | protocol v1 shallow clone 基础语义 |
 | `ls-refs` | ✅ protocol v2 | ✅ | ✅ 处理 `ref-prefix`、`symrefs`、`peel` | ✅ v2 capability / command parse 单测 | protocol v2 refs discovery |
-| `fetch=shallow filter` | ✅ protocol v2 | ✅ | ✅ v2 fetch 支持 `want`/`have`/`done`、`deepen`、`filter blob:none`；ViewRepo（P0）不覆写 `supports_filtered_fetch`，HTTP v2 depth/filter 返回 400，SSH 同样拒绝但写裸文本 `error: …`（DEFER-HP-17）；v0 不宣告 filter | ✅ v2 command parse 单测 + pack generation gates + capability honesty 单测 | v2 fetch；`filter blob:none` 只发送 commit/tree objects；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控 |
+| `fetch=shallow filter` | ✅ protocol v2 | ✅ | ✅ v2 fetch 支持 `want`/`have`/`done`、`deepen`、`filter blob:none`；MTR13 候选 ImportRepo 与 Monorepo 支持，ViewRepo（P0）不覆写 `supports_filtered_fetch`，HTTP v2 depth/filter 返回 400，SSH 同样拒绝但写裸文本 `error: …`（DEFER-HP-17）；v0 不宣告 filter | ✅ v2 command parse 单测 + pack generation gates + capability honesty 单测 | v2 fetch；`blob:none` 过滤未显式请求的 blob，ImportRepo 候选的授权 tag 附带见 traces §6；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控 |
 | `agent=mega/0.1.0` | ✅ both | ❌ | ❌ | ❌ | 信息性，不影响协议行为 |
 | `atomic` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现原子 ref 更新，已从 advertise 移除 |
 | `report-status-v2` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现 v2 语义，已从 advertise 移除 |
 | `delete-refs` | ✅ 已声明 | ✅ HTTP CL delete + Monorepo tag-reject smoke | ❌ | N/A | HTTP smoke 已覆盖 CL delete；Monorepo 禁止 Git-client Tag；SSH delete 矩阵仍未补齐 |
 | `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
 | `no-thin` | ✅ receive-pack（2026-09-16 重新 advertise） | ❌（客户端侧语义，服务端无需 parse） | ✅ 依赖客户端不发送 thin pack；服务端解码器对残余 thin/malformed pack fail-closed 并经 `unpack_stream` 转为 typed 错误（2026-09-16） | ✅ `receive_pack_advertises_only_supported_baseline_capabilities` + RCV-01 端到端回归（默认 delta push） | 移除期间 thin pack 触发解码 panic/断连（RCV-01）；重 advertise 以匹配解码器 fail-closed 契约 |
-| `include-tag` | 发布版移除；MTR13候选仅ImportRepo通告 | 候选v0首want/v2 fetch解析 | 候选按请求附带T(B) | MTR13精确集合/负控待验 | Monorepo/ViewRepo保持不通告、不附带；候选未通过自身C/D |
+| `include-tag` | 候选 v0 仅 ImportRepo 动态通告；v2 为基础请求参数，不单列广告 | 已实现 v0 首 want / v2 fetch 请求解析 | ImportRepo 候选按请求附带 T(B)；其余 handler 不附带 | 候选矩阵及最终验收状态见 MTR13 卡 | 统一 FetchPackOptions；本地 A/B 已通过，最终 C/D 待，不宣称已发布 |
 | `server-option` | ❌ 已移除 (v2) | ✅ | ❌ | ✅ `v2_capability_advertisement_does_not_advertise_server_option` | v2 parsed capabilities 未被 inspect/act-on，advertise 会误导客户端；2026-06-30 从 v2 advertise 移除 |
 | `object-format` | ✅ v0/v1 upload/receive `object-format=sha1`；✅ v2 `object-format=sha1` | ✅ 对象算法能力校验 | ✅ 按配置算法检查 OID 宽度 | ✅ `b3_02_capability_uses_injected_sha1_kind` 与 v2 capability 单测 | 当前 v0/v1 显式声明 `sha1`；FIX24 保持现有 capability 语义并修正空广告零 OID 宽度 |
 
@@ -1366,9 +1374,8 @@ MTR-40 的 ImportRepo 覆盖它：在本次构建的代码视图中拒绝不可�
 `prepare_pack` 仍只在实际发包前运行，不改变 ViewRepo 非 ready 协商轮成本。
 receive-pack 广告只向已通过当前推送权限检查的调用者显示受污染代码 ref，
 供显式删除或重置；旧 traces ref 在两个方向均隐藏，标准 Git 客户端无法从广告取得它的更新旧值。该广告规则没有增加对已知旧 OID 的原始 receive 命令的服务端写入拒绝策略。
-完整 PACK 对象闭包隔离仍由 [唯一 traces 协议](traces.md#6-普通代码-clone-与旧-git-traces)
-和后继 MTR-13 承接：当前 full_pack 实际仍发送同仓全部对象，MTR-40 的 want/have
-守卫不提供 traces 内容保密性。 非旧 traces 的 ImportRepo 若默认分支不是 main，v2 HEAD symref 也指向实际可见的默认分支；MTR-40 用例覆盖 dev 分支。
+完整 PACK 对象闭包隔离由 [唯一 traces 协议](traces.md#6-普通代码-clone-与旧-git-traces)
+和 MTR-13 承接。MTR40 发布阶段的历史 full_pack 会发送同仓全部对象，单独的 want/have 守卫不提供 traces 内容保密性；MTR13 工作区候选已在同一代码视图中规划闭包，并在物化后复核 ref 指纹，变化时拒绝发包，完整验收与 C/D 待。非旧 traces 的 ImportRepo 若默认分支不是 main，v2 HEAD symref 也指向实际可见的默认分支；MTR-40 用例覆盖 dev 分支。
 
 钩子失败时不会调用任何 pack 方法。`ViewUnavailable` 的 HTTP 应答是带 `Retry-After` 的 503；
 `PackRejected` 的 HTTP 应答是 200、`application/x-git-upload-pack-result` 和一个 ERR
