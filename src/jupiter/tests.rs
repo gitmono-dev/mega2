@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -156,7 +156,7 @@ async fn test_db_config_kind(kind: TestDatabaseKind) -> (DbConfig, TestSchemaGua
     (config, schema)
 }
 
-/// One per-test schema, dropped (`DROP SCHEMA ... CASCADE`) by whichever of
+/// One per-test database, dropped (`DROP DATABASE`) by whichever of
 /// its holders lets go first: the [`TestSchemaGuard`], or the test thread's
 /// exit for a schema something kept alive (libvault's modules hold `Arc`
 /// cycles, so a vault's pool is never freed).
@@ -164,33 +164,42 @@ struct TestSchema {
     admin_url: String,
     schema: String,
     owner: String,
-    dropped: AtomicBool,
+    removed: Mutex<bool>,
 }
 
 impl TestSchema {
-    /// Whether the caller is the one to drop the schema.
-    fn claim(&self) -> bool {
-        !self.dropped.swap(true, Ordering::AcqRel)
-    }
-
     /// Drops the schema from any thread, a tokio worker included (where
     /// `block_on` panics and a task spawned there would die with the test's
     /// runtime): the work gets a thread and runtime of its own and is waited
     /// for, so a test binary never exits with a drop still in flight.
-    fn drop_off_thread(&self) {
+    fn drop_off_thread(&self, thread_ended: bool) {
+        let mut removed = self.removed.lock().unwrap_or_else(|err| err.into_inner());
+        if *removed {
+            return;
+        }
+        if thread_ended {
+            eprintln!(
+                "test schema {} was still held when {} ended; dropping it now",
+                self.schema, self.owner
+            );
+        }
         let admin_url = self.admin_url.clone();
         let schema = self.schema.clone();
         let worker = std::thread::Builder::new()
             .name(format!("drop-{schema}"))
             .spawn(move || drop_test_schema(&admin_url, &schema));
-        match worker {
-            Ok(worker) => {
-                if worker.join().is_err() {
-                    eprintln!("test schema left behind: the drop thread panicked");
-                }
+        // Keep the per-database lock until the outcome is known. A failed
+        // attempt must leave the thread-exit fallback eligible to try again.
+        *removed = match worker {
+            Ok(worker) => worker.join().unwrap_or_else(|_| {
+                eprintln!("test schema left behind: the drop thread panicked");
+                false
+            }),
+            Err(err) => {
+                eprintln!("test schema left behind: no drop thread: {err}");
+                false
             }
-            Err(err) => eprintln!("test schema left behind: no drop thread: {err}"),
-        }
+        };
     }
 }
 
@@ -206,9 +215,7 @@ impl TestSchemaGuard {
 
 impl Drop for TestSchemaGuard {
     fn drop(&mut self) {
-        if self.0.claim() {
-            self.0.drop_off_thread();
-        }
+        self.0.drop_off_thread(false);
     }
 }
 
@@ -225,18 +232,12 @@ struct HeldSchemas(Vec<Arc<TestSchema>>);
 impl Drop for HeldSchemas {
     fn drop(&mut self) {
         for schema in self.0.drain(..) {
-            if schema.claim() {
-                eprintln!(
-                    "test schema {} was still held when {} ended; dropping it now",
-                    schema.schema, schema.owner
-                );
-                schema.drop_off_thread();
-            }
+            schema.drop_off_thread(true);
         }
     }
 }
 
-fn drop_test_schema(admin_url: &str, schema: &str) {
+fn drop_test_schema(admin_url: &str, schema: &str) -> bool {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();
@@ -244,7 +245,7 @@ fn drop_test_schema(admin_url: &str, schema: &str) {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("test schema {schema} left behind: no runtime for the drop: {err}");
-            return;
+            return false;
         }
     };
     let dropped = runtime.block_on(async {
@@ -298,10 +299,19 @@ fn drop_test_schema(admin_url: &str, schema: &str) {
             dropped = admin.execute_unprepared(&drop_sql).await;
         }
         dropped?;
-        admin.close().await
+        if let Err(err) = admin.close().await {
+            eprintln!(
+                "test database {schema} removed but its admin connection did not close: {err}"
+            );
+        }
+        Ok::<(), sea_orm::DbErr>(())
     });
-    if let Err(err) = dropped {
-        eprintln!("test schema {schema} left behind: {err}");
+    match dropped {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("test schema {schema} left behind: {err}");
+            false
+        }
     }
 }
 
@@ -350,7 +360,8 @@ async fn create_test_database(kind: TestDatabaseKind) -> (String, TestSchemaGuar
         });
     // Cloning the migrated template is the per-test setup. Replaying migrations
     // here is what made a single fixture take minutes.
-    execute_postgres(&admin, format!("DROP DATABASE IF EXISTS {schema}")).await;
+    // CREATE must reject a name left by an earlier process with the same PID.
+    // Such a database belongs to the baseline, never to this test instance.
     if matches!(kind, TestDatabaseKind::Blank) {
         execute_postgres(&admin, format!("CREATE DATABASE {schema}")).await;
     } else {
@@ -417,7 +428,7 @@ async fn create_test_database(kind: TestDatabaseKind) -> (String, TestSchemaGuar
         admin_url,
         schema,
         owner,
-        dropped: AtomicBool::new(false),
+        removed: Mutex::new(false),
     });
     let _ = HELD_ON_THIS_THREAD.try_with(|held| held.borrow_mut().0.push(schema.clone()));
     (db_url, TestSchemaGuard(schema))
@@ -1534,5 +1545,983 @@ mod schema_guard_tests {
             "database {schema} outlived its guard"
         );
         drop(txn);
+    }
+
+    const DB_CLEANUP_REPRO_CASE: &str = "ceres::snapshot::pages::tests::mst2_projection_checks_full_leaf_path_before_resolve_and_http_reads";
+
+    fn db_cleanup_repro_emit(prefix: &str, receipt: &serde_json::Value) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{prefix} {receipt}")?;
+        stdout.flush()
+    }
+
+    fn db_cleanup_repro_process_start(pid: u32) -> String {
+        let mut probe = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("FIX_MTR14_REPRO_SETUP: read process start");
+        let started = std::time::Instant::now();
+        while probe
+            .try_wait()
+            .expect("FIX_MTR14_REPRO_SETUP: process identity probe")
+            .is_none()
+        {
+            if started.elapsed() >= Duration::from_secs(2) {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                panic!("FIX_MTR14_REPRO_SETUP: process identity probe timed out");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let output = probe
+            .wait_with_output()
+            .expect("FIX_MTR14_REPRO_SETUP: process identity output");
+        assert!(output.status.success(), "FIX_MTR14_REPRO_SETUP: ps failed");
+        let start = String::from_utf8(output.stdout)
+            .expect("FIX_MTR14_REPRO_SETUP: process start is not UTF-8")
+            .trim()
+            .to_owned();
+        assert!(!start.is_empty(), "FIX_MTR14_REPRO_SETUP: no process start");
+        start
+    }
+
+    type DbCleanupReproCatalog = Vec<(String, i64, String)>;
+
+    fn db_cleanup_repro_catalog(prefixes: &[String]) -> (String, DbCleanupReproCatalog) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("FIX_MTR14_REPRO_SETUP: admin runtime");
+        runtime.block_on(async {
+            let admin_url = std::env::var("MEGA_DATABASE__DB_URL")
+                .unwrap_or_else(|_| DEFAULT_TEST_DATABASE_URL.into());
+            let admin = Database::connect(admin_connect_options(&admin_url))
+                .await
+                .expect("FIX_MTR14_REPRO_SETUP: admin connection");
+            let owner: String = admin
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT current_user::text AS owner".to_owned(),
+                ))
+                .await
+                .expect("FIX_MTR14_REPRO_SETUP: admin owner query")
+                .expect("FIX_MTR14_REPRO_SETUP: admin owner row")
+                .try_get("", "owner")
+                .expect("FIX_MTR14_REPRO_SETUP: admin owner value");
+            let predicates = (1..=prefixes.len())
+                .map(|index| {
+                    format!("left(datname::text, char_length(${index}::text)) = ${index}::text")
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let rows = admin
+                .query_all_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "SELECT datname::text AS name, oid::bigint AS oid, \
+                         pg_get_userbyid(datdba)::text AS owner FROM pg_database \
+                         WHERE {predicates} ORDER BY datname"
+                    ),
+                    prefixes.iter().cloned().map(Value::from),
+                ))
+                .await
+                .expect("FIX_MTR14_REPRO_SETUP: catalog query");
+            admin
+                .close()
+                .await
+                .expect("FIX_MTR14_REPRO_SETUP: close admin before continuing");
+            let databases = rows
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.try_get("", "name").expect("repro database name"),
+                        row.try_get("", "oid").expect("repro database OID"),
+                        row.try_get("", "owner").expect("repro database owner"),
+                    )
+                })
+                .collect();
+            (owner, databases)
+        })
+    }
+
+    struct DbCleanupReproChild {
+        child: std::process::Child,
+        start: String,
+        started: std::time::Instant,
+        raw_log_dir: std::path::PathBuf,
+        status: Option<std::process::ExitStatus>,
+        one_pass: Option<bool>,
+        timed_out: bool,
+        stopped_on_unwind: bool,
+    }
+
+    impl DbCleanupReproChild {
+        fn receipt(&self, phase: &str) -> std::io::Result<()> {
+            let receipt = serde_json::json!({
+                "phase": phase,
+                "pid": self.child.id(),
+                "start": self.start,
+                "raw_log_dir": self.raw_log_dir,
+                "stdout": self.raw_log_dir.join("stdout.log"),
+                "stderr": self.raw_log_dir.join("stderr.log"),
+                "libtest_log": self.raw_log_dir.join("libtest.log"),
+                "exit_code": self.status.as_ref().and_then(std::process::ExitStatus::code),
+                "success": self.status.as_ref().is_some_and(std::process::ExitStatus::success),
+                "one_pass": self.one_pass,
+                "timed_out": self.timed_out,
+                "stopped_on_unwind": self.stopped_on_unwind,
+                "elapsed_seconds": self.started.elapsed().as_secs_f64(),
+            });
+            let filename = if phase == "spawn" {
+                "identity.json"
+            } else {
+                "terminal.json"
+            };
+            std::fs::write(self.raw_log_dir.join(filename), receipt.to_string())?;
+            db_cleanup_repro_emit("FIX_MTR14_REPRO_CHILD", &receipt)
+        }
+
+        fn exactly_one_pass(&self) -> bool {
+            let Ok(logfile) = std::fs::read_to_string(self.raw_log_dir.join("libtest.log")) else {
+                return false;
+            };
+            let Ok(stdout) = std::fs::read_to_string(self.raw_log_dir.join("stdout.log")) else {
+                return false;
+            };
+            let outcomes = logfile
+                .lines()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            let summaries = stdout
+                .lines()
+                .filter(|line| line.starts_with("test result:"))
+                .collect::<Vec<_>>();
+            let expected = format!("ok {DB_CLEANUP_REPRO_CASE}");
+            outcomes == [expected.as_str()]
+                && summaries.len() == 1
+                && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+        }
+    }
+
+    impl Drop for DbCleanupReproChild {
+        fn drop(&mut self) {
+            if self.status.is_none() {
+                self.status = self.child.try_wait().ok().flatten();
+                if self.status.is_none() {
+                    self.stopped_on_unwind = true;
+                    let _ = self.child.kill();
+                    self.status = self.child.wait().ok();
+                }
+                self.one_pass = Some(false);
+                let _ = self.receipt("terminal");
+            }
+        }
+    }
+
+    #[test]
+    fn db_cleanup_repro() {
+        let parent_pid = std::process::id();
+        let parent_start = db_cleanup_repro_process_start(parent_pid);
+        let artifacts = tempfile::Builder::new()
+            .prefix(&format!("mega2-fix14-repro-{parent_pid}-"))
+            .tempdir()
+            .expect("FIX_MTR14_REPRO_SETUP: private log directory")
+            .keep();
+        let (owner, baseline) = db_cleanup_repro_catalog(&["mega2_test_".to_owned()]);
+        let blocked_pids = baseline
+            .iter()
+            .filter_map(|row| {
+                row.0
+                    .strip_prefix("mega2_test_")?
+                    .split_once('_')?
+                    .0
+                    .parse::<u32>()
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(
+            artifacts.join("baseline.json"),
+            serde_json::json!({
+                "owner": owner, "databases": baseline,
+            })
+            .to_string(),
+        )
+        .expect("FIX_MTR14_REPRO_SETUP: record baseline");
+        db_cleanup_repro_emit(
+            "FIX_MTR14_REPRO_ARTIFACT",
+            &serde_json::json!({
+                "parent_pid": parent_pid, "parent_start": parent_start,
+                "raw_log_dir": artifacts, "baseline_admin_closed": true,
+                "child_case": DB_CLEANUP_REPRO_CASE, "child_count": 16,
+                "child_timeout_seconds": 120, "blocked_pids": blocked_pids,
+                "unix_pid_collision_gate": cfg!(unix),
+            }),
+        )
+        .expect("FIX_MTR14_REPRO_SETUP: emit artifact identity");
+
+        let executable =
+            std::env::current_exe().expect("FIX_MTR14_REPRO_SETUP: current executable");
+        let mut children = Vec::with_capacity(16);
+        for index in 0..16 {
+            let raw_log_dir = artifacts.join(format!("child-{index:02}"));
+            std::fs::create_dir(&raw_log_dir).expect("FIX_MTR14_REPRO_SETUP: child log directory");
+            let stdout =
+                std::fs::File::create(raw_log_dir.join("stdout.log")).expect("repro stdout");
+            let stderr =
+                std::fs::File::create(raw_log_dir.join("stderr.log")).expect("repro stderr");
+            let started = std::time::Instant::now();
+            let mut command = std::process::Command::new(&executable);
+            command
+                .args(["--exact", DB_CLEANUP_REPRO_CASE, "--nocapture", "--logfile"])
+                .arg(raw_log_dir.join("libtest.log"))
+                .stdin(std::process::Stdio::null())
+                .stdout(stdout)
+                .stderr(stderr);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+
+                let blocked_pids = blocked_pids.clone();
+                let check_pid = move || {
+                    let pid = unsafe { libc::getpid() } as u32;
+                    if blocked_pids.contains(&pid) {
+                        Err(std::io::Error::from_raw_os_error(libc::EEXIST))
+                    } else {
+                        Ok(())
+                    }
+                };
+                // Only getpid, a read-only PID lookup, and a raw OS error run after fork.
+                unsafe { command.pre_exec(check_pid) };
+            }
+            let child = command
+                .spawn()
+                .expect("FIX_MTR14_REPRO_SETUP: spawn exact child");
+            children.push(DbCleanupReproChild {
+                child,
+                start: String::new(),
+                started,
+                raw_log_dir,
+                status: None,
+                one_pass: None,
+                timed_out: false,
+                stopped_on_unwind: false,
+            });
+            let child = children.last_mut().expect("repro child registered");
+            child.start = db_cleanup_repro_process_start(child.child.id());
+            child
+                .receipt("spawn")
+                .expect("FIX_MTR14_REPRO_SETUP: record child identity");
+        }
+        while children.iter().any(|child| child.status.is_none()) {
+            for child in children.iter_mut().filter(|child| child.status.is_none()) {
+                child.status = child
+                    .child
+                    .try_wait()
+                    .expect("FIX_MTR14_REPRO_SETUP: wait child");
+                if child.status.is_none() && child.started.elapsed() >= Duration::from_secs(120) {
+                    child.timed_out = true;
+                    child
+                        .child
+                        .kill()
+                        .expect("FIX_MTR14_REPRO_SETUP: kill owned timed-out child");
+                    child.status = Some(
+                        child
+                            .child
+                            .wait()
+                            .expect("FIX_MTR14_REPRO_SETUP: reap owned child"),
+                    );
+                }
+                if child.status.is_some() {
+                    child.one_pass = Some(
+                        !child.timed_out
+                            && child
+                                .status
+                                .as_ref()
+                                .is_some_and(std::process::ExitStatus::success)
+                            && child.exactly_one_pass(),
+                    );
+                    child
+                        .receipt("terminal")
+                        .expect("FIX_MTR14_REPRO_SETUP: record child terminal");
+                }
+            }
+            if children.iter().any(|child| child.status.is_none()) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(
+            children.iter().all(|child| child.one_pass == Some(true)),
+            "FIX_MTR14_REPRO_CHILD_FAILURE: all 16 children must exit normally with exactly one pass"
+        );
+        let prefixes = children
+            .iter()
+            .map(|child| format!("mega2_test_{}_", child.child.id()))
+            .collect::<Vec<_>>();
+        let (after_owner, after) = db_cleanup_repro_catalog(&prefixes);
+        assert_eq!(
+            after_owner, owner,
+            "FIX_MTR14_REPRO_SETUP: admin owner changed"
+        );
+        let residue = after
+            .into_iter()
+            .filter(|row| !baseline.iter().any(|old| old.0 == row.0))
+            .collect::<Vec<_>>();
+        assert!(
+            residue.iter().all(|row| row.2 == owner
+                && prefixes.iter().any(|prefix| row
+                    .0
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| !suffix.is_empty()
+                        && suffix.bytes().all(|byte| byte.is_ascii_digit())))),
+            "FIX_MTR14_REPRO_SETUP: unexpected database ownership or name"
+        );
+        std::fs::write(
+            artifacts.join("residue.json"),
+            serde_json::to_vec(&residue).expect("serialize repro residue"),
+        )
+        .expect("FIX_MTR14_REPRO_SETUP: record residue");
+        if !residue.is_empty() {
+            panic!("FIX_MTR14_REPRO_ORACLE: owned database remains after test completion");
+        }
+    }
+
+    #[cfg(unix)]
+    mod db_cleanup_parallel_support {
+        use std::{
+            fs::{self, File, OpenOptions},
+            io::{Read, Write},
+            os::unix::{
+                fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+                process::CommandExt,
+            },
+            path::{Path, PathBuf},
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+
+        use serde_json::{Value as Json, json};
+
+        use super::*;
+
+        const ENV: &str = "MEGA2_FIX_MTR14_BARRIER_DIR";
+        const CHILD_A: &str = "jupiter::tests::schema_guard_tests::db_cleanup_parallel_child_a";
+        const CHILD_B: &str = "jupiter::tests::schema_guard_tests::db_cleanup_parallel_child_b";
+        const LIMIT: Duration = Duration::from_secs(120);
+
+        #[derive(Clone)]
+        struct Barrier {
+            directory: PathBuf,
+            nonce: String,
+            parent_pid: u32,
+            parent_start: String,
+        }
+
+        fn text<'a>(value: &'a Json, field: &str) -> &'a str {
+            value[field]
+                .as_str()
+                .expect("FIX_MTR14_PARALLEL_SETUP: missing text field")
+        }
+
+        fn number(value: &Json, field: &str) -> u32 {
+            value[field]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .expect("FIX_MTR14_PARALLEL_SETUP: invalid PID")
+        }
+
+        fn checked_metadata(metadata: &fs::Metadata, directory: bool) {
+            let uid = unsafe { libc::geteuid() };
+            assert_eq!(metadata.uid(), uid, "FIX_MTR14_PARALLEL_SETUP: wrong UID");
+            assert_eq!(
+                metadata.permissions().mode() & 0o7777,
+                if directory { 0o700 } else { 0o600 },
+                "FIX_MTR14_PARALLEL_SETUP: wrong mode"
+            );
+            assert!(
+                if directory {
+                    metadata.is_dir()
+                } else {
+                    metadata.is_file()
+                },
+                "FIX_MTR14_PARALLEL_SETUP: wrong file kind"
+            );
+        }
+
+        fn read_file(path: &Path) -> Option<Json> {
+            let mut file = match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(error) => panic!("FIX_MTR14_PARALLEL_SETUP: barrier open: {error}"),
+            };
+            checked_metadata(&file.metadata().expect("barrier metadata"), false);
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take(16385)
+                .read_to_end(&mut bytes)
+                .expect("barrier read");
+            assert!(
+                bytes.len() <= 16384,
+                "FIX_MTR14_PARALLEL_SETUP: oversized barrier file"
+            );
+            Some(
+                serde_json::from_slice(&bytes)
+                    .expect("FIX_MTR14_PARALLEL_SETUP: malformed barrier JSON"),
+            )
+        }
+
+        fn publish(barrier: &Barrier, name: &str, value: Json) {
+            assert!(
+                !name.contains('/'),
+                "FIX_MTR14_PARALLEL_SETUP: invalid leaf"
+            );
+            let destination = barrier.directory.join(name);
+            assert!(
+                !destination.exists(),
+                "FIX_MTR14_PARALLEL_SETUP: duplicate marker"
+            );
+            let staging = barrier
+                .directory
+                .join(format!(".{name}.{}", std::process::id()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&staging)
+                .expect("FIX_MTR14_PARALLEL_SETUP: create marker");
+            file.write_all(value.to_string().as_bytes())
+                .expect("barrier write");
+            file.flush().expect("barrier flush");
+            drop(file);
+            fs::rename(staging, destination).expect("FIX_MTR14_PARALLEL_SETUP: publish marker");
+        }
+
+        fn validate(barrier: &Barrier, value: &Json) {
+            assert_eq!(
+                text(value, "nonce"),
+                barrier.nonce,
+                "FIX_MTR14_PARALLEL_SETUP: wrong nonce"
+            );
+            assert_eq!(
+                number(value, "parent_pid"),
+                barrier.parent_pid,
+                "wrong parent PID"
+            );
+            assert_eq!(
+                text(value, "parent_start"),
+                barrier.parent_start,
+                "wrong parent start"
+            );
+        }
+
+        fn marker(barrier: &Barrier, details: Json) -> Json {
+            json!({"nonce": barrier.nonce, "parent_pid": barrier.parent_pid,
+            "parent_start": barrier.parent_start, "details": details})
+        }
+
+        fn inherited_barrier() -> Option<Barrier> {
+            let directory = PathBuf::from(std::env::var_os(ENV)?);
+            assert!(
+                directory.is_absolute(),
+                "FIX_MTR14_PARALLEL_SETUP: relative barrier"
+            );
+            assert_eq!(
+                directory.canonicalize().expect("canonical barrier"),
+                directory,
+                "FIX_MTR14_PARALLEL_SETUP: noncanonical barrier"
+            );
+            for component in directory.ancestors() {
+                assert!(
+                    !fs::symlink_metadata(component)
+                        .expect("barrier path metadata")
+                        .file_type()
+                        .is_symlink(),
+                    "FIX_MTR14_PARALLEL_SETUP: symlink in path"
+                );
+            }
+            checked_metadata(
+                &fs::symlink_metadata(&directory).expect("barrier directory"),
+                true,
+            );
+            let manifest = read_file(&directory.join("owner.json"))
+                .expect("FIX_MTR14_PARALLEL_SETUP: missing owner manifest");
+            assert_eq!(
+                text(&manifest, "protocol"),
+                "mega2-fix14-parallel-v1",
+                "unknown barrier protocol"
+            );
+            let nonce = text(&manifest, "nonce").to_owned();
+            let parsed =
+                uuid::Uuid::parse_str(&nonce).expect("FIX_MTR14_PARALLEL_SETUP: invalid nonce");
+            assert_eq!(
+                parsed.get_version_num(),
+                4,
+                "FIX_MTR14_PARALLEL_SETUP: nonce is not random v4"
+            );
+            let parent_pid = number(&manifest, "parent_pid");
+            assert_eq!(
+                unsafe { libc::getppid() } as u32,
+                parent_pid,
+                "FIX_MTR14_PARALLEL_SETUP: manifest is not the actual parent"
+            );
+            let parent_start = text(&manifest, "parent_start").to_owned();
+            assert_eq!(
+                db_cleanup_repro_process_start(parent_pid),
+                parent_start,
+                "FIX_MTR14_PARALLEL_SETUP: parent identity changed"
+            );
+            let expected = format!("mega2-fix14-parallel-{parent_pid}-{nonce}-");
+            assert!(
+                directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&expected) && name.len() > expected.len()),
+                "FIX_MTR14_PARALLEL_SETUP: path does not bind nonce and parent"
+            );
+            Some(Barrier {
+                directory,
+                nonce,
+                parent_pid,
+                parent_start,
+            })
+        }
+
+        async fn wait_marker(barrier: &Barrier, name: &str, deadline: Instant) -> Json {
+            loop {
+                if let Some(value) = read_file(&barrier.directory.join(name)) {
+                    validate(barrier, &value);
+                    return value;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "FIX_MTR14_PARALLEL_SETUP: marker timeout: {name}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn backend(db: &DatabaseConnection) -> i64 {
+            let row = db
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT pg_backend_pid()::bigint AS pid, 1::bigint AS alive".to_owned(),
+                ))
+                .await
+                .expect("FIX_MTR14_PARALLEL_ASSERT: live connection query")
+                .expect("backend row");
+            assert_eq!(row.try_get::<i64>("", "alive").expect("alive value"), 1);
+            row.try_get("", "pid").expect("backend PID")
+        }
+
+        async fn absent(name: &str) {
+            let admin_url = std::env::var("MEGA_DATABASE__DB_URL")
+                .unwrap_or_else(|_| DEFAULT_TEST_DATABASE_URL.into());
+            let admin = Database::connect(admin_connect_options(&admin_url))
+                .await
+                .expect("post admin");
+            let exists = admin
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT 1 FROM pg_database WHERE datname = $1",
+                    [Value::from(name)],
+                ))
+                .await
+                .expect("exact owned database query")
+                .is_some();
+            admin.close().await.expect("close post admin");
+            assert!(
+                !exists,
+                "FIX_MTR14_PARALLEL_ASSERT: owned database {name} remains"
+            );
+        }
+
+        async fn workload(role: &str, barrier: Option<&Barrier>, deadline: Instant) {
+            let pid = std::process::id();
+            let start = db_cleanup_repro_process_start(pid);
+            if let Some(barrier) = barrier {
+                let registration =
+                    wait_marker(barrier, &format!("register-{role}.json"), deadline).await;
+                assert_eq!(
+                    number(&registration["details"], "pid"),
+                    pid,
+                    "unregistered child PID"
+                );
+                assert_eq!(
+                    text(&registration["details"], "case"),
+                    case(role),
+                    "unregistered child case"
+                );
+                assert_eq!(
+                    text(&registration["details"], "start"),
+                    start,
+                    "unregistered child start"
+                );
+            }
+            let directory = tempfile::tempdir().expect("child fixture directory");
+            let (own_config, own_guard) = test_db_config(directory.path()).await;
+            let (control_config, control_guard) = test_db_config(directory.path()).await;
+            let own_name = own_guard.schema().to_owned();
+            let control_name = control_guard.schema().to_owned();
+            let prefix = format!("mega2_test_{pid}_");
+            assert!(own_name.starts_with(&prefix) && control_name.starts_with(&prefix));
+            assert_ne!(own_name, control_name);
+            // Existing one-connection admin options keep backend-PID comparison meaningful.
+            let own = Database::connect(admin_connect_options(&own_config.db_url))
+                .await
+                .expect("own connection");
+            let control = Database::connect(admin_connect_options(&control_config.db_url))
+                .await
+                .expect("control connection");
+            let own_backend = backend(&own).await;
+            let control_backend = backend(&control).await;
+            if let Some(barrier) = barrier {
+                publish(
+                    barrier,
+                    &format!("ready-{role}.json"),
+                    marker(
+                        barrier,
+                        json!({"pid": pid, "start": start, "own": own_name,
+                    "control": control_name, "own_backend": own_backend,
+                    "control_backend": control_backend}),
+                    ),
+                );
+                if role == "a" {
+                    wait_marker(barrier, "release-a.json", deadline).await;
+                } else {
+                    let exited = wait_marker(barrier, "a-exited.json", deadline).await;
+                    let registered = read_file(&barrier.directory.join("register-a.json"))
+                        .expect("registered A");
+                    validate(barrier, &registered);
+                    assert_eq!(exited["details"]["pid"], registered["details"]["pid"]);
+                    assert_eq!(exited["details"]["start"], registered["details"]["start"]);
+                    assert_eq!(exited["details"]["one_pass"], true);
+                    // A's process and both of its fixtures have finished; B's exact backends survive.
+                    assert_eq!(
+                        backend(&own).await,
+                        own_backend,
+                        "B own backend was terminated"
+                    );
+                    assert_eq!(
+                        backend(&control).await,
+                        control_backend,
+                        "B control backend was terminated"
+                    );
+                    publish(
+                        barrier,
+                        "b-survived.json",
+                        marker(
+                            barrier,
+                            json!({"pid": pid, "start": start, "own_backend": own_backend,
+                        "control_backend": control_backend, "queried_after_a_exit": true}),
+                        ),
+                    );
+                }
+            }
+            own.close().await.expect("close own connection");
+            drop(own_guard);
+            absent(&own_name).await;
+            assert_eq!(
+                backend(&control).await,
+                control_backend,
+                "FIX_MTR14_PARALLEL_ASSERT: own cleanup terminated the independent control backend"
+            );
+            control.close().await.expect("close control connection");
+            drop(control_guard);
+            absent(&control_name).await;
+            let details = json!({"role": role, "pid": pid, "start": start,
+            "own": own_name, "control": control_name, "control_backend": control_backend,
+            "own_absent": true, "control_survived_own_cleanup": true, "control_absent": true});
+            if let Some(barrier) = barrier {
+                publish(
+                    barrier,
+                    &format!("finished-{role}.json"),
+                    marker(barrier, details),
+                );
+            } else {
+                db_cleanup_repro_emit("FIX_MTR14_PARALLEL_SINGLE", &details)
+                    .expect("single-mode receipt");
+            }
+        }
+
+        pub(super) fn child(role: &str) {
+            let started = Instant::now();
+            let barrier = inherited_barrier(); // Invalid external values panic before any fixture SQL.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("child runtime");
+            runtime.block_on(workload(role, barrier.as_ref(), started + LIMIT));
+        }
+
+        fn case(role: &str) -> &'static str {
+            if role == "a" { CHILD_A } else { CHILD_B }
+        }
+
+        fn one_pass(child: &DbCleanupReproChild, expected: &str) -> bool {
+            let Ok(logfile) = fs::read_to_string(child.raw_log_dir.join("libtest.log")) else {
+                return false;
+            };
+            let Ok(stdout) = fs::read_to_string(child.raw_log_dir.join("stdout.log")) else {
+                return false;
+            };
+            let expected = format!("ok {expected}");
+            let outcomes = logfile
+                .lines()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            let summaries = stdout
+                .lines()
+                .filter(|line| line.starts_with("test result:"))
+                .collect::<Vec<_>>();
+            outcomes == [expected.as_str()]
+                && summaries.len() == 1
+                && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+        }
+
+        fn spawn(role: &str, barrier: &Barrier, blocked_pids: &[u32]) -> DbCleanupReproChild {
+            let raw_log_dir = barrier.directory.join(format!("child-{role}"));
+            fs::create_dir(&raw_log_dir).expect("child log directory");
+            fs::set_permissions(&raw_log_dir, fs::Permissions::from_mode(0o700))
+                .expect("child log mode");
+            let mut command = Command::new(std::env::current_exe().expect("current exe"));
+            command
+                .args(["--exact", case(role), "--nocapture", "--logfile"])
+                .arg(raw_log_dir.join("libtest.log"))
+                .env(ENV, &barrier.directory)
+                .stdin(Stdio::null())
+                .stdout(File::create(raw_log_dir.join("stdout.log")).expect("child stdout"))
+                .stderr(File::create(raw_log_dir.join("stderr.log")).expect("child stderr"));
+            let blocked_pids = blocked_pids.to_vec();
+            let check_pid = move || {
+                let pid = unsafe { libc::getpid() } as u32;
+                if blocked_pids.contains(&pid) {
+                    Err(std::io::Error::from_raw_os_error(libc::EEXIST))
+                } else {
+                    Ok(())
+                }
+            };
+            unsafe { command.pre_exec(check_pid) };
+            let started = Instant::now();
+            let mut child = DbCleanupReproChild {
+                child: command
+                    .spawn()
+                    .expect("FIX_MTR14_PARALLEL_SETUP: spawn child"),
+                start: String::new(),
+                started,
+                raw_log_dir,
+                status: None,
+                one_pass: None,
+                timed_out: false,
+                stopped_on_unwind: false,
+            };
+            child.start = db_cleanup_repro_process_start(child.child.id());
+            child.receipt("spawn").expect("child identity receipt");
+            publish(
+                barrier,
+                &format!("register-{role}.json"),
+                marker(
+                    barrier,
+                    json!({"pid": child.child.id(), "start": child.start, "case": case(role)}),
+                ),
+            );
+            child
+        }
+
+        fn poll(child: &mut DbCleanupReproChild, expected: &str) {
+            if child.status.is_some() {
+                return;
+            }
+            child.status = child.child.try_wait().expect("wait owned child");
+            if child.status.is_none() && child.started.elapsed() >= LIMIT {
+                child.timed_out = true;
+                let _ = child.child.kill();
+                child.status = Some(child.child.wait().expect("reap own timed-out child"));
+            }
+            if child.status.is_some() {
+                child.one_pass = Some(
+                    !child.timed_out
+                        && child
+                            .status
+                            .as_ref()
+                            .is_some_and(std::process::ExitStatus::success)
+                        && one_pass(child, expected),
+                );
+                child.receipt("terminal").expect("child terminal receipt");
+            }
+        }
+
+        pub(super) fn parent() {
+            assert!(
+                std::env::var_os(ENV).is_none(),
+                "FIX_MTR14_PARALLEL_SETUP: unexpected parent barrier env"
+            );
+            let parent_pid = std::process::id();
+            let parent_start = db_cleanup_repro_process_start(parent_pid);
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let directory = tempfile::Builder::new()
+                .prefix(&format!("mega2-fix14-parallel-{parent_pid}-{nonce}-"))
+                .tempdir()
+                .expect("private barrier directory")
+                .keep();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("private barrier mode");
+            let directory = directory.canonicalize().expect("canonical private barrier");
+            checked_metadata(
+                &fs::symlink_metadata(&directory).expect("parent barrier metadata"),
+                true,
+            );
+            let barrier = Barrier {
+                directory,
+                nonce,
+                parent_pid,
+                parent_start,
+            };
+            let (_, baseline) = db_cleanup_repro_catalog(&["mega2_test_".to_owned()]);
+            let blocked_pids = baseline
+                .iter()
+                .filter_map(|row| {
+                    row.0
+                        .strip_prefix("mega2_test_")?
+                        .split_once('_')?
+                        .0
+                        .parse::<u32>()
+                        .ok()
+                })
+                .collect::<Vec<_>>();
+            publish(
+                &barrier,
+                "owner.json",
+                json!({"protocol": "mega2-fix14-parallel-v1",
+            "nonce": barrier.nonce, "parent_pid": barrier.parent_pid, "parent_start": barrier.parent_start}),
+            );
+            db_cleanup_repro_emit(
+                "FIX_MTR14_PARALLEL_ARTIFACT",
+                &json!({"raw_log_dir": barrier.directory,
+            "parent_pid": parent_pid, "parent_start": barrier.parent_start, "nonce": barrier.nonce,
+            "baseline_admin_closed": true, "child_count": 2, "child_timeout_seconds": 120,
+            "blocked_pids": blocked_pids}),
+            )
+            .expect("parallel artifact receipt");
+            let mut a = spawn("a", &barrier, &blocked_pids);
+            let mut b = spawn("b", &barrier, &blocked_pids);
+            loop {
+                poll(&mut a, CHILD_A);
+                poll(&mut b, CHILD_B);
+                assert!(
+                    a.status.is_none() && b.status.is_none(),
+                    "FIX_MTR14_PARALLEL_SETUP: child ended before overlap"
+                );
+                if let (Some(ready_a), Some(ready_b)) = (
+                    read_file(&barrier.directory.join("ready-a.json")),
+                    read_file(&barrier.directory.join("ready-b.json")),
+                ) {
+                    validate(&barrier, &ready_a);
+                    validate(&barrier, &ready_b);
+                    assert_eq!(number(&ready_a["details"], "pid"), a.child.id());
+                    assert_eq!(text(&ready_a["details"], "start"), a.start);
+                    assert_eq!(number(&ready_b["details"], "pid"), b.child.id());
+                    assert_eq!(text(&ready_b["details"], "start"), b.start);
+                    publish(
+                        &barrier,
+                        "release-a.json",
+                        marker(&barrier, json!({"both_children_live": true})),
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            while a.status.is_none() {
+                poll(&mut a, CHILD_A);
+                poll(&mut b, CHILD_B);
+                assert!(
+                    b.status.is_none(),
+                    "FIX_MTR14_PARALLEL_ASSERT: B ended before A"
+                );
+                if a.status.is_none() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            assert_eq!(
+                a.one_pass,
+                Some(true),
+                "FIX_MTR14_PARALLEL_CHILD_FAILURE: A must pass once"
+            );
+            let finished_a =
+                read_file(&barrier.directory.join("finished-a.json")).expect("finished A receipt");
+            validate(&barrier, &finished_a);
+            assert_eq!(finished_a["details"]["own_absent"], true);
+            assert_eq!(finished_a["details"]["control_absent"], true);
+            publish(
+                &barrier,
+                "a-exited.json",
+                marker(
+                    &barrier,
+                    json!({"pid": a.child.id(), "start": a.start, "one_pass": true}),
+                ),
+            );
+            while b.status.is_none() {
+                poll(&mut b, CHILD_B);
+                if b.status.is_none() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            assert_eq!(
+                b.one_pass,
+                Some(true),
+                "FIX_MTR14_PARALLEL_CHILD_FAILURE: B must pass once"
+            );
+            let survived =
+                read_file(&barrier.directory.join("b-survived.json")).expect("B survival receipt");
+            validate(&barrier, &survived);
+            assert_eq!(survived["details"]["queried_after_a_exit"], true);
+            let finished_b =
+                read_file(&barrier.directory.join("finished-b.json")).expect("finished B receipt");
+            validate(&barrier, &finished_b);
+            assert_eq!(finished_b["details"]["own_absent"], true);
+            assert_eq!(finished_b["details"]["control_absent"], true);
+            let prefixes = [
+                format!("mega2_test_{}_", a.child.id()),
+                format!("mega2_test_{}_", b.child.id()),
+            ];
+            let (_, after) = db_cleanup_repro_catalog(&prefixes);
+            assert!(
+                after
+                    .iter()
+                    .all(|row| baseline.iter().any(|before| before == row)),
+                "FIX_MTR14_PARALLEL_ASSERT: child-owned residue after both children passed"
+            );
+        }
+    }
+
+    #[test]
+    fn db_cleanup_parallel_parent() {
+        #[cfg(unix)]
+        db_cleanup_parallel_support::parent();
+        #[cfg(not(unix))]
+        panic!("FIX_MTR14_PARALLEL_SETUP: Unix identity and no-symlink checks required");
+    }
+
+    #[test]
+    fn db_cleanup_parallel_child_a() {
+        #[cfg(unix)]
+        db_cleanup_parallel_support::child("a");
+        #[cfg(not(unix))]
+        panic!("FIX_MTR14_PARALLEL_SETUP: Unix identity and no-symlink checks required");
+    }
+
+    #[test]
+    fn db_cleanup_parallel_child_b() {
+        #[cfg(unix)]
+        db_cleanup_parallel_support::child("b");
+        #[cfg(not(unix))]
+        panic!("FIX_MTR14_PARALLEL_SETUP: Unix identity and no-symlink checks required");
     }
 }
