@@ -57,8 +57,6 @@ use crate::{
 const DEFAULT_TEST_DATABASE_URL: &str =
     "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 
-static TEST_SCHEMA_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 pub async fn test_db_connection(_temp_dir: &Path) -> DatabaseConnection {
     connect_guarded_database(TestDatabaseKind::Default).await
 }
@@ -348,7 +346,7 @@ async fn create_test_database(kind: TestDatabaseKind) -> (String, TestSchemaGuar
     let schema = format!(
         "mega2_test_{}_{}",
         std::process::id(),
-        TEST_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed)
+        uuid::Uuid::new_v4().as_u128()
     );
 
     let admin = Database::connect(admin_connect_options(&admin_url))
@@ -1732,17 +1730,6 @@ mod schema_guard_tests {
             .expect("FIX_MTR14_REPRO_SETUP: private log directory")
             .keep();
         let (owner, baseline) = db_cleanup_repro_catalog(&["mega2_test_".to_owned()]);
-        let blocked_pids = baseline
-            .iter()
-            .filter_map(|row| {
-                row.0
-                    .strip_prefix("mega2_test_")?
-                    .split_once('_')?
-                    .0
-                    .parse::<u32>()
-                    .ok()
-            })
-            .collect::<Vec<_>>();
         std::fs::write(
             artifacts.join("baseline.json"),
             serde_json::json!({
@@ -1757,8 +1744,8 @@ mod schema_guard_tests {
                 "parent_pid": parent_pid, "parent_start": parent_start,
                 "raw_log_dir": artifacts, "baseline_admin_closed": true,
                 "child_case": DB_CLEANUP_REPRO_CASE, "child_count": 16,
-                "child_timeout_seconds": 120, "blocked_pids": blocked_pids,
-                "unix_pid_collision_gate": cfg!(unix),
+                "child_timeout_seconds": 120, "blocked_pids": [],
+                "unix_pid_collision_gate": false,
             }),
         )
         .expect("FIX_MTR14_REPRO_SETUP: emit artifact identity");
@@ -1781,22 +1768,6 @@ mod schema_guard_tests {
                 .stdin(std::process::Stdio::null())
                 .stdout(stdout)
                 .stderr(stderr);
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-
-                let blocked_pids = blocked_pids.clone();
-                let check_pid = move || {
-                    let pid = unsafe { libc::getpid() } as u32;
-                    if blocked_pids.contains(&pid) {
-                        Err(std::io::Error::from_raw_os_error(libc::EEXIST))
-                    } else {
-                        Ok(())
-                    }
-                };
-                // Only getpid, a read-only PID lookup, and a raw OS error run after fork.
-                unsafe { command.pre_exec(check_pid) };
-            }
             let child = command
                 .spawn()
                 .expect("FIX_MTR14_REPRO_SETUP: spawn exact child");
@@ -1894,10 +1865,7 @@ mod schema_guard_tests {
         use std::{
             fs::{self, File, OpenOptions},
             io::{Read, Write},
-            os::unix::{
-                fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-                process::CommandExt,
-            },
+            os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
             path::{Path, PathBuf},
             process::{Command, Stdio},
             time::{Duration, Instant},
@@ -2286,7 +2254,7 @@ mod schema_guard_tests {
                 && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
         }
 
-        fn spawn(role: &str, barrier: &Barrier, blocked_pids: &[u32]) -> DbCleanupReproChild {
+        fn spawn(role: &str, barrier: &Barrier) -> DbCleanupReproChild {
             let raw_log_dir = barrier.directory.join(format!("child-{role}"));
             fs::create_dir(&raw_log_dir).expect("child log directory");
             fs::set_permissions(&raw_log_dir, fs::Permissions::from_mode(0o700))
@@ -2299,16 +2267,6 @@ mod schema_guard_tests {
                 .stdin(Stdio::null())
                 .stdout(File::create(raw_log_dir.join("stdout.log")).expect("child stdout"))
                 .stderr(File::create(raw_log_dir.join("stderr.log")).expect("child stderr"));
-            let blocked_pids = blocked_pids.to_vec();
-            let check_pid = move || {
-                let pid = unsafe { libc::getpid() } as u32;
-                if blocked_pids.contains(&pid) {
-                    Err(std::io::Error::from_raw_os_error(libc::EEXIST))
-                } else {
-                    Ok(())
-                }
-            };
-            unsafe { command.pre_exec(check_pid) };
             let started = Instant::now();
             let mut child = DbCleanupReproChild {
                 child: command
@@ -2385,17 +2343,6 @@ mod schema_guard_tests {
                 parent_start,
             };
             let (_, baseline) = db_cleanup_repro_catalog(&["mega2_test_".to_owned()]);
-            let blocked_pids = baseline
-                .iter()
-                .filter_map(|row| {
-                    row.0
-                        .strip_prefix("mega2_test_")?
-                        .split_once('_')?
-                        .0
-                        .parse::<u32>()
-                        .ok()
-                })
-                .collect::<Vec<_>>();
             publish(
                 &barrier,
                 "owner.json",
@@ -2407,11 +2354,11 @@ mod schema_guard_tests {
                 &json!({"raw_log_dir": barrier.directory,
             "parent_pid": parent_pid, "parent_start": barrier.parent_start, "nonce": barrier.nonce,
             "baseline_admin_closed": true, "child_count": 2, "child_timeout_seconds": 120,
-            "blocked_pids": blocked_pids}),
+            "blocked_pids": []}),
             )
             .expect("parallel artifact receipt");
-            let mut a = spawn("a", &barrier, &blocked_pids);
-            let mut b = spawn("b", &barrier, &blocked_pids);
+            let mut a = spawn("a", &barrier);
+            let mut b = spawn("b", &barrier);
             loop {
                 poll(&mut a, CHILD_A);
                 poll(&mut b, CHILD_B);
@@ -2523,5 +2470,914 @@ mod schema_guard_tests {
         db_cleanup_parallel_support::child("b");
         #[cfg(not(unix))]
         panic!("FIX_MTR14_PARALLEL_SETUP: Unix identity and no-symlink checks required");
+    }
+
+    #[cfg(unix)]
+    mod db_namespace_pid_reuse_support {
+        use std::{
+            fs::{self, File, OpenOptions},
+            io::{Read, Write},
+            os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            path::{Path, PathBuf},
+            process::{Child, Command, ExitStatus, Stdio},
+            time::{Duration, Instant},
+        };
+
+        use futures::FutureExt;
+        use serde_json::{Value as Json, json};
+
+        use super::*;
+
+        const ENV: &str = "MEGA2_FIX_MTR26_BARRIER_DIR";
+        const CASE: &str = "jupiter::tests::schema_guard_tests::db_namespace_pid_reuse_child";
+        const LIMIT: Duration = Duration::from_secs(120);
+
+        struct Barrier {
+            directory: PathBuf,
+            nonce: String,
+            parent_pid: u32,
+            parent_start: String,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+        struct Identity {
+            name: String,
+            oid: i64,
+            owner_oid: i64,
+            owner: String,
+            allow_connections: bool,
+            is_template: bool,
+            connection_limit: i32,
+            comment: Option<String>,
+        }
+
+        fn runtime() -> Result<tokio::runtime::Runtime, String> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "FIX_MTR26_SETUP: admin runtime".to_owned())
+        }
+
+        async fn admin() -> Result<DatabaseConnection, String> {
+            let url = std::env::var("MEGA_DATABASE__DB_URL")
+                .unwrap_or_else(|_| DEFAULT_TEST_DATABASE_URL.into());
+            let mut options = admin_connect_options(&url);
+            options
+                .connect_timeout(Duration::from_secs(10))
+                .acquire_timeout(Duration::from_secs(10));
+            let db = tokio::time::timeout(Duration::from_secs(10), Database::connect(options))
+                .await
+                .map_err(|_| "FIX_MTR26_SETUP: admin connect timeout".to_owned())?
+                .map_err(|_| "FIX_MTR26_SETUP: admin connection".to_owned())?;
+            db.execute_unprepared("SET statement_timeout = '10s'")
+                .await
+                .map_err(|_| "FIX_MTR26_SETUP: bounded admin statement".to_owned())?;
+            Ok(db)
+        }
+
+        async fn catalog(
+            db: &DatabaseConnection,
+            name: &str,
+            exact: bool,
+        ) -> Result<Vec<Identity>, String> {
+            let predicate = if exact {
+                "datname::text = $1"
+            } else {
+                "left(datname::text, char_length($1::text)) = $1::text"
+            };
+            let rows = db
+                .query_all_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "SELECT datname::text AS name, oid::bigint AS oid, \
+                         datdba::bigint AS owner_oid, pg_get_userbyid(datdba)::text AS owner, \
+                         datallowconn AS allow_connections, datistemplate AS is_template, \
+                         datconnlimit AS connection_limit, \
+                         shobj_description(oid, 'pg_database')::text AS comment \
+                         FROM pg_catalog.pg_database WHERE {predicate} ORDER BY datname"
+                    ),
+                    [Value::from(name)],
+                ))
+                .await
+                .map_err(|_| "FIX_MTR26_SETUP: catalog query".to_owned())?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(Identity {
+                        name: row.try_get("", "name").map_err(|_| "catalog name")?,
+                        oid: row.try_get("", "oid").map_err(|_| "catalog OID")?,
+                        owner_oid: row
+                            .try_get("", "owner_oid")
+                            .map_err(|_| "catalog owner OID")?,
+                        owner: row.try_get("", "owner").map_err(|_| "catalog owner")?,
+                        allow_connections: row
+                            .try_get("", "allow_connections")
+                            .map_err(|_| "catalog allow connections")?,
+                        is_template: row
+                            .try_get("", "is_template")
+                            .map_err(|_| "catalog template")?,
+                        connection_limit: row
+                            .try_get("", "connection_limit")
+                            .map_err(|_| "catalog connection limit")?,
+                        comment: row.try_get("", "comment").map_err(|_| "catalog comment")?,
+                    })
+                })
+                .collect()
+        }
+
+        fn catalog_now(name: &str, exact: bool) -> Result<Vec<Identity>, String> {
+            runtime()?.block_on(async {
+                let db = admin().await?;
+                let result = catalog(&db, name, exact).await;
+                let closed = db
+                    .close()
+                    .await
+                    .map_err(|_| "FIX_MTR26_SETUP: close catalog admin".to_owned());
+                let rows = result?;
+                closed?;
+                Ok(rows)
+            })
+        }
+
+        fn text<'a>(value: &'a Json, field: &str) -> &'a str {
+            value[field].as_str().expect("FIX_MTR26_SETUP: text field")
+        }
+
+        fn pid(value: &Json, field: &str) -> u32 {
+            value[field]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .expect("FIX_MTR26_SETUP: PID field")
+        }
+
+        fn private_metadata(metadata: &fs::Metadata, directory: bool) {
+            assert_eq!(
+                metadata.uid(),
+                unsafe { libc::geteuid() },
+                "FIX_MTR26_SETUP: UID"
+            );
+            assert_eq!(
+                metadata.permissions().mode() & 0o7777,
+                if directory { 0o700 } else { 0o600 },
+                "FIX_MTR26_SETUP: private mode"
+            );
+            assert!(
+                if directory {
+                    metadata.is_dir()
+                } else {
+                    metadata.is_file()
+                },
+                "FIX_MTR26_SETUP: file kind"
+            );
+        }
+
+        fn read(path: &Path) -> Option<Json> {
+            let mut file = match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(error) => panic!("FIX_MTR26_SETUP: marker open: {error}"),
+            };
+            private_metadata(&file.metadata().expect("marker metadata"), false);
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take(16385)
+                .read_to_end(&mut bytes)
+                .expect("marker read");
+            assert!(bytes.len() <= 16384, "FIX_MTR26_SETUP: oversized marker");
+            Some(serde_json::from_slice(&bytes).expect("FIX_MTR26_SETUP: marker JSON"))
+        }
+
+        fn marker(barrier: &Barrier, details: Json) -> Json {
+            json!({"nonce": barrier.nonce, "parent_pid": barrier.parent_pid,
+                "parent_start": barrier.parent_start, "details": details})
+        }
+
+        fn publish(barrier: &Barrier, name: &str, value: Json) {
+            assert!(!name.contains('/'), "FIX_MTR26_SETUP: marker leaf");
+            let destination = barrier.directory.join(name);
+            assert!(!destination.exists(), "FIX_MTR26_SETUP: duplicate marker");
+            let staging = barrier
+                .directory
+                .join(format!(".{name}.{}", std::process::id()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&staging)
+                .expect("FIX_MTR26_SETUP: marker create");
+            file.write_all(value.to_string().as_bytes())
+                .expect("marker write");
+            file.flush().expect("marker flush");
+            drop(file);
+            fs::rename(staging, destination).expect("marker publish");
+        }
+
+        fn validate(barrier: &Barrier, value: &Json) {
+            assert_eq!(
+                text(value, "nonce"),
+                barrier.nonce,
+                "FIX_MTR26_SETUP: nonce"
+            );
+            assert_eq!(pid(value, "parent_pid"), barrier.parent_pid, "parent PID");
+            assert_eq!(
+                text(value, "parent_start"),
+                barrier.parent_start,
+                "parent start"
+            );
+        }
+
+        fn inherited() -> Option<Barrier> {
+            let directory = PathBuf::from(std::env::var_os(ENV)?);
+            assert!(
+                directory.is_absolute(),
+                "FIX_MTR26_SETUP: relative directory"
+            );
+            assert_eq!(
+                directory.canonicalize().expect("canonical directory"),
+                directory
+            );
+            for component in directory.ancestors() {
+                assert!(
+                    !fs::symlink_metadata(component)
+                        .expect("path metadata")
+                        .file_type()
+                        .is_symlink()
+                );
+            }
+            private_metadata(
+                &fs::symlink_metadata(&directory).expect("directory metadata"),
+                true,
+            );
+            let owner = read(&directory.join("owner.json")).expect("FIX_MTR26_SETUP: owner marker");
+            assert_eq!(text(&owner, "protocol"), "mega2-fix26-namespace-v1");
+            let nonce = text(&owner, "nonce").to_owned();
+            let parsed = uuid::Uuid::parse_str(&nonce).expect("FIX_MTR26_SETUP: nonce UUID");
+            assert_eq!(
+                parsed.get_version_num(),
+                4,
+                "FIX_MTR26_SETUP: random v4 nonce"
+            );
+            assert_eq!(parsed.to_string(), nonce, "canonical nonce");
+            let parent_pid = pid(&owner, "parent_pid");
+            assert_eq!(
+                unsafe { libc::getppid() } as u32,
+                parent_pid,
+                "actual parent PID"
+            );
+            let parent_start = text(&owner, "parent_start").to_owned();
+            assert_eq!(
+                db_cleanup_repro_process_start(parent_pid),
+                parent_start,
+                "parent identity"
+            );
+            let prefix = format!("mega2-fix26-namespace-{parent_pid}-{nonce}-");
+            assert!(
+                directory
+                    .file_name()
+                    .and_then(|leaf| leaf.to_str())
+                    .is_some_and(|leaf| leaf.starts_with(&prefix) && leaf.len() > prefix.len())
+            );
+            Some(Barrier {
+                directory,
+                nonce,
+                parent_pid,
+                parent_start,
+            })
+        }
+
+        async fn wait(barrier: &Barrier, name: &str, deadline: Instant) -> Json {
+            loop {
+                if let Some(value) = read(&barrier.directory.join(name)) {
+                    validate(barrier, &value);
+                    return value;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "FIX_MTR26_SETUP: marker timeout {name}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn decimal_name(name: &str, child_pid: u32) -> bool {
+            name.len() <= 63
+                && name
+                    .strip_prefix(&format!("mega2_test_{child_pid}_"))
+                    .is_some_and(|tail| {
+                        !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        }
+
+        async fn fixture(barrier: Option<&Barrier>, deadline: Instant) -> Json {
+            let child_pid = std::process::id();
+            let child_start = db_cleanup_repro_process_start(child_pid);
+            if let Some(barrier) = barrier {
+                let registration = wait(barrier, "register.json", deadline).await;
+                assert_eq!(pid(&registration["details"], "pid"), child_pid);
+                assert_eq!(text(&registration["details"], "start"), child_start);
+                assert_eq!(text(&registration["details"], "case"), CASE);
+                publish(
+                    barrier,
+                    "ready.json",
+                    marker(
+                        barrier,
+                        json!({"pid": child_pid, "start": child_start, "case": CASE}),
+                    ),
+                );
+                let go = wait(barrier, "go.json", deadline).await;
+                assert_eq!(
+                    text(&go["details"], "legacy"),
+                    format!("mega2_test_{child_pid}_0")
+                );
+                assert_eq!(
+                    db_cleanup_repro_process_start(barrier.parent_pid),
+                    barrier.parent_start
+                );
+            }
+            let temp = tempfile::tempdir().expect("fixture temp directory");
+            let (config, guard) = test_db_config(temp.path()).await;
+            let name = guard.schema().to_owned();
+            assert!(
+                decimal_name(&name, child_pid),
+                "FIX_MTR26_ASSERT: actual factory name"
+            );
+            if let Some(barrier) = barrier {
+                publish(
+                    barrier,
+                    "allocated.json",
+                    marker(barrier, json!({"name": name})),
+                );
+                assert_ne!(
+                    name,
+                    format!("mega2_test_{child_pid}_0"),
+                    "factory reused legacy name"
+                );
+            }
+            let db = crate::jupiter::storage::init::database_connection(&config)
+                .await
+                .expect("FIX_MTR26_ASSERT: actual config connection");
+            assert_eq!(current_database(&db).await, name, "actual factory database");
+            let row = db
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT current_schema()::text AS schema, 1::bigint AS alive".to_owned(),
+                ))
+                .await
+                .expect("FIX_MTR26_ASSERT: actual fixture query")
+                .expect("fixture query row");
+            assert_eq!(row.try_get::<String>("", "schema").expect("schema"), name);
+            assert_eq!(row.try_get::<i64>("", "alive").expect("alive"), 1);
+            db.close().await.expect("close actual factory connection");
+            drop(guard);
+            assert!(
+                !database_exists(&name).await,
+                "FIX_MTR26_ASSERT: actual guard residue"
+            );
+            json!({"pid": child_pid, "start": child_start, "case": CASE, "name": name,
+                "query_passed": true, "guard_dropped": true, "own_absent": true})
+        }
+
+        pub(super) fn child() {
+            let started = Instant::now();
+            let barrier = inherited();
+            runtime().expect("child runtime").block_on(async {
+                let result = std::panic::AssertUnwindSafe(tokio::time::timeout(
+                    LIMIT,
+                    fixture(barrier.as_ref(), started + LIMIT),
+                ))
+                .catch_unwind()
+                .await;
+                match result {
+                    Ok(Ok(details)) => {
+                        if let Some(barrier) = &barrier {
+                            publish(barrier, "finished.json", marker(barrier, details.clone()));
+                        }
+                        db_cleanup_repro_emit("FIX_MTR26_CHILD_FINISHED", &details)
+                            .expect("child receipt");
+                    }
+                    Ok(Err(_)) => panic!("FIX_MTR26_SETUP: child fixture timeout"),
+                    Err(payload) => {
+                        if let Some(barrier) = &barrier {
+                            let message = payload
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| {
+                                    payload
+                                        .downcast_ref::<&str>()
+                                        .map(|message| (*message).to_owned())
+                                })
+                                .unwrap_or_else(|| "non-string panic".to_owned());
+                            let message = message.chars().take(8192).collect::<String>();
+                            publish(
+                                barrier,
+                                "fixture-panic.json",
+                                marker(barrier, json!({"message": message})),
+                            );
+                        }
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            });
+        }
+
+        struct Run {
+            barrier: Barrier,
+            child: Child,
+            child_start: String,
+            started: Instant,
+            status: Option<ExitStatus>,
+            timed_out: bool,
+            sentinel: Option<(Identity, bool)>,
+        }
+
+        impl Run {
+            fn stop(&mut self) -> Result<(), String> {
+                if self.status.is_none() {
+                    self.status = self
+                        .child
+                        .try_wait()
+                        .map_err(|_| "FIX_MTR26_SETUP: child poll")?;
+                }
+                if self.status.is_none() {
+                    let observed = std::panic::catch_unwind(|| {
+                        db_cleanup_repro_process_start(self.child.id())
+                    })
+                    .ok();
+                    if observed.as_deref() != Some(self.child_start.as_str()) {
+                        return Err(
+                            "FIX_MTR26_SETUP: refuse signal after child identity mismatch"
+                                .to_owned(),
+                        );
+                    }
+                    self.child
+                        .kill()
+                        .map_err(|_| "FIX_MTR26_SETUP: stop own child")?;
+                    self.status = Some(
+                        self.child
+                            .wait()
+                            .map_err(|_| "FIX_MTR26_SETUP: reap own child")?,
+                    );
+                }
+                Ok(())
+            }
+
+            fn poll(&mut self) {
+                self.status = self.child.try_wait().expect("FIX_MTR26_SETUP: child wait");
+                if self.status.is_none() && self.started.elapsed() >= LIMIT {
+                    self.timed_out = true;
+                    self.stop().expect("FIX_MTR26_SETUP: timeout stop");
+                }
+            }
+
+            fn sentinel(&mut self, baseline: &[Identity]) -> Result<(), String> {
+                let name = format!("mega2_test_{}_0", self.child.id());
+                let current = catalog_now(&name, true)?;
+                if let Some(before) = baseline.iter().find(|row| row.name == name) {
+                    if current != [before.clone()] {
+                        return Err(
+                            "FIX_MTR26_SETUP: baseline sentinel identity changed".to_owned()
+                        );
+                    }
+                    self.sentinel = Some((before.clone(), false));
+                    return Ok(());
+                }
+                if !current.is_empty() {
+                    return Err(
+                        "FIX_MTR26_SETUP: unowned exact name appeared after baseline".to_owned(),
+                    );
+                }
+                let comment = format!(
+                    "FIX_MTR26:{}:{}:{}",
+                    self.barrier.nonce,
+                    self.barrier.parent_pid,
+                    self.child.id()
+                );
+                runtime()?.block_on(async {
+                    let db = admin().await?;
+                    let owner: String = db
+                        .query_one_raw(Statement::from_string(
+                            DatabaseBackend::Postgres,
+                            "SELECT current_user::text AS owner".to_owned(),
+                        ))
+                        .await
+                        .map_err(|_| "sentinel owner query")?
+                        .ok_or("sentinel owner row")?
+                        .try_get("", "owner")
+                        .map_err(|_| "sentinel owner value")?;
+                    db.execute_unprepared(&format!(
+                        "CREATE DATABASE {name} WITH ALLOW_CONNECTIONS false"
+                    ))
+                    .await
+                    .map_err(|_| "FIX_MTR26_SETUP: unique sentinel CREATE failed")?;
+                    let initial = catalog(&db, &name, true).await?;
+                    let [initial] = initial.as_slice() else {
+                        return Err("sentinel identity row".to_owned());
+                    };
+                    if initial.owner != owner
+                        || initial.allow_connections
+                        || initial.comment.is_some()
+                    {
+                        return Err(
+                            "FIX_MTR26_SETUP: newly created sentinel identity mismatch".to_owned()
+                        );
+                    }
+                    self.sentinel = Some((initial.clone(), true));
+                    db.execute_unprepared(&format!("COMMENT ON DATABASE {name} IS '{comment}'"))
+                        .await
+                        .map_err(|_| "FIX_MTR26_SETUP: sentinel comment")?;
+                    let labeled = catalog(&db, &name, true).await?;
+                    let [labeled] = labeled.as_slice() else {
+                        return Err("labeled sentinel row".to_owned());
+                    };
+                    let mut expected = initial.clone();
+                    expected.comment = Some(comment);
+                    if *labeled != expected {
+                        return Err("sentinel label identity mismatch".to_owned());
+                    }
+                    self.sentinel = Some((labeled.clone(), true));
+                    db.close()
+                        .await
+                        .map_err(|_| "FIX_MTR26_SETUP: close seed admin")?;
+                    Ok(())
+                })
+            }
+
+            fn cleanup(&mut self) -> Result<Json, String> {
+                let Some((expected, owned)) = self.sentinel.clone() else {
+                    return Ok(json!({"sentinel": null}));
+                };
+                let actual = catalog_now(&expected.name, true)?;
+                if actual != [expected.clone()] {
+                    return Err(
+                        "FIX_MTR26_RESOURCE: sentinel identity changed; no DDL permitted"
+                            .to_owned(),
+                    );
+                }
+                if owned {
+                    runtime()?.block_on(async {
+                        let db = admin().await?;
+                        if catalog(&db, &expected.name, true).await? != [expected.clone()] {
+                            db.close()
+                                .await
+                                .map_err(|_| "close changed sentinel admin")?;
+                            return Err(
+                                "FIX_MTR26_RESOURCE: pre-DROP identity changed; no DDL permitted"
+                                    .to_owned(),
+                            );
+                        }
+                        db.execute_unprepared(&format!("DROP DATABASE {}", expected.name))
+                            .await
+                            .map_err(|_| "FIX_MTR26_RESOURCE: owned sentinel DROP")?;
+                        let absent = catalog(&db, &expected.name, true).await?.is_empty();
+                        db.close()
+                            .await
+                            .map_err(|_| "FIX_MTR26_RESOURCE: close cleanup admin")?;
+                        if !absent {
+                            return Err("FIX_MTR26_RESOURCE: owned sentinel remains".to_owned());
+                        }
+                        Ok(())
+                    })?;
+                }
+                self.sentinel = None;
+                Ok(
+                    json!({"identity": expected, "owned": owned, "legacy_unchanged": true,
+                    "owned_seed_removed": owned, "baseline_seed_preserved": !owned}),
+                )
+            }
+        }
+
+        impl Drop for Run {
+            fn drop(&mut self) {
+                let stopped = self.stop();
+                let cleanup = if stopped.is_ok() {
+                    self.cleanup()
+                } else {
+                    Err("child not reaped; no cleanup".to_owned())
+                };
+                if stopped.is_err() || cleanup.is_err() {
+                    let _ = db_cleanup_repro_emit(
+                        "FIX_MTR26_UNWIND_STOP",
+                        &json!({"pid": self.child.id(),
+                        "start": self.child_start, "stop": stopped, "cleanup": cleanup}),
+                    );
+                }
+            }
+        }
+
+        fn log_file(path: &Path) -> File {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+                .expect("private child log")
+        }
+
+        fn one_test(directory: &Path, success: bool) -> bool {
+            let Ok(stdout) = fs::read_to_string(directory.join("stdout.log")) else {
+                return false;
+            };
+            let lines = stdout.lines().collect::<Vec<_>>();
+            let running = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| line.starts_with("running ").then_some((index, *line)))
+                .collect::<Vec<_>>();
+            let cases = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    (line.starts_with("test ") && !line.starts_with("test result:"))
+                        .then_some((index, *line))
+                })
+                .collect::<Vec<_>>();
+            let summaries = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    line.starts_with("test result:").then_some((index, *line))
+                })
+                .collect::<Vec<_>>();
+            if running.len() != 1
+                || running[0].1 != "running 1 test"
+                || cases.len() != 1
+                || summaries.len() != 1
+                || running[0].0 >= cases[0].0
+                || cases[0].0 >= summaries[0].0
+                || lines[summaries[0].0 + 1..]
+                    .iter()
+                    .any(|line| !line.is_empty())
+            {
+                return false;
+            }
+            let Some(tail) = cases[0].1.strip_prefix(&format!("test {CASE} ... ")) else {
+                return false;
+            };
+            let prefix = if success {
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+            } else {
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; "
+            };
+            let Some(summary) = summaries[0].1.strip_prefix(prefix) else {
+                return false;
+            };
+            let Some((filtered, elapsed)) = summary.split_once(" filtered out; finished in ")
+            else {
+                return false;
+            };
+            let Some(elapsed) = elapsed.strip_suffix('s') else {
+                return false;
+            };
+            let Some((seconds, fraction)) = elapsed.split_once('.') else {
+                return false;
+            };
+            let digits =
+                |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+            if !digits(filtered) || !digits(seconds) || fraction.len() != 2 || !digits(fraction) {
+                return false;
+            }
+            let terminals = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    matches!(*line, "ok" | "FAILED" | "ignored").then_some((index, *line))
+                })
+                .collect::<Vec<_>>();
+            let expected = if success { "ok" } else { "FAILED" };
+            let terminal_index = if tail == expected {
+                if !terminals.is_empty() {
+                    return false;
+                }
+                cases[0].0
+            } else {
+                let inline_marker =
+                    tail.strip_prefix("FIX_MTR26_CHILD_FINISHED ")
+                        .is_some_and(|raw| {
+                            serde_json::from_str::<Json>(raw).is_ok_and(|value| value.is_object())
+                        });
+                if (!tail.is_empty() && !inline_marker)
+                    || terminals.len() != 1
+                    || terminals[0].1 != expected
+                    || terminals[0].0 <= cases[0].0
+                    || terminals[0].0 >= summaries[0].0
+                {
+                    return false;
+                }
+                terminals[0].0
+            };
+            let failures = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| (*line == "failures:").then_some(index))
+                .collect::<Vec<_>>();
+            let captured = lines
+                .iter()
+                .copied()
+                .filter(|line| line.starts_with("---- "))
+                .collect::<Vec<_>>();
+            if success {
+                return failures.is_empty() && captured.is_empty();
+            }
+            let Some(last_failure) = failures.last().copied() else {
+                return false;
+            };
+            let expected_capture = format!("---- {CASE} stdout ----");
+            if !(1..=2).contains(&failures.len())
+                || failures
+                    .iter()
+                    .any(|index| *index <= terminal_index || *index >= summaries[0].0)
+                || captured.len() > 1
+                || captured
+                    .iter()
+                    .any(|line| *line != expected_capture.as_str())
+            {
+                return false;
+            }
+            let failed_cases = lines[last_failure + 1..summaries[0].0]
+                .iter()
+                .copied()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            let expected_failed = format!("    {CASE}");
+            failed_cases == [expected_failed.as_str()]
+        }
+
+        pub(super) fn parent() {
+            assert!(
+                std::env::var_os(ENV).is_none(),
+                "FIX_MTR26_SETUP: parent inherited barrier"
+            );
+            let parent_pid = std::process::id();
+            let parent_start = db_cleanup_repro_process_start(parent_pid);
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let directory = tempfile::Builder::new()
+                .prefix(&format!("mega2-fix26-namespace-{parent_pid}-{nonce}-"))
+                .tempdir()
+                .expect("private directory")
+                .keep();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("private directory mode");
+            let directory = directory
+                .canonicalize()
+                .expect("canonical private directory");
+            private_metadata(
+                &fs::symlink_metadata(&directory).expect("private directory metadata"),
+                true,
+            );
+            let barrier = Barrier {
+                directory,
+                nonce,
+                parent_pid,
+                parent_start,
+            };
+            let baseline = catalog_now("mega2_test_", false)
+                .expect("FIX_MTR26_SETUP: initial baseline closed");
+            publish(
+                &barrier,
+                "owner.json",
+                json!({"protocol": "mega2-fix26-namespace-v1",
+                "nonce": barrier.nonce, "parent_pid": barrier.parent_pid, "parent_start": barrier.parent_start}),
+            );
+            let started = Instant::now();
+            let child = Command::new(std::env::current_exe().expect("current test binary"))
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(ENV, &barrier.directory)
+                .stdin(Stdio::null())
+                .stdout(log_file(&barrier.directory.join("stdout.log")))
+                .stderr(log_file(&barrier.directory.join("stderr.log")))
+                .spawn()
+                .expect("FIX_MTR26_SETUP: one fresh exact child");
+            let mut run = Run {
+                barrier,
+                child,
+                child_start: String::new(),
+                started,
+                status: None,
+                timed_out: false,
+                sentinel: None,
+            };
+            run.child_start = db_cleanup_repro_process_start(run.child.id());
+            db_cleanup_repro_emit("FIX_MTR26_ARTIFACT", &json!({"directory": run.barrier.directory,
+                "nonce": run.barrier.nonce, "parent_pid": parent_pid, "parent_start": run.barrier.parent_start,
+                "pid": run.child.id(), "start": run.child_start, "case": CASE, "child_count": 1,
+                "timeout_seconds": 120, "baseline_admin_closed": true})).expect("artifact receipt");
+            publish(
+                &run.barrier,
+                "register.json",
+                marker(
+                    &run.barrier,
+                    json!({"pid": run.child.id(), "start": run.child_start, "case": CASE}),
+                ),
+            );
+            let ready = loop {
+                run.poll();
+                if let Some(ready) = read(&run.barrier.directory.join("ready.json")) {
+                    break ready;
+                }
+                assert!(
+                    run.status.is_none(),
+                    "FIX_MTR26_SETUP: child ended before READY"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            validate(&run.barrier, &ready);
+            assert_eq!(pid(&ready["details"], "pid"), run.child.id());
+            assert_eq!(text(&ready["details"], "start"), run.child_start);
+            assert_eq!(text(&ready["details"], "case"), CASE);
+            assert_eq!(
+                db_cleanup_repro_process_start(run.child.id()),
+                run.child_start
+            );
+            run.sentinel(&baseline)
+                .expect("FIX_MTR26_SETUP: exact sentinel ready and admin closed");
+            let legacy = format!("mega2_test_{}_0", run.child.id());
+            db_cleanup_repro_emit("FIX_MTR26_SENTINEL", &json!({"identity": run.sentinel.as_ref().map(|seed| &seed.0),
+                "owned": run.sentinel.as_ref().is_some_and(|seed| seed.1), "seed_admin_closed": true})).expect("seed receipt");
+            publish(
+                &run.barrier,
+                "go.json",
+                marker(&run.barrier, json!({"legacy": legacy})),
+            );
+            while run.status.is_none() {
+                run.poll();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let finished = read(&run.barrier.directory.join("finished.json"));
+            let panic = read(&run.barrier.directory.join("fixture-panic.json"));
+            for receipt in finished.iter().chain(panic.iter()) {
+                validate(&run.barrier, receipt);
+            }
+            let exit = run.status.as_ref().and_then(ExitStatus::code);
+            let one_pass =
+                exit == Some(0) && one_test(&run.barrier.directory, true) && !run.timed_out;
+            let old_collision = exit == Some(101)
+                && one_test(&run.barrier.directory, false)
+                && !run.timed_out
+                && panic.as_ref().is_some_and(|receipt| {
+                    let message = text(&receipt["details"], "message");
+                    message.starts_with("failed to prepare PostgreSQL test schema: ")
+                        && message.contains("code: \"42P04\"")
+                        && message.contains(&format!(
+                            "message: \"database \\\"{legacy}\\\" already exists\""
+                        ))
+                });
+            let cleanup = run
+                .cleanup()
+                .expect("FIX_MTR26_RESOURCE: exact legacy identity and cleanup before oracle");
+            let after = catalog_now(&format!("mega2_test_{}_", run.child.id()), false)
+                .expect("FIX_MTR26_RESOURCE: closed after-catalog");
+            let no_new = after
+                .iter()
+                .all(|row| baseline.iter().any(|before| before == row));
+            db_cleanup_repro_emit(
+                "FIX_MTR26_TERMINAL",
+                &json!({"pid": run.child.id(), "start": run.child_start,
+                "exit_code": exit, "one_pass": one_pass, "old_42P04_exact_sentinel": old_collision,
+                "timed_out": run.timed_out, "cleanup": cleanup, "no_new_child_databases": no_new,
+                "resources_checked_before_oracle": true}),
+            )
+            .expect("terminal receipt");
+            assert!(no_new, "FIX_MTR26_RESOURCE: actual child fixture residue");
+            if old_collision {
+                panic!(
+                    "FIX_MTR26_OLD_COLLISION: real fixture rejected its exact PID_0 sentinel with 42P04"
+                );
+            }
+            assert!(
+                one_pass && panic.is_none(),
+                "FIX_MTR26_ORACLE: expected exactly one real fixture pass"
+            );
+            let finished = finished.expect("FIX_MTR26_ORACLE: actual fixture receipt");
+            let details = &finished["details"];
+            assert_eq!(pid(details, "pid"), run.child.id());
+            assert_eq!(text(details, "start"), run.child_start);
+            assert_eq!(text(details, "case"), CASE);
+            let name = text(details, "name");
+            assert!(decimal_name(name, run.child.id()) && name != legacy);
+            assert_eq!(details["query_passed"], true);
+            assert_eq!(details["guard_dropped"], true);
+            assert_eq!(details["own_absent"], true);
+        }
+    }
+
+    #[test]
+    fn db_namespace_pid_reuse_parent() {
+        #[cfg(unix)]
+        db_namespace_pid_reuse_support::parent();
+        #[cfg(not(unix))]
+        panic!("FIX_MTR26_SETUP: Unix PID identity and private directory checks required");
+    }
+
+    #[test]
+    fn db_namespace_pid_reuse_child() {
+        #[cfg(unix)]
+        db_namespace_pid_reuse_support::child();
+        #[cfg(not(unix))]
+        panic!("FIX_MTR26_SETUP: Unix PID identity and private directory checks required");
     }
 }
