@@ -1503,6 +1503,14 @@ mod tests {
                 assert_eq!(status, 400);
                 assert_eq!(resolved["error"]["code"], "SCOPE_INVALID");
                 assert!(resolved.get("lease_id").is_none());
+                state
+                    .storage
+                    .mono_storage()
+                    .base
+                    .connection
+                    .close_by_ref()
+                    .await
+                    .expect("close test pool before fixture teardown");
                 continue;
             }
             assert_eq!(status, 200);
@@ -1525,6 +1533,14 @@ mod tests {
                 raw
             );
             crate::ceres::snapshot::runtime::runtime().release_lease(lease);
+            state
+                .storage
+                .mono_storage()
+                .base
+                .connection
+                .close_by_ref()
+                .await
+                .expect("close test pool before fixture teardown");
         }
     }
 }
