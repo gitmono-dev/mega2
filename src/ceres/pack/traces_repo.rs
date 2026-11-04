@@ -242,6 +242,16 @@ pub(crate) async fn resolve_trace_receive(
     locator: &TracesLocator,
     caller: TracesCaller<'_>,
 ) -> Result<TraceReceiveScope, MegaError> {
+    let (_, scope) = resolve_trace_receive_with_discovery(db, config, locator, caller).await?;
+    Ok(scope)
+}
+
+pub(crate) async fn resolve_trace_receive_with_discovery(
+    db: &DatabaseConnection,
+    config: &TracesConfig,
+    locator: &TracesLocator,
+    caller: TracesCaller<'_>,
+) -> Result<(TraceDiscovery, TraceReceiveScope), MegaError> {
     let discovery =
         resolve_trace_discovery(db, config, locator, caller, ServiceType::ReceivePack).await?;
     let stream = match discovery.scope_id() {
@@ -320,7 +330,7 @@ pub(crate) async fn resolve_trace_receive(
     }) {
         return Err(TracesError::ObjectIntegrity.into());
     }
-    Ok(TraceReceiveScope {
+    let scope = TraceReceiveScope {
         stream_id: stream
             .as_ref()
             .map(|stream| stream.id.clone())
@@ -334,7 +344,8 @@ pub(crate) async fn resolve_trace_receive(
         tip_oid: tip_oid.map(|oid| oid.to_ascii_lowercase()),
         expected_generation,
         first_scope: stream.is_none(),
-    })
+    };
+    Ok((discovery, scope))
 }
 
 /// A single request's authorized, published snapshot. No public constructor,

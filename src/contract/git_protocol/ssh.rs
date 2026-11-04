@@ -15,7 +15,7 @@ use crate::{
     ceres::{
         api_service::state::ProtocolApiState,
         lfs::lfs_structs::Link,
-        pack::traces_repo::resolve_trace_discovery,
+        pack::traces_repo::{TraceDiscovery, resolve_trace_discovery},
         protocol::{
             ServiceType, SmartSession, TransportProtocol,
             import_refs::CommandType,
@@ -445,7 +445,7 @@ impl SshServer {
         &self,
         locator: &TracesLocator,
         service_type: ServiceType,
-    ) -> Result<(), MegaError> {
+    ) -> Result<TraceDiscovery, MegaError> {
         let credential = self
             .authenticated_credential
             .as_ref()
@@ -484,8 +484,7 @@ impl SshServer {
                 snapshot: snapshot.as_deref(),
             },
         };
-        resolve_trace_discovery(db, &config.traces, locator, caller, service_type).await?;
-        Ok(())
+        resolve_trace_discovery(db, &config.traces, locator, caller, service_type).await
     }
 
     async fn send_exec_err(
@@ -611,18 +610,23 @@ impl server::Handler for SshServer {
         match exec.kind {
             SshExecKind::Git(service_type) => {
                 let is_trace = exec.traces.is_some();
-                if let Some(locator) = &exec.traces
-                    && let Err(error) = self.authorize_traces_exec(locator, service_type).await
-                {
-                    tracing::debug!(error = %error, "SSH traces exec authorization rejected");
-                    self.send_exec_err(
-                        channel,
-                        session,
-                        &SshErrReply::new("traces locator not found", 1),
-                    )
-                    .await?;
-                    return Ok(());
-                }
+                let trace_discovery = if let Some(locator) = &exec.traces {
+                    match self.authorize_traces_exec(locator, service_type).await {
+                        Ok(discovery) => Some(discovery),
+                        Err(error) => {
+                            tracing::debug!(error = %error, "SSH traces exec authorization rejected");
+                            self.send_exec_err(
+                                channel,
+                                session,
+                                &SshErrReply::new("traces locator not found", 1),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                };
                 let mut smart_protocol = SmartSession::from_state(
                     exec.repo_path,
                     service_type,
@@ -630,6 +634,9 @@ impl server::Handler for SshServer {
                     &self.state,
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if let Some(discovery) = &trace_discovery {
+                    smart_protocol.hash_kind = discovery.hash_kind();
+                }
                 if let Some(username) = self.authenticated_user.clone() {
                     smart_protocol.set_authenticated_user(username);
                 }
@@ -686,7 +693,10 @@ impl server::Handler for SshServer {
 
                 let is_v2 = self.v2_channels.get(&channel).copied().unwrap_or(false);
                 if is_v2 && service_type == ServiceType::UploadPack {
-                    let v2_adv = v2::build_v2_capability_advertisement(smart_protocol.hash_kind);
+                    let v2_adv = match &trace_discovery {
+                        Some(discovery) => v2::build_traces_v2_capability_advertisement(discovery)?,
+                        None => v2::build_v2_capability_advertisement(smart_protocol.hash_kind),
+                    };
                     self.channels.insert(
                         channel,
                         GitSshChannelState {
@@ -700,8 +710,15 @@ impl server::Handler for SshServer {
                     session.data(channel, v2_adv.to_vec())?;
                     session.channel_success(channel)?;
                 } else {
-                    let outcome =
-                        classify_v0_advertise(smart_protocol.git_info_refs(&self.state).await)?;
+                    let advertisement = match &trace_discovery {
+                        Some(discovery) => smart::build_traces_v0_advertisement(
+                            discovery,
+                            TransportProtocol::Ssh,
+                            None,
+                        ),
+                        None => smart_protocol.git_info_refs(&self.state).await,
+                    };
+                    let outcome = classify_v0_advertise(advertisement)?;
                     let mut clients = self.clients.lock().await;
                     let mut out = SessionChannelOut { channel, session };
                     finish_v0_exec(

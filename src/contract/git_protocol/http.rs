@@ -22,7 +22,10 @@ use crate::{
     api::oauth::{bearer_token_from_authorization_value, login_user_from_mono_access_token},
     ceres::{
         api_service::state::ProtocolApiState,
-        pack::traces_repo::{resolve_trace_discovery, resolve_trace_fetch, resolve_trace_receive},
+        pack::traces_repo::{
+            TraceDiscovery, resolve_trace_discovery, resolve_trace_fetch, resolve_trace_receive,
+            resolve_trace_receive_with_discovery,
+        },
         protocol::{ServiceType, SmartSession, TransportProtocol, smart, v2},
         traces::{
             admission::TRACE_REQUEST_CAPACITY,
@@ -404,6 +407,62 @@ async fn trace_read_tip(
     Ok((grant.hash_kind(), grant.tip_oid().map(str::to_owned)))
 }
 
+async fn trace_discovery_tip(
+    state: &ProtocolApiState,
+    locator: &TracesLocator,
+    auth: &TraceHttpAuth,
+    service: ServiceType,
+) -> Result<(TraceDiscovery, Option<String>), MegaError> {
+    let config = state.storage.config();
+    let mono = state.storage.mono_storage();
+    let db = mono.get_connection();
+    match service {
+        ServiceType::UploadPack => {
+            let discovery =
+                resolve_trace_discovery(db, &config.traces, locator, auth.caller(), service)
+                    .await?;
+            let Some(scope_id) = discovery.scope_id() else {
+                return Ok((discovery, None));
+            };
+            let grant = resolve_trace_fetch(
+                db,
+                &config.traces,
+                locator,
+                auth.caller(),
+                Some(&state.entity_store),
+            )
+            .await?;
+            if grant.server_id() != discovery.server_id()
+                || grant.hash_kind() != discovery.hash_kind()
+                || grant.stream_id() != scope_id.to_string()
+            {
+                return Err(TracesError::UnknownScope.into());
+            }
+            Ok((discovery, grant.tip_oid().map(str::to_owned)))
+        }
+        ServiceType::ReceivePack => {
+            let (discovery, scope) =
+                resolve_trace_receive_with_discovery(db, &config.traces, locator, auth.caller())
+                    .await?;
+            let same_scope = match discovery.scope_id() {
+                Some(scope_id) => !scope.first_scope && scope.stream_id == scope_id.to_string(),
+                None => scope.first_scope && scope.tip_oid.is_none(),
+            };
+            if !same_scope || scope.hash_kind != discovery.hash_kind() {
+                return Err(TracesError::UnknownScope.into());
+            }
+            Ok((discovery, scope.tip_oid))
+        }
+    }
+}
+
+fn trace_advertisement_error(error: ProtocolError) -> MegaError {
+    match error {
+        ProtocolError::Traces(error) => error.into(),
+        _ => trace_invalid(),
+    }
+}
+
 async fn trace_info_refs(
     state: &ProtocolApiState,
     locator: &TracesLocator,
@@ -411,50 +470,17 @@ async fn trace_info_refs(
     headers: &http::HeaderMap,
 ) -> Result<Response<Body>, MegaError> {
     let auth = trace_http_auth(state, headers).await?;
-    let (kind, tip) = match service {
-        ServiceType::UploadPack => trace_read_tip(state, locator, &auth).await?,
-        ServiceType::ReceivePack => {
-            let mono = state.storage.mono_storage();
-            let scope = resolve_trace_receive(
-                mono.get_connection(),
-                &state.storage.config().traces,
-                locator,
-                auth.caller(),
-            )
-            .await?;
-            (scope.hash_kind, scope.tip_oid)
-        }
-    };
-    let mut body = BytesMut::new();
+    let (discovery, tip) = trace_discovery_tip(state, locator, &auth, service).await?;
     let content_type = match service {
         ServiceType::UploadPack => "application/x-git-upload-pack-advertisement",
         ServiceType::ReceivePack => "application/x-git-receive-pack-advertisement",
     };
-    if service == ServiceType::UploadPack && is_v2_request(headers) {
-        for line in ["version 2\n", "ls-refs\n", "fetch\n"] {
-            smart::add_pkt_line_string(&mut body, line.to_owned());
-        }
-        smart::add_pkt_line_string(&mut body, format!("object-format={}\n", kind.as_str()));
+    let body = if service == ServiceType::UploadPack && is_v2_request(headers) {
+        v2::build_traces_v2_capability_advertisement(&discovery)
     } else {
-        let (service_name, capabilities) = match service {
-            ServiceType::UploadPack => ("git-upload-pack", "allow-reachable-sha1-in-want"),
-            ServiceType::ReceivePack => ("git-receive-pack", "report-status no-thin"),
-        };
-        smart::add_pkt_line_string(&mut body, format!("# service={service_name}\n"));
-        body.extend_from_slice(b"0000");
-        let (oid, reference) = match tip {
-            Some(tip) => (tip, TRACE_REF),
-            None => ("0".repeat(kind.hex_len()), "capabilities^{}"),
-        };
-        smart::add_pkt_line_string(
-            &mut body,
-            format!(
-                "{oid} {reference}\0{capabilities} object-format={}\n",
-                kind.as_str()
-            ),
-        );
+        smart::build_traces_v0_advertisement(&discovery, TransportProtocol::Http, tip.as_deref())
     }
-    body.extend_from_slice(b"0000");
+    .map_err(trace_advertisement_error)?;
     Ok(trace_response(Body::from(body.freeze()), content_type))
 }
 
@@ -472,11 +498,20 @@ fn trace_capabilities<'a>(
     require_sha256_format: bool,
 ) -> Result<(), MegaError> {
     let mut format = None;
+    let mut agent_seen = false;
     for cap in caps {
         if let Some(value) = cap.strip_prefix("object-format=") {
             if format.replace(value).is_some() || value != kind.as_str() {
                 return Err(trace_invalid());
             }
+        } else if let Some(value) = cap.strip_prefix("agent=") {
+            if agent_seen
+                || value.is_empty()
+                || value.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(trace_invalid());
+            }
+            agent_seen = true;
         } else if !allowed.contains(&cap) {
             return Err(trace_invalid());
         }
@@ -1345,6 +1380,77 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn traces_agent_receive_accepts_real_git_capabilities_for_both_formats() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let old = "0".repeat(kind.hex_len());
+            let new = "a".repeat(kind.hex_len());
+            let mut command = BytesMut::new();
+            smart::add_pkt_line_string(
+                &mut command,
+                format!(
+                    "{old} {new} {TRACE_REF}\0report-status object-format={} agent=git/2.49.1-Linux\n",
+                    kind.as_str()
+                ),
+            );
+            command.extend_from_slice(b"0000");
+            let (mut writer, mut reader) = tokio::io::duplex(512);
+            writer.write_all(&command).await.unwrap();
+            drop(writer);
+            assert!(
+                trace_receive_commands(&mut reader, kind)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn traces_agent_upload_accepts_v0_and_v2_negotiation() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let oid = "a".repeat(kind.hex_len());
+            let mut v0 = BytesMut::new();
+            smart::add_pkt_line_string(
+                &mut v0,
+                format!(
+                    "want {oid} object-format={} agent=git/2.49.1-Linux\n",
+                    kind.as_str()
+                ),
+            );
+            v0.extend_from_slice(b"0000");
+            smart::add_pkt_line_string(&mut v0, "done\n".to_owned());
+            assert!(matches!(
+                trace_upload_command(v0.freeze(), kind),
+                Ok(TraceUploadCommand::Fetch { v2: false, .. })
+            ));
+
+            let mut v2 = BytesMut::new();
+            smart::add_pkt_line_string(&mut v2, "command=fetch\n".to_owned());
+            smart::add_pkt_line_string(&mut v2, "agent=git/2.49.1-Linux\n".to_owned());
+            smart::add_pkt_line_string(&mut v2, format!("object-format={}\n", kind.as_str()));
+            v2.extend_from_slice(b"0001");
+            smart::add_pkt_line_string(&mut v2, format!("want {oid}\n"));
+            smart::add_pkt_line_string(&mut v2, "done\n".to_owned());
+            v2.extend_from_slice(b"0000");
+            assert!(matches!(
+                trace_upload_command(v2.freeze(), kind),
+                Ok(TraceUploadCommand::Fetch { v2: true, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn traces_agent_rejects_empty_duplicate_and_invalid_values() {
+        for caps in [
+            vec!["agent="],
+            vec!["agent=git/1", "agent=git/2"],
+            vec!["agent=git/1\u{7f}"],
+        ] {
+            assert!(trace_capabilities(caps.into_iter(), HashKind::Sha1, &[], false).is_err());
+        }
+    }
 
     #[test]
     fn sha256_capability_negotiation_distinguishes_v0_upload() {

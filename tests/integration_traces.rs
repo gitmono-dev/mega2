@@ -2166,6 +2166,269 @@ mod disabled_http {
         object_format: String,
     }
 
+    fn fixture_file_sha256(path: &Path) -> String {
+        let mut file = fs::File::open(path).expect("open pinned fixture input");
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let size =
+                std::io::Read::read(&mut file, &mut buffer).expect("hash pinned fixture input");
+            if size == 0 {
+                break;
+            }
+            digest.update(&buffer[..size]);
+        }
+        hex::encode(digest.finalize())
+    }
+
+    struct ProviderBridgeChild(Option<Child>);
+
+    impl Drop for ProviderBridgeChild {
+        fn drop(&mut self) {
+            let Some(mut child) = self.0.take() else {
+                return;
+            };
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            #[cfg(unix)]
+            {
+                let group = i32::try_from(child.id()).expect("owned provider process group");
+                // This unreaped child was created as its own group leader;
+                // its PID cannot be reused while we signal its owned group.
+                unsafe {
+                    libc::kill(-group, libc::SIGTERM);
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        return;
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
+            child.wait().expect("reap owned provider bridge");
+        }
+    }
+
+    async fn qualify_fixture_local_root(fixture: &Fixture) {
+        // Normal repository tests remain self-contained. Formal MTR92/C
+        // windows require and pin both environment inputs in their runner.
+        let Some(manifest_path) = std::env::var_os("MEGA2_MTR92_PROVIDER_QUALIFICATION_MANIFEST")
+        else {
+            return;
+        };
+        let manifest_path = PathBuf::from(manifest_path);
+        assert!(
+            manifest_path.is_absolute(),
+            "explicit provider manifest path"
+        );
+        let manifest_bytes = fs::read(&manifest_path).expect("provider qualification manifest");
+        let manifest_sha = hex::encode(Sha256::digest(&manifest_bytes));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_bytes).expect("provider manifest JSON");
+        assert_eq!(manifest["schema_version"].as_u64(), Some(1));
+        assert_eq!(
+            manifest["kind"].as_str(),
+            Some("mega2-local-provider-qualification")
+        );
+        assert_eq!(
+            manifest["local_requires_exact_fixture_probe"].as_bool(),
+            Some(true)
+        );
+        let bridge = &manifest["bridge"];
+        let text = |value: &serde_json::Value| {
+            value.as_str().expect("provider manifest string").to_owned()
+        };
+        let script = PathBuf::from(text(&bridge["script_path"]));
+        let python = PathBuf::from(text(&bridge["python_path"]));
+        let artifact = PathBuf::from(text(&manifest["archived_libtest"]["path"]));
+        assert!(script.is_absolute() && python.is_absolute() && artifact.is_absolute());
+        assert_eq!(fixture_file_sha256(&script), text(&bridge["script_sha256"]));
+        assert_eq!(fixture_file_sha256(&python), text(&bridge["python_sha256"]));
+        assert_eq!(
+            fixture_file_sha256(&artifact),
+            text(&manifest["archived_libtest"]["sha256"])
+        );
+        let seconds = bridge["total_budget_seconds"]
+            .as_u64()
+            .expect("declared provider bridge budget");
+        assert!(
+            (1..=180).contains(&seconds),
+            "provider bridge keeps its declared aggregate budget"
+        );
+        let archive = PathBuf::from(
+            std::env::var_os("MEGA2_MTR92_PROVIDER_ROOT_RECEIPTS")
+                .expect("provider manifest requires durable receipt archive"),
+        );
+        assert!(archive.is_absolute());
+        let archive_metadata =
+            fs::symlink_metadata(&archive).expect("existing durable provider archive");
+        assert!(archive_metadata.is_dir() && !archive_metadata.file_type().is_symlink());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(archive_metadata.permissions().mode() & 0o777, 0o700);
+        }
+        let root = fixture.temp.path().join("objects");
+        assert!(
+            !root.exists(),
+            "a new fixture owns its fresh exact object root"
+        );
+        let mut directory = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory
+            .create(&root)
+            .expect("create exact fixture Local root");
+        let root = root.canonicalize().expect("canonical fixture Local root");
+        let receipt_dir = archive
+            .canonicalize()
+            .expect("canonical durable provider archive")
+            .join(format!("fixture-{}", Uuid::new_v4()));
+        assert!(!receipt_dir.exists());
+        let receipt_path = receipt_dir.join("ROOT-RECEIPT.json");
+        let mut command = Command::new(&python);
+        command
+            .env_clear()
+            .current_dir(fixture.temp.path())
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .arg(&script)
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("--root")
+            .arg(&root)
+            .arg("--receipt-dir")
+            .arg(&receipt_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                fs::File::create(fixture.temp.path().join("provider-bridge.stderr"))
+                    .expect("private provider bridge stderr"),
+            ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = ProviderBridgeChild(Some(
+            command
+                .spawn()
+                .expect("start pinned exact-root provider bridge"),
+        ));
+        // The bridge's 180s includes its internal 20s cleanup reserve. The
+        // outer 5s allows its controlled stop receipt; Drop owns TERM/KILL.
+        let deadline = Instant::now() + Duration::from_secs(seconds + 5);
+        let status = loop {
+            if let Some(status) = child
+                .0
+                .as_mut()
+                .expect("owned provider bridge")
+                .try_wait()
+                .expect("poll provider bridge")
+            {
+                child.0.take();
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "provider bridge exceeded declared budget plus 5s closeout"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            status.success(),
+            "exact-root provider qualification failed: {status}"
+        );
+        let receipt_bytes = fs::read(&receipt_path).expect("actual exact-root provider receipt");
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&receipt_bytes).expect("exact-root receipt JSON");
+        assert_eq!(receipt["accepted"].as_bool(), Some(true));
+        assert_eq!(receipt["total_cases"].as_u64(), Some(16));
+        assert_eq!(receipt["completed_cases"].as_u64(), Some(16));
+        assert_eq!(
+            receipt["cases"]
+                .as_array()
+                .expect("exact-root actual cases")
+                .len(),
+            16
+        );
+        assert_eq!(
+            receipt["local_root"]["canonical_path"].as_str(),
+            root.to_str()
+        );
+        assert_eq!(
+            receipt["local_root_after"]["canonical_path"].as_str(),
+            root.to_str()
+        );
+        for key in ["device", "inode", "uid", "gid", "mode"] {
+            assert_eq!(receipt["local_root"][key], receipt["local_root_after"][key]);
+        }
+        assert_eq!(
+            receipt["cleanup"]["all_owned_keys_absent"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            receipt["cleanup"]["all_children_reaped"].as_bool(),
+            Some(true)
+        );
+        assert!(
+            receipt["cleanup"]["errors"]
+                .as_array()
+                .expect("provider cleanup errors")
+                .is_empty()
+        );
+        assert!(
+            receipt["errors"]
+                .as_array()
+                .expect("provider errors")
+                .is_empty()
+        );
+        assert_eq!(
+            receipt["manifest_sha256"].as_str(),
+            Some(manifest_sha.as_str())
+        );
+        assert_eq!(receipt["bridge_sha256"], bridge["script_sha256"]);
+        assert_eq!(
+            receipt["artifact_sha256"],
+            manifest["archived_libtest"]["sha256"]
+        );
+        assert_eq!(
+            receipt["provider_source_before_sha256"],
+            receipt["provider_source_after_sha256"]
+        );
+        let summary = serde_json::json!({
+            "schema_version": 1,
+            "root_path": root.to_str().expect("UTF8 fixture root"),
+            "root_sha256": hex::encode(Sha256::digest(root.to_str().expect("UTF8 fixture root").as_bytes())),
+            "receipt_path": receipt_path,
+            "receipt_sha256": hex::encode(Sha256::digest(&receipt_bytes)),
+            "manifest_sha256": manifest_sha,
+            "cases": 16,
+        });
+        // Direct stderr avoids splitting libtest's partial stdout identity.
+        let mut stderr = std::io::stderr().lock();
+        std::io::Write::write_all(
+            &mut stderr,
+            format!("MTR92_PROVIDER_ROOT_OK {summary}\n").as_bytes(),
+        )
+        .expect("write provider root receipt marker");
+        std::io::Write::flush(&mut stderr).expect("flush provider root receipt marker");
+    }
+
     impl Fixture {
         async fn new(db: &sea_orm::DatabaseConnection) -> Self {
             assert!(!git_cli::git_cli_skip_requested(), "Docker Git is required");
@@ -2182,6 +2445,12 @@ mod disabled_http {
                 .tempdir_in(work)
                 .expect("isolated Docker Git workdir");
             let temp = tempfile::tempdir().expect("HTTP fixture directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+                    .expect("make the owned fixture directory private");
+            }
             let mut config: toml::Value = toml::from_str(
                 &fs::read_to_string(
                     Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
@@ -2205,7 +2474,7 @@ mod disabled_http {
             });
             let mut url = url::Url::parse(&admin).expect("test database URL");
             url.set_path(&name);
-            Self {
+            let fixture = Self {
                 temp,
                 shared,
                 database_url: url.to_string(),
@@ -2223,7 +2492,9 @@ mod disabled_http {
                 static_auth: false,
                 object_format: std::env::var("MEGA_TRACES_TEST_FORMAT")
                     .unwrap_or_else(|_| "sha1".to_owned()),
-            }
+            };
+            qualify_fixture_local_root(&fixture).await;
+            fixture
         }
 
         fn command(&self, enabled: bool, policy: &str, import_dir: &str) -> Command {
@@ -4043,6 +4314,11 @@ mod disabled_http {
 
     impl ScopeAuthFixture {
         async fn new(db: &sea_orm::DatabaseConnection) -> Self {
+            Self::new_with_kind(db, "sha1").await
+        }
+
+        async fn new_with_kind(db: &sea_orm::DatabaseConnection, kind: &str) -> Self {
+            assert!(matches!(kind, "sha1" | "sha256"));
             let fixture = Fixture::new(db).await;
             let config_path = fixture.temp.path().join("config.toml");
             let mut config: toml::Value =
@@ -4090,7 +4366,7 @@ mod disabled_http {
                 target_id: Set(target),
                 source_repo_id: Set("mtr39-auth-only".to_owned()),
                 epoch_id: Set(fixture.epoch.clone()),
-                hash_kind: Set("sha1".to_owned()),
+                hash_kind: Set(kind.to_owned()),
                 tip_oid: Set(None),
                 created_at: Set(Utc::now().fixed_offset()),
             }
@@ -4418,6 +4694,1209 @@ mod disabled_http {
         })
         .await
         .expect("scope transport close deadline");
+    }
+
+    async fn discovery_wire_curl_v0(
+        fixture: &ScopeAuthFixture,
+        token: Option<&str>,
+        label: &str,
+    ) -> Response {
+        wire_http_request(
+            fixture,
+            token,
+            label,
+            &format!("/.traces/by-scope/{}.git", fixture.fixture.scope),
+            false,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn wire_http_request(
+        fixture: &ScopeAuthFixture,
+        token: Option<&str>,
+        label: &str,
+        locator: &str,
+        v2: bool,
+        receive: bool,
+        request_body: Option<&[u8]>,
+    ) -> Response {
+        let config_path = fixture
+            .fixture
+            .temp
+            .path()
+            .join(format!("{label}.curl-config"));
+        let body_path = fixture
+            .fixture
+            .temp
+            .path()
+            .join(format!("{label}.curl-body"));
+        let header_path = fixture
+            .fixture
+            .temp
+            .path()
+            .join(format!("{label}.curl-headers"));
+        let stderr_path = fixture
+            .fixture
+            .temp
+            .path()
+            .join(format!("{label}.curl-stderr"));
+        let service = if receive {
+            "git-receive-pack"
+        } else {
+            "git-upload-pack"
+        };
+        let endpoint = if request_body.is_some() {
+            format!("{locator}/{service}")
+        } else {
+            format!("{locator}/info/refs?service={service}")
+        };
+        let url = format!("http://127.0.0.1:{}{endpoint}", fixture.http_port);
+        let method = if request_body.is_some() {
+            "POST"
+        } else {
+            "GET"
+        };
+        let mut config = format!(
+            "url = \"{url}\"\nrequest = \"{method}\"\nhttp1.1\nsilent\nshow-error\nconnect-timeout = 2\nmax-time = 10\nmax-filesize = 1048575\nproxy = \"\"\nnoproxy = \"*\"\n"
+        );
+        if let Some(token) = token {
+            config.push_str(&format!("header = \"Authorization: Bearer {token}\"\n"));
+        }
+        if v2 {
+            config.push_str("header = \"Git-Protocol: version=2\"\n");
+        }
+        if let Some(body) = request_body {
+            let request_path = fixture
+                .fixture
+                .temp
+                .path()
+                .join(format!("{label}.curl-request"));
+            fs::write(&request_path, body).expect("private curl request bytes");
+            config.push_str(&format!("header = \"Content-Type: application/x-{service}-request\"\ndata-binary = \"@{}\"\n", request_path.display()));
+        }
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut private_config = options
+            .open(&config_path)
+            .expect("private curl configuration");
+        std::io::Write::write_all(&mut private_config, config.as_bytes())
+            .expect("write private curl configuration");
+        drop(private_config);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&config_path)
+                    .expect("curl config metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "curl credential config must be private"
+            );
+        }
+        // -q is deliberately the first argument. No curlrc, proxy environment,
+        // credential in argv/URL, verbose trace, or inherited auth is used.
+        let mut command = Command::new("/usr/bin/curl");
+        command
+            .env_clear()
+            .current_dir(fixture.fixture.temp.path())
+            .args(["-q", "--config"])
+            .arg(&config_path)
+            .arg("--output")
+            .arg(&body_path)
+            .arg("--dump-header")
+            .arg(&header_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                fs::File::create(&stderr_path).expect("private curl stderr"),
+            ));
+        let mut child = OwnedChild::spawn(&mut command);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child
+                .0
+                .as_mut()
+                .expect("owned curl")
+                .try_wait()
+                .expect("poll curl")
+            {
+                child.0.take();
+                break status;
+            }
+            for (path, limit) in [(&body_path, 1024 * 1024), (&header_path, 64 * 1024)] {
+                if let Ok(metadata) = fs::metadata(path) {
+                    assert!(metadata.len() < limit, "bounded curl discovery output");
+                }
+            }
+            assert!(Instant::now() < deadline, "curl discovery exceeded 10s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            status.success(),
+            "standard curl discovery process failed: {status}"
+        );
+        let headers = fs::read_to_string(header_path).expect("curl HTTP headers");
+        let body = fs::read(body_path).expect("curl raw pkt-line body");
+        assert!(headers.len() < 64 * 1024 && body.len() < 1024 * 1024);
+        let status = headers
+            .lines()
+            .next()
+            .expect("curl status line")
+            .split_whitespace()
+            .nth(1)
+            .expect("curl status value")
+            .parse()
+            .expect("numeric curl HTTP status");
+        Response {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    fn discovery_wire_packets(mut bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        while !bytes.is_empty() {
+            assert!(
+                bytes.len() >= 4 && bytes[..4].iter().all(u8::is_ascii_hexdigit),
+                "complete Git pkt-line header"
+            );
+            let size =
+                usize::from_str_radix(std::str::from_utf8(&bytes[..4]).expect("pkt-line hex"), 16)
+                    .expect("pkt-line length");
+            if size == 0 {
+                packets.push(Vec::new());
+                bytes = &bytes[4..];
+            } else {
+                assert!(
+                    (5..=65520).contains(&size) && size <= bytes.len(),
+                    "complete bounded Git pkt-line"
+                );
+                packets.push(bytes[4..size].to_vec());
+                bytes = &bytes[size..];
+            }
+        }
+        packets
+    }
+
+    pub async fn http_v0_metadata_discovery_probe() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(ScopeAuthFixture::new(&db).await);
+            let fixture = fixture.as_mut().expect("HTTP v0 discovery fixture");
+            let token = fixture.static_token("mtr92-discovery-owner", "/project");
+            fixture
+                .bind(&fixture.owner, "static_push_token", "mtr92-discovery-owner")
+                .await;
+            fixture.start(true, true, "off").await;
+            let before = snapshot(&db).await;
+            let unauthenticated =
+                discovery_wire_curl_v0(fixture, None, "mtr92-unauthenticated").await;
+            assert_eq!(
+                unauthenticated.status, 401,
+                "the same real discovery requires authentication"
+            );
+            assert!(unauthenticated.body.is_empty());
+            let authorized =
+                discovery_wire_curl_v0(fixture, Some(&token), "mtr92-authorized").await;
+            assert_eq!(
+                authorized.status, 200,
+                "current bound owner must receive real HTTP discovery"
+            );
+            assert!(
+                authorized
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("application/x-git-upload-pack-advertisement")
+            );
+            let packets = discovery_wire_packets(&authorized.body);
+            assert_eq!(
+                packets.len(),
+                4,
+                "HTTP v0 service, flush, one empty ref, flush"
+            );
+            assert_eq!(packets[0], b"# service=git-upload-pack\n");
+            assert!(packets[1].is_empty() && packets[3].is_empty());
+            assert!(
+                packets[2]
+                    .starts_with(format!("{} capabilities^{{}}\0", "0".repeat(40)).as_bytes()),
+                "real existing empty SHA1 scope advertisement"
+            );
+            let line = std::str::from_utf8(&packets[2]).expect("UTF8 v0 advertisement");
+            let (_, capabilities) = line.split_once('\0').expect("v0 capabilities follow NUL");
+            assert!(
+                capabilities
+                    .split_ascii_whitespace()
+                    .any(|cap| cap == "object-format=sha1")
+            );
+            unchanged(&before, &snapshot(&db).await);
+            assert!(
+                capabilities
+                    .split_ascii_whitespace()
+                    .any(|cap| cap == "libra-traces-v1"),
+                "MTR92_WIRE_ORACLE: missing libra-traces-v1 on authenticated HTTP v0 discovery"
+            );
+        })
+        .catch_unwind()
+        .await;
+        let cleanup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(fixture) = &mut fixture {
+                fixture.stop();
+            }
+        }));
+        let closed = db.close().await;
+        drop(guard);
+        if (result.is_err() || cleanup.is_err())
+            && let Some(fixture) = fixture.take()
+        {
+            let logs = fixture.fixture.temp.keep();
+            for name in [
+                "process.out",
+                "process.err",
+                "mtr92-authorized.curl-body",
+                "mtr92-authorized.curl-headers",
+                "mtr92-authorized.curl-stderr",
+            ] {
+                if let Ok(bytes) = fs::read(logs.join(name)) {
+                    eprintln!(
+                        "HTTP v0 discovery failure artifact: file={} sha256={}",
+                        logs.join(name).display(),
+                        hex::encode(Sha256::digest(bytes))
+                    );
+                }
+            }
+        }
+        drop(fixture);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close discovery pool before database guard");
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct WireMetadata {
+        server: String,
+        scope: Option<String>,
+        format: String,
+    }
+
+    struct WireExpected<'a> {
+        locator: &'a str,
+        kind: &'a str,
+        scope: Option<&'a str>,
+        v2: bool,
+        receive: bool,
+    }
+
+    fn wire_metadata(bytes: &[u8], http: bool, expected: &WireExpected<'_>) -> WireMetadata {
+        let mut packets = discovery_wire_packets(bytes);
+        if http && !expected.v2 {
+            let service = if expected.receive {
+                "git-receive-pack"
+            } else {
+                "git-upload-pack"
+            };
+            assert_eq!(
+                packets.remove(0),
+                format!("# service={service}\n").as_bytes()
+            );
+            assert!(packets.remove(0).is_empty(), "HTTP service flush");
+        }
+        assert!(packets.pop().expect("advertisement flush").is_empty());
+        let capabilities: Vec<String> = if expected.v2 {
+            assert!(!expected.receive, "Git v2 is upload discovery only");
+            let lines: Vec<_> = packets
+                .into_iter()
+                .map(|line| String::from_utf8(line).expect("v2 UTF8 capability"))
+                .collect();
+            assert_eq!(lines.first().map(String::as_str), Some("version 2\n"));
+            assert_eq!(lines.get(1).map(String::as_str), Some("agent=mega/0.1.0\n"));
+            assert_eq!(lines.get(2).map(String::as_str), Some("ls-refs\n"));
+            assert_eq!(lines.get(3).map(String::as_str), Some("fetch\n"));
+            assert!(lines.iter().all(|line| line.ends_with('\n')));
+            lines
+                .into_iter()
+                .skip(1)
+                .map(|line| line.trim_end_matches('\n').to_owned())
+                .collect()
+        } else {
+            assert_eq!(packets.len(), 1, "one seeded empty trace ref");
+            let line = std::str::from_utf8(&packets[0]).expect("v0 UTF8 trace ref");
+            let (reference, capabilities) =
+                line.split_once('\0').expect("v0 NUL capability separator");
+            let width = if expected.kind == "sha1" { 40 } else { 64 };
+            assert_eq!(
+                reference,
+                format!("{} capabilities^{{}}", "0".repeat(width)),
+                "authorized metadata controls zero-ID width"
+            );
+            assert!(capabilities.ends_with('\n'));
+            capabilities
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            capabilities
+                .iter()
+                .filter(|cap| cap.as_str() == "libra-traces-v1")
+                .count(),
+            1
+        );
+        let values = |prefix: &str| {
+            capabilities
+                .iter()
+                .filter_map(|cap| cap.strip_prefix(prefix).map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let servers = values("libra-traces-server=");
+        assert_eq!(servers, [TRACE_SERVER_ID]);
+        let scopes = values("libra-traces-scope=");
+        assert_eq!(
+            scopes,
+            expected
+                .scope
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            "only the actual existing stream UUID is advertised"
+        );
+        assert_eq!(values("object-format="), [expected.kind]);
+        for unsupported in [
+            "shallow",
+            "filter",
+            "ofs-delta",
+            "delete-refs",
+            "side-band-64k",
+            "fetch=shallow filter",
+        ] {
+            assert!(
+                !capabilities.iter().any(|cap| cap == unsupported),
+                "traces advertises only implemented capabilities"
+            );
+        }
+        if !expected.v2 {
+            assert_eq!(
+                capabilities.iter().any(|cap| cap == "report-status"),
+                expected.receive
+            );
+            assert_eq!(
+                capabilities.iter().any(|cap| cap == "no-thin"),
+                expected.receive
+            );
+        }
+        if expected.v2 {
+            let mut exact = vec![
+                "agent=mega/0.1.0".to_owned(),
+                "ls-refs".to_owned(),
+                "fetch".to_owned(),
+                format!("object-format={}", expected.kind),
+                "libra-traces-v1".to_owned(),
+                format!("libra-traces-server={TRACE_SERVER_ID}"),
+            ];
+            if let Some(scope) = expected.scope {
+                exact.push(format!("libra-traces-scope={scope}"));
+            }
+            assert_eq!(capabilities, exact, "exact authorized v2 capability lines");
+        }
+        WireMetadata {
+            server: servers[0].clone(),
+            scope: scopes.into_iter().next(),
+            format: expected.kind.to_owned(),
+        }
+    }
+
+    async fn wire_ssh_advertisement(
+        session: &SshSession,
+        locator: &str,
+        v2: bool,
+        receive: bool,
+    ) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut channel = session
+                .channel_open_session()
+                .await
+                .expect("wire discovery SSH channel");
+            if v2 {
+                channel
+                    .set_env(false, "GIT_PROTOCOL", "version=2")
+                    .await
+                    .expect("wire SSH Git protocol env");
+            }
+            let service = if receive {
+                "git-receive-pack"
+            } else {
+                "git-upload-pack"
+            };
+            channel
+                .exec(true, format!("{service} '{locator}'"))
+                .await
+                .expect("wire SSH discovery exec");
+            let mut bytes = Vec::new();
+            let mut accepted = false;
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::Success => accepted = true,
+                    russh::ChannelMsg::Data { data } => {
+                        bytes.extend_from_slice(&data);
+                        assert!(bytes.len() < 64 * 1024, "bounded SSH discovery");
+                    }
+                    russh::ChannelMsg::ExtendedData { data, .. } => assert!(
+                        data.is_empty(),
+                        "discovery cannot use generic SSH error output"
+                    ),
+                    russh::ChannelMsg::Failure | russh::ChannelMsg::Close => {
+                        panic!("authorized SSH discovery refused")
+                    }
+                    _ => {}
+                }
+                if accepted && bytes.ends_with(b"0000") {
+                    break;
+                }
+            }
+            assert!(
+                accepted && bytes.ends_with(b"0000"),
+                "actual exec success and complete advertisement required"
+            );
+            channel
+                .eof()
+                .await
+                .expect("finish discovery-only SSH request");
+            channel
+                .close()
+                .await
+                .expect("close discovery-only SSH channel");
+            bytes
+        })
+        .await
+        .expect("wire SSH advertisement deadline")
+    }
+
+    async fn wire_expect_metadata(
+        fixture: &ScopeAuthFixture,
+        token: &str,
+        ssh: Option<&SshSession>,
+        expected: WireExpected<'_>,
+    ) -> WireMetadata {
+        let before = snapshot(&fixture.fixture.db).await;
+        let response = wire_http_request(
+            fixture,
+            Some(token),
+            &format!("wire-{}", Uuid::new_v4()),
+            expected.locator,
+            expected.v2,
+            expected.receive,
+            None,
+        )
+        .await;
+        assert_eq!(response.status, 200, "authorized actual curl discovery");
+        let service = if expected.receive {
+            "git-receive-pack"
+        } else {
+            "git-upload-pack"
+        };
+        assert!(
+            response
+                .headers
+                .to_ascii_lowercase()
+                .contains(&format!("application/x-{service}-advertisement"))
+        );
+        let http = wire_metadata(&response.body, true, &expected);
+        if let Some(session) = ssh {
+            let bytes =
+                wire_ssh_advertisement(session, expected.locator, expected.v2, expected.receive)
+                    .await;
+            assert_eq!(
+                wire_metadata(&bytes, false, &expected),
+                http,
+                "same configured server and actual stream on HTTP/SSH"
+            );
+        }
+        unchanged(&before, &snapshot(&fixture.fixture.db).await);
+        http
+    }
+
+    async fn wire_expect_refusal(
+        fixture: &ScopeAuthFixture,
+        token: Option<&str>,
+        ssh: Option<&SshSession>,
+        locator: &str,
+        v2: bool,
+        receive: bool,
+        status: u16,
+    ) -> Vec<u8> {
+        let before = snapshot(&fixture.fixture.db).await;
+        let response = wire_http_request(
+            fixture,
+            token,
+            &format!("wire-denied-{}", Uuid::new_v4()),
+            locator,
+            v2,
+            receive,
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status, status,
+            "actual discovery refusal, not setup/transport failure"
+        );
+        assert!(
+            !response
+                .body
+                .windows(b"libra-traces".len())
+                .any(|part| part == b"libra-traces")
+        );
+        if status == 401 {
+            assert!(response.body.is_empty());
+        }
+        if let Some(session) = ssh {
+            let service = if receive {
+                "git-receive-pack"
+            } else {
+                "git-upload-pack"
+            };
+            ssh_refused(session, &format!("{service} '{locator}'"), v2).await;
+        }
+        unchanged(&before, &snapshot(&fixture.fixture.db).await);
+        response.body
+    }
+
+    fn wire_by_path(target: &str, source: &str, epoch: &str, kind: &str) -> String {
+        format!(
+            "/.traces/by-path/{}/self/{}/{epoch}/{kind}.git",
+            URL_SAFE_NO_PAD.encode(target),
+            URL_SAFE_NO_PAD.encode(source)
+        )
+    }
+
+    async fn wire_access_token(
+        fixture: &mut ScopeAuthFixture,
+        username: &str,
+        principal: &str,
+    ) -> String {
+        fixture.next_key_id += 1;
+        let id = fixture.next_key_id;
+        let token = format!("mtr92-disposable-{}", Uuid::new_v4());
+        mega2_core::access_token::ActiveModel {
+            id: Set(id),
+            username: Set(username.to_owned()),
+            token: Set(token.clone()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(&fixture.fixture.db)
+        .await
+        .expect("current real Mono access token");
+        fixture
+            .bind(principal, "mono_account", &format!("access-token:{id}"))
+            .await;
+        token
+    }
+
+    async fn wire_code_control(fixture: &ScopeAuthFixture, ssh: Option<&SshSession>, v2: bool) {
+        let before = snapshot(&fixture.fixture.db).await;
+        let response = wire_http_request(
+            fixture,
+            None,
+            &format!("wire-code-{}", Uuid::new_v4()),
+            "/.git",
+            v2,
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let mut advertisements = vec![response.body];
+        if let Some(session) = ssh {
+            advertisements.push(wire_ssh_advertisement(session, "/.git", v2, false).await);
+        }
+        for bytes in advertisements {
+            assert!(
+                !bytes
+                    .windows(b"libra-traces".len())
+                    .any(|part| part == b"libra-traces"),
+                "ordinary code has no traces capabilities"
+            );
+            let packets = discovery_wire_packets(&bytes);
+            assert!(packets.last().expect("code advertisement flush").is_empty());
+            if v2 {
+                assert_eq!(packets[0], b"version 2\n");
+                assert!(packets.iter().any(|line| line == b"fetch=shallow filter\n"));
+            } else {
+                assert!(
+                    bytes
+                        .windows(b"refs/heads/main".len())
+                        .any(|part| part == b"refs/heads/main"),
+                    "positive ordinary code refs remain"
+                );
+            }
+            assert!(
+                bytes
+                    .windows(b"object-format=sha1".len())
+                    .any(|part| part == b"object-format=sha1")
+            );
+        }
+        unchanged(&before, &snapshot(&fixture.fixture.db).await);
+    }
+
+    async fn wire_standard_push_status(fixture: &ScopeAuthFixture, token: &str, kind: &str) {
+        let git = &fixture.fixture;
+        git.git(&[
+            "init",
+            "--initial-branch=main",
+            &format!("--object-format={kind}"),
+            "trace-source",
+        ]);
+        git.git(&["-C", "trace-source", "config", "pack.window", "0"]);
+        git.git(&["-C", "trace-source", "config", "gc.auto", "0"]);
+        let checkpoint = git.shared.path().join("trace-source/checkpoint/ab/cd");
+        fs::create_dir_all(&checkpoint).expect("standard status checkpoint");
+        fs::write(
+            checkpoint.join("metadata.json"),
+            b"{\"schema_version\":2}\n",
+        )
+        .expect("standard status metadata");
+        fs::write(
+            checkpoint.join("raw.bin"),
+            b"MTR92 standard report-status fixture\n",
+        )
+        .expect("standard status raw capture");
+        let tip = http_git_commit(git, "MTR92 standard push status");
+        let width = if kind == "sha1" { 40 } else { 64 };
+        assert_eq!(tip.len(), width);
+        let pack = git.git(&[
+            "-C",
+            "trace-source",
+            "pack-objects",
+            "--stdout",
+            "--revs",
+            "--all",
+            "--window=0",
+            "--no-reuse-delta",
+            "--no-reuse-object",
+        ]);
+        assert!(pack.starts_with(b"PACK"));
+        let epoch = Uuid::new_v4().to_string();
+        let locator = wire_by_path("/project", "mtr92-status-source", &epoch, kind);
+        let mut request = Vec::new();
+        pkt(
+            &mut request,
+            &format!(
+                "{} {tip} refs/libra/traces\0report-status object-format={kind}\n",
+                "0".repeat(width)
+            ),
+        );
+        request.extend_from_slice(b"0000");
+        request.extend_from_slice(&pack);
+        // Only the already delivered HTTP data plane is used here. SSH PACK
+        // roundtrips remain MTR12; both discovery selectors regress this status.
+        let response = wire_http_request(
+            fixture,
+            Some(token),
+            &format!("wire-status-{}", Uuid::new_v4()),
+            &locator,
+            false,
+            true,
+            Some(&request),
+        )
+        .await;
+        assert_eq!(response.status, 200, "real standard report-status push");
+        assert!(
+            response
+                .headers
+                .to_ascii_lowercase()
+                .contains("application/x-git-receive-pack-result")
+        );
+        assert_eq!(
+            discovery_wire_packets(&response.body),
+            vec![
+                b"unpack ok\n".to_vec(),
+                b"ok refs/libra/traces\n".to_vec(),
+                Vec::new()
+            ],
+            "standard ok never carries custom metadata or UUIDs"
+        );
+        let stream = trace_stream::Entity::find()
+            .filter(trace_stream::Column::EpochId.eq(epoch))
+            .one(&git.db)
+            .await
+            .expect("actual standard push stream")
+            .expect("standard push published a stream");
+        assert_eq!(stream.principal_id, fixture.owner);
+        assert_eq!(stream.tip_oid.as_deref(), Some(tip.as_str()));
+        assert_eq!(stream.hash_kind, kind);
+    }
+
+    pub async fn run_metadata_wire_matrix(kind: &str, with_ssh: bool) {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(ScopeAuthFixture::new_with_kind(&db, kind).await);
+            let fixture = fixture.as_mut().expect("metadata wire fixture");
+            assert_eq!(
+                fixture.fixture.object_format, "sha1",
+                "code format remains SHA1 even for SHA256 trace by-scope discovery"
+            );
+            let owner = fixture.owner.clone();
+            let outsider = fixture.outsider.clone();
+            let stream = trace_stream::Entity::find_by_id(&fixture.fixture.scope)
+                .one(&db)
+                .await
+                .expect("read actual wire scope")
+                .expect("wire scope exists");
+            assert_eq!(
+                stream.hash_kind, kind,
+                "scope kind is immutable from its initial insert"
+            );
+            let target_a = trace_target::Entity::find_by_id(&stream.target_id)
+                .one(&db)
+                .await
+                .expect("read target A")
+                .expect("target A exists");
+            assert_eq!(target_a.project_path, "/project");
+            // Both paths are actual native root trees made by service init;
+            // their credential prefixes remain disjoint.
+            let target_b = Uuid::new_v4().to_string();
+            let scope_b = Uuid::new_v4().to_string();
+            trace_target::ActiveModel {
+                id: Set(target_b.clone()),
+                target_kind: Set("native".to_owned()),
+                project_path: Set("/.traces-backup".to_owned()),
+                backing_import_repo_id: Set(None),
+                active: Set(true),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(&db)
+            .await
+            .expect("distinct real target B");
+            trace_stream::ActiveModel {
+                id: Set(scope_b.clone()),
+                principal_id: Set(owner.clone()),
+                target_id: Set(target_b),
+                source_repo_id: Set("mtr39-auth-only".to_owned()),
+                epoch_id: Set(fixture.fixture.epoch.clone()),
+                hash_kind: Set(kind.to_owned()),
+                tip_oid: Set(None),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(&db)
+            .await
+            .expect("distinct same-tuple target B stream");
+            let own_scope = format!("/.traces/by-scope/{}.git", fixture.fixture.scope);
+            let other_scope = format!("/.traces/by-scope/{scope_b}.git");
+            let unknown = format!("/.traces/by-scope/{}.git", Uuid::new_v4());
+            let own_path =
+                wire_by_path("/project", "mtr39-auth-only", &fixture.fixture.epoch, kind);
+            let empty_path =
+                wire_by_path("/project", "absent-source", &fixture.fixture.epoch, kind);
+            let other_path = wire_by_path(
+                "/.traces-backup",
+                "mtr39-auth-only",
+                &fixture.fixture.epoch,
+                kind,
+            );
+            let other_empty = wire_by_path(
+                "/.traces-backup",
+                "absent-source",
+                &fixture.fixture.epoch,
+                kind,
+            );
+            let own = fixture.static_token("mtr92-owner-a", "/project");
+            fixture
+                .bind(&owner, "static_push_token", "mtr92-owner-a")
+                .await;
+            let other = fixture.static_token("mtr92-other-principal-a", "/project");
+            fixture
+                .bind(&outsider, "static_push_token", "mtr92-other-principal-a")
+                .await;
+            let target_b_token = fixture.static_token("mtr92-owner-b", "/.traces-backup");
+            fixture
+                .bind(&owner, "static_push_token", "mtr92-owner-b")
+                .await;
+            let unbound = fixture.static_token("mtr92-wire-unbound", "/project");
+            fixture.start(true, true, "off").await;
+            let owner_session = if with_ssh {
+                Some(fixture.password_session(&own, true).await)
+            } else {
+                None
+            };
+            let other_session = if with_ssh {
+                Some(fixture.password_session(&other, true).await)
+            } else {
+                None
+            };
+            let target_b_session = if with_ssh {
+                Some(fixture.password_session(&target_b_token, true).await)
+            } else {
+                None
+            };
+            let unbound_session = if with_ssh {
+                Some(fixture.password_session(&unbound, true).await)
+            } else {
+                None
+            };
+            let anonymous = if with_ssh {
+                let mut session = fixture.connect().await;
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(10), session.authenticate_none("git"))
+                        .await
+                        .expect("anonymous wire auth deadline")
+                        .expect("anonymous wire auth")
+                        .success()
+                );
+                Some(session)
+            } else {
+                None
+            };
+            for v2 in [false, true] {
+                for (locator, scope) in [
+                    (&own_scope, Some(fixture.fixture.scope.as_str())),
+                    (&own_path, Some(fixture.fixture.scope.as_str())),
+                    (&empty_path, None),
+                ] {
+                    wire_expect_metadata(
+                        fixture,
+                        &own,
+                        owner_session.as_ref(),
+                        WireExpected {
+                            locator,
+                            kind,
+                            scope,
+                            v2,
+                            receive: false,
+                        },
+                    )
+                    .await;
+                }
+                // Shared project read is allowed, while by-path self never aliases another principal.
+                wire_expect_metadata(
+                    fixture,
+                    &other,
+                    other_session.as_ref(),
+                    WireExpected {
+                        locator: &own_scope,
+                        kind,
+                        scope: Some(&fixture.fixture.scope),
+                        v2,
+                        receive: false,
+                    },
+                )
+                .await;
+                wire_expect_metadata(
+                    fixture,
+                    &other,
+                    other_session.as_ref(),
+                    WireExpected {
+                        locator: &own_path,
+                        kind,
+                        scope: None,
+                        v2,
+                        receive: false,
+                    },
+                )
+                .await;
+                wire_expect_metadata(
+                    fixture,
+                    &target_b_token,
+                    target_b_session.as_ref(),
+                    WireExpected {
+                        locator: &other_path,
+                        kind,
+                        scope: Some(&scope_b),
+                        v2,
+                        receive: false,
+                    },
+                )
+                .await;
+                let denied_existing = wire_expect_refusal(
+                    fixture,
+                    Some(&own),
+                    owner_session.as_ref(),
+                    &other_scope,
+                    v2,
+                    false,
+                    404,
+                )
+                .await;
+                let denied_unknown = wire_expect_refusal(
+                    fixture,
+                    Some(&own),
+                    owner_session.as_ref(),
+                    &unknown,
+                    v2,
+                    false,
+                    404,
+                )
+                .await;
+                assert_eq!(
+                    denied_existing, denied_unknown,
+                    "cross-target scope existence remains hidden"
+                );
+                let denied_existing = wire_expect_refusal(
+                    fixture,
+                    Some(&own),
+                    owner_session.as_ref(),
+                    &other_path,
+                    v2,
+                    false,
+                    404,
+                )
+                .await;
+                let denied_empty = wire_expect_refusal(
+                    fixture,
+                    Some(&own),
+                    owner_session.as_ref(),
+                    &other_empty,
+                    v2,
+                    false,
+                    404,
+                )
+                .await;
+                assert_eq!(
+                    denied_existing, denied_empty,
+                    "cross-target by-path existence remains hidden"
+                );
+                for locator in [&own_scope, &empty_path, &unknown] {
+                    wire_expect_refusal(fixture, None, anonymous.as_ref(), locator, v2, false, 401)
+                        .await;
+                    wire_expect_refusal(
+                        fixture,
+                        Some(&unbound),
+                        unbound_session.as_ref(),
+                        locator,
+                        v2,
+                        false,
+                        404,
+                    )
+                    .await;
+                }
+                wire_code_control(fixture, anonymous.as_ref(), v2).await;
+            }
+            for (locator, scope) in [
+                (&own_scope, Some(fixture.fixture.scope.as_str())),
+                (&own_path, Some(fixture.fixture.scope.as_str())),
+                (&empty_path, None),
+            ] {
+                wire_expect_metadata(
+                    fixture,
+                    &own,
+                    owner_session.as_ref(),
+                    WireExpected {
+                        locator,
+                        kind,
+                        scope,
+                        v2: false,
+                        receive: true,
+                    },
+                )
+                .await;
+            }
+            let denied_existing = wire_expect_refusal(
+                fixture,
+                Some(&other),
+                other_session.as_ref(),
+                &own_scope,
+                false,
+                true,
+                404,
+            )
+            .await;
+            let denied_unknown = wire_expect_refusal(
+                fixture,
+                Some(&other),
+                other_session.as_ref(),
+                &unknown,
+                false,
+                true,
+                404,
+            )
+            .await;
+            assert_eq!(
+                denied_existing, denied_unknown,
+                "non-owner receive existence remains hidden"
+            );
+            wire_standard_push_status(fixture, &own, kind).await;
+            if let Some(session) = owner_session {
+                close_scope_session(session).await;
+            }
+            if let Some(session) = other_session {
+                close_scope_session(session).await;
+            }
+            if let Some(session) = target_b_session {
+                close_scope_session(session).await;
+            }
+            if let Some(session) = unbound_session {
+                close_scope_session(session).await;
+            }
+            if let Some(session) = anonymous {
+                close_scope_session(session).await;
+            }
+            fixture.start(true, true, "off").await;
+            let session = if with_ssh {
+                Some(fixture.password_session(&own, true).await)
+            } else {
+                None
+            };
+            wire_expect_metadata(
+                fixture,
+                &own,
+                session.as_ref(),
+                WireExpected {
+                    locator: &own_scope,
+                    kind,
+                    scope: Some(&fixture.fixture.scope),
+                    v2: true,
+                    receive: false,
+                },
+            )
+            .await;
+            if let Some(session) = session {
+                close_scope_session(session).await;
+            }
+            // A current Mono account/key is a separate credential source, with the real shared Cedar store.
+            let mono = wire_access_token(fixture, SCOPE_WRITER, &owner).await;
+            let nonwriter = wire_access_token(fixture, SCOPE_NONWRITER, &owner).await;
+            let writer_key = if with_ssh {
+                let key = fixture.key(SCOPE_WRITER).await;
+                fixture
+                    .bind(&owner, "mono_account", &format!("ssh-key:{}", key.id))
+                    .await;
+                Some(key)
+            } else {
+                None
+            };
+            let nonwriter_key = if with_ssh {
+                let key = fixture.key(SCOPE_NONWRITER).await;
+                fixture
+                    .bind(&owner, "mono_account", &format!("ssh-key:{}", key.id))
+                    .await;
+                Some(key)
+            } else {
+                None
+            };
+            fixture.start(false, false, "enforce").await;
+            let session = if let Some(key) = &writer_key {
+                Some(fixture.key_session("traces", key, true).await)
+            } else {
+                None
+            };
+            let denied = if let Some(key) = &nonwriter_key {
+                Some(fixture.key_session("traces", key, true).await)
+            } else {
+                None
+            };
+            for v2 in [false, true] {
+                wire_expect_metadata(
+                    fixture,
+                    &mono,
+                    session.as_ref(),
+                    WireExpected {
+                        locator: &own_scope,
+                        kind,
+                        scope: Some(&fixture.fixture.scope),
+                        v2,
+                        receive: false,
+                    },
+                )
+                .await;
+                let existing = wire_expect_refusal(
+                    fixture,
+                    Some(&nonwriter),
+                    denied.as_ref(),
+                    &own_scope,
+                    v2,
+                    false,
+                    404,
+                )
+                .await;
+                let missing = wire_expect_refusal(
+                    fixture,
+                    Some(&nonwriter),
+                    denied.as_ref(),
+                    &unknown,
+                    v2,
+                    false,
+                    404,
+                )
+                .await;
+                assert_eq!(
+                    existing, missing,
+                    "current owner credential without project read cannot discover existence"
+                );
+            }
+            wire_expect_metadata(
+                fixture,
+                &mono,
+                session.as_ref(),
+                WireExpected {
+                    locator: &own_scope,
+                    kind,
+                    scope: Some(&fixture.fixture.scope),
+                    v2: false,
+                    receive: true,
+                },
+            )
+            .await;
+            wire_expect_refusal(
+                fixture,
+                Some(&nonwriter),
+                denied.as_ref(),
+                &own_scope,
+                false,
+                true,
+                404,
+            )
+            .await;
+            if let Some(session) = session {
+                close_scope_session(session).await;
+            }
+            if let Some(session) = denied {
+                close_scope_session(session).await;
+            }
+        })
+        .catch_unwind()
+        .await;
+        let cleanup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(fixture) = &mut fixture {
+                fixture.stop();
+            }
+        }));
+        let closed = db.close().await;
+        drop(guard);
+        if (result.is_err() || cleanup.is_err())
+            && let Some(fixture) = fixture.take()
+        {
+            let logs = fixture.fixture.temp.keep();
+            for name in ["process.out", "process.err"] {
+                if let Ok(bytes) = fs::read(logs.join(name)) {
+                    eprintln!(
+                        "metadata wire failure log: file={} sha256={}",
+                        logs.join(name).display(),
+                        hex::encode(Sha256::digest(bytes))
+                    );
+                }
+            }
+        }
+        drop(fixture);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close metadata wire pool before database guard");
     }
 
     #[derive(Clone, Copy)]
@@ -10318,6 +11797,31 @@ async fn traces_disabled_http_upload() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn traces_disabled_http_receive() {
     disabled_http::run(disabled_http::Endpoint::Receive).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_wire_http_v0_metadata() {
+    disabled_http::http_v0_metadata_discovery_probe().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_wire_http_sha1() {
+    disabled_http::run_metadata_wire_matrix("sha1", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_wire_http_sha256() {
+    disabled_http::run_metadata_wire_matrix("sha256", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_wire_ssh_sha1() {
+    disabled_http::run_metadata_wire_matrix("sha1", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_wire_ssh_sha256() {
+    disabled_http::run_metadata_wire_matrix("sha256", true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

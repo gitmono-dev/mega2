@@ -81,6 +81,48 @@ pub(crate) fn traces_v0_capabilities(discovery: &TraceDiscovery) -> String {
     caps
 }
 
+pub(crate) fn build_traces_v0_advertisement(
+    discovery: &TraceDiscovery,
+    transport: TransportProtocol,
+    tip: Option<&str>,
+) -> Result<BytesMut, ProtocolError> {
+    let (oid, reference) = match tip {
+        Some(tip) => {
+            if discovery.scope_id().is_none()
+                || tip.len() != discovery.hash_kind().hex_len()
+                || !tip.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(ProtocolError::InvalidInput(
+                    "invalid traces discovery tip".to_owned(),
+                ));
+            }
+            (tip.to_owned(), "refs/libra/traces")
+        }
+        None => (
+            "0".repeat(discovery.hash_kind().hex_len()),
+            "capabilities^{}",
+        ),
+    };
+    let mut capabilities = traces_v0_capabilities(discovery);
+    if transport == TransportProtocol::Http && discovery.service_type() == ServiceType::UploadPack {
+        capabilities.push_str(" allow-reachable-sha1-in-want");
+    }
+    let mut body = BytesMut::new();
+    if transport == TransportProtocol::Http {
+        add_pkt_line_string(
+            &mut body,
+            format!("# service={}\n", discovery.service_type()),
+        );
+        body.extend_from_slice(PKT_LINE_END_MARKER);
+    }
+    add_pkt_line_string(
+        &mut body,
+        format!("{oid}{SP}{reference}{NUL}{capabilities}{LF}"),
+    );
+    body.extend_from_slice(PKT_LINE_END_MARKER);
+    Ok(body)
+}
+
 impl SmartSession {
     /// # Retrieves the information about Git references (refs) for the specified service type.
     ///
