@@ -510,6 +510,9 @@ async fn resolve_trace_fetch_capture(
         TracesCaller::StaticPushToken { credential_id, .. } => ("static_push_token", credential_id),
         TracesCaller::MonoAccessToken { token, .. } => ("mono_account", token.credential_id()),
         TracesCaller::MonoSshKey { key, .. } => ("mono_account", key.credential_id()),
+        TracesCaller::StaticScopedSshKey { token, .. } => {
+            ("static_push_token", token.name.as_str())
+        }
         #[cfg(test)]
         TracesCaller::MonoAccount { credential_id, .. } => ("mono_account", credential_id),
         TracesCaller::Anonymous => return Err(TracesError::Unauthenticated.into()),
@@ -519,7 +522,13 @@ async fn resolve_trace_fetch_capture(
         _ => None,
     };
     let authenticated_key = match caller {
-        TracesCaller::MonoSshKey { key, .. } => Some(key),
+        TracesCaller::MonoSshKey { key, .. } | TracesCaller::StaticScopedSshKey { key, .. } => {
+            Some(key)
+        }
+        _ => None,
+    };
+    let scoped_key_credential = match caller {
+        TracesCaller::StaticScopedSshKey { key, .. } => Some(key.credential_id()),
         _ => None,
     };
     after_authorization.await;
@@ -542,7 +551,10 @@ async fn resolve_trace_fetch_capture(
              LEFT JOIN access_token a ON a.id = $8 \
              LEFT JOIN ssh_keys k ON k.id = $9 \
              WHERE s.id = $4 AND s.target_id = $5 AND s.hash_kind = $6 \
-             AND t.project_path = $7 AND t.active = TRUE",
+             AND t.project_path = $7 AND t.active = TRUE \
+             AND ($11::text IS NULL OR EXISTS (SELECT 1 FROM trace_credential_binding kb \
+               WHERE kb.namespace = 'mono_account' AND kb.credential_id = $11 \
+               AND kb.retired_at IS NULL AND kb.principal_id = $3))",
             [
                 namespace.into(),
                 credential.into(),
@@ -554,6 +566,7 @@ async fn resolve_trace_fetch_capture(
                 authenticated_token.map(|token| token.id()).into(),
                 authenticated_key.map(|key| key.id()).into(),
                 authenticated_key.map(|key| key.fingerprint()).into(),
+                scoped_key_credential.into(),
             ],
         ))
         .await
@@ -2653,6 +2666,76 @@ pub(crate) mod tests {
             .unwrap();
         discovery_binding(&f.db, &f.principal_id, "mono_account", key.credential_id()).await;
         key
+    }
+
+    #[tokio::test]
+    async fn static_scoped_ssh_key_fetch_snapshot_rechecks_both_bindings_and_key() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            for mutation in 0..3 {
+                let f = DiscoveryFixture::new(kind, true).await;
+                let key = mono_fetch_ssh_key(&f).await;
+                let mut token = f.token.clone();
+                token.name = format!("trace-ssh-key:{}", key.id());
+                discovery_binding(&f.db, &f.principal_id, "static_push_token", &token.name).await;
+                let caller = TracesCaller::StaticScopedSshKey {
+                    key: &key,
+                    token: &token,
+                };
+                let tip = "a".repeat(kind.hex_len());
+                trace_stream::Entity::update_many()
+                    .col_expr(
+                        trace_stream::Column::TipOid,
+                        sea_orm::sea_query::Expr::value(tip.clone()),
+                    )
+                    .filter(trace_stream::Column::Id.eq(&f.stream_id))
+                    .exec(&f.db)
+                    .await
+                    .unwrap();
+                let grant = resolve_trace_fetch(&f.db, &f.config, &f.by_scope(), caller, None)
+                    .await
+                    .unwrap();
+                assert_eq!(grant.tip_oid(), Some(tip.as_str()));
+                let rejected = resolve_trace_fetch_capture(
+                    &f.db,
+                    &f.config,
+                    &f.by_scope(),
+                    caller,
+                    None,
+                    async {
+                        match mutation {
+                            0 | 1 => {
+                                let (namespace, id) = if mutation == 0 {
+                                    ("static_push_token", token.name.as_str())
+                                } else {
+                                    ("mono_account", key.credential_id())
+                                };
+                                trace_credential_binding::Entity::update_many()
+                                    .col_expr(
+                                        trace_credential_binding::Column::RetiredAt,
+                                        sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+                                    )
+                                    .filter(
+                                        trace_credential_binding::Column::Namespace.eq(namespace),
+                                    )
+                                    .filter(trace_credential_binding::Column::CredentialId.eq(id))
+                                    .filter(trace_credential_binding::Column::RetiredAt.is_null())
+                                    .exec(&f.db)
+                                    .await
+                                    .unwrap();
+                            }
+                            _ => {
+                                ssh_keys::Entity::delete_by_id(key.id())
+                                    .exec(&f.db)
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    },
+                )
+                .await;
+                fetch_rejected(rejected, TracesError::UnknownScope);
+            }
+        }
     }
 
     #[tokio::test]

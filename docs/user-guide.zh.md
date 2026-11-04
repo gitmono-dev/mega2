@@ -243,8 +243,10 @@ SSH traces 在凭据绑定和授权后支持 scoped Git receive-pack 和 upload-
 
 - 保留 SSH login `traces` 拒绝 none-auth。其它 login 即使获准匿名读取普通代码，也不能匿名访问 traces。principal 来自验证后的凭据和显式 binding，不来自 login 或同名 Mono 账户。
 - 静态 push token 按 `static_push_token / <配置token名称>` 绑定；Mono SSH 公钥按 `mono_account / ssh-key:<实际记录ID>` 绑定。公钥必须完成签名认证，仅提出一把 key 不产生准入身份。同一指纹的来源不唯一、密钥被删除或同 ID 来源被替换时，拒绝使用旧身份继续执行 traces 命令。
-- 先验证连接的真实凭据并确认其当前来源仍有效，再允许 scope 或 target 查询。所有 traces 命令在准入和广告之前都须通过 active binding 及对应目标权限检查：upload-pack 要求目标项目 read，允许有该权限的非 owner 共享读取；已有 scope 的 receive-pack 同时要求 scope owner 和目标项目 write，仅是 owner 或仅有 write 均不够。合法空 scope 按 Create 的 write 授权处理，不伪造已有 owner。静态 token 还须覆盖 target 路径；Mono SSH key 使用与该命令对应的当前有效 Cedar 权限，`off` 不放行，`shadow` 按真实 Cedar 决定，不能把普通代码的 shadow 放行当作 traces 权限。
+- 先验证连接的真实凭据并确认其当前来源仍有效，再允许 scope 或 target 查询。所有 traces 命令在准入和广告之前都须通过 active binding 及对应目标权限检查：upload-pack 要求目标项目 read，允许有该权限的非 owner 共享读取；已有 scope 的 receive-pack 同时要求 scope owner 和目标项目 write，仅是 owner 或仅有 write 均不够。合法空 scope 按 Create 的 write 授权处理，不伪造已有 owner。静态 token 还须覆盖 target 路径；未配置下述范围映射的 Mono SSH key 使用与该命令对应的当前有效 Cedar 权限，`off` 不放行，`shadow` 按真实 Cedar 决定，不能把普通代码的 shadow 放行当作 traces 权限。
 - 只有真实 traces locator 且通过上述检查，才允许 storage-only 下受限的 TraceRepo receive-pack 命令准入。普通代码和其它视图不获得该例外；原 `git.ssh_receive_pack=false` 配置与普通代码写入拒绝保持。关闭 traces 时的根保留命名空间拒绝和无 fallback 边界保持。
+
+在 `git.push_auth="token"` 的 storage-only 部署中，可为已保存的 SSH key 显式配置路径范围。假设真实 SSH key 记录 ID 为 `123`，配置一个名称为 `trace-ssh-key:123` 的静态令牌，填入受保护的 token secret 和允许路径（例如 `paths = ["/project"]`）；再用 `traces credentials bind` 将 `mono_account / ssh-key:123` 与 `static_push_token / trace-ssh-key:123` **分别绑定到同一 principal UUID**。两项绑定均须有效，签名验证通过的 key 才能在该令牌范围内读写 traces；两个绑定不同主体、缺失或退役时拒绝，不回退到 Mono Cedar。已有 scope 写入仍要求 owner。密钥客户端不发送 token secret，但该静态 token 仍可用于既有 HTTP/SSH 密码认证，必须保密。路径省略或空列表沿用静态 token 的全仓范围；若需限制必须明确列出路径。配置变更需要重启，轮换到不同 key 记录 ID 时须更新令牌名与绑定。未配置该名称时，Mono SSH key 的现有 Cedar 语义保持不变；普通代码 SSH 不使用此映射。
 
 同一服务进程中的 HTTP 与 SSH 共用一个 receive 容量和独立的一个 fetch 容量。连接中断不能证明已开始的数据库提交是否完成；决定后续动作前应检查实际 ref。ingest 截止时间不保证 COMMIT 或 rollback 清理的完成上界。
 

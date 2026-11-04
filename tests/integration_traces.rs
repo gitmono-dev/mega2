@@ -5455,6 +5455,358 @@ mod disabled_http {
     }
 
     // MTR12: real standard Git over the running binary and authorized SSH key.
+    pub async fn run_ssh_scoped_token_key_roundtrip() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(ScopeAuthFixture::new(&db).await);
+            let f = fixture.as_mut().expect("FIX29 fixture");
+            let key = f.key(SCOPE_WRITER).await;
+            let name = format!("trace-ssh-key:{}", key.id);
+            let token = f.static_token(&name, "/project");
+            f.bind(&f.owner, "mono_account", &format!("ssh-key:{}", key.id))
+                .await;
+            f.bind(&f.owner, "static_push_token", &name).await;
+            f.start(true, true, "off").await;
+            let path = wire_by_path("/project", "fix29-source", &f.fixture.epoch, "sha1");
+            let password = f.password_session(&token, true).await;
+            wire_expect_metadata(
+                f,
+                &token,
+                Some(&password),
+                WireExpected {
+                    locator: &path,
+                    kind: "sha1",
+                    scope: None,
+                    v2: false,
+                    receive: true,
+                },
+            )
+            .await;
+            close_scope_session(password).await;
+            // The signed SSH key authenticates on the same live service before
+            // standard Git proves its mapped path authorization.
+            let key_session = f.key_session("traces", &key, true).await;
+            close_scope_session(key_session).await;
+            let shared = f.fixture.shared.path();
+            let ssh_dir = shared.join("ssh");
+            fs::create_dir_all(&ssh_dir).expect("FIX29 SSH directory");
+            fs::copy(&key.path, ssh_dir.join("client_ed25519")).expect("FIX29 client key");
+            git_cli::write_known_hosts_via_keyscan(&ssh_dir.join("known_hosts"), f.fixture.port);
+            let ssh = git_cli::git_ssh_command(shared, f.fixture.port);
+            let url = format!(
+                "ssh://traces@{}:{}{}",
+                git_cli::mega2_reachable_host(),
+                f.fixture.port,
+                path
+            );
+            f.fixture
+                .git(&["init", "--object-format=sha1", "fix29-source"]);
+            fs::write(
+                shared.join("fix29-source/payload.bin"),
+                b"FIX29 synthetic key scope\0\xff\n",
+            )
+            .expect("synthetic payload");
+            f.fixture.git(&["-C", "fix29-source", "add", "payload.bin"]);
+            f.fixture.git(&[
+                "-C",
+                "fix29-source",
+                "-c",
+                "user.name=FIX29",
+                "-c",
+                "user.email=fix29@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "key scope",
+            ]);
+            let tip = f
+                .fixture
+                .git_text(&["-C", "fix29-source", "rev-parse", "HEAD"]);
+            let push = git_cli::git_cli_ssh(
+                shared,
+                &ssh,
+                &[
+                    "-C",
+                    "fix29-source",
+                    "push",
+                    "--no-thin",
+                    &url,
+                    "HEAD:refs/libra/traces",
+                ],
+            );
+            assert!(
+                push.status.success(),
+                "FIX29_REAL_KEY_PUSH_ORACLE: mapped signed-key Git push failed: {}",
+                String::from_utf8_lossy(&push.stderr)
+            );
+            let stream = trace_stream::Entity::find()
+                .filter(trace_stream::Column::PrincipalId.eq(f.owner.clone()))
+                .filter(trace_stream::Column::SourceRepoId.eq("fix29-source"))
+                .one(&db)
+                .await
+                .expect("FIX29 stream query")
+                .expect("FIX29 stream created");
+            assert_eq!(stream.tip_oid.as_deref(), Some(tip.as_str()));
+            let scope = format!("/.traces/by-scope/{}.git", stream.id);
+            let session = f.key_session("traces", &key, true).await;
+            let response = wire_http_request(
+                f,
+                Some(&token),
+                "fix29-after-push",
+                &scope,
+                false,
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(response.status, 200);
+            let expected = WireExpected {
+                locator: &scope,
+                kind: "sha1",
+                scope: Some(&stream.id),
+                v2: false,
+                receive: false,
+            };
+            let http = wire_metadata_with_tip(&response.body, true, &expected, Some(&tip));
+            let advertisement = wire_ssh_advertisement(&session, &scope, false, false).await;
+            assert_eq!(
+                wire_metadata_with_tip(&advertisement, false, &expected, Some(&tip)),
+                http
+            );
+            close_scope_session(session).await;
+            // Fetch actual PACK through both authenticated transports and
+            // compare the original raw bytes, not just advertisements.
+            f.fixture
+                .git(&["init", "--object-format=sha1", "fix29-ssh-fetch"]);
+            let scoped_ssh = format!(
+                "ssh://traces@{}:{}{}",
+                git_cli::mega2_reachable_host(),
+                f.fixture.port,
+                scope
+            );
+            let fetched = git_cli::git_cli_ssh(
+                shared,
+                &ssh,
+                &[
+                    "-C",
+                    "fix29-ssh-fetch",
+                    "fetch",
+                    &scoped_ssh,
+                    "refs/libra/traces:refs/remotes/h1/traces",
+                ],
+            );
+            git_cli::assert_git_success(&fetched, "FIX29 real scoped SSH fetch");
+            assert_eq!(
+                f.fixture.git_text(&[
+                    "-C",
+                    "fix29-ssh-fetch",
+                    "rev-parse",
+                    "refs/remotes/h1/traces"
+                ]),
+                tip
+            );
+            assert_eq!(
+                f.fixture.git(&[
+                    "-C",
+                    "fix29-ssh-fetch",
+                    "show",
+                    "refs/remotes/h1/traces:payload.bin"
+                ]),
+                b"FIX29 synthetic key scope\0\xff\n"
+            );
+            f.fixture
+                .git(&["init", "--object-format=sha1", "fix29-http-fetch"]);
+            let scoped_http = git_cli::mega2_http_url(f.http_port, &scope);
+            let fetched = git_cli::git_cli_as_user(
+                shared,
+                SCOPE_WRITER,
+                &token,
+                &[
+                    "-C",
+                    "fix29-http-fetch",
+                    "fetch",
+                    &scoped_http,
+                    "refs/libra/traces:refs/remotes/h1/traces",
+                ],
+            );
+            git_cli::assert_git_success(&fetched, "FIX29 actual HTTP fetch of SSH-pushed scope");
+            assert_eq!(
+                f.fixture.git_text(&[
+                    "-C",
+                    "fix29-http-fetch",
+                    "rev-parse",
+                    "refs/remotes/h1/traces"
+                ]),
+                tip
+            );
+            assert_eq!(
+                f.fixture.git(&[
+                    "-C",
+                    "fix29-http-fetch",
+                    "show",
+                    "refs/remotes/h1/traces:payload.bin"
+                ]),
+                b"FIX29 synthetic key scope\0\xff\n"
+            );
+        })
+        .catch_unwind()
+        .await;
+        let cleanup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(fixture) = &mut fixture {
+                fixture.stop();
+            }
+        }));
+        let closed = db.close().await;
+        drop(guard);
+        if (result.is_err() || cleanup.is_err())
+            && let Some(fixture) = fixture.take()
+        {
+            let logs = fixture.fixture.temp.keep();
+            for name in ["process.out", "process.err"] {
+                if let Ok(bytes) = fs::read(logs.join(name)) {
+                    eprintln!(
+                        "FIX29 fixture failure log: file={} sha256={}",
+                        logs.join(name).display(),
+                        hex::encode(Sha256::digest(bytes))
+                    );
+                }
+            }
+        }
+        drop(fixture);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close FIX29 pool");
+    }
+
+    pub async fn run_ssh_scoped_token_key_matrix() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(ScopeAuthFixture::new(&db).await);
+            let f = fixture.as_mut().expect("FIX29 matrix fixture");
+            let target_b = Uuid::new_v4().to_string();
+            trace_target::ActiveModel {
+                id: Set(target_b), target_kind: Set("native".into()), project_path: Set("/.traces-backup".into()),
+                backing_import_repo_id: Set(None), active: Set(true), created_at: Set(Utc::now().fixed_offset()),
+            }.insert(&db).await.expect("second target");
+            let a = f.key(SCOPE_WRITER).await;
+            let b = f.key(SCOPE_WRITER).await;
+            let mismatch = f.key(SCOPE_WRITER).await;
+            let unbound = f.key(SCOPE_WRITER).await;
+            let a_name = format!("trace-ssh-key:{}", a.id);
+            let b_name = format!("trace-ssh-key:{}", b.id);
+            let mismatch_name = format!("trace-ssh-key:{}", mismatch.id);
+            let unbound_name = format!("trace-ssh-key:{}", unbound.id);
+            let a_token = f.static_token(&a_name, "/");
+            let b_token = f.static_token(&b_name, "/project");
+            let mismatch_token = f.static_token(&mismatch_name, "/project");
+            let _unbound_token = f.static_token(&unbound_name, "/project");
+            f.bind(&f.owner, "mono_account", &format!("ssh-key:{}", a.id)).await;
+            f.bind(&f.owner, "static_push_token", &a_name).await;
+            f.bind(&f.outsider, "mono_account", &format!("ssh-key:{}", b.id)).await;
+            f.bind(&f.outsider, "static_push_token", &b_name).await;
+            f.bind(&f.outsider, "mono_account", &format!("ssh-key:{}", mismatch.id)).await;
+            f.bind(&f.owner, "static_push_token", &mismatch_name).await;
+            f.bind(&f.owner, "mono_account", &format!("ssh-key:{}", unbound.id)).await;
+            f.start(true, true, "off").await;
+            let shared = f.fixture.shared.path();
+            let ssh_dir = shared.join("ssh");
+            fs::create_dir_all(&ssh_dir).expect("FIX29 matrix ssh dir");
+            git_cli::write_known_hosts_via_keyscan(&ssh_dir.join("known_hosts"), f.fixture.port);
+            let ssh = git_cli::git_ssh_command(shared, f.fixture.port);
+            f.fixture.git(&["init", "--object-format=sha1", "fix29-matrix-source"]);
+            fs::write(shared.join("fix29-matrix-source/sentinel"), b"FIX29 matrix synthetic\0\xff\n").unwrap();
+            f.fixture.git(&["-C", "fix29-matrix-source", "add", "sentinel"]);
+            f.fixture.git(&["-C", "fix29-matrix-source", "-c", "user.name=FIX29", "-c", "user.email=fix29@example.invalid", "-c", "commit.gpgsign=false", "commit", "-m", "matrix"]);
+            let tip = f.fixture.git_text(&["-C", "fix29-matrix-source", "rev-parse", "HEAD"]);
+            let mut scopes = Vec::new();
+            for (key, target, source, owner) in [(&a, "/project", "fix29-a-one", &f.owner), (&a, "/.traces-backup", "fix29-a-two", &f.owner), (&b, "/project", "fix29-b-one", &f.outsider)] {
+                fs::copy(&key.path, ssh_dir.join("client_ed25519")).expect("select actual SSH key");
+                let locator = wire_by_path(target, source, &f.fixture.epoch, "sha1");
+                let url = format!("ssh://traces@{}:{}{}", git_cli::mega2_reachable_host(), f.fixture.port, locator);
+                let output = git_cli::git_cli_ssh(shared, &ssh, &["-C", "fix29-matrix-source", "push", "--no-thin", &url, "HEAD:refs/libra/traces"]);
+                git_cli::assert_git_success(&output, "FIX29 matrix actual SSH push");
+                let stream = trace_stream::Entity::find().filter(trace_stream::Column::PrincipalId.eq(owner.clone())).filter(trace_stream::Column::SourceRepoId.eq(source)).one(&db).await.unwrap().expect("matrix stream");
+                assert_eq!(stream.tip_oid.as_deref(), Some(tip.as_str()));
+                scopes.push(format!("/.traces/by-scope/{}.git", stream.id));
+            }
+            // B can read A's T1, but neither read nor write A's T2.
+            let b_session = f.key_session("traces", &b, true).await;
+            let a_scope = scopes[0].clone();
+            let a_scope_id = a_scope.trim_start_matches("/.traces/by-scope/").trim_end_matches(".git");
+            wire_expect_metadata(f, &b_token, Some(&b_session), WireExpected { locator: &a_scope, kind: "sha1", scope: Some(a_scope_id), v2: true, receive: false }).await;
+            for receive in [false, true] {
+                wire_expect_refusal(f, Some(&b_token), Some(&b_session), &scopes[1], false, receive, 404).await;
+            }
+            fs::copy(&b.path, ssh_dir.join("client_ed25519")).expect("peer key");
+            f.fixture.git(&["init", "--object-format=sha1", "fix29-peer-fetch"]);
+            let url = format!("ssh://traces@{}:{}{}", git_cli::mega2_reachable_host(), f.fixture.port, scopes[0]);
+            let fetch = git_cli::git_cli_ssh(shared, &ssh, &["-C", "fix29-peer-fetch", "fetch", &url, "refs/libra/traces:refs/remotes/h1/traces"]);
+            git_cli::assert_git_success(&fetch, "FIX29 peer actual SSH read");
+            assert_eq!(f.fixture.git(&["-C", "fix29-peer-fetch", "show", "refs/remotes/h1/traces:sentinel"]), b"FIX29 matrix synthetic\0\xff\n");
+            // A valid password for the other principal is a positive control;
+            // the mismatched key cannot inherit that token's rights.
+            let wrong = f.key_session("traces", &mismatch, true).await;
+            let status = wire_http_request(f, Some(&mismatch_token), "fix29-mismatch-positive", &scopes[0], false, false, None).await;
+            assert_eq!(status.status, 200);
+            ssh_refused(&wrong, &format!("git-upload-pack '{}'", scopes[0]), false).await;
+            close_scope_session(wrong).await;
+            let missing = f.key_session("traces", &unbound, true).await;
+            ssh_refused(&missing, &format!("git-upload-pack '{}'", scopes[0]), false).await;
+            close_scope_session(missing).await;
+            // Revoke static binding while a verified SSH session stays open.
+            db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "UPDATE trace_credential_binding SET retired_at=now() WHERE namespace='static_push_token' AND credential_id=$1 AND retired_at IS NULL", [b_name.clone().into()])).await.unwrap();
+            ssh_refused(&b_session, &format!("git-upload-pack '{}'", scopes[0]), false).await;
+            f.bind(&f.outsider, "static_push_token", &b_name).await;
+            db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "UPDATE trace_credential_binding SET retired_at=now() WHERE namespace='mono_account' AND credential_id=$1 AND retired_at IS NULL", [format!("ssh-key:{}", b.id).into()])).await.unwrap();
+            let status = wire_http_request(f, Some(&b_token), "fix29-key-revoked-http-positive", &scopes[0], false, false, None).await;
+            assert_eq!(status.status, 200);
+            ssh_refused(&b_session, &format!("git-upload-pack '{}'", scopes[0]), false).await;
+            close_scope_session(b_session).await;
+            let a_session = f.key_session("traces", &a, true).await;
+            let scope_id = scopes[1].trim_start_matches("/.traces/by-scope/").trim_end_matches(".git");
+            wire_expect_metadata(f, &a_token, Some(&a_session), WireExpected { locator: &scopes[1], kind: "sha1", scope: Some(scope_id), v2: true, receive: false }).await;
+            close_scope_session(a_session).await;
+        }).catch_unwind().await;
+        let cleanup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(fixture) = &mut fixture {
+                fixture.stop();
+            }
+        }));
+        let closed = db.close().await;
+        drop(guard);
+        if (result.is_err() || cleanup.is_err())
+            && let Some(fixture) = fixture.take()
+        {
+            let logs = fixture.fixture.temp.keep();
+            for name in ["process.out", "process.err"] {
+                if let Ok(bytes) = fs::read(logs.join(name)) {
+                    eprintln!(
+                        "FIX29 matrix log: file={} sha256={}",
+                        logs.join(name).display(),
+                        hex::encode(Sha256::digest(bytes))
+                    );
+                }
+            }
+        }
+        drop(fixture);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close FIX29 matrix pool");
+    }
+
     pub async fn ssh_git_roundtrip(kind: &str) {
         let (guard, db) = traces_db::TracesDb::migrated().await;
         let mut fixture = None;
@@ -12575,6 +12927,16 @@ async fn discovery_wire_http_sha1() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_wire_http_sha256() {
     disabled_http::run_metadata_wire_matrix("sha256", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scoped_token_key_matrix() {
+    disabled_http::run_ssh_scoped_token_key_matrix().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_scoped_token_key_roundtrip() {
+    disabled_http::run_ssh_scoped_token_key_roundtrip().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

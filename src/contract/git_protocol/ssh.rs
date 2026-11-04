@@ -371,6 +371,20 @@ fn ssh_pre_dispatch_reply(exec: &SshExecRequest) -> Option<SshErrReply> {
     }
 }
 
+/// Opt-in association of a verified SSH key with an existing path-scoped
+/// static token. The token secret is not presented by the key client; the
+/// traces authorization layer verifies both bindings name the same owner.
+fn scoped_key_token<'a>(
+    git: &'a GitConfig,
+    key: &AuthenticatedSshKey,
+) -> Option<&'a PushTokenConfig> {
+    if git.push_auth != Some(PushAuth::Token) {
+        return None;
+    }
+    let name = format!("trace-ssh-key:{}", key.id());
+    git.push_tokens.iter().find(|token| token.name == name)
+}
+
 #[derive(Clone)]
 pub(crate) enum SshAuthenticatedCredential {
     Static {
@@ -599,12 +613,18 @@ where
                 token,
             }
         }
-        SshAuthenticatedCredential::Key { key, .. } => TracesCaller::MonoSshKey {
-            key,
-            enforcement: Enforcement::parse(&config.cedar.enforcement)
-                .ok_or(TracesError::UnknownScope)?,
-            snapshot: snapshot.as_deref(),
-        },
+        SshAuthenticatedCredential::Key { key, .. } => {
+            if let Some(token) = scoped_key_token(&config.git, key) {
+                TracesCaller::StaticScopedSshKey { key, token }
+            } else {
+                TracesCaller::MonoSshKey {
+                    key,
+                    enforcement: Enforcement::parse(&config.cedar.enforcement)
+                        .ok_or(TracesError::UnknownScope)?,
+                    snapshot: snapshot.as_deref(),
+                }
+            }
+        }
     };
     serve_trace_git(
         TraceGitRequest {
@@ -680,12 +700,18 @@ impl SshServer {
                     token,
                 }
             }
-            SshAuthenticatedCredential::Key { key, .. } => TracesCaller::MonoSshKey {
-                key,
-                enforcement: Enforcement::parse(&config.cedar.enforcement)
-                    .ok_or(TracesError::UnknownScope)?,
-                snapshot: snapshot.as_deref(),
-            },
+            SshAuthenticatedCredential::Key { key, .. } => {
+                if let Some(token) = scoped_key_token(&config.git, key) {
+                    TracesCaller::StaticScopedSshKey { key, token }
+                } else {
+                    TracesCaller::MonoSshKey {
+                        key,
+                        enforcement: Enforcement::parse(&config.cedar.enforcement)
+                            .ok_or(TracesError::UnknownScope)?,
+                        snapshot: snapshot.as_deref(),
+                    }
+                }
+            }
         };
         resolve_trace_discovery(db, &config.traces, locator, caller, service_type).await
     }

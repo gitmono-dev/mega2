@@ -155,6 +155,12 @@ pub enum TracesCaller<'a> {
         enforcement: Enforcement,
         snapshot: Option<&'a EntitySnapshot>,
     },
+    /// A verified SSH key explicitly linked to a path-scoped static token.
+    /// Both credential bindings must resolve to the same principal.
+    StaticScopedSshKey {
+        key: &'a AuthenticatedSshKey,
+        token: &'a PushTokenConfig,
+    },
     #[cfg(test)]
     MonoAccount {
         credential_id: &'a str,
@@ -240,7 +246,8 @@ pub async fn authorize_traces(
     {
         return Ok(TracesAuthDecision::NotFound);
     }
-    if let TracesCaller::MonoSshKey { key, .. } = request.caller
+    if let TracesCaller::MonoSshKey { key, .. } | TracesCaller::StaticScopedSshKey { key, .. } =
+        request.caller
         && !key.is_current(db, false).await?
     {
         return Ok(TracesAuthDecision::NotFound);
@@ -248,9 +255,14 @@ pub async fn authorize_traces(
     let Some(presented) = presented_credential(request) else {
         return Ok(TracesAuthDecision::Unauthenticated);
     };
-    let Some(principal_id) =
+    // The two bindings are read in one statement, so a concurrent rotation
+    // cannot manufacture an association from two different snapshots.
+    let principal = if let TracesCaller::StaticScopedSshKey { key, token } = request.caller {
+        active_scoped_key_principal(db, key, token).await?
+    } else {
         active_principal(db, presented.namespace, presented.credential_id).await?
-    else {
+    };
+    let Some(principal_id) = principal else {
         return Ok(TracesAuthDecision::NotFound);
     };
     let access = match request.action {
@@ -280,6 +292,16 @@ fn presented_credential<'a>(request: &TracesAuthRequest<'a>) -> Option<Presented
             kind: PresentedKind::Token { token },
         }),
         TracesCaller::StaticPushToken { .. } => None,
+        TracesCaller::StaticScopedSshKey { key, token }
+            if token.name == format!("trace-ssh-key:{}", key.id()) =>
+        {
+            Some(Presented {
+                namespace: CredentialNamespace::StaticPushToken,
+                credential_id: &token.name,
+                kind: PresentedKind::Token { token },
+            })
+        }
+        TracesCaller::StaticScopedSshKey { .. } => None,
         TracesCaller::MonoAccessToken {
             token,
             enforcement,
@@ -358,12 +380,22 @@ pub async fn recheck_publish_authority<C: ConnectionTrait>(
     if stream.principal_id != authority.principal_id || stream.target_id != authority.target_id {
         return Err(publish_rejected());
     }
-    let Some(bound_principal) = locked_active_principal(conn, namespace, credential_id).await?
-    else {
-        return Err(publish_rejected());
-    };
-    if bound_principal != stream.principal_id {
-        return Err(publish_rejected());
+    if let TracesCaller::StaticScopedSshKey { key, token } = authority.caller {
+        // Match credential-management lock ordering: key source first, then
+        // both binding rows in stable id order. All checks share this txn.
+        if !key.is_current(conn, true).await?
+            || !locked_scoped_key_matches(conn, key, token, &stream.principal_id).await?
+        {
+            return Err(publish_rejected());
+        }
+    } else {
+        let Some(bound_principal) = locked_active_principal(conn, namespace, credential_id).await?
+        else {
+            return Err(publish_rejected());
+        };
+        if bound_principal != stream.principal_id {
+            return Err(publish_rejected());
+        }
     }
     if let TracesCaller::MonoAccessToken { token, .. } = authority.caller
         && !token.is_current(conn, true).await?
@@ -400,7 +432,9 @@ fn live_account_policy(
         TracesCaller::MonoAccessToken { .. } | TracesCaller::MonoSshKey { .. } => true,
         #[cfg(test)]
         TracesCaller::MonoAccount { .. } => true,
-        TracesCaller::Anonymous | TracesCaller::StaticPushToken { .. } => false,
+        TracesCaller::Anonymous
+        | TracesCaller::StaticPushToken { .. }
+        | TracesCaller::StaticScopedSshKey { .. } => false,
     };
     if !account {
         return Ok(None);
@@ -456,17 +490,17 @@ fn presented_for_publish<'a>(
         }),
         #[cfg(test)]
         TracesCaller::MonoAccount { .. } => Err(publish_rejected()),
-        TracesCaller::Anonymous | TracesCaller::StaticPushToken { .. } => {
-            presented_credential(&TracesAuthRequest {
-                caller: authority.caller,
-                action: TracesAction::Update {
-                    owner_principal_id: authority.principal_id,
-                },
-                canonical_target_path: authority.authorized_path,
-                commit_author: None,
-            })
-            .ok_or_else(publish_rejected)
-        }
+        TracesCaller::Anonymous
+        | TracesCaller::StaticPushToken { .. }
+        | TracesCaller::StaticScopedSshKey { .. } => presented_credential(&TracesAuthRequest {
+            caller: authority.caller,
+            action: TracesAction::Update {
+                owner_principal_id: authority.principal_id,
+            },
+            canonical_target_path: authority.authorized_path,
+            commit_author: None,
+        })
+        .ok_or_else(publish_rejected),
     }
 }
 
@@ -487,6 +521,12 @@ fn credential_identity(caller: TracesCaller<'_>) -> Option<(CredentialNamespace,
             Some((CredentialNamespace::StaticPushToken, credential_id))
         }
         TracesCaller::StaticPushToken { .. } => None,
+        TracesCaller::StaticScopedSshKey { key, token }
+            if token.name == format!("trace-ssh-key:{}", key.id()) =>
+        {
+            Some((CredentialNamespace::StaticPushToken, &token.name))
+        }
+        TracesCaller::StaticScopedSshKey { .. } => None,
         TracesCaller::MonoAccessToken { token, .. } => {
             Some((CredentialNamespace::MonoAccount, token.credential_id()))
         }
@@ -587,6 +627,69 @@ async fn active_principal<C: ConnectionTrait>(
         .one(db)
         .await?;
     Ok(row.map(|row| row.principal_id))
+}
+
+/// Read the explicit key and token association in one database snapshot.
+async fn active_scoped_key_principal<C: ConnectionTrait>(
+    conn: &C,
+    key: &AuthenticatedSshKey,
+    token: &PushTokenConfig,
+) -> Result<Option<String>, MegaError> {
+    if token.name != format!("trace-ssh-key:{}", key.id()) {
+        return Ok(None);
+    }
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT t.principal_id FROM trace_credential_binding t
+         JOIN trace_credential_binding k ON k.principal_id = t.principal_id
+         WHERE t.namespace = 'static_push_token' AND t.credential_id = $1 AND t.retired_at IS NULL
+           AND k.namespace = 'mono_account' AND k.credential_id = $2 AND k.retired_at IS NULL",
+            [
+                Value::from(token.name.clone()),
+                Value::from(key.credential_id().to_owned()),
+            ],
+        ))
+        .await?;
+    Ok(match row {
+        Some(row) => Some(row.try_get("", "principal_id")?),
+        None => None,
+    })
+}
+
+/// Lock both still-active bindings in the same deterministic order as rotation.
+async fn locked_scoped_key_matches<C: ConnectionTrait>(
+    conn: &C,
+    key: &AuthenticatedSshKey,
+    token: &PushTokenConfig,
+    principal: &str,
+) -> Result<bool, MegaError> {
+    if token.name != format!("trace-ssh-key:{}", key.id()) {
+        return Ok(false);
+    }
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT principal_id FROM trace_credential_binding
+         WHERE retired_at IS NULL AND ((namespace = 'static_push_token' AND credential_id = $1)
+            OR (namespace = 'mono_account' AND credential_id = $2))
+         ORDER BY id FOR UPDATE",
+            [
+                Value::from(token.name.clone()),
+                Value::from(key.credential_id().to_owned()),
+            ],
+        ))
+        .await?;
+    if rows.len() != 2 {
+        return Ok(false);
+    }
+    for row in rows {
+        let bound: String = row.try_get("", "principal_id")?;
+        if bound != principal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn target_allows(
@@ -2095,6 +2198,327 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn static_scoped_ssh_key_requires_both_matching_active_bindings_and_path() {
+        let (_temp, db) = migrated_db().await;
+        let original = ssh_source(&db, 7411, "publisher").await;
+        let key = ssh_witness(&db).await;
+        let owner = principal(&db).await;
+        let other = principal(&db).await;
+        let token = token("trace-ssh-key:7411", &["/team/app"]);
+        let mut request = TracesAuthRequest {
+            caller: TracesCaller::StaticScopedSshKey {
+                key: &key,
+                token: &token,
+            },
+            action: TracesAction::Create,
+            canonical_target_path: "/team/app",
+            commit_author: None,
+        };
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+        bind(
+            &db,
+            &owner,
+            CredentialNamespace::MonoAccount,
+            key.credential_id(),
+        )
+        .await;
+        bind(
+            &db,
+            &other,
+            CredentialNamespace::StaticPushToken,
+            &token.name,
+        )
+        .await;
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+        trace_credential_binding::Entity::update_many()
+            .col_expr(
+                trace_credential_binding::Column::RetiredAt,
+                sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+            )
+            .filter(trace_credential_binding::Column::Namespace.eq("static_push_token"))
+            .filter(trace_credential_binding::Column::CredentialId.eq(&token.name))
+            .exec(&db)
+            .await
+            .unwrap();
+        bind(
+            &db,
+            &owner,
+            CredentialNamespace::StaticPushToken,
+            &token.name,
+        )
+        .await;
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::Allow {
+                principal_id: owner.clone()
+            }
+        );
+        request.canonical_target_path = "/team/application";
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+        request.canonical_target_path = "/team/app";
+        request.action = TracesAction::Update {
+            owner_principal_id: &other,
+        };
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+        request.action = TracesAction::Create;
+        let mut wrong_name = token.clone();
+        wrong_name.name = "trace-ssh-key:7412".into();
+        request.caller = TracesCaller::StaticScopedSshKey {
+            key: &key,
+            token: &wrong_name,
+        };
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::Unauthenticated
+        );
+        request.caller = TracesCaller::StaticScopedSshKey {
+            key: &key,
+            token: &token,
+        };
+        let mut changed = original;
+        changed.ssh_key.push_str(" replaced");
+        replace_ssh_source(&db, &changed).await;
+        assert_eq!(
+            authorize_traces(&db, &request).await.unwrap(),
+            TracesAuthDecision::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn static_scoped_ssh_key_publication_rechecks_key_and_both_bindings() {
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        let original = ssh_source(&db, 7413, "publisher").await;
+        let key = ssh_witness(&db).await;
+        let token = token("trace-ssh-key:7413", &[&fixture.path]);
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::MonoAccount,
+            key.credential_id(),
+        )
+        .await;
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::StaticPushToken,
+            &token.name,
+        )
+        .await;
+        let authority = PublishAuthority {
+            caller: TracesCaller::StaticScopedSshKey {
+                key: &key,
+                token: &token,
+            },
+            principal_id: &fixture.principal_id,
+            target_id: &fixture.target_id,
+            authorized_path: &fixture.path,
+            expected_generation: 1,
+            policy: None,
+        };
+        recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .unwrap();
+        trace_credential_binding::Entity::update_many()
+            .col_expr(
+                trace_credential_binding::Column::RetiredAt,
+                sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+            )
+            .filter(trace_credential_binding::Column::Namespace.eq("static_push_token"))
+            .filter(trace_credential_binding::Column::CredentialId.eq(&token.name))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::StaticPushToken,
+            &token.name,
+        )
+        .await;
+        recheck_publish_authority(&db, &fixture.stream_id, &authority)
+            .await
+            .unwrap();
+        retire_account_binding(&db, key.credential_id()).await;
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::MonoAccount,
+            key.credential_id(),
+        )
+        .await;
+        let mut changed = original;
+        changed.ssh_key.push_str(" replaced");
+        replace_ssh_source(&db, &changed).await;
+        assert_rejected(
+            recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    #[tokio::test]
+    async fn static_scoped_ssh_key_publication_locks_both_bindings_and_source() {
+        use std::time::Duration;
+
+        use sea_orm::TransactionTrait;
+
+        let (_temp, db) = migrated_db().await;
+        let fixture = publish_fixture(&db).await;
+        ssh_source(&db, 7414, "publisher").await;
+        let key = ssh_witness(&db).await;
+        let token = token("trace-ssh-key:7414", &[&fixture.path]);
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::MonoAccount,
+            key.credential_id(),
+        )
+        .await;
+        bind(
+            &db,
+            &fixture.principal_id,
+            CredentialNamespace::StaticPushToken,
+            &token.name,
+        )
+        .await;
+        let authority = PublishAuthority {
+            caller: TracesCaller::StaticScopedSshKey {
+                key: &key,
+                token: &token,
+            },
+            principal_id: &fixture.principal_id,
+            target_id: &fixture.target_id,
+            authorized_path: &fixture.path,
+            expected_generation: 1,
+            policy: None,
+        };
+        for which in 0..3 {
+            let publication = db.begin().await.unwrap();
+            let publisher: i32 = publication
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT pg_backend_pid() AS pid",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "pid")
+                .unwrap();
+            recheck_publish_authority(&publication, &fixture.stream_id, &authority)
+                .await
+                .unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let writer = async {
+                let changing = db.begin().await.unwrap();
+                let pid: i32 = changing
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT pg_backend_pid() AS pid",
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get("", "pid")
+                    .unwrap();
+                tx.send(pid).unwrap();
+                let statement = match which {
+                    0 => Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "UPDATE trace_credential_binding SET retired_at=now() WHERE namespace='static_push_token' AND credential_id=$1 AND retired_at IS NULL",
+                        [token.name.clone().into()],
+                    ),
+                    1 => Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "UPDATE trace_credential_binding SET retired_at=now() WHERE namespace='mono_account' AND credential_id=$1 AND retired_at IS NULL",
+                        [key.credential_id().to_owned().into()],
+                    ),
+                    _ => Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "DELETE FROM ssh_keys WHERE id=$1",
+                        [key.id().into()],
+                    ),
+                };
+                let rows = changing
+                    .execute_raw(statement)
+                    .await
+                    .unwrap()
+                    .rows_affected();
+                changing.commit().await.unwrap();
+                rows
+            };
+            let release = async {
+                let writer_pid = rx.await.unwrap();
+                let blocked = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let row = db.query_one_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                            "SELECT $1::integer = ANY(pg_blocking_pids($2::integer)) AS blocked", [publisher.into(), writer_pid.into()]))
+                            .await.unwrap().unwrap();
+                        if row.try_get::<bool>("", "blocked").unwrap() { break; }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await;
+                publication.commit().await.unwrap();
+                blocked
+            };
+            let (rows, blocked) = tokio::join!(writer, release);
+            assert!(
+                blocked.is_ok(),
+                "scoped-key revocation {which} must wait for publication"
+            );
+            assert_eq!(rows, 1);
+            assert_rejected(
+                recheck_publish_authority(&db, &fixture.stream_id, &authority)
+                    .await
+                    .unwrap_err(),
+            );
+            match which {
+                0 => {
+                    bind(
+                        &db,
+                        &fixture.principal_id,
+                        CredentialNamespace::StaticPushToken,
+                        &token.name,
+                    )
+                    .await
+                }
+                1 => {
+                    bind(
+                        &db,
+                        &fixture.principal_id,
+                        CredentialNamespace::MonoAccount,
+                        key.credential_id(),
+                    )
+                    .await
+                }
+                _ => {}
+            }
+        }
     }
 
     #[tokio::test]
