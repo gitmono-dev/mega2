@@ -1,3 +1,13 @@
+**MTR12实际R（2026-11-04 UTC）：** 已核远端main为MTR92 `5895f694`、`v0.42.94` tag/Release空缺；实际 `cargo update --offline --workspace` exit0，仅本包版本 `.93→.94`，收据 `b9b2d66fc01cca950bb938f4deeb699e9df0a06cce97432b4e5fb2eae0d743f5`。SSH真实双格式及前驱回归通过，四计划治理与双语指南为最终候选；完整C、签名发布/D和持久H1仍待，不预认。Review waived非PASS。
+
+**MTR12数据面本地验证（2026-11-04 UTC）：** 原 `.93` 产品目标RED后，隔离候选接入专用SSH Trace Git流；原VER-1真实2/2通过（SHA1/SHA256，v0/v2、首次push、同principal跨HTTP/SSH、HTTP追加、原始blob与tip、>4MiB PACK、分片输入、混合receive 503及独立fetch、输入/输出断连后真实恢复、非owner只读与非法ref/delete/非快进拒绝），收据 `122bfcbd9aa716fb800fc5700868824af8f7654dbd15e41b0adf5747023fe8e2`，首次post及各实际Local root conformance接受。strict Clippy 0warning，MTR38 13/13、HTTP wire3/3、SSH wire2/2、MTR39 auth8/8、HTTP真实双格式2/2、MTR100禁用SSH2/2及其first-post均通过；原RED-01 setup401和GREEN-02/05测试oracle失败原件保留。仅本地资格，独立完整C/D及可重启持久H1尚待。MTR97共享blocking pool与5ms协作检查不等于全局容量或硬实时证明；DEBT-MTR98-ROLLBACK-BOUND仍open，300秒不覆盖COMMIT/rollback。Review waived非PASS。
+
+**MTR12真实RED（2026-11-04 UTC）：** 原`.93`产品、真实binary和标准Git经已绑定SSH密钥认证及empty-scope discovery成功后，首个by-path push以协议错误失败，实际服务记录 `trace repository does not write code objects`；目标0 passed/1 failed、Cargo101，RED收据 `8f0e7a0c63e8194e85507321c96b2bef1ae627825f96b48d26dec33f0bfad7eb`，实际Local root 16项conformance及首次资源post接受。RED-01的HTTP正向夹具401是独立setup失败，不计RED且原件保留；RED-02才是上述目标缺陷。现开始SSH专用数据面增量实现，原7AC/2VER和容量/债务边界不放宽；H1、完整C/D均待。Review waived非PASS。
+
+**MTR12开工登记（2026-11-04 UTC）：** 前驱MTR92 `5895f694` / `.93` 已实际C/D完成；本卡从该基线在独立工作树实施，不复用未编译候选作结果。fixture operator为root协调执行者（本机账号eli），H1拟为本机持久真实multi HTTP/SSH服务、两项目/两principal，直到LTR08安装smoke/D后按约移交/收口；目前尚未运行或认领live。ER03将四计划治理文件加入本卡I以承载前驱事实与本卡实际状态，原3生产文件上界、7AC/2VER和独立patch不变。消费MTR97 P2-4：设计拟沿用单进程共享receive/fetch各1、既有300秒单次admission及worker独立deadline/5ms协作检查；SSH channel须有界背压与真实worker终态，混合过载/断开资源验证待实际运行，不声称全局容量或5ms硬上界。仅终态SSH消息拟采用有界5秒发送，不改变ingest预算；DEBT-MTR98-ROLLBACK-BOUND仍open，300秒不覆盖COMMIT/rollback清理。H1必须绑定实际endpoint条件创建收据、同binary/config/server ID/真实标准Git及重启结果，不能以旧临时根冒充。先在原产品上真实RED，再增量接入；Review waived非PASS。
+
+**MTR92实际发布与收口（2026-11-04 UTC）：** MTR-92 `done/complete`；commit `5895f6947c6f39b51658699c1016c06c05a19fee`、signed annotated `v0.42.93` tag对象 `3023bf5f68a032ba11d0c195f92d5e9537b191d2` 与[Release](https://github.com/gitmono-dev/mega2/releases/tag/v0.42.93)已核。最终C实际24目标3185通过/0失败/3原ignored、五门0/0warning；first-post 276旧库身份不变、0新库/owned live，29个实际Local fixture roots共464条件创建证明。main Harbor [41823207148](https://github.com/gitmono-dev/mega2/actions/runs/41823207148) 实际success；tag Docker [41823242411](https://github.com/gitmono-dev/mega2/actions/runs/41823242411) amd64、arm64、manifest实际success。收据 `859f1f8c35c3e524abe54758bc677cd0967a2e6ec3252e63d0c7033c4c1067fb`。旧失败cohort保留，四原dirty保留；Review waived非PASS。后继MTR12/H1从本实际发布基线另起资格。
+
 **MTR92实际R（2026-11-04 UTC）：** 远端main仍为FIX28 `6d085023` 且 `v0.42.93` tag/Release实际空缺；已执行 `cargo update --offline --workspace` exit0，解析确认仅本包版本 `.92→.93`，R收据 `3e8cf40a79fc42347b74e06cc5d363f62e6db5bc1782c46ca1eea36372e5b38b`。新基线全部focused接受；完整五门C与签名发布/D仍待，先前失败cohort保留。Review waived非PASS。
 
 **MTR92新基线定向验收（2026-11-04 UTC）：** 在已发布FIX28 `.92` / `6d08502384b816bd98f733a2d1b82c514d755e5d` 基线，agent parser 3/3、真实Git HTTP SHA1/SHA256往返2/2、HTTP discovery wire3/3、SSH wire2/2及MTR38回归13/13实际通过，五窗source/tests/config parity及首次资源后检均接受；详见 `/tmp/mega2-plan-20261103/MTR92-POSTFIX28-FOCUSED-PREP/`。五组为本地资格，不是完整C/D；现准备真实 `.92→.93` R，保留旧失败cohort和首次资源结果。Review waived非PASS。
@@ -874,6 +884,10 @@ deepen-since
 deepen-not
 shallow
 ```
+
+### MTR12 SSH scoped Git 当前候选
+
+认证及 scope 授权后，独立 channel worker 消费真实 russh 输入并串流 scoped receive/upload，使用与 HTTP 同进程共享的 receive/fetch 准入；普通代码路径不获得 traces 写入权限。已有 scope 的 v0 广告携带真实 tip，v2 upload 支持 ls-refs/fetch，首次 by-path push 后再 discovery 学习 UUID。实际双格式、跨传输、>4MiB、断连及拒绝用例的收据见本文件顶部；完整 C/D 和持久 H1 尚未认领。阻塞线程和协作轮询不构成全局容量或硬实时保证，COMMIT/rollback 不包含在 ingest 截止时间保证内。
 
 ### MTR92旧候选 Traces discovery 接线（C1失败冻结，未发布）
 

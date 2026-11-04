@@ -5002,6 +5002,15 @@ mod disabled_http {
     }
 
     fn wire_metadata(bytes: &[u8], http: bool, expected: &WireExpected<'_>) -> WireMetadata {
+        wire_metadata_with_tip(bytes, http, expected, None)
+    }
+
+    fn wire_metadata_with_tip(
+        bytes: &[u8],
+        http: bool,
+        expected: &WireExpected<'_>,
+        tip: Option<&str>,
+    ) -> WireMetadata {
         let mut packets = discovery_wire_packets(bytes);
         if http && !expected.v2 {
             let service = if expected.receive {
@@ -5038,10 +5047,16 @@ mod disabled_http {
             let (reference, capabilities) =
                 line.split_once('\0').expect("v0 NUL capability separator");
             let width = if expected.kind == "sha1" { 40 } else { 64 };
+            let expected_reference = match tip {
+                Some(tip) => {
+                    assert_eq!(tip.len(), width, "actual tip has authorized hash width");
+                    format!("{tip} refs/libra/traces")
+                }
+                None => format!("{} capabilities^{{}}", "0".repeat(width)),
+            };
             assert_eq!(
-                reference,
-                format!("{} capabilities^{{}}", "0".repeat(width)),
-                "authorized metadata controls zero-ID width"
+                reference, expected_reference,
+                "authorized metadata and actual tip"
             );
             assert!(capabilities.ends_with('\n'));
             capabilities
@@ -5437,6 +5452,754 @@ mod disabled_http {
         assert_eq!(stream.principal_id, fixture.owner);
         assert_eq!(stream.tip_oid.as_deref(), Some(tip.as_str()));
         assert_eq!(stream.hash_kind, kind);
+    }
+
+    // MTR12: real standard Git over the running binary and authorized SSH key.
+    pub async fn ssh_git_roundtrip(kind: &str) {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(ScopeAuthFixture::new_with_kind(&db, kind).await);
+            let f = fixture.as_mut().expect("SSH Git fixture");
+            let writer = f.key(SCOPE_WRITER).await;
+            f.bind(&f.owner, "mono_account", &format!("ssh-key:{}", writer.id))
+                .await;
+            let outsider = f.key(SCOPE_WRITER).await;
+            f.bind(
+                &f.outsider,
+                "mono_account",
+                &format!("ssh-key:{}", outsider.id),
+            )
+            .await;
+            let token = format!("mtr12-http-{}", Uuid::new_v4());
+            mega2_core::access_token::ActiveModel {
+                id: Set(1001),
+                username: Set(SCOPE_WRITER.to_owned()),
+                token: Set(token.clone()),
+                created_at: Set(Utc::now().naive_utc()),
+            }
+            .insert(&db)
+            .await
+            .expect("seed same-principal HTTP token");
+            f.bind(&f.owner, "mono_account", "access-token:1001").await;
+            f.start(false, false, "enforce").await;
+            let locator = wire_by_path("/project", "mtr12-new-source", &f.fixture.epoch, kind);
+            let session = f.key_session("traces", &writer, true).await;
+            let expected = WireExpected {
+                locator: &locator,
+                kind,
+                scope: None,
+                v2: false,
+                receive: true,
+            };
+            let advertisement = wire_ssh_advertisement(&session, &locator, false, true).await;
+            wire_metadata(&advertisement, false, &expected);
+            close_scope_session(session).await;
+            let shared = f.fixture.shared.path();
+            let ssh_dir = shared.join("ssh");
+            fs::create_dir_all(&ssh_dir).expect("SSH fixture directory");
+            fs::copy(&writer.path, ssh_dir.join("client_ed25519")).expect("owned Git key");
+            git_cli::write_known_hosts_via_keyscan(&ssh_dir.join("known_hosts"), f.fixture.port);
+            let ssh = git_cli::git_ssh_command(shared, f.fixture.port);
+            let url = format!(
+                "ssh://traces@{}:{}{}",
+                git_cli::mega2_reachable_host(),
+                f.fixture.port,
+                locator
+            );
+            f.fixture
+                .git(&["init", &format!("--object-format={kind}"), "mtr12-source"]);
+            fs::write(
+                shared.join("mtr12-source/payload.bin"),
+                b"MTR12 actual SSH trace payload\0\xff\n",
+            )
+            .expect("synthetic blob");
+            f.fixture.git(&["-C", "mtr12-source", "add", "payload.bin"]);
+            f.fixture.git(&[
+                "-C",
+                "mtr12-source",
+                "-c",
+                "user.name=MTR12",
+                "-c",
+                "user.email=mtr12@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "SSH traces",
+            ]);
+            let tip = f
+                .fixture
+                .git_text(&["-C", "mtr12-source", "rev-parse", "HEAD"]);
+            let blob = f
+                .fixture
+                .git_text(&["-C", "mtr12-source", "rev-parse", "HEAD:payload.bin"]);
+            let push = git_cli::git_cli_ssh(
+                shared,
+                &ssh,
+                &[
+                    "-C",
+                    "mtr12-source",
+                    "push",
+                    "--no-thin",
+                    &url,
+                    "HEAD:refs/libra/traces",
+                ],
+            );
+            assert!(
+                push.status.success(),
+                "MTR12_SSH_PACK_ORACLE: authenticated standard Git first push failed: {}",
+                String::from_utf8_lossy(&push.stderr)
+            );
+            let stream = trace_stream::Entity::find()
+                .filter(trace_stream::Column::PrincipalId.eq(f.owner.clone()))
+                .filter(trace_stream::Column::SourceRepoId.eq("mtr12-new-source"))
+                .one(&db)
+                .await
+                .expect("query pushed stream")
+                .expect("first push created scope");
+            assert_eq!(stream.tip_oid.as_deref(), Some(tip.as_str()));
+            assert_eq!(stream.hash_kind, kind);
+            let scope_path = format!("/.traces/by-scope/{}.git", stream.id);
+            let http_scope = git_cli::mega2_http_url(f.http_port, &scope_path);
+            let session = f.key_session("traces", &writer, true).await;
+            let expected = WireExpected {
+                locator: &scope_path,
+                kind,
+                scope: Some(&stream.id),
+                v2: false,
+                receive: false,
+            };
+            let before_discovery = snapshot(&db).await;
+            let http_advertisement = wire_http_request(
+                f,
+                Some(&token),
+                "mtr12-after-first-push",
+                &scope_path,
+                false,
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(
+                http_advertisement.status, 200,
+                "bound same-principal HTTP discovery"
+            );
+            let http_metadata =
+                wire_metadata_with_tip(&http_advertisement.body, true, &expected, Some(&tip));
+            let ssh_advertisement =
+                wire_ssh_advertisement(&session, &scope_path, false, false).await;
+            assert_eq!(
+                wire_metadata_with_tip(&ssh_advertisement, false, &expected, Some(&tip)),
+                http_metadata,
+                "same server, scope, format, and tip over HTTP and SSH"
+            );
+            unchanged(&before_discovery, &snapshot(&db).await);
+            close_scope_session(session).await;
+            f.fixture.git(&[
+                "init",
+                &format!("--object-format={kind}"),
+                "mtr12-http-download",
+            ]);
+            let http_fetch = git_cli::git_cli_as_user(
+                shared,
+                SCOPE_WRITER,
+                &token,
+                &[
+                    "-C",
+                    "mtr12-http-download",
+                    "fetch",
+                    &http_scope,
+                    "refs/libra/traces:refs/remotes/origin/traces",
+                ],
+            );
+            git_cli::assert_git_success(&http_fetch, "MTR12 SSH-to-HTTP fetch");
+            assert_eq!(
+                f.fixture.git_text(&[
+                    "-C",
+                    "mtr12-http-download",
+                    "rev-parse",
+                    "refs/remotes/origin/traces"
+                ]),
+                tip
+            );
+            fs::write(
+                shared.join("mtr12-source/second.txt"),
+                b"MTR12 HTTP append\n",
+            )
+            .expect("second synthetic blob");
+            f.fixture.git(&["-C", "mtr12-source", "add", "second.txt"]);
+            f.fixture.git(&[
+                "-C",
+                "mtr12-source",
+                "-c",
+                "user.name=MTR12",
+                "-c",
+                "user.email=mtr12@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "HTTP append",
+            ]);
+            let second_tip = f
+                .fixture
+                .git_text(&["-C", "mtr12-source", "rev-parse", "HEAD"]);
+            let http_push = git_cli::git_cli_as_user(
+                shared,
+                SCOPE_WRITER,
+                &token,
+                &[
+                    "-C",
+                    "mtr12-source",
+                    "push",
+                    "--no-thin",
+                    &http_scope,
+                    "HEAD:refs/libra/traces",
+                ],
+            );
+            git_cli::assert_git_success(&http_push, "MTR12 HTTP-to-SSH append");
+            let current = trace_stream::Entity::find_by_id(&stream.id)
+                .one(&db)
+                .await
+                .expect("query appended scope")
+                .expect("scope retained");
+            assert_eq!(current.tip_oid.as_deref(), Some(second_tip.as_str()));
+            let scoped = format!(
+                "ssh://traces@{}:{}/.traces/by-scope/{}.git",
+                git_cli::mega2_reachable_host(),
+                f.fixture.port,
+                stream.id
+            );
+            f.fixture
+                .git(&["init", &format!("--object-format={kind}"), "mtr12-download"]);
+            let fetch = git_cli::git_cli_ssh(
+                shared,
+                &ssh,
+                &[
+                    "-C",
+                    "mtr12-download",
+                    "-c",
+                    "protocol.version=0",
+                    "fetch",
+                    &scoped,
+                    "refs/libra/traces:refs/remotes/origin/traces",
+                ],
+            );
+            git_cli::assert_git_success(&fetch, "MTR12 SSH fetch");
+            assert_eq!(
+                f.fixture.git_text(&[
+                    "-C",
+                    "mtr12-download",
+                    "rev-parse",
+                    "refs/remotes/origin/traces"
+                ]),
+                second_tip
+            );
+            f.fixture.git(&[
+                "init",
+                &format!("--object-format={kind}"),
+                "mtr12-download-v2",
+            ]);
+            let fetch_v2 = git_cli::git_cli_ssh(
+                shared,
+                &ssh,
+                &[
+                    "-C",
+                    "mtr12-download-v2",
+                    "-c",
+                    "protocol.version=2",
+                    "fetch",
+                    &scoped,
+                    "refs/libra/traces:refs/remotes/origin/traces",
+                ],
+            );
+            git_cli::assert_git_success(&fetch_v2, "MTR12 SSH v2 fetch");
+            assert_eq!(
+                f.fixture.git_text(&[
+                    "-C",
+                    "mtr12-download-v2",
+                    "rev-parse",
+                    "refs/remotes/origin/traces"
+                ]),
+                second_tip
+            );
+            assert_eq!(
+                f.fixture
+                    .git(&["-C", "mtr12-download", "cat-file", "blob", &blob]),
+                b"MTR12 actual SSH trace payload\0\xff\n"
+            );
+            f.fixture.git(&["-C", "mtr12-download", "fsck", "--strict"]);
+            if kind == "sha1" {
+                // Deterministic incompressible payload forces a real PACK larger
+                // than the russh 100-message input queue, without a network mock.
+                let mut state = 0x8ad4_b12c_79e3_5f01_u64;
+                let mut bytes = vec![0_u8; 5 * 1024 * 1024];
+                for byte in &mut bytes {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    *byte = state as u8;
+                }
+                fs::write(shared.join("mtr12-source/large.bin"), &bytes)
+                    .expect("large synthetic blob");
+                f.fixture.git(&["-C", "mtr12-source", "add", "large.bin"]);
+                f.fixture.git(&[
+                    "-C",
+                    "mtr12-source",
+                    "-c",
+                    "user.name=MTR12",
+                    "-c",
+                    "user.email=mtr12@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "large SSH append",
+                ]);
+                let large_tip = f
+                    .fixture
+                    .git_text(&["-C", "mtr12-source", "rev-parse", "HEAD"]);
+                let large_blob =
+                    f.fixture
+                        .git_text(&["-C", "mtr12-source", "rev-parse", "HEAD:large.bin"]);
+                let pack =
+                    f.fixture
+                        .git(&["-C", "mtr12-source", "pack-objects", "--stdout", "--all"]);
+                assert!(
+                    pack.len() > 4 * 1024 * 1024,
+                    "actual standard Git PACK must exceed 4 MiB"
+                );
+                drop(pack);
+                let push = git_cli::git_cli_ssh(
+                    shared,
+                    &ssh,
+                    &[
+                        "-C",
+                        "mtr12-source",
+                        "push",
+                        "--no-thin",
+                        &scoped,
+                        "HEAD:refs/libra/traces",
+                    ],
+                );
+                git_cli::assert_git_success(&push, "MTR12 large SSH append");
+                let http_fetch = git_cli::git_cli_as_user(
+                    shared,
+                    SCOPE_WRITER,
+                    &token,
+                    &[
+                        "-C",
+                        "mtr12-http-download",
+                        "fetch",
+                        &http_scope,
+                        "refs/libra/traces:refs/remotes/origin/traces",
+                    ],
+                );
+                git_cli::assert_git_success(&http_fetch, "MTR12 large SSH-to-HTTP fetch");
+                assert_eq!(
+                    f.fixture.git_text(&[
+                        "-C",
+                        "mtr12-http-download",
+                        "rev-parse",
+                        "refs/remotes/origin/traces"
+                    ]),
+                    large_tip
+                );
+                assert_eq!(
+                    f.fixture
+                        .git(&["-C", "mtr12-http-download", "cat-file", "blob", &large_blob]),
+                    bytes
+                );
+                f.fixture
+                    .git(&["-C", "mtr12-http-download", "fsck", "--strict"]);
+
+                // Keep an authenticated SSH receive open after fragmented
+                // commands and a partial PACK, then prove shared admission,
+                // independent fetch and recovery after peer disconnect.
+                let session = f.key_session("traces", &writer, true).await;
+                let mut channel = session
+                    .channel_open_session()
+                    .await
+                    .expect("held receive channel");
+                channel
+                    .exec(true, format!("git-receive-pack '{scope_path}'"))
+                    .await
+                    .expect("held receive exec");
+                let advertisement = tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut bytes = Vec::new();
+                    let mut accepted = false;
+                    while let Some(message) = channel.wait().await {
+                        match message {
+                            russh::ChannelMsg::Success => accepted = true,
+                            russh::ChannelMsg::Data { data } => bytes.extend_from_slice(&data),
+                            russh::ChannelMsg::Failure | russh::ChannelMsg::Close => {
+                                panic!("held receive refused")
+                            }
+                            _ => {}
+                        }
+                        if accepted && bytes.ends_with(b"0000") {
+                            return bytes;
+                        }
+                    }
+                    panic!("held receive closed before advertisement")
+                })
+                .await
+                .expect("held receive advertisement deadline");
+                let expected = WireExpected {
+                    locator: &scope_path,
+                    kind,
+                    scope: Some(&stream.id),
+                    v2: false,
+                    receive: true,
+                };
+                wire_metadata_with_tip(&advertisement, false, &expected, Some(&large_tip));
+                let command = format!(
+                    "{} {} refs/libra/traces\0report-status object-format=sha1\n",
+                    large_tip,
+                    "1".repeat(40)
+                );
+                let header = format!("{:04x}", command.len() + 4);
+                channel
+                    .data_bytes(bytes::Bytes::copy_from_slice(&header.as_bytes()[..2]))
+                    .await
+                    .expect("fragment one");
+                channel
+                    .data_bytes(bytes::Bytes::copy_from_slice(&header.as_bytes()[2..]))
+                    .await
+                    .expect("fragment two");
+                channel
+                    .data_bytes(bytes::Bytes::copy_from_slice(command.as_bytes()))
+                    .await
+                    .expect("receive command");
+                channel
+                    .data_bytes(bytes::Bytes::from_static(b"0000PACK\0\0\0\x02\0\0\0\x01"))
+                    .await
+                    .expect("partial PACK");
+                let busy = wire_http_request(
+                    f,
+                    Some(&token),
+                    "mtr12-held-http",
+                    &scope_path,
+                    false,
+                    true,
+                    Some(b"0000"),
+                )
+                .await;
+                assert_eq!(
+                    busy.status, 503,
+                    "HTTP and SSH must share the one receive slot"
+                );
+                f.fixture
+                    .git(&["init", "--object-format=sha1", "mtr12-fetch-during-receive"]);
+                let fetch = git_cli::git_cli_ssh(
+                    shared,
+                    &ssh,
+                    &[
+                        "-C",
+                        "mtr12-fetch-during-receive",
+                        "fetch",
+                        &scoped,
+                        "refs/libra/traces:refs/remotes/origin/traces",
+                    ],
+                );
+                git_cli::assert_git_success(&fetch, "independent fetch while SSH receive is held");
+                assert_eq!(
+                    f.fixture.git_text(&[
+                        "-C",
+                        "mtr12-fetch-during-receive",
+                        "rev-parse",
+                        "refs/remotes/origin/traces"
+                    ]),
+                    large_tip
+                );
+                channel.close().await.expect("disconnect held receive");
+                close_scope_session(session).await;
+                let status = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let label = format!("mtr12-after-close-{}", Uuid::new_v4());
+                        let result = wire_http_request(
+                            f,
+                            Some(&token),
+                            &label,
+                            &scope_path,
+                            false,
+                            true,
+                            Some(b"0000"),
+                        )
+                        .await;
+                        if result.status != 503 {
+                            break result.status;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .expect("receive slot released after disconnect");
+                assert_eq!(
+                    status, 200,
+                    "authorized empty receive must complete after slot release"
+                );
+                let current = trace_stream::Entity::find_by_id(&stream.id)
+                    .one(&db)
+                    .await
+                    .expect("scope after disconnect")
+                    .expect("scope retained");
+                assert_eq!(
+                    current.tip_oid.as_deref(),
+                    Some(large_tip.as_str()),
+                    "partial PACK must not publish"
+                );
+                fs::write(
+                    shared.join("mtr12-source/after-disconnect.txt"),
+                    b"post-disconnect\n",
+                )
+                .expect("recovery blob");
+                f.fixture
+                    .git(&["-C", "mtr12-source", "add", "after-disconnect.txt"]);
+                f.fixture.git(&[
+                    "-C",
+                    "mtr12-source",
+                    "-c",
+                    "user.name=MTR12",
+                    "-c",
+                    "user.email=mtr12@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "recovery after disconnect",
+                ]);
+                let recovery_tip = f
+                    .fixture
+                    .git_text(&["-C", "mtr12-source", "rev-parse", "HEAD"]);
+                let recovery = git_cli::git_cli_ssh(
+                    shared,
+                    &ssh,
+                    &[
+                        "-C",
+                        "mtr12-source",
+                        "push",
+                        "--no-thin",
+                        &scoped,
+                        "HEAD:refs/libra/traces",
+                    ],
+                );
+                git_cli::assert_git_success(&recovery, "actual SSH push after disconnect");
+                let current = trace_stream::Entity::find_by_id(&stream.id)
+                    .one(&db)
+                    .await
+                    .expect("scope after recovery")
+                    .expect("scope retained");
+                assert_eq!(current.tip_oid.as_deref(), Some(recovery_tip.as_str()));
+
+                // Interrupt a real multi-megabyte upload response after PACK
+                // starts, then prove the fetch slot is released by another
+                // authenticated Git fetch and exact object verification.
+                let output_session = f.key_session("traces", &writer, true).await;
+                let mut output_channel = output_session
+                    .channel_open_session()
+                    .await
+                    .expect("output-close channel");
+                output_channel
+                    .exec(true, format!("git-upload-pack '{scope_path}'"))
+                    .await
+                    .expect("output-close exec");
+                let output_adv = tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut bytes = Vec::new();
+                    let mut accepted = false;
+                    while let Some(message) = output_channel.wait().await {
+                        match message {
+                            russh::ChannelMsg::Success => accepted = true,
+                            russh::ChannelMsg::Data { data } => bytes.extend_from_slice(&data),
+                            russh::ChannelMsg::Failure | russh::ChannelMsg::Close => {
+                                panic!("output-close discovery refused")
+                            }
+                            _ => {}
+                        }
+                        if accepted && bytes.ends_with(b"0000") {
+                            return bytes;
+                        }
+                    }
+                    panic!("output-close discovery ended early")
+                })
+                .await
+                .expect("output-close discovery deadline");
+                let expected = WireExpected {
+                    locator: &scope_path,
+                    kind,
+                    scope: Some(&stream.id),
+                    v2: false,
+                    receive: false,
+                };
+                wire_metadata_with_tip(&output_adv, false, &expected, Some(&recovery_tip));
+                let want = format!("want {recovery_tip}\n");
+                let request = format!("{:04x}{}00000009done\n", want.len() + 4, want);
+                output_channel
+                    .data_bytes(bytes::Bytes::from(request))
+                    .await
+                    .expect("send upload request");
+                tokio::time::timeout(LIMIT, async {
+                    let mut first = Vec::new();
+                    while let Some(message) = output_channel.wait().await {
+                        match message {
+                            russh::ChannelMsg::Data { data } => {
+                                first.extend_from_slice(&data);
+                                if first.windows(4).any(|window| window == b"PACK") {
+                                    return;
+                                }
+                            }
+                            russh::ChannelMsg::Failure | russh::ChannelMsg::Close => {
+                                panic!("output-close before PACK")
+                            }
+                            _ => {}
+                        }
+                    }
+                    panic!("output-close ended before PACK")
+                })
+                .await
+                .expect("output PACK start deadline");
+                output_channel
+                    .close()
+                    .await
+                    .expect("disconnect during PACK output");
+                close_scope_session(output_session).await;
+                f.fixture
+                    .git(&["init", "--object-format=sha1", "mtr12-after-output-close"]);
+                let recovery_fetch = git_cli::git_cli_ssh(
+                    shared,
+                    &ssh,
+                    &[
+                        "-C",
+                        "mtr12-after-output-close",
+                        "fetch",
+                        &scoped,
+                        "refs/libra/traces:refs/remotes/origin/traces",
+                    ],
+                );
+                git_cli::assert_git_success(
+                    &recovery_fetch,
+                    "actual fetch after output disconnect",
+                );
+                assert_eq!(
+                    f.fixture.git_text(&[
+                        "-C",
+                        "mtr12-after-output-close",
+                        "rev-parse",
+                        "refs/remotes/origin/traces"
+                    ]),
+                    recovery_tip
+                );
+                assert_eq!(
+                    f.fixture.git(&[
+                        "-C",
+                        "mtr12-after-output-close",
+                        "cat-file",
+                        "blob",
+                        &large_blob
+                    ]),
+                    bytes
+                );
+                let object_count =
+                    scalar(&db, "SELECT count(*)::text AS value FROM trace_object").await;
+                let journal_count =
+                    scalar(&db, "SELECT count(*)::text AS value FROM trace_ref_update").await;
+                fs::copy(&outsider.path, ssh_dir.join("client_ed25519"))
+                    .expect("switch to bound outsider key");
+                let read = git_cli::git_cli_ssh(shared, &ssh, &["ls-remote", &scoped]);
+                git_cli::assert_git_success(&read, "authorized nonowner read");
+                assert!(
+                    String::from_utf8_lossy(&read.stdout).contains(&recovery_tip),
+                    "nonowner sees authorized current tip"
+                );
+                let denied = git_cli::git_cli_ssh(
+                    shared,
+                    &ssh,
+                    &[
+                        "-C",
+                        "mtr12-source",
+                        "push",
+                        &scoped,
+                        "HEAD:refs/libra/traces",
+                    ],
+                );
+                assert!(
+                    !denied.status.success(),
+                    "nonowner must not update owner's stream"
+                );
+                fs::copy(&writer.path, ssh_dir.join("client_ed25519"))
+                    .expect("restore owned writer key");
+                let extra_ref = git_cli::git_cli_ssh(
+                    shared,
+                    &ssh,
+                    &[
+                        "-C",
+                        "mtr12-source",
+                        "push",
+                        &scoped,
+                        "HEAD:refs/heads/other",
+                    ],
+                );
+                assert!(!extra_ref.status.success(), "extra ref must be rejected");
+                let delete = git_cli::git_cli_ssh(
+                    shared,
+                    &ssh,
+                    &["-C", "mtr12-source", "push", &scoped, ":refs/libra/traces"],
+                );
+                assert!(
+                    !delete.status.success(),
+                    "trace ref deletion must be rejected"
+                );
+                let rewrite = git_cli::git_cli_ssh(
+                    shared,
+                    &ssh,
+                    &[
+                        "-C",
+                        "mtr12-source",
+                        "push",
+                        "--force",
+                        "--no-thin",
+                        &scoped,
+                        &format!("{tip}:refs/libra/traces"),
+                    ],
+                );
+                assert!(
+                    !rewrite.status.success(),
+                    "non-fast-forward trace update must be rejected"
+                );
+                let current = trace_stream::Entity::find_by_id(&stream.id)
+                    .one(&db)
+                    .await
+                    .expect("scope after denied writes")
+                    .expect("scope retained");
+                assert_eq!(current.tip_oid.as_deref(), Some(recovery_tip.as_str()));
+                assert_eq!(
+                    scalar(&db, "SELECT count(*)::text AS value FROM trace_object").await,
+                    object_count,
+                    "denied writes must not alter membership"
+                );
+                assert_eq!(
+                    scalar(&db, "SELECT count(*)::text AS value FROM trace_ref_update").await,
+                    journal_count,
+                    "denied writes must not alter journal"
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
+        if let Some(f) = fixture.as_mut() {
+            f.stop();
+        }
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            if let Some(f) = fixture {
+                let logs = f.fixture.temp.keep();
+                eprintln!("MTR12 SSH fixture logs retained at {}", logs.display());
+            }
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close SSH Git fixture pool");
     }
 
     pub async fn run_metadata_wire_matrix(kind: &str, with_ssh: bool) {
@@ -11812,6 +12575,16 @@ async fn discovery_wire_http_sha1() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_wire_http_sha256() {
     disabled_http::run_metadata_wire_matrix("sha256", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_git_sha1_roundtrip() {
+    disabled_http::ssh_git_roundtrip("sha1").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_git_sha256_roundtrip() {
+    disabled_http::ssh_git_roundtrip("sha256").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,4 +1,13 @@
-use std::{collections::HashMap, hash::Hash, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    hash::Hash,
+    path::PathBuf,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Duration, Utc};
@@ -15,7 +24,9 @@ use crate::{
     ceres::{
         api_service::state::ProtocolApiState,
         lfs::lfs_structs::Link,
-        pack::traces_repo::{TraceDiscovery, resolve_trace_discovery},
+        pack::traces_repo::{
+            TraceDiscovery, TraceGitRequest, resolve_trace_discovery, serve_trace_git,
+        },
         protocol::{
             ServiceType, SmartSession, TransportProtocol,
             import_refs::CommandType,
@@ -169,6 +180,7 @@ where
                     pending_shallow_request: None,
                     exit_code: None,
                     receive_pack: ReceivePackProgress::default(),
+                    trace_channel: None,
                 },
             );
             out.data(advertise.freeze())?;
@@ -421,17 +433,208 @@ pub struct GitSshChannelState {
     pub pending_shallow_request: Option<Bytes>,
     pub exit_code: Option<u32>,
     receive_pack: ReceivePackProgress,
+    trace_channel: Option<Arc<TraceChannelControl>>,
+}
+
+// The connection map owns this control. A worker never owns its own control
+// Arc: connection/channel Drop must still be able to signal cancellation.
+struct TraceChannelControl {
+    cancel: Arc<AtomicBool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TraceChannelControl {
+    fn start(
+        channel: Channel<Msg>,
+        state: ProtocolApiState,
+        credential: SshAuthenticatedCredential,
+        locator: TracesLocator,
+        service_type: ServiceType,
+        version2: bool,
+    ) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let task = tokio::spawn(async move {
+            run_trace_channel(
+                channel,
+                state,
+                credential,
+                locator,
+                service_type,
+                version2,
+                signal,
+            )
+            .await;
+        });
+        Self {
+            cancel,
+            task: Some(task),
+        }
+    }
+}
+
+impl Drop for TraceChannelControl {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        // Never abort a task which may already be inside COMMIT. The reaper
+        // owns its JoinHandle and observes the real terminal outside the russh
+        // callback, where waiting for channel output cannot deadlock the loop.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if task.await.is_err() {
+                        tracing::error!("SSH traces worker did not complete normally");
+                    }
+                });
+            }
+            Err(_) => {
+                // Runtime teardown cannot drive more async cleanup. This is
+                // not reported as a completed worker or bounded DB rollback.
+                tracing::error!("SSH traces worker cleanup requires a running runtime");
+            }
+        }
+    }
+}
+
+async fn run_trace_channel(
+    channel: Channel<Msg>,
+    state: ProtocolApiState,
+    credential: SshAuthenticatedCredential,
+    locator: TracesLocator,
+    service_type: ServiceType,
+    version2: bool,
+    cancel: Arc<AtomicBool>,
+) {
+    let (mut input, output) = channel.split();
+    let mut reader = input.make_reader();
+    let mut writer = output.make_writer();
+    let result = run_authenticated_trace_channel(
+        &state,
+        &credential,
+        &locator,
+        TraceChannelOperation {
+            service_type,
+            version2,
+            cancel: cancel.clone(),
+        },
+        &mut reader,
+        &mut writer,
+    )
+    .await;
+    // Do not await a terminal send forever after its peer stopped accepting
+    // output. This is only best-effort transport teardown, not a new ingest
+    // deadline and not a bound on COMMIT/rollback cleanup.
+    let terminal = async {
+        if let Err(error) = result {
+            if !cancel.load(Ordering::Acquire) {
+                let message = match error {
+                    MegaError::Traces(error) => error.to_string(),
+                    _ => TracesError::UnknownScope.to_string(),
+                };
+                let reply = SshErrReply::new(message, 1);
+                let _ = output.data_bytes(reply.payload).await;
+            }
+            let _ = output.exit_status(1).await;
+        } else {
+            let _ = output.exit_status(0).await;
+        }
+        let _ = output.eof().await;
+        let _ = output.close().await;
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(5), terminal)
+        .await
+        .is_err()
+    {
+        cancel.store(true, Ordering::Release);
+        tracing::debug!("SSH traces terminal transport send timed out");
+    }
+}
+
+struct TraceChannelOperation {
+    service_type: ServiceType,
+    version2: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+async fn run_authenticated_trace_channel<R, W>(
+    state: &ProtocolApiState,
+    credential: &SshAuthenticatedCredential,
+    locator: &TracesLocator,
+    operation: TraceChannelOperation,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), MegaError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if credential.login() != "traces" {
+        return Err(TracesError::Unauthenticated.into());
+    }
+    let config = state.storage.config();
+    let mono = state.storage.mono_storage();
+    if let SshAuthenticatedCredential::Key { key, .. } = credential
+        && !key.is_current(mono.get_connection(), false).await?
+    {
+        return Err(TracesError::Unauthenticated.into());
+    }
+    let snapshot = if state.entity_store.is_dirty() {
+        None
+    } else {
+        state.entity_store.snapshot()
+    };
+    let caller = match credential {
+        SshAuthenticatedCredential::Static { .. } => {
+            if config.git.push_auth != Some(PushAuth::Token) {
+                return Err(TracesError::Unauthenticated.into());
+            }
+            let token = credential
+                .current_static_token(&config.git)
+                .ok_or(TracesError::Unauthenticated)?;
+            TracesCaller::StaticPushToken {
+                credential_id: &token.name,
+                token,
+            }
+        }
+        SshAuthenticatedCredential::Key { key, .. } => TracesCaller::MonoSshKey {
+            key,
+            enforcement: Enforcement::parse(&config.cedar.enforcement)
+                .ok_or(TracesError::UnknownScope)?,
+            snapshot: snapshot.as_deref(),
+        },
+    };
+    serve_trace_git(
+        TraceGitRequest {
+            state,
+            locator,
+            caller,
+            service_type: operation.service_type,
+            version2: operation.version2,
+            cancel: operation.cancel,
+        },
+        reader,
+        writer,
+    )
+    .await
 }
 
 impl server::Server for SshServer {
     type Handler = Self;
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
-        let mut s = self.clone();
-        s.clear_authentication();
-        s.channels.clear();
-        s.v2_channels.clear();
+        let client = Self {
+            clients: self.clients.clone(),
+            id: self.id,
+            channels: HashMap::new(),
+            v2_channels: HashMap::new(),
+            state: self.state.clone(),
+            authenticated_user: None,
+            authenticated_credential: None,
+        };
         self.id += 1;
-        s
+        client
     }
 }
 
@@ -692,6 +895,41 @@ impl server::Handler for SshServer {
                 }
 
                 let is_v2 = self.v2_channels.get(&channel).copied().unwrap_or(false);
+                if let Some(locator) = exec.traces {
+                    let credential = self
+                        .authenticated_credential
+                        .clone()
+                        .ok_or(TracesError::Unauthenticated)?;
+                    let input_channel = self
+                        .clients
+                        .lock()
+                        .await
+                        .remove(&(self.id, channel))
+                        .ok_or_else(|| anyhow::anyhow!("SSH trace channel is unavailable"))?;
+                    // The actual Channel receiver is consumed by this worker.
+                    // russh queues Data there before invoking Handler::data.
+                    session.channel_success(channel)?;
+                    let control = TraceChannelControl::start(
+                        input_channel,
+                        self.state.clone(),
+                        credential,
+                        locator,
+                        service_type,
+                        is_v2,
+                    );
+                    self.channels.insert(
+                        channel,
+                        GitSshChannelState {
+                            smart_protocol,
+                            data_combined: BytesMut::new(),
+                            pending_shallow_request: None,
+                            exit_code: None,
+                            receive_pack: ReceivePackProgress::default(),
+                            trace_channel: Some(Arc::new(control)),
+                        },
+                    );
+                    return Ok(());
+                }
                 if is_v2 && service_type == ServiceType::UploadPack {
                     let v2_adv = match &trace_discovery {
                         Some(discovery) => v2::build_traces_v2_capability_advertisement(discovery)?,
@@ -705,6 +943,7 @@ impl server::Handler for SshServer {
                             pending_shallow_request: None,
                             exit_code: None,
                             receive_pack: ReceivePackProgress::default(),
+                            trace_channel: None,
                         },
                     );
                     session.data(channel, v2_adv.to_vec())?;
@@ -913,6 +1152,15 @@ impl server::Handler for SshServer {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.trace_channel.is_some())
+        {
+            // Input already lives in russh's bounded Channel queue. Feeding it
+            // a second time would duplicate the PACK and leave that queue full.
+            return Ok(());
+        }
         let mut out = SessionChannelOut { channel, session };
         on_channel_data(&mut self.channels, channel, &self.state, data, &mut out).await?;
         Ok(())
@@ -923,6 +1171,15 @@ impl server::Handler for SshServer {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.trace_channel.is_some())
+        {
+            // Normal input EOF is delivered to the Channel reader. The worker
+            // still owns publication, status, output EOF and terminal close.
+            return Ok(());
+        }
         let had_client_entry = {
             let mut clients = self.clients.lock().await;
             clients.remove(&(self.id, channel)).is_some()
@@ -948,6 +1205,7 @@ impl server::Handler for SshServer {
         // client). Ensure any accumulated per-channel state and the client entry
         // are dropped so receive-pack buffers cannot leak across the connection.
         self.channels.remove(&channel);
+        self.v2_channels.remove(&channel);
         {
             let mut clients = self.clients.lock().await;
             clients.remove(&(self.id, channel));
@@ -1474,6 +1732,7 @@ mod tests {
             pending_shallow_request: None,
             exit_code: None,
             receive_pack: ReceivePackProgress::default(),
+            trace_channel: None,
         }
     }
 
@@ -2639,6 +2898,7 @@ mod tests {
             pending_shallow_request: None,
             exit_code: None,
             receive_pack: ReceivePackProgress::default(),
+            trace_channel: None,
         };
         let mut channel_b = GitSshChannelState {
             smart_protocol: SmartSession::new(
@@ -2650,6 +2910,7 @@ mod tests {
             pending_shallow_request: None,
             exit_code: None,
             receive_pack: ReceivePackProgress::default(),
+            trace_channel: None,
         };
 
         channel_a.data_combined.extend_from_slice(b"payload-a");

@@ -1,6 +1,13 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_trait::async_trait;
+use bytes::BytesMut;
 use git_internal::{
     errors::GitError,
     hash::HashKind,
@@ -11,25 +18,48 @@ use git_internal::{
     },
 };
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     callisto::{access_token, ssh_keys, trace_stream, trace_target},
     ceres::{
+        api_service::state::ProtocolApiState,
         pack::RepoHandler,
         protocol::{
-            ServiceType,
+            ServiceType, TransportProtocol,
             import_refs::{RefCommand, Refs},
+            smart, v2,
         },
-        traces::auth::{
-            TracesAction, TracesAuthDecision, TracesAuthRequest, TracesCaller, authorize_traces,
+        traces::{
+            admission::TRACE_REQUEST_CAPACITY,
+            auth::{
+                PublishAuthority, TracesAction, TracesAuthDecision, TracesAuthRequest,
+                TracesCaller, authorize_traces,
+            },
+            checkpoint_history::validate_checkpoint_history,
+            ingest::decode_wire_pack_with_control,
+            pack_encode::RawPackStream,
+            publication::{PublicationProposal, prepare},
         },
     },
-    common::errors::{MegaError, TracesError},
+    common::errors::{MegaError, ProtocolError, TracesError},
     config::TracesConfig,
     contract::git_protocol::path::{TracesLocator, TracesObjectFormat},
-    jupiter::storage::trace_target_storage::strict_canonical_project_path,
+    jupiter::{
+        service::{
+            trace_fetch_service::fetch_raw_objects,
+            trace_object_service::TraceObjectService,
+            trace_publish_service::{PreparedScopeRequest, TracePublishService},
+        },
+        storage::{
+            base_storage::StorageConnector,
+            trace_stream_storage::{ExpectedOldTip, ScopeFacts},
+            trace_target_storage::strict_canonical_project_path,
+        },
+    },
     orbit_api::object_storage::MultiObjectByteStream,
 };
 
@@ -568,6 +598,690 @@ fn fetch_authority_error(error: MegaError) -> MegaError {
     match error {
         MegaError::Traces(_) => error,
         _ => TracesError::QueryTimeout.into(),
+    }
+}
+
+pub(crate) struct TraceGitRequest<'a> {
+    pub(crate) state: &'a ProtocolApiState,
+    pub(crate) locator: &'a TracesLocator,
+    pub(crate) caller: TracesCaller<'a>,
+    pub(crate) service_type: ServiceType,
+    pub(crate) version2: bool,
+    pub(crate) cancel: Arc<AtomicBool>,
+}
+
+const TRACE_GIT_COMMAND_BYTES: usize = 64 * 1024;
+const TRACE_GIT_PKT_BYTES: usize = 65_520;
+const TRACE_GIT_REF: &str = "refs/libra/traces";
+
+fn trace_git_invalid() -> MegaError {
+    TracesError::InvalidParameter.into()
+}
+
+fn trace_git_interrupted() -> MegaError {
+    TracesError::QueryTimeout.into()
+}
+
+async fn trace_git_cancellable<T>(
+    cancel: &AtomicBool,
+    future: impl std::future::Future<Output = Result<T, MegaError>>,
+) -> Result<T, MegaError> {
+    tokio::pin!(future);
+    let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
+    loop {
+        tokio::select! {
+            biased;
+            _ = timer.tick() => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(trace_git_interrupted());
+                }
+            }
+            result = &mut future => return result,
+        }
+    }
+}
+
+async fn trace_git_write<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+) -> Result<(), MegaError> {
+    trace_git_cancellable(cancel, async {
+        writer
+            .write_all(bytes)
+            .await
+            .map_err(|_| trace_git_interrupted())?;
+        writer.flush().await.map_err(|_| trace_git_interrupted())
+    })
+    .await
+}
+
+enum TraceGitPacket {
+    Flush,
+    Delimiter,
+    Data(Vec<u8>),
+}
+
+async fn trace_git_packet<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    used: &mut usize,
+    cancel: &AtomicBool,
+) -> Result<Option<TraceGitPacket>, MegaError> {
+    trace_git_cancellable(cancel, async {
+        let mut header = [0; 4];
+        if reader
+            .read(&mut header[..1])
+            .await
+            .map_err(|_| trace_git_interrupted())?
+            == 0
+        {
+            return Ok(None);
+        }
+        reader
+            .read_exact(&mut header[1..])
+            .await
+            .map_err(|_| trace_git_invalid())?;
+        if !header.iter().all(u8::is_ascii_hexdigit) {
+            return Err(trace_git_invalid());
+        }
+        let length = usize::from_str_radix(
+            std::str::from_utf8(&header).map_err(|_| trace_git_invalid())?,
+            16,
+        )
+        .map_err(|_| trace_git_invalid())?;
+        *used = used
+            .checked_add(length.max(4))
+            .ok_or(TracesError::ResponseBudget)?;
+        if *used > TRACE_GIT_COMMAND_BYTES {
+            return Err(TracesError::ResponseBudget.into());
+        }
+        match length {
+            0 => Ok(Some(TraceGitPacket::Flush)),
+            1 => Ok(Some(TraceGitPacket::Delimiter)),
+            4..=TRACE_GIT_PKT_BYTES => {
+                let mut data = vec![0; length - 4];
+                reader
+                    .read_exact(&mut data)
+                    .await
+                    .map_err(|_| trace_git_invalid())?;
+                Ok(Some(TraceGitPacket::Data(data)))
+            }
+            _ => Err(trace_git_invalid()),
+        }
+    })
+    .await
+}
+
+fn trace_git_line(bytes: &[u8]) -> Result<&str, MegaError> {
+    let line = std::str::from_utf8(bytes).map_err(|_| trace_git_invalid())?;
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    if line.is_empty() || line.contains(['\0', '\n', '\r']) {
+        return Err(trace_git_invalid());
+    }
+    Ok(line)
+}
+
+fn trace_git_oid(raw: &str, kind: HashKind) -> Result<String, MegaError> {
+    if raw.len() != kind.hex_len() || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(trace_git_invalid());
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+fn trace_git_capabilities<'a>(
+    capabilities: impl Iterator<Item = &'a str>,
+    kind: HashKind,
+    allowed: &[&str],
+    require_format: bool,
+) -> Result<(), MegaError> {
+    let mut format = None;
+    let mut agent = false;
+    for capability in capabilities {
+        if let Some(value) = capability.strip_prefix("object-format=") {
+            if format.replace(value).is_some() || value != kind.as_str() {
+                return Err(trace_git_invalid());
+            }
+        } else if let Some(value) = capability.strip_prefix("agent=") {
+            if agent || value.is_empty() || !value.is_ascii() {
+                return Err(trace_git_invalid());
+            }
+            agent = true;
+        } else if !allowed.contains(&capability) {
+            return Err(trace_git_invalid());
+        }
+    }
+    if require_format && kind != HashKind::Sha1 && format.is_none() {
+        return Err(trace_git_invalid());
+    }
+    Ok(())
+}
+
+fn trace_git_advertisement_error(error: ProtocolError) -> MegaError {
+    match error {
+        ProtocolError::Traces(error) => error.into(),
+        _ => trace_git_invalid(),
+    }
+}
+
+async fn trace_git_read_discovery(
+    request: &TraceGitRequest<'_>,
+) -> Result<(TraceDiscovery, Option<String>), MegaError> {
+    let mono = request.state.storage.mono_storage();
+    let db = mono.get_connection();
+    let config = request.state.storage.config();
+    let account = match request.caller {
+        TracesCaller::MonoAccessToken { .. } | TracesCaller::MonoSshKey { .. } => true,
+        #[cfg(test)]
+        TracesCaller::MonoAccount { .. } => true,
+        _ => false,
+    };
+    let snapshot = if account {
+        if request.state.entity_store.is_dirty() {
+            return Err(TracesError::UnknownScope.into());
+        }
+        Some(
+            request
+                .state
+                .entity_store
+                .snapshot()
+                .ok_or(TracesError::UnknownScope)?,
+        )
+    } else {
+        None
+    };
+    // A channel can issue another ls-refs after policy changes. Even a legal
+    // absent by-path scope must use the current policy before an early return.
+    let caller = match request.caller {
+        TracesCaller::MonoAccessToken {
+            token, enforcement, ..
+        } => TracesCaller::MonoAccessToken {
+            token,
+            enforcement,
+            snapshot: snapshot.as_deref(),
+        },
+        TracesCaller::MonoSshKey {
+            key, enforcement, ..
+        } => TracesCaller::MonoSshKey {
+            key,
+            enforcement,
+            snapshot: snapshot.as_deref(),
+        },
+        #[cfg(test)]
+        TracesCaller::MonoAccount {
+            credential_id,
+            username,
+            enforcement,
+            ..
+        } => TracesCaller::MonoAccount {
+            credential_id,
+            username,
+            enforcement,
+            snapshot: snapshot.as_deref(),
+        },
+        other => other,
+    };
+    let discovery = resolve_trace_discovery(
+        db,
+        &config.traces,
+        request.locator,
+        caller,
+        ServiceType::UploadPack,
+    )
+    .await?;
+    let Some(scope_id) = discovery.scope_id() else {
+        return Ok((discovery, None));
+    };
+    let grant = resolve_trace_fetch(
+        db,
+        &config.traces,
+        request.locator,
+        caller,
+        Some(&request.state.entity_store),
+    )
+    .await?;
+    if grant.server_id() != discovery.server_id()
+        || grant.hash_kind() != discovery.hash_kind()
+        || grant.stream_id() != scope_id.to_string()
+    {
+        return Err(TracesError::UnknownScope.into());
+    }
+    Ok((discovery, grant.tip_oid().map(str::to_owned)))
+}
+
+/// Serve one authorized SSH trace channel. The transport owns status/EOF/close.
+/// Ordinary code RepoHandler entry points remain closed for trace repositories.
+pub(crate) async fn serve_trace_git<R, W>(
+    request: TraceGitRequest<'_>,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), MegaError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    match request.service_type {
+        ServiceType::ReceivePack => trace_git_receive(&request, reader, writer).await,
+        ServiceType::UploadPack => {
+            let (discovery, tip) = trace_git_read_discovery(&request).await?;
+            let kind = discovery.hash_kind();
+            let advertisement = if request.version2 {
+                v2::build_traces_v2_capability_advertisement(&discovery)
+            } else {
+                smart::build_traces_v0_advertisement(
+                    &discovery,
+                    TransportProtocol::Ssh,
+                    tip.as_deref(),
+                )
+            }
+            .map_err(trace_git_advertisement_error)?;
+            trace_git_write(writer, &advertisement, &request.cancel).await?;
+            if request.version2 {
+                trace_git_upload_v2(&request, kind, reader, writer).await
+            } else {
+                trace_git_upload_v0(&request, kind, reader, writer).await
+            }
+        }
+    }
+}
+
+struct TraceGitReceive {
+    old: String,
+    new: String,
+    report: bool,
+}
+
+async fn trace_git_receive_command<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    kind: HashKind,
+    cancel: &AtomicBool,
+) -> Result<Option<TraceGitReceive>, MegaError> {
+    let mut used = 0;
+    let mut command = None;
+    loop {
+        match trace_git_packet(reader, &mut used, cancel).await? {
+            Some(TraceGitPacket::Flush) => {
+                if command.is_none() {
+                    let mut trailing = [0];
+                    let count = trace_git_cancellable(cancel, async {
+                        reader
+                            .read(&mut trailing)
+                            .await
+                            .map_err(|_| trace_git_interrupted())
+                    })
+                    .await?;
+                    if count != 0 {
+                        return Err(trace_git_invalid());
+                    }
+                }
+                return Ok(command);
+            }
+            Some(TraceGitPacket::Data(bytes)) if command.is_none() => {
+                let line = std::str::from_utf8(&bytes).map_err(|_| trace_git_invalid())?;
+                let line = line.strip_suffix('\n').unwrap_or(line);
+                let (update, capabilities) = line.split_once('\0').unwrap_or((line, ""));
+                let mut fields = update.split(' ');
+                let old = trace_git_oid(fields.next().ok_or_else(trace_git_invalid)?, kind)?;
+                let new = trace_git_oid(fields.next().ok_or_else(trace_git_invalid)?, kind)?;
+                if fields.next() != Some(TRACE_GIT_REF)
+                    || fields.next().is_some()
+                    || new.bytes().all(|byte| byte == b'0')
+                {
+                    return Err(trace_git_invalid());
+                }
+                trace_git_capabilities(
+                    capabilities.split_ascii_whitespace(),
+                    kind,
+                    &["report-status", "no-thin"],
+                    true,
+                )?;
+                command = Some(TraceGitReceive {
+                    old,
+                    new,
+                    report: capabilities
+                        .split_ascii_whitespace()
+                        .any(|capability| capability == "report-status"),
+                });
+            }
+            _ => return Err(trace_git_invalid()),
+        }
+    }
+}
+
+async fn trace_git_receive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    request: &TraceGitRequest<'_>,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), MegaError> {
+    let config = request.state.storage.config();
+    let mono = request.state.storage.mono_storage();
+    let db = mono.get_connection();
+    let (discovery, scope) =
+        resolve_trace_receive_with_discovery(db, &config.traces, request.locator, request.caller)
+            .await?;
+    let mut admission = TRACE_REQUEST_CAPACITY.try_receive()?;
+    let advertisement = smart::build_traces_v0_advertisement(
+        &discovery,
+        TransportProtocol::Ssh,
+        scope.tip_oid.as_deref(),
+    )
+    .map_err(trace_git_advertisement_error)?;
+    admission
+        .read_commands(trace_git_write(writer, &advertisement, &request.cancel))
+        .await?;
+    let command = admission
+        .read_commands(trace_git_receive_command(
+            reader,
+            scope.hash_kind,
+            &request.cancel,
+        ))
+        .await?;
+    let Some(command) = command else {
+        return Ok(());
+    };
+    let old = if command.old.bytes().all(|byte| byte == b'0') {
+        "absent"
+    } else {
+        &command.old
+    };
+    let proposal = PublicationProposal {
+        stream_id: scope.stream_id.clone(),
+        expected_old_tip: if old == "absent" {
+            ExpectedOldTip::Absent
+        } else {
+            ExpectedOldTip::At(command.old.clone())
+        },
+        new_tip: command.new.clone(),
+        ref_names: vec![TRACE_GIT_REF.to_owned()],
+        delete: false,
+        idempotency_key: format!("git:{}:{old}:{}", scope.stream_id, command.new),
+    };
+    let objects = TraceObjectService::new(request.state.storage.git_service.obj_storage.clone());
+    let decoded = decode_wire_pack_with_control(
+        &mut admission,
+        scope.hash_kind,
+        reader,
+        request.cancel.clone(),
+    )
+    .await?;
+    let prepared =
+        validate_checkpoint_history(prepare(db, &objects, decoded, proposal).await?).await?;
+    let authority = PublishAuthority {
+        caller: request.caller,
+        principal_id: &scope.principal_id,
+        target_id: &scope.target_id,
+        authorized_path: &scope.target_path,
+        expected_generation: scope.expected_generation,
+        policy: Some(&request.state.entity_store),
+    };
+    let publisher = TracePublishService::new(request.state.storage.git_service.obj_storage.clone());
+    // Do not select/drop this future on disconnect: a started COMMIT has an
+    // unknown result until its actual completion. The existing prepared
+    // continuation checks cancellation before the commit boundary.
+    if scope.first_scope {
+        let facts = ScopeFacts {
+            stream_id: &scope.stream_id,
+            principal_id: &scope.principal_id,
+            target_id: &scope.target_id,
+            source_repo_id: &scope.source_repo_id,
+            epoch_id: &scope.epoch_id,
+            hash_kind: scope.hash_kind.as_str(),
+        };
+        publisher
+            .publish_prepared_first_scope(
+                &config.monorepo,
+                db,
+                &mono,
+                &PreparedScopeRequest {
+                    path: &scope.target_path,
+                    facts: &facts,
+                    prepared: &prepared,
+                    authority: &authority,
+                },
+            )
+            .await?;
+    } else {
+        publisher
+            .publish_prepared(db, &prepared, &authority)
+            .await?;
+    }
+    drop(prepared);
+    drop(admission);
+    if command.report {
+        let mut report = BytesMut::new();
+        smart::add_pkt_line_string(&mut report, "unpack ok\n".to_owned());
+        smart::add_pkt_line_string(&mut report, format!("ok {TRACE_GIT_REF}\n"));
+        report.extend_from_slice(b"0000");
+        trace_git_write(writer, &report, &request.cancel).await?;
+    }
+    Ok(())
+}
+
+async fn trace_git_fetch<W: AsyncWrite + Unpin>(
+    request: &TraceGitRequest<'_>,
+    kind: HashKind,
+    wants: &[String],
+    haves: &[String],
+    writer: &mut W,
+    done: bool,
+) -> Result<(), MegaError> {
+    let permit = TRACE_REQUEST_CAPACITY.try_fetch()?;
+    let mono = request.state.storage.mono_storage();
+    let grant = resolve_trace_fetch(
+        mono.get_connection(),
+        &request.state.storage.config().traces,
+        request.locator,
+        request.caller,
+        Some(&request.state.entity_store),
+    )
+    .await?;
+    if grant.hash_kind() != kind {
+        return Err(TracesError::UnknownScope.into());
+    }
+    let objects = TraceObjectService::new(request.state.storage.git_service.obj_storage.clone());
+    let cancellation = CancellationToken::new();
+    let source = trace_git_cancellable(
+        &request.cancel,
+        fetch_raw_objects(grant, &objects, wants, haves, cancellation.clone()),
+    )
+    .await;
+    let source = match source {
+        Ok(source) => source,
+        Err(error) => {
+            cancellation.cancel();
+            return Err(error);
+        }
+    };
+    let mut response = BytesMut::new();
+    if !done {
+        drop(source);
+        drop(permit);
+        if request.version2 {
+            smart::add_pkt_line_string(&mut response, "acknowledgments\n".to_owned());
+        }
+        smart::add_pkt_line_string(&mut response, "NAK\n".to_owned());
+        if request.version2 {
+            response.extend_from_slice(b"0000");
+        }
+        return trace_git_write(writer, &response, &request.cancel).await;
+    }
+    let mut pack = RawPackStream::new(source, kind, permit)?;
+    smart::add_pkt_line_string(
+        &mut response,
+        if request.version2 {
+            "packfile\n"
+        } else {
+            "NAK\n"
+        }
+        .to_owned(),
+    );
+    let result = async {
+        trace_git_write(writer, &response, &request.cancel).await?;
+        loop {
+            let chunk = trace_git_cancellable(&request.cancel, pack.next()).await?;
+            let Some(chunk) = chunk else {
+                if request.version2 {
+                    trace_git_write(writer, b"0000", &request.cancel).await?;
+                }
+                return Ok(());
+            };
+            if request.version2 {
+                for payload in chunk.chunks(TRACE_GIT_PKT_BYTES - 5) {
+                    let mut framed = BytesMut::with_capacity(payload.len() + 5);
+                    framed.extend_from_slice(format!("{:04x}", payload.len() + 5).as_bytes());
+                    framed.extend_from_slice(&[1]);
+                    framed.extend_from_slice(payload);
+                    trace_git_write(writer, &framed, &request.cancel).await?;
+                }
+            } else {
+                trace_git_write(writer, &chunk, &request.cancel).await?;
+            }
+        }
+    }
+    .await;
+    cancellation.cancel();
+    result
+}
+
+async fn trace_git_upload_v0<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    request: &TraceGitRequest<'_>,
+    kind: HashKind,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), MegaError> {
+    let mut used = 0;
+    let mut wants = Vec::new();
+    loop {
+        match trace_git_packet(reader, &mut used, &request.cancel).await? {
+            None if wants.is_empty() => return Ok(()),
+            Some(TraceGitPacket::Flush) if wants.is_empty() => return Ok(()),
+            Some(TraceGitPacket::Flush) => break,
+            Some(TraceGitPacket::Data(bytes)) => {
+                let line = trace_git_line(&bytes)?;
+                let mut fields = line
+                    .strip_prefix("want ")
+                    .ok_or_else(trace_git_invalid)?
+                    .split(' ');
+                wants.push(trace_git_oid(
+                    fields.next().ok_or_else(trace_git_invalid)?,
+                    kind,
+                )?);
+                if wants.len() == 1 {
+                    trace_git_capabilities(fields, kind, &[], false)?;
+                } else if fields.next().is_some() {
+                    return Err(trace_git_invalid());
+                }
+            }
+            _ => return Err(trace_git_invalid()),
+        }
+    }
+    let mut haves = Vec::new();
+    loop {
+        match trace_git_packet(reader, &mut used, &request.cancel).await? {
+            Some(TraceGitPacket::Data(bytes)) => {
+                let line = trace_git_line(&bytes)?;
+                if line == "done" {
+                    return trace_git_fetch(request, kind, &wants, &haves, writer, true).await;
+                }
+                haves.push(trace_git_oid(
+                    line.strip_prefix("have ").ok_or_else(trace_git_invalid)?,
+                    kind,
+                )?);
+            }
+            Some(TraceGitPacket::Flush) => {
+                trace_git_fetch(request, kind, &wants, &haves, writer, false).await?;
+            }
+            _ => return Err(trace_git_invalid()),
+        }
+    }
+}
+
+async fn trace_git_upload_v2<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    request: &TraceGitRequest<'_>,
+    kind: HashKind,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), MegaError> {
+    loop {
+        let mut used = 0;
+        let first = match trace_git_packet(reader, &mut used, &request.cancel).await? {
+            None | Some(TraceGitPacket::Flush) => return Ok(()),
+            Some(TraceGitPacket::Data(bytes)) => bytes,
+            _ => return Err(trace_git_invalid()),
+        };
+        let command = trace_git_line(&first)?
+            .strip_prefix("command=")
+            .ok_or_else(trace_git_invalid)?;
+        if command != "ls-refs" && command != "fetch" {
+            return Err(trace_git_invalid());
+        }
+        let mut capabilities = Vec::new();
+        loop {
+            match trace_git_packet(reader, &mut used, &request.cancel).await? {
+                Some(TraceGitPacket::Delimiter) => break,
+                Some(TraceGitPacket::Data(bytes)) => {
+                    capabilities.push(trace_git_line(&bytes)?.to_owned());
+                }
+                _ => return Err(trace_git_invalid()),
+            }
+        }
+        trace_git_capabilities(capabilities.iter().map(String::as_str), kind, &[], true)?;
+        let mut prefixes = Vec::new();
+        let mut wants = Vec::new();
+        let mut haves = Vec::new();
+        let mut done = false;
+        loop {
+            let bytes = match trace_git_packet(reader, &mut used, &request.cancel).await? {
+                Some(TraceGitPacket::Flush) => break,
+                Some(TraceGitPacket::Data(bytes)) => bytes,
+                _ => return Err(trace_git_invalid()),
+            };
+            let line = trace_git_line(&bytes)?;
+            if command == "ls-refs" {
+                match line {
+                    "peel" | "symrefs" => {}
+                    _ => prefixes.push(
+                        line.strip_prefix("ref-prefix ")
+                            .ok_or_else(trace_git_invalid)?
+                            .to_owned(),
+                    ),
+                }
+            } else if let Some(oid) = line.strip_prefix("want ") {
+                wants.push(trace_git_oid(oid, kind)?);
+            } else if let Some(oid) = line.strip_prefix("have ") {
+                haves.push(trace_git_oid(oid, kind)?);
+            } else {
+                match line {
+                    "done" if !done => done = true,
+                    "thin-pack" | "ofs-delta" | "no-progress" | "include-tag" => {}
+                    _ => return Err(trace_git_invalid()),
+                }
+            }
+        }
+        if command == "ls-refs" {
+            let (discovery, tip) = trace_git_read_discovery(request).await?;
+            if discovery.hash_kind() != kind {
+                return Err(TracesError::UnknownScope.into());
+            }
+            let mut response = BytesMut::new();
+            if let Some(tip) = tip
+                && (prefixes.is_empty()
+                    || prefixes
+                        .iter()
+                        .any(|prefix| TRACE_GIT_REF.starts_with(prefix)))
+            {
+                smart::add_pkt_line_string(&mut response, format!("{tip} {TRACE_GIT_REF}\n"));
+            }
+            response.extend_from_slice(b"0000");
+            trace_git_write(writer, &response, &request.cancel).await?;
+        } else {
+            if wants.is_empty() {
+                return Err(trace_git_invalid());
+            }
+            trace_git_fetch(request, kind, &wants, &haves, writer, done).await?;
+            if done {
+                return Ok(());
+            }
+        }
     }
 }
 

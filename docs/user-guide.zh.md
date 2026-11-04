@@ -37,7 +37,7 @@ trunk 模式下的推送规则（Monorepo 路径；ImportRepo 见第 2.6 节）�
 
 ### 2.2 SSH:普通代码只读与 Traces 准入
 
-storage-only 的**普通代码仓库不开放 SSH receive-pack**（`git.ssh_receive_pack=false` 仍是强制配置，省略会拒绝启动）；普通代码 SSH 用于 clone / fetch / pull。启用 traces 后，只有通过凭据绑定、owner 与项目写权限检查的 TraceRepo 才有受限的 SSH 命令准入例外，见第 5.3 节；这尚不提供 SSH PACK 上传或 fetch。普通代码的 `anonymous_access` 与 `push_auth` 认证形态见 [`deploy-trunk.md`](./deploy-trunk.md) 第 4 节。
+storage-only 的**普通代码仓库不开放 SSH receive-pack**（`git.ssh_receive_pack=false` 仍是强制配置，省略会拒绝启动）；普通代码 SSH 用于 clone / fetch / pull。启用 traces 后，只有通过凭据绑定、owner 与项目写权限检查的 TraceRepo 才有受限的 SSH 命令准入例外，见第 5.3 节；该例外支持 scoped traces 的 SSH PACK 上传和 fetch。普通代码的 `anonymous_access` 与 `push_auth` 认证形态见 [`deploy-trunk.md`](./deploy-trunk.md) 第 4 节。
 
 SSH 公钥认证会检查请求声明的算法与实际签名算法一致；例如声明 `rsa-sha2-512` 却提交 SHA-1 签名的请求会被拒绝，匹配的 RSA-SHA2-512 认证保持支持。现有标准 OpenSSH 密钥的保存、重载和公钥指纹接口保持不变。本次依赖更新没有启用 SSH agent 服务或转发；安全修复来源与密钥兼容说明见[协议文档](./refactoring/protocol.md#ssh-dependency-security)。
 
@@ -199,9 +199,9 @@ Monorepo 路径禁止 Git 客户端推送 Tag，Tag 经此入口管理（ImportR
 
 - **OCI Distribution `/v2`**:storage-only 且 `[oci].enabled=true` 时挂载,可作容器镜像仓库(`docker login` 复用 push token,无独立 token 服务)。架构与端点事实源见 [`refactoring/oci.md`](./refactoring/oci.md),启用步骤见 [`deploy-trunk.md`](./deploy-trunk.md) 第 10 节。
 - **Agent Session Capture `/api/v1/agent-capture`**：可选能力，接收并查询 Agent 会话、事件、checkpoint、transcript 与文件操作记录。仅在 storage-only 且 `[agent_capture].enabled=true`、配置至少一个 `[[agent_capture.ingest_tokens]]` 时挂载；使用独立 ingest token，不复用 Git push token，也不会由 Git push 自动产生会话记录。配置与配额事实源见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
-- **Traces 归档**：示例配置里的 `[traces].enabled` 保持 `false`。打开它必须由操作者写入 `server_id` UUID，mega2 不会在启动时生成这个 id。该开关控制 scoped traces 入口：HTTP Git 见第 5.2 节，SSH 身份、命令准入及当前候选的专属发现元数据见第 5.3 节；SSH PACK 数据面仍待交付。HTTP traces 失败使用稳定错误码：缺认证是 401 `unauthenticated`；未知或无权限的 scope 是 404 `unknown_scope`；非法参数或 cursor 是 400 `invalid_parameter` 或 `invalid_cursor`；`unsupported_schema`、`invalid_capture`、`object_integrity` 和 `trace_history_in_code` 是 409；`response_budget` 是 413；`query_timeout` 和 `search_unavailable` 是 503。错误文本不包含对象 key 或 transcript 正文。具名维护操作者用 `mega2 --config <现存配置> traces rebind-target --target <UUID> --path <canonical-path>` 把已有 target 指到新路径（也可以用 `MEGA_CONFIG` 点名配置）。路径必须已经是 canonical 形式，并且当前已经是目录。目标不存在、路径不是 canonical、或目录不存在时都不写库。该命令不生成默认配置，只在工作目录里发现的配置也会被拒绝。HTTP 发布在同一次数据库事务中重查 credential 仍有效、target 仍在授权路径上处于 active、binding generation 未变，以及调用者对当前路径仍有写权限。解包期间退役 credential 或改绑 target 会拒绝这次发布，tip、membership 和 journal 都保持不变。没有出示 credential 时是 `unauthenticated`。其余重查失败是 `unknown_scope`。Mono 账户的写权限在这次事务里读取进程当前的 Cedar 快照。解包前复制的快照不能放行这次发布；快照缺失或被标记为 dirty 时拒绝。`off` 不放行这次写权限。`shadow` 按当前 Cedar 决定，不会把代码推送里的 shadow 放行当成 traces 写权限。见[配置指南](./configuration.zh.md)。
+- **Traces 归档**：示例配置里的 `[traces].enabled` 保持 `false`。打开它必须由操作者写入 `server_id` UUID，mega2 不会在启动时生成这个 id。该开关控制 scoped traces 入口：HTTP Git 见第 5.2 节，SSH 身份、发现和 Git 传输见第 5.3 节。HTTP traces 失败使用稳定错误码：缺认证是 401 `unauthenticated`；未知或无权限的 scope 是 404 `unknown_scope`；非法参数或 cursor 是 400 `invalid_parameter` 或 `invalid_cursor`；`unsupported_schema`、`invalid_capture`、`object_integrity` 和 `trace_history_in_code` 是 409；`response_budget` 是 413；`query_timeout` 和 `search_unavailable` 是 503。错误文本不包含对象 key 或 transcript 正文。具名维护操作者用 `mega2 --config <现存配置> traces rebind-target --target <UUID> --path <canonical-path>` 把已有 target 指到新路径（也可以用 `MEGA_CONFIG` 点名配置）。路径必须已经是 canonical 形式，并且当前已经是目录。目标不存在、路径不是 canonical、或目录不存在时都不写库。该命令不生成默认配置，只在工作目录里发现的配置也会被拒绝。HTTP 发布在同一次数据库事务中重查 credential 仍有效、target 仍在授权路径上处于 active、binding generation 未变，以及调用者对当前路径仍有写权限。解包期间退役 credential 或改绑 target 会拒绝这次发布，tip、membership 和 journal 都保持不变。没有出示 credential 时是 `unauthenticated`。其余重查失败是 `unknown_scope`。Mono 账户的写权限在这次事务里读取进程当前的 Cedar 快照。解包前复制的快照不能放行这次发布；快照缺失或被标记为 dirty 时拒绝。`off` 不放行这次写权限。`shadow` 按当前 Cedar 决定，不会把代码推送里的 shadow 放行当成 traces 写权限。见[配置指南](./configuration.zh.md)。
 
-当 `[traces].enabled=false` 时，HTTP 的 GET/POST 请求若进入根 `.traces` 保留命名空间，会在业务鉴权、请求解压和读取请求体之前返回 HTTP 404，JSON 错误消息为 `traces locator not found`。此规则覆盖 discovery、upload-pack、receive-pack 及单次百分号解码或点段折叠进入该命名空间的别名；它不查 scope 是否存在，也不会回落到普通 Native/Import 仓库。未进入保留根的普通代码路径保持原分派。规则也检查 LFS 重写前由服务端保留的原始 URL：即使已有代码仓的根名字面为 `%2etraces`，其 `/%2etraces/…` URL 在关闭 traces 时仍按一次解码的保留别名返回 404。启用时本禁用守卫保持该字面根的既有分派。SSH 在已有连接认证之后检查 exec 的字面仓库路径；关闭 traces 时，进入根 `.traces` 的 upload-pack/receive-pack 在协议广告、读取 stdin 和普通仓库分派之前返回 `ERR traces locator not found`，exit status 为 1，并结束通道。SSH 路径不作 HTTP 百分号解码；普通嵌套、近似根名及字面 `%2etraces` 保持原分派。普通 SSH 认证和 storage-only 写入限制保持原语义。启用后的 HTTP Git 使用下述认证与 scope 边界，SSH 身份、命令准入与发现见第 5.3 节；SSH traces PACK 数据面仍未接入。详见 [traces 协议](./refactoring/traces.md)。
+当 `[traces].enabled=false` 时，HTTP 的 GET/POST 请求若进入根 `.traces` 保留命名空间，会在业务鉴权、请求解压和读取请求体之前返回 HTTP 404，JSON 错误消息为 `traces locator not found`。此规则覆盖 discovery、upload-pack、receive-pack 及单次百分号解码或点段折叠进入该命名空间的别名；它不查 scope 是否存在，也不会回落到普通 Native/Import 仓库。未进入保留根的普通代码路径保持原分派。规则也检查 LFS 重写前由服务端保留的原始 URL：即使已有代码仓的根名字面为 `%2etraces`，其 `/%2etraces/…` URL 在关闭 traces 时仍按一次解码的保留别名返回 404。启用时本禁用守卫保持该字面根的既有分派。SSH 在已有连接认证之后检查 exec 的字面仓库路径；关闭 traces 时，进入根 `.traces` 的 upload-pack/receive-pack 在协议广告、读取 stdin 和普通仓库分派之前返回 `ERR traces locator not found`，exit status 为 1，并结束通道。SSH 路径不作 HTTP 百分号解码；普通嵌套、近似根名及字面 `%2etraces` 保持原分派。普通 SSH 认证和 storage-only 写入限制保持原语义。启用后的 HTTP Git 使用下述认证与 scope 边界，SSH 身份、发现和 Git 传输见第 5.3 节。详见 [traces 协议](./refactoring/traces.md)。
 
 HTTP traces 支持标准 Git v0 推送以及 v0/v2 引用查询和 fetch。有效凭据必须先通过认证、principal 绑定与目标授权，之后才广告引用或读取请求体；没有凭据或凭据无效时返回带 `WWW-Authenticate` 的 401，已认证但无权限与未知 scope 均返回 404。空 scope 的 discovery 不创建数据库记录。SHA-1 和 SHA-256 使用该 scope 的实际对象格式，fetch 保留原始对象字节。身份与 locator 语法以 [traces 协议](./refactoring/traces.md) 为准；当前候选的 `libra-traces-*` 扩展广告见第 5.3 节，SSH 对象数据面仍待后继交付。
 
@@ -235,16 +235,18 @@ Traces v1 只接收无 delta 的 PACK。为推送仓库设置 `git config pack.w
 
 接收与 fetch 分别有独立容量限制。503 `query_timeout` 是可重试的过载或暂时不可用；退避后重试，并检查服务端容量。连接中断或 PACK 校验失败不能视为 fetch 成功。部署条件及占用恢复见[部署指南](./deployment.zh.md)。
 
-### 5.3 SSH traces 身份、准入与发现
+### 5.3 SSH traces Git
 
-SSH traces 提供凭据核验和 upload-pack / receive-pack 命令准入。当前候选已验证 HTTP/SSH 专属 discovery 元数据接线，尚待发布验收；SSH PACK 上传、fetch 与 H1 仍由后继交付。对象上传与读取继续使用第 5.2 节的 HTTP Git，不能把 SSH 握手或收到广告当作对象传输成功。
+SSH traces 在凭据绑定和授权后支持 scoped Git receive-pack 和 upload-pack。使用保留登录名 `traces`、第 5.2 节的 locator 和 `refs/libra/traces`，并使用绑定到目标 principal 的已验证密钥。例如执行 `git push --no-thin <ssh-traces-url> HEAD:refs/libra/traces`，以及 `git -c protocol.version=2 fetch <ssh-traces-url> refs/libra/traces:refs/libra/traces`；第 5.2 节的无 delta PACK 规则同样适用于 SSH。握手或广告成功不能单独证明对象传输成功。
 
-已授权的 HTTP/SSH discovery 公布 `libra-traces-v1` 和 `libra-traces-server=<server_id>`；只有已有 scope 才公布 `libra-traces-scope=<stream UUID>`，合法空 scope 省略该项，不伪造 UUID。`server_id` 来自持久部署配置，`object-format` 和空广告零 OID 的 40/64 位宽度由授权 metadata 选择的 SHA-1/SHA-256 格式决定。v2 discovery 仅用于 upload-pack/read；SSH 当前仍是能力广告，已有 scope UUID 不表示已广告真实 tip 或完成 PACK 传输。普通代码 discovery 不通告这些 traces 专属能力。
+已授权的 HTTP/SSH discovery 公布 `libra-traces-v1` 和 `libra-traces-server=<server_id>`；只有已有 scope 才公布 `libra-traces-scope=<stream UUID>`，合法空 scope 省略该项，不伪造 UUID。`server_id` 来自持久部署配置，`object-format` 和空广告零 OID 的 40/64 位宽度由授权 metadata 选择的 SHA-1/SHA-256 格式决定。v2 discovery 仅用于 upload-pack/read；已授权的已有 scope 会广告真实 traces tip；空 scope 不伪造 tip。已有 scope UUID 本身不代表 PACK 传输完成。普通代码 discovery 不通告这些 traces 专属能力。
 
 - 保留 SSH login `traces` 拒绝 none-auth。其它 login 即使获准匿名读取普通代码，也不能匿名访问 traces。principal 来自验证后的凭据和显式 binding，不来自 login 或同名 Mono 账户。
 - 静态 push token 按 `static_push_token / <配置token名称>` 绑定；Mono SSH 公钥按 `mono_account / ssh-key:<实际记录ID>` 绑定。公钥必须完成签名认证，仅提出一把 key 不产生准入身份。同一指纹的来源不唯一、密钥被删除或同 ID 来源被替换时，拒绝使用旧身份继续执行 traces 命令。
 - 先验证连接的真实凭据并确认其当前来源仍有效，再允许 scope 或 target 查询。所有 traces 命令在准入和广告之前都须通过 active binding 及对应目标权限检查：upload-pack 要求目标项目 read，允许有该权限的非 owner 共享读取；已有 scope 的 receive-pack 同时要求 scope owner 和目标项目 write，仅是 owner 或仅有 write 均不够。合法空 scope 按 Create 的 write 授权处理，不伪造已有 owner。静态 token 还须覆盖 target 路径；Mono SSH key 使用与该命令对应的当前有效 Cedar 权限，`off` 不放行，`shadow` 按真实 Cedar 决定，不能把普通代码的 shadow 放行当作 traces 权限。
 - 只有真实 traces locator 且通过上述检查，才允许 storage-only 下受限的 TraceRepo receive-pack 命令准入。普通代码和其它视图不获得该例外；原 `git.ssh_receive_pack=false` 配置与普通代码写入拒绝保持。关闭 traces 时的根保留命名空间拒绝和无 fallback 边界保持。
+
+同一服务进程中的 HTTP 与 SSH 共用一个 receive 容量和独立的一个 fetch 容量。连接中断不能证明已开始的数据库提交是否完成；决定后续动作前应检查实际 ref。ingest 截止时间不保证 COMMIT 或 rollback 清理的完成上界。
 
 SSH 的拒绝通过认证失败或受控通道错误、退出和关闭反馈；未知 scope 与已认证但无权限请求使用相同的受控 ERR，不泄露 scope 存在性。第 5 节的 HTTP 状态码不是 SSH 握手状态。凭据维护与身份来源的完整规则见 [Traces 协议](./refactoring/traces.md) 第 2.6 节。
 
@@ -266,7 +268,7 @@ libra mega2 browser
 |---|---|
 | `mega2 service init --yes` | 初始化空 Monorepo 并退出(不启动监听);空卷 bootstrap 的固定动作 |
 | `mega2 service http --host 0.0.0.0 -p 8000` | 启动 HTTP 面(Git smart HTTP + LFS + `/api/v1` + 可选 OCI / Agent Capture);与 Dockerfile 默认 CMD 一致 |
-| `mega2 service ssh [--ssh-port 2222]` | 启动 SSH 面（storage-only 普通代码只读；traces 身份/命令准入见 5.3，SSH PACK 数据面待交付）；standalone 形态要求 `cedar.enforcement=off`，否则改用 `multi` |
+| `mega2 service ssh [--ssh-port 2222]` | 启动 SSH 面（storage-only 普通代码只读；scoped traces Git 与身份见 5.3）；standalone 形态要求 `cedar.enforcement=off`，否则改用 `multi` |
 | `mega2 service multi http ssh` | 单进程同时启动 HTTP + SSH(共享授权快照) |
 | `mega2 path provision --server <URL> <PATH>` | 开通 Monorepo 路径(首次推送前,见 2.5);token 只从环境变量 `MEGA2_TOKEN` 读取,不读配置文件 |
 | `mega2 import-repo remove --path <P> --yes [--cleanup-id <ID>] [--max-rounds <N>]` | 在服务器上清理 ImportRepo(storage-only;`--config` 放在 `import-repo` 之前或设 `MEGA_CONFIG`);结局行与退出码见 2.6 |
