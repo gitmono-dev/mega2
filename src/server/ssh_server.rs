@@ -100,8 +100,15 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
     let server_url = format!("{host}:{ssh_port}");
     let addr = SocketAddr::from_str(&server_url)
         .map_err(|e| MegaError::Other(format!("Invalid SSH listen address {server_url}: {e}")))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| MegaError::Other(format!("SSH server failed: {e}")))?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|e| MegaError::Other(format!("SSH server failed: {e}")))?;
+    tracing::info!(address = %bound_addr, "SSH server started up");
     ssh_server
-        .run_on_address(ru_config, addr)
+        .run_on_socket(ru_config, &listener)
         .await
         .map_err(|e| MegaError::Other(format!("SSH server failed: {e}")))?;
     Ok(())

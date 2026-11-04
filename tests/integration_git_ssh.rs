@@ -221,9 +221,6 @@ impl ServiceProcess {
     ) {
         let deadline = Instant::now() + timeout;
         loop {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return;
-            }
             if let Some(status) = self.child.try_wait().expect("poll service") {
                 self.reaped = true;
                 panic!(
@@ -232,9 +229,24 @@ impl ServiceProcess {
                     read_log(stderr_path),
                 );
             }
+            let owned_ready = read_log(stdout_path).lines().any(|line| {
+                line.contains("SSH server started up")
+                    && line.split_whitespace().any(|field| {
+                        field
+                            .strip_prefix("address=")
+                            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+                            .is_some_and(|address| address.port() == port)
+                    })
+            });
+            if owned_ready
+                && TcpStream::connect(("127.0.0.1", port)).is_ok()
+                && self.child.try_wait().expect("poll ready service").is_none()
+            {
+                return;
+            }
             if Instant::now() >= deadline {
                 panic!(
-                    "service did not bind port {port} within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+                    "service did not establish owned SSH readiness on port {port} within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
                     read_log(stdout_path),
                     read_log(stderr_path),
                 );
@@ -283,6 +295,76 @@ impl Drop for ServiceProcess {
             let _ = self.child.wait();
         }
     }
+}
+
+#[test]
+fn ssh_readiness_rejects_foreign_listener() {
+    let foreign = std::net::TcpListener::bind("127.0.0.1:0").expect("bind owned foreign listener");
+    let port = foreign.local_addr().expect("listener address").port();
+    let logs = tempfile::tempdir().expect("isolated logs");
+    let stdout = logs.path().join("service.out");
+    let stderr = logs.path().join("service.err");
+    fs::write(&stdout, b"").expect("empty stdout");
+    fs::write(&stderr, b"").expect("empty stderr");
+    let mut command = Command::new("sleep");
+    command.arg("10");
+    let mut service = ServiceProcess::spawn(command);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        service.wait_until_listening(port, Duration::from_millis(500), &stdout, &stderr);
+    }));
+    let failure = outcome.expect_err("foreign listener was mistaken for this child");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("service did not establish owned SSH readiness"),
+        "wrong readiness failure: {message}"
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "foreign listener remains untouched"
+    );
+    drop(service);
+    drop(foreign);
+}
+
+#[test]
+fn ssh_readiness_bind_failure_has_no_ready_marker() {
+    let env = GitSshEnv::new();
+    let foreign = std::net::TcpListener::bind("0.0.0.0:0").expect("bind owned collision listener");
+    let port = foreign.local_addr().expect("collision address").port();
+    let stdout = env.temp_dir.path().join("collision.out");
+    let stderr = env.temp_dir.path().join("collision.err");
+    let mut command = env.full_config_command();
+    command.env("MEGA_LOG__PRINT_STD", "true");
+    command.args([
+        "service",
+        "ssh",
+        "--host",
+        git_cli::service_listen_host(),
+        "--ssh-port",
+        &port.to_string(),
+    ]);
+    command.stdout(Stdio::from(create_log_file(&stdout)));
+    command.stderr(Stdio::from(create_log_file(&stderr)));
+    let mut service = ServiceProcess::spawn(command);
+    let status = service
+        .wait_for_exit(Duration::from_secs(90))
+        .expect("colliding service exits");
+    assert!(!status.success(), "colliding SSH bind must fail");
+    assert!(
+        !read_log(&stdout).contains("SSH server started up"),
+        "failed bind emitted readiness"
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "owned collision listener remains active"
+    );
+    drop(service);
+    drop(foreign);
+    drop(env);
 }
 
 #[test]
