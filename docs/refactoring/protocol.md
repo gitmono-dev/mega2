@@ -1,5 +1,11 @@
 **现行执行指令（2026-11-03 UTC）：** 用户要求完成 Mega2 本计划，跳过交叉 Review，直接执行任务卡；本指令适用于当前 MTR-13 及后续卡。旧日期记录中的审查准入或待审要求不再作为本轮交叉 Review 前置，历史 FAIL/STOP 与原始证据保留，不将跳过记为 PASS。逐卡依赖、AC/VER、独立 C/D、签名+DCO、版本与发布门继续执行；必要Libra交接范围以本轮明确授权段为准，不一概重开全26卡。
 
+**MTR105三child版本面（2026-11-04 UTC）：** 以已签名本地parent `15769a5495dd22827dfb20e33cdd75420868109d` 新树为基础，fresh GitHub main仍1abb、v0.42.91 tag空缺及Release404已核；本次实际 `.90→.91` `cargo update --offline --workspace` exit0、仅自身版本字节改变，R收据 `25e4dfe4fb4bfbb8ad684347da30a133e565c30ac09e5b9853b2ce251508e5ca`。此R独立于旧二child树R/C1；新合树完整五门、零残留及发布/D均待，三个child均未done。保留所有旧失败与资源记录；Review waived非PASS。
+
+
+**现行MTR105新合树入口（2026-11-04 UTC）：** FIX27精确I7 signed/DCO本地提交 `15769a5495dd22827dfb20e33cdd75420868109d`，parent45db，receipt `fff278ed173e41b526ab371058abd71e76f182bee9c1bb6059d6f6faab29a640`；本地门与签名核验完成但未done。现行三child链623→45db→15769，继承tests.rs `e716a5d2...` 与pages.rs `c629fe66...`。MTR105仅六治理I与Cargo版本R，须重新核远端基线/版本空缺、从新parent实际.90→.91、冻结新合树后执行完整五门与实际D；之前R/C1只覆盖旧二child树，C1 FAIL不回改，不能复用为新C通过。原工作区四处及两份指南继续保护；Review waived非PASS。
+
+
 **FIX27本地门（2026-11-04 UTC）：** 正式格式化源码 `c629fe66396d2af98f47ac62828ee75cd2574c51b0e68874ffac80f86520c981` 已实际通过原定向用例/16子全部成功且首post无残留（报告14ffa471），nightly fmt零差异（8a12de4b）与strict Clippy零警告（0a6b20bb），各自后检通过。本地资格 `FIX27-LOCAL-ACCEPTANCE.json` SHA256 `d43e5579fbc934fdbec102625885cfb13f155bcd1f24b6dc2cf3abb0e9702d48`；待精确signed/DCO本地提交，AC3正式完整C/D仍待MTR105，非done。隔离未格式化实验完整lib2831/3原ignored为独立证据，不冒称正式C。Review waived非PASS。
 
 
