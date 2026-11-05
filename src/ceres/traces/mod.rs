@@ -4,6 +4,7 @@ pub(crate) mod checkpoint_history;
 pub mod cleanup;
 pub mod error;
 pub mod ingest;
+pub(crate) mod manifest;
 pub mod pack_decode;
 pub(crate) mod pack_encode;
 pub(crate) mod parser;

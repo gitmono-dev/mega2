@@ -59,6 +59,20 @@ pub(crate) enum InvalidCheckpoint {
     ManifestNotObject,
     /// metadata.json or manifest.json names another checkpoint.
     IdMismatch,
+    /// Transcript parts are not in the manifest's declared order.
+    PartOrder,
+    /// A declared resource path is not in the checkpoint tree.
+    PartPath,
+    /// The tree entry OID is not the OID named by the manifest.
+    PartOid,
+    /// A declared resource is not a Git blob.
+    PartType,
+    /// A part's payload length is not its manifest `byte_len`.
+    PartLength,
+    /// The logical resource length is not the manifest total.
+    TotalLength,
+    /// `content_hash.txt` does not match the covered bytes.
+    ContentHash,
 }
 
 impl InvalidCheckpoint {
@@ -71,6 +85,13 @@ impl InvalidCheckpoint {
             Self::MetadataNotObject => "metadata_not_object",
             Self::ManifestNotObject => "manifest_not_object",
             Self::IdMismatch => "id_mismatch",
+            Self::PartOrder => "part_order",
+            Self::PartPath => "part_path",
+            Self::PartOid => "part_oid",
+            Self::PartType => "part_type",
+            Self::PartLength => "part_length",
+            Self::TotalLength => "total_length",
+            Self::ContentHash => "content_hash",
         }
     }
 }

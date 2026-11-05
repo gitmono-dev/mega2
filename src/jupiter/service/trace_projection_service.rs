@@ -15,6 +15,7 @@ use crate::{
     callisto::{trace_object, trace_stream},
     ceres::traces::{
         ingest::{RawTreeMode, verified_commit_links},
+        manifest::{self, ManifestStore},
         parser::{self, CheckpointLocation, CheckpointParse, InvalidCheckpoint, MAX_CHECKPOINTS},
     },
     common::errors::{MegaError, TracesError},
@@ -230,9 +231,32 @@ impl<C: RawReadControl> StreamReader<'_, C> {
             Some(oid) => self.read(oid, RawObjectType::Blob).await?,
             None => Vec::new(),
         };
-        Ok(parser::parse_checkpoint(
-            location, &roles, &metadata, &manifest,
-        ))
+        let parsed = parser::parse_checkpoint(location, &roles, &metadata, &manifest);
+        let CheckpointParse::Parsed(parsed) = parsed else {
+            return Ok(parsed);
+        };
+        match manifest::verify_declared_resources(
+            &manifest,
+            &parsed.location.tree_oid,
+            hash_bytes,
+            self.control,
+            self,
+        )
+        .await?
+        {
+            Ok(()) => Ok(CheckpointParse::Parsed(parsed)),
+            Err(reason) => Ok(CheckpointParse::Invalid {
+                key: parsed.location.checkpoint_id,
+                tree_oid: parsed.location.tree_oid,
+                reason,
+            }),
+        }
+    }
+}
+
+impl<C: RawReadControl> ManifestStore for StreamReader<'_, C> {
+    async fn load(&self, oid: &str, kind: RawObjectType) -> Result<Vec<u8>, MegaError> {
+        self.read(oid, kind).await
     }
 }
 
@@ -597,5 +621,75 @@ mod tests {
                 .await,
             Err(MegaError::Traces(TracesError::QueryTimeout))
         ));
+    }
+
+    #[tokio::test]
+    async fn resource_integrity_projection_real_and_invalid_keeps_archive() {
+        let (_db_dir, db) = database().await;
+        let (_store_dir, store) = local_store().await;
+        let objects = TraceObjectService::new(store);
+        let stream_id = stream(&db, "sha1").await;
+        let entries = libra_objects().await;
+        archive(&db, &objects, &stream_id, "sha1", &entries).await;
+        let service = TraceProjectionService::new(objects.clone());
+        let tip = service
+            .checkpoints_at_commit(&db, &stream_id, LIBRA_H2_TIP, &budget())
+            .await
+            .unwrap();
+        assert!(
+            tip.checkpoints
+                .iter()
+                .all(|checkpoint| matches!(checkpoint, CheckpointParse::Parsed(_))),
+            "real Libra resources match their manifest: {:?}",
+            tip.checkpoints
+        );
+
+        let mut fixture = Fixture::new(HashKind::Sha1);
+        let metadata_bytes = br#"{"checkpoint_id":"abcd"}"#;
+        let metadata = fixture.object("blob", metadata_bytes);
+        let missing = fixture.object("blob", b"not-the-declared-path");
+        let manifest_body = format!(
+            r#"{{"entries":{{"metadata":{{"path":"metadata.json","oid":"{metadata}","byte_len":{metadata_len}}},"lifecycle_events":{{"path":"events/lifecycle.jsonl","oid":"{missing}","byte_len":21}},"transcript":{{"path":"transcript/claude_code.jsonl","oid":"{missing}","byte_len":21}},"redaction_report":{{"path":"redaction_report.json","oid":"{missing}","byte_len":21}},"content_hash":{{"path":"content_hash.txt","oid":"{missing}","byte_len":21}}}},"content_hash":{{"algorithm":"sha256","path":"content_hash.txt","coverage":["metadata","lifecycle_events","transcript","redaction_report"]}}}}"#,
+            metadata_len = metadata_bytes.len()
+        );
+        let manifest = fixture.object("blob", manifest_body.as_bytes());
+        let leaf = fixture.tree(&[
+            ("100644", b"manifest.json", &manifest),
+            ("100644", b"metadata.json", &metadata),
+            ("100644", b"stray", &missing),
+        ]);
+        let prefix = fixture.tree(&[("40000", b"cd", &leaf)]);
+        let checkpoints = fixture.tree(&[("40000", b"ab", &prefix)]);
+        let root = fixture.tree(&[("40000", b"checkpoint", &checkpoints)]);
+        let commit = fixture.commit(&root, None);
+        let broken: Vec<_> = fixture
+            .objects
+            .iter()
+            .map(|(oid, _, bytes)| (oid.clone(), bytes.clone()))
+            .collect();
+        let broken_stream = stream(&db, "sha1").await;
+        archive(&db, &objects, &broken_stream, "sha1", &broken).await;
+        let result = service
+            .checkpoints_at_commit(&db, &broken_stream, &commit, &budget())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.checkpoints.as_slice(),
+            [CheckpointParse::Invalid {
+                reason: InvalidCheckpoint::PartPath,
+                ..
+            }]
+        ));
+        for (oid, bytes) in &broken {
+            assert_eq!(
+                objects
+                    .get_raw(&broken_stream, "sha1", oid)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(bytes.as_slice()),
+                "an invalid resource leaves the archive in place"
+            );
+        }
     }
 }
