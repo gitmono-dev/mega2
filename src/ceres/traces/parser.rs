@@ -257,6 +257,130 @@ pub(crate) fn parse_checkpoint(
     })
 }
 
+/// metadata.json schema written by the current Libra capture writer.
+pub(crate) const METADATA_SCHEMA_VERSION: u64 = 2;
+/// manifest.json schema written by the current Libra capture writer.
+pub(crate) const MANIFEST_SCHEMA_VERSION: u64 = 1;
+/// `entries.lifecycle_events.schema_version` for the registered JSONL schema.
+pub(crate) const LIFECYCLE_SCHEMA_VERSION: u64 = 2;
+
+/// How far a published checkpoint's declared schema can be interpreted.
+///
+/// An unknown schema stays archived. It is not a layout failure and it is not
+/// `missing_raw`. A known schema with a `created_at` that is not Unix seconds
+/// is [`CaptureSchema::Invalid`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CaptureSchema {
+    Supported {
+        /// `metadata.agent_kind` as written. Not rewritten to another slug.
+        agent_kind: String,
+        /// Unix seconds. Milliseconds are rejected before they reach this field.
+        created_at: i64,
+        /// The transcript entry is declared `redacted`.
+        redacted: bool,
+        /// Never set when `redacted` is true. Redacted text is not missing raw.
+        missing_raw: bool,
+    },
+    Unsupported,
+    Invalid {
+        reason: &'static str,
+    },
+}
+
+/// Classify metadata and manifest schema versions.
+///
+/// Versions other than metadata 2, manifest 1, and lifecycle 2 are
+/// [`CaptureSchema::Unsupported`]. The bytes are not rejected as a Git object.
+pub(crate) fn classify_capture(metadata: &[u8], manifest: &[u8]) -> CaptureSchema {
+    let Some(metadata) = json_object(metadata) else {
+        return CaptureSchema::Unsupported;
+    };
+    let Some(manifest) = json_object(manifest) else {
+        return CaptureSchema::Unsupported;
+    };
+    if schema_version(&metadata) != Some(METADATA_SCHEMA_VERSION)
+        || schema_version(&manifest) != Some(MANIFEST_SCHEMA_VERSION)
+        || schema_version(
+            manifest
+                .pointer("/entries/lifecycle_events")
+                .unwrap_or(&manifest),
+        ) != Some(LIFECYCLE_SCHEMA_VERSION)
+    {
+        return CaptureSchema::Unsupported;
+    }
+    let agent_kind = match metadata.get("agent_kind") {
+        None => String::new(),
+        Some(serde_json::Value::String(kind)) => kind.clone(),
+        Some(_) => {
+            return CaptureSchema::Invalid {
+                reason: "agent_kind",
+            };
+        }
+    };
+    let Some(created_at) = unix_seconds(metadata.get("created_at")) else {
+        return CaptureSchema::Invalid {
+            reason: "created_at",
+        };
+    };
+    let redacted = manifest
+        .pointer("/entries/transcript/redaction")
+        .and_then(serde_json::Value::as_str)
+        == Some("redacted");
+    CaptureSchema::Supported {
+        agent_kind,
+        created_at,
+        redacted,
+        missing_raw: false,
+    }
+}
+
+fn json_object(bytes: &[u8]) -> Option<serde_json::Value> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .filter(serde_json::Value::is_object)
+}
+
+fn schema_version(value: &serde_json::Value) -> Option<u64> {
+    value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// `created_at` is an integer count of Unix seconds.
+///
+/// A millisecond timestamp is larger than `1_000_000_000_000` and is rejected.
+/// Fractional numbers are rejected. The value must also be a chrono timestamp.
+fn unix_seconds(value: Option<&serde_json::Value>) -> Option<i64> {
+    let number = value?.as_i64()?;
+    if !(0..1_000_000_000_000).contains(&number) {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(number, 0)?;
+    Some(number)
+}
+
+/// `Libra-Parent-Commit` from the commit message.
+///
+/// The returned string is only the trailer value. Header `parent` lines are
+/// not read, so the trailer cannot become a Git parent.
+pub(crate) fn code_commit_trailer(commit: &[u8]) -> Option<String> {
+    let message = commit
+        .windows(2)
+        .position(|pair| pair == b"\n\n")
+        .map(|index| &commit[index + 2..])?;
+    for line in message.split(|byte| *byte == b'\n') {
+        let Some(rest) = line.strip_prefix(b"Libra-Parent-Commit:") else {
+            continue;
+        };
+        let value = String::from_utf8(rest.to_vec()).ok()?.trim().to_owned();
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +558,104 @@ mod tests {
             }
         ));
         assert_eq!(InvalidCheckpoint::IdMismatch.as_str(), "id_mismatch");
+    }
+
+    fn supported_docs(created_at: &str, agent_kind: &str) -> (Vec<u8>, Vec<u8>) {
+        let metadata = format!(
+            r#"{{"schema_version":2,"agent_kind":{agent_kind},"created_at":{created_at}}}"#
+        );
+        let manifest = r#"{"schema_version":1,"entries":{"lifecycle_events":{"schema_version":2},"transcript":{"redaction":"redacted"}}}"#;
+        (metadata.into_bytes(), manifest.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn capture_schema_versions_accept_registered_and_keep_agent_kind() {
+        let (metadata, manifest) = supported_docs("1700000000", r#""claude_code""#);
+        assert_eq!(
+            classify_capture(&metadata, &manifest),
+            CaptureSchema::Supported {
+                agent_kind: "claude_code".to_owned(),
+                created_at: 1_700_000_000,
+                redacted: true,
+                missing_raw: false,
+            }
+        );
+        let (metadata, manifest) = supported_docs("1700000000", r#""not_a_provider""#);
+        assert!(matches!(
+            classify_capture(&metadata, &manifest),
+            CaptureSchema::Supported {
+                agent_kind,
+                redacted: true,
+                missing_raw: false,
+                ..
+            } if agent_kind == "not_a_provider"
+        ));
+    }
+
+    #[test]
+    fn capture_schema_versions_reject_unknown_and_milliseconds() {
+        let metadata =
+            br#"{"schema_version":9,"agent_kind":"claude_code","created_at":1700000000}"#.to_vec();
+        let (_, manifest) = supported_docs("1700000000", r#""claude_code""#);
+        assert_eq!(
+            classify_capture(&metadata, &manifest),
+            CaptureSchema::Unsupported
+        );
+        let manifest_v2 =
+            r#"{"schema_version":2,"entries":{"lifecycle_events":{"schema_version":2}}}"#;
+        assert_eq!(
+            classify_capture(
+                &supported_docs("1", r#""claude_code""#).0,
+                manifest_v2.as_bytes()
+            ),
+            CaptureSchema::Unsupported
+        );
+        let lifecycle =
+            r#"{"schema_version":1,"entries":{"lifecycle_events":{"schema_version":1}}}"#;
+        assert_eq!(
+            classify_capture(
+                &supported_docs("1", r#""claude_code""#).0,
+                lifecycle.as_bytes()
+            ),
+            CaptureSchema::Unsupported
+        );
+        let (metadata, manifest) = supported_docs("1700000000000", r#""claude_code""#);
+        assert_eq!(
+            classify_capture(&metadata, &manifest),
+            CaptureSchema::Invalid {
+                reason: "created_at"
+            }
+        );
+        let (metadata, manifest) = supported_docs("1700000000.5", r#""claude_code""#);
+        assert_eq!(
+            classify_capture(&metadata, &manifest),
+            CaptureSchema::Invalid {
+                reason: "created_at"
+            }
+        );
+    }
+
+    #[test]
+    fn capture_schema_versions_trailer_is_not_a_git_parent() {
+        let parent = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let code = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let commit = format!(
+            "tree cccccccccccccccccccccccccccccccccccccccc\nparent {parent}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\nsubject\n\nLibra-Parent-Commit: {code}\n"
+        );
+        assert_eq!(
+            code_commit_trailer(commit.as_bytes()).as_deref(),
+            Some(code)
+        );
+        let no_header = format!(
+            "tree cccccccccccccccccccccccccccccccccccccccc\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\nLibra-Parent-Commit: {code}\n"
+        );
+        assert_eq!(
+            code_commit_trailer(no_header.as_bytes()).as_deref(),
+            Some(code)
+        );
+        let header_only = format!(
+            "tree cccccccccccccccccccccccccccccccccccccccc\nparent {parent}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\nno trailer\n"
+        );
+        assert_eq!(code_commit_trailer(header_only.as_bytes()), None);
     }
 }

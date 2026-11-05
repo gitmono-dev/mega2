@@ -16,7 +16,10 @@ use crate::{
     ceres::traces::{
         ingest::{RawTreeMode, verified_commit_links},
         manifest::{self, ManifestStore},
-        parser::{self, CheckpointLocation, CheckpointParse, InvalidCheckpoint, MAX_CHECKPOINTS},
+        parser::{
+            self, CaptureSchema, CheckpointLocation, CheckpointParse, InvalidCheckpoint,
+            MAX_CHECKPOINTS,
+        },
     },
     common::errors::{MegaError, TracesError},
     jupiter::service::trace_object_service::{RawObjectType, RawReadControl, TraceObjectService},
@@ -72,6 +75,11 @@ pub(crate) struct CommitCheckpoints {
     pub(crate) commit_oid: String,
     pub(crate) root_tree: String,
     pub(crate) parents: Vec<String>,
+    /// `Libra-Parent-Commit` trailer. This is not one of `parents`.
+    pub(crate) code_commit: Option<String>,
+    /// Schema verdict aligned with `checkpoints`. Unknown schemas stay here
+    /// instead of deleting the archived objects.
+    pub(crate) schemas: Vec<CaptureSchema>,
     pub(crate) checkpoints: Vec<CheckpointParse>,
 }
 
@@ -114,10 +122,12 @@ impl TraceProjectionService {
         };
         let commit_oid = commit_oid.to_ascii_lowercase();
         let commit = reader.read(&commit_oid, RawObjectType::Commit).await?;
+        let code_commit = parser::code_commit_trailer(&commit);
         let links = verified_commit_links(&commit, hash_bytes * 2, control)
             .map_err(|_| MegaError::from(TracesError::ObjectIntegrity))?;
         let root = reader.read(&links.tree, RawObjectType::Tree).await?;
         let mut checkpoints = Vec::new();
+        let mut schemas = Vec::new();
         if let Some(checkpoint_root) = parser::checkpoint_root(&root, hash_bytes, control)? {
             let prefixes = reader.read(&checkpoint_root, RawObjectType::Tree).await?;
             for prefix in parser::checkpoint_children(&prefixes, hash_bytes, control)? {
@@ -131,6 +141,7 @@ impl TraceProjectionService {
                         tree_oid: prefix.oid,
                         reason: InvalidCheckpoint::LayoutMode,
                     });
+                    schemas.push(CaptureSchema::Unsupported);
                     continue;
                 }
                 let leaves = reader.read(&prefix.oid, RawObjectType::Tree).await?;
@@ -139,7 +150,7 @@ impl TraceProjectionService {
                     if checkpoints.len() >= MAX_CHECKPOINTS {
                         return Err(TracesError::ResponseBudget.into());
                     }
-                    let checkpoint =
+                    let (checkpoint, schema) =
                         match (leaf.mode, parser::checkpoint_id(prefix.name, leaf.name)) {
                             (RawTreeMode::Tree, Ok(checkpoint_id)) => {
                                 reader
@@ -149,17 +160,21 @@ impl TraceProjectionService {
                                     })
                                     .await?
                             }
-                            (mode, id) => CheckpointParse::Invalid {
-                                key: parser::raw_key(prefix.name, leaf.name),
-                                tree_oid: leaf.oid,
-                                reason: if mode == RawTreeMode::Tree {
-                                    id.err().unwrap_or(InvalidCheckpoint::LayoutKey)
-                                } else {
-                                    InvalidCheckpoint::LayoutMode
+                            (mode, id) => (
+                                CheckpointParse::Invalid {
+                                    key: parser::raw_key(prefix.name, leaf.name),
+                                    tree_oid: leaf.oid,
+                                    reason: if mode == RawTreeMode::Tree {
+                                        id.err().unwrap_or(InvalidCheckpoint::LayoutKey)
+                                    } else {
+                                        InvalidCheckpoint::LayoutMode
+                                    },
                                 },
-                            },
+                                CaptureSchema::Unsupported,
+                            ),
                         };
                     checkpoints.push(checkpoint);
+                    schemas.push(schema);
                 }
             }
         }
@@ -168,6 +183,8 @@ impl TraceProjectionService {
             commit_oid,
             root_tree: links.tree,
             parents: links.parents,
+            code_commit,
+            schemas,
             checkpoints,
         })
     }
@@ -210,17 +227,23 @@ impl<C: RawReadControl> StreamReader<'_, C> {
         Ok(object.into_bytes())
     }
 
-    async fn checkpoint(&self, location: CheckpointLocation) -> Result<CheckpointParse, MegaError> {
+    async fn checkpoint(
+        &self,
+        location: CheckpointLocation,
+    ) -> Result<(CheckpointParse, CaptureSchema), MegaError> {
         let hash_bytes = if self.hash_kind == "sha256" { 32 } else { 20 };
         let tree = self.read(&location.tree_oid, RawObjectType::Tree).await?;
         let roles = match parser::checkpoint_roles(&tree, hash_bytes, self.control)? {
             Ok(roles) => roles,
             Err(reason) => {
-                return Ok(CheckpointParse::Invalid {
-                    key: location.checkpoint_id,
-                    tree_oid: location.tree_oid,
-                    reason,
-                });
+                return Ok((
+                    CheckpointParse::Invalid {
+                        key: location.checkpoint_id,
+                        tree_oid: location.tree_oid,
+                        reason,
+                    },
+                    CaptureSchema::Unsupported,
+                ));
             }
         };
         let metadata = match &roles.metadata {
@@ -232,8 +255,9 @@ impl<C: RawReadControl> StreamReader<'_, C> {
             None => Vec::new(),
         };
         let parsed = parser::parse_checkpoint(location, &roles, &metadata, &manifest);
+        let schema = parser::classify_capture(&metadata, &manifest);
         let CheckpointParse::Parsed(parsed) = parsed else {
-            return Ok(parsed);
+            return Ok((parsed, schema));
         };
         match manifest::verify_declared_resources(
             &manifest,
@@ -244,12 +268,15 @@ impl<C: RawReadControl> StreamReader<'_, C> {
         )
         .await?
         {
-            Ok(()) => Ok(CheckpointParse::Parsed(parsed)),
-            Err(reason) => Ok(CheckpointParse::Invalid {
-                key: parsed.location.checkpoint_id,
-                tree_oid: parsed.location.tree_oid,
-                reason,
-            }),
+            Ok(()) => Ok((CheckpointParse::Parsed(parsed), schema)),
+            Err(reason) => Ok((
+                CheckpointParse::Invalid {
+                    key: parsed.location.checkpoint_id,
+                    tree_oid: parsed.location.tree_oid,
+                    reason,
+                },
+                schema,
+            )),
         }
     }
 }
@@ -691,5 +718,97 @@ mod tests {
                 "an invalid resource leaves the archive in place"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn capture_schema_projection_keeps_trailer_off_the_parent_list() {
+        let (_db_dir, db) = database().await;
+        let (_store_dir, store) = local_store().await;
+        let objects = TraceObjectService::new(store);
+        let stream_id = stream(&db, "sha1").await;
+        let code = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let git_parent = "cccccccccccccccccccccccccccccccccccccccc";
+        let mut fixture = Fixture::new(HashKind::Sha1);
+        let metadata_bytes = br#"{"schema_version":2,"checkpoint_id":"abcd","agent_kind":"claude_code","created_at":1700000000}"#;
+        let manifest_bytes = br#"{"schema_version":1,"checkpoint_id":"abcd","entries":{"lifecycle_events":{"schema_version":2},"transcript":{"redaction":"redacted"}}}"#;
+        let metadata = fixture.object("blob", metadata_bytes);
+        let manifest = fixture.object("blob", manifest_bytes);
+        let leaf = fixture.tree(&[
+            ("100644", b"manifest.json", &manifest),
+            ("100644", b"metadata.json", &metadata),
+        ]);
+        let prefix = fixture.tree(&[("40000", b"cd", &leaf)]);
+        let checkpoints = fixture.tree(&[("40000", b"ab", &prefix)]);
+        let root = fixture.tree(&[("40000", b"checkpoint", &checkpoints)]);
+        let commit_bytes = format!(
+            "tree {root}\nparent {git_parent}\nauthor Test <test@example.test> 0 +0000\ncommitter Test <test@example.test> 0 +0000\n\ncheckpoint\n\nLibra-Parent-Commit: {code}\n"
+        );
+        let commit = fixture.object("commit", commit_bytes.as_bytes());
+        let stored: Vec<_> = fixture
+            .objects
+            .iter()
+            .map(|(oid, _, bytes)| (oid.clone(), bytes.clone()))
+            .collect();
+        archive(&db, &objects, &stream_id, "sha1", &stored).await;
+        let service = TraceProjectionService::new(objects.clone());
+        let result = service
+            .checkpoints_at_commit(&db, &stream_id, &commit, &budget())
+            .await
+            .unwrap();
+        assert_eq!(result.parents, [git_parent]);
+        assert_eq!(result.code_commit.as_deref(), Some(code));
+        assert!(!result.parents.iter().any(|parent| parent == code));
+        assert!(matches!(
+            result.schemas.as_slice(),
+            [CaptureSchema::Supported {
+                agent_kind,
+                created_at: 1_700_000_000,
+                redacted: true,
+                missing_raw: false,
+            }] if agent_kind == "claude_code"
+        ));
+        for (oid, bytes) in &stored {
+            assert_eq!(
+                objects
+                    .get_raw(&stream_id, "sha1", oid)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(bytes.as_slice())
+            );
+        }
+
+        let mut unknown = Fixture::new(HashKind::Sha1);
+        let metadata = unknown.object(
+            "blob",
+            br#"{"schema_version":9,"checkpoint_id":"abcd","created_at":1700000000}"#,
+        );
+        let manifest = unknown.object("blob", br#"{"schema_version":9,"checkpoint_id":"abcd"}"#);
+        let leaf = unknown.tree(&[
+            ("100644", b"manifest.json", &manifest),
+            ("100644", b"metadata.json", &metadata),
+        ]);
+        let prefix = unknown.tree(&[("40000", b"cd", &leaf)]);
+        let checkpoints = unknown.tree(&[("40000", b"ab", &prefix)]);
+        let root = unknown.tree(&[("40000", b"checkpoint", &checkpoints)]);
+        let commit = unknown.commit(&root, None);
+        let stored: Vec<_> = unknown
+            .objects
+            .iter()
+            .map(|(oid, _, bytes)| (oid.clone(), bytes.clone()))
+            .collect();
+        let unknown_stream = stream(&db, "sha1").await;
+        archive(&db, &objects, &unknown_stream, "sha1", &stored).await;
+        let result = service
+            .checkpoints_at_commit(&db, &unknown_stream, &commit, &budget())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.checkpoints.as_slice(),
+            [CheckpointParse::Parsed(_)]
+        ));
+        assert_eq!(result.schemas, [CaptureSchema::Unsupported]);
+        assert!(result.code_commit.is_none());
+        assert!(result.parents.is_empty());
     }
 }
