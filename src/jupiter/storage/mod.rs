@@ -30,6 +30,7 @@ pub(crate) mod qualified_metadata_family;
 pub mod stg_common;
 pub(crate) mod trace_credential_storage;
 pub mod trace_object_storage;
+pub mod trace_projection_storage;
 pub mod trace_stream_storage;
 pub mod trace_target_storage;
 pub mod user_storage;

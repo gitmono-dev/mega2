@@ -284,6 +284,21 @@ impl AppContext {
                 crate::jupiter::service::mono_write_audit::DEFAULT_INSPECT_INTERVAL,
                 notification_shutdown.clone(),
             );
+            if config.traces.enabled {
+                crate::jupiter::service::trace_index_worker::TraceIndexWorker::new(
+                    storage
+                        .mono_service
+                        .mono_storage
+                        .base
+                        .connection
+                        .as_ref()
+                        .clone(),
+                    crate::jupiter::service::trace_object_service::TraceObjectService::new(
+                        storage.mono_service.git_service.obj_storage.clone(),
+                    ),
+                )
+                .spawn_background(notification_shutdown.clone());
+            }
 
             Ok::<(ConnectionManager, CancellationToken), MegaError>((
                 connection,

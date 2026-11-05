@@ -5454,6 +5454,185 @@ mod disabled_http {
         assert_eq!(stream.hash_kind, kind);
     }
 
+    // MTR-15: the service process indexes a real Git push from the durable journal.
+    pub async fn run_projection_worker() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(ScopeAuthFixture::new(&db).await);
+            let f = fixture.as_mut().expect("projection fixture");
+            let key = f.key(SCOPE_WRITER).await;
+            let name = format!("trace-ssh-key:{}", key.id);
+            let token = f.static_token(&name, "/project");
+            f.bind(&f.owner, "mono_account", &format!("ssh-key:{}", key.id))
+                .await;
+            f.bind(&f.owner, "static_push_token", &name).await;
+            f.start(true, true, "off").await;
+            let path = wire_by_path("/project", "mtr15-source", &f.fixture.epoch, "sha1");
+            let shared = f.fixture.shared.path();
+            let ssh_dir = shared.join("ssh");
+            fs::create_dir_all(&ssh_dir).expect("projection SSH directory");
+            fs::copy(&key.path, ssh_dir.join("client_ed25519")).expect("projection client key");
+            git_cli::write_known_hosts_via_keyscan(&ssh_dir.join("known_hosts"), f.fixture.port);
+            let ssh = git_cli::git_ssh_command(shared, f.fixture.port);
+            let url = format!(
+                "ssh://traces@{}:{}{}",
+                git_cli::mega2_reachable_host(),
+                f.fixture.port,
+                path
+            );
+            f.fixture
+                .git(&["init", "--object-format=sha1", "mtr15-source"]);
+            let leaf = shared.join("mtr15-source/checkpoint/ab/cd");
+            fs::create_dir_all(&leaf).expect("checkpoint leaf");
+            fs::write(
+                leaf.join("metadata.json"),
+                br#"{"schema_version":9,"checkpoint_id":"abcd"}"#,
+            )
+            .expect("metadata");
+            fs::write(
+                leaf.join("manifest.json"),
+                br#"{"schema_version":9,"checkpoint_id":"abcd"}"#,
+            )
+            .expect("manifest");
+            f.fixture.git(&["-C", "mtr15-source", "add", "."]);
+            f.fixture.git(&[
+                "-C",
+                "mtr15-source",
+                "-c",
+                "user.name=MTR15",
+                "-c",
+                "user.email=mtr15@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "checkpoint",
+                "-m",
+                "Libra-Parent-Commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ]);
+            let tip = f
+                .fixture
+                .git_text(&["-C", "mtr15-source", "rev-parse", "HEAD"]);
+            let push = git_cli::git_cli_ssh(
+                shared,
+                &ssh,
+                &[
+                    "-C",
+                    "mtr15-source",
+                    "push",
+                    "--no-thin",
+                    &url,
+                    "HEAD:refs/libra/traces",
+                ],
+            );
+            assert!(
+                push.status.success(),
+                "projection worker push failed: {}",
+                String::from_utf8_lossy(&push.stderr)
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let (sessions, checkpoints) = loop {
+                let state: Option<String> = db
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "SELECT state FROM trace_ref_update WHERE new_tip = $1",
+                        [tip.clone().into()],
+                    ))
+                    .await
+                    .expect("journal query")
+                    .and_then(|row| row.try_get("", "state").ok());
+                let session: Option<String> = db
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT session_key FROM trace_session WHERE session_key = 'unsupported:abcd'".to_owned(),
+                    ))
+                    .await
+                    .expect("session query")
+                    .and_then(|row| row.try_get("", "session_key").ok());
+                if state.as_deref() == Some("indexed") && session.as_deref() == Some("unsupported:abcd")
+                {
+                    let sessions: i64 = db
+                        .query_one_raw(Statement::from_string(
+                            DatabaseBackend::Postgres,
+                            "SELECT count(*)::bigint AS n FROM trace_session".to_owned(),
+                        ))
+                        .await
+                        .expect("session count")
+                        .expect("row")
+                        .try_get("", "n")
+                        .expect("n");
+                    let checkpoints: i64 = db
+                        .query_one_raw(Statement::from_string(
+                            DatabaseBackend::Postgres,
+                            "SELECT count(*)::bigint AS n FROM trace_checkpoint".to_owned(),
+                        ))
+                        .await
+                        .expect("checkpoint count")
+                        .expect("row")
+                        .try_get("", "n")
+                        .expect("n");
+                    break (sessions, checkpoints);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "journal was not indexed from the durable push\nstderr:\n{}",
+                    fs::read_to_string(f.fixture.temp.path().join("process.err")).unwrap_or_default()
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            };
+            let accepted: String = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT tip_oid FROM trace_stream WHERE tip_oid = $1",
+                    [tip.clone().into()],
+                ))
+                .await
+                .expect("accepted tip")
+                .expect("accepted tip row")
+                .try_get("", "tip_oid")
+                .expect("tip");
+            assert_eq!(accepted, tip, "publication tip stays independent of indexing");
+            f.stop();
+            f.start(true, true, "off").await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let sessions_after: i64 = db
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT count(*)::bigint AS n FROM trace_session".to_owned(),
+                ))
+                .await
+                .expect("session count after restart")
+                .expect("row")
+                .try_get("", "n")
+                .expect("n");
+            let checkpoints_after: i64 = db
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT count(*)::bigint AS n FROM trace_checkpoint".to_owned(),
+                ))
+                .await
+                .expect("checkpoint count after restart")
+                .expect("row")
+                .try_get("", "n")
+                .expect("n");
+            assert_eq!(sessions_after, sessions);
+            assert_eq!(checkpoints_after, checkpoints);
+            let _ = token;
+        })
+        .catch_unwind()
+        .await;
+        if let Some(fixture) = fixture.as_mut() {
+            fixture.stop();
+        }
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close projection worker pool");
+    }
+
     // MTR12: real standard Git over the running binary and authorized SSH key.
     pub async fn run_ssh_scoped_token_key_roundtrip() {
         let (guard, db) = traces_db::TracesDb::migrated().await;
@@ -12937,6 +13116,11 @@ async fn ssh_scoped_token_key_matrix() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_scoped_token_key_roundtrip() {
     disabled_http::run_ssh_scoped_token_key_roundtrip().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projection_worker_projects_real_push_and_resumes() {
+    disabled_http::run_projection_worker().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
