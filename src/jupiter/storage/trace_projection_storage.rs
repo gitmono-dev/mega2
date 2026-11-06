@@ -26,6 +26,13 @@ use crate::{
     },
 };
 
+struct CheckpointWrite<'a> {
+    stream_id: &'a str,
+    hash_kind: &'a str,
+    code_commit: Option<&'a str>,
+    index_version: i64,
+}
+
 /// One pass over the durable ref journal.
 pub struct TraceProjectionStore<'a> {
     db: &'a DatabaseConnection,
@@ -121,11 +128,14 @@ impl<'a> TraceProjectionStore<'a> {
         for (checkpoint, schema) in projected.checkpoints.iter().zip(projected.schemas.iter()) {
             self.write_checkpoint(
                 &txn,
-                &stream.id,
-                &stream.hash_kind,
                 checkpoint,
                 schema,
-                projected.code_commit.as_deref(),
+                &CheckpointWrite {
+                    stream_id: &stream.id,
+                    hash_kind: &stream.hash_kind,
+                    code_commit: projected.code_commit.as_deref(),
+                    index_version: crate::ceres::traces::fragments::FRAGMENT_INDEX_VERSION,
+                },
             )
             .await?;
         }
@@ -155,15 +165,82 @@ impl<'a> TraceProjectionStore<'a> {
         Ok(())
     }
 
+    /// Replay already indexed journal rows into a new fragment version.
+    ///
+    /// Stops at the first checkpoint that cannot be reread. Later sequences are
+    /// left untouched, and raw objects are only read.
+    pub async fn rebuild_indexed(
+        &self,
+        stream_id: &str,
+        index_version: i64,
+    ) -> Result<(), MegaError> {
+        if index_version < 1 {
+            return Err(MegaError::Other(
+                "trace fragment index version must be positive".into(),
+            ));
+        }
+        let rows = trace_ref_update::Entity::find()
+            .filter(trace_ref_update::Column::StreamId.eq(stream_id))
+            .filter(trace_ref_update::Column::State.eq("indexed"))
+            .order_by_asc(trace_ref_update::Column::RefSequence)
+            .all(self.db)
+            .await?;
+        for row in rows {
+            let stream = trace_stream::Entity::find_by_id(row.stream_id.clone())
+                .one(self.db)
+                .await?
+                .ok_or_else(|| MegaError::Other("trace journal names a missing stream".into()))?;
+            let accepted = stream.tip_oid.clone();
+            let projected = TraceProjectionService::new(self.objects.clone())
+                .checkpoints_at_commit(
+                    self.db,
+                    &stream.id,
+                    &row.new_tip,
+                    &ProjectionControl::new(Duration::from_secs(30)),
+                )
+                .await?;
+            let txn = self.db.begin().await?;
+            for (checkpoint, schema) in projected.checkpoints.iter().zip(projected.schemas.iter()) {
+                self.write_checkpoint(
+                    &txn,
+                    checkpoint,
+                    schema,
+                    &CheckpointWrite {
+                        stream_id: &stream.id,
+                        hash_kind: &stream.hash_kind,
+                        code_commit: projected.code_commit.as_deref(),
+                        index_version,
+                    },
+                )
+                .await?;
+            }
+            txn.commit().await?;
+            let after = trace_stream::Entity::find_by_id(stream.id)
+                .one(self.db)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other("trace stream disappeared during version rebuild".into())
+                })?;
+            if after.tip_oid != accepted {
+                return Err(MegaError::Other(
+                    "trace index rebuild changed the accepted tip".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn write_checkpoint(
         &self,
         txn: &impl ConnectionTrait,
-        stream_id: &str,
-        hash_kind: &str,
         checkpoint: &CheckpointParse,
         schema: &CaptureSchema,
-        code_commit: Option<&str>,
+        write: &CheckpointWrite<'_>,
     ) -> Result<(), MegaError> {
+        let stream_id = write.stream_id;
+        let hash_kind = write.hash_kind;
+        let code_commit = write.code_commit;
+        let index_version = write.index_version;
         let (key, tree) = match checkpoint {
             CheckpointParse::Parsed(parsed) => (
                 parsed.location.checkpoint_id.clone(),
@@ -211,6 +288,7 @@ impl<'a> TraceProjectionStore<'a> {
                         stream_id,
                         &checkpoint_id,
                         &resource_id,
+                        index_version,
                         &fragments,
                     )
                     .await?;

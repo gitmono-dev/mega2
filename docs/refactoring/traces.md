@@ -802,6 +802,8 @@ HTTP命令段与解压后的upload请求解析上限各64KiB、单ref receive；
 
 **MTR-51 manifest 资源完整性（不写库）：** 已解析且 manifest 含 `entries` 对象时，`ceres::traces::manifest` 核对已声明资源。分片 transcript 的 `parts` 按数组顺序读取，文件名后缀必须从 `.001` 连续递增；单 blob transcript 只有 `oid`、没有 `parts`。每个 part 的路径必须落在该 checkpoint tree 内，Git 类型为 blob，tree 条目 OID 与 manifest 一致，payload 长度等于 `byte_len`。分片长度之和必须等于 transcript 的 `byte_len`。`content_hash.txt` 是 `sha256:` 加 64 位十六进制（也接受无前缀的 64 位十六进制），覆盖顺序固定为 metadata、lifecycle_events、transcript、redaction_report 的原始字节；transcript 取按 part 顺序拼接的逻辑字节。已声明的 reasoning artifact，其 `sha256` 必须等于该 blob。任一不符把该 checkpoint 标为 invalid，稳定原因为 `part_order`、`part_path`、`part_oid`、`part_type`、`part_length`、`total_length` 或 `content_hash`。没有 `entries` 的 manifest 仍只做布局解析。原始归档与可见 membership 不删除。未知 schema 仍归 MTR-52，不在本检查里标 `unsupported`。
 
+**MTR-75 片段去重与版本（不改 raw）：** 同一 stream、同一 `content_digest`、同一 `index_version` 只保留一行 `trace_fragment`。每个 checkpoint/resource 仍各有一条 membership。`TraceIndexWorker::rebuild_index_version` 只重读已 `indexed` 的 journal，按 `ref_sequence` 顺序把片段写入新版本；中途失败不再处理更后的 sequence。raw 对象 OID 和字节不变，accepted tip 不变。
+
 **MTR-16 正文片段（不改归档）：** 已知 schema 的逻辑 transcript 按 manifest part 顺序拼接后再切片。每片 UTF-8 正文最多 16KiB，切在字符边界上；比一片更长时，相邻片至少重叠 256 字节。`body` 是原文切片，`ascii_fold` 只把 ASCII 大写折成小写。`index_version` 从 1 开始。归档 Git 对象字节不改。
 
 **MTR-15 journal 索引（不改 accepted tip）：** 服务在 `[traces].enabled` 时启动索引 worker。它只读取已提交的 `trace_ref_update`，按 `ref_sequence` 连续认领 `pending` 或已过期的 `claimed` 行，把 checkpoint 写成 `trace_checkpoint`。已知 schema 另写 session、ordinal 0 的 resource 和 code link；未知或无效 schema 写入 `session_key = unsupported:<checkpoint id>`，可以用这条 key 查到。完成后把 journal 标成 `indexed`。`trace_stream.tip_oid` 仍是发布时的 accepted tip，worker 不改它。进程退出后，未完成的 claim 过期，重启从 journal 继续，已索引的行不会再插一行。

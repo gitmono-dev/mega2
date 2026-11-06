@@ -61,6 +61,16 @@ pub async fn test_db_connection(_temp_dir: &Path) -> DatabaseConnection {
     connect_guarded_database(TestDatabaseKind::Default).await
 }
 
+/// Migrated database for trace fragment tests. Migrations run on the real helper
+/// connection; the schema guard stays attached to that connection.
+pub async fn migrated_trace_test_db(temp_dir: &Path) -> DatabaseConnection {
+    let db = test_db_connection(temp_dir).await;
+    crate::jupiter::migration::apply_migrations(&db, true)
+        .await
+        .expect("apply migrations");
+    db
+}
+
 async fn connect_guarded_database(kind: TestDatabaseKind) -> DatabaseConnection {
     let (db_url, schema) = create_test_database(kind).await;
 
