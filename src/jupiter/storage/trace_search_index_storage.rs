@@ -118,6 +118,13 @@ pub async fn validate_catalog(conn: &DatabaseConnection) -> Result<CatalogValida
                     i.oid::bigint AS index_oid,
                     am.amname AS method,
                     pg_catalog.pg_get_indexdef(i.oid) AS indexdef,
+                    (ix.indnkeyatts = 1 AND ix.indnatts = 1
+                     AND ix.indpred IS NULL AND ix.indexprs IS NULL
+                     AND NOT ix.indisunique
+                     AND pg_catalog.pg_get_indexdef(i.oid) = pg_catalog.format(
+                         'CREATE INDEX %I ON %I.%I USING gin (ascii_fold mega2_extensions.gin_trgm_ops)',
+                         i.relname, n.nspname, c.relname
+                     )) AS canonical_definition,
                     ix.indisvalid AS valid,
                     ix.indisready AS ready,
                     a.attname AS column_name,
@@ -167,12 +174,7 @@ pub async fn validate_catalog(conn: &DatabaseConnection) -> Result<CatalogValida
     {
         return Ok(CatalogValidation::Unavailable(CatalogFailure::Opclass));
     }
-    let indexdef = text(index, "indexdef").unwrap_or_default();
-    if !indexdef.contains("USING gin")
-        || !indexdef.contains(&format!(
-            "(ascii_fold {TRUSTED_EXTENSION_SCHEMA}.{TRUSTED_OPCLASS})"
-        ))
-    {
+    if flag(index, "canonical_definition") != Some(true) {
         return Ok(CatalogValidation::Unavailable(CatalogFailure::Columns));
     }
     if flag(index, "valid") != Some(true) {
@@ -243,17 +245,8 @@ mod tests {
         let db = trace_search_catalog_db(directory.path()).await;
         // The cloned test database does not copy the server's shared extension.
         // Install it only here. Do not drop the shared `pg_trgm`.
-        exec(
-            &db,
-            "DO $$ BEGIN
-                 IF NOT EXISTS (
-                     SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'mega2_traces_ext_owner'
-                 ) THEN
-                     CREATE ROLE mega2_traces_ext_owner NOLOGIN;
-                 END IF;
-             END $$",
-        )
-        .await;
+        // The operator-provisioned role is cluster-wide. Do not create or alter
+        // roles from a test; CREATE SCHEMA fails if the role is absent.
         exec(
             &db,
             "CREATE SCHEMA IF NOT EXISTS mega2_extensions AUTHORIZATION mega2_traces_ext_owner",
@@ -343,6 +336,26 @@ mod tests {
              ON trace_fragment USING gin (body mega2_extensions.gin_trgm_ops)",
         )
         .await;
+        assert_eq!(
+            validate_catalog(&db).await.unwrap(),
+            CatalogValidation::Unavailable(CatalogFailure::Columns)
+        );
+    }
+
+    #[tokio::test]
+    async fn gin_catalog_rejects_partial_index() {
+        let (_dir, db) = database().await;
+        exec(&db, "CREATE INDEX trace_fragment_ascii_fold_trgm_v1 ON trace_fragment USING gin (ascii_fold mega2_extensions.gin_trgm_ops) WHERE index_version = 1").await;
+        assert_eq!(
+            validate_catalog(&db).await.unwrap(),
+            CatalogValidation::Unavailable(CatalogFailure::Columns)
+        );
+    }
+
+    #[tokio::test]
+    async fn gin_catalog_rejects_multiple_columns() {
+        let (_dir, db) = database().await;
+        exec(&db, "CREATE INDEX trace_fragment_ascii_fold_trgm_v1 ON trace_fragment USING gin (ascii_fold mega2_extensions.gin_trgm_ops, body mega2_extensions.gin_trgm_ops)").await;
         assert_eq!(
             validate_catalog(&db).await.unwrap(),
             CatalogValidation::Unavailable(CatalogFailure::Columns)
