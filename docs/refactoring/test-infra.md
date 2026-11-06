@@ -397,6 +397,10 @@ SSH 集成测试**禁止**在测试栈中新增 sshd 服务；唯一拓扑是 ca
 | 端口 | 探测 `127.0.0.1:0` 取 ephemeral 端口后立即启动 `--ssh-port` |
 | 清理 | SIGINT 停服务、回收 PID、删除临时 DB 与 `CASE/ssh` |
 
+## Trace GIN catalog
+
+MTR-74 的 `gin_catalog_` 与 `gin_trust_` 用例使用 `test_db_connection` 和真实 migration，在本例 schema 的 `trace_fragment` 上建索引。它们只更新本例索引的 `pg_index` 标志或 `indclass`，不 `DROP` 共享的 `pg_trgm`，也不改 `mega2_extensions`。扩展版本比较的是编译期常量 `1.6`。
+
 ## Trace fragment 版本重建
 
 MTR-75 的内部验收不拉起 `mega2` 二进制。`fragment_membership_` 用 `test_db_connection` 加真实 `apply_migrations`，直接调用 `store_fragments`。`fragment_index_version_rebuild_` 用同一个数据库 helper 和本地 raw object store，调用 `TraceIndexWorker::rebuild_index_version`。重建前后用 `get_raw` 对比 OID 和字节。这两条命令不替代 `cargo test --all`。

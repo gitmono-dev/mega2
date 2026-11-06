@@ -71,6 +71,12 @@ pub async fn migrated_trace_test_db(temp_dir: &Path) -> DatabaseConnection {
     db
 }
 
+/// Migrated schema for GIN catalog checks. The shared `pg_trgm` extension stays
+/// in the test server database; this helper does not drop it.
+pub async fn trace_search_catalog_db(temp_dir: &Path) -> DatabaseConnection {
+    migrated_trace_test_db(temp_dir).await
+}
+
 async fn connect_guarded_database(kind: TestDatabaseKind) -> DatabaseConnection {
     let (db_url, schema) = create_test_database(kind).await;
 
