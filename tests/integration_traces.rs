@@ -13353,6 +13353,57 @@ async fn fragment_projection_splits_utf8_parts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gin_optional_startup_keeps_code_and_traces_without_extension() {
+    let admin_url = std::env::var("MEGA2_IT_DB_ADMIN_URL").expect("MEGA2_IT_DB_ADMIN_URL");
+    let name = format!(
+        "traces_noext_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let admin = sea_orm::Database::connect(admin_url.as_str())
+        .await
+        .expect("admin");
+    admin
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("CREATE DATABASE {name} TEMPLATE template0"),
+        ))
+        .await
+        .expect("template0 database");
+    let _ = admin.close().await;
+    let mut parsed = url::Url::parse(&admin_url).expect("admin url");
+    parsed.set_path(&name);
+    let db = sea_orm::Database::connect(parsed.as_str())
+        .await
+        .expect("no-extension database");
+    mega2_core::traces_migration_ops::apply_migrations(&db, true)
+        .await
+        .expect("migrations without pg_trgm");
+    let guard = name;
+    let extension: Option<String> = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT extname FROM pg_catalog.pg_extension WHERE extname = 'pg_trgm'".to_owned(),
+        ))
+        .await
+        .expect("extension query")
+        .and_then(|row| row.try_get("", "extname").ok());
+    assert!(extension.is_none());
+    let _ = db.close().await;
+    let admin = sea_orm::Database::connect(admin_url.as_str())
+        .await
+        .expect("admin cleanup");
+    admin
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("DROP DATABASE IF EXISTS {guard}"),
+        ))
+        .await
+        .expect("drop no-extension database");
+    let _ = admin.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_git_sha1_roundtrip() {
     disabled_http::ssh_git_roundtrip("sha1").await;
 }

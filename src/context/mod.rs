@@ -298,6 +298,16 @@ impl AppContext {
                     ),
                 )
                 .spawn_background(notification_shutdown.clone());
+                crate::jupiter::service::trace_search_index_service::TraceSearchIndexService::new(
+                    storage
+                        .mono_service
+                        .mono_storage
+                        .base
+                        .connection
+                        .as_ref()
+                        .clone(),
+                )
+                .spawn_background(notification_shutdown.clone());
             }
 
             Ok::<(ConnectionManager, CancellationToken), MegaError>((
@@ -655,6 +665,25 @@ mod tests {
             tests::test_storage,
         },
     };
+
+    #[tokio::test]
+    async fn deferred_gin_hook_stops_without_blocking_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::jupiter::tests::test_db_connection(directory.path()).await;
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let service =
+            crate::jupiter::service::trace_search_index_service::TraceSearchIndexService::new(db);
+        service.clone().spawn_background(shutdown.clone());
+        shutdown.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(matches!(
+            service.state(),
+            crate::jupiter::service::trace_search_index_service::IndexState::Unavailable(_)
+        ));
+    }
 
     #[test]
     fn is_secret_ref_value_detects_vault_uri() {

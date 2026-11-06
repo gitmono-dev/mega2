@@ -178,6 +178,23 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn optional_gin_startup_succeeds_without_extension() {
+        let (db, _guard) = crate::jupiter::tests::test_database_without_extensions()
+            .await
+            .expect("template0 database");
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .expect("ordinary migrations succeed without pg_trgm");
+        let state = crate::jupiter::storage::trace_search_index_storage::validate_catalog(&db)
+            .await
+            .expect("catalog probe");
+        assert!(matches!(
+            state,
+            crate::jupiter::storage::trace_search_index_storage::CatalogValidation::Unavailable(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn database_connection_returns_error_for_invalid_config() {
         let config = DbConfig {
             db_type: "mysql".to_owned(),

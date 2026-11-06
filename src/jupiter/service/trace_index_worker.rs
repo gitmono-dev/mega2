@@ -251,4 +251,17 @@ mod tests {
             .unwrap();
         assert_eq!(tip.tip_oid.as_deref(), Some(commit.as_str()));
     }
+
+    #[tokio::test]
+    async fn gin_independent_watermark_does_not_mark_search_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = test_db_connection(directory.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        let service =
+            crate::jupiter::service::trace_search_index_service::TraceSearchIndexService::new(db);
+        assert!(matches!(
+            service.state(),
+            crate::jupiter::service::trace_search_index_service::IndexState::Unavailable(_)
+        ));
+    }
 }

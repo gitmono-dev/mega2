@@ -39,6 +39,10 @@ pub enum CatalogFailure {
     ExtensionVersion,
     SchemaOwner,
     Missing,
+    ExtensionMissing,
+    WrongNamespace,
+    IndexPermissionDenied,
+    BuildTimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +74,24 @@ pub async fn create_canonical_index(conn: &DatabaseConnection) -> Result<(), Meg
 
 /// Read the fragment table's namespace and the trusted extension catalog.
 pub async fn validate_catalog(conn: &DatabaseConnection) -> Result<CatalogValidation, MegaError> {
+    let any_extension = one_row(
+        conn,
+        "SELECT ns.nspname AS schema
+         FROM pg_catalog.pg_extension ext
+         JOIN pg_catalog.pg_namespace ns ON ns.oid = ext.extnamespace
+         WHERE ext.extname = 'pg_trgm'",
+    )
+    .await?;
+    let Some(any_extension) = any_extension else {
+        return Ok(CatalogValidation::Unavailable(
+            CatalogFailure::ExtensionMissing,
+        ));
+    };
+    if text(&any_extension, "schema").as_deref() != Some(TRUSTED_EXTENSION_SCHEMA) {
+        return Ok(CatalogValidation::Unavailable(
+            CatalogFailure::WrongNamespace,
+        ));
+    }
     let extension = one_row(
         conn,
         "SELECT ext.extversion AS version,
@@ -417,6 +439,60 @@ mod tests {
             validate_catalog(&db).await.unwrap(),
             CatalogValidation::Unavailable(CatalogFailure::NotReady)
         );
+    }
+
+    #[tokio::test]
+    async fn gin_preconditions_missing_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let (db, _guard) = crate::jupiter::tests::test_database_without_extensions()
+            .await
+            .expect("template0 database");
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .unwrap();
+        let _ = directory;
+        assert_eq!(
+            validate_catalog(&db).await.unwrap(),
+            CatalogValidation::Unavailable(CatalogFailure::ExtensionMissing)
+        );
+    }
+
+    #[tokio::test]
+    async fn gin_preconditions_wrong_namespace() {
+        let (_dir, db) = database().await;
+        exec(&db, "CREATE SCHEMA IF NOT EXISTS wrong_trgm").await;
+        exec(
+            &db,
+            "UPDATE pg_catalog.pg_extension
+             SET extnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'wrong_trgm')
+             WHERE extname = 'pg_trgm'",
+        )
+        .await;
+        assert_eq!(
+            validate_catalog(&db).await.unwrap(),
+            CatalogValidation::Unavailable(CatalogFailure::WrongNamespace)
+        );
+    }
+
+    #[tokio::test]
+    async fn gin_preconditions_permission_denied() {
+        let (_dir, db) = database().await;
+        let role = format!("gin_denied_{}", uuid::Uuid::new_v4().simple());
+        exec(&db, &format!("CREATE ROLE {role} NOLOGIN")).await;
+        exec(&db, &format!("GRANT {role} TO CURRENT_USER")).await;
+        exec(&db, &format!("SET ROLE {role}")).await;
+        let schema = quoted_current_schema(&db).await.unwrap();
+        let error = db
+            .execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                canonical_index_ddl(&schema),
+            ))
+            .await
+            .unwrap_err();
+        exec(&db, "RESET ROLE").await;
+        exec(&db, &format!("DROP OWNED BY {role}")).await;
+        exec(&db, &format!("DROP ROLE {role}")).await;
+        assert!(format!("{error}").contains("permission denied"), "{error}");
     }
 
     #[tokio::test]
