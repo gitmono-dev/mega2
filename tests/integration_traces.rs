@@ -5454,6 +5454,230 @@ mod disabled_http {
         assert_eq!(stream.hash_kind, kind);
     }
 
+    // MTR-16: a real push of a multi-part UTF-8 transcript is sliced by the service.
+    pub async fn run_fragment_projection() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(ScopeAuthFixture::new(&db).await);
+            let f = fixture.as_mut().expect("fragment fixture");
+            let key = f.key(SCOPE_WRITER).await;
+            let name = format!("trace-ssh-key:{}", key.id);
+            let _token = f.static_token(&name, "/project");
+            f.bind(&f.owner, "mono_account", &format!("ssh-key:{}", key.id))
+                .await;
+            f.bind(&f.owner, "static_push_token", &name).await;
+            f.start(true, true, "off").await;
+            let path = wire_by_path("/project", "mtr16-source", &f.fixture.epoch, "sha1");
+            let shared = f.fixture.shared.path();
+            let ssh_dir = shared.join("ssh");
+            fs::create_dir_all(&ssh_dir).expect("fragment SSH directory");
+            fs::copy(&key.path, ssh_dir.join("client_ed25519")).expect("fragment client key");
+            git_cli::write_known_hosts_via_keyscan(&ssh_dir.join("known_hosts"), f.fixture.port);
+            let ssh = git_cli::git_ssh_command(shared, f.fixture.port);
+            let url = format!(
+                "ssh://traces@{}:{}{}",
+                git_cli::mega2_reachable_host(),
+                f.fixture.port,
+                path
+            );
+            f.fixture
+                .git(&["init", "--object-format=sha1", "mtr16-source"]);
+            let leaf = shared.join("mtr16-source/checkpoint/ab/cd");
+            fs::create_dir_all(leaf.join("events")).expect("events dir");
+            fs::create_dir_all(leaf.join("transcript")).expect("transcript dir");
+            let metadata = br#"{"schema_version":2,"checkpoint_id":"abcd","agent_kind":"claude_code","created_at":1700000000}"#;
+            let events = b"{}\n";
+            let mut part_a = String::new();
+            while part_a.len() < 16_383 {
+                part_a.push_str(&format!("{:08x}-", part_a.len()));
+            }
+            part_a.push('中');
+            let part_b = "PART-TWO-中";
+            let report = b"{}";
+            fs::write(leaf.join("metadata.json"), metadata).expect("metadata");
+            fs::write(leaf.join("events/lifecycle.jsonl"), events).expect("events");
+            fs::write(leaf.join("transcript/claude_code.jsonl.001"), &part_a).expect("part 1");
+            fs::write(leaf.join("transcript/claude_code.jsonl.002"), part_b).expect("part 2");
+            fs::write(leaf.join("redaction_report.json"), report).expect("report");
+            let oid = |relative: &str| {
+                f.fixture.git_text(&[
+                    "-C",
+                    "mtr16-source",
+                    "hash-object",
+                    "-w",
+                    &format!("checkpoint/ab/cd/{relative}"),
+                ])
+            };
+            let metadata_oid = oid("metadata.json");
+            let events_oid = oid("events/lifecycle.jsonl");
+            let part_a_oid = oid("transcript/claude_code.jsonl.001");
+            let part_b_oid = oid("transcript/claude_code.jsonl.002");
+            let report_oid = oid("redaction_report.json");
+            let mut logical = part_a.into_bytes();
+            logical.extend_from_slice(part_b.as_bytes());
+            let mut covered = Sha256::new();
+            covered.update(metadata);
+            covered.update(events);
+            covered.update(&logical);
+            covered.update(report);
+            let digest = hex::encode(covered.finalize());
+            let hash_file = format!("sha256:{digest}");
+            fs::write(leaf.join("content_hash.txt"), &hash_file).expect("content hash");
+            let hash_oid = oid("content_hash.txt");
+            let manifest = serde_json::json!({
+                "schema_version": 1,
+                "checkpoint_id": "abcd",
+                "content_hash": {
+                    "algorithm": "sha256",
+                    "path": "content_hash.txt",
+                    "coverage": ["metadata", "lifecycle_events", "transcript", "redaction_report"]
+                },
+                "entries": {
+                    "metadata": {"path": "metadata.json", "oid": metadata_oid, "byte_len": metadata.len()},
+                    "lifecycle_events": {"path": "events/lifecycle.jsonl", "oid": events_oid, "byte_len": events.len(), "schema_version": 2},
+                    "transcript": {
+                        "path": "transcript/claude_code.jsonl",
+                        "byte_len": logical.len(),
+                        "chunked": true,
+                        "parts": [
+                            {"path": "transcript/claude_code.jsonl.001", "oid": part_a_oid, "byte_len": logical.len() - part_b.len()},
+                            {"path": "transcript/claude_code.jsonl.002", "oid": part_b_oid, "byte_len": part_b.len()}
+                        ]
+                    },
+                    "redaction_report": {"path": "redaction_report.json", "oid": report_oid, "byte_len": report.len()},
+                    "content_hash": {"path": "content_hash.txt", "oid": hash_oid, "byte_len": hash_file.len()}
+                }
+            });
+            fs::write(leaf.join("manifest.json"), serde_json::to_vec(&manifest).expect("manifest json")).expect("manifest");
+            f.fixture.git(&["-C", "mtr16-source", "add", "."]);
+            f.fixture.git(&[
+                "-C",
+                "mtr16-source",
+                "-c",
+                "user.name=MTR16",
+                "-c",
+                "user.email=mtr16@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "fragments",
+            ]);
+            let tip = f
+                .fixture
+                .git_text(&["-C", "mtr16-source", "rev-parse", "HEAD"]);
+            let _ = &tip;
+            let stored_part = fs::read(leaf.join("transcript/claude_code.jsonl.001")).expect("reread part");
+            let push = git_cli::git_cli_ssh(
+                shared,
+                &ssh,
+                &[
+                    "-C",
+                    "mtr16-source",
+                    "push",
+                    "--no-thin",
+                    &url,
+                    "HEAD:refs/libra/traces",
+                ],
+            );
+            assert!(
+                push.status.success(),
+                "fragment push failed: {}",
+                String::from_utf8_lossy(&push.stderr)
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let bodies: Vec<String> = loop {
+                let rows = db
+                    .query_all_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT body, ascii_fold, index_version FROM trace_fragment".to_owned(),
+                    ))
+                    .await
+                    .expect("fragment query");
+                if !rows.is_empty() {
+                    break rows
+                        .into_iter()
+                        .map(|row| {
+                            let version: i64 = row.try_get("", "index_version").expect("version");
+                            assert_eq!(version, 1);
+                            let body: String = row.try_get("", "body").expect("body");
+                            let folded: String = row.try_get("", "ascii_fold").expect("fold");
+                            assert!(body.len() <= 16 * 1024);
+                            assert_eq!(folded, {
+                                body.chars()
+                                    .map(|ch| if ch.is_ascii_uppercase() { ch.to_ascii_lowercase() } else { ch })
+                                    .collect::<String>()
+                            });
+                            body
+                        })
+                        .collect();
+                }
+                let journals = db
+                    .query_all_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT state FROM trace_ref_update".to_owned(),
+                    ))
+                    .await
+                    .expect("journal diag")
+                    .into_iter()
+                    .map(|row| row.try_get::<String>("", "state").unwrap_or_default())
+                    .collect::<Vec<_>>();
+                let sessions = db
+                    .query_all_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT session_key FROM trace_session".to_owned(),
+                    ))
+                    .await
+                    .expect("session diag")
+                    .into_iter()
+                    .map(|row| row.try_get::<String>("", "session_key").unwrap_or_default())
+                    .collect::<Vec<_>>();
+                assert!(
+                    Instant::now() < deadline,
+                    "fragments were not projected\njournals: {journals:?}\nsessions: {sessions:?}\nstderr:\n{}",
+                    fs::read_to_string(f.fixture.temp.path().join("process.err")).unwrap_or_default()
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            };
+            let text = String::from_utf8(logical).expect("logical utf-8");
+            assert!(bodies.len() >= 2, "long transcript splits");
+            let mut bodies = bodies;
+            bodies.sort_by_key(|body| text.find(body).expect("fragment is a slice of the transcript"));
+            let mut rebuilt = bodies[0].clone();
+            for body in bodies.iter().skip(1) {
+                let previous = rebuilt.len();
+                let max = previous.min(body.len());
+                let overlap = (256..=max)
+                    .rev()
+                    .find(|size| body.is_char_boundary(*size) && rebuilt.ends_with(&body[..*size]))
+                    .expect("adjacent overlap");
+                assert!(overlap >= 256);
+                rebuilt.push_str(&body[overlap..]);
+            }
+            assert_eq!(rebuilt, text);
+            let reread = f.fixture.git_text(&[
+                "-C",
+                "mtr16-source",
+                "cat-file",
+                "blob",
+                "HEAD:checkpoint/ab/cd/transcript/claude_code.jsonl.001",
+            ]);
+            assert_eq!(reread.as_bytes(), stored_part.as_slice());
+        })
+        .catch_unwind()
+        .await;
+        if let Some(fixture) = fixture.as_mut() {
+            fixture.stop();
+        }
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close fragment projection pool");
+    }
+
     // MTR-15: the service process indexes a real Git push from the durable journal.
     pub async fn run_projection_worker() {
         let (guard, db) = traces_db::TracesDb::migrated().await;
@@ -13121,6 +13345,11 @@ async fn ssh_scoped_token_key_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn projection_worker_projects_real_push_and_resumes() {
     disabled_http::run_projection_worker().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fragment_projection_splits_utf8_parts() {
+    disabled_http::run_fragment_projection().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

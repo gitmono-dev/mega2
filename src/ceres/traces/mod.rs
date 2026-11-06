@@ -3,6 +3,7 @@ pub mod auth;
 pub(crate) mod checkpoint_history;
 pub mod cleanup;
 pub mod error;
+pub(crate) mod fragments;
 pub mod ingest;
 pub(crate) mod manifest;
 pub mod pack_decode;

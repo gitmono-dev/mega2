@@ -122,6 +122,7 @@ impl<'a> TraceProjectionStore<'a> {
             self.write_checkpoint(
                 &txn,
                 &stream.id,
+                &stream.hash_kind,
                 checkpoint,
                 schema,
                 projected.code_commit.as_deref(),
@@ -158,6 +159,7 @@ impl<'a> TraceProjectionStore<'a> {
         &self,
         txn: &impl ConnectionTrait,
         stream_id: &str,
+        hash_kind: &str,
         checkpoint: &CheckpointParse,
         schema: &CaptureSchema,
         code_commit: Option<&str>,
@@ -197,9 +199,22 @@ impl<'a> TraceProjectionStore<'a> {
                 missing_raw: _,
             } => {
                 self.ensure_session(txn, stream_id, &key).await?;
-                self.ensure_resource(txn, stream_id, &checkpoint_id).await?;
+                let resource_id = self.ensure_resource(txn, stream_id, &checkpoint_id).await?;
                 self.ensure_code_link(txn, stream_id, &checkpoint_id, code_commit)
                     .await?;
+                if let CheckpointParse::Parsed(parsed) = checkpoint {
+                    let fragments = self
+                        .transcript_fragments(stream_id, hash_kind, &parsed.manifest_oid)
+                        .await?;
+                    crate::jupiter::storage::trace_fragment_storage::store_fragments(
+                        txn,
+                        stream_id,
+                        &checkpoint_id,
+                        &resource_id,
+                        &fragments,
+                    )
+                    .await?;
+                }
             }
             CaptureSchema::Unsupported | CaptureSchema::Invalid { .. } => {
                 self.ensure_session(txn, stream_id, &format!("unsupported:{key}"))
@@ -238,26 +253,72 @@ impl<'a> TraceProjectionStore<'a> {
         txn: &impl ConnectionTrait,
         stream_id: &str,
         checkpoint_id: &str,
-    ) -> Result<(), MegaError> {
+    ) -> Result<String, MegaError> {
         let existing = trace_resource::Entity::find()
             .filter(trace_resource::Column::CheckpointId.eq(checkpoint_id))
             .filter(trace_resource::Column::Ordinal.eq(0))
             .one(txn)
             .await?;
-        if existing.is_none() {
-            trace_resource::ActiveModel {
-                id: Set(Uuid::new_v4().to_string()),
-                stream_id: Set(stream_id.to_owned()),
-                checkpoint_id: Set(checkpoint_id.to_owned()),
-                ordinal: Set(0),
-                byte_start: Set(0),
-                byte_end: Set(0),
-                created_at: Set(Utc::now().fixed_offset()),
-            }
-            .insert(txn)
-            .await?;
+        if let Some(existing) = existing {
+            return Ok(existing.id);
         }
-        Ok(())
+        let id = Uuid::new_v4().to_string();
+        trace_resource::ActiveModel {
+            id: Set(id.clone()),
+            stream_id: Set(stream_id.to_owned()),
+            checkpoint_id: Set(checkpoint_id.to_owned()),
+            ordinal: Set(0),
+            byte_start: Set(0),
+            byte_end: Set(0),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(txn)
+        .await?;
+        Ok(id)
+    }
+
+    async fn transcript_fragments(
+        &self,
+        stream_id: &str,
+        hash_kind: &str,
+        manifest_oid: &str,
+    ) -> Result<Vec<crate::ceres::traces::fragments::TextFragment>, MegaError> {
+        let Some(manifest) = self
+            .objects
+            .get_raw(stream_id, hash_kind, manifest_oid)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let value: serde_json::Value = match serde_json::from_slice(&manifest) {
+            Ok(value) => value,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let Some(transcript) = value.pointer("/entries/transcript") else {
+            return Ok(Vec::new());
+        };
+        let mut parts = Vec::new();
+        if let Some(declared) = transcript
+            .get("parts")
+            .and_then(serde_json::Value::as_array)
+        {
+            for part in declared {
+                let Some(oid) = part.get("oid").and_then(serde_json::Value::as_str) else {
+                    return Ok(Vec::new());
+                };
+                let Some(bytes) = self.objects.get_raw(stream_id, hash_kind, oid).await? else {
+                    return Ok(Vec::new());
+                };
+                parts.push(bytes);
+            }
+        } else if let Some(oid) = transcript.get("oid").and_then(serde_json::Value::as_str) {
+            let Some(bytes) = self.objects.get_raw(stream_id, hash_kind, oid).await? else {
+                return Ok(Vec::new());
+            };
+            parts.push(bytes);
+        }
+        let logical = crate::ceres::traces::fragments::reassemble_parts(&parts);
+        Ok(crate::ceres::traces::fragments::split_utf8(&logical).unwrap_or_default())
     }
 
     async fn ensure_code_link(

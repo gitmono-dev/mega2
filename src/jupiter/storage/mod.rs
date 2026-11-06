@@ -29,6 +29,7 @@ pub mod push_queue_storage;
 pub(crate) mod qualified_metadata_family;
 pub mod stg_common;
 pub(crate) mod trace_credential_storage;
+pub mod trace_fragment_storage;
 pub mod trace_object_storage;
 pub mod trace_projection_storage;
 pub mod trace_stream_storage;
