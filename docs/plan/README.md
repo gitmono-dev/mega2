@@ -1,4 +1,4 @@
-**MTR-71 前滚修复本地门禁（2026-11-07）：** `v0.42.105` 后台 ensure 与建索引共用同一物理连接，lease 随连接关闭释放，阻塞后端取消时主动终止。定向 27 项通过，服务级权限拒绝验证 `IndexPermissionDenied`，VER-7 真实超时采纳 132.91 秒。无扩展真实服务 Git push 通过。最终树全量 24 targets、3246 passed/0 failed/3 ignored，fmt/strict clippy 0 warning。签名提交、tag、Release 与远端 D 尚未取得，不记 done。
+**MTR-71 前滚修复本地门禁（2026-11-07）：** `v0.42.105` 后台 ensure 与建索引共用同一物理连接，lease 随连接关闭释放，阻塞后端取消时主动终止。定向 27 项通过，服务级权限拒绝验证 `IndexPermissionDenied`，VER-7 真实超时采纳 132.91 秒。无扩展真实服务 Git push 通过。最终树全量 24 targets、3246 passed/0 failed/3 ignored，fmt/strict clippy 0 warning。签名提交 `584049a309a235dec6dd6ac95d8698fbd46d7392`、标注 tag `v0.42.105` 与 [Release](https://github.com/gitmono-dev/mega2/releases/tag/v0.42.105) 已核。main Harbor [42330233728](https://github.com/gitmono-dev/mega2/actions/runs/42330233728) 与 tag Docker [42330255721](https://github.com/gitmono-dev/mega2/actions/runs/42330255721) 的 amd64、arm64 和 docker 作业均 success。Lifecycle 为 `done` / `complete`。
 
 **历史 MTR-71 发布后更正（2026-11-07）：** `v0.42.104` 已发布；此前部分 AC/VER 勾选缺少真实场景证据，且连接池 session advisory lock 存在缺陷。已在日期计划撤回勾选并前滚修复，本段保留历史。
 
