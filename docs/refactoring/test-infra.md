@@ -397,6 +397,10 @@ SSH 集成测试**禁止**在测试栈中新增 sshd 服务；唯一拓扑是 ca
 | 端口 | 探测 `127.0.0.1:0` 取 ephemeral 端口后立即启动 `--ssh-port` |
 | 清理 | SIGINT 停服务、回收 PID、删除临时 DB 与 `CASE/ssh` |
 
+## Trace GIN operator 恢复
+
+MTR-73 的 `gin_recovery_descriptor_` 与 `gin_recovery_budget_` 在真实 PostgreSQL 上验证 descriptor、无索引分支、own invalid 重建和真实 `statement_timeout`。`gin_operator_repair_ready_`、`gin_operator_mismatch_` 与 `gin_operator_lease_` 用真实 `mega2` 二进制执行 inspect/repair，检查 descriptor 0600 权限、无索引和 own invalid 两分支的新 OID、未知对象不被 DROP，以及共享 lease 忙时不建、释放后可建。每个用例用独立 `TEMPLATE template0` 数据库和可信扩展，只清理本例数据库。
+
 ## Trace GIN 延后建设
 
 MTR-71 的定向验收分两组：`gin_preconditions_`（缺扩展、错误 namespace、无建索引权限）与 `gin_ensure_`（建索引、双连接争用、operator 补装后重试、catalog 失效撤销旧 Ready）。权限拒绝用例用独立连接池，让所有会话以已有的扩展 owner 角色运行，验证服务自己的 `IndexState` 变成 `IndexPermissionDenied`，不创建、修改或删除任何集群角色。

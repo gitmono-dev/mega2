@@ -7759,6 +7759,26 @@ mod disabled_http {
         snapshot
     }
 
+    /// Wait for the background journal indexer to settle before asserting that
+    /// subsequent read-only Git requests do not change business state.
+    async fn wait_for_trace_indexed(db: &sea_orm::DatabaseConnection, stream_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let pending = scalar(db, &format!(
+                "SELECT count(*)::text AS value FROM trace_ref_update WHERE stream_id = '{stream_id}' AND state <> 'indexed'"
+            ))
+            .await;
+            if pending == "0" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "trace journal did not reach indexed before the read-only snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     fn unchanged(before: &Snapshot, after: &Snapshot) {
         assert_eq!(
             before.keys().collect::<Vec<_>>(),
@@ -8392,6 +8412,7 @@ mod disabled_http {
             .expect("first push created scope");
         assert_eq!(stream.tip_oid.as_deref(), Some(first.as_str()));
         assert_eq!(stream.hash_kind, kind);
+        wait_for_trace_indexed(db, &stream.id).await;
         let by_scope = format!("/.traces/by-scope/{}.git", stream.id);
         let outsider = Uuid::new_v4().to_string();
         trace_principal::ActiveModel {
@@ -13476,4 +13497,275 @@ async fn traces_disabled_ssh_upload() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn traces_disabled_ssh_receive() {
     disabled_http::run_ssh(true).await;
+}
+
+async fn gin_operator_database() -> (traces_db::TracesDb, sea_orm::DatabaseConnection, String) {
+    let admin_url = std::env::var("MEGA2_IT_DB_ADMIN_URL").expect("MEGA2_IT_DB_ADMIN_URL");
+    let name = format!(
+        "traces_gin_op_{}_{}",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    );
+    let admin = sea_orm::Database::connect(admin_url.as_str())
+        .await
+        .expect("admin");
+    admin
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("CREATE DATABASE {name} TEMPLATE template0"),
+        ))
+        .await
+        .expect("create operator test database");
+    let guard = traces_db::TracesDb {
+        admin_url: admin_url.clone(),
+        name: name.clone(),
+    };
+    let _ = admin.close().await;
+    let mut parsed = url::Url::parse(&admin_url).expect("admin url");
+    parsed.set_path(&name);
+    let db = sea_orm::Database::connect(parsed.as_str())
+        .await
+        .expect("operator test database");
+    mega2_core::traces_migration_ops::apply_migrations(&db, true)
+        .await
+        .expect("operator migrations");
+    for sql in [
+        "CREATE SCHEMA IF NOT EXISTS mega2_extensions AUTHORIZATION mega2_traces_ext_owner",
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA mega2_extensions VERSION '1.6'",
+    ] {
+        db.execute_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.to_owned(),
+        ))
+        .await
+        .expect("trusted extension in operator database");
+    }
+    (guard, db, parsed.to_string())
+}
+
+fn gin_operator_cli(
+    config: &std::path::Path,
+    admin_url: &str,
+    descriptor: &std::path::Path,
+    action: &str,
+    timeout: u64,
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .arg("--config")
+        .arg(config)
+        .args(["traces", "search-index", "--action", action])
+        .arg("--descriptor-file")
+        .arg(descriptor)
+        .arg("--execution-timeout")
+        .arg(timeout.to_string())
+        .env("MEGA2_TRACES_PG_ADMIN_URL", admin_url)
+        .output()
+        .expect("run traces search-index")
+}
+
+fn gin_operator_config(dir: &tempfile::TempDir) -> PathBuf {
+    let path = dir.path().join("config.toml");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+        &path,
+    )
+    .expect("copy operator config");
+    path
+}
+
+fn gin_receipt(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(path).expect("descriptor receipt"))
+        .expect("descriptor json")
+}
+
+async fn gin_index_row(db: &sea_orm::DatabaseConnection) -> Option<(i64, bool, bool)> {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "SELECT i.oid::bigint AS index_oid, ix.indisvalid AS valid, ix.indisready AS ready
+         FROM pg_catalog.pg_index ix
+         JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
+         JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace
+         WHERE i.relname = 'trace_fragment_ascii_fold_trgm_v1'
+           AND n.nspname = current_schema()"
+            .to_owned(),
+    ))
+    .await
+    .expect("index row")
+    .map(|row| {
+        (
+            row.try_get("", "index_oid").expect("oid"),
+            row.try_get("", "valid").expect("valid"),
+            row.try_get("", "ready").expect("ready"),
+        )
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gin_operator_repair_ready_no_index_and_own_invalid() {
+    let (_guard, db, admin_url) = gin_operator_database().await;
+    let dir = tempfile::tempdir().expect("operator tempdir");
+    let config = gin_operator_config(&dir);
+    let descriptor = dir.path().join("descriptor.json");
+
+    let inspect = gin_operator_cli(&config, &admin_url, &descriptor, "inspect", 1800);
+    assert!(
+        inspect.status.success(),
+        "inspect no-index: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let receipt = gin_receipt(&descriptor);
+    assert_eq!(receipt["index_version"].as_i64(), Some(1));
+    assert!(receipt["index_oid"].is_null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&descriptor)
+                .expect("descriptor mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let repair = gin_operator_cli(&config, &admin_url, &descriptor, "repair", 60);
+    assert!(
+        repair.status.success(),
+        "repair no-index: {}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let first_oid = gin_index_row(&db).await.expect("index after repair");
+    assert!(first_oid.1 && first_oid.2, "index must be valid and ready");
+    let receipt = gin_receipt(&descriptor);
+    assert_eq!(receipt["index_oid"].as_i64(), Some(first_oid.0));
+
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "UPDATE pg_catalog.pg_index SET indisvalid = false
+         WHERE indexrelid = (
+             SELECT i.oid FROM pg_catalog.pg_class i
+             JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace
+             WHERE i.relname = 'trace_fragment_ascii_fold_trgm_v1'
+               AND n.nspname = current_schema()
+         )"
+        .to_owned(),
+    ))
+    .await
+    .expect("make own index invalid");
+    let inspect_invalid = gin_operator_cli(&config, &admin_url, &descriptor, "inspect", 1800);
+    assert!(inspect_invalid.status.success(), "inspect own invalid");
+    let before = gin_receipt(&descriptor);
+    assert_eq!(before["index_oid"].as_i64(), Some(first_oid.0));
+
+    let repair_invalid = gin_operator_cli(&config, &admin_url, &descriptor, "repair", 60);
+    assert!(
+        repair_invalid.status.success(),
+        "repair own invalid: {}",
+        String::from_utf8_lossy(&repair_invalid.stderr)
+    );
+    let second_oid = gin_index_row(&db).await.expect("rebuilt index");
+    assert!(second_oid.1 && second_oid.2);
+    assert_ne!(first_oid.0, second_oid.0, "rebuild must replace the OID");
+    let after = gin_receipt(&descriptor);
+    assert_eq!(after["index_oid"].as_i64(), Some(second_oid.0));
+    let _ = db.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gin_operator_mismatch_refuses_drop_and_preserves_object() {
+    let (_guard, db, admin_url) = gin_operator_database().await;
+    let dir = tempfile::tempdir().expect("operator tempdir");
+    let config = gin_operator_config(&dir);
+    let descriptor = dir.path().join("descriptor.json");
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "CREATE INDEX trace_fragment_ascii_fold_trgm_v1 ON trace_fragment (ascii_fold)".to_owned(),
+    ))
+    .await
+    .expect("mismatched btree index");
+    let before = gin_index_row(&db).await.expect("mismatched index exists");
+
+    for action in ["inspect", "repair"] {
+        let output = gin_operator_cli(&config, &admin_url, &descriptor, action, 60);
+        assert!(
+            !output.status.success(),
+            "{action} must refuse mismatched index"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("repair refused")
+                || String::from_utf8_lossy(&output.stderr).contains("canonical DDL"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!descriptor.exists(), "{action} must not write a receipt");
+        let after = gin_index_row(&db).await.expect("mismatched index kept");
+        assert_eq!(before.0, after.0, "rejected object must not be dropped");
+    }
+    let _ = db.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gin_operator_lease_blocks_then_allows_repair() {
+    let (_guard, db, admin_url) = gin_operator_database().await;
+    let dir = tempfile::tempdir().expect("operator tempdir");
+    let config = gin_operator_config(&dir);
+    let descriptor = dir.path().join("descriptor.json");
+
+    let mut holder = db
+        .get_postgres_connection_pool()
+        .acquire()
+        .await
+        .expect("lease holder");
+    holder.close_on_drop();
+    let locked: bool = sea_orm::sqlx::query_scalar(
+        "SELECT pg_try_advisory_lock(hashtextextended('trace_fragment_ascii_fold_trgm_v1:' || to_regclass('trace_fragment')::oid::text, 0))",
+    )
+    .fetch_one(&mut *holder)
+    .await
+    .expect("take shared lease");
+    assert!(locked);
+
+    let blocked = gin_operator_cli(&config, &admin_url, &descriptor, "repair", 60);
+    assert!(!blocked.status.success(), "busy lease must not build");
+    assert!(
+        gin_index_row(&db).await.is_none(),
+        "no index while lease is busy"
+    );
+    assert!(!descriptor.exists());
+
+    let released: bool = sea_orm::sqlx::query_scalar(
+        "SELECT pg_advisory_unlock(hashtextextended('trace_fragment_ascii_fold_trgm_v1:' || to_regclass('trace_fragment')::oid::text, 0))",
+    )
+    .fetch_one(&mut *holder)
+    .await
+    .expect("release lease");
+    assert!(released);
+    drop(holder);
+
+    let repaired = gin_operator_cli(&config, &admin_url, &descriptor, "repair", 60);
+    assert!(
+        repaired.status.success(),
+        "repair after lease release: {}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    let index = gin_index_row(&db).await.expect("index after release");
+    assert!(index.1 && index.2);
+    let owner: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_catalog.pg_get_userbyid(i.relowner) AS owner
+             FROM pg_catalog.pg_class i
+             JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace
+             WHERE i.relname = 'trace_fragment_ascii_fold_trgm_v1'
+               AND n.nspname = current_schema()"
+                .to_owned(),
+        ))
+        .await
+        .expect("index owner")
+        .expect("owner row")
+        .try_get("", "owner")
+        .expect("owner");
+    assert!(!owner.is_empty());
+    let _ = db.close().await;
 }

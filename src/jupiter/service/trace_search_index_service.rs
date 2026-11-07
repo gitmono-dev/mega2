@@ -190,6 +190,102 @@ impl TraceSearchIndexService {
     }
 }
 
+/// Operator maintenance entry: optionally DROP the exact own invalid index,
+/// then run the canonical DDL on the same leased physical connection.
+///
+/// This shares the service lease and lock budgets with the background builder.
+/// After the DDL, the catalog is re-read so the receipt uses the new index OID.
+pub async fn run_operator_maintenance(
+    db: &DatabaseConnection,
+    execution_timeout: Duration,
+    drop_invalid_index: bool,
+) -> Result<IndexState, MegaError> {
+    let mut connection = db
+        .get_postgres_connection_pool()
+        .acquire()
+        .await
+        .map_err(|error| MegaError::Other(format!("acquire trace index connection: {error}")))?;
+    connection.close_on_drop();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| MegaError::Other(format!("read trace index backend: {error}")))?;
+    let mut guard = TerminateOnDrop {
+        pool: db.get_postgres_connection_pool().clone(),
+        pid: Some(pid),
+    };
+    let seconds = execution_timeout.as_secs().clamp(1, 7200);
+    sqlx::query("SET statement_timeout = 0")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| MegaError::Other(format!("reset statement budget: {error}")))?;
+    sqlx::query("SET lock_timeout = '30s'")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| MegaError::Other(format!("bound trace index lock wait: {error}")))?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET statement_timeout = '{seconds}s'"
+    )))
+    .execute(&mut *connection)
+    .await
+    .map_err(|error| MegaError::Other(format!("set execution budget: {error}")))?;
+    let locked: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_lock(hashtextextended('trace_fragment_ascii_fold_trgm_v1:' || to_regclass('trace_fragment')::oid::text, 0))",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|error| MegaError::Other(format!("acquire trace index lease: {error}")))?;
+    if !locked {
+        guard.disarm();
+        return Ok(IndexState::Unavailable(CatalogFailure::Missing));
+    }
+    let schema: String = sqlx::query_scalar(
+        "SELECT pg_catalog.quote_ident(n.nspname) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = pg_catalog.to_regclass('trace_fragment') AND c.relkind = 'r'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|error| MegaError::Other(format!("resolve trace fragment schema: {error}")))?;
+    if drop_invalid_index {
+        // DROP INDEX and CREATE INDEX CONCURRENTLY cannot share one implicit
+        // multi-statement transaction. Run them separately on the same leased
+        // physical connection.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP INDEX IF EXISTS {schema}.trace_fragment_ascii_fold_trgm_v1"
+        )))
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| MegaError::Other(format!("drop own invalid index: {error}")))?;
+    }
+    let ddl = crate::jupiter::storage::trace_search_index_storage::canonical_index_ddl(&schema);
+    let result = sqlx::query(sqlx::AssertSqlSafe(ddl))
+        .execute(&mut *connection)
+        .await;
+    if result.is_ok() {
+        guard.disarm();
+    }
+    drop(guard);
+    drop(connection);
+    let state = match result {
+        Ok(_) => match validate_catalog(db).await? {
+            CatalogValidation::Ready(_) => IndexState::Ready,
+            CatalogValidation::Unavailable(reason) => IndexState::Unavailable(reason),
+        },
+        Err(error) => match error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref()
+        {
+            Some("42501") => IndexState::Unavailable(CatalogFailure::IndexPermissionDenied),
+            Some("57014") | Some("55P03") => IndexState::Unavailable(CatalogFailure::BuildTimedOut),
+            _ => {
+                tracing::warn!(error = %error, "operator trace GIN maintenance failed");
+                IndexState::Unavailable(CatalogFailure::Missing)
+            }
+        },
+    };
+    Ok(state)
+}
+
 /// Terminates the lease-holding backend when a build cycle is dropped early.
 struct TerminateOnDrop {
     pool: sqlx::PgPool,
@@ -466,6 +562,71 @@ mod tests {
             started.elapsed() <= Duration::from_secs(180),
             "case budget exceeded: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn gin_recovery_budget_timeout_then_repair() {
+        let (_dir, db) = database().await;
+        let mut external = db.get_postgres_connection_pool().acquire().await.unwrap();
+        external.close_on_drop();
+        sqlx::query("BEGIN").execute(&mut *external).await.unwrap();
+        sqlx::query("LOCK TABLE trace_fragment IN SHARE UPDATE EXCLUSIVE MODE")
+            .execute(&mut *external)
+            .await
+            .unwrap();
+        // A real statement_timeout fires while the build waits for the lock.
+        let timed_out = run_operator_maintenance(&db, Duration::from_secs(2), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            timed_out,
+            IndexState::Unavailable(CatalogFailure::BuildTimedOut)
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut *external)
+            .await
+            .unwrap();
+        // With a larger operator budget the same maintenance reaches Ready.
+        let ready = run_operator_maintenance(&db, Duration::from_secs(60), true)
+            .await
+            .unwrap();
+        assert_eq!(ready, IndexState::Ready);
+    }
+
+    #[tokio::test]
+    async fn gin_recovery_lease_is_shared_with_operator() {
+        let (_dir, db) = database().await;
+        let mut holder = db.get_postgres_connection_pool().acquire().await.unwrap();
+        holder.close_on_drop();
+        let locked: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock(hashtextextended('trace_fragment_ascii_fold_trgm_v1:' || to_regclass('trace_fragment')::oid::text, 0))",
+        )
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+        assert!(locked);
+        let blocked = run_operator_maintenance(&db, Duration::from_secs(60), false)
+            .await
+            .unwrap();
+        assert_eq!(blocked, IndexState::Unavailable(CatalogFailure::Missing));
+        assert_eq!(
+            validate_catalog(&db).await.unwrap(),
+            CatalogValidation::Unavailable(CatalogFailure::Missing)
+        );
+        let released: bool = sqlx::query_scalar(
+            "SELECT pg_advisory_unlock(hashtextextended('trace_fragment_ascii_fold_trgm_v1:' || to_regclass('trace_fragment')::oid::text, 0))",
+        )
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+        assert!(released);
+        drop(holder);
+        assert_eq!(
+            run_operator_maintenance(&db, Duration::from_secs(60), false)
+                .await
+                .unwrap(),
+            IndexState::Ready
         );
     }
 }

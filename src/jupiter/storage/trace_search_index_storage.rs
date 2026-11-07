@@ -217,6 +217,168 @@ pub async fn validate_catalog(conn: &DatabaseConnection) -> Result<CatalogValida
     }))
 }
 
+/// Descriptor receipt produced by `inspect` and refreshed after `repair`.
+/// `index_oid` is `None` when the canonical index does not exist yet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TraceGinReceipt {
+    pub database_oid: i64,
+    pub schema_oid: i64,
+    pub table_oid: i64,
+    pub index_oid: Option<i64>,
+    pub owner: String,
+    pub index_version: i64,
+    pub canonical_ddl: String,
+}
+
+/// Admission decision for `repair`. Only these two build paths are allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairDisposition {
+    /// Canonical index already satisfies every catalog predicate.
+    AlreadyReady,
+    /// The canonical index is absent. Build it, no DROP.
+    BuildOnly,
+    /// The exact canonical index exists but is invalid or unready.
+    DropAndBuild { index_oid: i64 },
+    /// An unknown or mismatched object. Never DROP it.
+    Rejected(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryAssessment {
+    pub receipt: TraceGinReceipt,
+    pub disposition: RepairDisposition,
+}
+
+/// Inspect the live catalog for a controlled repair.
+///
+/// The receipt is evidence only: `repair` re-reads the catalog instead of
+/// trusting a file that anyone could edit.
+pub async fn assess_recovery(conn: &DatabaseConnection) -> Result<RecoveryAssessment, MegaError> {
+    let extension = one_row(
+        conn,
+        "SELECT ext.extversion AS version,
+                pg_catalog.pg_get_userbyid(ns.nspowner) AS owner
+         FROM pg_catalog.pg_extension ext
+         JOIN pg_catalog.pg_namespace ns ON ns.oid = ext.extnamespace
+         WHERE ext.extname = 'pg_trgm'
+           AND ns.nspname = 'mega2_extensions'",
+    )
+    .await?;
+    let Some(extension) = extension else {
+        return Ok(rejected_assessment(
+            "pg_trgm extension is missing in the trusted namespace",
+        ));
+    };
+    if text(&extension, "version").as_deref() != Some(EXPECTED_PG_TRGM_EXTVERSION) {
+        return Ok(rejected_assessment(
+            "pg_trgm version does not match the reviewed 1.6",
+        ));
+    }
+    if text(&extension, "owner").as_deref() != Some(TRUSTED_SCHEMA_OWNER) {
+        return Ok(rejected_assessment(
+            "trusted extension schema owner mismatch",
+        ));
+    }
+    let table = one_row(
+        conn,
+        "SELECT d.oid::bigint AS database_oid,
+                n.oid::bigint AS schema_oid,
+                c.oid::bigint AS table_oid,
+                pg_catalog.pg_get_userbyid(c.relowner) AS table_owner,
+                pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE') AS can_act
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_catalog.pg_database d ON d.datname = current_database()
+         WHERE c.relname = 'trace_fragment'
+           AND c.relkind = 'r'
+           AND n.nspname = current_schema()",
+    )
+    .await?;
+    let Some(table) = table else {
+        return Ok(rejected_assessment(
+            "canonical trace_fragment table is missing",
+        ));
+    };
+    if flag(&table, "can_act") != Some(true) {
+        return Ok(rejected_assessment(
+            "operator cannot act as the canonical fragment table owner",
+        ));
+    }
+    let schema = quoted_current_schema(conn).await?;
+    let receipt = TraceGinReceipt {
+        database_oid: integer(&table, "database_oid")?,
+        schema_oid: integer(&table, "schema_oid")?,
+        table_oid: integer(&table, "table_oid")?,
+        index_oid: None,
+        owner: text(&table, "table_owner").unwrap_or_default(),
+        index_version: CANONICAL_INDEX_VERSION,
+        canonical_ddl: canonical_index_ddl(&schema),
+    };
+    let index = one_row(
+        conn,
+        "SELECT i.oid::bigint AS index_oid,
+                pg_catalog.pg_get_indexdef(i.oid) AS indexdef,
+                ix.indisvalid AS valid,
+                ix.indisready AS ready
+         FROM pg_catalog.pg_index ix
+         JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
+         JOIN pg_catalog.pg_class c ON c.oid = ix.indrelid
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relname = 'trace_fragment'
+           AND n.nspname = current_schema()
+           AND i.relname = 'trace_fragment_ascii_fold_trgm_v1'",
+    )
+    .await?;
+    let Some(index) = index else {
+        return Ok(RecoveryAssessment {
+            receipt,
+            disposition: RepairDisposition::BuildOnly,
+        });
+    };
+    let index_oid = integer(&index, "index_oid")?;
+    let receipt = TraceGinReceipt {
+        index_oid: Some(index_oid),
+        ..receipt
+    };
+    let indexdef = text(&index, "indexdef").unwrap_or_default();
+    let expected = format!(
+        "CREATE INDEX {CANONICAL_INDEX_NAME} ON {schema}.trace_fragment USING gin (ascii_fold {TRUSTED_EXTENSION_SCHEMA}.{TRUSTED_OPCLASS})"
+    );
+    if indexdef != expected {
+        return Ok(RecoveryAssessment {
+            receipt,
+            disposition: RepairDisposition::Rejected(
+                "an index with the canonical name does not match the canonical DDL".to_owned(),
+            ),
+        });
+    }
+    if flag(&index, "valid") == Some(true) && flag(&index, "ready") == Some(true) {
+        return Ok(RecoveryAssessment {
+            receipt,
+            disposition: RepairDisposition::AlreadyReady,
+        });
+    }
+    Ok(RecoveryAssessment {
+        receipt,
+        disposition: RepairDisposition::DropAndBuild { index_oid },
+    })
+}
+
+fn rejected_assessment(reason: &str) -> RecoveryAssessment {
+    RecoveryAssessment {
+        receipt: TraceGinReceipt {
+            database_oid: 0,
+            schema_oid: 0,
+            table_oid: 0,
+            index_oid: None,
+            owner: String::new(),
+            index_version: CANONICAL_INDEX_VERSION,
+            canonical_ddl: String::new(),
+        },
+        disposition: RepairDisposition::Rejected(reason.to_owned()),
+    }
+}
+
 fn index_version_from_name(name: &str) -> Option<i64> {
     let suffix = name.rsplit("_v").next()?;
     if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -553,5 +715,82 @@ mod tests {
             }
             CatalogValidation::Unavailable(reason) => panic!("{reason:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn gin_recovery_descriptor_missing_index_is_build_only() {
+        let (_dir, db) = database().await;
+        let assessment = assess_recovery(&db).await.unwrap();
+        assert_eq!(assessment.disposition, RepairDisposition::BuildOnly);
+        assert_eq!(assessment.receipt.index_oid, None);
+        assert_eq!(assessment.receipt.index_version, CANONICAL_INDEX_VERSION);
+        assert!(!assessment.receipt.owner.is_empty());
+        assert!(
+            assessment
+                .receipt
+                .canonical_ddl
+                .contains(CANONICAL_INDEX_NAME)
+        );
+    }
+
+    #[tokio::test]
+    async fn gin_recovery_descriptor_own_invalid_is_rebuilt_with_new_oid() {
+        let (_dir, db) = database().await;
+        create_canonical_index(&db).await.unwrap();
+        exec(
+            &db,
+            "UPDATE pg_catalog.pg_index SET indisvalid = false
+             WHERE indexrelid = (
+                 SELECT i.oid FROM pg_catalog.pg_class i
+                 JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace
+                 WHERE i.relname = 'trace_fragment_ascii_fold_trgm_v1'
+                   AND n.nspname = current_schema()
+             )",
+        )
+        .await;
+        let assessment = assess_recovery(&db).await.unwrap();
+        let RepairDisposition::DropAndBuild { index_oid: old_oid } = assessment.disposition else {
+            panic!("expected own invalid disposition: {assessment:?}");
+        };
+        assert_eq!(assessment.receipt.index_oid, Some(old_oid));
+        let state = crate::jupiter::service::trace_search_index_service::run_operator_maintenance(
+            &db,
+            std::time::Duration::from_secs(60),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            crate::jupiter::service::trace_search_index_service::IndexState::Ready
+        );
+        let refreshed = assess_recovery(&db).await.unwrap();
+        assert_eq!(refreshed.disposition, RepairDisposition::AlreadyReady);
+        assert_ne!(refreshed.receipt.index_oid, Some(old_oid));
+    }
+
+    #[tokio::test]
+    async fn gin_recovery_descriptor_unknown_object_is_never_dropped() {
+        let (_dir, db) = database().await;
+        exec(
+            &db,
+            "CREATE INDEX trace_fragment_ascii_fold_trgm_v1 ON trace_fragment (ascii_fold)",
+        )
+        .await;
+        let assessment = assess_recovery(&db).await.unwrap();
+        assert!(matches!(
+            assessment.disposition,
+            RepairDisposition::Rejected(_)
+        ));
+        let still_there = super::one_row(
+            &db,
+            "SELECT i.relname AS name FROM pg_catalog.pg_class i
+             JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace
+             WHERE i.relname = 'trace_fragment_ascii_fold_trgm_v1'
+               AND n.nspname = current_schema()",
+        )
+        .await
+        .unwrap();
+        assert!(still_there.is_some(), "rejected index must not be dropped");
     }
 }
