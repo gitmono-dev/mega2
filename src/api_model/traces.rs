@@ -107,6 +107,19 @@ impl TracesCapabilities {
     }
 }
 
+/// `GET /api/v1/traces/targets/resolve` body (MTR-88).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TargetResolve {
+    pub target_id: String,
+    pub project_path: String,
+    pub target_kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct TargetResolveQuery {
+    pub path: String,
+}
+
 /// Errors returned when the wire filter itself is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceFilterError {
@@ -410,5 +423,20 @@ mod tests {
             "{limits_ref}"
         );
         let _ = limits_schema;
+    }
+
+    #[test]
+    fn target_resolve_wire_round_trips_the_registered_identity() {
+        let body = TargetResolve {
+            target_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            project_path: "/project/app".to_owned(),
+            target_kind: "native".to_owned(),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["target_id"], body.target_id);
+        assert_eq!(json["project_path"], "/project/app");
+        assert_eq!(json["target_kind"], "native");
+        let decoded: TargetResolve = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, body);
     }
 }

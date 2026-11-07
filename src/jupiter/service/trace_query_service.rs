@@ -113,6 +113,39 @@ fn catalog_reason(
     }
 }
 
+pub async fn resolve_registered_target(
+    db: &sea_orm::DatabaseConnection,
+    raw_path: &str,
+    may_read: bool,
+) -> Result<crate::api_model::traces::TargetResolve, TargetResolveError> {
+    use crate::{
+        api_model::traces::TargetResolve,
+        jupiter::storage::trace_target_storage::{active_at, canonical_project_path},
+    };
+    let path = canonical_project_path(raw_path).map_err(|_| TargetResolveError::InvalidPath)?;
+    if !may_read {
+        return Err(TargetResolveError::UnknownScope);
+    }
+    match active_at(db, &path)
+        .await
+        .map_err(TargetResolveError::Database)?
+    {
+        Some(row) => Ok(TargetResolve {
+            target_id: row.id,
+            project_path: row.project_path,
+            target_kind: row.target_kind,
+        }),
+        None => Err(TargetResolveError::UnknownScope),
+    }
+}
+
+#[derive(Debug)]
+pub enum TargetResolveError {
+    InvalidPath,
+    UnknownScope,
+    Database(crate::common::errors::MegaError),
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -200,5 +233,48 @@ mod tests {
 
         let filtered = project_sessions(&rows, &make_filter(Some("claude_code"), None, None, None));
         assert_eq!(filtered[1].checkpoints.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn target_resolve_reads_the_active_row_and_does_not_insert() {
+        use sea_orm::EntityTrait;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = crate::jupiter::tests::test_db_connection(temp_dir.path()).await;
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .unwrap();
+        crate::jupiter::storage::trace_target_storage::insert_active(
+            &db,
+            "native",
+            "/project/app",
+            None,
+        )
+        .await
+        .unwrap();
+        let before = crate::callisto::trace_target::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        let found = super::resolve_registered_target(&db, "/project/app", true)
+            .await
+            .unwrap();
+        assert_eq!(found.target_id, before[0].id);
+        assert_eq!(found.project_path, "/project/app");
+        assert!(
+            super::resolve_registered_target(&db, "/missing", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            super::resolve_registered_target(&db, "/project/app", false)
+                .await
+                .is_err()
+        );
+        let after = crate::callisto::trace_target::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0].id, before[0].id);
     }
 }
