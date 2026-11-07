@@ -56,8 +56,8 @@ pub async fn capabilities(
 
 /// Locate one active registered target. Missing and unreadable paths are the same 404.
 ///
-/// FIX-MTR-30 keeps Axum's query rejection for a missing `path` so that the
-/// authenticated 400 mapping stays in FIX-MTR-32. Authentication runs first.
+/// Authentication runs first. An authenticated missing or non-canonical `path`
+/// is 400 `invalid_parameter`.
 #[utoipa::path(
     get,
     path = "/traces/targets/resolve",
@@ -78,7 +78,8 @@ pub async fn resolve_target(
     authenticate_trace_api(&protocol, &headers)
         .await
         .map_err(ApiError::from)?;
-    let Query(query) = query?;
+    let Query(query) =
+        query.map_err(|_| ApiError::from(MegaError::from(TracesError::InvalidParameter)))?;
     let path = crate::jupiter::storage::trace_target_storage::canonical_project_path(&query.path)
         .map_err(|_| ApiError::from(MegaError::from(TracesError::InvalidParameter)))?;
     let may_read = match authorize_trace_api_read(&protocol, &headers, &path).await {
@@ -293,6 +294,22 @@ mod tests {
         assert_eq!(json["search_ready"], false);
         assert_eq!(json["bounded_scan_supported"], false);
         assert!(json["search_unavailable_reason"].is_string(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn target_resolve_parameter_error_is_invalid_parameter_after_auth() {
+        let (app, _, _dir) = traces_app().await;
+        let (status, body) = get(app.clone(), "/traces/targets/resolve", Some("wide-secret")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_parameter"), "{body}");
+        let (status, body) = get(
+            app,
+            "/traces/targets/resolve?path=/project/../app",
+            Some("wide-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_parameter"), "{body}");
     }
 
     #[tokio::test]
