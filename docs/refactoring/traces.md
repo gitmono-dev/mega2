@@ -804,7 +804,7 @@ HTTP命令段与解压后的upload请求解析上限各64KiB、单ref receive；
 
 **MTR-88 target 定位：** `GET /api/v1/traces/targets/resolve?path=` 只返回已登记且调用者可读的 active target。读权限走与 traces Git 相同的 `authorize_traces` Read 判定，凭据必须有 active 的 `trace_credential_binding`；没有绑定的凭据与无权限一样返回 404。未知路径和无读权限都是 404 `unknown_scope`，未认证是 401。这个接口不创建 `trace_target` 行。
 
-**MTR-34 capabilities 接口：** `GET /api/v1/traces/capabilities` 只在 `[traces].enabled` 时挂载，认证方式与 traces Git HTTP 相同：`push_auth=token` 时是已配置的 push token，否则是 Mono access token；只要求认证，不核对 traces 主体绑定。响应的 `protocol` 是 `libra-traces/v1`，`server_id` 是配置里的部署 UUID。`git_transports` 固定为 `http` 与 `ssh`，`object_formats` 固定为 `sha1` 与 `sha256`。`limits` 只调用 `TracesCapabilityLimits::from_protocol_limits`，不另写默认值。搜索能力标志的已知偏差由 FIX-MTR-31 前滚修复，不能以当前响应声称 `/search` 已可用。
+**MTR-34 capabilities 接口：** `GET /api/v1/traces/capabilities` 只在 `[traces].enabled` 时挂载，认证方式与 traces Git HTTP 相同：`push_auth=token` 时是已配置的 push token，否则是 Mono access token；只要求认证，不核对 traces 主体绑定。响应的 `protocol` 是 `libra-traces/v1`，`server_id` 是配置里的部署 UUID。`git_transports` 固定为 `http` 与 `ssh`，`object_formats` 固定为 `sha1` 与 `sha256`。`limits` 只调用 `TracesCapabilityLimits::from_protocol_limits`，不另写默认值。FIX-MTR-31：搜索就绪读取本进程 `IndexState`，不能只凭 catalog 合格。`/search` 由 MTR-20 挂载前，`search_ready` 与 `bounded_scan_supported` 都是 false；索引 Ready 时 `search_unavailable_reason` 为 `search_not_served`，索引不可用时为对应稳定原因。
 
 **MTR-86 capabilities limits 查询与扫描字段：** 同一个 `TracesCapabilityLimits` 还包含 `query_bytes_min`、`query_bytes_max`、`response_bytes_max`、`candidate_fragments_max`、`scan_bytes_max`、`query_timeout_ms`，全部只从 `TracesProtocolLimits` 逐字段投影，不接受 operator 配置覆盖。
 
@@ -852,7 +852,7 @@ HTTP命令段与解压后的upload请求解析上限各64KiB、单ref receive；
 | `/streams/{stream_id}/checkpoints/{checkpoint_id}/transcript` | `cursor`、`max_bytes` 有界读取逻辑 transcript，可起始指定字节 offset；不读取 reasoning 密文正文 |
 | `/search` | 必填 `target_id`、`q`，可选 source/stream/session/agent/time/code OID；返回原文命中及来源 |
 
-`/capabilities` 的搜索能力字段固定为 `search_ready: boolean`、`cjk_index_supported: boolean`、`bounded_scan_supported: boolean`。`search_ready=true` 表示当前部署的查询服务、所需扩展及索引版本通过 readiness 检查，能够按预算执行查询；false 时同时返回稳定 `search_unavailable_reason` 字符串。`cjk_index_supported=false` 不使搜索整体不可用，CJK 查询走 `bounded_scan_supported=true` 的预算扫描。它们不替代每个 stream 的索引水位，也不代表全部历史已有索引。
+`/capabilities` 的搜索能力字段固定为 `search_ready: boolean`、`cjk_index_supported: boolean`、`bounded_scan_supported: boolean`。`search_ready=true` 表示当前部署的查询服务、所需扩展及索引版本通过 readiness 检查，能够按预算执行查询；false 时同时返回稳定 `search_unavailable_reason` 字符串。`cjk_index_supported=false` 不使搜索整体不可用。`/search` 挂载后，CJK 查询才走 `bounded_scan_supported=true` 的预算扫描；挂载前两个搜索标志保持 false，见 FIX-MTR-31。它们不替代每个 stream 的索引水位，也不代表全部历史已有索引。
 
 `/capabilities` 的 `limits` 对象逐项公开下表 22 个 `u64` 字段。v1 的 22 项均为固定协议常量；广告与实际准入、请求默认及响应预算引用同一常量来源，不提供 operator override，TOML 中未声明的预算字段／namespace 按现有未知字段规则拒绝。请求仍可显式选择 `limit`／`max_bytes`，必须在固定边界内；省略时使用固定协议默认值。修改常量须先修订此契约、两份计划及兼容性门。KiB/MiB 均按 1024 进制。当前代码只声明 `TracesProtocolLimits::MAX_OBJECT_BYTES`、`MAX_METADATA_BYTES`、`MAX_MANIFEST_BYTES`、`MAX_PACK_BYTES`、`MAX_DECODED_BYTES`、`MAX_OBJECTS`、`MAX_NEW_COMMITS`、`MAX_DELTA_DEPTH`、`MAX_TREE_DEPTH`、`INGEST_TIMEOUT_SECONDS`、`METADATA_LIMIT_DEFAULT`、`SEARCH_LIMIT_DEFAULT`、`METADATA_LIMIT_MAX`、`SEARCH_LIMIT_MAX`、`TEXT_BYTES_DEFAULT`、`TEXT_BYTES_MAX`、`QUERY_BYTES_MIN`、`QUERY_BYTES_MAX`、`QUERY_TIMEOUT_MS`、`RESPONSE_BYTES_MAX`、`CANDIDATE_FRAGMENTS_MAX` 与 `SCAN_BYTES_MAX`。当前代码已声明表中全部 22 个常量。本段不提前定义表外行为。
 

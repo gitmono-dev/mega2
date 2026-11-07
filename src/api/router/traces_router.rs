@@ -48,12 +48,10 @@ pub async fn capabilities(
         .deployment_server_id()
         .ok_or_else(|| ApiError::from(MegaError::from(TracesError::Unauthenticated)))?
         .to_owned();
-    let body = trace_query_service::read_capabilities(
-        state.storage.mono_storage().get_connection(),
-        &server_id,
-    )
-    .await;
-    Ok(Json(body))
+    let index = state.storage.trace_search_index_service.state();
+    Ok(Json(trace_query_service::read_capabilities(
+        &server_id, &index,
+    )))
 }
 
 /// Locate one active registered target. Missing and unreadable paths are the same 404.
@@ -284,6 +282,17 @@ mod tests {
             .await
             .unwrap();
         assert!(bindings.is_empty(), "{bindings:?}");
+    }
+
+    #[tokio::test]
+    async fn capabilities_readiness_route_reports_the_process_index_state() {
+        let (app, _, _dir) = traces_app().await;
+        let (status, body) = get(app, "/traces/capabilities", Some("wide-secret")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["search_ready"], false);
+        assert_eq!(json["bounded_scan_supported"], false);
+        assert!(json["search_unavailable_reason"].is_string(), "{json}");
     }
 
     #[tokio::test]

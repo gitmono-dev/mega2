@@ -73,23 +73,27 @@ pub fn project_sessions(
     projected
 }
 
-pub async fn read_capabilities(
-    db: &sea_orm::DatabaseConnection,
+/// Capabilities for this process. Readiness comes from the process-derived
+/// index state, not a fresh catalog read. `/search` is not served by this
+/// build, so `search_ready` stays false with a stable reason even when the
+/// index itself is valid. MTR-20 removes that limit when it mounts `/search`.
+pub fn read_capabilities(
     server_id: &str,
+    index: &crate::jupiter::service::trace_search_index_service::IndexState,
 ) -> crate::api_model::traces::TracesCapabilities {
     use crate::{
         api_model::traces::TracesCapabilities,
-        jupiter::storage::trace_search_index_storage::{CatalogValidation, validate_catalog},
+        jupiter::service::trace_search_index_service::IndexState,
     };
-    let (ready, reason) = match validate_catalog(db).await {
-        Ok(CatalogValidation::Ready(_)) => (true, None),
-        Ok(CatalogValidation::Unavailable(failure)) => {
-            (false, Some(catalog_reason(&failure).to_owned()))
-        }
-        Err(_) => (false, Some("catalog_unreadable".to_owned())),
+    let reason = match index {
+        IndexState::Ready => SEARCH_NOT_SERVED,
+        IndexState::Unavailable(failure) => catalog_reason(failure),
     };
-    TracesCapabilities::project(server_id, ready, reason)
+    TracesCapabilities::project(server_id, false, Some(reason.to_owned()))
 }
+
+/// Stable reason while the search route is not mounted.
+pub const SEARCH_NOT_SERVED: &str = "search_not_served";
 
 fn catalog_reason(
     failure: &crate::jupiter::storage::trace_search_index_storage::CatalogFailure,
@@ -276,5 +280,27 @@ mod tests {
             .unwrap();
         assert_eq!(after.len(), before.len());
         assert_eq!(after[0].id, before[0].id);
+    }
+
+    #[test]
+    fn capabilities_readiness_never_advertises_unserved_search() {
+        use crate::jupiter::{
+            service::trace_search_index_service::IndexState,
+            storage::trace_search_index_storage::CatalogFailure,
+        };
+        let ready = super::read_capabilities("id", &IndexState::Ready);
+        assert!(!ready.search_ready);
+        assert!(!ready.bounded_scan_supported);
+        assert_eq!(
+            ready.search_unavailable_reason.as_deref(),
+            Some(super::SEARCH_NOT_SERVED)
+        );
+        let missing =
+            super::read_capabilities("id", &IndexState::Unavailable(CatalogFailure::Missing));
+        assert!(!missing.search_ready);
+        assert_eq!(
+            missing.search_unavailable_reason.as_deref(),
+            Some("index_missing")
+        );
     }
 }

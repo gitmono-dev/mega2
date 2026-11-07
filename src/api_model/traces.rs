@@ -101,7 +101,7 @@ impl TracesCapabilities {
             limits: TracesCapabilityLimits::from_protocol_limits(),
             search_ready,
             cjk_index_supported: false,
-            bounded_scan_supported: true,
+            bounded_scan_supported: false,
             search_unavailable_reason: if search_ready { None } else { reason },
         }
     }
