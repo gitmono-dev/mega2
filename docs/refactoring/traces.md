@@ -802,6 +802,8 @@ HTTP命令段与解压后的upload请求解析上限各64KiB、单ref receive；
 
 **MTR-51 manifest 资源完整性（不写库）：** 已解析且 manifest 含 `entries` 对象时，`ceres::traces::manifest` 核对已声明资源。分片 transcript 的 `parts` 按数组顺序读取，文件名后缀必须从 `.001` 连续递增；单 blob transcript 只有 `oid`、没有 `parts`。每个 part 的路径必须落在该 checkpoint tree 内，Git 类型为 blob，tree 条目 OID 与 manifest 一致，payload 长度等于 `byte_len`。分片长度之和必须等于 transcript 的 `byte_len`。`content_hash.txt` 是 `sha256:` 加 64 位十六进制（也接受无前缀的 64 位十六进制），覆盖顺序固定为 metadata、lifecycle_events、transcript、redaction_report 的原始字节；transcript 取按 part 顺序拼接的逻辑字节。已声明的 reasoning artifact，其 `sha256` 必须等于该 blob。任一不符把该 checkpoint 标为 invalid，稳定原因为 `part_order`、`part_path`、`part_oid`、`part_type`、`part_length`、`total_length` 或 `content_hash`。没有 `entries` 的 manifest 仍只做布局解析。原始归档与可见 membership 不删除。未知 schema 仍归 MTR-52，不在本检查里标 `unsupported`。
 
+**MTR-85 capabilities limits 续字段：** 同一个 `TracesCapabilityLimits` 还包含 `max_tree_depth`、`ingest_timeout_seconds`、`metadata_limit_default`、`search_limit_default`、`text_bytes_default`、`metadata_limit_max`、`search_limit_max`、`text_bytes_max`，全部只从 `TracesProtocolLimits` 逐字段投影，不接受 operator 配置覆盖。
+
 **MTR-84 capabilities limits：** `api_model::traces::TracesCapabilityLimits` 的 8 个字段只从 `TracesProtocolLimits` 逐字段投影，不读取 operator 配置。字段为 `max_object_bytes`、`max_metadata_bytes`、`max_manifest_bytes`、`max_pack_bytes`、`max_decoded_bytes`、`max_objects`、`max_new_commits`、`max_delta_depth`。`from_protocol_limits` 是这些字段的唯一生产 mapper。
 
 **MTR-53 筛选语义：** `agent` 只按 `metadata.agent_kind` 原值匹配，`code_commit` 只按 code 关联字符串匹配。`since` 与 `until` 必须是带时区的 RFC3339，正规化为 UTC，区间为 `[since, until)`，等值为空区间，反向区间拒绝。session 只要任一 checkpoint 命中就纳入，并按命中 checkpoint 的最大 `created_at` 排序，最新在前，同时间按 session_key 稳定排序。

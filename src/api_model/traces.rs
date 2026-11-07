@@ -17,6 +17,14 @@ pub struct TracesCapabilityLimits {
     pub max_objects: u64,
     pub max_new_commits: u64,
     pub max_delta_depth: u64,
+    pub max_tree_depth: u64,
+    pub ingest_timeout_seconds: u64,
+    pub metadata_limit_default: u64,
+    pub search_limit_default: u64,
+    pub text_bytes_default: u64,
+    pub metadata_limit_max: u64,
+    pub search_limit_max: u64,
+    pub text_bytes_max: u64,
 }
 
 impl TracesCapabilityLimits {
@@ -30,6 +38,14 @@ impl TracesCapabilityLimits {
             max_objects: TracesProtocolLimits::MAX_OBJECTS,
             max_new_commits: TracesProtocolLimits::MAX_NEW_COMMITS,
             max_delta_depth: TracesProtocolLimits::MAX_DELTA_DEPTH,
+            max_tree_depth: TracesProtocolLimits::MAX_TREE_DEPTH,
+            ingest_timeout_seconds: TracesProtocolLimits::INGEST_TIMEOUT_SECONDS,
+            metadata_limit_default: TracesProtocolLimits::METADATA_LIMIT_DEFAULT,
+            search_limit_default: TracesProtocolLimits::SEARCH_LIMIT_DEFAULT,
+            text_bytes_default: TracesProtocolLimits::TEXT_BYTES_DEFAULT,
+            metadata_limit_max: TracesProtocolLimits::METADATA_LIMIT_MAX,
+            search_limit_max: TracesProtocolLimits::SEARCH_LIMIT_MAX,
+            text_bytes_max: TracesProtocolLimits::TEXT_BYTES_MAX,
         }
     }
 }
@@ -215,6 +231,48 @@ mod tests {
         assert_eq!(json["max_objects"], 100_000);
         assert_eq!(json["max_new_commits"], 10_000);
         assert_eq!(json["max_delta_depth"], 64);
+        let decoded: TracesCapabilityLimits = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, limits);
+    }
+
+    #[test]
+    fn capability_limits_85_projects_timeout_and_limit_scalars() {
+        let limits = TracesCapabilityLimits::from_protocol_limits();
+        assert_eq!(limits.max_tree_depth, TracesProtocolLimits::MAX_TREE_DEPTH);
+        assert_eq!(
+            limits.ingest_timeout_seconds,
+            TracesProtocolLimits::INGEST_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            limits.metadata_limit_default,
+            TracesProtocolLimits::METADATA_LIMIT_DEFAULT
+        );
+        assert_eq!(
+            limits.search_limit_default,
+            TracesProtocolLimits::SEARCH_LIMIT_DEFAULT
+        );
+        assert_eq!(
+            limits.text_bytes_default,
+            TracesProtocolLimits::TEXT_BYTES_DEFAULT
+        );
+        assert_eq!(
+            limits.metadata_limit_max,
+            TracesProtocolLimits::METADATA_LIMIT_MAX
+        );
+        assert_eq!(
+            limits.search_limit_max,
+            TracesProtocolLimits::SEARCH_LIMIT_MAX
+        );
+        assert_eq!(limits.text_bytes_max, TracesProtocolLimits::TEXT_BYTES_MAX);
+        let json = serde_json::to_value(&limits).unwrap();
+        assert_eq!(json["max_tree_depth"], 64);
+        assert_eq!(json["ingest_timeout_seconds"], 300);
+        assert_eq!(json["metadata_limit_default"], 50);
+        assert_eq!(json["search_limit_default"], 20);
+        assert_eq!(json["text_bytes_default"], 16_384);
+        assert_eq!(json["metadata_limit_max"], 200);
+        assert_eq!(json["search_limit_max"], 100);
+        assert_eq!(json["text_bytes_max"], 131_072);
         let decoded: TracesCapabilityLimits = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, limits);
     }
