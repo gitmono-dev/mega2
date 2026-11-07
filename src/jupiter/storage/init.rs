@@ -195,6 +195,71 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn optional_gin_startup_succeeds_with_wrong_namespace() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        use crate::jupiter::storage::trace_search_index_storage::{
+            CatalogFailure, CatalogValidation, validate_catalog,
+        };
+
+        let (db, _guard) = crate::jupiter::tests::test_database_without_extensions()
+            .await
+            .expect("template0 database");
+        for sql in [
+            "CREATE SCHEMA wrong_trgm",
+            "CREATE EXTENSION pg_trgm WITH SCHEMA wrong_trgm VERSION '1.6'",
+        ] {
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                sql.to_owned(),
+            ))
+            .await
+            .expect("wrong-namespace fixture");
+        }
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .expect("ordinary migrations succeed with a wrong extension namespace");
+        assert_eq!(
+            validate_catalog(&db).await.expect("catalog probe"),
+            CatalogValidation::Unavailable(CatalogFailure::WrongNamespace)
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_gin_startup_migrations_never_create_gin() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        use crate::jupiter::storage::trace_search_index_storage::{
+            CatalogFailure, CatalogValidation, validate_catalog,
+        };
+
+        // With the trusted extension present, ordinary migrations still leave
+        // the GIN index absent: startup never issues index DDL, so a role that
+        // cannot create indexes is not a startup precondition.
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::jupiter::tests::test_db_connection(directory.path()).await;
+        for sql in [
+            "CREATE SCHEMA IF NOT EXISTS mega2_extensions AUTHORIZATION mega2_traces_ext_owner",
+            "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA mega2_extensions VERSION '1.6'",
+        ] {
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                sql.to_owned(),
+            ))
+            .await
+            .expect("trusted extension in this disposable database");
+        }
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .expect("ordinary migrations");
+        assert_eq!(
+            validate_catalog(&db).await.expect("catalog probe"),
+            CatalogValidation::Unavailable(CatalogFailure::Missing),
+            "migrations must not build the trace GIN index"
+        );
+    }
+
+    #[tokio::test]
     async fn database_connection_returns_error_for_invalid_config() {
         let config = DbConfig {
             db_type: "mysql".to_owned(),

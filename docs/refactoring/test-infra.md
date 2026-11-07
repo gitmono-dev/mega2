@@ -397,6 +397,14 @@ SSH 集成测试**禁止**在测试栈中新增 sshd 服务；唯一拓扑是 ca
 | 端口 | 探测 `127.0.0.1:0` 取 ephemeral 端口后立即启动 `--ssh-port` |
 | 清理 | SIGINT 停服务、回收 PID、删除临时 DB 与 `CASE/ssh` |
 
+## Trace GIN 延后建设
+
+MTR-71 的定向验收分两组：`gin_preconditions_`（缺扩展、错误 namespace、无建索引权限）与 `gin_ensure_`（建索引、双连接争用、operator 补装后重试、catalog 失效撤销旧 Ready）。权限拒绝用例用独立连接池，让所有会话以已有的扩展 owner 角色运行，验证服务自己的 `IndexState` 变成 `IndexPermissionDenied`，不创建、修改或删除任何集群角色。
+
+`gin_external_catalog_adoption_without_restart` 用另一条连接持表锁，让服务自己的建索引真实触发 30 秒 `lock_timeout`；随后用不符的 btree 索引验证不被采纳，再以 canonical DDL 替换，同一个服务实例在两个 60 秒周期后自动 Ready，整个用例不超过 180 秒。`deferred_gin_hook_releases_lease_on_shutdown` 也持表锁使建索引阻塞，确认停机后 lease 被释放且没有建出索引。
+
+无扩展的真实服务验收使用独立 `TEMPLATE template0` 数据库，启动真实 `mega2` 服务，先验证普通 Git，再推送 traces 并读取片段投影行。guard 只删除本例唯一命名的数据库，不删除共享扩展或角色。
+
 ## Trace GIN catalog
 
 MTR-74 的 `gin_catalog_` 与 `gin_trust_` 用例使用 `test_db_connection` 和真实 migration，在本例 schema 的 `trace_fragment` 上建索引。它们只更新本例索引的 `pg_index` 标志或 `indclass`，不 `DROP` 共享的 `pg_trgm`，也不改 `mega2_extensions`。扩展版本比较的是编译期常量 `1.6`。

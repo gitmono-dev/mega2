@@ -1,4 +1,8 @@
-**MTR-71 本地门禁（2026-11-07）：** GIN 建索引改为后台进行，不挡住普通启动。定向 9 项通过。全量 24 targets、3230 passed、0 failed、3 ignored。版本 `0.42.104`。签名提交、tag、Release 与 D 尚未取得，不记 done。
+**MTR-71 前滚修复本地门禁（2026-11-07）：** `v0.42.105` 后台 ensure 与建索引共用同一物理连接，lease 随连接关闭释放，阻塞后端取消时主动终止。定向 27 项通过，服务级权限拒绝验证 `IndexPermissionDenied`，VER-7 真实超时采纳 132.91 秒。无扩展真实服务 Git push 通过。最终树全量 24 targets、3246 passed/0 failed/3 ignored，fmt/strict clippy 0 warning。签名提交、tag、Release 与远端 D 尚未取得，不记 done。
+
+**历史 MTR-71 发布后更正（2026-11-07）：** `v0.42.104` 已发布；此前部分 AC/VER 勾选缺少真实场景证据，且连接池 session advisory lock 存在缺陷。已在日期计划撤回勾选并前滚修复，本段保留历史。
+
+**历史 MTR-71 本地门禁（2026-11-07）：** GIN 建索引改为后台进行，不挡住普通启动。定向 9 项通过。全量 24 targets、3230 passed、0 failed、3 ignored。版本 `0.42.104`。签名提交、tag、Release 与 D 尚未取得，不记 done。
 
 **MTR-74 前滚修复收口（2026-11-07）：** 部分 GIN 索引误判已前滚修复并发布 `v0.42.103`。签名提交 `e453dd666f5f8210c0a61c37f0c2d5870bd5cc2b`。main Harbor [42267724603](https://github.com/gitmono-dev/mega2/actions/runs/42267724603) 与 tag Docker [42267789474](https://github.com/gitmono-dev/mega2/actions/runs/42267789474) 均 success。Lifecycle 为 `done` / `complete`。`v0.42.102` 缺陷原件保留。
 

@@ -43,6 +43,8 @@ pub enum CatalogFailure {
     WrongNamespace,
     IndexPermissionDenied,
     BuildTimedOut,
+    /// The catalog or the build connection could not be read in this cycle.
+    CatalogUnreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,22 +479,33 @@ mod tests {
     #[tokio::test]
     async fn gin_preconditions_permission_denied() {
         let (_dir, db) = database().await;
-        let role = format!("gin_denied_{}", uuid::Uuid::new_v4().simple());
-        exec(&db, &format!("CREATE ROLE {role} NOLOGIN")).await;
-        exec(&db, &format!("GRANT {role} TO CURRENT_USER")).await;
-        exec(&db, &format!("SET ROLE {role}")).await;
-        let schema = quoted_current_schema(&db).await.unwrap();
-        let error = db
-            .execute_raw(Statement::from_string(
-                DatabaseBackend::Postgres,
-                canonical_index_ddl(&schema),
-            ))
+        // This database is owned by the test guard. Its public schema permits
+        // role access, but the extension owner does not own this test table.
+        // No cluster role or privilege is created, modified, or deleted.
+        exec(
+            &db,
+            "CREATE TABLE public.trace_fragment (ascii_fold text NOT NULL)",
+        )
+        .await;
+        let schema = "public";
+        let mut connection = db.get_postgres_connection_pool().acquire().await.unwrap();
+        connection.close_on_drop();
+        sea_orm::sqlx::query("SET ROLE mega2_traces_ext_owner")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let error = sea_orm::sqlx::query(sea_orm::sqlx::AssertSqlSafe(canonical_index_ddl(schema)))
+            .execute(&mut *connection)
             .await
             .unwrap_err();
-        exec(&db, "RESET ROLE").await;
-        exec(&db, &format!("DROP OWNED BY {role}")).await;
-        exec(&db, &format!("DROP ROLE {role}")).await;
-        assert!(format!("{error}").contains("permission denied"), "{error}");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("42501"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

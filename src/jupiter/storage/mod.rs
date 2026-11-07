@@ -196,6 +196,9 @@ pub struct Storage {
     pub storage_event_emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     pub notification_storage: notification_storage::NotificationStorage,
     pub(crate) view_runtime: Arc<ViewRuntime>,
+    /// Per-process GIN readiness shared with the background builder.
+    pub(crate) trace_search_index_service:
+        crate::jupiter::service::trace_search_index_service::TraceSearchIndexService,
     /// Shared authorization snapshot holder (ADR-UN-02). Injected by
     /// `AppContext`; the same `Arc` is shared with the HTTP state so the write
     /// path (notify) and read path (guard/push) observe the same instance.
@@ -413,6 +416,10 @@ impl Storage {
             storage_event_emitter,
             notification_storage,
             view_runtime,
+            trace_search_index_service:
+                crate::jupiter::service::trace_search_index_service::TraceSearchIndexService::new(
+                    connection.as_ref().clone(),
+                ),
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
         };
@@ -426,6 +433,13 @@ impl Storage {
 
     pub fn config_handle(&self) -> ConfigHandle {
         self.config_handle.clone()
+    }
+
+    /// Current process-local GIN readiness maintained by the background service.
+    pub(crate) fn trace_search_index_state(
+        &self,
+    ) -> crate::jupiter::service::trace_search_index_service::IndexState {
+        self.trace_search_index_service.state()
     }
 
     /// Shared authorization snapshot holder (ADR-UN-02). Returns the same `Arc`
@@ -807,6 +821,10 @@ impl Storage {
                 crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
             view_runtime,
+            trace_search_index_service:
+                crate::jupiter::service::trace_search_index_service::TraceSearchIndexService::new(
+                    DatabaseConnection::default(),
+                ),
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
         }

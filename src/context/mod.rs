@@ -298,16 +298,10 @@ impl AppContext {
                     ),
                 )
                 .spawn_background(notification_shutdown.clone());
-                crate::jupiter::service::trace_search_index_service::TraceSearchIndexService::new(
-                    storage
-                        .mono_service
-                        .mono_storage
-                        .base
-                        .connection
-                        .as_ref()
-                        .clone(),
-                )
-                .spawn_background(notification_shutdown.clone());
+                storage
+                    .trace_search_index_service
+                    .clone()
+                    .spawn_background(notification_shutdown.clone());
             }
 
             Ok::<(ConnectionManager, CancellationToken), MegaError>((
@@ -683,6 +677,118 @@ mod tests {
             service.state(),
             crate::jupiter::service::trace_search_index_service::IndexState::Unavailable(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn deferred_gin_hook_releases_lease_on_shutdown() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, sqlx};
+
+        use crate::jupiter::{
+            service::trace_search_index_service::{IndexState, TraceSearchIndexService},
+            storage::trace_search_index_storage::{
+                CatalogFailure, CatalogValidation, validate_catalog,
+            },
+        };
+
+        async fn granted_leases(db: &sea_orm::DatabaseConnection) -> i64 {
+            db.query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT count(*)::bigint AS n FROM pg_catalog.pg_locks l
+                 JOIN pg_catalog.pg_database d ON d.oid = l.database
+                 WHERE l.locktype = 'advisory' AND l.granted
+                   AND d.datname = current_database()"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::jupiter::tests::test_db_connection(directory.path()).await;
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .unwrap();
+        // Trusted extension inside this disposable database only.
+        for sql in [
+            "CREATE SCHEMA IF NOT EXISTS mega2_extensions AUTHORIZATION mega2_traces_ext_owner",
+            "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA mega2_extensions VERSION '1.6'",
+        ] {
+            db.execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                sql.to_owned(),
+            ))
+            .await
+            .unwrap();
+        }
+        // A conflicting table lock keeps the concurrent build waiting on the
+        // server after the service has taken its lease.
+        let mut holder = db.get_postgres_connection_pool().acquire().await.unwrap();
+        holder.close_on_drop();
+        sqlx::query("BEGIN").execute(&mut *holder).await.unwrap();
+        sqlx::query("LOCK TABLE trace_fragment IN SHARE UPDATE EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let service = TraceSearchIndexService::new(db.clone());
+        let shutdown = CancellationToken::new();
+        service.clone().spawn_background(shutdown.clone());
+        let held = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while granted_leases(&db).await == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(held.is_ok(), "background cycle must take the lease");
+
+        shutdown.cancel();
+        let released = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while granted_leases(&db).await != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        sqlx::query("ROLLBACK").execute(&mut *holder).await.unwrap();
+        drop(holder);
+        assert!(
+            released.is_ok(),
+            "shutdown must release the lease while the build is blocked"
+        );
+        assert_ne!(service.state(), IndexState::Ready);
+        // The terminated build never created the index.
+        assert_eq!(
+            validate_catalog(&db).await.unwrap(),
+            CatalogValidation::Unavailable(CatalogFailure::Missing)
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_gin_hook_shares_status_with_storage_clones() {
+        use crate::jupiter::{
+            service::trace_search_index_service::IndexState,
+            storage::trace_search_index_storage::CatalogFailure,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = test_storage(directory.path()).await;
+        let reader = storage.clone();
+        assert_eq!(
+            reader.trace_search_index_state(),
+            IndexState::Unavailable(CatalogFailure::Missing)
+        );
+        let observed = storage
+            .trace_search_index_service
+            .ensure_once()
+            .await
+            .unwrap();
+        assert_eq!(
+            observed,
+            IndexState::Unavailable(CatalogFailure::ExtensionMissing)
+        );
+        assert_eq!(reader.trace_search_index_state(), observed);
     }
 
     #[test]

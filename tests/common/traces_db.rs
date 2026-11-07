@@ -17,8 +17,8 @@ use url::Url;
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub struct TracesDb {
-    admin_url: String,
-    name: String,
+    pub(super) admin_url: String,
+    pub(super) name: String,
 }
 
 impl TracesDb {

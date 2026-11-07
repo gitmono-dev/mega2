@@ -96,12 +96,22 @@ mod tests {
         },
     };
 
-    #[tokio::test]
-    async fn fragment_index_version_rebuild_keeps_raw_bytes() {
+    /// A stream whose single supported checkpoint journal row is already indexed.
+    struct IndexedStream {
+        _directory: tempfile::TempDir,
+        _store_dir: tempfile::TempDir,
+        db: sea_orm::DatabaseConnection,
+        objects: TraceObjectService,
+        fixture: Fixture,
+        stream_id: String,
+        commit: String,
+    }
+
+    async fn indexed_stream() -> IndexedStream {
         let directory = tempfile::tempdir().unwrap();
         let db = test_db_connection(directory.path()).await;
         apply_migrations(&db, true).await.unwrap();
-        let (_store_dir, store) = local_store().await;
+        let (store_dir, store) = local_store().await;
         let objects = TraceObjectService::new(store);
         let mut fixture = Fixture::new(HashKind::Sha1);
         let metadata = br#"{"schema_version":2,"checkpoint_id":"abcd","agent_kind":"claude_code","created_at":1700000000}"#;
@@ -218,6 +228,29 @@ mod tests {
         .unwrap();
         let worker = TraceIndexWorker::new(db.clone(), objects.clone());
         assert_eq!(worker.index_once().await.unwrap(), 1);
+        IndexedStream {
+            _directory: directory,
+            _store_dir: store_dir,
+            db,
+            objects,
+            fixture,
+            stream_id,
+            commit,
+        }
+    }
+
+    #[tokio::test]
+    async fn fragment_index_version_rebuild_keeps_raw_bytes() {
+        let IndexedStream {
+            _directory,
+            _store_dir,
+            db,
+            objects,
+            fixture,
+            stream_id,
+            commit,
+        } = indexed_stream().await;
+        let worker = TraceIndexWorker::new(db.clone(), objects.clone());
         let mut before = BTreeMap::new();
         for (oid, _kind, bytes) in &fixture.objects {
             let stored = objects.get_raw(&stream_id, "sha1", oid).await.unwrap();
@@ -254,14 +287,38 @@ mod tests {
 
     #[tokio::test]
     async fn gin_independent_watermark_does_not_mark_search_ready() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = test_db_connection(directory.path()).await;
-        apply_migrations(&db, true).await.unwrap();
-        let service =
-            crate::jupiter::service::trace_search_index_service::TraceSearchIndexService::new(db);
-        assert!(matches!(
-            service.state(),
-            crate::jupiter::service::trace_search_index_service::IndexState::Unavailable(_)
-        ));
+        use crate::jupiter::{
+            service::trace_search_index_service::{IndexState, TraceSearchIndexService},
+            storage::trace_search_index_storage::CatalogFailure,
+        };
+
+        let IndexedStream {
+            _directory,
+            _store_dir,
+            db,
+            stream_id,
+            ..
+        } = indexed_stream().await;
+        // The journal watermark has caught up and fragments exist.
+        let pending = trace_ref_update::Entity::find()
+            .filter(trace_ref_update::Column::StreamId.eq(stream_id.clone()))
+            .all(&db)
+            .await
+            .unwrap();
+        assert!(!pending.is_empty());
+        assert!(pending.iter().all(|row| row.state == "indexed"));
+        let fragments = trace_fragment::Entity::find()
+            .filter(trace_fragment::Column::StreamId.eq(stream_id))
+            .all(&db)
+            .await
+            .unwrap();
+        assert!(!fragments.is_empty());
+        // This cloned test database has no pg_trgm, so search stays unavailable.
+        let service = TraceSearchIndexService::new(db);
+        assert_eq!(
+            service.ensure_once().await.unwrap(),
+            IndexState::Unavailable(CatalogFailure::ExtensionMissing)
+        );
+        assert_ne!(service.state(), IndexState::Ready);
     }
 }

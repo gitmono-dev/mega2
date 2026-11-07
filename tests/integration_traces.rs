@@ -5455,12 +5455,28 @@ mod disabled_http {
     }
 
     // MTR-16: a real push of a multi-part UTF-8 transcript is sliced by the service.
-    pub async fn run_fragment_projection() {
-        let (guard, db) = traces_db::TracesDb::migrated().await;
+    pub async fn run_fragment_projection(without_extension: bool) {
+        let (guard, db) = if without_extension {
+            super::no_extension_database().await
+        } else {
+            traces_db::TracesDb::migrated().await
+        };
         let mut fixture = None;
         let result = AssertUnwindSafe(async {
             fixture = Some(ScopeAuthFixture::new(&db).await);
             let f = fixture.as_mut().expect("fragment fixture");
+            if without_extension {
+                let extension = db.query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT extname FROM pg_catalog.pg_extension WHERE extname = 'pg_trgm'".to_owned(),
+                )).await.expect("query extension");
+                assert!(extension.is_none(), "fixture must not contain pg_trgm");
+                f.fixture.start(false, "trunk", "/third-party").await;
+                let code_url = git_cli::mega2_http_url(f.fixture.port, "/.git");
+                let output = git_cli::git_cli_no_auth(f.fixture.shared.path(), &["ls-remote", &code_url]);
+                assert!(output.status.success(), "ordinary Git discovery without pg_trgm: {}", String::from_utf8_lossy(&output.stderr));
+                f.fixture.stop();
+            }
             let key = f.key(SCOPE_WRITER).await;
             let name = format!("trace-ssh-key:{}", key.id);
             let _token = f.static_token(&name, "/project");
@@ -13349,11 +13365,10 @@ async fn projection_worker_projects_real_push_and_resumes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fragment_projection_splits_utf8_parts() {
-    disabled_http::run_fragment_projection().await;
+    disabled_http::run_fragment_projection(false).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gin_optional_startup_keeps_code_and_traces_without_extension() {
+async fn no_extension_database() -> (traces_db::TracesDb, sea_orm::DatabaseConnection) {
     let admin_url = std::env::var("MEGA2_IT_DB_ADMIN_URL").expect("MEGA2_IT_DB_ADMIN_URL");
     let name = format!(
         "traces_noext_{}_{}",
@@ -13369,8 +13384,14 @@ async fn gin_optional_startup_keeps_code_and_traces_without_extension() {
             format!("CREATE DATABASE {name} TEMPLATE template0"),
         ))
         .await
-        .expect("template0 database");
-    let _ = admin.close().await;
+        .expect("create unique template0 database");
+    // Construct the owned guard immediately after creation so failures during
+    // setup still remove only this test's uniquely named database.
+    let guard = traces_db::TracesDb {
+        admin_url: admin_url.clone(),
+        name: name.clone(),
+    };
+    admin.close().await.expect("close admin");
     let mut parsed = url::Url::parse(&admin_url).expect("admin url");
     parsed.set_path(&name);
     let db = sea_orm::Database::connect(parsed.as_str())
@@ -13379,28 +13400,12 @@ async fn gin_optional_startup_keeps_code_and_traces_without_extension() {
     mega2_core::traces_migration_ops::apply_migrations(&db, true)
         .await
         .expect("migrations without pg_trgm");
-    let guard = name;
-    let extension: Option<String> = db
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "SELECT extname FROM pg_catalog.pg_extension WHERE extname = 'pg_trgm'".to_owned(),
-        ))
-        .await
-        .expect("extension query")
-        .and_then(|row| row.try_get("", "extname").ok());
-    assert!(extension.is_none());
-    let _ = db.close().await;
-    let admin = sea_orm::Database::connect(admin_url.as_str())
-        .await
-        .expect("admin cleanup");
-    admin
-        .execute_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            format!("DROP DATABASE IF EXISTS {guard}"),
-        ))
-        .await
-        .expect("drop no-extension database");
-    let _ = admin.close().await;
+    (guard, db)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gin_optional_startup_keeps_code_and_traces_without_extension() {
+    disabled_http::run_fragment_projection(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

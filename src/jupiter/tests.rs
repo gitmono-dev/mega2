@@ -995,6 +995,10 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
             crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         notification_storage: NotificationStorage::new(connection.clone()),
         view_runtime,
+        trace_search_index_service:
+            crate::jupiter::service::trace_search_index_service::TraceSearchIndexService::new(
+                connection.as_ref().clone(),
+            ),
         entity_store: Arc::new(SharedEntityStore::default()),
         vault: None,
     }
