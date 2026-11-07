@@ -29,7 +29,10 @@ use crate::{
         protocol::{ServiceType, SmartSession, TransportProtocol, smart, v2},
         traces::{
             admission::TRACE_REQUEST_CAPACITY,
-            auth::{PublishAuthority, TracesCaller},
+            auth::{
+                PublishAuthority, TracesAction, TracesAuthDecision, TracesAuthRequest,
+                TracesCaller, authorize_traces,
+            },
             checkpoint_history::validate_checkpoint_history,
             ingest::decode_wire_pack,
             pack_encode::RawPackStream,
@@ -339,6 +342,39 @@ impl TraceHttpAuth {
                 snapshot: self.snapshot.as_deref(),
             },
         }
+    }
+}
+
+/// Authenticate a traces read API caller with the same credentials as traces Git.
+pub(crate) async fn authenticate_trace_api(
+    state: &ProtocolApiState,
+    headers: &http::HeaderMap,
+) -> Result<(), MegaError> {
+    trace_http_auth(state, headers).await.map(|_| ())
+}
+
+/// Read decision for a traces read API path. The credential must have an
+/// active traces binding; unknown and unreadable targets are the same 404.
+pub(crate) async fn authorize_trace_api_read(
+    state: &ProtocolApiState,
+    headers: &http::HeaderMap,
+    canonical_target_path: &str,
+) -> Result<String, MegaError> {
+    let auth = trace_http_auth(state, headers).await?;
+    match authorize_traces(
+        state.storage.mono_storage().get_connection(),
+        &TracesAuthRequest {
+            caller: auth.caller(),
+            action: TracesAction::Read,
+            canonical_target_path,
+            commit_author: None,
+        },
+    )
+    .await?
+    {
+        TracesAuthDecision::Allow { principal_id } => Ok(principal_id),
+        TracesAuthDecision::Unauthenticated => Err(TracesError::Unauthenticated.into()),
+        TracesAuthDecision::NotFound => Err(TracesError::UnknownScope.into()),
     }
 }
 

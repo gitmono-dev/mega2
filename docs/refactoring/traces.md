@@ -802,9 +802,9 @@ HTTP命令段与解压后的upload请求解析上限各64KiB、单ref receive；
 
 **MTR-51 manifest 资源完整性（不写库）：** 已解析且 manifest 含 `entries` 对象时，`ceres::traces::manifest` 核对已声明资源。分片 transcript 的 `parts` 按数组顺序读取，文件名后缀必须从 `.001` 连续递增；单 blob transcript 只有 `oid`、没有 `parts`。每个 part 的路径必须落在该 checkpoint tree 内，Git 类型为 blob，tree 条目 OID 与 manifest 一致，payload 长度等于 `byte_len`。分片长度之和必须等于 transcript 的 `byte_len`。`content_hash.txt` 是 `sha256:` 加 64 位十六进制（也接受无前缀的 64 位十六进制），覆盖顺序固定为 metadata、lifecycle_events、transcript、redaction_report 的原始字节；transcript 取按 part 顺序拼接的逻辑字节。已声明的 reasoning artifact，其 `sha256` 必须等于该 blob。任一不符把该 checkpoint 标为 invalid，稳定原因为 `part_order`、`part_path`、`part_oid`、`part_type`、`part_length`、`total_length` 或 `content_hash`。没有 `entries` 的 manifest 仍只做布局解析。原始归档与可见 membership 不删除。未知 schema 仍归 MTR-52，不在本检查里标 `unsupported`。
 
-**MTR-88 target 定位：** `GET /api/v1/traces/targets/resolve?path=` 只返回已登记且调用者可读的 active target。未知路径和无读权限都是 404 `unknown_scope`，未认证是 401。这个接口不创建 `trace_target` 行。
+**MTR-88 target 定位：** `GET /api/v1/traces/targets/resolve?path=` 只返回已登记且调用者可读的 active target。读权限走与 traces Git 相同的 `authorize_traces` Read 判定，凭据必须有 active 的 `trace_credential_binding`；没有绑定的凭据与无权限一样返回 404。未知路径和无读权限都是 404 `unknown_scope`，未认证是 401。这个接口不创建 `trace_target` 行。
 
-**MTR-34 capabilities 接口：** `GET /api/v1/traces/capabilities` 只在 `[traces].enabled` 时挂载，并且必须出示已配置的 push token。响应的 `protocol` 是 `libra-traces/v1`，`server_id` 是配置里的部署 UUID。`git_transports` 固定为 `http` 与 `ssh`，`object_formats` 固定为 `sha1` 与 `sha256`。`limits` 只调用 `TracesCapabilityLimits::from_protocol_limits`，不另写默认值。搜索未就绪时 `search_ready` 为 false，并带稳定的 `search_unavailable_reason`。
+**MTR-34 capabilities 接口：** `GET /api/v1/traces/capabilities` 只在 `[traces].enabled` 时挂载，认证方式与 traces Git HTTP 相同：`push_auth=token` 时是已配置的 push token，否则是 Mono access token；只要求认证，不核对 traces 主体绑定。响应的 `protocol` 是 `libra-traces/v1`，`server_id` 是配置里的部署 UUID。`git_transports` 固定为 `http` 与 `ssh`，`object_formats` 固定为 `sha1` 与 `sha256`。`limits` 只调用 `TracesCapabilityLimits::from_protocol_limits`，不另写默认值。搜索能力标志的已知偏差由 FIX-MTR-31 前滚修复，不能以当前响应声称 `/search` 已可用。
 
 **MTR-86 capabilities limits 查询与扫描字段：** 同一个 `TracesCapabilityLimits` 还包含 `query_bytes_min`、`query_bytes_max`、`response_bytes_max`、`candidate_fragments_max`、`scan_bytes_max`、`query_timeout_ms`，全部只从 `TracesProtocolLimits` 逐字段投影，不接受 operator 配置覆盖。
 
