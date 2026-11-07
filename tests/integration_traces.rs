@@ -7764,11 +7764,17 @@ mod disabled_http {
     async fn wait_for_trace_indexed(db: &sea_orm::DatabaseConnection, stream_id: &str) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
+            let total = scalar(db, &format!(
+                "SELECT count(*)::text AS value FROM trace_ref_update WHERE stream_id = '{stream_id}'"
+            ))
+            .await;
             let pending = scalar(db, &format!(
                 "SELECT count(*)::text AS value FROM trace_ref_update WHERE stream_id = '{stream_id}' AND state <> 'indexed'"
             ))
             .await;
-            if pending == "0" {
+            // An empty result can mean publication has not inserted the journal
+            // yet. Waiting only for zero pending rows would then return early.
+            if total != "0" && pending == "0" {
                 break;
             }
             assert!(
