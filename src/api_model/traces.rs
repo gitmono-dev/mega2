@@ -25,6 +25,12 @@ pub struct TracesCapabilityLimits {
     pub metadata_limit_max: u64,
     pub search_limit_max: u64,
     pub text_bytes_max: u64,
+    pub query_bytes_min: u64,
+    pub query_bytes_max: u64,
+    pub response_bytes_max: u64,
+    pub candidate_fragments_max: u64,
+    pub scan_bytes_max: u64,
+    pub query_timeout_ms: u64,
 }
 
 impl TracesCapabilityLimits {
@@ -46,6 +52,12 @@ impl TracesCapabilityLimits {
             metadata_limit_max: TracesProtocolLimits::METADATA_LIMIT_MAX,
             search_limit_max: TracesProtocolLimits::SEARCH_LIMIT_MAX,
             text_bytes_max: TracesProtocolLimits::TEXT_BYTES_MAX,
+            query_bytes_min: TracesProtocolLimits::QUERY_BYTES_MIN,
+            query_bytes_max: TracesProtocolLimits::QUERY_BYTES_MAX,
+            response_bytes_max: TracesProtocolLimits::RESPONSE_BYTES_MAX,
+            candidate_fragments_max: TracesProtocolLimits::CANDIDATE_FRAGMENTS_MAX,
+            scan_bytes_max: TracesProtocolLimits::SCAN_BYTES_MAX,
+            query_timeout_ms: TracesProtocolLimits::QUERY_TIMEOUT_MS,
         }
     }
 }
@@ -273,6 +285,41 @@ mod tests {
         assert_eq!(json["metadata_limit_max"], 200);
         assert_eq!(json["search_limit_max"], 100);
         assert_eq!(json["text_bytes_max"], 131_072);
+        let decoded: TracesCapabilityLimits = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, limits);
+    }
+
+    #[test]
+    fn capability_limits_86_projects_query_and_scan_scalars() {
+        let limits = TracesCapabilityLimits::from_protocol_limits();
+        assert_eq!(
+            limits.query_bytes_min,
+            TracesProtocolLimits::QUERY_BYTES_MIN
+        );
+        assert_eq!(
+            limits.query_bytes_max,
+            TracesProtocolLimits::QUERY_BYTES_MAX
+        );
+        assert_eq!(
+            limits.response_bytes_max,
+            TracesProtocolLimits::RESPONSE_BYTES_MAX
+        );
+        assert_eq!(
+            limits.candidate_fragments_max,
+            TracesProtocolLimits::CANDIDATE_FRAGMENTS_MAX
+        );
+        assert_eq!(limits.scan_bytes_max, TracesProtocolLimits::SCAN_BYTES_MAX);
+        assert_eq!(
+            limits.query_timeout_ms,
+            TracesProtocolLimits::QUERY_TIMEOUT_MS
+        );
+        let json = serde_json::to_value(&limits).unwrap();
+        assert_eq!(json["query_bytes_min"], 1);
+        assert_eq!(json["query_bytes_max"], 256);
+        assert_eq!(json["response_bytes_max"], 1_048_576);
+        assert_eq!(json["candidate_fragments_max"], 2_000);
+        assert_eq!(json["scan_bytes_max"], 8_388_608);
+        assert_eq!(json["query_timeout_ms"], 2_000);
         let decoded: TracesCapabilityLimits = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, limits);
     }
