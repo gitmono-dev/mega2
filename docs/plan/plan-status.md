@@ -729,7 +729,7 @@ Libra独立来源修复候选：`docs/development/plan/plan-20261025-qualificati
 
 # 计划执行状况总表（plan-status.md）
 
-2026-11-08：FIX-MTR-30（`v0.42.114`，Harbor 42411151814，Docker 42411172631）与 FIX-MTR-31（`v0.42.115`，提交 `f3b718a`，Harbor 42417267334，Docker 42417283677）已 done/complete。FIX-MTR-32（定位参数稳定错误）仍 pending，完成后才实施 MTR-55。MTR-34/MTR-88 的既有版本和远端事实保留；认证与搜索就绪缺口已前滚，参数错误缺口仍未关闭。
+2026-11-08：FIX-MTR-30（`v0.42.114`）、FIX-MTR-31（`v0.42.115`，Harbor 42417267334，Docker 42417283677）与 FIX-MTR-32（`v0.42.116`，提交 `b16e818`，Harbor 42423991167，Docker 42424007978）已 done/complete。下一张是 MTR-55。MTR-34/MTR-88 的既有版本和远端事实保留；认证、搜索就绪与参数错误缺口均已前滚。
 
 > **现行执行前沿（原8文档正式写入：2026-10-22 21:00:20 UTC；非本次新采纳或评审PASS时间）：Libra选定f966来源资格限域接受，FIX06的8AC/8VER与canonical采纳仍待本轮共同H0。** 新恢复方案84664/exit0/chunk8f6dc7真实Claude与隔离Codex双PASS后，actual52474/exit0/chunkac9169完成原network3通过/0ignored/0重试、42条命令全部exit0且owned清理为空；新各boundary源码inventory与VCS身份一致。仅具名继承旧fmt/strict clippy/product CLI build、15focused及full10757最终通过/21原ignored/1flaky；不把旧22040/31114 STOP、missing终态、迁移者UNKNOWN或非连续审计改写成通过。root终态 `/tmp/libra_f966_cwd_recovery_actual_after31114_20261023/root-terminal.json` SHA256 `3fb07e4b14bb915b6dbf1de6cbcb5e75f3f9656e33d94f972ea4f3456ad8c77d`绑定本地430b1cae/上游f966548/版本0.30.86。inner185.297950秒不是最终预算记账；outer188.596712秒加1秒launcher余量扣190，7200累计6107、剩余1093秒（不是1097），无自动新尝试授权。H0尚未PASS；FIX06批量实现、新A/B、自身ER05及完整C/D未完成，LTR卡未完成，13笔本地文档不得提前push。以下旧“当前/待资格/运行中”等段均按各自时点保留。 原实际写入由 `/tmp/fix06_H0_governance_apply_actual_20261023/receipt.json` SHA256 `6dd403e4bbd18ecbd6ba2c920d691dc18ef2e0a2533982aef6ef4b5bb56fcb0f`绑定；此前20:59:30为候选生成时间，H0 R1 actual81582/exit1/chunk061e55为Claude FAIL/Codex PASS，此次仅订正登记，仍待复审。
 
