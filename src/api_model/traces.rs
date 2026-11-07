@@ -1,6 +1,38 @@
 //! Wire filter for session and checkpoint capture queries (MTR-53).
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::config::TracesProtocolLimits;
+
+/// Fixed protocol budget fields for the capabilities response (MTR-84).
+/// These values come only from `TracesProtocolLimits`, never from operator TOML.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TracesCapabilityLimits {
+    pub max_object_bytes: u64,
+    pub max_metadata_bytes: u64,
+    pub max_manifest_bytes: u64,
+    pub max_pack_bytes: u64,
+    pub max_decoded_bytes: u64,
+    pub max_objects: u64,
+    pub max_new_commits: u64,
+    pub max_delta_depth: u64,
+}
+
+impl TracesCapabilityLimits {
+    pub fn from_protocol_limits() -> Self {
+        Self {
+            max_object_bytes: TracesProtocolLimits::MAX_OBJECT_BYTES,
+            max_metadata_bytes: TracesProtocolLimits::MAX_METADATA_BYTES,
+            max_manifest_bytes: TracesProtocolLimits::MAX_MANIFEST_BYTES,
+            max_pack_bytes: TracesProtocolLimits::MAX_PACK_BYTES,
+            max_decoded_bytes: TracesProtocolLimits::MAX_DECODED_BYTES,
+            max_objects: TracesProtocolLimits::MAX_OBJECTS,
+            max_new_commits: TracesProtocolLimits::MAX_NEW_COMMITS,
+            max_delta_depth: TracesProtocolLimits::MAX_DELTA_DEPTH,
+        }
+    }
+}
 
 /// Errors returned when the wire filter itself is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,5 +175,47 @@ mod tests {
         )
         .unwrap();
         assert!(!empty.window.contains(Utc::now()));
+    }
+
+    #[test]
+    fn capability_limits_84_projects_every_protocol_scalar() {
+        let limits = TracesCapabilityLimits::from_protocol_limits();
+        assert_eq!(
+            limits.max_object_bytes,
+            TracesProtocolLimits::MAX_OBJECT_BYTES
+        );
+        assert_eq!(
+            limits.max_metadata_bytes,
+            TracesProtocolLimits::MAX_METADATA_BYTES
+        );
+        assert_eq!(
+            limits.max_manifest_bytes,
+            TracesProtocolLimits::MAX_MANIFEST_BYTES
+        );
+        assert_eq!(limits.max_pack_bytes, TracesProtocolLimits::MAX_PACK_BYTES);
+        assert_eq!(
+            limits.max_decoded_bytes,
+            TracesProtocolLimits::MAX_DECODED_BYTES
+        );
+        assert_eq!(limits.max_objects, TracesProtocolLimits::MAX_OBJECTS);
+        assert_eq!(
+            limits.max_new_commits,
+            TracesProtocolLimits::MAX_NEW_COMMITS
+        );
+        assert_eq!(
+            limits.max_delta_depth,
+            TracesProtocolLimits::MAX_DELTA_DEPTH
+        );
+        let json = serde_json::to_value(&limits).unwrap();
+        assert_eq!(json["max_object_bytes"], 67_108_864);
+        assert_eq!(json["max_metadata_bytes"], 1_048_576);
+        assert_eq!(json["max_manifest_bytes"], 1_048_576);
+        assert_eq!(json["max_pack_bytes"], 536_870_912);
+        assert_eq!(json["max_decoded_bytes"], 1_073_741_824);
+        assert_eq!(json["max_objects"], 100_000);
+        assert_eq!(json["max_new_commits"], 10_000);
+        assert_eq!(json["max_delta_depth"], 64);
+        let decoded: TracesCapabilityLimits = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, limits);
     }
 }
