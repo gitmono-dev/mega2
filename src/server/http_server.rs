@@ -28,7 +28,7 @@ use crate::{
         api_doc::ApiDoc,
         api_router::{self},
         oauth::{api_store::BrowserSessionStore, website_session_store::WebsiteSessionStore},
-        router::{lfs_router, oci_router, snapshot_router},
+        router::{lfs_router, oci_router, snapshot_router, traces_router},
     },
     ceres::{
         api_service::{cache::GitObjectCache, state::ProtocolApiState},
@@ -928,7 +928,7 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
             .merge(lfs_router::routers().with_state(api_state.clone()))
             .nest(
                 "/api/v1",
-                api_router::routers()
+                with_traces(api_router::routers(), config.as_ref())
                     .with_state(api_state.clone())
                     .route_layer(middleware::from_fn_with_state(
                         api_state.clone(),
@@ -992,7 +992,37 @@ pub(crate) fn mount_views(config: &Config) -> bool {
 }
 
 pub(crate) fn storage_only_api_v1(config: &Config) -> OpenApiRouter<MonoApiServiceState> {
-    api_router::storage_only_routers_with_views(mount_agent_capture(config), mount_views(config))
+    with_traces(
+        api_router::storage_only_routers_with_views(
+            mount_agent_capture(config),
+            mount_views(config),
+        ),
+        config,
+    )
+}
+
+fn with_traces(
+    router: OpenApiRouter<MonoApiServiceState>,
+    config: &Config,
+) -> OpenApiRouter<MonoApiServiceState> {
+    if config.traces.enabled {
+        router.merge(traces_router::routers())
+    } else {
+        router
+    }
+}
+
+/// OpenAPI for the storage-only surface plus the traces capabilities route.
+pub(crate) fn storage_only_openapi_doc_with_traces() -> utoipa::openapi::OpenApi {
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .merge(lfs_router::routers())
+        .nest(
+            "/api/v1",
+            api_router::storage_only_routers_with_views(false, false)
+                .merge(traces_router::routers()),
+        )
+        .split_for_parts()
+        .1
 }
 
 pub(crate) fn storage_only_openapi_doc(

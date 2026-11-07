@@ -2,12 +2,15 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::config::TracesProtocolLimits;
 
+pub const TRACES_PROTOCOL_ID: &str = "libra-traces/v1";
+
 /// Fixed protocol budget fields for the capabilities response (MTR-84).
 /// These values come only from `TracesProtocolLimits`, never from operator TOML.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TracesCapabilityLimits {
     pub max_object_bytes: u64,
     pub max_metadata_bytes: u64,
@@ -58,6 +61,48 @@ impl TracesCapabilityLimits {
             candidate_fragments_max: TracesProtocolLimits::CANDIDATE_FRAGMENTS_MAX,
             scan_bytes_max: TracesProtocolLimits::SCAN_BYTES_MAX,
             query_timeout_ms: TracesProtocolLimits::QUERY_TIMEOUT_MS,
+        }
+    }
+}
+
+/// Authenticated `GET /api/v1/traces/capabilities` body (MTR-34).
+/// `limits` is only `TracesCapabilityLimits::from_protocol_limits`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TracesCapabilities {
+    pub protocol: String,
+    pub server_id: String,
+    pub git_transports: Vec<String>,
+    pub object_formats: Vec<String>,
+    pub api_version: String,
+    pub schema_version: u64,
+    pub index_version: u64,
+    pub limits: TracesCapabilityLimits,
+    pub search_ready: bool,
+    pub cjk_index_supported: bool,
+    pub bounded_scan_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_unavailable_reason: Option<String>,
+}
+
+impl TracesCapabilities {
+    pub fn project(
+        server_id: impl Into<String>,
+        search_ready: bool,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            protocol: TRACES_PROTOCOL_ID.to_owned(),
+            server_id: server_id.into(),
+            git_transports: vec!["http".to_owned(), "ssh".to_owned()],
+            object_formats: vec!["sha1".to_owned(), "sha256".to_owned()],
+            api_version: "v1".to_owned(),
+            schema_version: 1,
+            index_version: 1,
+            limits: TracesCapabilityLimits::from_protocol_limits(),
+            search_ready,
+            cjk_index_supported: false,
+            bounded_scan_supported: true,
+            search_unavailable_reason: if search_ready { None } else { reason },
         }
     }
 }
@@ -322,5 +367,48 @@ mod tests {
         assert_eq!(json["query_timeout_ms"], 2_000);
         let decoded: TracesCapabilityLimits = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, limits);
+    }
+
+    #[test]
+    fn capabilities_limits_wire_uses_the_protocol_mapper_and_openapi_schema() {
+        let projected = TracesCapabilities::project(
+            "11111111-1111-4111-8111-111111111111",
+            false,
+            Some("index_missing".to_owned()),
+        );
+        assert_eq!(projected.protocol, TRACES_PROTOCOL_ID);
+        assert_eq!(
+            projected.limits,
+            TracesCapabilityLimits::from_protocol_limits()
+        );
+        let json = serde_json::to_value(&projected).unwrap();
+        assert_eq!(
+            json["limits"],
+            serde_json::to_value(TracesCapabilityLimits::from_protocol_limits()).unwrap()
+        );
+        assert_eq!(json["git_transports"], serde_json::json!(["http", "ssh"]));
+        assert_eq!(
+            json["object_formats"],
+            serde_json::json!(["sha1", "sha256"])
+        );
+        assert_eq!(json["search_unavailable_reason"], "index_missing");
+
+        let doc = crate::server::http_server::storage_only_openapi_doc_with_traces();
+        let components = doc.components.expect("components");
+        let limits_schema = components
+            .schemas
+            .get("TracesCapabilityLimits")
+            .expect("limits schema");
+        let parent = components
+            .schemas
+            .get("TracesCapabilities")
+            .expect("capabilities schema");
+        let parent_json = serde_json::to_value(parent).unwrap();
+        let limits_ref = parent_json["properties"]["limits"].to_string();
+        assert!(
+            limits_ref.contains("TracesCapabilityLimits"),
+            "{limits_ref}"
+        );
+        let _ = limits_schema;
     }
 }

@@ -18,6 +18,7 @@ pub mod push_queue_router;
 pub mod repo_router;
 pub mod snapshot_router;
 pub mod tag_router;
+pub mod traces_router;
 pub mod user_router;
 pub mod view_router;
 pub mod webhook_router;

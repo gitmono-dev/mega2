@@ -73,6 +73,46 @@ pub fn project_sessions(
     projected
 }
 
+pub async fn read_capabilities(
+    db: &sea_orm::DatabaseConnection,
+    server_id: &str,
+) -> crate::api_model::traces::TracesCapabilities {
+    use crate::{
+        api_model::traces::TracesCapabilities,
+        jupiter::storage::trace_search_index_storage::{CatalogValidation, validate_catalog},
+    };
+    let (ready, reason) = match validate_catalog(db).await {
+        Ok(CatalogValidation::Ready(_)) => (true, None),
+        Ok(CatalogValidation::Unavailable(failure)) => {
+            (false, Some(catalog_reason(&failure).to_owned()))
+        }
+        Err(_) => (false, Some("catalog_unreadable".to_owned())),
+    };
+    TracesCapabilities::project(server_id, ready, reason)
+}
+
+fn catalog_reason(
+    failure: &crate::jupiter::storage::trace_search_index_storage::CatalogFailure,
+) -> &'static str {
+    use crate::jupiter::storage::trace_search_index_storage::CatalogFailure;
+    match failure {
+        CatalogFailure::Method => "index_method",
+        CatalogFailure::Opclass => "index_opclass",
+        CatalogFailure::Columns => "index_columns",
+        CatalogFailure::IndexVersion => "index_version",
+        CatalogFailure::NotValid => "index_invalid",
+        CatalogFailure::NotReady => "index_not_ready",
+        CatalogFailure::ExtensionVersion => "extension_version",
+        CatalogFailure::SchemaOwner => "extension_owner",
+        CatalogFailure::Missing => "index_missing",
+        CatalogFailure::ExtensionMissing => "extension_missing",
+        CatalogFailure::WrongNamespace => "extension_namespace",
+        CatalogFailure::IndexPermissionDenied => "index_permission_denied",
+        CatalogFailure::BuildTimedOut => "index_build_timeout",
+        CatalogFailure::CatalogUnreadable => "catalog_unreadable",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
