@@ -33,6 +33,7 @@ pub mod trace_fragment_storage;
 pub mod trace_object_storage;
 pub mod trace_projection_storage;
 pub mod trace_search_index_storage;
+pub mod trace_search_storage;
 pub mod trace_stream_storage;
 pub mod trace_target_storage;
 pub mod user_storage;

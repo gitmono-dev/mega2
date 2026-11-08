@@ -10,3 +10,4 @@ pub mod pack_decode;
 pub(crate) mod pack_encode;
 pub(crate) mod parser;
 pub(crate) mod publication;
+pub mod query;
