@@ -338,6 +338,59 @@ impl QuerySnapshotEnvelope {
     }
 }
 
+/// The coverage verdict of one query (MTR-66).
+///
+/// The verdict is taken at the pinned query snapshot, so a push or an index
+/// catch-up that happens after the query started does not change it. The scan
+/// and the index are reported separately: a query that stopped at its byte
+/// budget and a query that read a complete scan over an incomplete index are
+/// different failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QueryCoverage {
+    /// Whether the scan read the whole scope within its budget.
+    pub scan_complete: bool,
+    /// Whether the pinned snapshot's index covered the pinned accepted range.
+    pub index_complete: bool,
+    /// Whether the query covered the whole scope.
+    pub coverage_complete: bool,
+    /// The stable reason when the coverage is not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
+}
+
+impl QueryCoverage {
+    /// The stable reason for an incomplete scan.
+    pub const SCAN_INCOMPLETE: &'static str = "scan_incomplete";
+    /// The stable reason for an incomplete index.
+    pub const INDEX_INCOMPLETE: &'static str = "index_incomplete";
+
+    /// Take the coverage verdict at a pinned snapshot.
+    ///
+    /// The scan is incomplete when it stopped at its byte or candidate budget,
+    /// and the index is incomplete when the indexed watermark of the pinned
+    /// snapshot has not caught up with its accepted watermark.
+    pub fn take(
+        snapshot: crate::ceres::traces::cursor::QuerySnapshot,
+        scan_complete: bool,
+    ) -> Self {
+        let index_complete = snapshot.indexed_seq >= snapshot.accepted_seq;
+        let coverage_complete = scan_complete && index_complete;
+        let incomplete_reason = if coverage_complete {
+            None
+        } else if !scan_complete {
+            Some(Self::SCAN_INCOMPLETE.to_owned())
+        } else {
+            Some(Self::INDEX_INCOMPLETE.to_owned())
+        };
+        Self {
+            scan_complete,
+            index_complete,
+            coverage_complete,
+            incomplete_reason,
+        }
+    }
+}
+
 /// Stream metadata index coverage and capture validation state (MTR-63).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ReadProjectionState {
@@ -870,6 +923,48 @@ mod tests {
         assert_eq!(json["indexed_seq"], 9);
         assert_eq!(json["index_version"], 1);
         assert_eq!(json["index_caught_up"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn coverage_wire_reports_the_scan_and_the_index_separately() {
+        use crate::ceres::traces::cursor::QuerySnapshot;
+
+        // A complete scan over a complete index is a complete coverage.
+        let complete = QueryCoverage::take(QuerySnapshot::new(4, 4, 1), true);
+        assert!(complete.scan_complete);
+        assert!(complete.index_complete);
+        assert!(complete.coverage_complete);
+        assert!(complete.incomplete_reason.is_none());
+
+        // An incomplete scan is reported as a scan failure.
+        let scan_gap = QueryCoverage::take(QuerySnapshot::new(4, 4, 1), false);
+        assert!(!scan_gap.scan_complete);
+        assert!(scan_gap.index_complete);
+        assert!(!scan_gap.coverage_complete);
+        assert_eq!(
+            scan_gap.incomplete_reason.as_deref(),
+            Some(QueryCoverage::SCAN_INCOMPLETE)
+        );
+
+        // An incomplete index at the pinned snapshot is reported as an index
+        // failure, even when the scan itself was complete.
+        let index_gap = QueryCoverage::take(QuerySnapshot::new(4, 2, 1), true);
+        assert!(index_gap.scan_complete);
+        assert!(!index_gap.index_complete);
+        assert!(!index_gap.coverage_complete);
+        assert_eq!(
+            index_gap.incomplete_reason.as_deref(),
+            Some(QueryCoverage::INDEX_INCOMPLETE)
+        );
+
+        let json = serde_json::to_value(&index_gap).expect("coverage JSON");
+        assert_eq!(json["scan_complete"], serde_json::json!(true));
+        assert_eq!(json["index_complete"], serde_json::json!(false));
+        assert_eq!(json["coverage_complete"], serde_json::json!(false));
+        assert_eq!(
+            json["incomplete_reason"],
+            serde_json::json!("index_incomplete")
+        );
     }
 
     #[test]

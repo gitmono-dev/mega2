@@ -1188,6 +1188,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_coverage_is_taken_at_the_pinned_snapshot() {
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, Set};
+        use uuid::Uuid;
+
+        use crate::{api_model::traces::QueryCoverage, ceres::traces::cursor::QuerySnapshot};
+
+        // The pinned snapshot is complete, so a complete scan is a complete
+        // coverage.
+        let snapshot = QuerySnapshot::new(4, 4, 1);
+        let coverage = QueryCoverage::take(snapshot, true);
+        assert!(coverage.coverage_complete);
+
+        // A push and an index catch-up after the snapshot do not change it.
+        let lagging = QuerySnapshot::new(4, 2, 1);
+        let coverage = QueryCoverage::take(lagging, true);
+        assert!(!coverage.coverage_complete);
+        assert_eq!(
+            coverage.incomplete_reason.as_deref(),
+            Some(QueryCoverage::INDEX_INCOMPLETE)
+        );
+
+        // The snapshot the query pins comes from the journal, and it is the
+        // one the coverage is judged against.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = crate::jupiter::tests::test_db_connection(temp_dir.path()).await;
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .unwrap();
+        let now = Utc::now().fixed_offset();
+        let target = crate::jupiter::storage::trace_target_storage::insert_active(
+            &db,
+            "native",
+            "/project/coverage",
+            None,
+        )
+        .await
+        .unwrap();
+        let target_id = target.id.clone();
+        let owner = Uuid::new_v4().to_string();
+        crate::callisto::trace_principal::ActiveModel {
+            id: Set(owner.clone()),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let stream_id = Uuid::new_v4().to_string();
+        crate::callisto::trace_stream::ActiveModel {
+            id: Set(stream_id.clone()),
+            principal_id: Set(owner),
+            target_id: Set(target_id),
+            source_repo_id: Set("coverage-source".to_owned()),
+            epoch_id: Set(Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        for (sequence, state) in [(1_i64, "indexed"), (2, "indexed"), (3, "pending")] {
+            crate::callisto::trace_ref_update::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                stream_id: Set(stream_id.clone()),
+                ref_sequence: Set(sequence),
+                idempotency_key: Set(Uuid::new_v4().to_string()),
+                old_tip: Set(None),
+                new_tip: Set(format!("{sequence:040x}")),
+                state: Set(state.to_owned()),
+                claim_until: Set(None),
+                attempt_count: Set(0),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        // The pinned snapshot sees the pending row, so its index is behind.
+        let pinned = super::pin_query_snapshot(&db, &stream_id)
+            .await
+            .expect("snapshot");
+        assert_eq!(pinned.accepted_seq, 3);
+        assert_eq!(pinned.indexed_seq, 2);
+        let coverage = QueryCoverage::take(pinned, true);
+        assert!(!coverage.index_complete);
+        assert!(!coverage.coverage_complete);
+
+        // After the indexer catches up, a fresh query is complete.
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        crate::callisto::trace_ref_update::Entity::update_many()
+            .col_expr(
+                crate::callisto::trace_ref_update::Column::State,
+                sea_orm::sea_query::Expr::value("indexed"),
+            )
+            .filter(crate::callisto::trace_ref_update::Column::StreamId.eq(stream_id.clone()))
+            .filter(crate::callisto::trace_ref_update::Column::RefSequence.eq(3))
+            .exec(&db)
+            .await
+            .unwrap();
+        let fresh = super::pin_query_snapshot(&db, &stream_id)
+            .await
+            .expect("snapshot");
+        assert_eq!(fresh.accepted_seq, 3);
+        assert_eq!(fresh.indexed_seq, 3);
+        let coverage = QueryCoverage::take(fresh, true);
+        assert!(coverage.index_complete);
+        assert!(coverage.coverage_complete);
+    }
+
+    #[tokio::test]
     async fn stream_directory_pages_filters_and_index_status() {
         use chrono::Utc;
         use sea_orm::{ActiveModelTrait, Set};

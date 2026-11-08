@@ -5,6 +5,7 @@
 //! and a timed-out query both surface as stable errors instead.
 
 use crate::{
+    api_model::traces::QueryCoverage,
     ceres::traces::query::LiteralQuery,
     common::errors::{MegaError, TracesError},
     jupiter::{
@@ -62,6 +63,21 @@ pub async fn search_stream(
         .await
         .map_err(map_search_error)?;
     Ok(SearchOutcome { result })
+}
+
+/// The coverage verdict of one search, taken at its pinned snapshot.
+///
+/// The scan state comes from the bounded search that actually ran, and the
+/// index state comes from the snapshot the query pinned, so a later push or
+/// index catch-up does not change the verdict.
+pub fn coverage_of(
+    snapshot: crate::ceres::traces::cursor::QuerySnapshot,
+    result: &LiteralSearchResult,
+) -> QueryCoverage {
+    // A candidate cap that stopped the search means the scan did not read the
+    // whole scope. A truncated bounded scan means the byte budget stopped it.
+    let scan_complete = !result.truncated;
+    QueryCoverage::take(snapshot, scan_complete)
 }
 
 /// The plan one query used, for the coverage matrix.
@@ -135,5 +151,38 @@ mod tests {
     fn literal_search_names_both_plans() {
         assert_eq!(plan_name(SearchPlan::IndexedTrigram), "indexed_trigram");
         assert_eq!(plan_name(SearchPlan::BoundedScan), "bounded_scan");
+    }
+
+    #[test]
+    fn scan_coverage_reports_a_truncated_scan_as_incomplete() {
+        use crate::ceres::traces::cursor::QuerySnapshot;
+
+        let snapshot = QuerySnapshot::new(4, 4, 1);
+
+        // A scan that ran to the end of the scope is complete.
+        let complete = LiteralSearchResult {
+            matches: Vec::new(),
+            plan: SearchPlan::IndexedTrigram,
+            scanned_bytes: 0,
+            truncated: false,
+        };
+        let coverage = super::coverage_of(snapshot, &complete);
+        assert!(coverage.scan_complete);
+        assert!(coverage.coverage_complete);
+
+        // A scan that stopped at its budget is not complete.
+        let truncated = LiteralSearchResult {
+            matches: Vec::new(),
+            plan: SearchPlan::BoundedScan,
+            scanned_bytes: 4096,
+            truncated: true,
+        };
+        let coverage = super::coverage_of(snapshot, &truncated);
+        assert!(!coverage.scan_complete);
+        assert!(!coverage.coverage_complete);
+        assert_eq!(
+            coverage.incomplete_reason.as_deref(),
+            Some(crate::api_model::traces::QueryCoverage::SCAN_INCOMPLETE)
+        );
     }
 }
