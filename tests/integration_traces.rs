@@ -14436,3 +14436,87 @@ async fn capability_limits_openapi_live_resolves_the_typed_component() {
     }
     assert_eq!(limit_properties.len(), 22);
 }
+
+/// MTR-54 VER-1: the live capabilities response reports the readiness
+/// projection. The CJK capability is measured from the deployed locale, and
+/// the search surface stays fail-closed until `/search` is mounted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_readiness_projects_the_measured_locale_capability() {
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let (status, body) = runtime.get("/api/v1/traces/capabilities").await;
+    assert_eq!(status, 200, "capabilities status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("capabilities JSON");
+
+    // The readiness flags are booleans, never a readiness string.
+    for name in [
+        "search_ready",
+        "cjk_index_supported",
+        "bounded_scan_supported",
+    ] {
+        assert!(json[name].is_boolean(), "{name} is not a boolean: {body}");
+    }
+
+    // `/search` is not mounted by this build, so the search surface stays
+    // closed and the reason is the stable one.
+    assert_eq!(json["search_ready"], serde_json::json!(false));
+    assert_eq!(json["bounded_scan_supported"], serde_json::json!(false));
+    // The reason is the stable index reason when the index is unavailable,
+    // and the not-served reason when the index itself is ready.
+    let reason = json["search_unavailable_reason"]
+        .as_str()
+        .expect("search unavailable reason");
+    let index_ready = runtime
+        .db()
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS present FROM pg_catalog.pg_extension WHERE extname = 'pg_trgm'",
+        ))
+        .await
+        .expect("pg_trgm probe")
+        .first()
+        .and_then(|row| row.try_get::<i64>("", "present").ok())
+        .unwrap_or(0)
+        > 0;
+    assert_eq!(
+        reason,
+        if index_ready {
+            "search_not_served"
+        } else {
+            "extension_missing"
+        },
+        "the unavailable reason must match the live index state: {body}"
+    );
+
+    // The CJK capability matches what the live locale actually extracts. The
+    // probe needs the extension, so a database without it reports false.
+    let expected_cjk: bool = {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+        match runtime
+            .db()
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT cardinality(mega2_extensions.show_trgm($1)) > 0 AS has_cjk_trigram",
+                ["中文測".into()],
+            ))
+            .await
+        {
+            Ok(rows) => rows
+                .first()
+                .and_then(|row| row.try_get::<bool>("", "has_cjk_trigram").ok())
+                .unwrap_or(false),
+            // The extension is missing in this database, so no CJK trigram can
+            // be extracted from it.
+            Err(_) => false,
+        }
+    };
+    assert_eq!(
+        json["cjk_index_supported"],
+        serde_json::json!(expected_cjk),
+        "the CJK capability must match the live locale: {body}"
+    );
+
+    // The version fields are declared accurately.
+    assert_eq!(json["api_version"], serde_json::json!("v1"));
+    assert_eq!(json["schema_version"], serde_json::json!(1));
+    assert_eq!(json["index_version"], serde_json::json!(1));
+}

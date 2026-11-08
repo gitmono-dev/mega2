@@ -80,6 +80,7 @@ pub fn project_sessions(
 pub fn read_capabilities(
     server_id: &str,
     index: &crate::jupiter::service::trace_search_index_service::IndexState,
+    cjk_index_supported: bool,
 ) -> crate::api_model::traces::TracesCapabilities {
     use crate::{
         api_model::traces::TracesCapabilities,
@@ -89,7 +90,11 @@ pub fn read_capabilities(
         IndexState::Ready => SEARCH_NOT_SERVED,
         IndexState::Unavailable(failure) => catalog_reason(failure),
     };
-    TracesCapabilities::project(server_id, false, Some(reason.to_owned()))
+    let mut capabilities = TracesCapabilities::project(server_id, false, Some(reason.to_owned()));
+    // The CJK capability is read from the deployed locale, so it is reported
+    // as measured instead of being assumed from the index alone.
+    capabilities.cjk_index_supported = cjk_index_supported;
+    capabilities
 }
 
 /// Stable reason while the search route is not mounted.
@@ -991,20 +996,35 @@ mod tests {
             service::trace_search_index_service::IndexState,
             storage::trace_search_index_storage::CatalogFailure,
         };
-        let ready = super::read_capabilities("id", &IndexState::Ready);
+        let ready = super::read_capabilities("id", &IndexState::Ready, false);
         assert!(!ready.search_ready);
         assert!(!ready.bounded_scan_supported);
+        assert!(!ready.cjk_index_supported);
         assert_eq!(
             ready.search_unavailable_reason.as_deref(),
             Some(super::SEARCH_NOT_SERVED)
         );
-        let missing =
-            super::read_capabilities("id", &IndexState::Unavailable(CatalogFailure::Missing));
+        let missing = super::read_capabilities(
+            "id",
+            &IndexState::Unavailable(CatalogFailure::Missing),
+            false,
+        );
         assert!(!missing.search_ready);
+        assert!(!missing.cjk_index_supported);
         assert_eq!(
             missing.search_unavailable_reason.as_deref(),
             Some("index_missing")
         );
+    }
+
+    #[test]
+    fn capabilities_report_the_measured_cjk_locale_capability() {
+        use crate::jupiter::service::trace_search_index_service::IndexState;
+        let ready = super::read_capabilities("id", &IndexState::Ready, true);
+        assert!(ready.cjk_index_supported);
+        // The CJK capability never turns the search surface on by itself.
+        assert!(!ready.search_ready);
+        assert!(!ready.bounded_scan_supported);
     }
 
     #[tokio::test]

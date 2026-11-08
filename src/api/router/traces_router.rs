@@ -18,7 +18,10 @@ use crate::{
     ceres::api_service::state::ProtocolApiState,
     common::errors::{ApiError, MegaError, TracesError},
     contract::git_protocol::http::{authenticate_trace_api, authorize_trace_api_read},
-    jupiter::{service::trace_query_service, storage::base_storage::StorageConnector},
+    jupiter::{
+        service::{trace_query_service, trace_search_service},
+        storage::base_storage::StorageConnector,
+    },
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
@@ -60,8 +63,14 @@ pub async fn capabilities(
         .ok_or_else(|| ApiError::from(MegaError::from(TracesError::Unauthenticated)))?
         .to_owned();
     let index = state.storage.trace_search_index_service.state();
+    let cjk_index_supported =
+        trace_search_service::cjk_index_supported(state.storage.mono_storage().get_connection())
+            .await
+            .unwrap_or(false);
     Ok(Json(trace_query_service::read_capabilities(
-        &server_id, &index,
+        &server_id,
+        &index,
+        cjk_index_supported,
     )))
 }
 

@@ -18,6 +18,19 @@ use crate::{
 /// The stable reason the search surface is not available.
 pub const SEARCH_UNAVAILABLE: &str = "search_unavailable";
 
+/// Whether this deployment's locale can extract trigrams from CJK text.
+///
+/// The answer is read from the live database because it depends on the
+/// deployed locale, not on the index alone.
+pub async fn cjk_index_supported(db: &sea_orm::DatabaseConnection) -> Result<bool, TracesError> {
+    crate::jupiter::storage::trace_search_storage::locale_extracts_cjk_trigrams(db)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "traces CJK locale probe failed");
+            TracesError::search_unavailable(SEARCH_UNAVAILABLE)
+        })
+}
+
 /// One keyword search request.
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
