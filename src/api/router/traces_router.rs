@@ -2,14 +2,17 @@
 
 use axum::{
     Json,
-    extract::{FromRef, Query, State, rejection::QueryRejection},
+    extract::{FromRef, Path, Query, State, rejection::QueryRejection},
     http::HeaderMap,
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::MonoApiServiceState,
-    api_model::traces::{TargetResolve, TargetResolveQuery, TracesCapabilities},
+    api_model::traces::{
+        StreamDirectory, StreamDirectoryQuery, TargetResolve, TargetResolveQuery,
+        TracesCapabilities, admit_stream_directory_query,
+    },
     ceres::api_service::state::ProtocolApiState,
     common::errors::{ApiError, MegaError, TracesError},
     contract::git_protocol::http::{authenticate_trace_api, authorize_trace_api_read},
@@ -20,6 +23,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
         .routes(routes!(capabilities))
         .routes(routes!(resolve_target))
+        .routes(routes!(list_target_streams))
 }
 
 /// Capabilities for an authenticated caller.
@@ -52,6 +56,67 @@ pub async fn capabilities(
     Ok(Json(trace_query_service::read_capabilities(
         &server_id, &index,
     )))
+}
+
+/// List streams of one target. The target id in the path is the only scope.
+#[utoipa::path(
+    get,
+    path = "/traces/targets/{target_id}/streams",
+    params(
+        ("target_id" = String, Path, description = "Registered target id"),
+        ("source" = Option<String>, Query, description = "Exact source_repo_id"),
+        ("owner" = Option<String>, Query, description = "Exact principal id"),
+        ("epoch" = Option<String>, Query, description = "Exact epoch id"),
+        ("limit" = Option<u64>, Query, description = "Page size; default 50, max 200"),
+        ("cursor" = Option<String>, Query, description = "Keyset cursor bound to these filters")
+    ),
+    responses(
+        (status = 200, description = "Stream directory", body = StreamDirectory),
+        (status = 400, description = "Invalid parameter or cursor"),
+        (status = 401, description = "Missing or rejected credentials"),
+        (status = 404, description = "Unknown or unreadable target")
+    ),
+    tag = "Traces"
+)]
+pub async fn list_target_streams(
+    State(state): State<MonoApiServiceState>,
+    Path(target_id): Path<String>,
+    headers: HeaderMap,
+    query: Result<Query<StreamDirectoryQuery>, QueryRejection>,
+) -> Result<Json<StreamDirectory>, ApiError> {
+    let protocol = ProtocolApiState::from_ref(&state);
+    authenticate_trace_api(&protocol, &headers)
+        .await
+        .map_err(ApiError::from)?;
+    let Query(query) =
+        query.map_err(|_| ApiError::from(MegaError::from(TracesError::InvalidParameter)))?;
+    let request = admit_stream_directory_query(&target_id, query)
+        .map_err(|error| ApiError::from(MegaError::from(error)))?;
+    let mono = state.storage.mono_storage();
+    let db = mono.get_connection();
+    let target = crate::jupiter::storage::trace_target_storage::find_by_id(db, &target_id)
+        .await
+        .map_err(ApiError::from)?;
+    let Some(target) = target.filter(|row| row.active) else {
+        return Err(ApiError::from(MegaError::from(TracesError::UnknownScope)));
+    };
+    let may_read = match authorize_trace_api_read(&protocol, &headers, &target.project_path).await {
+        Ok(_) => true,
+        Err(MegaError::Traces(TracesError::UnknownScope)) => false,
+        Err(error) => return Err(ApiError::from(error)),
+    };
+    match trace_query_service::list_target_streams(db, &target_id, &request, may_read).await {
+        Ok(body) => Ok(Json(body)),
+        Err(trace_query_service::StreamDirectoryError::UnknownScope) => {
+            Err(ApiError::from(MegaError::from(TracesError::UnknownScope)))
+        }
+        Err(trace_query_service::StreamDirectoryError::InvalidParameter) => Err(ApiError::from(
+            MegaError::from(TracesError::InvalidParameter),
+        )),
+        Err(trace_query_service::StreamDirectoryError::Database(error)) => {
+            Err(ApiError::from(error))
+        }
+    }
 }
 
 /// Locate one active registered target. Missing and unreadable paths are the same 404.
@@ -310,6 +375,127 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("invalid_parameter"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn stream_directory_filters_and_rejects_unreadable_targets() {
+        use sea_orm::Set;
+        let (app, db, _dir) = traces_app().await;
+        let target = crate::callisto::trace_target::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = chrono::Utc::now().fixed_offset();
+        async fn owner(db: &sea_orm::DatabaseConnection) -> String {
+            let id = Uuid::new_v4().to_string();
+            crate::callisto::trace_principal::ActiveModel {
+                id: Set(id.clone()),
+                created_at: Set(chrono::Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            id
+        }
+        let owner_a = owner(&db).await;
+        let owner_b = owner(&db).await;
+        let epoch_a = Uuid::new_v4().to_string();
+        let epoch_b = Uuid::new_v4().to_string();
+        for (owner_id, source, epoch) in [
+            (owner_a.as_str(), "src-a", epoch_a.as_str()),
+            (owner_b.as_str(), "src-b", epoch_b.as_str()),
+        ] {
+            crate::callisto::trace_stream::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                principal_id: Set(owner_id.to_owned()),
+                target_id: Set(target.id.clone()),
+                source_repo_id: Set(source.to_owned()),
+                epoch_id: Set(epoch.to_owned()),
+                hash_kind: Set("sha1".to_owned()),
+                tip_oid: Set(None),
+                created_at: Set(now),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let path = format!("/traces/targets/{}/streams", target.id);
+        let (status, body) = get(app.clone(), &path, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let (status, body) = get(app.clone(), &format!("{path}?limit=0"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let (status, body) = get(app.clone(), &path, Some("wide-secret")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["items"].as_array().unwrap().len(), 2);
+        assert!(
+            json["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["target_id"] == target.id)
+        );
+        let (status, body) = get(
+            app.clone(),
+            &format!("{path}?source=src-b"),
+            Some("wide-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["items"].as_array().unwrap().len(), 1);
+        assert_eq!(json["items"][0]["source"], "src-b");
+        let (status, body) = get(
+            app.clone(),
+            &format!("{path}?owner={owner_b}"),
+            Some("wide-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["items"][0]["owner"], owner_b);
+        let (status, body) = get(
+            app.clone(),
+            &format!("{path}?epoch={epoch_a}"),
+            Some("wide-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["items"][0]["epoch"], epoch_a);
+        let (status, body) =
+            get(app.clone(), &format!("{path}?limit=1"), Some("wide-secret")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let cursor = json["next_cursor"].as_str().unwrap();
+        let (status, body) = get(
+            app.clone(),
+            &format!("{path}?limit=1&source=other&cursor={cursor}"),
+            Some("wide-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_cursor"), "{body}");
+        let (status, body) = get(
+            app.clone(),
+            &format!("{path}?limit=201"),
+            Some("wide-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_parameter"), "{body}");
+        let (status, body) = get(app.clone(), &path, Some("unbound-secret")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, body) = get(app.clone(), &path, Some("narrow-secret")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, body) = get(
+            app,
+            &format!("/traces/targets/{}/streams", Uuid::new_v4()),
+            Some("wide-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
 
     #[tokio::test]

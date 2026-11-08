@@ -120,6 +120,140 @@ pub struct TargetResolveQuery {
     pub path: String,
 }
 
+/// `GET /api/v1/traces/targets/{target_id}/streams` (MTR-55).
+pub const STREAM_DIRECTORY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct StreamDirectory {
+    pub schema_version: u32,
+    pub items: Vec<StreamDirectoryItem>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct StreamDirectoryItem {
+    pub stream_id: String,
+    pub target_id: String,
+    pub owner: String,
+    pub source: String,
+    pub epoch: String,
+    pub hash_kind: String,
+    pub accepted_tip: Option<String>,
+    pub indexed_tip: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDirectoryQuery {
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub epoch: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Admitted stream-directory query. `limit` is the protocol default or an in-range value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamDirectoryRequest {
+    pub source: Option<String>,
+    pub owner: Option<String>,
+    pub epoch: Option<String>,
+    pub limit: u64,
+    pub after_id: Option<String>,
+}
+
+fn present_filter(
+    value: Option<String>,
+) -> Result<Option<String>, crate::common::errors::TracesError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() || value.chars().all(char::is_whitespace) {
+        return Err(crate::common::errors::TracesError::InvalidParameter);
+    }
+    Ok(Some(value))
+}
+
+fn filter_key(
+    target_id: &str,
+    source: &Option<String>,
+    owner: &Option<String>,
+    epoch: &Option<String>,
+) -> String {
+    format!(
+        "{target_id}\n{}\n{}\n{}",
+        source.as_deref().unwrap_or(""),
+        owner.as_deref().unwrap_or(""),
+        epoch.as_deref().unwrap_or("")
+    )
+}
+
+fn cursor_binding(target_id: &str, request: &StreamDirectoryRequest) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(
+        filter_key(target_id, &request.source, &request.owner, &request.epoch).as_bytes(),
+    );
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Keyset cursor bound to the target and the current filters.
+pub fn stream_directory_cursor(
+    target_id: &str,
+    request: &StreamDirectoryRequest,
+    after_id: &str,
+) -> String {
+    format!("v1.{}.{}", cursor_binding(target_id, request), after_id)
+}
+
+/// Apply the fixed metadata page bounds and decode a bound cursor.
+pub fn admit_stream_directory_query(
+    target_id: &str,
+    query: StreamDirectoryQuery,
+) -> Result<StreamDirectoryRequest, crate::common::errors::TracesError> {
+    use crate::common::errors::TracesError;
+    let source = present_filter(query.source)?;
+    let owner = present_filter(query.owner)?;
+    let epoch = present_filter(query.epoch)?;
+    let limit = match query.limit {
+        None => TracesProtocolLimits::METADATA_LIMIT_DEFAULT,
+        Some(limit) if (1..=TracesProtocolLimits::METADATA_LIMIT_MAX).contains(&limit) => limit,
+        Some(_) => return Err(TracesError::InvalidParameter),
+    };
+    let request = StreamDirectoryRequest {
+        source,
+        owner,
+        epoch,
+        limit,
+        after_id: None,
+    };
+    let after_id = match query.cursor.as_deref() {
+        None => None,
+        Some(cursor) if cursor.is_empty() || cursor.chars().all(char::is_whitespace) => {
+            return Err(TracesError::InvalidCursor);
+        }
+        Some(cursor) => {
+            let rest = cursor
+                .strip_prefix("v1.")
+                .ok_or(TracesError::InvalidCursor)?;
+            let (binding, after_id) = rest.split_once('.').ok_or(TracesError::InvalidCursor)?;
+            if binding != cursor_binding(target_id, &request) || after_id.is_empty() {
+                return Err(TracesError::InvalidCursor);
+            }
+            Some(after_id.to_owned())
+        }
+    };
+    Ok(StreamDirectoryRequest {
+        after_id,
+        ..request
+    })
+}
+
 /// Errors returned when the wire filter itself is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceFilterError {
@@ -206,6 +340,109 @@ impl CaptureQueryFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_filter_wire_defaults_and_cursor_binding() {
+        use crate::common::errors::TracesError;
+        let admitted = admit_stream_directory_query(
+            "target",
+            StreamDirectoryQuery {
+                source: None,
+                owner: None,
+                epoch: None,
+                limit: None,
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(admitted.limit, TracesProtocolLimits::METADATA_LIMIT_DEFAULT);
+        assert!(admitted.after_id.is_none());
+        let max = admit_stream_directory_query(
+            "target",
+            StreamDirectoryQuery {
+                source: Some("repo".to_owned()),
+                owner: Some("owner".to_owned()),
+                epoch: Some("epoch".to_owned()),
+                limit: Some(TracesProtocolLimits::METADATA_LIMIT_MAX),
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(max.limit, TracesProtocolLimits::METADATA_LIMIT_MAX);
+        assert!(
+            admit_stream_directory_query(
+                "target",
+                StreamDirectoryQuery {
+                    source: None,
+                    owner: None,
+                    epoch: None,
+                    limit: Some(TracesProtocolLimits::METADATA_LIMIT_MAX + 1),
+                    cursor: None,
+                },
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            admit_stream_directory_query(
+                "target",
+                StreamDirectoryQuery {
+                    source: Some(" ".to_owned()),
+                    owner: None,
+                    epoch: None,
+                    limit: None,
+                    cursor: None,
+                },
+            ),
+            Err(TracesError::InvalidParameter)
+        ));
+        let cursor = stream_directory_cursor("target", &max, "stream-1");
+        let page = admit_stream_directory_query(
+            "target",
+            StreamDirectoryQuery {
+                source: Some("repo".to_owned()),
+                owner: Some("owner".to_owned()),
+                epoch: Some("epoch".to_owned()),
+                limit: Some(TracesProtocolLimits::METADATA_LIMIT_MAX),
+                cursor: Some(cursor),
+            },
+        )
+        .unwrap();
+        assert_eq!(page.after_id.as_deref(), Some("stream-1"));
+        assert!(matches!(
+            admit_stream_directory_query(
+                "target",
+                StreamDirectoryQuery {
+                    source: Some("other".to_owned()),
+                    owner: Some("owner".to_owned()),
+                    epoch: Some("epoch".to_owned()),
+                    limit: Some(10),
+                    cursor: Some(stream_directory_cursor("target", &max, "stream-1")),
+                },
+            ),
+            Err(TracesError::InvalidCursor)
+        ));
+        let body = StreamDirectory {
+            schema_version: STREAM_DIRECTORY_SCHEMA_VERSION,
+            items: vec![StreamDirectoryItem {
+                stream_id: "stream-1".to_owned(),
+                target_id: "target".to_owned(),
+                owner: "owner".to_owned(),
+                source: "repo".to_owned(),
+                epoch: "epoch".to_owned(),
+                hash_kind: "sha1".to_owned(),
+                accepted_tip: Some("a".repeat(40)),
+                indexed_tip: None,
+                status: "index_pending".to_owned(),
+            }],
+            next_cursor: None,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert!(json["next_cursor"].is_null());
+        assert_eq!(json["items"][0]["status"], "index_pending");
+        let decoded: StreamDirectory = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, body);
+    }
 
     #[test]
     fn capture_query_filter_wire_parses_literals_and_window() {

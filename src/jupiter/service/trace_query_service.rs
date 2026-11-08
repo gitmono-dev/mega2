@@ -150,6 +150,142 @@ pub enum TargetResolveError {
     Database(crate::common::errors::MegaError),
 }
 
+/// Why a stream directory read failed. Missing and unreadable targets match.
+#[derive(Debug)]
+pub enum StreamDirectoryError {
+    UnknownScope,
+    InvalidParameter,
+    Database(crate::common::errors::MegaError),
+}
+
+fn stream_status(accepted: Option<&str>, indexed: Option<&str>) -> &'static str {
+    match accepted {
+        None => "empty",
+        Some(tip) if indexed == Some(tip) => "indexed",
+        Some(_) => "index_pending",
+    }
+}
+
+/// Last `new_tip` of the contiguous `indexed` prefix starting at sequence 1.
+fn contiguous_indexed_tip(updates: &[crate::callisto::trace_ref_update::Model]) -> Option<String> {
+    let mut tip = None;
+    for (offset, row) in updates.iter().enumerate() {
+        let Ok(offset) = i64::try_from(offset) else {
+            break;
+        };
+        if row.ref_sequence != offset + 1 || row.state != "indexed" {
+            break;
+        }
+        tip = Some(row.new_tip.clone());
+    }
+    tip
+}
+
+/// Streams of one active target. `may_read` is the traces Read decision for that target.
+pub async fn list_target_streams(
+    db: &sea_orm::DatabaseConnection,
+    target_id: &str,
+    request: &crate::api_model::traces::StreamDirectoryRequest,
+    may_read: bool,
+) -> Result<crate::api_model::traces::StreamDirectory, StreamDirectoryError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+
+    use crate::{
+        api_model::traces::{
+            STREAM_DIRECTORY_SCHEMA_VERSION, StreamDirectory, StreamDirectoryItem,
+        },
+        callisto::{trace_ref_update, trace_stream, trace_target},
+        config::TracesProtocolLimits,
+    };
+    if !may_read {
+        return Err(StreamDirectoryError::UnknownScope);
+    }
+    if request.limit == 0 || request.limit > TracesProtocolLimits::METADATA_LIMIT_MAX {
+        return Err(StreamDirectoryError::InvalidParameter);
+    }
+    let target = trace_target::Entity::find_by_id(target_id.to_owned())
+        .one(db)
+        .await
+        .map_err(|err| {
+            StreamDirectoryError::Database(crate::common::errors::MegaError::from(err))
+        })?;
+    if target.as_ref().is_none_or(|row| !row.active) {
+        return Err(StreamDirectoryError::UnknownScope);
+    }
+    let mut query =
+        trace_stream::Entity::find().filter(trace_stream::Column::TargetId.eq(target_id));
+    if let Some(source) = &request.source {
+        query = query.filter(trace_stream::Column::SourceRepoId.eq(source));
+    }
+    if let Some(owner) = &request.owner {
+        query = query.filter(trace_stream::Column::PrincipalId.eq(owner));
+    }
+    if let Some(epoch) = &request.epoch {
+        query = query.filter(trace_stream::Column::EpochId.eq(epoch));
+    }
+    if let Some(after) = &request.after_id {
+        query = query.filter(trace_stream::Column::Id.gt(after));
+    }
+    let mut rows = query
+        .order_by_asc(trace_stream::Column::Id)
+        .limit(request.limit.saturating_add(1))
+        .all(db)
+        .await
+        .map_err(|err| {
+            StreamDirectoryError::Database(crate::common::errors::MegaError::from(err))
+        })?;
+    let next_cursor = if rows.len() > usize::try_from(request.limit).unwrap_or(usize::MAX) {
+        rows.pop();
+        rows.last().map(|row| {
+            crate::api_model::traces::stream_directory_cursor(target_id, request, &row.id)
+        })
+    } else {
+        None
+    };
+    let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    let updates = if ids.is_empty() {
+        Vec::new()
+    } else {
+        trace_ref_update::Entity::find()
+            .filter(trace_ref_update::Column::StreamId.is_in(ids))
+            .order_by_asc(trace_ref_update::Column::RefSequence)
+            .all(db)
+            .await
+            .map_err(|err| {
+                StreamDirectoryError::Database(crate::common::errors::MegaError::from(err))
+            })?
+    };
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            let mut mine: Vec<_> = updates
+                .iter()
+                .filter(|update| update.stream_id == row.id)
+                .cloned()
+                .collect();
+            mine.sort_by_key(|update| update.ref_sequence);
+            let indexed = contiguous_indexed_tip(&mine);
+            let status = stream_status(row.tip_oid.as_deref(), indexed.as_deref());
+            StreamDirectoryItem {
+                stream_id: row.id,
+                target_id: row.target_id,
+                owner: row.principal_id,
+                source: row.source_repo_id,
+                epoch: row.epoch_id,
+                hash_kind: row.hash_kind,
+                accepted_tip: row.tip_oid,
+                indexed_tip: indexed,
+                status: status.to_owned(),
+            }
+        })
+        .collect();
+    Ok(StreamDirectory {
+        schema_version: STREAM_DIRECTORY_SCHEMA_VERSION,
+        items,
+        next_cursor,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -301,6 +437,310 @@ mod tests {
         assert_eq!(
             missing.search_unavailable_reason.as_deref(),
             Some("index_missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_directory_pages_filters_and_index_status() {
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, Set};
+        use uuid::Uuid;
+
+        use crate::{api_model::traces::StreamDirectoryRequest, config::TracesProtocolLimits};
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = crate::jupiter::tests::test_db_connection(temp_dir.path()).await;
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .unwrap();
+        let now = Utc::now().fixed_offset();
+        let target = crate::jupiter::storage::trace_target_storage::insert_active(
+            &db,
+            "native",
+            "/project/app",
+            None,
+        )
+        .await
+        .unwrap();
+        let other = crate::jupiter::storage::trace_target_storage::insert_active(
+            &db,
+            "native",
+            "/project/other",
+            None,
+        )
+        .await
+        .unwrap();
+        async fn principal(db: &sea_orm::DatabaseConnection) -> String {
+            let id = Uuid::new_v4().to_string();
+            crate::callisto::trace_principal::ActiveModel {
+                id: Set(id.clone()),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            id
+        }
+        let owner_a = principal(&db).await;
+        let owner_b = principal(&db).await;
+        async fn stream(
+            db: &sea_orm::DatabaseConnection,
+            target_id: &str,
+            owner: &str,
+            source: &str,
+            epoch: &str,
+            tip: Option<&str>,
+        ) -> String {
+            crate::callisto::trace_stream::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                principal_id: Set(owner.to_owned()),
+                target_id: Set(target_id.to_owned()),
+                source_repo_id: Set(source.to_owned()),
+                epoch_id: Set(epoch.to_owned()),
+                hash_kind: Set("sha1".to_owned()),
+                tip_oid: Set(tip.map(str::to_owned)),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .unwrap()
+            .id
+        }
+        async fn journal(
+            db: &sea_orm::DatabaseConnection,
+            stream_id: &str,
+            sequence: i64,
+            tip: &str,
+            state: &str,
+        ) {
+            crate::callisto::trace_ref_update::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                stream_id: Set(stream_id.to_owned()),
+                ref_sequence: Set(sequence),
+                idempotency_key: Set(Uuid::new_v4().to_string()),
+                old_tip: Set(None),
+                new_tip: Set(tip.to_owned()),
+                state: Set(state.to_owned()),
+                claim_until: Set(None),
+                attempt_count: Set(0),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+        let epoch_a = Uuid::new_v4().to_string();
+        let epoch_b = Uuid::new_v4().to_string();
+        let epoch_c = Uuid::new_v4().to_string();
+        let pending_tip = "b".repeat(40);
+        let indexed_tip = "a".repeat(40);
+        let pending = stream(
+            &db,
+            &target.id,
+            &owner_a,
+            "src-a",
+            &epoch_a,
+            Some(&pending_tip),
+        )
+        .await;
+        journal(&db, &pending, 1, &indexed_tip, "indexed").await;
+        journal(&db, &pending, 2, &pending_tip, "pending").await;
+        let done_tip = "c".repeat(40);
+        let done = stream(
+            &db,
+            &target.id,
+            &owner_b,
+            "src-b",
+            &epoch_b,
+            Some(&done_tip),
+        )
+        .await;
+        journal(&db, &done, 1, &done_tip, "indexed").await;
+        let empty = stream(&db, &target.id, &owner_a, "src-a", &epoch_c, None).await;
+        let _foreign = stream(&db, &other.id, &owner_a, "src-a", &epoch_a, None).await;
+        let _ = now;
+
+        let all = super::list_target_streams(
+            &db,
+            &target.id,
+            &StreamDirectoryRequest {
+                source: None,
+                owner: None,
+                epoch: None,
+                limit: 10,
+                after_id: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.items.len(), 3);
+        assert!(all.items.iter().all(|item| item.target_id == target.id));
+        let pending_item = all
+            .items
+            .iter()
+            .find(|item| item.stream_id == pending)
+            .unwrap();
+        assert_eq!(
+            pending_item.indexed_tip.as_deref(),
+            Some(indexed_tip.as_str())
+        );
+        assert_eq!(pending_item.status, "index_pending");
+        let done_item = all
+            .items
+            .iter()
+            .find(|item| item.stream_id == done)
+            .unwrap();
+        assert_eq!(done_item.status, "indexed");
+        assert_eq!(done_item.owner, owner_b);
+        let empty_item = all
+            .items
+            .iter()
+            .find(|item| item.stream_id == empty)
+            .unwrap();
+        assert_eq!(empty_item.status, "empty");
+        assert!(empty_item.accepted_tip.is_none());
+
+        let by_source = super::list_target_streams(
+            &db,
+            &target.id,
+            &StreamDirectoryRequest {
+                source: Some("src-b".to_owned()),
+                owner: None,
+                epoch: None,
+                limit: 10,
+                after_id: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_source.items.len(), 1);
+        assert_eq!(by_source.items[0].stream_id, done);
+        let by_owner = super::list_target_streams(
+            &db,
+            &target.id,
+            &StreamDirectoryRequest {
+                source: None,
+                owner: Some(owner_b.clone()),
+                epoch: None,
+                limit: 10,
+                after_id: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_owner.items[0].stream_id, done);
+        let by_epoch = super::list_target_streams(
+            &db,
+            &target.id,
+            &StreamDirectoryRequest {
+                source: None,
+                owner: None,
+                epoch: Some(epoch_c.clone()),
+                limit: 10,
+                after_id: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_epoch.items[0].stream_id, empty);
+
+        for _index in 0..TracesProtocolLimits::METADATA_LIMIT_DEFAULT + 1 {
+            stream(
+                &db,
+                &target.id,
+                &owner_a,
+                "page",
+                &Uuid::new_v4().to_string(),
+                None,
+            )
+            .await;
+        }
+        let page = super::list_target_streams(
+            &db,
+            &target.id,
+            &StreamDirectoryRequest {
+                source: Some("page".to_owned()),
+                owner: None,
+                epoch: None,
+                limit: TracesProtocolLimits::METADATA_LIMIT_DEFAULT,
+                after_id: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.items.len() as u64,
+            TracesProtocolLimits::METADATA_LIMIT_DEFAULT
+        );
+        let cursor = page.next_cursor.expect("next page");
+        let admitted = crate::api_model::traces::admit_stream_directory_query(
+            &target.id,
+            crate::api_model::traces::StreamDirectoryQuery {
+                source: Some("page".to_owned()),
+                owner: None,
+                epoch: None,
+                limit: Some(TracesProtocolLimits::METADATA_LIMIT_DEFAULT),
+                cursor: Some(cursor),
+            },
+        )
+        .unwrap();
+        let rest = super::list_target_streams(&db, &target.id, &admitted, true)
+            .await
+            .unwrap();
+        assert_eq!(rest.items.len(), 1);
+        assert!(rest.next_cursor.is_none());
+        assert!(
+            super::list_target_streams(
+                &db,
+                &target.id,
+                &StreamDirectoryRequest {
+                    source: None,
+                    owner: None,
+                    epoch: None,
+                    limit: TracesProtocolLimits::METADATA_LIMIT_MAX + 1,
+                    after_id: None,
+                },
+                true,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            super::list_target_streams(
+                &db,
+                &target.id,
+                &StreamDirectoryRequest {
+                    source: None,
+                    owner: None,
+                    epoch: None,
+                    limit: 10,
+                    after_id: None,
+                },
+                false,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            super::list_target_streams(
+                &db,
+                &Uuid::new_v4().to_string(),
+                &StreamDirectoryRequest {
+                    source: None,
+                    owner: None,
+                    epoch: None,
+                    limit: 10,
+                    after_id: None,
+                },
+                true,
+            )
+            .await
+            .is_err()
         );
     }
 }
