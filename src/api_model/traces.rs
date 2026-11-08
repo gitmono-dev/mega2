@@ -636,6 +636,104 @@ pub fn checkpoint_cursor(stream_id: &str, session_id: &str, after_key: &str) -> 
     )
 }
 
+/// `GET /api/v1/traces/streams/{stream_id}/sessions/{session_id}/checkpoints/{checkpoint_id}/transcript` (MTR-18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TranscriptPage {
+    pub schema_version: u32,
+    pub checkpoint_id: String,
+    pub resource_id: String,
+    pub content_digest: String,
+    pub byte_start: i64,
+    pub byte_end: i64,
+    pub text: String,
+    pub truncated: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptQuery {
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Admitted transcript query. The byte budget is the fixed protocol default or
+/// an in-range value; the cursor is bound to the fixed checkpoint scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRequest {
+    pub max_bytes: u64,
+    pub byte_offset: u64,
+}
+
+/// Apply the fixed text budget and decode a bound continuation cursor.
+pub fn admit_transcript_query(
+    stream_id: &str,
+    session_id: &str,
+    checkpoint_id: &str,
+    query: TranscriptQuery,
+) -> Result<TranscriptRequest, crate::common::errors::TracesError> {
+    use crate::common::errors::TracesError;
+    let max_bytes = match query.max_bytes {
+        None => TracesProtocolLimits::TEXT_BYTES_DEFAULT,
+        Some(max_bytes) if (1..=TracesProtocolLimits::TEXT_BYTES_MAX).contains(&max_bytes) => {
+            max_bytes
+        }
+        Some(_) => return Err(TracesError::InvalidParameter),
+    };
+    let byte_offset = match query.cursor.as_deref() {
+        None => 0,
+        Some(cursor) if cursor.is_empty() || cursor.chars().all(char::is_whitespace) => {
+            return Err(TracesError::InvalidCursor);
+        }
+        Some(cursor) => {
+            let rest = cursor
+                .strip_prefix("v1.")
+                .ok_or(TracesError::InvalidCursor)?;
+            let (binding, offset) = rest.split_once('.').ok_or(TracesError::InvalidCursor)?;
+            if binding != transcript_cursor_binding(stream_id, session_id, checkpoint_id) {
+                return Err(TracesError::InvalidCursor);
+            }
+            offset
+                .parse::<u64>()
+                .map_err(|_| TracesError::InvalidCursor)?
+        }
+    };
+    Ok(TranscriptRequest {
+        max_bytes,
+        byte_offset,
+    })
+}
+
+fn transcript_cursor_binding(stream_id: &str, session_id: &str, checkpoint_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for value in [stream_id, session_id, checkpoint_id] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Keyset cursor for one transcript continuation.
+pub fn transcript_cursor(
+    stream_id: &str,
+    session_id: &str,
+    checkpoint_id: &str,
+    byte_offset: u64,
+) -> String {
+    format!(
+        "v1.{}.{}",
+        transcript_cursor_binding(stream_id, session_id, checkpoint_id),
+        byte_offset
+    )
+}
+
 /// Errors returned when the wire filter itself is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceFilterError {

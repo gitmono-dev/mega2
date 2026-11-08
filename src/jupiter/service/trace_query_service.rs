@@ -650,6 +650,104 @@ pub async fn read_session_checkpoint(
     })
 }
 
+/// The transcript text of one checkpoint resource.
+pub async fn read_session_checkpoint_transcript(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: &str,
+    session_id: &str,
+    checkpoint_id: &str,
+    request: &crate::api_model::traces::TranscriptRequest,
+    may_read: bool,
+) -> Result<crate::api_model::traces::TranscriptPage, SessionReadError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+
+    use crate::{
+        api_model::traces::{TranscriptPage, transcript_cursor},
+        callisto::{
+            trace_checkpoint, trace_fragment, trace_fragment::membership, trace_resource,
+            trace_session,
+        },
+    };
+    if !may_read {
+        return Err(SessionReadError::UnknownScope);
+    }
+    let session = trace_session::Entity::find()
+        .filter(trace_session::Column::Id.eq(session_id))
+        .filter(trace_session::Column::StreamId.eq(stream_id))
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(SessionReadError::UnknownScope)?;
+    let checkpoint = trace_checkpoint::Entity::find_by_id(checkpoint_id.to_owned())
+        .filter(trace_checkpoint::Column::StreamId.eq(stream_id))
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(SessionReadError::UnknownScope)?;
+
+    let mut memberships = membership::Entity::find()
+        .filter(membership::Column::StreamId.eq(stream_id))
+        .filter(membership::Column::CheckpointId.eq(checkpoint.id.clone()))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+    memberships.sort_by_key(|row| row.resource_id.clone());
+    let Some(first) = memberships.first().cloned() else {
+        return Err(SessionReadError::UnknownScope);
+    };
+    let resources = trace_resource::Entity::find()
+        .filter(trace_resource::Column::StreamId.eq(stream_id))
+        .filter(trace_resource::Column::CheckpointId.eq(checkpoint.id.clone()))
+        .order_by_asc(trace_resource::Column::Ordinal)
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+    let resource = resources
+        .into_iter()
+        .find(|row| row.id == first.resource_id)
+        .ok_or(SessionReadError::UnknownScope)?;
+
+    let fragment = trace_fragment::Entity::find_by_id(first.fragment_id.clone())
+        .filter(trace_fragment::Column::StreamId.eq(stream_id))
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(SessionReadError::UnknownScope)?;
+
+    let body = fragment.body;
+    let bytes = body.as_bytes();
+    let start = usize::try_from(request.byte_offset)
+        .unwrap_or(bytes.len())
+        .min(bytes.len());
+    let budget = usize::try_from(request.max_bytes).unwrap_or(0);
+    let mut end = start.saturating_add(budget).min(bytes.len());
+    while end > start && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = body.get(start..end).unwrap_or_default().to_owned();
+    let truncated = end < bytes.len();
+    Ok(TranscriptPage {
+        schema_version: crate::api_model::traces::STREAM_DIRECTORY_SCHEMA_VERSION,
+        checkpoint_id: checkpoint.id,
+        resource_id: resource.id,
+        content_digest: fragment.content_digest,
+        byte_start: resource.byte_start,
+        byte_end: resource.byte_end,
+        text,
+        truncated,
+        next_cursor: if truncated {
+            Some(transcript_cursor(
+                stream_id,
+                &session.id,
+                checkpoint_id,
+                u64::try_from(end).unwrap_or(0),
+            ))
+        } else {
+            None
+        },
+    })
+}
+
 /// Streams of one active target. `may_read` is the traces Read decision for that target.
 pub async fn list_target_streams(
     db: &sea_orm::DatabaseConnection,

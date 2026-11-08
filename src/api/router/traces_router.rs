@@ -12,8 +12,8 @@ use crate::{
     api_model::traces::{
         CheckpointPage, CheckpointQuery, CheckpointSummary, SessionDetail, SessionPage,
         SessionQuery, StreamDirectory, StreamDirectoryQuery, TargetResolve, TargetResolveQuery,
-        TracesCapabilities, admit_checkpoint_query, admit_session_query,
-        admit_stream_directory_query,
+        TracesCapabilities, TranscriptPage, TranscriptQuery, admit_checkpoint_query,
+        admit_session_query, admit_stream_directory_query, admit_transcript_query,
     },
     ceres::api_service::state::ProtocolApiState,
     common::errors::{ApiError, MegaError, TracesError},
@@ -30,6 +30,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(read_stream_session))
         .routes(routes!(list_session_checkpoints))
         .routes(routes!(read_session_checkpoint))
+        .routes(routes!(read_session_checkpoint_transcript))
 }
 
 /// Capabilities for an authenticated caller.
@@ -122,6 +123,67 @@ pub async fn list_target_streams(
         Err(trace_query_service::StreamDirectoryError::Database(error)) => {
             Err(ApiError::from(error))
         }
+    }
+}
+
+/// The transcript text of one checkpoint, within the fixed byte budget.
+#[utoipa::path(
+    get,
+    path = "/traces/streams/{stream_id}/sessions/{session_id}/checkpoints/{checkpoint_id}/transcript",
+    params(
+        ("stream_id" = String, Path, description = "Stream id"),
+        ("session_id" = String, Path, description = "Session id"),
+        ("checkpoint_id" = String, Path, description = "Checkpoint id"),
+        ("max_bytes" = Option<u64>, Query, description = "Byte budget; default 16 KiB, max 128 KiB"),
+        ("cursor" = Option<String>, Query, description = "Continuation cursor for this scope")
+    ),
+    responses(
+        (status = 200, description = "Transcript page", body = TranscriptPage),
+        (status = 400, description = "Invalid parameter or cursor"),
+        (status = 401, description = "Missing or rejected credentials"),
+        (status = 404, description = "Unknown or unreadable checkpoint")
+    ),
+    tag = "Traces"
+)]
+pub async fn read_session_checkpoint_transcript(
+    State(state): State<MonoApiServiceState>,
+    Path((stream_id, session_id, checkpoint_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    query: Result<Query<TranscriptQuery>, QueryRejection>,
+) -> Result<Json<TranscriptPage>, ApiError> {
+    let protocol = ProtocolApiState::from_ref(&state);
+    authenticate_trace_api(&protocol, &headers)
+        .await
+        .map_err(ApiError::from)?;
+    let Query(query) =
+        query.map_err(|_| ApiError::from(MegaError::from(TracesError::InvalidParameter)))?;
+    let request = admit_transcript_query(&stream_id, &session_id, &checkpoint_id, query)
+        .map_err(|error| ApiError::from(MegaError::from(error)))?;
+    let mono = state.storage.mono_storage();
+    let db = mono.get_connection();
+    let may_read =
+        match authorize_trace_api_read_for_stream(&protocol, &headers, db, &stream_id).await {
+            Ok(may_read) => may_read,
+            Err(error) => return Err(ApiError::from(error)),
+        };
+    match trace_query_service::read_session_checkpoint_transcript(
+        db,
+        &stream_id,
+        &session_id,
+        &checkpoint_id,
+        &request,
+        may_read,
+    )
+    .await
+    {
+        Ok(body) => Ok(Json(body)),
+        Err(trace_query_service::SessionReadError::UnknownScope) => {
+            Err(ApiError::from(MegaError::from(TracesError::UnknownScope)))
+        }
+        Err(trace_query_service::SessionReadError::InvalidParameter) => Err(ApiError::from(
+            MegaError::from(TracesError::InvalidParameter),
+        )),
+        Err(trace_query_service::SessionReadError::Database(error)) => Err(ApiError::from(error)),
     }
 }
 

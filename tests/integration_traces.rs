@@ -13878,6 +13878,113 @@ async fn gin_operator_lease_blocks_then_allows_repair() {
     let _ = db.close().await;
 }
 
+/// MTR-18 VER-1: the real HTTP transcript read stays inside the fixed byte
+/// budget, never cuts a UTF-8 character, and continues with its cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transcript_api_reads_the_fixed_scope_within_the_byte_budget() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let db = runtime.db();
+    let owner = uuid::Uuid::new_v4().to_string();
+    let target = uuid::Uuid::new_v4().to_string();
+    let stream = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let checkpoint = uuid::Uuid::new_v4().to_string();
+    let resource = uuid::Uuid::new_v4().to_string();
+    let fragment = uuid::Uuid::new_v4().to_string();
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let body = "第一行中文\n第二行 english\n第三行 tail";
+    let body_bytes = body.len() as i64;
+    for statement in [
+        format!("INSERT INTO trace_principal (id) VALUES ('{owner}')"),
+        format!(
+            "INSERT INTO trace_credential_binding (id, principal_id, namespace, credential_id) VALUES ('{}', '{owner}', 'static_push_token', 'mtr89')",
+            uuid::Uuid::new_v4()
+        ),
+        format!(
+            "INSERT INTO trace_target (id, target_kind, project_path, active) VALUES ('{target}', 'native', '/project/transcript-nav', true)"
+        ),
+        format!(
+            "INSERT INTO trace_stream (id, principal_id, target_id, source_repo_id, epoch_id, hash_kind, tip_oid) VALUES ('{stream}', '{owner}', '{target}', 'transcript-nav-source', '{epoch}', 'sha1', NULL)"
+        ),
+        format!(
+            "INSERT INTO trace_session (id, stream_id, session_key) VALUES ('{session}', '{stream}', 'transcript-nav-session')"
+        ),
+        format!(
+            "INSERT INTO trace_checkpoint (id, stream_id, checkpoint_key, original_tree) VALUES ('{checkpoint}', '{stream}', 'transcript-nav-checkpoint', '{}')",
+            "a".repeat(40)
+        ),
+        format!(
+            "INSERT INTO trace_resource (id, stream_id, checkpoint_id, ordinal, byte_start, byte_end) VALUES ('{resource}', '{stream}', '{checkpoint}', 0, 0, {body_bytes})"
+        ),
+        format!(
+            "INSERT INTO trace_fragment (id, stream_id, content_digest, index_version, body, ascii_fold) VALUES ('{fragment}', '{stream}', 'transcript-nav-digest', 1, '{}', '{}')",
+            body.replace('\'', "''"),
+            body.to_lowercase().replace('\'', "''")
+        ),
+        format!(
+            "INSERT INTO trace_fragment_membership (id, fragment_id, stream_id, checkpoint_id, resource_id) VALUES ('{}', '{fragment}', '{stream}', '{checkpoint}', '{resource}')",
+            uuid::Uuid::new_v4()
+        ),
+    ] {
+        db.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            statement,
+        ))
+        .await
+        .expect("seed traces transcript fixture");
+    }
+
+    let base = format!(
+        "/api/v1/traces/streams/{stream}/sessions/{session}/checkpoints/{checkpoint}/transcript"
+    );
+    let (status, text) = runtime.get(&base).await;
+    assert_eq!(status, 200, "transcript status: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("transcript JSON");
+    assert_eq!(json["text"], body);
+    assert_eq!(json["truncated"], false);
+    assert!(json["next_cursor"].is_null(), "{text}");
+    assert_eq!(json["checkpoint_id"], checkpoint);
+
+    let (status, text) = runtime.get(&format!("{base}?max_bytes=7")).await;
+    assert_eq!(status, 200, "transcript budget status: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("transcript budget JSON");
+    assert_eq!(json["truncated"], true);
+    let first = json["text"].as_str().expect("budgeted text").to_owned();
+    assert!(first.len() < 7, "the budget must be respected: {first:?}");
+    assert!(body.starts_with(first.as_str()), "{first:?}");
+    let cursor = json["next_cursor"]
+        .as_str()
+        .expect("transcript next cursor")
+        .to_owned();
+
+    let (status, text) = runtime
+        .get(&format!("{base}?max_bytes=7&cursor={cursor}"))
+        .await;
+    assert_eq!(status, 200, "transcript cursor status: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("transcript cursor JSON");
+    let second = json["text"].as_str().expect("continued text").to_owned();
+    assert_eq!(json["truncated"], true);
+    assert!(
+        body.starts_with(&format!("{first}{second}")),
+        "the continuation must resume after the first page: {first:?} {second:?}"
+    );
+
+    let (status, text) = runtime.get(&format!("{base}?max_bytes=131073")).await;
+    assert_eq!(status, 400, "transcript over-budget status: {text}");
+    assert!(text.contains("invalid_parameter"), "{text}");
+
+    let (status, text) = runtime
+        .get(&format!(
+            "/api/v1/traces/streams/{stream}/sessions/{session}/checkpoints/{}/transcript",
+            uuid::Uuid::new_v4()
+        ))
+        .await;
+    assert_eq!(status, 404, "unknown checkpoint transcript status: {text}");
+    assert!(text.contains("unknown_scope"), "{text}");
+}
+
 /// MTR-90 VER-1: the real HTTP checkpoint list and detail honour the fixed
 /// metadata page budget and the target read decision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
