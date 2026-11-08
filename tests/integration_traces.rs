@@ -13878,6 +13878,145 @@ async fn gin_operator_lease_blocks_then_allows_repair() {
     let _ = db.close().await;
 }
 
+/// MTR-17 VER-1: the real HTTP sessions list and detail honour the fixed
+/// metadata page budget and the target read decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_navigation_list_and_detail_follow_the_fixed_page_budget() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let db = runtime.db();
+    let owner = uuid::Uuid::new_v4().to_string();
+    let target = uuid::Uuid::new_v4().to_string();
+    let stream = uuid::Uuid::new_v4().to_string();
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let principal = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT current_database() AS name",
+        ))
+        .await
+        .expect("database name")
+        .expect("database name row");
+    let _ = principal;
+    for statement in [
+        format!("INSERT INTO trace_principal (id) VALUES ('{owner}')"),
+        format!(
+            "INSERT INTO trace_credential_binding (id, principal_id, namespace, credential_id) VALUES ('{}', '{owner}', 'static_push_token', 'mtr89')",
+            uuid::Uuid::new_v4()
+        ),
+        format!(
+            "INSERT INTO trace_target (id, target_kind, project_path, active) VALUES ('{target}', 'native', '/project/session-nav', true)"
+        ),
+        format!(
+            "INSERT INTO trace_stream (id, principal_id, target_id, source_repo_id, epoch_id, hash_kind, tip_oid) VALUES ('{stream}', '{owner}', '{target}', 'session-nav-source', '{epoch}', 'sha1', NULL)"
+        ),
+    ] {
+        db.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            statement,
+        ))
+        .await
+        .expect("seed traces identity");
+    }
+    for index in 0..210 {
+        db.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO trace_session (id, stream_id, session_key) VALUES ('{}', '{stream}', 'session-{index:04}')",
+                uuid::Uuid::new_v4()
+            ),
+        ))
+        .await
+        .expect("seed session row");
+    }
+
+    let (status, body) = runtime
+        .get(&format!("/api/v1/traces/streams/{stream}/sessions"))
+        .await;
+    assert_eq!(status, 200, "sessions list status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("sessions list JSON");
+    let items = json["items"].as_array().expect("sessions items");
+    assert_eq!(
+        items.len(),
+        50,
+        "omitting limit must use the protocol default of 50"
+    );
+    let first_session_key = items[0]["session_key"]
+        .as_str()
+        .expect("first session key")
+        .to_owned();
+    let cursor = json["next_cursor"]
+        .as_str()
+        .expect("sessions next cursor")
+        .to_owned();
+
+    let (status, body) = runtime
+        .get(&format!(
+            "/api/v1/traces/streams/{stream}/sessions?limit=200"
+        ))
+        .await;
+    assert_eq!(status, 200, "sessions limit=200 status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("sessions limit=200 JSON");
+    assert_eq!(
+        json["items"].as_array().expect("sessions items").len(),
+        200,
+        "limit=200 must be accepted"
+    );
+
+    let (status, body) = runtime
+        .get(&format!(
+            "/api/v1/traces/streams/{stream}/sessions?limit=201"
+        ))
+        .await;
+    assert_eq!(status, 400, "sessions limit=201 status: {body}");
+    assert!(body.contains("invalid_parameter"), "{body}");
+
+    let (status, body) = runtime
+        .get(&format!(
+            "/api/v1/traces/streams/{stream}/sessions?limit=50&cursor={cursor}"
+        ))
+        .await;
+    assert_eq!(status, 200, "sessions cursor status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("sessions cursor JSON");
+    let items = json["items"].as_array().expect("sessions cursor items");
+    assert_eq!(items.len(), 50, "the cursor page keeps the default budget");
+    assert_ne!(
+        items[0]["session_key"]
+            .as_str()
+            .expect("cursor page session key"),
+        first_session_key.as_str(),
+        "the cursor page must continue after the first page"
+    );
+
+    let (status, body) = runtime
+        .get(&format!(
+            "/api/v1/traces/streams/{stream}/sessions/session-0000"
+        ))
+        .await;
+    assert_eq!(status, 200, "session detail status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("session detail JSON");
+    assert_eq!(json["session_key"], "session-0000");
+    assert!(json["code_link"].is_string(), "{body}");
+
+    let (status, body) = runtime
+        .get(&format!(
+            "/api/v1/traces/streams/{stream}/sessions/session-missing"
+        ))
+        .await;
+    assert_eq!(status, 404, "unknown session status: {body}");
+    assert!(body.contains("unknown_scope"), "{body}");
+
+    let (status, body) = runtime
+        .get(&format!(
+            "/api/v1/traces/streams/{}/sessions",
+            uuid::Uuid::new_v4()
+        ))
+        .await;
+    assert_eq!(status, 404, "unknown stream status: {body}");
+    assert!(body.contains("unknown_scope"), "{body}");
+}
+
 /// MTR-89 VER-1: the real HTTP capabilities response carries the same fixed
 /// limits DTO that the public protocol constants define.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -383,6 +383,168 @@ impl ReadProjectionState {
     }
 }
 
+/// `GET /api/v1/traces/streams/{stream_id}/sessions` (MTR-17).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub session_key: String,
+    pub checkpoint_count: u64,
+    pub capture_time: Option<String>,
+    pub accepted_watermark: Option<String>,
+    pub indexed_watermark: Option<String>,
+    pub code_link: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionDetail {
+    pub session_id: String,
+    pub session_key: String,
+    pub checkpoint_count: u64,
+    pub capture_time: Option<String>,
+    pub accepted_watermark: Option<String>,
+    pub indexed_watermark: Option<String>,
+    pub code_link: Option<String>,
+    pub completeness: CaptureCompleteness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionPage {
+    pub schema_version: u32,
+    pub items: Vec<SessionSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionQuery {
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub code_commit: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Admitted session query. The page size is the fixed protocol default or an
+/// in-range value; the cursor is bound to the stream and the filters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequest {
+    pub agent: Option<String>,
+    pub session: Option<String>,
+    pub code_commit: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub limit: u64,
+    pub after_key: Option<String>,
+}
+
+/// Apply the fixed metadata page bounds and the session filters.
+pub fn admit_session_query(
+    stream_id: &str,
+    query: SessionQuery,
+) -> Result<SessionRequest, crate::common::errors::TracesError> {
+    use crate::common::errors::TracesError;
+    let agent = present_filter(query.agent)?;
+    let session = present_filter(query.session)?;
+    let code_commit = present_filter(query.code_commit)?;
+    let since = present_filter(query.since)?;
+    let until = present_filter(query.until)?;
+    if let Some(code_commit) = &code_commit
+        && !matches!(code_commit.len(), 40 | 64)
+        && !code_commit.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(TracesError::InvalidParameter);
+    }
+    let limit = match query.limit {
+        None => TracesProtocolLimits::METADATA_LIMIT_DEFAULT,
+        Some(limit) if (1..=TracesProtocolLimits::METADATA_LIMIT_MAX).contains(&limit) => limit,
+        Some(_) => return Err(TracesError::InvalidParameter),
+    };
+    let after_key = match query.cursor.as_deref() {
+        None => None,
+        Some(cursor) if cursor.is_empty() || cursor.chars().all(char::is_whitespace) => {
+            return Err(TracesError::InvalidCursor);
+        }
+        Some(cursor) => {
+            let rest = cursor
+                .strip_prefix("v1.")
+                .ok_or(TracesError::InvalidCursor)?;
+            let (binding, after_key) = rest.split_once('.').ok_or(TracesError::InvalidCursor)?;
+            if binding
+                != session_cursor_binding(stream_id, &agent, &session, &code_commit, &since, &until)
+                || after_key.is_empty()
+            {
+                return Err(TracesError::InvalidCursor);
+            }
+            Some(after_key.to_owned())
+        }
+    };
+    Ok(SessionRequest {
+        agent,
+        session,
+        code_commit,
+        since,
+        until,
+        limit,
+        after_key,
+    })
+}
+
+fn session_cursor_binding(
+    stream_id: &str,
+    agent: &Option<String>,
+    session: &Option<String>,
+    code_commit: &Option<String>,
+    since: &Option<String>,
+    until: &Option<String>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for value in [
+        Some(stream_id.to_owned()),
+        agent.clone(),
+        session.clone(),
+        code_commit.clone(),
+        since.clone(),
+        until.clone(),
+    ] {
+        hasher.update((value.is_some() as u8).to_le_bytes());
+        if let Some(value) = value {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Keyset cursor for one session page.
+pub fn session_cursor(stream_id: &str, request: &SessionRequest, after_key: &str) -> String {
+    format!(
+        "v1.{}.{}",
+        session_cursor_binding(
+            stream_id,
+            &request.agent,
+            &request.session,
+            &request.code_commit,
+            &request.since,
+            &request.until
+        ),
+        after_key
+    )
+}
+
 /// Errors returned when the wire filter itself is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceFilterError {

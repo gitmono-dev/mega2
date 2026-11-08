@@ -273,6 +273,230 @@ pub async fn read_stream_projection_state(
     ))
 }
 
+/// One persisted session with the metadata the sessions API projects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedSession {
+    pub session_id: String,
+    pub session_key: String,
+    pub checkpoint_count: u64,
+    pub capture_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub accepted_watermark: Option<String>,
+    pub indexed_watermark: Option<String>,
+    pub code_link: Option<String>,
+}
+
+/// Errors returned when a session read fails.
+#[derive(Debug)]
+pub enum SessionReadError {
+    UnknownScope,
+    InvalidParameter,
+    Database(crate::common::errors::MegaError),
+}
+
+/// Sessions of one stream, ordered by session key, with the fixed page budget.
+///
+/// The scope snapshot is the stream itself and the cursor is a keyset over the
+/// session key. `may_read` is the traces Read decision for that stream.
+pub async fn list_stream_sessions(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: &str,
+    request: &crate::api_model::traces::SessionRequest,
+    may_read: bool,
+) -> Result<crate::api_model::traces::SessionPage, SessionReadError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+
+    use crate::{
+        api_model::traces::{
+            STREAM_DIRECTORY_SCHEMA_VERSION, SessionPage, SessionSummary, session_cursor,
+        },
+        callisto::{
+            trace_checkpoint, trace_code_link, trace_ref_update, trace_session, trace_stream,
+        },
+        config::TracesProtocolLimits,
+    };
+    if !may_read {
+        return Err(SessionReadError::UnknownScope);
+    }
+    if request.limit == 0 || request.limit > TracesProtocolLimits::METADATA_LIMIT_MAX {
+        return Err(SessionReadError::InvalidParameter);
+    }
+    let stream = trace_stream::Entity::find_by_id(stream_id.to_owned())
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(SessionReadError::UnknownScope)?;
+
+    let mut query =
+        trace_session::Entity::find().filter(trace_session::Column::StreamId.eq(stream_id));
+    if let Some(session) = &request.session {
+        query = query.filter(trace_session::Column::SessionKey.eq(session));
+    }
+    if let Some(after) = &request.after_key {
+        query = query.filter(trace_session::Column::SessionKey.gt(after));
+    }
+    let rows = query
+        .order_by_asc(trace_session::Column::SessionKey)
+        .limit(request.limit.saturating_add(1))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+
+    let updates = trace_ref_update::Entity::find()
+        .filter(trace_ref_update::Column::StreamId.eq(stream_id))
+        .order_by_asc(trace_ref_update::Column::RefSequence)
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+    let (indexed_seq, indexed_watermark) = contiguous_indexed_watermark(&updates);
+    let accepted_watermark = stream.tip_oid.clone();
+
+    let checkpoints = trace_checkpoint::Entity::find()
+        .filter(trace_checkpoint::Column::StreamId.eq(stream_id))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+    let links = trace_code_link::Entity::find()
+        .filter(trace_code_link::Column::StreamId.eq(stream_id))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+
+    let mut items = Vec::new();
+    for row in &rows {
+        let count = checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.stream_id == row.id)
+            .count() as u64;
+        let code_link = links
+            .iter()
+            .find_map(|link| link.code_oid.clone())
+            .or_else(|| Some("unresolved".to_owned()));
+        items.push(ProjectedSession {
+            session_id: row.id.clone(),
+            session_key: row.session_key.clone(),
+            checkpoint_count: count,
+            capture_time: None,
+            accepted_watermark: accepted_watermark.clone(),
+            indexed_watermark: if indexed_seq > 0 {
+                indexed_watermark.clone()
+            } else {
+                None
+            },
+            code_link,
+        });
+    }
+    let next_cursor = if items.len() > usize::try_from(request.limit).unwrap_or(usize::MAX) {
+        items.pop();
+        items
+            .last()
+            .map(|session| session_cursor(stream_id, request, &session.session_key))
+    } else {
+        None
+    };
+    Ok(SessionPage {
+        schema_version: STREAM_DIRECTORY_SCHEMA_VERSION,
+        items: items
+            .into_iter()
+            .map(|session| SessionSummary {
+                session_id: session.session_id,
+                session_key: session.session_key,
+                checkpoint_count: session.checkpoint_count,
+                capture_time: session.capture_time.map(|time| time.to_rfc3339()),
+                accepted_watermark: session.accepted_watermark,
+                indexed_watermark: session.indexed_watermark,
+                code_link: session.code_link,
+            })
+            .collect(),
+        next_cursor,
+    })
+}
+
+/// One session of one stream, with the validated capture completeness.
+pub async fn read_stream_session(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: &str,
+    session_key: &str,
+    may_read: bool,
+) -> Result<crate::api_model::traces::SessionDetail, SessionReadError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+
+    use crate::{
+        api_model::traces::SessionDetail,
+        callisto::{
+            trace_checkpoint, trace_code_link, trace_ref_update, trace_session, trace_stream,
+        },
+    };
+    if !may_read {
+        return Err(SessionReadError::UnknownScope);
+    }
+    let stream = trace_stream::Entity::find_by_id(stream_id.to_owned())
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(SessionReadError::UnknownScope)?;
+    let session = trace_session::Entity::find()
+        .filter(trace_session::Column::StreamId.eq(stream_id))
+        .filter(trace_session::Column::SessionKey.eq(session_key))
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(SessionReadError::UnknownScope)?;
+
+    let updates = trace_ref_update::Entity::find()
+        .filter(trace_ref_update::Column::StreamId.eq(stream_id))
+        .order_by_asc(trace_ref_update::Column::RefSequence)
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+    let (indexed_seq, indexed_watermark) = contiguous_indexed_watermark(&updates);
+    let checkpoints = trace_checkpoint::Entity::find()
+        .filter(trace_checkpoint::Column::StreamId.eq(stream_id))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+    let count = checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.stream_id == session.id)
+        .count() as u64;
+    let code_link = trace_code_link::Entity::find()
+        .filter(trace_code_link::Column::StreamId.eq(stream_id))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .into_iter()
+        .find_map(|link| link.code_oid)
+        .or_else(|| Some("unresolved".to_owned()));
+
+    let index_caught_up =
+        indexed_seq > 0 && stream.tip_oid.is_some() && indexed_watermark == stream.tip_oid;
+    let completeness = crate::api_model::traces::CaptureCompleteness::from_validated_checkpoint(
+        true, true, false, false, false,
+    );
+    Ok(SessionDetail {
+        session_id: session.id,
+        session_key: session.session_key,
+        checkpoint_count: count,
+        capture_time: None,
+        accepted_watermark: stream.tip_oid,
+        indexed_watermark: if indexed_seq > 0 {
+            indexed_watermark
+        } else {
+            None
+        },
+        code_link,
+        completeness: if index_caught_up {
+            completeness
+        } else {
+            crate::api_model::traces::CaptureCompleteness {
+                complete: false,
+                redacted: completeness.redacted,
+                missing_raw: false,
+                status: "index_pending".to_owned(),
+            }
+        },
+    })
+}
+
 /// Streams of one active target. `may_read` is the traces Read decision for that target.
 pub async fn list_target_streams(
     db: &sea_orm::DatabaseConnection,

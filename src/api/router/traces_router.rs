@@ -10,8 +10,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use crate::{
     api::MonoApiServiceState,
     api_model::traces::{
-        StreamDirectory, StreamDirectoryQuery, TargetResolve, TargetResolveQuery,
-        TracesCapabilities, admit_stream_directory_query,
+        SessionDetail, SessionPage, SessionQuery, StreamDirectory, StreamDirectoryQuery,
+        TargetResolve, TargetResolveQuery, TracesCapabilities, admit_session_query,
+        admit_stream_directory_query,
     },
     ceres::api_service::state::ProtocolApiState,
     common::errors::{ApiError, MegaError, TracesError},
@@ -24,6 +25,8 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(capabilities))
         .routes(routes!(resolve_target))
         .routes(routes!(list_target_streams))
+        .routes(routes!(list_stream_sessions))
+        .routes(routes!(read_stream_session))
 }
 
 /// Capabilities for an authenticated caller.
@@ -116,6 +119,127 @@ pub async fn list_target_streams(
         Err(trace_query_service::StreamDirectoryError::Database(error)) => {
             Err(ApiError::from(error))
         }
+    }
+}
+
+/// Sessions of one stream. The stream scope is the only authorization scope.
+#[utoipa::path(
+    get,
+    path = "/traces/streams/{stream_id}/sessions",
+    params(
+        ("stream_id" = String, Path, description = "Stream id"),
+        ("agent" = Option<String>, Query, description = "Exact metadata.agent_kind"),
+        ("session" = Option<String>, Query, description = "Exact session key"),
+        ("code_commit" = Option<String>, Query, description = "Exact code OID"),
+        ("since" = Option<String>, Query, description = "RFC3339 lower bound"),
+        ("until" = Option<String>, Query, description = "RFC3339 upper bound"),
+        ("limit" = Option<u64>, Query, description = "Page size; default 50, max 200"),
+        ("cursor" = Option<String>, Query, description = "Keyset cursor bound to these filters")
+    ),
+    responses(
+        (status = 200, description = "Session page", body = SessionPage),
+        (status = 400, description = "Invalid parameter or cursor"),
+        (status = 401, description = "Missing or rejected credentials"),
+        (status = 404, description = "Unknown or unreadable stream")
+    ),
+    tag = "Traces"
+)]
+pub async fn list_stream_sessions(
+    State(state): State<MonoApiServiceState>,
+    Path(stream_id): Path<String>,
+    headers: HeaderMap,
+    query: Result<Query<SessionQuery>, QueryRejection>,
+) -> Result<Json<SessionPage>, ApiError> {
+    let protocol = ProtocolApiState::from_ref(&state);
+    authenticate_trace_api(&protocol, &headers)
+        .await
+        .map_err(ApiError::from)?;
+    let Query(query) =
+        query.map_err(|_| ApiError::from(MegaError::from(TracesError::InvalidParameter)))?;
+    let request = admit_session_query(&stream_id, query)
+        .map_err(|error| ApiError::from(MegaError::from(error)))?;
+    let mono = state.storage.mono_storage();
+    let db = mono.get_connection();
+    let may_read =
+        match authorize_trace_api_read_for_stream(&protocol, &headers, db, &stream_id).await {
+            Ok(may_read) => may_read,
+            Err(error) => return Err(ApiError::from(error)),
+        };
+    match trace_query_service::list_stream_sessions(db, &stream_id, &request, may_read).await {
+        Ok(body) => Ok(Json(body)),
+        Err(trace_query_service::SessionReadError::UnknownScope) => {
+            Err(ApiError::from(MegaError::from(TracesError::UnknownScope)))
+        }
+        Err(trace_query_service::SessionReadError::InvalidParameter) => Err(ApiError::from(
+            MegaError::from(TracesError::InvalidParameter),
+        )),
+        Err(trace_query_service::SessionReadError::Database(error)) => Err(ApiError::from(error)),
+    }
+}
+
+/// One session of one stream. The stream scope is the only authorization scope.
+#[utoipa::path(
+    get,
+    path = "/traces/streams/{stream_id}/sessions/{session_id}",
+    params(
+        ("stream_id" = String, Path, description = "Stream id"),
+        ("session_id" = String, Path, description = "Session key")
+    ),
+    responses(
+        (status = 200, description = "Session metadata", body = SessionDetail),
+        (status = 401, description = "Missing or rejected credentials"),
+        (status = 404, description = "Unknown or unreadable session")
+    ),
+    tag = "Traces"
+)]
+pub async fn read_stream_session(
+    State(state): State<MonoApiServiceState>,
+    Path((stream_id, session_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<SessionDetail>, ApiError> {
+    let protocol = ProtocolApiState::from_ref(&state);
+    authenticate_trace_api(&protocol, &headers)
+        .await
+        .map_err(ApiError::from)?;
+    let mono = state.storage.mono_storage();
+    let db = mono.get_connection();
+    let may_read =
+        match authorize_trace_api_read_for_stream(&protocol, &headers, db, &stream_id).await {
+            Ok(may_read) => may_read,
+            Err(error) => return Err(ApiError::from(error)),
+        };
+    match trace_query_service::read_stream_session(db, &stream_id, &session_id, may_read).await {
+        Ok(body) => Ok(Json(body)),
+        Err(trace_query_service::SessionReadError::UnknownScope) => {
+            Err(ApiError::from(MegaError::from(TracesError::UnknownScope)))
+        }
+        Err(trace_query_service::SessionReadError::InvalidParameter) => Err(ApiError::from(
+            MegaError::from(TracesError::InvalidParameter),
+        )),
+        Err(trace_query_service::SessionReadError::Database(error)) => Err(ApiError::from(error)),
+    }
+}
+
+/// Read decision for one stream, resolved through its active target path.
+async fn authorize_trace_api_read_for_stream(
+    protocol: &ProtocolApiState,
+    headers: &HeaderMap,
+    db: &sea_orm::DatabaseConnection,
+    stream_id: &str,
+) -> Result<bool, MegaError> {
+    use sea_orm::EntityTrait;
+    let stream = crate::callisto::trace_stream::Entity::find_by_id(stream_id.to_owned())
+        .one(db)
+        .await?
+        .ok_or_else(|| MegaError::from(TracesError::UnknownScope))?;
+    let target = crate::jupiter::storage::trace_target_storage::find_by_id(db, &stream.target_id)
+        .await?
+        .filter(|row| row.active)
+        .ok_or_else(|| MegaError::from(TracesError::UnknownScope))?;
+    match authorize_trace_api_read(protocol, headers, &target.project_path).await {
+        Ok(_) => Ok(true),
+        Err(MegaError::Traces(TracesError::UnknownScope)) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 

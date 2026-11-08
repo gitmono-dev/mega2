@@ -26,6 +26,7 @@ pub struct TracesRuntime {
     token: String,
     database_url: String,
     database: Option<crate::traces_db::TracesDb>,
+    db: Option<sea_orm::DatabaseConnection>,
 }
 
 impl TracesRuntime {
@@ -144,16 +145,23 @@ impl TracesRuntime {
             token,
             database_url,
             database: None,
+            db: None,
         };
         let mut runtime = runtime;
         runtime.await_ready().await;
         runtime.database = Some(database);
+        runtime.db = Some(db);
         runtime
     }
 
     /// Base URL of the running service.
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Database connection of this runtime, for public SQL fixtures only.
+    pub fn db(&self) -> &sea_orm::DatabaseConnection {
+        self.db.as_ref().expect("runtime database connection")
     }
 
     /// GET a path with the synthetic credential and return the status and body.
