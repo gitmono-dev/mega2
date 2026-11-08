@@ -185,7 +185,17 @@ pub async fn read_session_checkpoint_transcript(
     )
     .await
     {
-        Ok(body) => Ok(Json(body)),
+        Ok(body) => {
+            // The envelope is measured before it is returned, so an
+            // over-budget response is rejected whole instead of being cut
+            // into invalid JSON.
+            crate::api_model::traces_budget::fit_envelope(
+                &body,
+                &crate::api_model::traces_budget::ResponseBudget::from_protocol_limits(),
+            )
+            .map_err(|error| ApiError::from(MegaError::from(error)))?;
+            Ok(Json(body))
+        }
         Err(trace_query_service::SessionReadError::UnknownScope) => {
             Err(ApiError::from(MegaError::from(TracesError::UnknownScope)))
         }
@@ -684,6 +694,33 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("invalid_parameter"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn response_budget_routes_reject_an_over_budget_envelope_as_valid_json() {
+        use crate::api_model::traces_budget::{ResponseBudget, fit_envelope};
+
+        // The shared budget is the one the protocol declares.
+        let budget = ResponseBudget::from_protocol_limits();
+        assert_eq!(
+            budget.max_bytes,
+            crate::config::TracesProtocolLimits::RESPONSE_BYTES_MAX
+        );
+
+        // An over-budget response is rejected whole, and the error the client
+        // reads is still valid JSON.
+        let error = fit_envelope(&"a".repeat(2 * 1024 * 1024), &budget).expect_err("budget");
+        assert_eq!(error.code(), "response_budget");
+        assert_eq!(error.http_status().as_u16(), 413);
+        let rendered = serde_json::to_string(&error.public_message()).expect("error JSON");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&rendered).is_ok(),
+            "{rendered}"
+        );
+
+        // A response that fits is returned whole.
+        let ok = fit_envelope(&"ab", &budget).expect("envelope");
+        assert_eq!(ok, b"\"ab\"".to_vec());
     }
 
     #[tokio::test]

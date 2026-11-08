@@ -1300,6 +1300,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_budget_reads_the_protocol_limits_for_every_surface() {
+        use crate::{
+            api_model::traces_budget::{
+                ResponseBudget, admit_body_bytes, admit_search_limit, fit_body,
+            },
+            config::TracesProtocolLimits,
+        };
+
+        // Every surface reads the same protocol constants.
+        let budget = ResponseBudget::from_protocol_limits();
+        assert_eq!(budget.max_bytes, TracesProtocolLimits::RESPONSE_BYTES_MAX);
+        assert_eq!(
+            admit_search_limit(None).expect("search default"),
+            TracesProtocolLimits::SEARCH_LIMIT_DEFAULT
+        );
+        assert_eq!(
+            admit_body_bytes(None).expect("body default"),
+            TracesProtocolLimits::TEXT_BYTES_DEFAULT
+        );
+
+        // A body that does not fit is cut on a character boundary and the
+        // cursor continues from the byte the cut stopped at.
+        // The body is five bytes: a three-byte character and two ASCII bytes.
+        let cut = fit_body("雪ab", &ResponseBudget { max_bytes: 4 }).expect("body");
+        assert!(!cut.is_whole());
+        assert_eq!(cut.next_cursor(), Some(4));
+
+        // A budget that holds exactly the character stops at its boundary.
+        let cut = fit_body("雪ab", &ResponseBudget { max_bytes: 3 }).expect("body");
+        assert!(!cut.is_whole());
+        assert_eq!(cut.next_cursor(), Some(3));
+
+        // A budget that cannot hold the character rejects it instead of
+        // cutting it into invalid text.
+        let narrow = ResponseBudget { max_bytes: 2 };
+        let error = fit_body("雪ab", &narrow).expect_err("budget");
+        assert_eq!(error.code(), "response_budget");
+
+        // A body that fits is returned whole with no cursor.
+        let whole = fit_body("abcd", &ResponseBudget { max_bytes: 4 }).expect("body");
+        assert!(whole.is_whole());
+        assert_eq!(whole.next_cursor(), None);
+    }
+
+    #[tokio::test]
     async fn stream_directory_pages_filters_and_index_status() {
         use chrono::Utc;
         use sea_orm::{ActiveModelTrait, Set};
