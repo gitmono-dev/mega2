@@ -254,6 +254,135 @@ pub fn admit_stream_directory_query(
     })
 }
 
+/// Validated capture completeness for a read projection (MTR-63).
+///
+/// Completeness is derived only from validated checkpoint parse and schema
+/// results; `redacted = true` never sets `missing_raw = true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CaptureCompleteness {
+    pub complete: bool,
+    pub redacted: bool,
+    pub missing_raw: bool,
+    pub status: String,
+}
+
+impl CaptureCompleteness {
+    /// Project completeness from one validated checkpoint outcome.
+    pub fn from_validated_checkpoint(
+        parse_valid: bool,
+        schema_supported: bool,
+        schema_invalid: bool,
+        redacted: bool,
+        missing_raw: bool,
+    ) -> Self {
+        let effective_missing_raw = !redacted && missing_raw;
+        if !parse_valid || schema_invalid {
+            return Self {
+                complete: false,
+                redacted,
+                missing_raw: false,
+                status: "invalid".to_owned(),
+            };
+        }
+        if !schema_supported {
+            return Self {
+                complete: false,
+                redacted: false,
+                missing_raw: false,
+                status: "unsupported".to_owned(),
+            };
+        }
+        if effective_missing_raw {
+            return Self {
+                complete: false,
+                redacted,
+                missing_raw: true,
+                status: "missing_raw".to_owned(),
+            };
+        }
+        Self {
+            complete: true,
+            redacted,
+            missing_raw: false,
+            status: "complete".to_owned(),
+        }
+    }
+}
+
+/// Stream metadata index coverage and capture validation state (MTR-63).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReadProjectionState {
+    pub accepted_seq: u64,
+    pub accepted_watermark: Option<String>,
+    pub indexed_seq: u64,
+    pub indexed_watermark: Option<String>,
+    pub index_state: String,
+    pub unsupported: u64,
+    pub invalid: u64,
+    pub coverage_complete: bool,
+    pub completeness: CaptureCompleteness,
+}
+
+impl ReadProjectionState {
+    /// Assemble the wire projection from watermarks and validated checkpoint counts.
+    ///
+    /// When the index is behind (`index_state != "indexed"`), `coverage_complete`
+    /// and `completeness.complete` stay `false` even when the result set is empty.
+    pub fn project(
+        accepted: (u64, Option<String>),
+        indexed: (u64, Option<String>),
+        unsupported: u64,
+        invalid: u64,
+        redacted: bool,
+        missing_raw: bool,
+    ) -> Self {
+        let (accepted_seq, accepted_watermark) = accepted;
+        let (indexed_seq, indexed_watermark) = indexed;
+        let effective_missing_raw = !redacted && missing_raw;
+        let index_state = match accepted_watermark.as_deref() {
+            None if accepted_seq == 0 => "empty",
+            Some(tip)
+                if accepted_seq > 0
+                    && indexed_seq == accepted_seq
+                    && indexed_watermark.as_deref() == Some(tip) =>
+            {
+                "indexed"
+            }
+            _ => "index_pending",
+        };
+        let index_caught_up = index_state == "indexed";
+        let coverage_complete =
+            index_caught_up && unsupported == 0 && invalid == 0 && !effective_missing_raw;
+        let status = if !index_caught_up {
+            index_state
+        } else if invalid > 0 {
+            "invalid"
+        } else if unsupported > 0 {
+            "unsupported"
+        } else if effective_missing_raw {
+            "missing_raw"
+        } else {
+            "complete"
+        };
+        Self {
+            accepted_seq,
+            accepted_watermark,
+            indexed_seq,
+            indexed_watermark,
+            index_state: index_state.to_owned(),
+            unsupported,
+            invalid,
+            coverage_complete,
+            completeness: CaptureCompleteness {
+                complete: coverage_complete,
+                redacted,
+                missing_raw: effective_missing_raw,
+                status: status.to_owned(),
+            },
+        }
+    }
+}
+
 /// Errors returned when the wire filter itself is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceFilterError {
@@ -675,5 +804,49 @@ mod tests {
         assert_eq!(json["target_kind"], "native");
         let decoded: TargetResolve = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn read_projection_wire_projects_watermarks_counts_and_redacted_completeness() {
+        let redacted_only =
+            CaptureCompleteness::from_validated_checkpoint(true, true, false, true, true);
+        assert!(redacted_only.complete);
+        assert!(redacted_only.redacted);
+        assert!(!redacted_only.missing_raw);
+        assert_eq!(redacted_only.status, "complete");
+
+        let lagging_empty = ReadProjectionState::project(
+            (2, Some("b".repeat(40))),
+            (1, Some("a".repeat(40))),
+            0,
+            0,
+            false,
+            false,
+        );
+        assert_eq!(lagging_empty.accepted_seq, 2);
+        assert_eq!(lagging_empty.indexed_seq, 1);
+        assert_eq!(lagging_empty.index_state, "index_pending");
+        assert!(!lagging_empty.coverage_complete);
+        assert!(!lagging_empty.completeness.complete);
+
+        let caught_up = ReadProjectionState::project(
+            (2, Some("b".repeat(40))),
+            (2, Some("b".repeat(40))),
+            1,
+            2,
+            true,
+            true,
+        );
+        let json = serde_json::to_value(&caught_up).unwrap();
+        assert_eq!(json["accepted_seq"], 2);
+        assert_eq!(json["indexed_seq"], 2);
+        assert_eq!(json["index_state"], "indexed");
+        assert_eq!(json["unsupported"], 1);
+        assert_eq!(json["invalid"], 2);
+        assert_eq!(json["coverage_complete"], false);
+        assert_eq!(json["completeness"]["redacted"], true);
+        assert_eq!(json["completeness"]["missing_raw"], false);
+        let decoded: ReadProjectionState = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, caught_up);
     }
 }

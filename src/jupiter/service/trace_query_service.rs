@@ -166,8 +166,11 @@ fn stream_status(accepted: Option<&str>, indexed: Option<&str>) -> &'static str 
     }
 }
 
-/// Last `new_tip` of the contiguous `indexed` prefix starting at sequence 1.
-fn contiguous_indexed_tip(updates: &[crate::callisto::trace_ref_update::Model]) -> Option<String> {
+/// Last `new_tip` and sequence of the contiguous `indexed` prefix starting at sequence 1.
+fn contiguous_indexed_watermark(
+    updates: &[crate::callisto::trace_ref_update::Model],
+) -> (u64, Option<String>) {
+    let mut seq = 0_u64;
     let mut tip = None;
     for (offset, row) in updates.iter().enumerate() {
         let Ok(offset) = i64::try_from(offset) else {
@@ -176,9 +179,98 @@ fn contiguous_indexed_tip(updates: &[crate::callisto::trace_ref_update::Model]) 
         if row.ref_sequence != offset + 1 || row.state != "indexed" {
             break;
         }
+        let Ok(next_seq) = u64::try_from(row.ref_sequence) else {
+            break;
+        };
+        seq = next_seq;
         tip = Some(row.new_tip.clone());
     }
-    tip
+    (seq, tip)
+}
+
+/// Last `new_tip` of the contiguous `indexed` prefix starting at sequence 1.
+fn contiguous_indexed_tip(updates: &[crate::callisto::trace_ref_update::Model]) -> Option<String> {
+    contiguous_indexed_watermark(updates).1
+}
+
+/// Project stream metadata index coverage and capture validation state (MTR-63).
+///
+/// Watermarks and `index_state` are read from the durable stream and journal
+/// rows; `unsupported`, `invalid`, `redacted`, and `missing_raw` come from the
+/// validated checkpoint parse and schema results.
+pub async fn read_stream_projection_state(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: &str,
+    validated_checkpoints: &[(
+        crate::ceres::traces::parser::CheckpointParse,
+        crate::ceres::traces::parser::CaptureSchema,
+    )],
+) -> Result<crate::api_model::traces::ReadProjectionState, StreamDirectoryError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+
+    use crate::{
+        api_model::traces::ReadProjectionState,
+        callisto::{trace_ref_update, trace_stream},
+        ceres::traces::parser::{CaptureSchema, CheckpointParse},
+    };
+
+    let stream = trace_stream::Entity::find_by_id(stream_id.to_owned())
+        .one(db)
+        .await
+        .map_err(|err| StreamDirectoryError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(StreamDirectoryError::UnknownScope)?;
+    let updates = trace_ref_update::Entity::find()
+        .filter(trace_ref_update::Column::StreamId.eq(stream_id))
+        .order_by_asc(trace_ref_update::Column::RefSequence)
+        .all(db)
+        .await
+        .map_err(|err| {
+            StreamDirectoryError::Database(crate::common::errors::MegaError::from(err))
+        })?;
+    let accepted_seq = updates
+        .last()
+        .and_then(|row| u64::try_from(row.ref_sequence).ok())
+        .unwrap_or(0);
+    let accepted_watermark = stream
+        .tip_oid
+        .or_else(|| updates.last().map(|row| row.new_tip.clone()));
+    let (indexed_seq, indexed_watermark) = contiguous_indexed_watermark(&updates);
+
+    let mut unsupported = 0_u64;
+    let mut invalid = 0_u64;
+    let mut any_redacted = false;
+    let mut any_missing_raw = false;
+    for (parse, schema) in validated_checkpoints {
+        if matches!(parse, CheckpointParse::Invalid { .. }) {
+            invalid = invalid.saturating_add(1);
+            continue;
+        }
+        match schema {
+            CaptureSchema::Invalid { .. } => {
+                invalid = invalid.saturating_add(1);
+            }
+            CaptureSchema::Unsupported => {
+                unsupported = unsupported.saturating_add(1);
+            }
+            CaptureSchema::Supported {
+                redacted,
+                missing_raw,
+                ..
+            } => {
+                any_redacted |= *redacted;
+                any_missing_raw |= !*redacted && *missing_raw;
+            }
+        }
+    }
+
+    Ok(ReadProjectionState::project(
+        (accepted_seq, accepted_watermark),
+        (indexed_seq, indexed_watermark),
+        unsupported,
+        invalid,
+        any_redacted,
+        any_missing_raw,
+    ))
 }
 
 /// Streams of one active target. `may_read` is the traces Read decision for that target.
@@ -742,5 +834,157 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn read_projection_state_tracks_watermarks_counts_lagging_empty_and_redacted_only() {
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, Set};
+        use uuid::Uuid;
+
+        use crate::ceres::traces::parser::{
+            CheckpointLocation, CheckpointParse, InvalidCheckpoint, classify_capture,
+            parse_checkpoint,
+        };
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = crate::jupiter::tests::test_db_connection(temp_dir.path()).await;
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .unwrap();
+        let now = Utc::now().fixed_offset();
+        let owner = Uuid::new_v4().to_string();
+        crate::callisto::trace_principal::ActiveModel {
+            id: Set(owner.clone()),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let target = crate::jupiter::storage::trace_target_storage::insert_active(
+            &db,
+            "native",
+            "/project/read-projection",
+            None,
+        )
+        .await
+        .unwrap();
+        let tip_1 = "a".repeat(40);
+        let tip_2 = "b".repeat(40);
+        let stream_id = crate::callisto::trace_stream::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            principal_id: Set(owner),
+            target_id: Set(target.id),
+            source_repo_id: Set("source-projection".to_owned()),
+            epoch_id: Set(Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(Some(tip_2.clone())),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap()
+        .id;
+        for (seq, tip, state) in [
+            (1_i64, tip_1.as_str(), "indexed"),
+            (2_i64, tip_2.as_str(), "pending"),
+        ] {
+            crate::callisto::trace_ref_update::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                stream_id: Set(stream_id.clone()),
+                ref_sequence: Set(seq),
+                idempotency_key: Set(Uuid::new_v4().to_string()),
+                old_tip: Set(None),
+                new_tip: Set(tip.to_owned()),
+                state: Set(state.to_owned()),
+                claim_until: Set(None),
+                attempt_count: Set(0),
+                created_at: Set(now),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        // AC-2, AC-3, AC-4, AC-7: lagging index with empty results is not complete.
+        let lagging = super::read_stream_projection_state(&db, &stream_id, &[])
+            .await
+            .unwrap();
+        assert_eq!(lagging.accepted_seq, 2);
+        assert_eq!(lagging.accepted_watermark.as_deref(), Some(tip_2.as_str()));
+        assert_eq!(lagging.indexed_seq, 1);
+        assert_eq!(lagging.indexed_watermark.as_deref(), Some(tip_1.as_str()));
+        assert_eq!(lagging.index_state, "index_pending");
+        assert!(!lagging.coverage_complete);
+        assert!(!lagging.completeness.complete);
+
+        // Advance ref_sequence 2 to indexed and verify AC-1, AC-5, AC-6, AC-8.
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let pending_row = crate::callisto::trace_ref_update::Entity::find()
+            .filter(crate::callisto::trace_ref_update::Column::StreamId.eq(&stream_id))
+            .filter(crate::callisto::trace_ref_update::Column::RefSequence.eq(2_i64))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: crate::callisto::trace_ref_update::ActiveModel = pending_row.into();
+        active.state = Set("indexed".to_owned());
+        active.update(&db).await.unwrap();
+
+        let roles = crate::ceres::traces::parser::CheckpointRoles {
+            metadata: Some("c".repeat(40)),
+            manifest: Some("d".repeat(40)),
+        };
+        let redacted_meta = br#"{"schema_version":2,"checkpoint_id":"cp01","agent_kind":"claude_code","created_at":1700000000}"#;
+        let redacted_manifest = br#"{"schema_version":1,"checkpoint_id":"cp01","entries":{"lifecycle_events":{"schema_version":2},"transcript":{"redaction":"redacted"}}}"#;
+        let parsed_ok = parse_checkpoint(
+            CheckpointLocation {
+                checkpoint_id: "cp01".to_owned(),
+                tree_oid: "e".repeat(40),
+            },
+            &roles,
+            redacted_meta,
+            redacted_manifest,
+        );
+        let schema_redacted = classify_capture(redacted_meta, redacted_manifest);
+        let redacted_state = super::read_stream_projection_state(
+            &db,
+            &stream_id,
+            &[(parsed_ok.clone(), schema_redacted.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(redacted_state.index_state, "indexed");
+        assert!(redacted_state.coverage_complete);
+        assert!(redacted_state.completeness.complete);
+        assert!(redacted_state.completeness.redacted);
+        assert!(!redacted_state.completeness.missing_raw);
+
+        let unsupported_meta = br#"{"schema_version":99,"checkpoint_id":"cp01"}"#;
+        let schema_unsupported = classify_capture(unsupported_meta, redacted_manifest);
+        let invalid_meta = br#"{"schema_version":2,"checkpoint_id":"cp01","agent_kind":"claude_code","created_at":1700000000000}"#;
+        let schema_invalid = classify_capture(invalid_meta, redacted_manifest);
+        let layout_invalid = CheckpointParse::Invalid {
+            key: "cp02".to_owned(),
+            tree_oid: "f".repeat(40),
+            reason: InvalidCheckpoint::MissingManifest,
+        };
+        let mixed = super::read_stream_projection_state(
+            &db,
+            &stream_id,
+            &[
+                (parsed_ok.clone(), schema_redacted.clone()),
+                (parsed_ok.clone(), schema_unsupported),
+                (parsed_ok, schema_invalid),
+                (layout_invalid, schema_redacted),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(mixed.unsupported, 1);
+        assert_eq!(mixed.invalid, 2);
+        assert!(!mixed.coverage_complete);
+        assert!(!mixed.completeness.complete);
+        assert!(!mixed.completeness.missing_raw);
     }
 }
