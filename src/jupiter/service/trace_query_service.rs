@@ -193,6 +193,57 @@ fn contiguous_indexed_watermark(
     (seq, tip)
 }
 
+/// The pinned watermarks of one stream, read from its journal.
+///
+/// The accepted sequence is the highest journal row, and the indexed sequence
+/// is the contiguous `indexed` prefix. A query pins both so a later page reads
+/// the same snapshot even when a new push arrives or the indexer catches up.
+pub async fn pin_query_snapshot(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: &str,
+) -> Result<crate::ceres::traces::cursor::QuerySnapshot, StreamDirectoryError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+
+    use crate::callisto::trace_ref_update;
+    let updates = trace_ref_update::Entity::find()
+        .filter(trace_ref_update::Column::StreamId.eq(stream_id))
+        .order_by_asc(trace_ref_update::Column::RefSequence)
+        .all(db)
+        .await
+        .map_err(|err| {
+            StreamDirectoryError::Database(crate::common::errors::MegaError::from(err))
+        })?;
+    let accepted_seq = updates
+        .last()
+        .and_then(|row| u64::try_from(row.ref_sequence).ok())
+        .unwrap_or(0);
+    let (indexed_seq, _) = contiguous_indexed_watermark(&updates);
+    Ok(crate::ceres::traces::cursor::QuerySnapshot::new(
+        accepted_seq,
+        indexed_seq,
+        INDEX_VERSION,
+    ))
+}
+
+/// The index version the query surface reads from.
+pub const INDEX_VERSION: u64 = 1;
+
+/// The binding of one snapshot query.
+///
+/// The binding covers the scope and the exact filters, so a cursor issued for
+/// one query is rejected by any other.
+pub fn snapshot_binding(
+    scope: &str,
+    filters: &str,
+    index_version: u64,
+) -> crate::ceres::traces::cursor::SnapshotBinding {
+    crate::ceres::traces::cursor::SnapshotBinding {
+        scope: scope.to_owned(),
+        filters: filters.to_owned(),
+        index_version,
+    }
+}
+
 /// Last `new_tip` of the contiguous `indexed` prefix starting at sequence 1.
 fn contiguous_indexed_tip(updates: &[crate::callisto::trace_ref_update::Model]) -> Option<String> {
     contiguous_indexed_watermark(updates).1
@@ -1025,6 +1076,115 @@ mod tests {
         // The CJK capability never turns the search surface on by itself.
         assert!(!ready.search_ready);
         assert!(!ready.bounded_scan_supported);
+    }
+
+    #[tokio::test]
+    async fn snapshot_query_pins_the_watermarks_and_keeps_an_old_cursor_stable() {
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, Set};
+        use uuid::Uuid;
+
+        use crate::ceres::traces::cursor::{decode_cursor, encode_cursor};
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = crate::jupiter::tests::test_db_connection(temp_dir.path()).await;
+        crate::jupiter::migration::apply_migrations(&db, true)
+            .await
+            .unwrap();
+        let now = Utc::now().fixed_offset();
+        let target = crate::jupiter::storage::trace_target_storage::insert_active(
+            &db,
+            "native",
+            "/project/app",
+            None,
+        )
+        .await
+        .unwrap();
+        let target_id = target.id.clone();
+        let owner = Uuid::new_v4().to_string();
+        crate::callisto::trace_principal::ActiveModel {
+            id: Set(owner.clone()),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let stream_id = Uuid::new_v4().to_string();
+        crate::callisto::trace_stream::ActiveModel {
+            id: Set(stream_id.clone()),
+            principal_id: Set(owner),
+            target_id: Set(target_id),
+            source_repo_id: Set("snapshot-source".to_owned()),
+            epoch_id: Set(Uuid::new_v4().to_string()),
+            hash_kind: Set("sha1".to_owned()),
+            tip_oid: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        async fn journal(
+            db: &sea_orm::DatabaseConnection,
+            stream_id: &str,
+            sequence: i64,
+            state: &str,
+        ) {
+            crate::callisto::trace_ref_update::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                stream_id: Set(stream_id.to_owned()),
+                ref_sequence: Set(sequence),
+                idempotency_key: Set(Uuid::new_v4().to_string()),
+                old_tip: Set(None),
+                new_tip: Set(format!("{sequence:040x}")),
+                state: Set(state.to_owned()),
+                claim_until: Set(None),
+                attempt_count: Set(0),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+
+        journal(&db, &stream_id, 1, "indexed").await;
+        journal(&db, &stream_id, 2, "indexed").await;
+
+        // The first request pins the watermarks it reads.
+        let snapshot = super::pin_query_snapshot(&db, &stream_id)
+            .await
+            .expect("snapshot");
+        assert_eq!(snapshot.accepted_seq, 2);
+        assert_eq!(snapshot.indexed_seq, 2);
+        assert_eq!(snapshot.index_version, super::INDEX_VERSION);
+
+        let binding = super::snapshot_binding(&stream_id, "query=needle", super::INDEX_VERSION);
+        let cursor = encode_cursor(&binding, &snapshot, "key-1");
+
+        // A new push arrives after the snapshot was taken.
+        journal(&db, &stream_id, 3, "indexed").await;
+        // The background indexer catches up on the row that was pending.
+        journal(&db, &stream_id, 4, "pending").await;
+
+        // The old cursor still reads the pinned snapshot.
+        let decoded = decode_cursor(&cursor, &binding).expect("cursor");
+        assert_eq!(decoded.snapshot.accepted_seq, 2);
+        assert_eq!(decoded.snapshot.indexed_seq, 2);
+        assert_eq!(decoded.after_key, "key-1");
+
+        // A fresh query sees the newer watermarks instead.
+        let fresh = super::pin_query_snapshot(&db, &stream_id)
+            .await
+            .expect("snapshot");
+        assert_eq!(fresh.accepted_seq, 4);
+        assert_eq!(fresh.indexed_seq, 3);
+
+        // A cursor issued for another scope or filter is rejected.
+        let other_scope =
+            super::snapshot_binding("other-stream", "query=needle", super::INDEX_VERSION);
+        assert!(decode_cursor(&cursor, &other_scope).is_err());
+        let other_filters =
+            super::snapshot_binding(&stream_id, "query=other", super::INDEX_VERSION);
+        assert!(decode_cursor(&cursor, &other_filters).is_err());
     }
 
     #[tokio::test]

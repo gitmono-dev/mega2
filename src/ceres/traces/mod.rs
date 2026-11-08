@@ -2,6 +2,7 @@ pub mod admission;
 pub mod auth;
 pub(crate) mod checkpoint_history;
 pub mod cleanup;
+pub mod cursor;
 pub mod error;
 pub(crate) mod fragments;
 pub mod ingest;

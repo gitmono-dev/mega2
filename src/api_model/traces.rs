@@ -309,6 +309,35 @@ impl CaptureCompleteness {
     }
 }
 
+/// The snapshot a paged query is pinned to (MTR-42).
+///
+/// The envelope reports the watermarks the query was started with, so a
+/// client can tell that a later page belongs to the same snapshot even when
+/// a new push or a new index version was published in between.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QuerySnapshotEnvelope {
+    /// The highest accepted journal sequence the query may see.
+    pub accepted_seq: u64,
+    /// The highest indexed journal sequence the query may see.
+    pub indexed_seq: u64,
+    /// The index version the query was served from.
+    pub index_version: u64,
+    /// Whether the indexed watermark has caught up with the accepted one.
+    pub index_caught_up: bool,
+}
+
+impl QuerySnapshotEnvelope {
+    /// Project the envelope from a pinned snapshot.
+    pub fn project(snapshot: crate::ceres::traces::cursor::QuerySnapshot) -> Self {
+        Self {
+            accepted_seq: snapshot.accepted_seq,
+            indexed_seq: snapshot.indexed_seq,
+            index_version: snapshot.index_version,
+            index_caught_up: snapshot.indexed_seq >= snapshot.accepted_seq,
+        }
+    }
+}
+
 /// Stream metadata index coverage and capture validation state (MTR-63).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ReadProjectionState {
@@ -820,6 +849,28 @@ impl CaptureQueryFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_envelope_reports_the_pinned_watermarks() {
+        use crate::ceres::traces::cursor::QuerySnapshot;
+
+        let envelope = QuerySnapshotEnvelope::project(QuerySnapshot::new(9, 9, 1));
+        assert_eq!(envelope.accepted_seq, 9);
+        assert_eq!(envelope.indexed_seq, 9);
+        assert_eq!(envelope.index_version, 1);
+        assert!(envelope.index_caught_up);
+
+        let lagging = QuerySnapshotEnvelope::project(QuerySnapshot::new(9, 4, 1));
+        assert_eq!(lagging.accepted_seq, 9);
+        assert_eq!(lagging.indexed_seq, 4);
+        assert!(!lagging.index_caught_up);
+
+        let json = serde_json::to_value(&envelope).expect("envelope JSON");
+        assert_eq!(json["accepted_seq"], 9);
+        assert_eq!(json["indexed_seq"], 9);
+        assert_eq!(json["index_version"], 1);
+        assert_eq!(json["index_caught_up"], serde_json::json!(true));
+    }
 
     #[test]
     fn stream_filter_wire_defaults_and_cursor_binding() {
