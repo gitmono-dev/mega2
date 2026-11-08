@@ -16,13 +16,26 @@ use crate::{
             admin_router, agent_capture_router, artifacts_router, bot_router, buck_router,
             cl_router, commit_router, gpg_router, group_router, import_repo_router,
             merge_queue_router, preview_router, push_queue_router, repo_router, tag_router,
-            user_router, view_router, webhook_router,
+            traces_router, user_router, view_router, webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
     common::errors::{ApiError, MegaError},
     config::PushPolicy,
 };
+
+/// Register the read-only traces API. Both trunk and review call this; the
+/// routes stay absent unless `[traces].enabled` is true.
+pub fn merge_traces(
+    router: OpenApiRouter<MonoApiServiceState>,
+    enabled: bool,
+) -> OpenApiRouter<MonoApiServiceState> {
+    if enabled {
+        router.merge(traces_router::routers())
+    } else {
+        router
+    }
+}
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()

@@ -840,7 +840,7 @@ HTTP命令段与解压后的upload请求解析上限各64KiB、单ref receive；
 
 ## 5. Agent 只读 API 与 Libra 消费
 
-所有路径以下列 `/api/v1/traces` 为前缀，均为 GET：
+所有路径以下列 `/api/v1/traces` 为前缀，均为 GET。MTR-49：这些路由由 `api_router::merge_traces` 登记，只在 `[traces].enabled` 时挂到 trunk 和 review；关闭时不注册，运行时 OpenAPI 也不列出它们。
 
 | 相对路径 | 输入/用途 |
 |---|---|

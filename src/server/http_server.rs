@@ -28,7 +28,7 @@ use crate::{
         api_doc::ApiDoc,
         api_router::{self},
         oauth::{api_store::BrowserSessionStore, website_session_store::WebsiteSessionStore},
-        router::{lfs_router, oci_router, snapshot_router, traces_router},
+        router::{lfs_router, oci_router, snapshot_router},
     },
     ceres::{
         api_service::{cache::GitObjectCache, state::ProtocolApiState},
@@ -1005,11 +1005,7 @@ fn with_traces(
     router: OpenApiRouter<MonoApiServiceState>,
     config: &Config,
 ) -> OpenApiRouter<MonoApiServiceState> {
-    if config.traces.enabled {
-        router.merge(traces_router::routers())
-    } else {
-        router
-    }
+    api_router::merge_traces(router, config.traces.enabled)
 }
 
 /// OpenAPI for the storage-only surface plus the traces capabilities route.
@@ -1018,8 +1014,10 @@ pub(crate) fn storage_only_openapi_doc_with_traces() -> utoipa::openapi::OpenApi
         .merge(lfs_router::routers())
         .nest(
             "/api/v1",
-            api_router::storage_only_routers_with_views(false, false)
-                .merge(traces_router::routers()),
+            api_router::merge_traces(
+                api_router::storage_only_routers_with_views(false, false),
+                true,
+            ),
         )
         .split_for_parts()
         .1

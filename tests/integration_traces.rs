@@ -13293,6 +13293,100 @@ mod disabled_http {
         }
         closed.expect("close HTTP fixture pool before database guard");
     }
+
+    pub async fn run_traces_router_mount() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(Fixture::new(&db).await);
+            let fixture = fixture.as_mut().expect("mount fixture");
+            let mut init = fixture.command(false, "trunk", "/third-party");
+            init.args(["service", "init", "--yes"]);
+            OwnedChild::spawn(&mut init).require_success().await;
+            for (policy, enabled) in [
+                ("trunk", false),
+                ("trunk", true),
+                ("review", false),
+                ("review", true),
+            ] {
+                fixture.start(enabled, policy, "/third-party").await;
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .expect("client");
+                let openapi: serde_json::Value = client
+                    .get(git_cli::mega2_host_http_url(
+                        fixture.port,
+                        "/api/openapi.json",
+                    ))
+                    .send()
+                    .await
+                    .expect("openapi")
+                    .json()
+                    .await
+                    .expect("openapi json");
+                let paths = openapi["paths"].as_object().expect("paths");
+                let mounted: Vec<_> = paths
+                    .keys()
+                    .filter(|path| path.contains("/traces/"))
+                    .cloned()
+                    .collect();
+                if enabled {
+                    for suffix in [
+                        "/api/v1/traces/capabilities",
+                        "/api/v1/traces/targets/resolve",
+                        "/api/v1/traces/targets/{target_id}/streams",
+                    ] {
+                        let spec = paths
+                            .get(suffix)
+                            .unwrap_or_else(|| panic!("missing {suffix} in {mounted:?}"));
+                        assert!(spec.get("get").is_some(), "{suffix} must be GET");
+                        assert!(spec.get("post").is_none(), "{suffix} is read-only");
+                        assert!(spec.get("put").is_none(), "{suffix} is read-only");
+                        assert!(spec.get("delete").is_none(), "{suffix} is read-only");
+                    }
+                } else {
+                    assert!(
+                        mounted.is_empty(),
+                        "{policy} disabled still lists {mounted:?}"
+                    );
+                }
+                for path in [
+                    "/api/v1/traces/capabilities",
+                    "/api/v1/traces/targets/resolve",
+                    "/api/v1/traces/targets/missing/streams",
+                ] {
+                    let status = client
+                        .get(git_cli::mega2_host_http_url(fixture.port, path))
+                        .send()
+                        .await
+                        .expect("probe")
+                        .status();
+                    if enabled {
+                        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{policy} {path}");
+                    } else {
+                        assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{policy} {path}");
+                    }
+                }
+            }
+        })
+        .catch_unwind()
+        .await;
+        let cleanup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(fixture) = &mut fixture {
+                fixture.stop();
+            }
+        }));
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close mount fixture pool");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13358,6 +13452,11 @@ async fn traces_disabled_http_upload() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn traces_disabled_http_receive() {
     disabled_http::run(disabled_http::Endpoint::Receive).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn traces_router_mount_follows_the_profile_switch() {
+    disabled_http::run_traces_router_mount().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
