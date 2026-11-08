@@ -5,10 +5,12 @@
 //! case-insensitively through the same fold the fragment index stores; every
 //! other character, including non-ASCII, compares byte for byte.
 
-use crate::ceres::traces::fragments::ascii_fold;
+use crate::{ceres::traces::fragments::ascii_fold, config::TracesProtocolLimits};
 
 /// Longest accepted query in UTF-8 bytes.
-pub const QUERY_BYTES_MAX: u64 = 256;
+///
+/// This is the single protocol constant, not a second copy of the value.
+pub const QUERY_BYTES_MAX: u64 = TracesProtocolLimits::QUERY_BYTES_MAX;
 
 /// One literal keyword query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +26,7 @@ impl LiteralQuery {
     ///
     /// An empty query and a query longer than [`QUERY_BYTES_MAX`] are rejected.
     pub fn new(raw: &str) -> Result<Self, LiteralQueryError> {
-        if raw.is_empty() {
+        if (raw.len() as u64) < TracesProtocolLimits::QUERY_BYTES_MIN {
             return Err(LiteralQueryError::Empty);
         }
         if raw.len() as u64 > QUERY_BYTES_MAX {
@@ -91,6 +93,13 @@ mod tests {
         assert!(LiteralQuery::new("").is_err());
         assert!(LiteralQuery::new(&"a".repeat(257)).is_err());
         assert!(LiteralQuery::new(&"a".repeat(256)).is_ok());
+    }
+
+    #[test]
+    fn literal_query_reads_the_protocol_limit_constants() {
+        assert_eq!(QUERY_BYTES_MAX, TracesProtocolLimits::QUERY_BYTES_MAX);
+        assert_eq!(QUERY_BYTES_MAX, 256);
+        assert_eq!(TracesProtocolLimits::QUERY_BYTES_MIN, 1);
     }
 
     #[test]
