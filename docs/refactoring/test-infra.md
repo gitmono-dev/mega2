@@ -420,3 +420,13 @@ MTR-75 的内部验收不拉起 `mega2` 二进制。`fragment_membership_` 用 `
 ## 强制纪律
 
 **新增服务必须先按 checklist 登记评审，禁止绕规范加服务。**
+
+### Traces 真实进程 runtime helper（MTR-89）
+
+`tests/common/traces_runtime.rs` 是 traces HTTP 真实进程用例的专用 helper，只由
+`tests/integration_traces.rs` 通过 `#[path]` 引入，不进入 `tests/common/mod.rs`。
+它负责：本例独有的临时目录、样例配置副本、合成静态 token 与 secret 文件、独立
+的已迁移测试数据库、端口预留、真实 `CARGO_BIN_EXE_mega2` 进程（先 `service init`
+再 `service http`）、120 秒启动探活、每请求 10 秒上限，以及 30 秒内 kill/wait 的
+收尾。数据库守卫只删除本例的库；进程退出与端口释放都在用例自己的所有权范围内。
+用例只观察公开 HTTP 响应与运行时 OpenAPI 文档，不导入私有 API 或 server 模块。

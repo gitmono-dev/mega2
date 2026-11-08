@@ -1,6 +1,9 @@
 #[path = "common/traces_db.rs"]
 mod traces_db;
 
+#[path = "common/traces_runtime.rs"]
+mod traces_runtime;
+
 use std::path::PathBuf;
 
 use chrono::Utc;
@@ -13873,4 +13876,197 @@ async fn gin_operator_lease_blocks_then_allows_repair() {
         .expect("owner");
     assert!(!owner.is_empty());
     let _ = db.close().await;
+}
+
+/// MTR-89 VER-1: the real HTTP capabilities response carries the same fixed
+/// limits DTO that the public protocol constants define.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_limits_http_live_matches_the_public_protocol_constants() {
+    use mega2_core::config::TracesProtocolLimits;
+
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let (status, body) = runtime.get("/api/v1/traces/capabilities").await;
+    assert_eq!(status, 200, "capabilities status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("capabilities JSON");
+    assert_eq!(json["protocol"], "libra-traces/v1");
+    assert_eq!(json["server_id"], "11111111-1111-4111-8111-111111111111");
+    assert_eq!(json["git_transports"], serde_json::json!(["http", "ssh"]));
+    assert_eq!(
+        json["object_formats"],
+        serde_json::json!(["sha1", "sha256"])
+    );
+
+    let limits = &json["limits"];
+    let expected = [
+        ("max_object_bytes", TracesProtocolLimits::MAX_OBJECT_BYTES),
+        (
+            "max_metadata_bytes",
+            TracesProtocolLimits::MAX_METADATA_BYTES,
+        ),
+        (
+            "max_manifest_bytes",
+            TracesProtocolLimits::MAX_MANIFEST_BYTES,
+        ),
+        ("max_pack_bytes", TracesProtocolLimits::MAX_PACK_BYTES),
+        ("max_decoded_bytes", TracesProtocolLimits::MAX_DECODED_BYTES),
+        ("max_objects", TracesProtocolLimits::MAX_OBJECTS),
+        ("max_new_commits", TracesProtocolLimits::MAX_NEW_COMMITS),
+        ("max_delta_depth", TracesProtocolLimits::MAX_DELTA_DEPTH),
+        ("max_tree_depth", TracesProtocolLimits::MAX_TREE_DEPTH),
+        (
+            "ingest_timeout_seconds",
+            TracesProtocolLimits::INGEST_TIMEOUT_SECONDS,
+        ),
+        (
+            "metadata_limit_default",
+            TracesProtocolLimits::METADATA_LIMIT_DEFAULT,
+        ),
+        (
+            "search_limit_default",
+            TracesProtocolLimits::SEARCH_LIMIT_DEFAULT,
+        ),
+        (
+            "text_bytes_default",
+            TracesProtocolLimits::TEXT_BYTES_DEFAULT,
+        ),
+        (
+            "metadata_limit_max",
+            TracesProtocolLimits::METADATA_LIMIT_MAX,
+        ),
+        ("search_limit_max", TracesProtocolLimits::SEARCH_LIMIT_MAX),
+        ("text_bytes_max", TracesProtocolLimits::TEXT_BYTES_MAX),
+        ("query_bytes_min", TracesProtocolLimits::QUERY_BYTES_MIN),
+        ("query_bytes_max", TracesProtocolLimits::QUERY_BYTES_MAX),
+        (
+            "response_bytes_max",
+            TracesProtocolLimits::RESPONSE_BYTES_MAX,
+        ),
+        (
+            "candidate_fragments_max",
+            TracesProtocolLimits::CANDIDATE_FRAGMENTS_MAX,
+        ),
+        ("scan_bytes_max", TracesProtocolLimits::SCAN_BYTES_MAX),
+        ("query_timeout_ms", TracesProtocolLimits::QUERY_TIMEOUT_MS),
+    ];
+    assert_eq!(expected.len(), 22);
+    for (name, value) in expected {
+        assert_eq!(
+            limits[name],
+            serde_json::json!(value),
+            "capabilities limit {name} does not match the protocol constant"
+        );
+    }
+    assert_eq!(limits.as_object().expect("limits object").len(), 22);
+}
+
+/// MTR-89 VER-2: the runtime OpenAPI document resolves the capabilities
+/// response to the same typed limits component.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_limits_openapi_live_resolves_the_typed_component() {
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let (status, body) = runtime.get("/api/openapi.json").await;
+    assert_eq!(status, 200, "openapi status: {body}");
+    let document: serde_json::Value = serde_json::from_str(&body).expect("openapi JSON");
+
+    let capabilities_path = document["paths"]["/api/v1/traces/capabilities"]["get"]
+        .as_object()
+        .expect("capabilities GET operation")
+        .clone();
+    let content = capabilities_path["responses"]["200"]["content"]
+        .as_object()
+        .expect("capabilities 200 content")
+        .clone();
+    let application_json = content
+        .get("application/json")
+        .expect("capabilities application/json content");
+    let schema_ref = application_json["schema"]["$ref"]
+        .as_str()
+        .expect("capabilities schema reference")
+        .to_owned();
+    assert!(
+        schema_ref.contains("TracesCapabilities"),
+        "capabilities schema reference is not the typed component: {schema_ref}"
+    );
+
+    let components = document["components"]["schemas"]
+        .as_object()
+        .expect("openapi components schemas");
+    let capabilities_name = schema_ref
+        .rsplit('/')
+        .next()
+        .expect("schema component name");
+    let capabilities = components
+        .get(capabilities_name)
+        .unwrap_or_else(|| panic!("missing capabilities component {capabilities_name}"))
+        .clone();
+    let properties = capabilities["properties"]
+        .as_object()
+        .expect("capabilities properties")
+        .clone();
+    let limits_ref = properties["limits"]["$ref"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "capabilities limits is not a component reference: {}",
+                properties["limits"]
+            )
+        })
+        .to_owned();
+    assert!(
+        limits_ref.contains("TracesCapabilityLimits"),
+        "capabilities limits reference is not the typed component: {limits_ref}"
+    );
+
+    let limits_name = limits_ref
+        .rsplit('/')
+        .next()
+        .expect("limits component name");
+    let limits = components
+        .get(limits_name)
+        .unwrap_or_else(|| panic!("missing limits component {limits_name}"))
+        .clone();
+    let limit_properties = limits["properties"]
+        .as_object()
+        .expect("limits properties")
+        .clone();
+    let required = limits["required"]
+        .as_array()
+        .expect("limits required list")
+        .clone();
+    let expected = [
+        "max_object_bytes",
+        "max_metadata_bytes",
+        "max_manifest_bytes",
+        "max_pack_bytes",
+        "max_decoded_bytes",
+        "max_objects",
+        "max_new_commits",
+        "max_delta_depth",
+        "max_tree_depth",
+        "ingest_timeout_seconds",
+        "metadata_limit_default",
+        "search_limit_default",
+        "text_bytes_default",
+        "metadata_limit_max",
+        "search_limit_max",
+        "text_bytes_max",
+        "query_bytes_min",
+        "query_bytes_max",
+        "response_bytes_max",
+        "candidate_fragments_max",
+        "scan_bytes_max",
+        "query_timeout_ms",
+    ];
+    assert_eq!(expected.len(), 22);
+    for name in expected {
+        assert!(
+            limit_properties.contains_key(name),
+            "runtime OpenAPI limits schema is missing {name}"
+        );
+        assert!(
+            required.iter().any(|value| value == name),
+            "runtime OpenAPI limits schema does not require {name}"
+        );
+    }
+    assert_eq!(limit_properties.len(), 22);
 }
