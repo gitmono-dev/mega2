@@ -20,6 +20,7 @@ pub(crate) mod trace_projection_service;
 pub mod trace_publish_service;
 pub(crate) mod trace_query_service;
 pub(crate) mod trace_search_index_service;
+pub(crate) mod trace_search_service;
 pub mod trace_target_service;
 pub mod view_metrics;
 pub mod view_projection_service;
