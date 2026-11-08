@@ -545,6 +545,97 @@ pub fn session_cursor(stream_id: &str, request: &SessionRequest, after_key: &str
     )
 }
 
+/// `GET /api/v1/traces/streams/{stream_id}/sessions/{session_id}/checkpoints` (MTR-90).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CheckpointSummary {
+    pub checkpoint_id: String,
+    pub checkpoint_key: String,
+    pub session_id: String,
+    pub original_tree: String,
+    pub resource_count: u64,
+    pub byte_start: Option<i64>,
+    pub byte_end: Option<i64>,
+    pub code_link: Option<String>,
+    pub completeness: CaptureCompleteness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CheckpointPage {
+    pub schema_version: u32,
+    pub items: Vec<CheckpointSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointQuery {
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Admitted checkpoint query for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRequest {
+    pub limit: u64,
+    pub after_key: Option<String>,
+}
+
+/// Apply the fixed metadata page bounds for a checkpoint page.
+pub fn admit_checkpoint_query(
+    stream_id: &str,
+    session_id: &str,
+    query: CheckpointQuery,
+) -> Result<CheckpointRequest, crate::common::errors::TracesError> {
+    use crate::common::errors::TracesError;
+    let limit = match query.limit {
+        None => TracesProtocolLimits::METADATA_LIMIT_DEFAULT,
+        Some(limit) if (1..=TracesProtocolLimits::METADATA_LIMIT_MAX).contains(&limit) => limit,
+        Some(_) => return Err(TracesError::InvalidParameter),
+    };
+    let after_key = match query.cursor.as_deref() {
+        None => None,
+        Some(cursor) if cursor.is_empty() || cursor.chars().all(char::is_whitespace) => {
+            return Err(TracesError::InvalidCursor);
+        }
+        Some(cursor) => {
+            let rest = cursor
+                .strip_prefix("v1.")
+                .ok_or(TracesError::InvalidCursor)?;
+            let (binding, after_key) = rest.split_once('.').ok_or(TracesError::InvalidCursor)?;
+            if binding != checkpoint_cursor_binding(stream_id, session_id) || after_key.is_empty() {
+                return Err(TracesError::InvalidCursor);
+            }
+            Some(after_key.to_owned())
+        }
+    };
+    Ok(CheckpointRequest { limit, after_key })
+}
+
+fn checkpoint_cursor_binding(stream_id: &str, session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for value in [stream_id, session_id] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Keyset cursor for one checkpoint page.
+pub fn checkpoint_cursor(stream_id: &str, session_id: &str, after_key: &str) -> String {
+    format!(
+        "v1.{}.{}",
+        checkpoint_cursor_binding(stream_id, session_id),
+        after_key
+    )
+}
+
 /// Errors returned when the wire filter itself is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceFilterError {

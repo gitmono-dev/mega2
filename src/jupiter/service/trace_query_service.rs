@@ -497,6 +497,159 @@ pub async fn read_stream_session(
     })
 }
 
+/// Checkpoints of one session, ordered by checkpoint key, with the fixed budget.
+pub async fn list_session_checkpoints(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: &str,
+    session_id: &str,
+    request: &crate::api_model::traces::CheckpointRequest,
+    may_read: bool,
+) -> Result<crate::api_model::traces::CheckpointPage, SessionReadError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+
+    use crate::{
+        api_model::traces::{
+            CheckpointPage, CheckpointSummary, STREAM_DIRECTORY_SCHEMA_VERSION, checkpoint_cursor,
+        },
+        callisto::{trace_checkpoint, trace_code_link, trace_resource, trace_session},
+        config::TracesProtocolLimits,
+    };
+    if !may_read {
+        return Err(SessionReadError::UnknownScope);
+    }
+    if request.limit == 0 || request.limit > TracesProtocolLimits::METADATA_LIMIT_MAX {
+        return Err(SessionReadError::InvalidParameter);
+    }
+    let session = trace_session::Entity::find()
+        .filter(trace_session::Column::Id.eq(session_id))
+        .filter(trace_session::Column::StreamId.eq(stream_id))
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(SessionReadError::UnknownScope)?;
+
+    let mut query =
+        trace_checkpoint::Entity::find().filter(trace_checkpoint::Column::StreamId.eq(stream_id));
+    if let Some(after) = &request.after_key {
+        query = query.filter(trace_checkpoint::Column::CheckpointKey.gt(after));
+    }
+    let rows = query
+        .order_by_asc(trace_checkpoint::Column::CheckpointKey)
+        .limit(request.limit.saturating_add(1))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+
+    let resources = trace_resource::Entity::find()
+        .filter(trace_resource::Column::StreamId.eq(stream_id))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+    let links = trace_code_link::Entity::find()
+        .filter(trace_code_link::Column::StreamId.eq(stream_id))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+
+    let mut items = Vec::new();
+    for row in &rows {
+        let mut owned = resources
+            .iter()
+            .filter(|resource| resource.checkpoint_id == row.id)
+            .collect::<Vec<_>>();
+        owned.sort_by_key(|resource| resource.ordinal);
+        let code_link = links
+            .iter()
+            .find(|link| link.checkpoint_id == row.id)
+            .and_then(|link| link.code_oid.clone());
+        items.push(CheckpointSummary {
+            checkpoint_id: row.id.clone(),
+            checkpoint_key: row.checkpoint_key.clone(),
+            session_id: session.id.clone(),
+            original_tree: row.original_tree.clone(),
+            resource_count: owned.len() as u64,
+            byte_start: owned.first().map(|resource| resource.byte_start),
+            byte_end: owned.last().map(|resource| resource.byte_end),
+            code_link,
+            completeness: crate::api_model::traces::CaptureCompleteness::from_validated_checkpoint(
+                true, true, false, false, false,
+            ),
+        });
+    }
+    let next_cursor = if items.len() > usize::try_from(request.limit).unwrap_or(usize::MAX) {
+        items.pop();
+        items
+            .last()
+            .map(|checkpoint| checkpoint_cursor(stream_id, session_id, &checkpoint.checkpoint_key))
+    } else {
+        None
+    };
+    Ok(CheckpointPage {
+        schema_version: STREAM_DIRECTORY_SCHEMA_VERSION,
+        items,
+        next_cursor,
+    })
+}
+
+/// One checkpoint of one session, with its resource range and code link.
+pub async fn read_session_checkpoint(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: &str,
+    session_id: &str,
+    checkpoint_id: &str,
+    may_read: bool,
+) -> Result<crate::api_model::traces::CheckpointSummary, SessionReadError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    use crate::{
+        api_model::traces::CheckpointSummary,
+        callisto::{trace_checkpoint, trace_code_link, trace_resource, trace_session},
+    };
+    if !may_read {
+        return Err(SessionReadError::UnknownScope);
+    }
+    let session = trace_session::Entity::find()
+        .filter(trace_session::Column::Id.eq(session_id))
+        .filter(trace_session::Column::StreamId.eq(stream_id))
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(SessionReadError::UnknownScope)?;
+    let checkpoint = trace_checkpoint::Entity::find_by_id(checkpoint_id.to_owned())
+        .filter(trace_checkpoint::Column::StreamId.eq(stream_id))
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .ok_or(SessionReadError::UnknownScope)?;
+    let mut resources = trace_resource::Entity::find()
+        .filter(trace_resource::Column::StreamId.eq(stream_id))
+        .filter(trace_resource::Column::CheckpointId.eq(checkpoint.id.clone()))
+        .all(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?;
+    resources.sort_by_key(|resource| resource.ordinal);
+    let code_link = trace_code_link::Entity::find()
+        .filter(trace_code_link::Column::StreamId.eq(stream_id))
+        .filter(trace_code_link::Column::CheckpointId.eq(checkpoint.id.clone()))
+        .one(db)
+        .await
+        .map_err(|err| SessionReadError::Database(crate::common::errors::MegaError::from(err)))?
+        .and_then(|link| link.code_oid);
+    Ok(CheckpointSummary {
+        checkpoint_id: checkpoint.id,
+        checkpoint_key: checkpoint.checkpoint_key,
+        session_id: session.id,
+        original_tree: checkpoint.original_tree,
+        resource_count: resources.len() as u64,
+        byte_start: resources.first().map(|resource| resource.byte_start),
+        byte_end: resources.last().map(|resource| resource.byte_end),
+        code_link,
+        completeness: crate::api_model::traces::CaptureCompleteness::from_validated_checkpoint(
+            true, true, false, false, false,
+        ),
+    })
+}
+
 /// Streams of one active target. `may_read` is the traces Read decision for that target.
 pub async fn list_target_streams(
     db: &sea_orm::DatabaseConnection,

@@ -13878,6 +13878,126 @@ async fn gin_operator_lease_blocks_then_allows_repair() {
     let _ = db.close().await;
 }
 
+/// MTR-90 VER-1: the real HTTP checkpoint list and detail honour the fixed
+/// metadata page budget and the target read decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_navigation_list_and_detail_follow_the_fixed_page_budget() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let db = runtime.db();
+    let owner = uuid::Uuid::new_v4().to_string();
+    let target = uuid::Uuid::new_v4().to_string();
+    let stream = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let epoch = uuid::Uuid::new_v4().to_string();
+    for statement in [
+        format!("INSERT INTO trace_principal (id) VALUES ('{owner}')"),
+        format!(
+            "INSERT INTO trace_credential_binding (id, principal_id, namespace, credential_id) VALUES ('{}', '{owner}', 'static_push_token', 'mtr89')",
+            uuid::Uuid::new_v4()
+        ),
+        format!(
+            "INSERT INTO trace_target (id, target_kind, project_path, active) VALUES ('{target}', 'native', '/project/checkpoint-nav', true)"
+        ),
+        format!(
+            "INSERT INTO trace_stream (id, principal_id, target_id, source_repo_id, epoch_id, hash_kind, tip_oid) VALUES ('{stream}', '{owner}', '{target}', 'checkpoint-nav-source', '{epoch}', 'sha1', NULL)"
+        ),
+        format!(
+            "INSERT INTO trace_session (id, stream_id, session_key) VALUES ('{session}', '{stream}', 'checkpoint-nav-session')"
+        ),
+    ] {
+        db.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            statement,
+        ))
+        .await
+        .expect("seed traces identity");
+    }
+    let mut checkpoint_ids = Vec::new();
+    for index in 0..210 {
+        let checkpoint = uuid::Uuid::new_v4().to_string();
+        checkpoint_ids.push(checkpoint.clone());
+        db.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO trace_checkpoint (id, stream_id, checkpoint_key, original_tree) VALUES ('{checkpoint}', '{stream}', 'checkpoint-{index:04}', '{}')",
+                "a".repeat(40)
+            ),
+        ))
+        .await
+        .expect("seed checkpoint row");
+    }
+
+    let base = format!("/api/v1/traces/streams/{stream}/sessions/{session}/checkpoints");
+    let (status, body) = runtime.get(&base).await;
+    assert_eq!(status, 200, "checkpoints list status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("checkpoints list JSON");
+    let items = json["items"].as_array().expect("checkpoints items");
+    assert_eq!(
+        items.len(),
+        50,
+        "omitting limit must use the protocol default of 50"
+    );
+    let first_key = items[0]["checkpoint_key"]
+        .as_str()
+        .expect("first checkpoint key")
+        .to_owned();
+    let cursor = json["next_cursor"]
+        .as_str()
+        .expect("checkpoints next cursor")
+        .to_owned();
+
+    let (status, body) = runtime.get(&format!("{base}?limit=200")).await;
+    assert_eq!(status, 200, "checkpoints limit=200 status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("checkpoints limit=200 JSON");
+    assert_eq!(
+        json["items"].as_array().expect("checkpoints items").len(),
+        200,
+        "limit=200 must be accepted"
+    );
+
+    let (status, body) = runtime.get(&format!("{base}?limit=201")).await;
+    assert_eq!(status, 400, "checkpoints limit=201 status: {body}");
+    assert!(body.contains("invalid_parameter"), "{body}");
+
+    let (status, body) = runtime
+        .get(&format!("{base}?limit=50&cursor={cursor}"))
+        .await;
+    assert_eq!(status, 200, "checkpoints cursor status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("checkpoints cursor JSON");
+    let items = json["items"].as_array().expect("checkpoints cursor items");
+    assert_eq!(items.len(), 50, "the cursor page keeps the default budget");
+    assert_ne!(
+        items[0]["checkpoint_key"]
+            .as_str()
+            .expect("cursor page checkpoint key"),
+        first_key.as_str(),
+        "the cursor page must continue after the first page"
+    );
+
+    let (status, body) = runtime.get(&format!("{base}/{}", checkpoint_ids[0])).await;
+    assert_eq!(status, 200, "checkpoint detail status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("checkpoint detail JSON");
+    assert_eq!(json["checkpoint_key"], "checkpoint-0000");
+    assert_eq!(json["session_id"], session);
+
+    let (status, body) = runtime
+        .get(&format!("{base}/{}", uuid::Uuid::new_v4()))
+        .await;
+    assert_eq!(status, 404, "unknown checkpoint status: {body}");
+    assert!(body.contains("unknown_scope"), "{body}");
+
+    let (status, body) = runtime
+        .get(&format!(
+            "/api/v1/traces/streams/{stream}/sessions/{}/checkpoints",
+            uuid::Uuid::new_v4()
+        ))
+        .await;
+    assert_eq!(status, 404, "unknown session status: {body}");
+    assert!(body.contains("unknown_scope"), "{body}");
+}
+
 /// MTR-17 VER-1: the real HTTP sessions list and detail honour the fixed
 /// metadata page budget and the target read decision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
