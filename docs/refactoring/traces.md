@@ -991,6 +991,10 @@ MTR-68 的 history driver 只要求 `LIBRA_REPO`（pin 的 Libra checkout，含 
 
 2026-11-09 的本地真实运行：四个 selector 4/4 通过（日志 SHA256 `3fd4209068ade720dc8961529f4f5bf661fb9476114d5767a9f8bb19644b1399`，不含 token/密钥）。
 
+MTR-64 的 ref-reject driver 使用 `MEGA2_TRACES_INTEROP_HTTP_URL`、`MEGA2_TRACES_INTEROP_TARGET`、`MEGA2_TRACES_INTEROP_TOKEN_FILE`、`MEGA2_TRACES_INTEROP_SSH_URL`、`MEGA2_TRACES_INTEROP_AGENT_REPO`、`MEGA2_TRACES_INTEROP_SCOPE` 与 `LIBRA_SSH_COMMAND`。每个 case 先建立一次真实成功 push 的基线，再向同一 by-scope 入口发送删除或 forced non-fast-forward：删除依据是 advertisement 不提供 `delete-refs`，forced 更新在 HTTP 以 409 与 `object_integrity`、SSH 以 `remote error: object_integrity` 拒绝；两类拒绝都必须不是 401/403/`unauthenticated`，且拒绝后 remote tip 与基线一致。逐案为 `http_delete`、`ssh_delete`、`http_non_ff`、`ssh_non_ff`，末行为 `traces interop ref-reject summary: executed=<n> passed=<n> failed=<n>`。
+
+2026-11-09 的本地真实运行：4/4 通过（日志 SHA256 `13320967a4fcc79f6e06b4f6cb43574005974d5eefd9214d6ee7609b78ac8fa9`，不含 token/密钥）。
+
 2026-11-09 的本地真实 fixture 证据：mega2 `0.42.133` debug binary、ephemeral PostgreSQL `mega2_interop`、`[traces].enabled=true`、两个 static push token（分别覆盖 `/project/interop` 与 `/project/other`）与两条真实 Libra scoped push；`--case http` 的 5/5 逐案通过（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`，日志 SHA256 `f96343c72b7f51935d6c58a6cee415385f5a30c6a8f89f31095e3738dd090431`，不含 token 或 DSN）。
 
 
