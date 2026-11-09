@@ -953,6 +953,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 ## 7. 旧 Capture 全量清除与接口退场
 
+**事件与过滤退场（MTR-57）：** `agent_tenants`、`agent_repo_paths` 与 `agent_capture.events.committed`、`agent_capture.checkpoint.committed` 已从 storage-event 模型、事件字面量白名单与 target 过滤中删除；`StorageEventsTargetConfig` 现在启用 `deny_unknown_fields`，仍携带这些键的配置会被拒绝。其余四类事件（`repo.push`、`oci.manifest.published`、`lfs.object.uploaded`、`lfs.media.finalized`）的投影/范围/过滤行为保持不变，由 `noncapture_event_preservation` 与既有模块回归覆盖。
+
 **配置退场（MTR-27）：** `[agent_capture]` 已从配置模型与严格的未知字段白名单中删除；仍携带该节的 TOML 会得到明确的“section was removed”错误并指向 scoped traces Git 与 `/api/v1/traces`，`MEGA_AGENT_CAPTURE__*` 环境覆盖同样被拒绝。三份随仓样例（`config/config.toml`、`config-review.toml`、`config-storage-only.toml`）已移除该节与旧 Capture 事件/过滤示例；storage-event 模型中的旧 Capture 事件名与 `agent_tenants`/`agent_repo_paths` 字段留给 MTR-57。
 
 **内部运行时退场（MTR-28）：** 旧 `jupiter::service::agent_capture_service`、`jupiter::storage::agent_capture_storage` 与 `ceres::agent_capture`（auth）模块已删除；启动不再初始化旧 ingest token，`Storage` 不再持有旧 service；维护侧 typed legacy locator（`traces purge-legacy-capture`）保持可用，历史 SQL add migration 原样保留。stage 扫描 `legacy_retirement_stage_28` 以有限 allowlist 证明没有非列入的运行时符号残留。

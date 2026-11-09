@@ -137,14 +137,15 @@ Numeric bounds hold even when the table is disabled: `max_in_flight` is
 1..=10, and `shutdown_grace_seconds` is 0..=10 (WH-14; `0` aborts in-flight
 sends at once, and the ceiling is what keeps ADR-WH-03's drain bounded).
 
-Filter entries validate per source dimension. `git_paths`, `lfs_paths` and
-`agent_repo_paths` must be absolute canonical paths; `oci_repositories` must
+Filter entries validate per source dimension. `git_paths` and `lfs_paths`
+must be absolute canonical paths. `oci_repositories` must
 be canonical lowercase distribution `remoteName` values, judged by the same
 rule as the inbound `/v2` router (`src/common/oci_name.rs` is the single
-implementation shared by both callers — WH-14). `agent_tenants` is compared
-verbatim against the server-supplied value. A name the router would reject
+implementation shared by both callers — WH-14). A name the router would reject
 can never match an inbound repository, so such a filter entry is a silently
-dead subscription and is rejected rather than accepted. Every list is capped
+dead subscription and is rejected rather than accepted. The legacy Capture
+filters (`agent_tenants` / `agent_repo_paths`) were removed by MTR-57 and are
+rejected by the strict unknown-field check. Every list is capped
 at 64 entries of 1..=256 bytes each.
 
 Every target `secret_ref` must use the namespace
@@ -176,16 +177,15 @@ single application emitter owner on `Storage`; on disabled configs nothing
 is resolved and the emitter stays disabled. Each POST resolves DNS once,
 rejects loopback/private/link-local/metadata/mixed results, pins the
 connection to that verified address, and keeps the original hostname for TLS
-SNI. All six source hooks are installed (WH-03..WH-08): `repo.push`,
-`oci.manifest.published`, `lfs.object.uploaded`, `lfs.media.finalized`,
-`agent_capture.events.committed` and `agent_capture.checkpoint.committed` are retired with the legacy Capture events (their removal from the storage-event model belongs to MTR-57).
+SNI. Four source hooks are installed (WH-03..WH-06): `repo.push`,
+`oci.manifest.published`, `lfs.object.uploaded` and `lfs.media.finalized`.
+The two legacy Capture events were retired with MTR-57.
 See [`storage-events.md`](storage-events.md) for the per-source commit points
 and the registered coverage gaps.
 
-Target `events` must be unique literals from the six frozen types, at most 16
-targets per table, and `agent_tenants` / `agent_repo_paths` are both empty or
-both non-empty (an empty filter list means that source is not subscribed — it
-is not a wildcard).
+Target `events` must be unique literals from the four frozen types, at most 16
+targets per table. An empty filter list means that source is not subscribed —
+it is not a wildcard.
 
 Upgrading from a release before the WH-14 gates: `shutdown_grace_seconds`
 above 10 and non-canonical `oci_repositories` entries used to load, and now

@@ -798,28 +798,10 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
         validate_storage_events_filter_list("git_paths", &target.git_paths, FilterKind::Path)?;
         validate_storage_events_filter_list("lfs_paths", &target.lfs_paths, FilterKind::Path)?;
         validate_storage_events_filter_list(
-            "agent_repo_paths",
-            &target.agent_repo_paths,
-            FilterKind::Path,
-        )?;
-        validate_storage_events_filter_list(
             "oci_repositories",
             &target.oci_repositories,
             FilterKind::OciRepository,
         )?;
-        validate_storage_events_filter_list(
-            "agent_tenants",
-            &target.agent_tenants,
-            FilterKind::Opaque,
-        )?;
-        let agent_tenants_empty = target.agent_tenants.is_empty();
-        let agent_repos_empty = target.agent_repo_paths.is_empty();
-        if agent_tenants_empty != agent_repos_empty {
-            return Err(MegaError::Other(
-                "[[storage_events.targets]] agent_tenants and agent_repo_paths must both be empty or both be non-empty"
-                    .to_string(),
-            ));
-        }
     }
     if events.targets.len() > 16 {
         return Err(MegaError::Other(
@@ -1105,8 +1087,6 @@ const STORAGE_EVENTS_EVENT_LITERALS: &[&str] = &[
     "oci.manifest.published",
     "lfs.object.uploaded",
     "lfs.media.finalized",
-    "agent_capture.events.committed",
-    "agent_capture.checkpoint.committed",
 ];
 
 fn is_storage_events_event_literal(value: &str) -> bool {
@@ -1118,13 +1098,10 @@ fn is_storage_events_event_literal(value: &str) -> bool {
 /// form. Count and byte-size limits are shared.
 #[derive(Clone, Copy)]
 enum FilterKind {
-    /// Absolute canonical repository path (`git_paths`, `lfs_paths`,
-    /// `agent_repo_paths`).
+    /// Absolute canonical repository path (`git_paths`, `lfs_paths`).
     Path,
     /// Canonical distribution `remoteName` (`oci_repositories`).
     OciRepository,
-    /// Server-supplied opaque value compared verbatim (`agent_tenants`).
-    Opaque,
 }
 
 fn validate_storage_events_filter_list(
@@ -1161,7 +1138,6 @@ fn validate_storage_events_filter_list(
                     )));
                 }
             }
-            FilterKind::Opaque => {}
         }
     }
     Ok(())
@@ -2313,8 +2289,6 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "oci_repositories",
             "lfs_paths",
             "include_unscoped_lfs",
-            "agent_tenants",
-            "agent_repo_paths",
         ]),
         "traces" => Some(&["enabled", "server_id", "scope"]),
         "github_sync" => Some(&[
@@ -4674,8 +4648,6 @@ mod tests {
             oci_repositories: Vec::new(),
             lfs_paths: Vec::new(),
             include_unscoped_lfs: false,
-            agent_tenants: Vec::new(),
-            agent_repo_paths: Vec::new(),
         }
     }
 
@@ -4831,8 +4803,6 @@ mod tests {
             oci_repositories: Vec::new(),
             lfs_paths: Vec::new(),
             include_unscoped_lfs: false,
-            agent_tenants: Vec::new(),
-            agent_repo_paths: Vec::new(),
         }];
         let err = config
             .validate()
@@ -4877,14 +4847,6 @@ mod tests {
         let err = config.validate().expect_err("too many filter items");
         assert!(err.to_string().contains("at most 64"), "{err}");
 
-        let mut config = valid_config();
-        let mut target = sample_target();
-        target.agent_tenants = vec!["acme".to_string()];
-        target.agent_repo_paths = Vec::new();
-        config.storage_events.targets = vec![target];
-        let err = config.validate().expect_err("agent filters must be paired");
-        assert!(err.to_string().contains("agent_tenants"), "{err}");
-
         // WH-14 / ADR-WH-01: `oci_repositories` uses the same canonical
         // `remoteName` rule as the inbound `/v2` router — a name the router
         // would reject can never match, so it is a dead subscription.
@@ -4922,19 +4884,6 @@ mod tests {
         let err = config.validate().expect_err("too many oci filter items");
         assert!(err.to_string().contains("oci_repositories"), "{err}");
         assert!(err.to_string().contains("at most 64"), "{err}");
-
-        // `agent_tenants` is `FilterKind::Opaque`: a tenant is compared
-        // verbatim and is neither a path nor a remoteName, so a value that
-        // fails both of those rules must still be accepted. Guards against
-        // wiring the tenant list to the wrong arm.
-        let mut config = valid_config();
-        let mut target = sample_target();
-        target.agent_tenants = vec!["Acme Corp".to_string()];
-        target.agent_repo_paths = vec!["/team/a".to_string()];
-        config.storage_events.targets = vec![target];
-        config
-            .validate()
-            .expect("opaque tenant values are compared verbatim, not parsed");
 
         for invalid in [
             "Team/Image",

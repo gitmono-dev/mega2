@@ -1301,8 +1301,6 @@ mod tests {
             oci_repositories: Vec::new(),
             lfs_paths: Vec::new(),
             include_unscoped_lfs,
-            agent_tenants: Vec::new(),
-            agent_repo_paths: Vec::new(),
         };
         let secret = crate::config::secret::SecretString::new(
             "hex:1111111111111111111111111111111111111111111111111111111111111111",

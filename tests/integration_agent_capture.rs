@@ -42,9 +42,7 @@ installation_id = "it-agent-capture"
 id = "ops-main"
 url = "https://events.example.invalid/ingest"
 secret_ref = "vault://secret/config/it/storage_events/targets/ops-main/hmac#value"
-events = ["agent_capture.events.committed", "agent_capture.checkpoint.committed"]
-agent_tenants = ["default"]
-agent_repo_paths = ["/third-part/mega"]
+events = ["repo.push"]
 "#;
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);

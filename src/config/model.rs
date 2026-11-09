@@ -302,6 +302,7 @@ fn default_storage_events_shutdown_grace_seconds() -> u64 {
 /// One static outbound target. `secret_ref` is stored opaque here; WH-11
 /// resolves it at startup when enabled.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct StorageEventsTargetConfig {
     pub id: String,
     pub url: String,
@@ -315,10 +316,6 @@ pub struct StorageEventsTargetConfig {
     pub lfs_paths: Vec<String>,
     #[serde(default)]
     pub include_unscoped_lfs: bool,
-    #[serde(default)]
-    pub agent_tenants: Vec<String>,
-    #[serde(default)]
-    pub agent_repo_paths: Vec<String>,
 }
 #[derive(Deserialize, Debug, Clone)]
 pub struct VaultBootstrapConfig {

@@ -17,8 +17,6 @@ pub enum EventType {
     OciManifestPublished,
     LfsObjectUploaded,
     LfsMediaFinalized,
-    AgentCaptureEventsCommitted,
-    AgentCaptureCheckpointCommitted,
 }
 
 impl EventType {
@@ -28,8 +26,6 @@ impl EventType {
             Self::OciManifestPublished => "oci.manifest.published",
             Self::LfsObjectUploaded => "lfs.object.uploaded",
             Self::LfsMediaFinalized => "lfs.media.finalized",
-            Self::AgentCaptureEventsCommitted => "agent_capture.events.committed",
-            Self::AgentCaptureCheckpointCommitted => "agent_capture.checkpoint.committed",
         }
     }
 }
@@ -39,7 +35,6 @@ pub enum EventSource {
     Git,
     Oci,
     Lfs,
-    AgentCapture,
 }
 
 impl EventSource {
@@ -48,27 +43,16 @@ impl EventSource {
             Self::Git => "git",
             Self::Oci => "oci",
             Self::Lfs => "lfs",
-            Self::AgentCapture => "agent_capture",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventScope {
-    Git {
-        repo_path: String,
-    },
-    Oci {
-        oci_repository: String,
-    },
+    Git { repo_path: String },
+    Oci { oci_repository: String },
     LfsUnscoped,
-    Media {
-        repo_path: String,
-    },
-    AgentCapture {
-        tenant_id: String,
-        repo_path: String,
-    },
+    Media { repo_path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,20 +79,6 @@ pub enum EventData {
         oid: String,
         size: u64,
         manifest_id: String,
-    },
-    AgentCaptureEventsCommitted {
-        capture_id: String,
-        receipt_id: String,
-        new_event_count: u64,
-        stream_kind: String,
-        generation: u64,
-        completeness: String,
-    },
-    AgentCaptureCheckpointCommitted {
-        capture_id: String,
-        checkpoint_id: String,
-        completeness: String,
-        raw_committed: bool,
     },
 }
 
@@ -192,19 +162,6 @@ fn target_matches(event: &CommittedEvent, target: &StorageEventsTargetConfig) ->
                     .any(|name| name == oci_repository)
         }
         EventScope::LfsUnscoped => target.include_unscoped_lfs,
-        EventScope::AgentCapture {
-            tenant_id,
-            repo_path,
-        } => {
-            !target.agent_tenants.is_empty()
-                && !target.agent_repo_paths.is_empty()
-                && target.agent_tenants.iter().any(|item| item == tenant_id)
-                && validate_canonical_path(repo_path).is_ok()
-                && target
-                    .agent_repo_paths
-                    .iter()
-                    .any(|filter| path_filter_matches(filter, repo_path))
-        }
     }
 }
 
@@ -227,14 +184,6 @@ fn scope_matches_type(event: &CommittedEvent) -> bool {
             EventType::LfsMediaFinalized,
             EventSource::Lfs,
             EventScope::Media { .. }
-        ) | (
-            EventType::AgentCaptureEventsCommitted,
-            EventSource::AgentCapture,
-            EventScope::AgentCapture { .. }
-        ) | (
-            EventType::AgentCaptureCheckpointCommitted,
-            EventSource::AgentCapture,
-            EventScope::AgentCapture { .. }
         )
     )
 }
@@ -247,14 +196,6 @@ fn validate_scope_and_data(event: &CommittedEvent) -> Result<(), ProjectionDrop>
         }
         EventScope::Oci { oci_repository } => require_nonempty(oci_repository)?,
         EventScope::LfsUnscoped => {}
-        EventScope::AgentCapture {
-            tenant_id,
-            repo_path,
-        } => {
-            require_nonempty(tenant_id)?;
-            require_nonempty(repo_path)?;
-            validate_canonical_path(repo_path).map_err(|_| ProjectionDrop::InvalidScope)?;
-        }
     }
     match &event.data {
         EventData::RepoPush {
@@ -290,28 +231,6 @@ fn validate_scope_and_data(event: &CommittedEvent) -> Result<(), ProjectionDrop>
         } => {
             require_oid(oid)?;
             require_nonempty(manifest_id)?;
-        }
-        EventData::AgentCaptureEventsCommitted {
-            capture_id,
-            receipt_id,
-            stream_kind,
-            completeness,
-            ..
-        } => {
-            require_nonempty(capture_id)?;
-            require_nonempty(receipt_id)?;
-            require_nonempty(stream_kind)?;
-            require_nonempty(completeness)?;
-        }
-        EventData::AgentCaptureCheckpointCommitted {
-            capture_id,
-            checkpoint_id,
-            completeness,
-            ..
-        } => {
-            require_nonempty(capture_id)?;
-            require_nonempty(checkpoint_id)?;
-            require_nonempty(completeness)?;
         }
     }
     Ok(())
@@ -378,14 +297,6 @@ impl Envelope {
                     repo_path: None,
                     oci_repository: None,
                 },
-                EventScope::AgentCapture {
-                    tenant_id,
-                    repo_path,
-                } => EnvelopeScope {
-                    tenant_id: Some(tenant_id.clone()),
-                    repo_path: Some(repo_path.clone()),
-                    oci_repository: None,
-                },
             },
             data: data_value(&event.data)?,
         })
@@ -435,32 +346,6 @@ fn data_value(data: &EventData) -> Result<serde_json::Value, ProjectionDrop> {
             "manifest_id": manifest_id,
             "transfer": "fastcdc",
         })),
-        EventData::AgentCaptureEventsCommitted {
-            capture_id,
-            receipt_id,
-            new_event_count,
-            stream_kind,
-            generation,
-            completeness,
-        } => Ok(serde_json::json!({
-            "capture_id": capture_id,
-            "receipt_id": receipt_id,
-            "new_event_count": new_event_count,
-            "stream_kind": stream_kind,
-            "generation": generation,
-            "completeness": completeness,
-        })),
-        EventData::AgentCaptureCheckpointCommitted {
-            capture_id,
-            checkpoint_id,
-            completeness,
-            raw_committed,
-        } => Ok(serde_json::json!({
-            "capture_id": capture_id,
-            "checkpoint_id": checkpoint_id,
-            "completeness": completeness,
-            "raw_committed": raw_committed,
-        })),
     }
 }
 
@@ -486,15 +371,11 @@ mod tests {
                 "oci.manifest.published".to_string(),
                 "lfs.object.uploaded".to_string(),
                 "lfs.media.finalized".to_string(),
-                "agent_capture.events.committed".to_string(),
-                "agent_capture.checkpoint.committed".to_string(),
             ],
             git_paths: vec!["/team/a".to_string()],
             oci_repositories: vec!["team/image".to_string()],
             lfs_paths: vec!["/team/a".to_string()],
             include_unscoped_lfs: true,
-            agent_tenants: vec!["acme".to_string()],
-            agent_repo_paths: vec!["/team/a".to_string()],
         }
     }
 
@@ -569,40 +450,6 @@ mod tests {
                     manifest_id: "m1".to_string(),
                 },
             },
-            CommittedEvent {
-                event_id: uuid(),
-                event_type: EventType::AgentCaptureEventsCommitted,
-                occurred_at: 1_700_000_000,
-                source: EventSource::AgentCapture,
-                scope: EventScope::AgentCapture {
-                    tenant_id: "acme".to_string(),
-                    repo_path: "/team/a".to_string(),
-                },
-                data: EventData::AgentCaptureEventsCommitted {
-                    capture_id: "1".to_string(),
-                    receipt_id: "r1".to_string(),
-                    new_event_count: 2,
-                    stream_kind: "external_capture".to_string(),
-                    generation: 1,
-                    completeness: "complete".to_string(),
-                },
-            },
-            CommittedEvent {
-                event_id: uuid(),
-                event_type: EventType::AgentCaptureCheckpointCommitted,
-                occurred_at: 1_700_000_000,
-                source: EventSource::AgentCapture,
-                scope: EventScope::AgentCapture {
-                    tenant_id: "acme".to_string(),
-                    repo_path: "/team/a".to_string(),
-                },
-                data: EventData::AgentCaptureCheckpointCommitted {
-                    capture_id: "1".to_string(),
-                    checkpoint_id: "ck1".to_string(),
-                    completeness: "incomplete".to_string(),
-                    raw_committed: false,
-                },
-            },
         ];
         for event in &events {
             let body = project(event).expect("project");
@@ -611,8 +458,11 @@ mod tests {
             let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(value["schema_version"], 1);
             assert!(value["scope"].is_object());
-            assert!(value["scope"].get("tenant_id").is_some());
-            assert!(value["scope"].get("repo_path").is_some());
+            assert!(value["scope"].get("tenant_id").is_none());
+            assert!(
+                value["scope"].get("repo_path").is_some()
+                    || value["scope"].get("repo_path") == Some(&serde_json::Value::Null)
+            );
             assert!(value["scope"].get("oci_repository").is_some());
             assert!(value.get("actor").is_none());
         }
@@ -705,37 +555,6 @@ mod tests {
         };
         assert!(select_targets(&oci_prefix, std::slice::from_ref(&target)).is_empty());
 
-        let agent = CommittedEvent {
-            event_id: uuid(),
-            event_type: EventType::AgentCaptureEventsCommitted,
-            occurred_at: 1,
-            source: EventSource::AgentCapture,
-            scope: EventScope::AgentCapture {
-                tenant_id: "acme".to_string(),
-                repo_path: "/team/a".to_string(),
-            },
-            data: EventData::AgentCaptureEventsCommitted {
-                capture_id: "1".to_string(),
-                receipt_id: "r".to_string(),
-                new_event_count: 1,
-                stream_kind: "external_capture".to_string(),
-                generation: 1,
-                completeness: "complete".to_string(),
-            },
-        };
-        assert_eq!(
-            select_targets(&agent, std::slice::from_ref(&target)).len(),
-            1
-        );
-        let other_tenant = CommittedEvent {
-            scope: EventScope::AgentCapture {
-                tenant_id: "other".to_string(),
-                repo_path: "/team/a".to_string(),
-            },
-            ..agent.clone()
-        };
-        assert!(select_targets(&other_tenant, std::slice::from_ref(&target)).is_empty());
-
         let lfs = CommittedEvent {
             event_id: uuid(),
             event_type: EventType::LfsObjectUploaded,
@@ -750,5 +569,67 @@ mod tests {
         assert_eq!(select_targets(&lfs, std::slice::from_ref(&target)).len(), 1);
         target.include_unscoped_lfs = false;
         assert!(select_targets(&lfs, std::slice::from_ref(&target)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod legacy_event_tests {
+    use super::{EventData, EventScope, EventSource, EventType};
+
+    /// MTR-57: only the four non-Capture event literals remain; the retired
+    /// Capture events have no variant and no wire literal.
+    #[test]
+    fn legacy_event_filters_removed() {
+        let literals: Vec<&str> = [
+            EventType::RepoPush,
+            EventType::OciManifestPublished,
+            EventType::LfsObjectUploaded,
+            EventType::LfsMediaFinalized,
+        ]
+        .iter()
+        .map(|event| event.as_str())
+        .collect();
+        assert_eq!(
+            literals,
+            vec![
+                "repo.push",
+                "oci.manifest.published",
+                "lfs.object.uploaded",
+                "lfs.media.finalized",
+            ]
+        );
+        let removed = [
+            "agent_capture.events.committed",
+            "agent_capture.checkpoint.committed",
+        ];
+        for literal in removed {
+            assert!(
+                literals.iter().all(|known| known != &literal),
+                "{literal} must have no event type"
+            );
+        }
+        // A config that still carries the removed target filters is rejected
+        // by the strict unknown-field whitelist instead of being ignored.
+        let sample = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+        )
+        .expect("sample config");
+        let config = format!(
+            "{sample}\n[[storage_events.targets]]\nid = \"ops\"\nurl = \"https://events.example.invalid/ingest\"\nsecret_ref = \"vault://secret/config/example/storage_events/targets/ops/hmac#value\"\nevents = [\"repo.push\"]\nagent_tenants = [\"acme\"]\nagent_repo_paths = [\"/team/a\"]\n"
+        );
+        let error = crate::config::Config::load_str(&config).expect_err("removed filters");
+        assert!(
+            error.to_string().contains("agent_tenants"),
+            "unexpected error: {error}"
+        );
+        // The remaining shapes still exist so non-Capture projections compile.
+        let _ = (
+            EventSource::Git,
+            EventScope::LfsUnscoped,
+            EventData::LfsObjectUploaded {
+                oid: "ab".to_owned(),
+                size: 1,
+            },
+        );
     }
 }

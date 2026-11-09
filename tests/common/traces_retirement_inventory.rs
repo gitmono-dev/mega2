@@ -47,6 +47,24 @@ const STAGE_27_FORBIDDEN: [&str; 4] = [
     "MEGA_AGENT_CAPTURE__",
 ];
 
+/// Stage 57: the removed Capture event kinds and target filters.
+const STAGE_57_FORBIDDEN: [&str; 6] = [
+    "agent_tenants",
+    "agent_repo_paths",
+    "agent_capture.events.committed",
+    "agent_capture.checkpoint.committed",
+    "AgentCaptureEventsCommitted",
+    "AgentCaptureCheckpointCommitted",
+];
+
+/// Stage 57 allowlist: the retirement assertions that name the removed
+/// symbols to prove they no longer resolve.
+const STAGE_57_ALLOWLIST: [&str; 3] = [
+    "src/jupiter/service/storage_event.rs",
+    "tests/common/traces_retirement_inventory.rs",
+    "tests/integration_traces.rs",
+];
+
 /// Stage 27 allowlist: the removal guard names what it rejects, and the
 /// retirement tests prove the names are gone.
 const STAGE_27_ALLOWLIST: [&str; 4] = [
@@ -121,4 +139,9 @@ pub fn scan_stage_28(repo_root: &Path) -> Result<Vec<String>, String> {
 /// Stage 27 scan (removed legacy config and event names).
 pub fn scan_stage_27(repo_root: &Path) -> Result<Vec<String>, String> {
     scan(repo_root, &STAGE_27_FORBIDDEN, &STAGE_27_ALLOWLIST)
+}
+
+/// Stage 57 scan (removed Capture events and target filters).
+pub fn scan_stage_57(repo_root: &Path) -> Result<Vec<String>, String> {
+    scan(repo_root, &STAGE_57_FORBIDDEN, &STAGE_57_ALLOWLIST)
 }

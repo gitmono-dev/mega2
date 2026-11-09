@@ -16860,3 +16860,15 @@ fn legacy_retirement_stage_27() {
     let model = std::fs::read_to_string(root.join("src/config/model.rs")).expect("model");
     assert!(!model.contains("AgentCaptureConfig"));
 }
+
+/// MTR-57 stage scanner: the removed Capture event kinds and target filters
+/// survive only in the retirement assertions that prove they are gone.
+#[test]
+fn legacy_retirement_stage_57() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_57(root).expect("stage 57 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy event symbols: {hits:?}"
+    );
+}
