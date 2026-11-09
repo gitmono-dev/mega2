@@ -977,6 +977,10 @@ MTR-58 的 HTTP driver 使用的 fixture：`MEGA2_TRACES_INTEROP_HTTP_URL`（meg
 
 HTTP driver 逐案执行并计数：`http_push`（Libra `agent push --mega2` 真实 scoped push）、`http_fetch`（Libra `mega2 traces fetch` 显式 fetch）、`http_unauthenticated`（直接请求协议端点，要求 401 与 Basic challenge）、`http_cross_scope_want`（向本 scope 索取他 scope 对象被拒）、`http_cross_scope_delta`（以他 scope commit 为父的 delta push 整体被拒）。输出契约为 `==> <case>` / `PASS: <case>` / `FAIL: <case>` 与末行 `traces interop http summary: executed=<n> passed=<n> failed=<n>`。离线 selector `cargo test --test integration_traces interop_http_` 只验证参数解析、缺 fixture 非零退出与 cleanup guard，不连接真实服务。
 
+MTR-59 的 SSH driver 使用 `MEGA2_TRACES_INTEROP_SSH_URL`（`ssh://git@host:port/project/<name>.git`）、`MEGA2_TRACES_INTEROP_TARGET`、`MEGA2_TRACES_INTEROP_AGENT_REPO`、`MEGA2_TRACES_INTEROP_SCOPE`、`MEGA2_TRACES_INTEROP_FOREIGN_WANT` 与 `LIBRA_SSH_COMMAND`（指向携带已绑定私钥的 ssh wrapper 可执行文件）；逐案执行 `ssh_push`、`ssh_fetch`、`ssh_none_auth`（保留 login `traces` 的 none-auth 以 Permission denied 拒绝）、`ssh_cross_scope_want` 与 `ssh_cross_scope_delta`，输出契约与 HTTP driver 相同但末行为 `traces interop ssh summary: executed=<n> passed=<n> failed=<n>`。离线 selector `cargo test --test integration_traces interop_ssh_` 只验证参数解析、缺 fixture 非零退出与 cleanup guard。
+
+2026-11-09 的本地真实 SSH fixture：同一 `mega2` 进程组内的 `service ssh`（`127.0.0.1:2222`）、`ssh_keys` 记录 9001 与同一 principal 的 `static_push_token / trace-ssh-key:9001`、`mono_account / ssh-key:9001` 绑定；`--case ssh` 5/5 逐案通过（日志 SHA256 `741d0d2821eaf38c337b83ec642ff51c1b9ec88952662bde1ca7279f968dfcfd`，不含密钥或 token）。
+
 2026-11-09 的本地真实 fixture 证据：mega2 `0.42.133` debug binary、ephemeral PostgreSQL `mega2_interop`、`[traces].enabled=true`、两个 static push token（分别覆盖 `/project/interop` 与 `/project/other`）与两条真实 Libra scoped push；`--case http` 的 5/5 逐案通过（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`，日志 SHA256 `f96343c72b7f51935d6c58a6cee415385f5a30c6a8f89f31095e3738dd090431`，不含 token 或 DSN）。
 
 
