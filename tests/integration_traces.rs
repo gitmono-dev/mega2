@@ -15806,3 +15806,183 @@ async fn purge_schema_journal_items_and_fence_contract() {
     drop(closed);
     drop(guard);
 }
+/// MTR-33 black-box fence gate: the real `traces purge-legacy-capture
+/// --action fence` CLI persists the persistent fence, repeats idempotently and
+/// refuses an unauthorized manifest without writing a fence row.
+#[tokio::test]
+async fn purge_fence_cli_activates_and_rejects() {
+    use sea_orm::ConnectionTrait;
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    db.execute_unprepared(
+        "INSERT INTO agent_capture_session
+         (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind, completeness)
+         VALUES ('deploy-m33', 'tenant-m33', 'repo', 'producer', 'fence-session', 'external_capture', 'complete')",
+    )
+    .await
+    .expect("legacy session");
+    let journal = "33333333-3333-4333-8333-333333333333";
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge
+         (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+         VALUES ('{journal}', 'local:/srv/mega2/objects', 'local:/srv/mega2/objects', 'deploy-m33', 'sha256:manifest', 'frozen')"
+    ))
+    .await
+    .expect("journal");
+
+    let temp = tempfile::tempdir().expect("fixture dir");
+    let database_url = std::env::var("MEGA_DATABASE__DB_URL")
+        .unwrap_or_else(|_| "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".into());
+    let name: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_database() AS name",
+        ))
+        .await
+        .expect("database name")
+        .expect("database row")
+        .try_get("", "name")
+        .expect("name");
+    let mut url = url::Url::parse(&database_url).expect("database url");
+    url.set_path(&name);
+    let config = temp.path().join("config.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample config");
+    let sample = sample.replace(
+        "db_url = \"postgres://localhost:5432/mono\"",
+        &format!("db_url = \"{}\"", url.as_str()),
+    );
+    let sample = sample.replace(
+        "base_dir = \"/tmp/.mono\"",
+        &format!("base_dir = \"{}\"", temp.path().display()),
+    );
+    std::fs::write(&config, sample).expect("config");
+    // The CLI refuses a config that was not explicitly named.
+    let invalid_manifest = temp.path().join("invalid.json");
+    std::fs::write(
+        &invalid_manifest,
+        r#"{"bucket_scope": "mega2-legacy/", "owners": [], "orphan_prefixes": []}"#,
+    )
+    .expect("invalid manifest");
+    let run = |manifest: &std::path::Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "traces",
+                "purge-legacy-capture",
+                "--action",
+                "fence",
+                "--journal",
+                journal,
+                "--maintenance-manifest",
+            ])
+            .arg(manifest)
+            .env("MEGA_BASE_DIR", temp.path().join("base"))
+            .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+            .output()
+            .expect("run purge CLI")
+    };
+    let refused = run(&invalid_manifest);
+    assert!(
+        !refused.status.success(),
+        "an unauthorized manifest must fail"
+    );
+    let rows: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM trace_legacy_writer_fence",
+        ))
+        .await
+        .expect("fence count")
+        .expect("fence row")
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(rows, 0, "no fence row for an invalid activation");
+
+    let manifest = temp.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+            "bucket_scope": "mega2-legacy/",
+            "owners": [{"owner": "owner-a", "deployment_id": "deploy-m33", "tenant_id": "tenant-m33", "receipt_id": "receipt-a", "complete": true}],
+            "orphan_prefixes": []
+        }"#,
+    )
+    .expect("manifest");
+    let activated = run(&manifest);
+    assert!(
+        activated.status.success(),
+        "activation failed: {}",
+        String::from_utf8_lossy(&activated.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&activated.stdout);
+    assert!(stdout.contains("activated"), "{stdout}");
+    let again = run(&manifest);
+    assert!(again.status.success(), "idempotent activation");
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("already-active"),
+        "{}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+    let persisted: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM trace_legacy_writer_fence WHERE active",
+        ))
+        .await
+        .expect("active fence count")
+        .expect("active fence row")
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(persisted, 1, "one persistent active fence");
+
+    // The barrier is the trigger, proved with a role that holds an explicit
+    // DML grant. The guard restores the pre-test grants afterwards.
+    let role = format!("mega2_m33_probe_{}", std::process::id());
+    db.execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .ok();
+    db.execute_unprepared(&format!("CREATE ROLE {role} NOLOGIN"))
+        .await
+        .expect("probe role");
+    db.execute_unprepared(&format!(
+        "GRANT INSERT, UPDATE, DELETE, SELECT ON agent_capture_session TO {role}"
+    ))
+    .await
+    .expect("probe grants");
+    use sea_orm::TransactionTrait;
+    for statement in [
+        "INSERT INTO agent_capture_session
+         (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind)
+         VALUES ('d', 't', 'r', 'p', 'fenced-insert', 'external_capture')".to_owned(),
+        "UPDATE agent_capture_session SET completeness = 'empty' WHERE client_session_id = 'fence-session'".to_owned(),
+        "DELETE FROM agent_capture_session WHERE client_session_id = 'fence-session'".to_owned(),
+    ] {
+        // Each probe uses its own transaction: the barrier aborts the current
+        // transaction, which must not hide the next probe's result.
+        let txn = db.begin().await.expect("probe txn");
+        txn.execute_unprepared(&format!("SET LOCAL ROLE {role}"))
+            .await
+            .expect("set role");
+        let error = txn
+            .execute_unprepared(&statement)
+            .await
+            .expect_err("the barrier must reject the write");
+        assert!(
+            error.to_string().contains("fenced"),
+            "unexpected barrier error: {error}"
+        );
+        txn.rollback().await.ok();
+    }
+    db.execute_unprepared(&format!("REVOKE ALL ON agent_capture_session FROM {role}"))
+        .await
+        .expect("restore grants");
+    db.execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .expect("drop probe role");
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}

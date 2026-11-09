@@ -15,6 +15,7 @@ pub mod storage_event_emitter;
 pub mod storage_event_transport;
 pub(crate) mod trace_fetch_service;
 pub(crate) mod trace_index_worker;
+pub mod trace_legacy_fence;
 pub mod trace_legacy_manifest;
 pub mod trace_legacy_roles;
 pub mod trace_legacy_scope_guard;

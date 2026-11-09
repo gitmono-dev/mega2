@@ -965,6 +965,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 **旧 app 三类 DML 撤销（MTR-67）：** ownership 准备之后，`trace_legacy_roles::revoke_legacy_dml` 对 12 张旧表分别 `REVOKE INSERT, UPDATE, DELETE` FROM 旧 app role 与 `PUBLIC`；随后用 `has_table_privilege` 逐个证明旧 app 无有效权限，若仍可经继承角色获得则显式失败（`InheritedGrant`），不报成功。真正 oracle 是在**无 active fence**时以 `SET LOCAL ROLE <app>` 尝试 INSERT：必须以 `permission denied`/`42501` 拒绝并回滚，不能由 MTR-33 的 trigger 拒绝冒充 REVOKE 完成；有 active fence 时拒绝执行撤销（无法证明权限结果）。
 
+**持久 writer fence 与公开维护入口（MTR-33）：** `mega2 --config <现存配置> traces purge-legacy-capture --action fence --journal <UUID> --maintenance-manifest <PATH>` 是冻结的公开维护入口。`fence` 在同一事务内重跑 MTR-62 全库授权 preflight，未知/新增 scope 则不激活且不产生 receipt；journal 必须存在且为 `frozen`；同一 journal 的 active fence 重复激活幂等并返回同一 fence/receipt；只有 legacy 表 owner（maintenance role）成员可切换 fence。激活后 `trace_legacy_writer_fence.active` 持久存在，12 张旧表的 `trace_legacy_write_fence()`（`SECURITY DEFINER`，仅 owner 可读 fence 表）拒绝 INSERT/UPDATE/DELETE，旧 Capture HTTP 写入口以稳定 `legacy_capture_fenced`（409）拒绝；`inventory`/`delete`/`drop` 由后续卡接线，当前明确拒绝而不假装成功。
+
 **持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
 - `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
 - `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；

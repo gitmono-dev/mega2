@@ -72,6 +72,96 @@ pub(crate) async fn revoke_dml_file(
         .map_err(|error| error.to_string())
 }
 
+/// `traces purge-legacy-capture`: the public maintenance entry point frozen by
+/// MTR-33. `--action fence` re-runs the whole-database preflight and activates
+/// the persistent writer fence; the later inventory/delete/drop actions are
+/// wired by their own cards and are refused here.
+pub fn cli() -> clap::Command {
+    clap::Command::new("purge-legacy-capture")
+        .about("Legacy Capture purge maintenance (fence/inventory/delete/drop)")
+        .arg(
+            clap::Arg::new("action")
+                .long("action")
+                .value_name("ACTION")
+                .required(true)
+                .value_parser(["fence", "inventory", "delete", "drop"])
+                .help("Maintenance action"),
+        )
+        .arg(
+            clap::Arg::new("journal")
+                .long("journal")
+                .value_name("UUID")
+                .required(true)
+                .help("Frozen purge journal UUID"),
+        )
+        .arg(
+            clap::Arg::new("maintenance-manifest")
+                .long("maintenance-manifest")
+                .value_name("PATH")
+                .required(true)
+                .help("Controlled maintenance manifest file"),
+        )
+}
+
+pub(crate) async fn exec(
+    ctx: crate::commands::CommandContext,
+    args: &clap::ArgMatches,
+) -> crate::common::errors::MegaResult {
+    use crate::common::errors::MegaError;
+    let config = crate::commands::require_config(ctx, "traces purge-legacy-capture")?;
+    super::ensure_schema_current(&config.database).await?;
+    let connection = std::sync::Arc::new(
+        crate::jupiter::storage::init::postgres_connection(&config.database).await?,
+    );
+    let action = args
+        .get_one::<String>("action")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let journal = args
+        .get_one::<String>("journal")
+        .cloned()
+        .unwrap_or_default();
+    let manifest_path = std::path::PathBuf::from(
+        args.get_one::<String>("maintenance-manifest")
+            .cloned()
+            .unwrap_or_default(),
+    );
+    match action {
+        "fence" => {
+            let raw = std::fs::read_to_string(&manifest_path).map_err(|error| {
+                MegaError::cli_exit(
+                    1,
+                    format!("cannot read {}: {error}", manifest_path.display()),
+                )
+            })?;
+            let receipt = crate::jupiter::service::trace_legacy_fence::activate_fence(
+                connection.as_ref(),
+                &journal,
+                &raw,
+            )
+            .await
+            .map_err(|error| MegaError::cli_exit(1, error.to_string()))?;
+            println!(
+                "fence {} journal {} aggregate {} receipt {} {}",
+                receipt.fence_id,
+                receipt.journal_id,
+                receipt.aggregate_digest,
+                receipt.receipt_digest,
+                if receipt.already_active {
+                    "already-active"
+                } else {
+                    "activated"
+                }
+            );
+            Ok(())
+        }
+        other => Err(MegaError::cli_exit(
+            1,
+            format!("purge-legacy-capture --action {other} is not wired in this release"),
+        )),
+    }
+}
+
 /// The maintenance driver refuses a config that was found implicitly: only an
 /// explicitly named `--config`/`MEGA_CONFIG` may authorize a purge manifest.
 pub(crate) fn require_named_config(source: ConfigSource) -> Result<(), String> {

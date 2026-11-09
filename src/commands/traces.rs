@@ -36,6 +36,7 @@ pub fn cli() -> Command {
         .subcommand(traces_target::cli())
         .subcommand(traces_credentials::cli())
         .subcommand(traces_search_index::cli())
+        .subcommand(traces_purge::cli())
         .subcommand(rebuild_index_cli())
 }
 
@@ -46,6 +47,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         Some(("credentials", sub)) => traces_credentials::exec(ctx, sub).await,
         Some(("search-index", sub)) => traces_search_index::exec(ctx, sub).await,
         Some(("rebuild-index", sub)) => rebuild_index(ctx, sub).await,
+        Some(("purge-legacy-capture", sub)) => traces_purge::exec(ctx, sub).await,
         Some((cmd, _)) => Err(unknown_subcommand(cmd)),
         None => Err(unknown_subcommand("traces")),
     }
@@ -122,7 +124,7 @@ fn require_named_config(source: Option<ConfigSource>) -> Result<(), MegaError> {
     }
 }
 
-async fn ensure_schema_current(config: &DbConfig) -> Result<(), MegaError> {
+pub(crate) async fn ensure_schema_current(config: &DbConfig) -> Result<(), MegaError> {
     let connection = read_only_database_connection(config).await.map_err(|_| {
         rebuild_index_error("cannot open the configured database for a read-only schema check")
     })?;

@@ -20,8 +20,11 @@ use crate::{
     ceres::agent_capture::auth::{lookup_ingest_token, token_covers_capture_repo},
     common::{canonical_json, errors::MegaError},
     config::AgentCaptureIngestTokenConfig,
-    jupiter::storage::agent_capture_storage::{
-        AgentCaptureStorage, InsertCheckpoint, InsertEvent, InsertFileOp, SessionNaturalKey,
+    jupiter::storage::{
+        agent_capture_storage::{
+            AgentCaptureStorage, InsertCheckpoint, InsertEvent, InsertFileOp, SessionNaturalKey,
+        },
+        base_storage::StorageConnector,
     },
     orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectNamespace},
 };
@@ -110,6 +113,27 @@ fn require_ingest_token(
     )
     .cloned()
     .ok_or_else(AgentCaptureHttpError::unauthorized)
+}
+
+/// Legacy Capture writes are refused with a stable code while the purge fence
+/// is active (MTR-33). A fence lookup failure also fails closed.
+async fn reject_if_fenced(state: &MonoApiServiceState) -> Result<(), AgentCaptureHttpError> {
+    match crate::jupiter::service::trace_legacy_fence::ensure_unfenced(
+        state
+            .storage
+            .agent_capture_service
+            .storage
+            .base
+            .get_connection(),
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(crate::jupiter::service::trace_legacy_fence::LegacyFenceError::Fenced) => {
+            Err(AgentCaptureHttpError::legacy_capture_fenced())
+        }
+        Err(_) => Err(AgentCaptureHttpError::conflict()),
+    }
 }
 
 fn receipt_error(err: MegaError) -> AgentCaptureHttpError {
@@ -626,6 +650,7 @@ async fn put_session(
     State(state): State<MonoApiServiceState>,
     request: Request,
 ) -> Result<Json<SessionPutResponse>, AgentCaptureHttpError> {
+    reject_if_fenced(&state).await?;
     let (parts, body) = request.into_parts();
     let token = require_ingest_token(&state, &parts.headers)?;
     let (repo_segment, client_session_segment) = session_put_path(parts.uri.path())?;
@@ -722,6 +747,7 @@ async fn staging_blob(
     State(state): State<MonoApiServiceState>,
     request: Request,
 ) -> Result<Json<StagingBlobResponse>, AgentCaptureHttpError> {
+    reject_if_fenced(&state).await?;
     let (parts, body) = request.into_parts();
     let token = require_ingest_token(&state, &parts.headers)?;
     let capture_id = session_staging_path(parts.uri.path())?;
@@ -774,6 +800,7 @@ async fn finalize_blob(
     State(state): State<MonoApiServiceState>,
     request: Request,
 ) -> Result<Json<FinalizeBlobResponse>, AgentCaptureHttpError> {
+    reject_if_fenced(&state).await?;
     let (parts, body) = request.into_parts();
     let token = require_ingest_token(&state, &parts.headers)?;
     let (capture_id, lease_id) = session_finalize_path(parts.uri.path())?;
@@ -853,6 +880,7 @@ async fn events_batch(
     State(state): State<MonoApiServiceState>,
     request: Request,
 ) -> Result<Json<EventsBatchResponse>, AgentCaptureHttpError> {
+    reject_if_fenced(&state).await?;
     let (parts, body) = request.into_parts();
     let token = require_ingest_token(&state, &parts.headers)?;
     let capture_id = session_events_batch_path(parts.uri.path())?;
@@ -984,6 +1012,7 @@ async fn file_ops_batch(
     State(state): State<MonoApiServiceState>,
     request: Request,
 ) -> Result<Json<FileOpsBatchResponse>, AgentCaptureHttpError> {
+    reject_if_fenced(&state).await?;
     let (parts, body) = request.into_parts();
     let token = require_ingest_token(&state, &parts.headers)?;
     let capture_id = session_file_ops_batch_path(parts.uri.path())?;
@@ -1096,6 +1125,7 @@ async fn post_checkpoint(
     State(state): State<MonoApiServiceState>,
     request: Request,
 ) -> Result<Json<CheckpointPostResponse>, AgentCaptureHttpError> {
+    reject_if_fenced(&state).await?;
     let (parts, body) = request.into_parts();
     let token = require_ingest_token(&state, &parts.headers)?;
     let capture_id = session_checkpoints_post_path(parts.uri.path())?;
@@ -2242,7 +2272,14 @@ mod tests {
         let row = agent_capture_event::Entity::find()
             .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
             .filter(agent_capture_event::Column::EventUid.eq("0:0".to_owned()))
-            .one(state.storage.agent_capture_service.storage.get_connection())
+            .one(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("load")
             .expect("event");
@@ -2286,7 +2323,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let rows = agent_capture_event::Entity::find()
             .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 0);
@@ -2327,7 +2371,14 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let session = agent_capture_session::Entity::find_by_id(capture_id)
-            .one(state.storage.agent_capture_service.storage.get_connection())
+            .one(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("load")
             .expect("session");
@@ -2451,7 +2502,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let rows = agent_capture_event::Entity::find()
             .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 0);
@@ -2555,7 +2613,14 @@ mod tests {
         assert_eq!(json_body(response).await["accepted"], true);
         let rows = agent_capture_file_op::Entity::find()
             .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 1);
@@ -2620,7 +2685,14 @@ mod tests {
             file_ops_request(state.clone(), capture_id, Some("Bearer secret-ci"), &body).await;
         assert_eq!(response.status(), StatusCode::OK);
         let session = agent_capture_session::Entity::find_by_id(capture_id)
-            .one(state.storage.agent_capture_service.storage.get_connection())
+            .one(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("load")
             .expect("session");
@@ -2679,7 +2751,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let rows = agent_capture_file_op::Entity::find()
             .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 0);
@@ -2701,7 +2780,14 @@ mod tests {
         assert_eq!(body["error"]["code"], "bad_request");
         let rows = agent_capture_file_op::Entity::find()
             .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 0);
@@ -2723,7 +2809,14 @@ mod tests {
         assert_eq!(body["error"]["code"], "bad_request");
         let rows = agent_capture_file_op::Entity::find()
             .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 0);
@@ -2744,7 +2837,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let rows = agent_capture_file_op::Entity::find()
             .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 0);
@@ -2764,7 +2864,14 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
         let rows = agent_capture_file_op::Entity::find()
             .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 1);
@@ -2927,7 +3034,14 @@ mod tests {
         assert_eq!(body["accepted"], true);
         let rows = agent_capture_checkpoint::Entity::find()
             .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 1);
@@ -2966,7 +3080,14 @@ mod tests {
             .to_owned();
         let digest = agent_capture_blob::Entity::find()
             .filter(agent_capture_blob::Column::LeaseId.eq(lease_id))
-            .one(state.storage.agent_capture_service.storage.get_connection())
+            .one(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("load")
             .expect("blob")
@@ -2981,7 +3102,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let rows = agent_capture_checkpoint::Entity::find()
             .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(rows, 0);
@@ -3003,7 +3131,14 @@ mod tests {
         assert_eq!(body["completeness"], "incomplete");
         assert_eq!(body["partial_reason"], "missing_raw");
         let session = agent_capture_session::Entity::find_by_id(capture_id)
-            .one(state.storage.agent_capture_service.storage.get_connection())
+            .one(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("load")
             .expect("session");
@@ -3035,13 +3170,27 @@ mod tests {
         let blobs = agent_capture_blob::Entity::find()
             .filter(agent_capture_blob::Column::Digest.eq(digest.clone()))
             .filter(agent_capture_blob::Column::Visibility.eq("raw"))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count blobs");
         assert_eq!(blobs, 1);
         let checkpoints = agent_capture_checkpoint::Entity::find()
             .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count checkpoints");
         assert_eq!(checkpoints, 2);
@@ -3148,7 +3297,14 @@ mod tests {
         assert_eq!(checkpointed.status(), StatusCode::OK);
         let before = agent_capture_access_audit::Entity::find()
             .filter(agent_capture_access_audit::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         let response = get_request(
@@ -3169,7 +3325,14 @@ mod tests {
         assert_eq!(response_bytes(response).await, payload);
         let after = agent_capture_access_audit::Entity::find()
             .filter(agent_capture_access_audit::Column::CaptureId.eq(capture_id))
-            .count(state.storage.agent_capture_service.storage.get_connection())
+            .count(
+                state
+                    .storage
+                    .agent_capture_service
+                    .storage
+                    .base
+                    .get_connection(),
+            )
             .await
             .expect("count");
         assert_eq!(after, before + 1);

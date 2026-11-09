@@ -7,7 +7,7 @@
 //! unauthorized scopes, untrusted orphan prefixes, a shared bucket root and
 //! any attempt to include the old Git traces all block the preflight.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -88,7 +88,9 @@ impl From<sea_orm::DbErr> for ScopeGuardError {
     }
 }
 
-async fn legacy_scopes(db: &DatabaseConnection) -> Result<Vec<(String, String)>, ScopeGuardError> {
+async fn legacy_scopes<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<(String, String)>, ScopeGuardError> {
     // AC-1: every legacy scope is enumerated from all 12 tables. Eight tables
     // carry the columns directly; the four child tables inherit them from
     // their parent session (and blob) row.
@@ -131,8 +133,8 @@ async fn legacy_scopes(db: &DatabaseConnection) -> Result<Vec<(String, String)>,
 }
 
 /// Run the whole-database preflight. No deletion happens here.
-pub async fn preflight_legacy_scopes(
-    db: &DatabaseConnection,
+pub async fn preflight_legacy_scopes<C: ConnectionTrait>(
+    db: &C,
     raw_manifest: &str,
 ) -> Result<AggregateScopeReceipt, ScopeGuardError> {
     let manifest: ScopeAuthorizationManifest = serde_json::from_str(raw_manifest)

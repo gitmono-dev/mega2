@@ -91,6 +91,8 @@ impl MigrationTrait for Migration {
             "CREATE OR REPLACE FUNCTION trace_legacy_write_fence()
              RETURNS trigger
              LANGUAGE plpgsql
+             SECURITY DEFINER
+             SET search_path = pg_catalog, public, pg_temp
              AS $$
              BEGIN
                IF EXISTS (SELECT 1 FROM trace_legacy_writer_fence WHERE active) THEN
@@ -104,6 +106,8 @@ impl MigrationTrait for Migration {
              $$",
         )
         .await?;
+        conn.execute_unprepared("REVOKE ALL ON FUNCTION trace_legacy_write_fence() FROM PUBLIC")
+            .await?;
         for table in LEGACY_TABLES {
             conn.execute_unprepared(&format!(
                 "DROP TRIGGER IF EXISTS {table}_legacy_write_fence ON {table}"

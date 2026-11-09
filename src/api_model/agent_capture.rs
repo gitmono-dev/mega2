@@ -118,6 +118,12 @@ impl ErrorEnvelope {
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self::new(CODE_PAYLOAD_TOO_LARGE, message)
     }
+
+    /// Stable rejection of a legacy capture write while the purge fence is
+    /// active (MTR-33).
+    pub fn legacy_capture_fenced() -> Self {
+        Self::new(CODE_CONFLICT, "legacy_capture_fenced")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +165,15 @@ impl AgentCaptureHttpError {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             envelope: ErrorEnvelope::payload_too_large(message),
+        }
+    }
+
+    /// A legacy capture write while the purge fence is active is a conflict
+    /// with a stable code, not a transient failure.
+    pub fn legacy_capture_fenced() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            envelope: ErrorEnvelope::legacy_capture_fenced(),
         }
     }
 }
