@@ -969,6 +969,28 @@ DROP 依 FK 顺序删除 `agent_capture_session/event/source_stream/checkpoint/f
 
 ## 8. 联合验收与发布证据
 
+### 8.0 逐 transport 拒绝证据审计（MTR-69）
+
+2026-11-09 只读重跑 MTR-58/59/64 的已发布脚本，对同一 fixture 逐 transport 审计 8 个独立拒绝 oracle：
+
+| # | transport | oracle | 观察到的拒绝 | case 计数 |
+|---|---|---|---|---|
+| 1 | HTTP | delete | advertisement 无 `delete-refs`，ref-policy 拒绝后 tip 不变 | `http_delete` 1/1 |
+| 2 | SSH | delete | advertisement 无 `delete-refs`，ref-policy 拒绝后 tip 不变 | `ssh_delete` 1/1 |
+| 3 | HTTP | non-FF | HTTP 409 + `object_integrity`，tip 不变 | `http_non_ff` 1/1 |
+| 4 | SSH | non-FF | `remote error: object_integrity`，tip 不变 | `ssh_non_ff` 1/1 |
+| 5 | HTTP | cross-scope want | 跨 scope 对象请求被拒绝 | `http_cross_scope_want` 1/1 |
+| 6 | SSH | cross-scope want | 跨 scope 对象请求被拒绝 | `ssh_cross_scope_want` 1/1 |
+| 7 | HTTP | cross-scope delta | 跨 scope delta push 整体被拒绝 | `http_cross_scope_delta` 1/1 |
+| 8 | SSH | cross-scope delta | 跨 scope delta push 整体被拒绝 | `ssh_cross_scope_delta` 1/1 |
+
+逐 case 计数：`--case ref-reject` 4/4、`--case http` 5/5、`--case ssh` 5/5，均 `failed=0`，无 skip、无 zero-case。
+
+固定 pin：mega2 `0.42.137` source/binary、Libra binary SHA256 `e07e3c00f26091b9b0b827008c8548e6b4e284fb6ba70c8477838cef4aa087f0`、被审计契约 SHA256 `0962d83061f4491315890516f953f71852f868c8286f781ea5d37b5c6188207e`、server id `22222222-2222-4222-8222-222222222222`、targets `/project/interop`（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`）与 `/project/other`（scope `2ad3bc80-9dd3-4462-8430-9eabc06f4452`）；fixture 使用 synthetic token/SSH key，报告不含凭据或 DSN。
+
+sanitized 报告 digest：`mtr69-http.log` SHA256 `0b83048a1bee10daeafc87b1f17846bc32c56c37c333d27a9158d79c13740c4f`、`mtr69-ssh.log` SHA256 `0df3557306812b807fa579f96763669d28eed23ff730d0349994609579096e2e`、`mtr69-ref.log` SHA256 `7e781f0c44778115a6a6050d14c744d0d513ce4188d8453bbb4b9b8058eb4e85`。本审计不改生产脚本，功能消费由 MTR-22 承接。
+
+
 ### 8.1 双仓互操作 smoke driver（MTR-58..69）
 
 `scripts/traces_interop_smoke.sh --case <http|ssh|agent|history|ref-reject>` 是双仓互操作的唯一入口，每个 case 由同名的 `scripts/traces_interop_<case>.sh` 真实驱动，必需 `MEGA2_TRACES_INTEROP=1` 且由运维提供 fixture。缺少 fixture 值、`skip`、或零 case 一律算失败；退出码 `0` 全部通过、`1` 至少一个 case 失败（含缺 fixture）、`2` 用法或前置错误（未知 case、开关未打开、driver 缺失），此时不运行任何 case。
