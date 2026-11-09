@@ -969,6 +969,38 @@ DROP 依 FK 顺序删除 `agent_capture_session/event/source_stream/checkpoint/f
 
 ## 8. 联合验收与发布证据
 
+### 8.2 双仓 H5 功能移交（MTR-22）
+
+2026-11-09 只读取用 MTR-58/59/60/68 的已交付 driver 与 MTR-69 的逐 transport 审计，形成两仓 H5 功能移交。15 条 AC 与 MTR-69 的 8 条 transport AC 逐条登记，不合并：
+
+| AC | 来源 case / selector | 结果 |
+|---|---|---|
+| AC-1 HTTP 真实 push | `http_push` | pass |
+| AC-2 SSH 真实 push | `ssh_push` | pass |
+| AC-3 JSON 搜索 | `agent_search` | pass |
+| AC-4 预算续读 | `agent_transcript_budget` | pass |
+| AC-5 固定 evidence 重读 | `agent_evidence_reread` | pass |
+| AC-6 普通 clone sentinel 排除 | `agent_code_clone_excludes_traces` | pass |
+| AC-7 peer principal 覆盖被拒 | `live_peer_principal_write_denied` | pass |
+| AC-8 T1/T2 独立作用域 | `live_other_target_ref_isolation` | pass |
+| AC-9 两个 source 独立作用域 | `live_other_source_ref_isolation` | pass |
+| AC-10 两个 epoch 保留历史 | `live_epoch_history_retained` | pass |
+| AC-11 clean 改写旧流拒绝 | `live_clean_rewrite_denied` | pass |
+| AC-12 new-stream 显式新建 | `live_new_stream_epoch_created` | pass |
+| AC-13 旧 stream 仍可读 | `live_old_stream_bytes_readable` | pass |
+| AC-14 两仓 commit 与 fixture pin 一致 | 见下方 pin 表 | pass |
+| AC-15 只功能移交、不等 MTR-29 C/D | 审计仅消费已交付证据 | pass |
+
+MTR-69 的 8 条 transport AC（HTTP/SSH delete、non-FF、cross-scope want、cross-scope delta）按其 §8.0 报告的 count 与 digest 原样消费，全部通过。
+
+逐 case 计数：`--case http` 5/5、`--case ssh` 5/5、`--case agent` 7/7、`--case history` 4/4，均 `failed=0`，无 skip。
+
+两仓 pin：mega2 `152babe5`（MTR-22 审计基线，MTR-69 提交）、Libra `7d9daa77e`、Libra binary SHA256 `e07e3c00f26091b9b0b827008c8548e6b4e284fb6ba70c8477838cef4aa087f0`、契约 SHA256 `f483925ddefb7f482b1100f1ee07a22f410b47f48662edbd01cbcfef7488e497`、server id `22222222-2222-4222-8222-222222222222`、targets `/project/interop`（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`）与 `/project/other`（scope `2ad3bc80-9dd3-4462-8430-9eabc06f4452`）。
+
+sanitized 报告 digest：`mtr22-http.log` `eae7f6685c528b606e84b499f192b3e5cb44f8f10f13703aec47fd50fe96a447`、`mtr22-ssh.log` `3f009f5dcb57eadf99fbe54232c1d7c46d1f91ec812fe2c89c56f4581db1c06a`、`mtr22-agent.log` `b250613ed29ea0ac730cefcdb1ebca92fa53134a7971e0cbc17fed4a4f754bda`、`mtr22-history.log` `69c2349a1a6a44342073a5d55628b968bf01a4477bea34e9997934b4fc726d3b`。报告不含 token、私钥或 DSN。
+
+移交边界：本审计只证明功能可用与双仓 pin 一致；正式 C/D 由 MTR-29（旧 Capture 退场 minor 发布）承载，H5 不等待该 C/D，也不能把 locally-accepted 当作 formal C/D 完成。
+
 ### 8.0 逐 transport 拒绝证据审计（MTR-69）
 
 2026-11-09 只读重跑 MTR-58/59/64 的已发布脚本，对同一 fixture 逐 transport 审计 8 个独立拒绝 oracle：
