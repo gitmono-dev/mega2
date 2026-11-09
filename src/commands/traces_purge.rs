@@ -220,6 +220,21 @@ pub(crate) async fn exec(
     }
 }
 
+/// Verify one journal against one explicitly named maintenance manifest and
+/// return the receipt the guarded DROP consumes.
+pub(crate) async fn verify_receipt_file(
+    db: &DatabaseConnection,
+    adapter: &crate::orbit::ObjectStoreAdapter,
+    journal: &str,
+    manifest_path: &Path,
+) -> Result<crate::jupiter::service::trace_legacy_receipt::VerifiedLegacyPurgeReceipt, String> {
+    let raw = std::fs::read_to_string(manifest_path)
+        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+    crate::jupiter::service::trace_legacy_receipt::verify_purge_complete(db, adapter, journal, &raw)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// The maintenance driver refuses a config that was found implicitly: only an
 /// explicitly named `--config`/`MEGA_CONFIG` may authorize a purge manifest.
 pub(crate) fn require_named_config(source: ConfigSource) -> Result<(), String> {
@@ -423,6 +438,78 @@ mod tests {
                 .execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
                 .await;
         }
+        db.close().await.ok();
+    }
+
+    #[tokio::test]
+    async fn purge_receipt_driver_reads_one_manifest() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let root = temp_dir.path().join("objects");
+        std::fs::create_dir_all(&root).expect("root");
+        let db = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&db, true).await.expect("migrations");
+        let storage: crate::orbit_api::factory::ObjectStorageConfig = toml::from_str(&format!(
+            "storage_type = \"local\"\n[local]\nroot_dir = \"{}\"\n",
+            root.display()
+        ))
+        .expect("storage");
+        let adapter = crate::orbit::factory::ObjectStorageFactory::build_adapter(&storage)
+            .await
+            .expect("adapter");
+        let journal = "12121212-1212-4212-8212-121212121212";
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(
+            "INSERT INTO agent_capture_session
+             (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind, completeness)
+             VALUES ('deploy-d', 'tenant-d', 'repo', 'producer', 'driver-receipt', 'external_capture', 'complete')",
+        )
+        .await
+        .expect("session");
+        db.execute_unprepared(&format!(
+            "INSERT INTO trace_legacy_purge
+             (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+             VALUES ('{journal}', 'local:{}', '{}', 'deploy-d', 'sha256:manifest', 'frozen')",
+            root.display(),
+            root.display()
+        ))
+        .await
+        .expect("journal");
+        db.execute_unprepared(&format!(
+            "INSERT INTO trace_legacy_purge_item (id, purge_id, scope, object_key, deleted_at)
+             VALUES ('13131313-1313-4313-8313-131313131313', '{journal}', 'deploy-d', 'agent/raw/aa', now())"
+        ))
+        .await
+        .expect("item");
+        db.execute_unprepared(&format!(
+            "INSERT INTO trace_legacy_writer_fence (id, purge_id, deployment_id, active)
+             VALUES ('14141414-1414-4414-8414-141414141414', '{journal}', 'deploy-d', TRUE)"
+        ))
+        .await
+        .expect("fence");
+        let manifest = temp_dir.path().join("manifest.json");
+        std::fs::write(
+            &manifest,
+            format!(
+                r#"{{"bucket_scope":"mega2-legacy/","deployment_id":"deploy-d","backend_kind":"local","storage_location":"{}","historical_locations":["local:{}"],"owners":[{{"owner":"owner-a","deployment_id":"deploy-d","tenant_id":"tenant-d","receipt_id":"receipt-a","complete":true}}],"orphan_prefixes":[]}}"#,
+                root.display(),
+                root.display()
+            ),
+        )
+        .expect("manifest");
+        let receipt = super::verify_receipt_file(&db, &adapter, journal, &manifest)
+            .await
+            .expect("driver receipt");
+        assert_eq!(receipt.digest().len(), 64);
+        assert_eq!(receipt.journal_id(), journal);
+        let missing = super::verify_receipt_file(
+            &db,
+            &adapter,
+            journal,
+            &temp_dir.path().join("absent.json"),
+        )
+        .await
+        .expect_err("missing manifest");
+        assert!(missing.contains("cannot read"), "{missing}");
         db.close().await.ok();
     }
 }
