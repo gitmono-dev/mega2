@@ -953,6 +953,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 ## 7. 旧 Capture 全量清除与接口退场
 
+**旧实体模型退场（MTR-31）：** `callisto` 中 11 个旧 Capture entity 模块（session/event/source_stream/checkpoint/file_op/blob/blob_ref/ingest_receipt/access_audit/tombstone/deletion_ledger）与其再导出已删除；`agent_capture_stream_blob` 从未有实体，只由明确 SQL 写入，删除时不得假设存在该实体。历史 add migration `m20260913_000100_add_agent_capture_tables` 保持纯 SQL，仍可从未升级历史库建出全部 12 张旧表；guarded DROP 之后由 maintenance ledger 记账。
+
 **旧对象 namespace 退场（MTR-35）：** `mega2_core::orbit_api::object_storage::ObjectNamespace` 不再有 `Agent` 变体与其 `"agent"` 字符串/匹配分支；`Git`/`Lfs`/`Log`/`Artifact`/`Attachment`/`Oci`/`Media`/`ChunkMapReceipt`/`Traces` 的稳定字符串与分片规则不变，`Traces` 仍按 `traces/...` 寻址。维护侧 typed legacy locator 不依赖该 enum，继续以 manifest 中的字面 `agent/` 前缀工作（MTR-24/25 已证）。
 
 **事件与过滤退场（MTR-57）：** `agent_tenants`、`agent_repo_paths` 与 `agent_capture.events.committed`、`agent_capture.checkpoint.committed` 已从 storage-event 模型、事件字面量白名单与 target 过滤中删除；`StorageEventsTargetConfig` 现在启用 `deny_unknown_fields`，仍携带这些键的配置会被拒绝。其余四类事件（`repo.push`、`oci.manifest.published`、`lfs.object.uploaded`、`lfs.media.finalized`）的投影/范围/过滤行为保持不变，由 `noncapture_event_preservation` 与既有模块回归覆盖。

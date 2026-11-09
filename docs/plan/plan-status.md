@@ -1,3 +1,5 @@
+**MTR-31 本地门禁（2026-11-09）：** 删除 11 个旧 Capture entity 模块与 `callisto` 再导出；`agent_capture_stream_blob` 无实体、仅 SQL；历史 add migration 纯 SQL 且从零迁移仍建出 12 表。VER-1、VER-2 通过；fmt、严格 Clippy exit 0。本卡 Release write set N/A，不 bump。Lifecycle 为 `in-progress` / `locally-accepted`，main/tag D 门待完成。用户免交叉 Review，不记 Review PASS。
+
 **MTR-35 本地门禁（2026-11-09）：** 删除 `ObjectNamespace::Agent`（变体/字符串/分片/匹配与测试），traces 隔离测试改用 `Log`；其余 namespace 字符串与分片不变，维护 locator 的字面 `agent/` 前缀保留。VER-1、VER-2 通过；fmt、严格 Clippy exit 0。本卡 Release write set N/A，不 bump。Lifecycle 为 `in-progress` / `locally-accepted`，main/tag D 门待完成。用户免交叉 Review，不记 Review PASS。
 
 **MTR-57 本地门禁（2026-11-09）：** 删除 `agent_tenants`/`agent_repo_paths` 与两类旧 Capture 事件（枚举/字面量白名单/发射/投影），`StorageEventsTargetConfig` 启用 `deny_unknown_fields`；六个 cfg(test) 构造器与 context/validate/reload 同步清理。VER-1、VER-2、VER-3 通过；退场 target 通过；fmt、严格 Clippy exit 0。本卡 Release write set N/A，不 bump。Lifecycle 为 `in-progress` / `locally-accepted`，main/tag D 门待完成。用户免交叉 Review，不记 Review PASS。

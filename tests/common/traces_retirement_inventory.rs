@@ -38,6 +38,19 @@ const STAGE_28_FORBIDDEN: [&str; 7] = [
     "token_covers_capture_repo",
 ];
 
+/// Stage 31: the removed legacy entity modules and re-exports.
+const STAGE_31_FORBIDDEN: [&str; 3] = [
+    "pub mod agent_capture_",
+    "callisto::agent_capture_",
+    "agent_capture_session::Entity",
+];
+
+/// Stage 31 allowlist: the scanner itself and the removal assertions.
+const STAGE_31_ALLOWLIST: [&str; 2] = [
+    "tests/common/traces_retirement_inventory.rs",
+    "tests/integration_traces.rs",
+];
+
 /// Stage 35: the removed legacy object namespace.
 const STAGE_35_FORBIDDEN: [&str; 2] = ["ObjectNamespace::Agent", "ObjectNamespace :: Agent"];
 
@@ -158,4 +171,9 @@ pub fn scan_stage_57(repo_root: &Path) -> Result<Vec<String>, String> {
 /// Stage 35 scan (removed legacy object namespace).
 pub fn scan_stage_35(repo_root: &Path) -> Result<Vec<String>, String> {
     scan(repo_root, &STAGE_35_FORBIDDEN, &STAGE_35_ALLOWLIST)
+}
+
+/// Stage 31 scan (removed legacy entity modules).
+pub fn scan_stage_31(repo_root: &Path) -> Result<Vec<String>, String> {
+    scan(repo_root, &STAGE_31_FORBIDDEN, &STAGE_31_ALLOWLIST)
 }

@@ -16927,3 +16927,90 @@ fn legacy_retirement_stage_35() {
         "non-allowlisted legacy namespace symbols: {hits:?}"
     );
 }
+
+/// MTR-31 entity retirement: the 11 legacy Capture entity modules are gone,
+/// the historic add migration is SQL-only and still builds the 12 legacy
+/// tables from scratch (a historical upgrade), and SeaORM/SQL can still read
+/// them through the public seam.
+#[tokio::test]
+async fn legacy_entities_removed_migration_still_upgrades() {
+    use sea_orm::{ConnectionTrait, Statement};
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let tables = [
+        "agent_capture_session",
+        "agent_capture_event",
+        "agent_capture_source_stream",
+        "agent_capture_checkpoint",
+        "agent_capture_file_op",
+        "agent_capture_blob",
+        "agent_capture_blob_ref",
+        "agent_capture_ingest_receipt",
+        "agent_capture_stream_blob",
+        "agent_capture_access_audit",
+        "agent_capture_tombstone",
+        "agent_capture_deletion_ledger",
+    ];
+    for table in tables {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass($1) IS NOT NULL AS present",
+                [table.into()],
+            ))
+            .await
+            .expect("table lookup")
+            .expect("table row");
+        assert!(
+            row.try_get::<bool>("", "present").unwrap(),
+            "the historic add migration must still create {table}"
+        );
+    }
+    // AC-1/AC-2: no legacy entity module or file remains.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for module in [
+        "agent_capture_session",
+        "agent_capture_event",
+        "agent_capture_source_stream",
+        "agent_capture_checkpoint",
+        "agent_capture_file_op",
+        "agent_capture_blob",
+        "agent_capture_blob_ref",
+        "agent_capture_ingest_receipt",
+        "agent_capture_access_audit",
+        "agent_capture_tombstone",
+        "agent_capture_deletion_ledger",
+    ] {
+        assert!(
+            !root.join(format!("src/callisto/{module}.rs")).exists(),
+            "{module}.rs must be gone"
+        );
+    }
+    // AC-3: no entity is assumed for `agent_capture_stream_blob`; the table is
+    // only written through explicit SQL.
+    assert!(
+        !root
+            .join("src/callisto/agent_capture_stream_blob.rs")
+            .exists()
+    );
+    // AC-4: the historic migration stays SQL-only (no entity import).
+    let migration = std::fs::read_to_string(
+        root.join("src/jupiter/migration/m20260913_000100_add_agent_capture_tables.rs"),
+    )
+    .expect("migration source");
+    assert!(!migration.contains("callisto::agent_capture"));
+    assert!(migration.contains("CREATE TABLE IF NOT EXISTS agent_capture_session"));
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}
+
+/// MTR-31 stage scanner: no removed entity module or re-export survives.
+#[test]
+fn legacy_retirement_stage_31() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_31(root).expect("stage 31 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy entity symbols: {hits:?}"
+    );
+}
