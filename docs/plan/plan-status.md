@@ -1,3 +1,5 @@
+**MTR-62 本地门禁（2026-11-09）：** 新增 `trace_legacy_scope_guard`（12 表 scope 枚举、唯一 owner + 完整 receipt、未知/清单外/重复 scope 阻断、orphan prefix 可信归属、共享 bucket 根与旧 Git traces 拒绝、aggregate receipt）与 driver `preflight_scopes_file`。VER-1 4 例、VER-2 1 例通过；fmt、严格 Clippy exit 0。版本 `0.42.140`。Lifecycle 为 `in-progress` / `locally-accepted`，main/tag D 门待完成。用户免交叉 Review，不记 Review PASS。
+
 **MTR-56 本地门禁（2026-11-09）：** 新增 `trace_legacy_manifest`（运行配置、旧 DB metadata、历史部署位置、运维声明四来源核验；未知位置/重复或清单外 scope 阻断；规范化数字摘要写入 `trace_legacy_purge`）与私有 driver `commands::traces_purge`（具名 manifest 文件、显式 config 要求）。VER-1 provenance 4 例、VER-2 driver 1 例通过；fmt、严格 Clippy exit 0。版本 `0.42.139`。Lifecycle 为 `in-progress` / `locally-accepted`，main/tag D 门待完成。用户免交叉 Review，不记 Review PASS。
 
 **MTR-23 本地门禁（2026-11-09）：** 新增 additive 迁移 `m20261015_000400_trace_legacy_purge`（journal/items/fence 三表 + 12 张旧表 barrier trigger，`down` 显式 no-op）与 `trace_legacy_purge`/`trace_legacy_purge_item`/`trace_legacy_writer_fence` 实体；VER-1..VER-4 的 4 个 `db_contract` 与 VER-5 `purge_schema_` 全部通过；fmt、严格 Clippy exit 0。版本 `0.42.138`。Lifecycle 为 `in-progress` / `locally-accepted`，main/tag D 门待完成。用户免交叉 Review，不记 Review PASS。

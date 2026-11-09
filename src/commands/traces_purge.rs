@@ -30,6 +30,20 @@ pub(crate) async fn freeze_manifest_file(
         .map_err(|error| error.to_string())
 }
 
+/// Read the scope-authorization manifest of one whole database and run the
+/// preflight. This driver never deletes; it returns the aggregate receipt the
+/// destructive step must carry.
+pub(crate) async fn preflight_scopes_file(
+    db: &DatabaseConnection,
+    manifest_path: &Path,
+) -> Result<crate::jupiter::service::trace_legacy_scope_guard::AggregateScopeReceipt, String> {
+    let raw = std::fs::read_to_string(manifest_path)
+        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+    crate::jupiter::service::trace_legacy_scope_guard::preflight_legacy_scopes(db, &raw)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// The maintenance driver refuses a config that was found implicitly: only an
 /// explicitly named `--config`/`MEGA_CONFIG` may authorize a purge manifest.
 pub(crate) fn require_named_config(source: ConfigSource) -> Result<(), String> {
@@ -94,6 +108,42 @@ mod tests {
             .expect_err("an implicit config must be refused");
         assert!(implicit.contains("explicitly named"), "{implicit}");
         require_named_config(ConfigSource::Cli).expect("named config");
+        db.close().await.ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_scope_preflight_driver_reads_one_manifest() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&db, true).await.expect("migrations");
+        use sea_orm::ConnectionTrait;
+        db.execute_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            "INSERT INTO agent_capture_session
+             (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind, completeness)
+             VALUES ('deploy-a', 'tenant-a', 'repo', 'producer', 'driver-session', 'external_capture', 'complete')",
+        ))
+        .await
+        .expect("legacy session");
+        let path = temp_dir.path().join("scopes.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "bucket_scope": "mega2-legacy/",
+                "owners": [{"owner": "owner-a", "deployment_id": "deploy-a", "tenant_id": "tenant-a", "receipt_id": "receipt-a", "complete": true}],
+                "orphan_prefixes": []
+            }"#,
+        )
+        .expect("manifest");
+        let receipt = super::preflight_scopes_file(&db, &path)
+            .await
+            .expect("preflight through the driver");
+        assert_eq!(receipt.scope_count, 1, "one enumerated scope");
+        assert_eq!(receipt.owners, vec!["owner-a".to_owned()]);
+        let missing = super::preflight_scopes_file(&db, &temp_dir.path().join("absent.json"))
+            .await
+            .expect_err("a missing manifest must fail");
+        assert!(missing.contains("cannot read"), "{missing}");
         db.close().await.ok();
     }
 }

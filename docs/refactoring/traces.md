@@ -959,6 +959,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 **维护范围 provenance（MTR-56）：** 清除只能从受控维护清单开始。服务端 `trace_legacy_manifest::verify_and_freeze` 同时核对四个来源：（1）运行配置的 object storage backend 与位置必须与清单一致；（2）旧 DB metadata（`agent_capture_session` 的 DISTINCT deployment/tenant）不得含清单外 scope；（3）清单必须逐项声明历史部署位置，空值或 `unknown` 一律阻断；（4）运维声明必须带非空 identity 与 statement digest。重复 scope 视为来源冲突并阻断。全部通过后计算规范化数字摘要并把 `manifest_digest`、backend fingerprint 与历史位置写入 `trace_legacy_purge` journal，才产生后续删除步骤可消费的冻结授权；本步骤不读取也不删除任何 Capture 正文。
 
+**全库旧 scope 授权 preflight（MTR-62）：** 任何不可逆删除前，`trace_legacy_scope_guard::preflight_legacy_scopes` 从全部 12 张旧表枚举 DISTINCT `(deployment_id, tenant_id)`（8 张直接列、4 张经父 session/blob 关联），要求每个 scope 恰有一个明确 owner 且该 owner 的 receipt 已完成；未知 owner、清单外 scope、重复 owner、非可信 orphan prefix 一律阻断，不会先删已知部分。`bucket_scope` 为空或 `/`（共享 bucket 根）被拒绝，`delete_git_traces=true` 被拒绝；全部通过后才生成绑定 owner 集合、receipt ID 与枚举 scope 的 aggregate receipt 摘要，owner 集合变化即失效。
+
 **持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
 - `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
 - `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；
