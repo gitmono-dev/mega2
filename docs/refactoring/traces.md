@@ -969,6 +969,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 **部署外围屏障探针（MTR-46）：** 部署维护者在 MTR-33 激活 fence 后，用 `scripts/traces_legacy_fence_probe.sh --maintenance-manifest <PATH> --old-image <DIGEST> --journal <UUID>` 对本部署真实 backend 逐一取证：旧 app role 的 DB INSERT 必须以 permission denied/fenced 拒绝，旧对象凭据对 legacy prefix 的 PUT 必须返回 401/403；缺少 fixture、探针未运行或探针意外成功都算失败，不 skip。旧 image digest 写入 sanitized 汇总，reports 不含凭据或 DSN；未取得真实部署的 DB/PUT 探针前不得进入 H6。
 
+**冻结对象 inventory（MTR-24）：** `traces purge-legacy-capture --action inventory` 只在 `frozen` journal 且该 journal 的 active writer fence 存在时运行，并使用维护连接（只做只读 schema 检查，不自动 apply migration）。枚举范围严格来自冻结 manifest：固定 `agent/raw/`、`agent/redacted/`、`agent/staging/` 加上 manifest 的 `trusted_prefixes`（必须以 `agent/` 开头且无 `..`/反斜杠/NUL），其余前缀不枚举。Local backend 无原生版本，item 的 `provider_version`/`provider_generation` 记 `None`；S3/S3-compatible/GCS 需要 provider 原生版本能力，本维护连接无法证明时整体阻断（不按当前 listing 放行）。重复运行幂等：已登记的 `(purge_id, scope, object_key)` 不重复插入。本步骤不删除任何对象。
+
 **持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
 - `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
 - `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；

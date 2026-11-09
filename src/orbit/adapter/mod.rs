@@ -229,6 +229,21 @@ impl ObjectStoreAdapter {
         store
     }
 
+    /// Lists every backend object under `prefix`, returning its backend path and
+    /// byte size, sorted by path. The prefix is a literal backend path prefix
+    /// (for example `agent/raw/`); callers own the prefix policy.
+    pub async fn list_prefix(&self, prefix: &str) -> OrbitResult<Vec<(String, u64)>> {
+        let path = object_store::path::Path::from(prefix);
+        let mut stream = self.to_store().list(Some(&path));
+        let mut objects = Vec::new();
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(IoOrbitError::from)?;
+            objects.push((meta.location.to_string(), meta.size));
+        }
+        objects.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(objects)
+    }
+
     /// Buffers an [`ObjectByteStream`] into [`Bytes`]. Used for log appends (need length) and manifest handling.
     async fn buffer_stream(mut data: ObjectByteStream, max_bytes: u64) -> OrbitResult<Bytes> {
         // NOTE: this buffers the ENTIRE input in memory. `max_bytes` bounds the

@@ -155,6 +155,34 @@ pub(crate) async fn exec(
             );
             Ok(())
         }
+        "inventory" => {
+            let raw = std::fs::read_to_string(&manifest_path).map_err(|error| {
+                MegaError::cli_exit(
+                    1,
+                    format!("cannot read {}: {error}", manifest_path.display()),
+                )
+            })?;
+            let adapter =
+                crate::orbit::factory::ObjectStorageFactory::build_adapter(&config.object_storage)
+                    .await
+                    .map_err(|error| MegaError::cli_exit(1, error.to_string()))?;
+            let outcome = crate::jupiter::service::trace_legacy_inventory::freeze_legacy_inventory(
+                connection.as_ref(),
+                &adapter,
+                &journal,
+                &raw,
+            )
+            .await
+            .map_err(|error| MegaError::cli_exit(1, error.to_string()))?;
+            println!(
+                "inventory {} prefixes={} items={} capability={}",
+                outcome.journal_id,
+                outcome.prefixes.join(","),
+                outcome.items,
+                outcome.capability
+            );
+            Ok(())
+        }
         other => Err(MegaError::cli_exit(
             1,
             format!("purge-legacy-capture --action {other} is not wired in this release"),

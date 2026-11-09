@@ -162,3 +162,5 @@ HTTP traces 每进程分别允许一个接收请求和一个 fetch；过载返�
 ### 旧 Capture 角色准备（MTR-61）
 
 激活旧 writer fence 前，部署 DBA 在维护连接上执行角色准备：旧 app role 必须是普通角色（无 SUPERUSER、BYPASSRLS、CREATEROLE）且与 maintenance role 不同，12 张旧表与 `trace_legacy_write_fence()` 的 ownership 转交 maintenance role，并证明旧 app role 不能 ALTER 这些表或禁用其 trigger。DML 撤销与 fence 激活仍是独立步骤：撤销会移除旧 app role 与 PUBLIC 在 12 张表上的 INSERT/UPDATE/DELETE，继承授权会显式失败，并在无 active fence 时以真实拒绝写入证明结果。
+
+旧 Capture 清除的 inventory 步骤只枚举冻结 manifest 中的前缀，并为每个对象写入一条 journal item；它要求该 journal 的 active writer fence，且不会执行数据库迁移；云 backend 必须先证明其原生版本清单能力才能通过。

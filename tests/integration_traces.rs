@@ -16094,3 +16094,211 @@ mod purge_perimeter {
         );
     }
 }
+
+/// MTR-24 inventory gate: the real CLI enumerates only the frozen prefixes of a
+/// Local backend, writes one journal item per object, refuses a backend whose
+/// native version capability is unknown, and requires the journal's active
+/// fence.
+#[tokio::test]
+async fn purge_inventory_cli_freezes_the_local_prefixes() {
+    use sea_orm::ConnectionTrait;
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let temp = tempfile::tempdir().expect("fixture dir");
+    let root = temp.path().join("objects");
+    for path in [
+        "agent/raw/aa",
+        "agent/redacted/bb",
+        "agent/staging/cc",
+        "agent/trusted/old",
+        "other/outside",
+    ] {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+        std::fs::write(full, b"sentinel").expect("object");
+    }
+    let journal = "77777777-7777-4777-8777-777777777777";
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge
+         (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+         VALUES ('{journal}', 'local:{}', '{}', 'deploy-inv', 'sha256:manifest', 'frozen')",
+        root.display(),
+        root.display()
+    ))
+    .await
+    .expect("journal");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_writer_fence (id, purge_id, deployment_id, active)
+         VALUES ('88888888-8888-4888-8888-888888888888', '{journal}', 'deploy-inv', TRUE)"
+    ))
+    .await
+    .expect("fence");
+
+    let database_url = std::env::var("MEGA_DATABASE__DB_URL")
+        .unwrap_or_else(|_| "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".into());
+    let name: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_database() AS name",
+        ))
+        .await
+        .expect("database name")
+        .expect("database row")
+        .try_get("", "name")
+        .expect("name");
+    let mut url = url::Url::parse(&database_url).expect("database url");
+    url.set_path(&name);
+    let config = temp.path().join("config.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample config");
+    let sample = sample
+        .replace(
+            "db_url = \"postgres://localhost:5432/mono\"",
+            &format!("db_url = \"{}\"", url.as_str()),
+        )
+        .replace(
+            "base_dir = \"/tmp/.mono\"",
+            &format!("base_dir = \"{}\"", temp.path().display()),
+        )
+        .replace(
+            "root_dir = \"${base_dir}/objects\"",
+            &format!("root_dir = \"{}\"", root.display()),
+        );
+    std::fs::write(&config, sample).expect("config");
+    let manifest = temp.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{
+                "bucket_scope": "mega2-legacy/",
+                "deployment_id": "deploy-inv",
+                "backend_kind": "local",
+                "storage_location": "{}",
+                "historical_locations": ["local:{}"],
+                "scopes": [],
+                "operator": {{"identity": "operator@example.invalid", "statement_digest": "sha256:statement"}},
+                "trusted_prefixes": ["agent/trusted/"]
+            }}"#,
+            root.display(),
+            root.display()
+        ),
+    )
+    .expect("manifest");
+    let run = |journal: &str, manifest: &std::path::Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "traces",
+                "purge-legacy-capture",
+                "--action",
+                "inventory",
+                "--journal",
+                journal,
+                "--maintenance-manifest",
+            ])
+            .arg(manifest)
+            .env("MEGA_BASE_DIR", temp.path().join("base"))
+            .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+            .output()
+            .expect("run inventory CLI")
+    };
+
+    let refused = run("99999999-9999-4999-8999-999999999999", &manifest);
+    assert!(!refused.status.success(), "a missing journal must fail");
+
+    // AC-1: the maintenance connection never applies a migration.
+    let applied_before: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM seaql_migrations",
+        ))
+        .await
+        .expect("migration count")
+        .expect("migration row")
+        .try_get("", "n")
+        .expect("count");
+    let first = run(journal, &manifest);
+    assert!(
+        first.status.success(),
+        "inventory failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let applied_after: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM seaql_migrations",
+        ))
+        .await
+        .expect("migration count")
+        .expect("migration row")
+        .try_get("", "n")
+        .expect("count");
+    assert_eq!(applied_before, applied_after, "inventory must not migrate");
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(stdout.contains("items=4"), "{stdout}");
+    assert!(stdout.contains("agent/raw/"), "{stdout}");
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT object_key FROM trace_legacy_purge_item WHERE purge_id = '{journal}' ORDER BY object_key"
+            ),
+        ))
+        .await
+        .expect("items");
+    let keys: Vec<String> = rows
+        .iter()
+        .map(|row| row.try_get::<String>("", "object_key").expect("key"))
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "agent/raw/aa".to_owned(),
+            "agent/redacted/bb".to_owned(),
+            "agent/staging/cc".to_owned(),
+            "agent/trusted/old".to_owned(),
+        ],
+        "outside prefixes must not be inventoried"
+    );
+    // Re-running the inventory is idempotent.
+    let again = run(journal, &manifest);
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("items=0"));
+
+    // A cloud backend needs the native version inventory and must block.
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_purge SET backend_fingerprint = 's3:bucket' WHERE id = '{journal}'"
+    ))
+    .await
+    .expect("backend");
+    let blocked = run(journal, &manifest);
+    assert!(!blocked.status.success(), "s3 inventory must block");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("native version"),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+
+    // Without the journal's active fence there is no inventory.
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_purge SET backend_fingerprint = 'local:{}' WHERE id = '{journal}'",
+        root.display()
+    ))
+    .await
+    .expect("backend restore");
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_writer_fence SET active = FALSE, released_at = now() WHERE purge_id = '{journal}'"
+    ))
+    .await
+    .expect("release fence");
+    let unfenced = run(journal, &manifest);
+    assert!(
+        !unfenced.status.success(),
+        "inventory needs the active fence"
+    );
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}

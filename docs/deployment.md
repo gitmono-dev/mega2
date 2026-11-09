@@ -161,3 +161,5 @@ HTTP traces permits one receive request and one fetch per process; overload retu
 ### Legacy Capture role preparation (MTR-61)
 
 Before the legacy writer fence is activated, the deployment DBA runs the role preparation against the maintenance connection: the old app role must be a plain role (no SUPERUSER, no BYPASSRLS, no CREATEROLE) and distinct from the maintenance role, ownership of the 12 legacy tables and `trace_legacy_write_fence()` moves to the maintenance role, and the app role is proved unable to ALTER those tables or disable their triggers. DML revocation and fence activation stay separate steps: the revocation removes INSERT/UPDATE/DELETE from the app role and PUBLIC on all 12 tables, fails on an inherited grant, and proves the result with a refused write while no fence is active.
+
+The legacy purge inventory step lists only the frozen manifest prefixes and stores one journal item per object. It requires the journal's active writer fence and does not migrate the database; a cloud backend must prove its native version inventory before the step can pass.

@@ -204,3 +204,7 @@ upgrading.
 RustFS. Its `MAILPIT_*` values are optional website-next SMTP-capture inputs;
 mega2 neither reads them nor sends SMTP. The Compose topology and service
 profiles are documented in [`test-infra.md`](./test-infra.md).
+
+## Legacy purge maintenance
+
+`traces purge-legacy-capture` uses the configured `[object_storage]` backend for its inventory step. The inventory enumerates only the frozen manifest prefixes; a cloud backend without a provable native version inventory blocks the step, while `local` records objects without provider versions.
