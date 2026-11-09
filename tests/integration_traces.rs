@@ -15275,3 +15275,130 @@ async fn search_api_returns_representative_evidence_and_a_coverage_report() {
         "the runtime OpenAPI is missing the search schema"
     );
 }
+
+/// Offline selector for the traces interop HTTP driver (MTR-58).
+///
+/// These cases never reach a live service: they only start the audited shell
+/// driver with a controlled environment and assert its argument parsing, the
+/// missing-fixture failure path, and the cleanup guard.
+mod interop_http {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+    };
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    }
+
+    fn driver(case: Option<&str>, interop: bool) -> Output {
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .current_dir(repo_root())
+            .arg("scripts/traces_interop_smoke.sh");
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        if interop {
+            command.env("MEGA2_TRACES_INTEROP", "1");
+        }
+        if let Some(case) = case {
+            command.args(["--case", case]);
+        }
+        command.output().expect("run the interop driver")
+    }
+
+    fn stdout(output: &Output) -> String {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn interop_http_lists_cases() {
+        let output = Command::new("bash")
+            .current_dir(repo_root())
+            .args(["scripts/traces_interop_smoke.sh", "--list-cases"])
+            .output()
+            .expect("list interop cases");
+        assert!(output.status.success());
+        let cases = stdout(&output);
+        assert_eq!(
+            cases.lines().collect::<Vec<_>>(),
+            vec!["http", "ssh", "agent", "history", "ref-reject"]
+        );
+    }
+
+    #[test]
+    fn interop_http_requires_a_case_and_the_switch() {
+        let missing = driver(None, true);
+        assert_eq!(missing.status.code(), Some(2), "missing --case");
+        let off = driver(Some("http"), false);
+        assert_eq!(off.status.code(), Some(2), "switch off");
+        assert!(String::from_utf8_lossy(&off.stderr).contains("MEGA2_TRACES_INTEROP=1"));
+        let unknown = driver(Some("nope"), true);
+        assert_eq!(unknown.status.code(), Some(2), "unknown case");
+    }
+
+    #[test]
+    fn interop_http_missing_fixture_fails_the_run() {
+        let output = driver(Some("http"), true);
+        assert_eq!(output.status.code(), Some(1), "missing fixture must fail");
+        assert!(
+            stdout(&output).contains("FAIL: fixture"),
+            "missing fixture output: {}",
+            stdout(&output)
+        );
+    }
+
+    #[test]
+    fn interop_http_cleanup_guard_removes_owned_workdir() {
+        let root = tempfile::tempdir().expect("interop workdir parent");
+        let fixture = root.path().join("fixture");
+        fs::create_dir_all(fixture.join("agent-repo")).expect("prepared repo dir");
+        fs::write(fixture.join("token"), "synthetic").expect("token file");
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .current_dir(repo_root())
+            .args(["scripts/traces_interop_smoke.sh", "--case", "http"])
+            .env("MEGA2_TRACES_INTEROP", "1")
+            .env("MEGA2_TRACES_INTEROP_HTTP_URL", "http://127.0.0.1:9")
+            .env("MEGA2_TRACES_INTEROP_TARGET", "/project/interop")
+            .env("MEGA2_TRACES_INTEROP_TOKEN_FILE", fixture.join("token"))
+            .env(
+                "MEGA2_TRACES_INTEROP_AGENT_REPO",
+                fixture.join("agent-repo"),
+            )
+            .env(
+                "MEGA2_TRACES_INTEROP_SCOPE",
+                "3f1d2c4b-5a6e-4f70-8a9b-0c1d2e3f4a5b",
+            )
+            .env(
+                "MEGA2_TRACES_INTEROP_FOREIGN_WANT",
+                "0123456789abcdef0123456789abcdef01234567",
+            );
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = command.output().expect("run the interop driver");
+        assert_eq!(output.status.code(), Some(1), "unreachable fixture fails");
+        let text = stdout(&output);
+        assert!(
+            text.contains("traces interop http summary:"),
+            "summary missing: {text}"
+        );
+        let workdir = text
+            .lines()
+            .find_map(|line| line.strip_prefix("traces interop workdir: "))
+            .expect("driver prints its owned workdir");
+        assert!(
+            !Path::new(workdir).exists(),
+            "the cleanup guard must remove the owned workdir {workdir}"
+        );
+    }
+}

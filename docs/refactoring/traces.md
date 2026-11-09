@@ -969,6 +969,17 @@ DROP 依 FK 顺序删除 `agent_capture_session/event/source_stream/checkpoint/f
 
 ## 8. 联合验收与发布证据
 
+### 8.1 双仓互操作 smoke driver（MTR-58..69）
+
+`scripts/traces_interop_smoke.sh --case <http|ssh|agent|history|ref-reject>` 是双仓互操作的唯一入口，每个 case 由同名的 `scripts/traces_interop_<case>.sh` 真实驱动，必需 `MEGA2_TRACES_INTEROP=1` 且由运维提供 fixture。缺少 fixture 值、`skip`、或零 case 一律算失败；退出码 `0` 全部通过、`1` 至少一个 case 失败（含缺 fixture）、`2` 用法或前置错误（未知 case、开关未打开、driver 缺失），此时不运行任何 case。
+
+MTR-58 的 HTTP driver 使用的 fixture：`MEGA2_TRACES_INTEROP_HTTP_URL`（mega2 origin）、`MEGA2_TRACES_INTEROP_TARGET`（拥有该 traces 的 canonical 项目路径）、`MEGA2_TRACES_INTEROP_TOKEN_FILE`（HTTP push token）、`MEGA2_TRACES_INTEROP_AGENT_REPO`（已绑定 epoch 的 Libra 仓库）、`MEGA2_TRACES_INTEROP_SCOPE`（该 stream UUID）、`MEGA2_TRACES_INTEROP_FOREIGN_WANT`（另一 scope 的 commit）。`LIBRA_BIN`/`GIT_BIN` 可覆盖客户端，`MEGA2_TRACES_INTEROP_WORKDIR` 指定自有工作目录（默认新建临时目录，退出时由 cleanup guard 删除；`MEGA2_TRACES_INTEROP_KEEP_WORKDIR=1` 保留）。
+
+HTTP driver 逐案执行并计数：`http_push`（Libra `agent push --mega2` 真实 scoped push）、`http_fetch`（Libra `mega2 traces fetch` 显式 fetch）、`http_unauthenticated`（直接请求协议端点，要求 401 与 Basic challenge）、`http_cross_scope_want`（向本 scope 索取他 scope 对象被拒）、`http_cross_scope_delta`（以他 scope commit 为父的 delta push 整体被拒）。输出契约为 `==> <case>` / `PASS: <case>` / `FAIL: <case>` 与末行 `traces interop http summary: executed=<n> passed=<n> failed=<n>`。离线 selector `cargo test --test integration_traces interop_http_` 只验证参数解析、缺 fixture 非零退出与 cleanup guard，不连接真实服务。
+
+2026-11-09 的本地真实 fixture 证据：mega2 `0.42.133` debug binary、ephemeral PostgreSQL `mega2_interop`、`[traces].enabled=true`、两个 static push token（分别覆盖 `/project/interop` 与 `/project/other`）与两条真实 Libra scoped push；`--case http` 的 5/5 逐案通过（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`，日志 SHA256 `f96343c72b7f51935d6c58a6cee415385f5a30c6a8f89f31095e3738dd090431`，不含 token 或 DSN）。
+
+
 固定同一组服务/客户端 commit+version/fixture，覆盖：两种 transport 的有效与无效身份；同项目跨 principal/source/epoch、跨项目隔离；首次推送并发与回复丢失；FF/删除/中途 checkpoint 篡改；SHA-1/SHA-256 raw byte round-trip；跨 scope wants/delta base拒绝；普通 fresh/bare/mirror/shallow clone 不传 traces专属对象；已混存旧ref与错误HEAD；索引 crash/replay/unsupported/invalid 水位；关键词 CJK/ASCII/标点/part边界/超长行/重复片段；有界读取和原证据重读；跨项目搜索计数/游标权限隔离；旧清除中断续跑/历史version/共享bucket不误删/receipt-before-DROP。
 
 没有真实服务运行或凭据时，依对应计划登记未运行与前置缺口，不把 fixture、过滤零命中或 provider skipped 记为 live PASS。分别记录 Git 已接收、读索引可查、联合实际服务通过、旧 Capture 全量删除及发布 C/D 的证据；计划文档提交不改变任何实施卡的 pending 状态。
