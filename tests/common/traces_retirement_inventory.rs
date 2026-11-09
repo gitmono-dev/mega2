@@ -11,8 +11,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Symbols that must not survive the MTR-26 HTTP retirement.
-const FORBIDDEN: [&str; 5] = [
+/// Stage 26: symbols that must not survive the legacy HTTP retirement.
+const STAGE_26_FORBIDDEN: [&str; 5] = [
     "agent_capture_router",
     "api_model::agent_capture",
     "AgentCaptureHttpError",
@@ -20,15 +20,29 @@ const FORBIDDEN: [&str; 5] = [
     "\"/api/v1/agent-capture",
 ];
 
-/// Files that may still mention those symbols because their removal belongs to
-/// a later card, or because they are the retirement tests themselves.
-const ALLOWLIST: [&str; 6] = [
+/// Stage 26 allowlist: only the retirement tests may still name the old paths.
+const STAGE_26_ALLOWLIST: [&str; 3] = [
     "tests/integration_agent_capture.rs",
     "tests/integration_traces.rs",
     "tests/common/traces_retirement_inventory.rs",
-    "src/ceres/agent_capture/",
-    "src/jupiter/service/agent_capture_service.rs",
-    "src/jupiter/storage/agent_capture_storage.rs",
+];
+
+/// Stage 28: the removed internal runtime modules and types.
+const STAGE_28_FORBIDDEN: [&str; 7] = [
+    "agent_capture_service",
+    "AgentCaptureService",
+    "agent_capture_storage",
+    "AgentCaptureStorage",
+    "ceres::agent_capture",
+    "lookup_ingest_token",
+    "token_covers_capture_repo",
+];
+
+/// Stage 28 allowlist: the scanner itself and the retirement assertions that
+/// name the removed paths to prove they are gone.
+const STAGE_28_ALLOWLIST: [&str; 2] = [
+    "tests/common/traces_retirement_inventory.rs",
+    "tests/integration_traces.rs",
 ];
 
 fn rust_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -46,7 +60,7 @@ fn rust_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 }
 
 /// Returns every non-allowlisted hit as `path:line: symbol`.
-pub fn scan_stage_26(repo_root: &Path) -> Result<Vec<String>, String> {
+fn scan(repo_root: &Path, forbidden: &[&str], allowlist: &[&str]) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
     rust_files(&repo_root.join("src"), &mut files)?;
     rust_files(&repo_root.join("tests"), &mut files)?;
@@ -58,7 +72,7 @@ pub fn scan_stage_26(repo_root: &Path) -> Result<Vec<String>, String> {
             .map_err(|error| error.to_string())?
             .to_string_lossy()
             .replace('\\', "/");
-        if ALLOWLIST
+        if allowlist
             .iter()
             .any(|allowed| relative == *allowed || relative.starts_with(allowed))
         {
@@ -66,7 +80,7 @@ pub fn scan_stage_26(repo_root: &Path) -> Result<Vec<String>, String> {
         }
         let text = fs::read_to_string(&file).map_err(|error| format!("{relative}: {error}"))?;
         for (index, line) in text.lines().enumerate() {
-            for symbol in FORBIDDEN {
+            for symbol in forbidden {
                 if line.contains(symbol) {
                     hits.push(format!("{relative}:{}: {symbol}", index + 1));
                 }
@@ -74,4 +88,14 @@ pub fn scan_stage_26(repo_root: &Path) -> Result<Vec<String>, String> {
         }
     }
     Ok(hits)
+}
+
+/// Stage 26 scan (legacy HTTP surface).
+pub fn scan_stage_26(repo_root: &Path) -> Result<Vec<String>, String> {
+    scan(repo_root, &STAGE_26_FORBIDDEN, &STAGE_26_ALLOWLIST)
+}
+
+/// Stage 28 scan (legacy internal runtime).
+pub fn scan_stage_28(repo_root: &Path) -> Result<Vec<String>, String> {
+    scan(repo_root, &STAGE_28_FORBIDDEN, &STAGE_28_ALLOWLIST)
 }

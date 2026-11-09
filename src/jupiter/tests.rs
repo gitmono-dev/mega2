@@ -21,11 +21,11 @@ use crate::{
     jupiter::{
         migration::apply_migrations,
         service::{
-            agent_capture_service::AgentCaptureService, artifact_service::ArtifactService,
-            buck_service::BuckService, cl_service::CLService, git_service::GitService,
-            import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
-            oci_service::OciService, push_queue_service::PushQueueService,
-            view_worker::ViewRuntime, webhook_service::WebhookService,
+            artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
+            git_service::GitService, import_service::ImportService, lfs_service::LfsService,
+            mono_service::MonoService, oci_service::OciService,
+            push_queue_service::PushQueueService, view_worker::ViewRuntime,
+            webhook_service::WebhookService,
         },
         storage::{
             AppService, Storage,
@@ -989,7 +989,6 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         import_service: ImportService::mock(),
         lfs_service: LfsService::mock(),
         oci_service: OciService::mock(),
-        agent_capture_service: AgentCaptureService::mock(),
         webhook_service,
         storage_event_emitter:
             crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),

@@ -66,9 +66,9 @@ For implementation details, start from the module paths listed in this guide and
 | `config` | TOML config pipeline: `loader` (source resolution), `model` (config model), `validate` (startup validation), `secret` (SecretRef), `reload` (hot reload). Note: the config module is `src/config/`, **not** `src/common/config` |
 | `context` | The composition root `AppContext` and the read-only assembly `ReadOnlyContext` (see §1) |
 | `server` | Service bootstrap: `http_server` (axum router assembly, CORS/session/trace middleware), `ssh_server`, `trace_context` |
-| `api` | HTTP handlers and routes: `api_router` (mode-specific `/api/v1` routes), `lfs_router`, `oci_router`, `preview_router`, `tag_router`, `agent_capture_router`, `api_write_auth` (product-write auth), `api_doc` (OpenAPI) |
+| `api` | HTTP handlers and routes: `api_router` (mode-specific `/api/v1` routes), `lfs_router`, `oci_router`, `preview_router`, `tag_router`, `api_write_auth` (product-write auth), `api_doc` (OpenAPI) |
 | `api_model` | Request/response DTOs (utoipa schemas) |
-| `ceres` | Business services: `protocol` + `pack` (Git smart protocol and pack handling), `api_service` (monorepo read/write core), `lfs`, `oci`, `agent_capture`, `code_edit`, `snapshot` (MST/2), `github_sync`, `merge_checker` |
+| `ceres` | Business services: `protocol` + `pack` (Git smart protocol and pack handling), `api_service` (monorepo read/write core), `lfs`, `oci`, `code_edit`, `snapshot` (MST/2), `github_sync`, `merge_checker` |
 | `jupiter` | Storage and service foundation: `storage/` (`*Storage` wrappers), `service/` (`push_queue_service` and friends), `migration/` (sea-orm-migration), `redis/` |
 | `callisto` | sea-orm entities, one file per table; re-exported via `pub use crate::callisto::*` in `lib.rs` |
 | `orbit_api` + `orbit` | Object-storage contract (traits/config) and backend implementations (local / S3 / GCS), built through `orbit::factory::ObjectStorageFactory` |
@@ -120,7 +120,7 @@ See the [Configuration Guide](./configuration.md) for SecretRef settings and val
 | Git view URLs (read-only) | `/.filter/<filter_id>.git`, `/.view/<name>.git`, `/.view/<name>@<version>.git` (HTTP and SSH upload-pack) | `[views].enabled` defaults off and requires restart; receive-pack is rejected and LFS under view prefixes returns 404 |
 | Views API | `/api/v1/views` (`POST ?wait=true` registration and `GET ?name=&version=`), `GET /api/v1/views/{filter_id}`, `GET /api/v1/views/metrics`; see [views operations](./deploy-trunk.md) | `[views].enabled` defaults off and requires restart; mounted only in trunk / storage-only, returns 404 when disabled |
 | OCI registry | `/v2/` | `[oci].enabled` and storage-only; fail-closed (not registered) under review |
-| Agent Capture | `/api/v1/agent-capture` | `[agent_capture].enabled` and storage-only |
+| Legacy Agent Capture (retired) | `/api/v1/agent-capture` (never mounted) | surface and runtime removed by MTR-26/MTR-28 |
 | MST/2 snapshot surface | `/api/v2` | nest is static; handlers fail closed unless `[mst2].enabled`; toggling needs a restart |
 | Swagger UI / OpenAPI | `/swagger-ui`, `/api/openapi.json` | always mounted; document content varies by mode |
 

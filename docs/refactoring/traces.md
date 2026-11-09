@@ -953,6 +953,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 ## 7. 旧 Capture 全量清除与接口退场
 
+**内部运行时退场（MTR-28）：** 旧 `jupiter::service::agent_capture_service`、`jupiter::storage::agent_capture_storage` 与 `ceres::agent_capture`（auth）模块已删除；启动不再初始化旧 ingest token，`Storage` 不再持有旧 service；维护侧 typed legacy locator（`traces purge-legacy-capture`）保持可用，历史 SQL add migration 原样保留。stage 扫描 `legacy_retirement_stage_28` 以有限 allowlist 证明没有非列入的运行时符号残留。
+
 **HTTP 接口退场（MTR-26）：** 12 条旧 `/api/v1/agent-capture` 路由已从两个 profile 移除，运行时 OpenAPI 不再列出这些路径或旧 Capture DTO；即使 `[agent_capture].enabled=true` 也不会挂载。新客户端使用 scoped traces Git（`refs/libra/traces`，HTTP/SSH）上传，使用 `/api/v1/traces` 只读接口查询；旧的 session/event/checkpoint/transcript/file-op 端到端行为由 traces 目标覆盖，`[agent_capture]` 配置不再生效。
 
 旧 Capture 12 表及其全部所属对象（raw、redacted、staging 及可信清单确认的历史前缀）**全部删除，不迁移**；用户已明确选择这一策略。先通过 H5，再执行限定作用域、可恢复的清除流程，最后以 H6 放行终态。不能把所有共享 bucket 的 `agent/` 当可删除范围。

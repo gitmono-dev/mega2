@@ -65,9 +65,9 @@ mega2 是服务 Agent 工作流的第二代 Mega 引擎；第一代 Mega 项目�
 | `config` | TOML 配置管线：`loader`（来源解析）、`model`（配置模型）、`validate`（启动校验）、`secret`（SecretRef）、`reload`（热加载）。注意：配置模块在 `src/config/`，**不是** `src/common/config` |
 | `context` | 组合根 `AppContext` 与只读装配 `ReadOnlyContext`（见第 1 节） |
 | `server` | 服务引导：`http_server`（axum router 装配、CORS/session/trace 中间件）、`ssh_server`、`trace_context` |
-| `api` | HTTP handler 与路由：`api_router`（按形态切换的 `/api/v1` 子集）、`lfs_router`、`oci_router`、`preview_router`、`tag_router`、`agent_capture_router`、`api_write_auth`（产品写鉴权）、`api_doc`（OpenAPI） |
+| `api` | HTTP handler 与路由：`api_router`（按形态切换的 `/api/v1` 子集）、`lfs_router`、`oci_router`、`preview_router`、`tag_router`、`api_write_auth`（产品写鉴权）、`api_doc`（OpenAPI） |
 | `api_model` | 请求/响应 DTO（utoipa schema） |
-| `ceres` | 业务服务：`protocol` + `pack`（Git smart 协议与收包）、`api_service`（monorepo 读写核心）、`lfs`、`oci`、`agent_capture`、`code_edit`、`snapshot`（MST/2）、`github_sync`、`merge_checker` |
+| `ceres` | 业务服务：`protocol` + `pack`（Git smart 协议与收包）、`api_service`（monorepo 读写核心）、`lfs`、`oci`、`code_edit`、`snapshot`（MST/2）、`github_sync`、`merge_checker` |
 | `jupiter` | 存储与服务底座：`storage/`（`*Storage` 包装器）、`service/`（`push_queue_service` 等）、`migration/`（sea-orm-migration）、`redis/` |
 | `callisto` | sea-orm 实体，一表一文件；`lib.rs` 做 `pub use crate::callisto::*` 重导出 |
 | `orbit_api` + `orbit` | 对象存储契约（trait/config）与后端实现（local / S3 / GCS），经 `orbit::factory::ObjectStorageFactory` 构建 |
@@ -119,13 +119,13 @@ HTTP router 在 `server::http_server::app`（`src/server/http_server.rs:681`）�
 | Git 视图 URL（只读） | `/.filter/<filter_id>.git`、`/.view/<name>.git`、`/.view/<name>@<version>.git`（HTTP 与 SSH upload-pack） | `[views].enabled` 缺省关闭，重启生效；receive-pack 拒绝，视图前缀 LFS 返回 404 |
 | 视图 API | `/api/v1/views`（`POST ?wait=true` 注册、`GET ?name=&version=`）、`GET /api/v1/views/{filter_id}`、`GET /api/v1/views/metrics`；请求见[视图运维](./deploy-trunk.md) | `[views].enabled` 缺省关闭，重启生效；只在 trunk / storage-only 挂载，关闭时返回 404 |
 | OCI registry | `/v2/` | `[oci].enabled` 且 storage-only；review 形态 fail-closed 不注册 |
-| Agent Capture | `/api/v1/agent-capture` | `[agent_capture].enabled` 且 storage-only |
+| 旧 Agent Capture（已退场） | `/api/v1/agent-capture`（永不挂载） | MTR-26/MTR-28 已移除表面与运行时 |
 | MST/2 快照面 | `/api/v2` | nest 静态注册，handler 在 `[mst2].enabled` 为 false 时 fail-closed；切换需重启 |
 | Swagger UI / OpenAPI | `/swagger-ui`、`/api/openapi.json` | 始终挂载；文档内容随形态裁剪 |
 
 端口、compose 栈与容器部署参数见 [`deploy-trunk.md`](./deploy-trunk.md)（本地 compose）与仓库根 `Dockerfile`（release 构建，默认 `service http --host 0.0.0.0 -p 8000`）。
 
-深入阅读：[`refactoring/protocol.md`](./refactoring/protocol.md)（receive-pack 分层、pkt-line、认证上下文）、[`refactoring/oci.md`](./refactoring/oci.md)、[`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
+深入阅读：[`refactoring/protocol.md`](./refactoring/protocol.md)（receive-pack 分层、pkt-line、认证上下文）、[`refactoring/oci.md`](./refactoring/oci.md)。
 
 ## 7. 配置与热加载
 

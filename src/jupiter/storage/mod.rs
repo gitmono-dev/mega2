@@ -1,4 +1,3 @@
-pub mod agent_capture_storage;
 pub mod artifact_storage;
 pub mod audit_storage;
 pub mod base_storage;
@@ -66,7 +65,6 @@ use crate::{
     contract::{policy::entitystore::SharedEntityStore, vault::integration::vault_core::VaultCore},
     jupiter::{
         service::{
-            agent_capture_service::AgentCaptureService,
             artifact_service::ArtifactService,
             buck_service::BuckService,
             cl_service::CLService,
@@ -82,7 +80,6 @@ use crate::{
             webhook_service::WebhookService,
         },
         storage::{
-            agent_capture_storage::AgentCaptureStorage,
             audit_storage::AuditStorage,
             base_storage::{BaseStorage, StorageConnector},
             bots_storage::BotsStorage,
@@ -190,7 +187,6 @@ pub struct Storage {
     pub git_service: GitService,
     pub lfs_service: LfsService,
     pub oci_service: OciService,
-    pub agent_capture_service: AgentCaptureService,
     pub config_handle: ConfigHandle,
     pub config: Arc<Config>,
     pub webhook_service: WebhookService,
@@ -318,13 +314,6 @@ impl Storage {
             oci_storage: oci_db_storage.clone(),
             obj_storage: object_store.clone(),
         };
-        let agent_capture_service = AgentCaptureService {
-            storage: AgentCaptureStorage { base: base.clone() },
-            obj_storage: object_store.clone(),
-            storage_event_emitter:
-                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::from_config_disabled(&config),
-        };
-
         let git_service = GitService {
             obj_storage: object_store.clone(),
         };
@@ -412,7 +401,6 @@ impl Storage {
             import_service,
             lfs_service,
             oci_service,
-            agent_capture_service,
             webhook_service,
             storage_event_emitter,
             notification_storage,
@@ -472,10 +460,9 @@ impl Storage {
         &mut self,
         emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     ) {
-        // LfsService / AgentCaptureService are built before the vault-bound
-        // emitter exists (WH-11), so rebinding must fan out (WH-05 / WH-07).
+        // LfsService is built before the vault-bound emitter exists (WH-11),
+        // so rebinding must fan out (WH-05 / WH-07).
         self.lfs_service.storage_event_emitter = emitter.clone();
-        self.agent_capture_service.storage_event_emitter = emitter.clone();
         self.storage_event_emitter = emitter;
     }
 
@@ -816,7 +803,6 @@ impl Storage {
             import_service: ImportService::mock(),
             lfs_service: LfsService::mock(),
             oci_service: OciService::mock(),
-            agent_capture_service: AgentCaptureService::mock(),
             webhook_service,
             storage_event_emitter:
                 crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
@@ -938,16 +924,6 @@ mod tests {
 
         // Should be 50% of 16 = 8
         assert_eq!(concurrency, 8);
-    }
-
-    #[test]
-    fn mock_storage_includes_agent_capture_service() {
-        let storage = Storage::mock();
-        assert_eq!(
-            crate::orbit_api::object_storage::ObjectNamespace::Agent.to_string(),
-            "agent"
-        );
-        let _ = &storage.agent_capture_service;
     }
 
     #[test]

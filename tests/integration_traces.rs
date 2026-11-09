@@ -16734,3 +16734,48 @@ fn legacy_retirement_stage_26() {
     assert!(!root.join("src/api_model/agent_capture.rs").exists());
     assert!(!root.join("src/api/router/agent_capture_router.rs").exists());
 }
+
+/// MTR-28 runtime retirement: the real binary starts without the legacy Capture
+/// service/storage/auth modules, the maintenance CLI still answers, and the
+/// stage scanner finds no non-allowlisted reference to the removed runtime.
+#[tokio::test]
+async fn legacy_runtime_removed_smoke() {
+    // The real service boots with traces enabled and without the legacy
+    // Capture runtime linked in.
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let (status, _body) = runtime.get("/api/openapi.json").await;
+    assert_eq!(status, 200, "the real binary still serves OpenAPI");
+    // The maintenance CLI still accepts its typed legacy locator commands.
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .args(["traces", "purge-legacy-capture", "--help"])
+        .output()
+        .expect("run help");
+    assert!(
+        help.status.success(),
+        "maintenance CLI help failed: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let text = String::from_utf8_lossy(&help.stdout);
+    for flag in ["--action", "--journal", "--maintenance-manifest"] {
+        assert!(text.contains(flag), "missing {flag} in help: {text}");
+    }
+}
+
+/// MTR-28 stage scanner: no removed runtime module or symbol survives outside
+/// the scanner's own pattern table.
+#[test]
+fn legacy_retirement_stage_28() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_28(root).expect("stage 28 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy runtime symbols: {hits:?}"
+    );
+    for removed in [
+        "src/jupiter/service/agent_capture_service.rs",
+        "src/jupiter/storage/agent_capture_storage.rs",
+        "src/ceres/agent_capture",
+    ] {
+        assert!(!root.join(removed).exists(), "{removed} must be gone");
+    }
+}
