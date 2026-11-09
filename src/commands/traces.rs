@@ -4,6 +4,8 @@
 
 #[path = "traces_credentials.rs"]
 mod traces_credentials;
+#[path = "traces_purge.rs"]
+mod traces_purge;
 #[path = "traces_search_index.rs"]
 mod traces_search_index;
 #[path = "traces_target.rs"]
