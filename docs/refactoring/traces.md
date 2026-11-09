@@ -1056,7 +1056,7 @@ MTR-59 的 SSH driver 使用 `MEGA2_TRACES_INTEROP_SSH_URL`（`ssh://git@host:po
 
 MTR-60 的 agent driver 使用 `MEGA2_TRACES_INTEROP_HTTP_URL`、`MEGA2_TRACES_INTEROP_TARGET`、`MEGA2_TRACES_INTEROP_TOKEN_FILE`、`MEGA2_TRACES_INTEROP_SEARCH_STREAM`、`MEGA2_TRACES_INTEROP_QUERY` 与 `LIBRA_REPO`；逐案执行 `agent_search`（机器搜索命中且带代表 evidence）、`agent_transcript_budget`（有界读取加 cursor 续读等于完整正文）、`agent_evidence_reread`（按命中 checkpoint 重读正文）、`agent_code_clone_excludes_traces`（普通 clone 不含 traces 专属 sentinel）与三个 LTR-21 selector （`live_peer_principal_write_denied`、`live_other_target_ref_isolation`、`live_other_source_ref_isolation`，各自执行并计数，未运行即失败）。末行为 `traces interop agent summary: executed=<n> passed=<n> failed=<n>`；离线 selector 为 `interop_agent_`。
 
-**H4 客户端缺口（MTR-60 记录）：** 当前 pin 的 Libra 客户端 `mega2 traces search` 仍请求 `/api/v1/traces/search`，`mega2 traces transcript` 仍请求 `/streams/<id>/checkpoints/<id>/transcript`（且无 session 参数），与 MTR-20/MTR-18 已挂载的 `/streams/<id>/search` 与 `/streams/<stream>/sessions/<session>/checkpoints/<checkpoint>/transcript` 不一致；因此本卡的 AC-1..AC-3 由服务端已挂载 API 直测，客户端修复由后续 Libra 卡承接，不能把该缺口当 skip。
+**H4 客户端缺口（MTR-60 记录，2026-11-09 已由 Libra 修复）：** 当时 pin 的 Libra 客户端 `mega2 traces search` 请求旧 `/api/v1/traces/search`、`transcript` 请求无 session 的旧路径，与已挂载路由不一致；MTR-60 的 AC-1..AC-3 因而以服务端已挂载 API 直测。Libra `0.30.168`（`fc972f9cc`）已把 search 切到 `/streams/<id>/search`（`--stream` 必填、路由自管正文预算）并把 transcript 切到带 session 的已挂载路由（缺省解析所属 session），真实 fixture 验证命中与正文读取通过；客户端缺口自此关闭，后续 real-client 证据按新的 pin 重取。
 
 2026-11-09 的本地真实 agent fixture：同一 `mega2` 进程、primary/peer 两个 token、两把 SSH key 与两套静态绑定、两个 target 与真实 Libra live checkpoint；`--case agent` 7/7 通过（日志 SHA256 `611a7981da97accc4166a8e9ba3c83828ada70872dd87094fa167554423002a3`，不含 token/密钥）。
 
