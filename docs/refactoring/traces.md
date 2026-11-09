@@ -981,6 +981,12 @@ MTR-59 的 SSH driver 使用 `MEGA2_TRACES_INTEROP_SSH_URL`（`ssh://git@host:po
 
 2026-11-09 的本地真实 SSH fixture：同一 `mega2` 进程组内的 `service ssh`（`127.0.0.1:2222`）、`ssh_keys` 记录 9001 与同一 principal 的 `static_push_token / trace-ssh-key:9001`、`mono_account / ssh-key:9001` 绑定；`--case ssh` 5/5 逐案通过（日志 SHA256 `741d0d2821eaf38c337b83ec642ff51c1b9ec88952662bde1ca7279f968dfcfd`，不含密钥或 token）。
 
+MTR-60 的 agent driver 使用 `MEGA2_TRACES_INTEROP_HTTP_URL`、`MEGA2_TRACES_INTEROP_TARGET`、`MEGA2_TRACES_INTEROP_TOKEN_FILE`、`MEGA2_TRACES_INTEROP_SEARCH_STREAM`、`MEGA2_TRACES_INTEROP_QUERY` 与 `LIBRA_REPO`；逐案执行 `agent_search`（机器搜索命中且带代表 evidence）、`agent_transcript_budget`（有界读取加 cursor 续读等于完整正文）、`agent_evidence_reread`（按命中 checkpoint 重读正文）、`agent_code_clone_excludes_traces`（普通 clone 不含 traces 专属 sentinel）与三个 LTR-21 selector （`live_peer_principal_write_denied`、`live_other_target_ref_isolation`、`live_other_source_ref_isolation`，各自执行并计数，未运行即失败）。末行为 `traces interop agent summary: executed=<n> passed=<n> failed=<n>`；离线 selector 为 `interop_agent_`。
+
+**H4 客户端缺口（MTR-60 记录）：** 当前 pin 的 Libra 客户端 `mega2 traces search` 仍请求 `/api/v1/traces/search`，`mega2 traces transcript` 仍请求 `/streams/<id>/checkpoints/<id>/transcript`（且无 session 参数），与 MTR-20/MTR-18 已挂载的 `/streams/<id>/search` 与 `/streams/<stream>/sessions/<session>/checkpoints/<checkpoint>/transcript` 不一致；因此本卡的 AC-1..AC-3 由服务端已挂载 API 直测，客户端修复由后续 Libra 卡承接，不能把该缺口当 skip。
+
+2026-11-09 的本地真实 agent fixture：同一 `mega2` 进程、primary/peer 两个 token、两把 SSH key 与两套静态绑定、两个 target 与真实 Libra live checkpoint；`--case agent` 7/7 通过（日志 SHA256 `611a7981da97accc4166a8e9ba3c83828ada70872dd87094fa167554423002a3`，不含 token/密钥）。
+
 2026-11-09 的本地真实 fixture 证据：mega2 `0.42.133` debug binary、ephemeral PostgreSQL `mega2_interop`、`[traces].enabled=true`、两个 static push token（分别覆盖 `/project/interop` 与 `/project/other`）与两条真实 Libra scoped push；`--case http` 的 5/5 逐案通过（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`，日志 SHA256 `f96343c72b7f51935d6c58a6cee415385f5a30c6a8f89f31095e3738dd090431`，不含 token 或 DSN）。
 
 

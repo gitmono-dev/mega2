@@ -15525,3 +15525,110 @@ mod interop_ssh {
         );
     }
 }
+
+/// Offline selector for the traces interop agent driver (MTR-60).
+///
+/// Starts the audited shell driver with a controlled environment and asserts
+/// argument parsing, the missing-fixture failure and the cleanup guard; it
+/// never reaches a live service or the Libra checkout.
+mod interop_agent {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+    };
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    }
+
+    fn driver(case: Option<&str>, interop: bool) -> Output {
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .current_dir(repo_root())
+            .arg("scripts/traces_interop_smoke.sh");
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        if interop {
+            command.env("MEGA2_TRACES_INTEROP", "1");
+        }
+        if let Some(case) = case {
+            command.args(["--case", case]);
+        }
+        command.output().expect("run the interop driver")
+    }
+
+    #[test]
+    fn interop_agent_requires_a_case_and_the_switch() {
+        assert_eq!(driver(None, true).status.code(), Some(2), "missing --case");
+        let off = driver(Some("agent"), false);
+        assert_eq!(off.status.code(), Some(2), "switch off");
+        assert!(String::from_utf8_lossy(&off.stderr).contains("MEGA2_TRACES_INTEROP=1"));
+        assert_eq!(
+            driver(Some("nope"), true).status.code(),
+            Some(2),
+            "unknown case"
+        );
+    }
+
+    #[test]
+    fn interop_agent_missing_fixture_fails_the_run() {
+        let output = driver(Some("agent"), true);
+        assert_eq!(output.status.code(), Some(1), "missing fixture must fail");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("FAIL: fixture"),
+            "missing fixture output: {text}"
+        );
+    }
+
+    #[test]
+    fn interop_agent_cleanup_guard_removes_owned_workdir() {
+        let root = tempfile::tempdir().expect("interop workdir parent");
+        let fixture = root.path().join("fixture");
+        fs::create_dir_all(fixture.join("libra-repo")).expect("fixture dir");
+        fs::write(fixture.join("token"), "synthetic").expect("token file");
+        let libra_stub = fixture.join("libra-stub");
+        fs::write(&libra_stub, "#!/bin/sh\nexit 1\n").expect("libra stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&libra_stub, fs::Permissions::from_mode(0o700)).expect("exec bit");
+        }
+        let output = Command::new("bash")
+            .env_clear()
+            .current_dir(repo_root())
+            .args(["scripts/traces_interop_smoke.sh", "--case", "agent"])
+            .env("MEGA2_TRACES_INTEROP", "1")
+            .env("MEGA2_TRACES_INTEROP_HTTP_URL", "http://127.0.0.1:9")
+            .env("MEGA2_TRACES_INTEROP_TARGET", "/project/interop")
+            .env("MEGA2_TRACES_INTEROP_TOKEN_FILE", fixture.join("token"))
+            .env(
+                "MEGA2_TRACES_INTEROP_SEARCH_STREAM",
+                "597b9eb7-61f4-432a-a814-21b58d1a2157",
+            )
+            .env("MEGA2_TRACES_INTEROP_QUERY", "connection timeout")
+            .env("LIBRA_REPO", fixture.join("libra-repo"))
+            .env("LIBRA_BIN", &libra_stub)
+            .output()
+            .expect("run the agent interop driver");
+        assert_eq!(output.status.code(), Some(1), "unreachable fixture fails");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("traces interop agent summary:"),
+            "summary missing: {text}"
+        );
+        let workdir = text
+            .lines()
+            .find_map(|line| line.strip_prefix("traces interop workdir: "))
+            .expect("driver prints its owned workdir");
+        assert!(
+            !Path::new(workdir).exists(),
+            "the cleanup guard must remove the owned workdir {workdir}"
+        );
+    }
+}

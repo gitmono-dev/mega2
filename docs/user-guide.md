@@ -235,7 +235,7 @@ Fetch the traces ref explicitly, for example `git -c protocol.version=2 fetch <t
 
 Receive and fetch have independent capacity limits. A 503 `query_timeout` indicates retryable overload or temporary unavailability; back off before retrying and inspect server capacity. A disconnected transfer or failed PACK checksum is not a successful fetch. See the [Deployment Guide](./deployment.md) for provisioning and occupancy recovery.
 
-For the two-repository interop check, run `MEGA2_TRACES_INTEROP=1 scripts/traces_interop_smoke.sh --case http` or `--case ssh` against an operator-provided fixture. The driver performs a real Libra scoped push and explicit fetch, rejects an unauthenticated protocol request (401 with a Basic challenge), and rejects a cross-scope want and a cross-scope delta. A missing fixture value is a failure, never a skip; see the [traces protocol](./refactoring/traces.md#81-双仓互操作-smoke-drivermtr-5869) for the fixture names and exit codes.
+For the two-repository interop check, run `MEGA2_TRACES_INTEROP=1 scripts/traces_interop_smoke.sh --case http` or `--case ssh` or `--case agent` against an operator-provided fixture. The driver performs a real Libra scoped push and explicit fetch, rejects an unauthenticated protocol request (401 with a Basic challenge), and rejects a cross-scope want and a cross-scope delta. A missing fixture value is a failure, never a skip; see the [traces protocol](./refactoring/traces.md#81-双仓互操作-smoke-drivermtr-5869) for the fixture names and exit codes.
 
 ### 5.3 SSH traces Git
 
