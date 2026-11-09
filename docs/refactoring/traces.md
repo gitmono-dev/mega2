@@ -967,6 +967,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 **持久 writer fence 与公开维护入口（MTR-33）：** `mega2 --config <现存配置> traces purge-legacy-capture --action fence --journal <UUID> --maintenance-manifest <PATH>` 是冻结的公开维护入口。`fence` 在同一事务内重跑 MTR-62 全库授权 preflight，未知/新增 scope 则不激活且不产生 receipt；journal 必须存在且为 `frozen`；同一 journal 的 active fence 重复激活幂等并返回同一 fence/receipt；只有 legacy 表 owner（maintenance role）成员可切换 fence。激活后 `trace_legacy_writer_fence.active` 持久存在，12 张旧表的 `trace_legacy_write_fence()`（`SECURITY DEFINER`，仅 owner 可读 fence 表）拒绝 INSERT/UPDATE/DELETE，旧 Capture HTTP 写入口以稳定 `legacy_capture_fenced`（409）拒绝；`inventory`/`delete`/`drop` 由后续卡接线，当前明确拒绝而不假装成功。
 
+**部署外围屏障探针（MTR-46）：** 部署维护者在 MTR-33 激活 fence 后，用 `scripts/traces_legacy_fence_probe.sh --maintenance-manifest <PATH> --old-image <DIGEST> --journal <UUID>` 对本部署真实 backend 逐一取证：旧 app role 的 DB INSERT 必须以 permission denied/fenced 拒绝，旧对象凭据对 legacy prefix 的 PUT 必须返回 401/403；缺少 fixture、探针未运行或探针意外成功都算失败，不 skip。旧 image digest 写入 sanitized 汇总，reports 不含凭据或 DSN；未取得真实部署的 DB/PUT 探针前不得进入 H6。
+
 **持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
 - `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
 - `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；

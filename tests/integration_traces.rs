@@ -15986,3 +15986,111 @@ async fn purge_fence_cli_activates_and_rejects() {
     drop(closed);
     drop(guard);
 }
+
+/// Offline selector for the deployment perimeter probe (MTR-46).
+///
+/// Argument parsing, the missing-fixture failure and the cleanup guard only;
+/// the real probes need the named deployment maintainer and never run here.
+mod purge_perimeter {
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    fn script() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/traces_legacy_fence_probe.sh")
+    }
+
+    fn run(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+        let mut command = Command::new("bash");
+        command.env_clear().arg(script()).args(args);
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().expect("run the perimeter probe")
+    }
+
+    #[test]
+    fn purge_perimeter_requires_arguments() {
+        let missing = run(&[], &[]);
+        assert_eq!(missing.status.code(), Some(2), "missing arguments");
+        let bad_journal = run(
+            &[
+                "--maintenance-manifest",
+                "/dev/null",
+                "--old-image",
+                "sha256:old",
+                "--journal",
+                "not-a-uuid",
+            ],
+            &[],
+        );
+        assert_eq!(bad_journal.status.code(), Some(2), "invalid journal");
+    }
+
+    #[test]
+    fn purge_perimeter_missing_fixture_fails() {
+        let manifest = tempfile::NamedTempFile::new().expect("manifest");
+        let output = run(
+            &[
+                "--maintenance-manifest",
+                manifest.path().to_str().expect("path"),
+                "--old-image",
+                "sha256:old",
+                "--journal",
+                "66666666-6666-4666-8666-666666666666",
+            ],
+            &[],
+        );
+        assert_eq!(output.status.code(), Some(1), "missing fixture must fail");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("FAIL: fixture"),
+            "missing fixture output: {text}"
+        );
+    }
+
+    #[test]
+    fn purge_perimeter_unreachable_fixture_counts_each_probe() {
+        let manifest = tempfile::NamedTempFile::new().expect("manifest");
+        let token = tempfile::NamedTempFile::new().expect("token");
+        std::fs::write(token.path(), "synthetic").expect("token");
+        let output = run(
+            &[
+                "--maintenance-manifest",
+                manifest.path().to_str().expect("path"),
+                "--old-image",
+                "sha256:old",
+                "--journal",
+                "66666666-6666-4666-8666-666666666666",
+            ],
+            &[
+                // A closed port: both probes run and are refused, which is the
+                // expected outcome only for a reachable deployment. Here they
+                // must be counted, never skipped.
+                (
+                    "MEGA2_TRACES_PROBE_DB_URL",
+                    "postgres://probe:probe@127.0.0.1:9/probe",
+                ),
+                (
+                    "MEGA2_TRACES_PROBE_OBJECT_PUT_URL",
+                    "http://127.0.0.1:9/legacy",
+                ),
+                (
+                    "MEGA2_TRACES_PROBE_OBJECT_TOKEN_FILE",
+                    token.path().to_str().expect("path"),
+                ),
+            ],
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("traces legacy fence probe: executed=2"),
+            "each probe must be counted: {text}"
+        );
+    }
+}
