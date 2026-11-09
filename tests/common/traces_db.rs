@@ -57,6 +57,16 @@ impl TracesDb {
         mega2_core::traces_migration_ops::apply_migrations(&db, true)
             .await
             .expect("apply migrations");
+        // The search surface is served only when the reviewed extension is
+        // present, so the fixture installs it before the service starts.
+        for statement in [
+            "CREATE SCHEMA IF NOT EXISTS mega2_extensions AUTHORIZATION mega2_traces_ext_owner",
+            "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA mega2_extensions VERSION '1.6'",
+        ] {
+            db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, statement))
+                .await
+                .expect("install the reviewed trigram extension");
+        }
         (Self { admin_url, name }, db)
     }
 }

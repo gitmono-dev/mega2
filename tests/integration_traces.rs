@@ -13893,6 +13893,19 @@ async fn transcript_api_reads_the_fixed_scope_within_the_byte_budget() {
     let checkpoint = uuid::Uuid::new_v4().to_string();
     let resource = uuid::Uuid::new_v4().to_string();
     let fragment = uuid::Uuid::new_v4().to_string();
+    // The search surface is served only when the reviewed extension and the
+    // canonical index are present, so the fixture installs them.
+    for statement in [
+        "CREATE SCHEMA IF NOT EXISTS mega2_extensions AUTHORIZATION mega2_traces_ext_owner",
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA mega2_extensions VERSION '1.6'",
+    ] {
+        db.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            statement,
+        ))
+        .await
+        .expect("install the reviewed trigram extension");
+    }
     let epoch = uuid::Uuid::new_v4().to_string();
     let body = "第一行中文\n第二行 english\n第三行 tail";
     let body_bytes = body.len() as i64;
@@ -14439,13 +14452,13 @@ async fn capability_limits_openapi_live_resolves_the_typed_component() {
 
 /// MTR-54 VER-1: the live capabilities response reports the readiness
 /// projection. The CJK capability is measured from the deployed locale, and
-/// the search surface stays fail-closed until `/search` is mounted.
+/// the mounted search surface follows the process index state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_readiness_projects_the_measured_locale_capability() {
     let runtime = traces_runtime::TracesRuntime::start().await;
-    let (status, body) = runtime.get("/api/v1/traces/capabilities").await;
+    let (status, mut body) = runtime.get("/api/v1/traces/capabilities").await;
     assert_eq!(status, 200, "capabilities status: {body}");
-    let json: serde_json::Value = serde_json::from_str(&body).expect("capabilities JSON");
+    let mut json: serde_json::Value = serde_json::from_str(&body).expect("capabilities JSON");
 
     // The readiness flags are booleans, never a readiness string.
     for name in [
@@ -14456,36 +14469,43 @@ async fn capability_readiness_projects_the_measured_locale_capability() {
         assert!(json[name].is_boolean(), "{name} is not a boolean: {body}");
     }
 
-    // `/search` is not mounted by this build, so the search surface stays
-    // closed and the reason is the stable one.
-    assert_eq!(json["search_ready"], serde_json::json!(false));
-    assert_eq!(json["bounded_scan_supported"], serde_json::json!(false));
-    // The reason is the stable index reason when the index is unavailable,
-    // and the not-served reason when the index itself is ready.
-    let reason = json["search_unavailable_reason"]
-        .as_str()
-        .expect("search unavailable reason");
-    let index_ready = runtime
-        .db()
-        .query_all_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "SELECT count(*)::bigint AS present FROM pg_catalog.pg_extension WHERE extname = 'pg_trgm'",
-        ))
-        .await
-        .expect("pg_trgm probe")
-        .first()
-        .and_then(|row| row.try_get::<i64>("", "present").ok())
-        .unwrap_or(0)
-        > 0;
-    assert_eq!(
-        reason,
-        if index_ready {
-            "search_not_served"
-        } else {
-            "extension_missing"
-        },
-        "the unavailable reason must match the live index state: {body}"
-    );
+    // The route is mounted and the fixture installs the reviewed extension,
+    // so the background catalog pass must reach Ready. Poll instead of
+    // sampling the startup race.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if json["search_ready"] == serde_json::json!(true) {
+            assert_eq!(
+                json["bounded_scan_supported"],
+                serde_json::json!(true),
+                "a ready search surface must advertise its bounded scan: {body}"
+            );
+            assert!(
+                json.get("search_unavailable_reason").is_none(),
+                "a ready search surface must not carry an unavailable reason: {body}"
+            );
+            break;
+        }
+        assert_eq!(json["search_ready"], serde_json::json!(false));
+        assert_eq!(
+            json["bounded_scan_supported"],
+            serde_json::json!(false),
+            "an unavailable search surface must not advertise its bounded scan: {body}"
+        );
+        assert!(
+            json["search_unavailable_reason"].is_string(),
+            "an unavailable search surface must carry a stable reason: {body}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the process index did not become ready within 30s: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (status, next_body) = runtime.get("/api/v1/traces/capabilities").await;
+        assert_eq!(status, 200, "capabilities status: {next_body}");
+        body = next_body;
+        json = serde_json::from_str(&body).expect("capabilities JSON");
+    }
 
     // The CJK capability matches what the live locale actually extracts. The
     // probe needs the extension, so a database without it reports false.
@@ -14519,4 +14539,114 @@ async fn capability_readiness_projects_the_measured_locale_capability() {
     assert_eq!(json["api_version"], serde_json::json!("v1"));
     assert_eq!(json["schema_version"], serde_json::json!(1));
     assert_eq!(json["index_version"], serde_json::json!(1));
+}
+
+/// MTR-20 VER-1: the mounted search route returns one representative
+/// evidence per hit, counts repeated evidence, and reports its coverage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_api_returns_representative_evidence_and_a_coverage_report() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let db = runtime.db();
+    let owner = uuid::Uuid::new_v4().to_string();
+    let target = uuid::Uuid::new_v4().to_string();
+    let stream = uuid::Uuid::new_v4().to_string();
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let checkpoint = uuid::Uuid::new_v4().to_string();
+    let resource = uuid::Uuid::new_v4().to_string();
+    let fragment = uuid::Uuid::new_v4().to_string();
+    for statement in [
+        format!("INSERT INTO trace_principal (id) VALUES ('{owner}')"),
+        format!(
+            "INSERT INTO trace_credential_binding (id, principal_id, namespace, credential_id) VALUES ('{}', '{owner}', 'static_push_token', 'mtr89')",
+            uuid::Uuid::new_v4()
+        ),
+        format!(
+            "INSERT INTO trace_target (id, target_kind, project_path, active) VALUES ('{target}', 'native', '/project/search-api', true)"
+        ),
+        format!(
+            "INSERT INTO trace_stream (id, principal_id, target_id, source_repo_id, epoch_id, hash_kind, tip_oid) VALUES ('{stream}', '{owner}', '{target}', 'search-api-source', '{epoch}', 'sha1', NULL)"
+        ),
+        format!(
+            "INSERT INTO trace_session (id, stream_id, session_key) VALUES ('{session}', '{stream}', 'search-session')"
+        ),
+        format!(
+            "INSERT INTO trace_checkpoint (id, stream_id, checkpoint_key, original_tree) VALUES ('{checkpoint}', '{stream}', 'search-session', '{}')",
+            "a".repeat(40)
+        ),
+        format!(
+            "INSERT INTO trace_resource (id, stream_id, checkpoint_id, ordinal, byte_start, byte_end) VALUES ('{resource}', '{stream}', '{checkpoint}', 0, 0, 20)"
+        ),
+        format!(
+            "INSERT INTO trace_fragment (id, stream_id, content_digest, index_version, body, ascii_fold) VALUES ('{fragment}', '{stream}', '{}', 1, 'the needle is here', 'the needle is here')",
+            uuid::Uuid::new_v4()
+        ),
+        format!(
+            "INSERT INTO trace_fragment_membership (id, fragment_id, stream_id, checkpoint_id, resource_id) VALUES ('{}', '{fragment}', '{stream}', '{checkpoint}', '{resource}')",
+            uuid::Uuid::new_v4()
+        ),
+    ] {
+        db.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            statement,
+        ))
+        .await
+        .expect("seed traces search fixture");
+    }
+    db.execute_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "CREATE INDEX IF NOT EXISTS trace_fragment_ascii_fold_trgm_v1 ON public.trace_fragment USING gin (ascii_fold mega2_extensions.gin_trgm_ops)",
+    ))
+    .await
+    .expect("build the canonical search index");
+
+    let (status, body) = runtime
+        .get(&format!("/api/v1/traces/streams/{stream}/search?q=needle"))
+        .await;
+    assert_eq!(status, 200, "search status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("search JSON");
+    assert_eq!(json["schema_version"], 1);
+    let items = json["items"].as_array().expect("search items");
+    assert_eq!(items.len(), 1, "one hit for the seeded fragment: {body}");
+    let hit = &items[0];
+    assert!(hit["content_digest"].is_string(), "{body}");
+    assert_eq!(hit["checkpoint_id"], checkpoint, "{body}");
+    assert_eq!(hit["resource_id"], resource, "{body}");
+    assert_eq!(hit["session_id"], session, "{body}");
+    assert_eq!(hit["occurrence_count"], 1, "{body}");
+    // The hit carries one representative evidence, not a list of origins.
+    assert!(hit["occurrences"].is_null(), "{body}");
+
+    // The page reports the coverage of the query it read.
+    assert!(json["coverage"]["coverage_complete"].is_boolean(), "{body}");
+    assert!(json["coverage"]["scan_complete"].is_boolean(), "{body}");
+    assert!(json["coverage"]["index_complete"].is_boolean(), "{body}");
+    assert_eq!(json["snapshot"]["accepted_seq"], 0, "{body}");
+    assert_eq!(json["snapshot"]["index_version"], 1, "{body}");
+
+    // An empty query is rejected, and the error is valid JSON.
+    let (status, body) = runtime
+        .get(&format!("/api/v1/traces/streams/{stream}/search?q="))
+        .await;
+    assert_eq!(status, 400, "empty query status: {body}");
+    assert!(body.contains("invalid_parameter"), "{body}");
+    let _: serde_json::Value = serde_json::from_str(&body).expect("error JSON");
+
+    // The runtime OpenAPI document carries the new search schema.
+    let (status, body) = runtime.get("/api/openapi.json").await;
+    assert_eq!(status, 200, "openapi status: {body}");
+    let document: serde_json::Value = serde_json::from_str(&body).expect("openapi JSON");
+    let search_path = document["paths"]["/api/v1/traces/streams/{stream_id}/search"]["get"]
+        .as_object()
+        .expect("search GET operation");
+    assert!(search_path.contains_key("responses"), "{search_path:?}");
+    let components = document["components"]["schemas"]
+        .as_object()
+        .expect("openapi components schemas");
+    assert!(
+        components.contains_key("SearchPage"),
+        "the runtime OpenAPI is missing the search schema"
+    );
 }

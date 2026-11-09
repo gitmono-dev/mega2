@@ -338,6 +338,60 @@ impl QuerySnapshotEnvelope {
     }
 }
 
+/// One search hit with a fixed representative evidence (MTR-20).
+///
+/// The hit carries one representative evidence, not an unbounded list of the
+/// checkpoints it came from. The same evidence seen again is reported as a
+/// higher occurrence count instead of more rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SearchHit {
+    /// The fragment this hit was found in.
+    pub fragment_id: String,
+    /// The digest of the matched content.
+    pub content_digest: String,
+    /// The byte range of the matched content inside the resource.
+    pub byte_start: i64,
+    /// The end of the matched byte range.
+    pub byte_end: i64,
+    /// The checkpoint that holds the matched resource.
+    pub checkpoint_id: String,
+    /// The resource that holds the matched content.
+    pub resource_id: String,
+    /// The session that holds the checkpoint.
+    pub session_id: String,
+    /// How often the same evidence was seen.
+    pub occurrence_count: u64,
+}
+
+/// The search response (MTR-20).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SearchPage {
+    pub schema_version: u32,
+    /// The snapshot this page was read at.
+    pub snapshot: QuerySnapshotEnvelope,
+    /// The coverage of this page.
+    pub coverage: QueryCoverage,
+    /// The hits of this page.
+    pub items: Vec<SearchHit>,
+    /// The cursor that reads the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// The search query (MTR-20).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchQuery {
+    /// The literal keyword query.
+    pub q: String,
+    /// The page size.
+    #[serde(default)]
+    pub limit: Option<u64>,
+    /// The continuation cursor.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
 /// The coverage verdict of one query (MTR-66).
 ///
 /// The verdict is taken at the pinned query snapshot, so a push or an index

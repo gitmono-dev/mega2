@@ -10,10 +10,11 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use crate::{
     api::MonoApiServiceState,
     api_model::traces::{
-        CheckpointPage, CheckpointQuery, CheckpointSummary, SessionDetail, SessionPage,
-        SessionQuery, StreamDirectory, StreamDirectoryQuery, TargetResolve, TargetResolveQuery,
-        TracesCapabilities, TranscriptPage, TranscriptQuery, admit_checkpoint_query,
-        admit_session_query, admit_stream_directory_query, admit_transcript_query,
+        CheckpointPage, CheckpointQuery, CheckpointSummary, SearchPage, SearchQuery, SessionDetail,
+        SessionPage, SessionQuery, StreamDirectory, StreamDirectoryQuery, TargetResolve,
+        TargetResolveQuery, TracesCapabilities, TranscriptPage, TranscriptQuery,
+        admit_checkpoint_query, admit_session_query, admit_stream_directory_query,
+        admit_transcript_query,
     },
     ceres::api_service::state::ProtocolApiState,
     common::errors::{ApiError, MegaError, TracesError},
@@ -27,6 +28,7 @@ use crate::{
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
         .routes(routes!(capabilities))
+        .routes(routes!(search))
         .routes(routes!(resolve_target))
         .routes(routes!(list_target_streams))
         .routes(routes!(list_stream_sessions))
@@ -34,6 +36,64 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(list_session_checkpoints))
         .routes(routes!(read_session_checkpoint))
         .routes(routes!(read_session_checkpoint_transcript))
+}
+
+/// Search the one stream the caller may read.
+///
+/// The search runs inside the fixed budget of the shared response helper, and
+/// the readiness of the search surface comes from the process index state.
+#[utoipa::path(
+    get,
+    path = "/traces/streams/{stream_id}/search",
+    params(
+        ("stream_id" = String, Path, description = "Stream id"),
+        ("q" = String, Query, description = "Literal keyword query"),
+        ("limit" = Option<u64>, Query, description = "Page size; default 20, max 100"),
+        ("cursor" = Option<String>, Query, description = "Continuation cursor for this scope")
+    ),
+    responses(
+        (status = 200, description = "Search page", body = SearchPage),
+        (status = 400, description = "Invalid parameter or cursor"),
+        (status = 401, description = "Missing or rejected credentials"),
+        (status = 404, description = "Unknown or unreadable stream"),
+        (status = 503, description = "Search unavailable or query timeout")
+    ),
+    tag = "Traces"
+)]
+pub async fn search(
+    State(state): State<MonoApiServiceState>,
+    Path(stream_id): Path<String>,
+    headers: HeaderMap,
+    query: Result<Query<SearchQuery>, QueryRejection>,
+) -> Result<Json<SearchPage>, ApiError> {
+    let protocol = ProtocolApiState::from_ref(&state);
+    authenticate_trace_api(&protocol, &headers)
+        .await
+        .map_err(ApiError::from)?;
+    let Query(query) =
+        query.map_err(|_| ApiError::from(MegaError::from(TracesError::InvalidParameter)))?;
+    let request = trace_query_service::admit_search_request(&stream_id, query)
+        .map_err(|error| ApiError::from(MegaError::from(error)))?;
+    let mono = state.storage.mono_storage();
+    let db = mono.get_connection();
+    let may_read =
+        match authorize_trace_api_read_for_stream(&protocol, &headers, db, &stream_id).await {
+            Ok(may_read) => may_read,
+            Err(error) => return Err(ApiError::from(error)),
+        };
+    if !may_read {
+        return Err(ApiError::from(MegaError::from(TracesError::UnknownScope)));
+    }
+    let index = state.storage.trace_search_index_service.state();
+    let page = trace_query_service::read_search_page(db, &index, &request)
+        .await
+        .map_err(|error| ApiError::from(MegaError::from(error)))?;
+    crate::api_model::traces_budget::fit_envelope(
+        &page,
+        &crate::api_model::traces_budget::ResponseBudget::from_protocol_limits(),
+    )
+    .map_err(|error| ApiError::from(MegaError::from(error)))?;
+    Ok(Json(page))
 }
 
 /// Capabilities for an authenticated caller.
@@ -675,6 +735,8 @@ mod tests {
         let (status, body) = get(app, "/traces/capabilities", Some("wide-secret")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // This fixture has no reviewed extension, so the index is unavailable
+        // and the search surface stays closed with a stable reason.
         assert_eq!(json["search_ready"], false);
         assert_eq!(json["bounded_scan_supported"], false);
         assert!(json["search_unavailable_reason"].is_string(), "{json}");

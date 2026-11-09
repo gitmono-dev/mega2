@@ -80,6 +80,93 @@ pub fn coverage_of(
     QueryCoverage::take(snapshot, scan_complete)
 }
 
+/// One search hit with a fixed representative evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHit {
+    /// The fragment the hit was found in.
+    pub fragment_id: String,
+    /// The digest of the matched content.
+    pub content_digest: String,
+    /// The byte range of the matched content.
+    pub byte_start: i64,
+    /// The end of the matched byte range.
+    pub byte_end: i64,
+    /// The checkpoint that holds the matched resource.
+    pub checkpoint_id: String,
+    /// The resource that holds the matched content.
+    pub resource_id: String,
+    /// The session that holds the checkpoint.
+    pub session_id: String,
+    /// How often the same evidence was seen.
+    pub occurrence_count: u64,
+}
+
+/// The scope of one search hit.
+///
+/// The hit carries one representative checkpoint and session, so it never
+/// expands into an unbounded list of the checkpoints it came from.
+async fn resolve_hit_scope(
+    db: &sea_orm::DatabaseConnection,
+    checkpoint_id: &str,
+    resource_id: &str,
+) -> Result<(String, String), TracesError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    use crate::callisto::{trace_checkpoint, trace_session};
+
+    let checkpoint = trace_checkpoint::Entity::find_by_id(checkpoint_id.to_owned())
+        .one(db)
+        .await
+        .map_err(|_error| TracesError::search_unavailable(SEARCH_UNAVAILABLE))?
+        .ok_or_else(|| TracesError::search_unavailable(SEARCH_UNAVAILABLE))?;
+    // The session that holds the checkpoint is found by its key.
+    let session = trace_session::Entity::find()
+        .filter(trace_session::Column::StreamId.eq(checkpoint.stream_id.clone()))
+        .filter(trace_session::Column::SessionKey.eq(checkpoint.checkpoint_key.clone()))
+        .one(db)
+        .await
+        .map_err(|_error| TracesError::search_unavailable(SEARCH_UNAVAILABLE))?
+        .ok_or_else(|| TracesError::search_unavailable(SEARCH_UNAVAILABLE))?;
+    let _ = resource_id;
+    Ok((session.id, checkpoint.id))
+}
+
+/// Build the hits of one search result.
+///
+/// Repeated evidence is counted instead of being listed again, so a hit never
+/// grows an unbounded list of the checkpoints it came from.
+pub async fn hits_of(
+    db: &sea_orm::DatabaseConnection,
+    result: &LiteralSearchResult,
+) -> Result<Vec<SearchHit>, TracesError> {
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for candidate in &result.matches {
+        let (session_id, checkpoint_id) =
+            resolve_hit_scope(db, &candidate.checkpoint_id, &candidate.resource_id).await?;
+        // The same evidence seen again raises its count instead of adding a
+        // second row for it.
+        let repeated = hits.iter_mut().find(|hit| {
+            hit.fragment_id == candidate.fragment_id
+                && hit.checkpoint_id == checkpoint_id
+                && hit.resource_id == candidate.resource_id
+        });
+        match repeated {
+            Some(hit) => hit.occurrence_count = hit.occurrence_count.saturating_add(1),
+            None => hits.push(SearchHit {
+                fragment_id: candidate.fragment_id.clone(),
+                content_digest: candidate.content_digest.clone(),
+                byte_start: candidate.byte_start,
+                byte_end: candidate.byte_end,
+                checkpoint_id,
+                resource_id: candidate.resource_id.clone(),
+                session_id,
+                occurrence_count: 1,
+            }),
+        }
+    }
+    Ok(hits)
+}
+
 /// The plan one query used, for the coverage matrix.
 pub fn plan_name(plan: SearchPlan) -> &'static str {
     match plan {

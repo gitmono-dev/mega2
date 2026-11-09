@@ -74,9 +74,8 @@ pub fn project_sessions(
 }
 
 /// Capabilities for this process. Readiness comes from the process-derived
-/// index state, not a fresh catalog read. `/search` is not served by this
-/// build, so `search_ready` stays false with a stable reason even when the
-/// index itself is valid. MTR-20 removes that limit when it mounts `/search`.
+/// index state, not a fresh catalog read. The `/search` route is mounted, so
+/// the search surface is ready exactly when that index state is ready.
 pub fn read_capabilities(
     server_id: &str,
     index: &crate::jupiter::service::trace_search_index_service::IndexState,
@@ -86,14 +85,19 @@ pub fn read_capabilities(
         api_model::traces::TracesCapabilities,
         jupiter::service::trace_search_index_service::IndexState,
     };
+    // The search route is mounted, so the search surface is ready exactly when
+    // the process index state is ready and the search service can run.
+    let search_ready = matches!(index, IndexState::Ready);
     let reason = match index {
-        IndexState::Ready => SEARCH_NOT_SERVED,
-        IndexState::Unavailable(failure) => catalog_reason(failure),
+        IndexState::Ready => None,
+        IndexState::Unavailable(failure) => Some(catalog_reason(failure).to_owned()),
     };
-    let mut capabilities = TracesCapabilities::project(server_id, false, Some(reason.to_owned()));
+    let mut capabilities = TracesCapabilities::project(server_id, search_ready, reason);
     // The CJK capability is read from the deployed locale, so it is reported
     // as measured instead of being assumed from the index alone.
     capabilities.cjk_index_supported = cjk_index_supported;
+    // The bounded scan is available with the mounted search route.
+    capabilities.bounded_scan_supported = search_ready;
     capabilities
 }
 
@@ -242,6 +246,105 @@ pub fn snapshot_binding(
         filters: filters.to_owned(),
         index_version,
     }
+}
+
+/// The admitted search request.
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    /// The stream the search is scoped to.
+    pub stream_id: String,
+    /// The literal query.
+    pub query: crate::ceres::traces::query::LiteralQuery,
+    /// The page size.
+    pub limit: u64,
+    /// The cursor of the previous page.
+    pub cursor: Option<String>,
+}
+
+/// Admit one search request.
+///
+/// The query text goes through the literal query definition, so an empty or
+/// over-long query is rejected, and the page size is bounded by the shared
+/// budget helper.
+pub fn admit_search_request(
+    stream_id: &str,
+    query: crate::api_model::traces::SearchQuery,
+) -> Result<SearchRequest, crate::common::errors::TracesError> {
+    use crate::{api_model::traces_budget::admit_search_limit, ceres::traces::query::LiteralQuery};
+
+    let literal = LiteralQuery::new(&query.q)
+        .map_err(|_| crate::common::errors::TracesError::InvalidParameter)?;
+    let limit = admit_search_limit(query.limit)?;
+    Ok(SearchRequest {
+        stream_id: stream_id.to_owned(),
+        query: literal,
+        limit,
+        cursor: query.cursor,
+    })
+}
+
+/// Read one search page.
+///
+/// The page is read at a pinned snapshot, so a later push or index catch-up
+/// does not change it, and the coverage of the page says whether the whole
+/// scope was covered.
+pub async fn read_search_page(
+    db: &sea_orm::DatabaseConnection,
+    index: &crate::jupiter::service::trace_search_index_service::IndexState,
+    request: &SearchRequest,
+) -> Result<crate::api_model::traces::SearchPage, crate::common::errors::TracesError> {
+    use crate::{
+        api_model::traces::{QuerySnapshotEnvelope, SearchHit, SearchPage},
+        jupiter::{
+            service::trace_search_service::{coverage_of, hits_of, search_stream},
+            storage::trace_search_storage::SearchBudget,
+        },
+    };
+
+    let budget = SearchBudget {
+        candidate_limit: request.limit,
+        ..SearchBudget::from_protocol_limits()
+    };
+    let search = crate::jupiter::service::trace_search_service::SearchRequest {
+        stream_id: request.stream_id.clone(),
+        query: request.query.clone(),
+    };
+    let outcome = search_stream(db, index, &search, budget).await?;
+    let snapshot =
+        pin_query_snapshot(db, &request.stream_id)
+            .await
+            .map_err(|error| match error {
+                StreamDirectoryError::UnknownScope => {
+                    crate::common::errors::TracesError::UnknownScope
+                }
+                StreamDirectoryError::InvalidParameter => {
+                    crate::common::errors::TracesError::InvalidParameter
+                }
+                StreamDirectoryError::Database(_) => {
+                    crate::common::errors::TracesError::search_unavailable("search_unavailable")
+                }
+            })?;
+    let coverage = coverage_of(snapshot, &outcome.result);
+    let hits = hits_of(db, &outcome.result).await?;
+    Ok(SearchPage {
+        schema_version: 1,
+        snapshot: QuerySnapshotEnvelope::project(snapshot),
+        coverage,
+        items: hits
+            .into_iter()
+            .map(|hit| SearchHit {
+                fragment_id: hit.fragment_id,
+                content_digest: hit.content_digest,
+                byte_start: hit.byte_start,
+                byte_end: hit.byte_end,
+                checkpoint_id: hit.checkpoint_id,
+                resource_id: hit.resource_id,
+                session_id: hit.session_id,
+                occurrence_count: hit.occurrence_count,
+            })
+            .collect(),
+        next_cursor: None,
+    })
 }
 
 /// Last `new_tip` of the contiguous `indexed` prefix starting at sequence 1.
@@ -1048,19 +1151,19 @@ mod tests {
             storage::trace_search_index_storage::CatalogFailure,
         };
         let ready = super::read_capabilities("id", &IndexState::Ready, false);
-        assert!(!ready.search_ready);
-        assert!(!ready.bounded_scan_supported);
+        // The search route is mounted, so a ready index makes the search
+        // surface ready and the bounded scan available.
+        assert!(ready.search_ready);
+        assert!(ready.bounded_scan_supported);
         assert!(!ready.cjk_index_supported);
-        assert_eq!(
-            ready.search_unavailable_reason.as_deref(),
-            Some(super::SEARCH_NOT_SERVED)
-        );
+        assert!(ready.search_unavailable_reason.is_none());
         let missing = super::read_capabilities(
             "id",
             &IndexState::Unavailable(CatalogFailure::Missing),
             false,
         );
         assert!(!missing.search_ready);
+        assert!(!missing.bounded_scan_supported);
         assert!(!missing.cjk_index_supported);
         assert_eq!(
             missing.search_unavailable_reason.as_deref(),
@@ -1073,9 +1176,10 @@ mod tests {
         use crate::jupiter::service::trace_search_index_service::IndexState;
         let ready = super::read_capabilities("id", &IndexState::Ready, true);
         assert!(ready.cjk_index_supported);
-        // The CJK capability never turns the search surface on by itself.
-        assert!(!ready.search_ready);
-        assert!(!ready.bounded_scan_supported);
+        // The CJK capability is reported next to the search readiness, and
+        // it never turns the search surface on by itself.
+        assert!(ready.search_ready);
+        assert!(ready.bounded_scan_supported);
     }
 
     #[tokio::test]
