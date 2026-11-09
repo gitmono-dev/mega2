@@ -971,6 +971,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 **冻结对象 inventory（MTR-24）：** `traces purge-legacy-capture --action inventory` 只在 `frozen` journal 且该 journal 的 active writer fence 存在时运行，并使用维护连接（只做只读 schema 检查，不自动 apply migration）。枚举范围严格来自冻结 manifest：固定 `agent/raw/`、`agent/redacted/`、`agent/staging/` 加上 manifest 的 `trusted_prefixes`（必须以 `agent/` 开头且无 `..`/反斜杠/NUL），其余前缀不枚举。Local backend 无原生版本，item 的 `provider_version`/`provider_generation` 记 `None`；S3/S3-compatible/GCS 需要 provider 原生版本能力，本维护连接无法证明时整体阻断（不按当前 listing 放行）。重复运行幂等：已登记的 `(purge_id, scope, object_key)` 不重复插入。本步骤不删除任何对象。
 
+**journal 驱动的对象删除（MTR-25）：** `traces purge-legacy-capture --action delete` 只消费同一 frozen journal 的已冻结 inventory：逐项 `delete` 后在同一事务里写 `deleted_at` 并推进 journal cursor，进程中断后从首个未标记项续行（不从空桶推断"本来无数据"）；只允许 manifest 冻结前缀内的键，`traces/` 新 namespace 与共享 bucket 未授权前缀永不处理；删除完成后逐前缀复扫必须为空，并按 manifest owners 输出 owner 列表；本步骤不 DROP 任何旧表（DROP 由 MTR-32 guarded migration 承接）。Local 无历史版本；S3/GCS 的历史 version/generation 删除需要真实 provider 能力，由实际部署维护者按 VER-2 逐 backend 验证。
+
 **持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
 - `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
 - `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；

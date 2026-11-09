@@ -183,6 +183,36 @@ pub(crate) async fn exec(
             );
             Ok(())
         }
+        "delete" => {
+            let raw = std::fs::read_to_string(&manifest_path).map_err(|error| {
+                MegaError::cli_exit(
+                    1,
+                    format!("cannot read {}: {error}", manifest_path.display()),
+                )
+            })?;
+            let adapter =
+                crate::orbit::factory::ObjectStorageFactory::build_adapter(&config.object_storage)
+                    .await
+                    .map_err(|error| MegaError::cli_exit(1, error.to_string()))?;
+            let outcome = crate::jupiter::service::trace_legacy_purge::delete_legacy_objects(
+                connection.as_ref(),
+                &adapter,
+                &journal,
+                &raw,
+            )
+            .await
+            .map_err(|error| MegaError::cli_exit(1, error.to_string()))?;
+            println!(
+                "delete {} deleted={} already={} remaining={} rescan_empty={} owners={}",
+                outcome.journal_id,
+                outcome.deleted,
+                outcome.already_deleted,
+                outcome.remaining,
+                outcome.rescan_empty,
+                outcome.owners.join(",")
+            );
+            Ok(())
+        }
         other => Err(MegaError::cli_exit(
             1,
             format!("purge-legacy-capture --action {other} is not wired in this release"),

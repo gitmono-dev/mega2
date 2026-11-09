@@ -18,6 +18,7 @@ pub(crate) mod trace_index_worker;
 pub mod trace_legacy_fence;
 pub mod trace_legacy_inventory;
 pub mod trace_legacy_manifest;
+pub mod trace_legacy_purge;
 pub mod trace_legacy_roles;
 pub mod trace_legacy_scope_guard;
 pub mod trace_object_service;

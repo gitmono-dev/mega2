@@ -16302,3 +16302,186 @@ async fn purge_inventory_cli_freezes_the_local_prefixes() {
     drop(closed);
     drop(guard);
 }
+
+/// MTR-25 deletion gate: the real CLI deletes only the frozen inventory,
+/// resumes from a partially deleted journal, leaves unauthorized prefixes and
+/// the new traces namespace untouched, and never drops the legacy tables.
+#[tokio::test]
+async fn purge_delete_cli_resumes_and_rescans() {
+    use sea_orm::ConnectionTrait;
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let temp = tempfile::tempdir().expect("fixture dir");
+    let root = temp.path().join("objects");
+    for path in [
+        "agent/raw/aa",
+        "agent/redacted/bb",
+        "agent/staging/cc",
+        "other/keep",
+        "traces/v1/keep",
+    ] {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+        std::fs::write(full, b"sentinel").expect("object");
+    }
+    let journal = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge
+         (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+         VALUES ('{journal}', 'local:{}', '{}', 'deploy-del', 'sha256:manifest', 'frozen')",
+        root.display(),
+        root.display()
+    ))
+    .await
+    .expect("journal");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_writer_fence (id, purge_id, deployment_id, active)
+         VALUES ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '{journal}', 'deploy-del', TRUE)"
+    ))
+    .await
+    .expect("fence");
+    let manifest = temp.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{
+                "bucket_scope": "mega2-legacy/",
+                "deployment_id": "deploy-del",
+                "backend_kind": "local",
+                "storage_location": "{}",
+                "historical_locations": ["local:{}"],
+                "scopes": [],
+                "owners": [{{"owner": "owner-a", "deployment_id": "deploy-del", "tenant_id": "tenant-a", "receipt_id": "receipt-a", "complete": true}}],
+                "operator": {{"identity": "operator@example.invalid", "statement_digest": "sha256:statement"}}
+            }}"#,
+            root.display(),
+            root.display()
+        ),
+    )
+    .expect("manifest");
+    let database_url = std::env::var("MEGA_DATABASE__DB_URL")
+        .unwrap_or_else(|_| "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".into());
+    let name: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_database() AS name",
+        ))
+        .await
+        .expect("database name")
+        .expect("database row")
+        .try_get("", "name")
+        .expect("name");
+    let mut url = url::Url::parse(&database_url).expect("database url");
+    url.set_path(&name);
+    let config = temp.path().join("config.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample config");
+    let sample = sample
+        .replace(
+            "db_url = \"postgres://localhost:5432/mono\"",
+            &format!("db_url = \"{}\"", url.as_str()),
+        )
+        .replace(
+            "base_dir = \"/tmp/.mono\"",
+            &format!("base_dir = \"{}\"", temp.path().display()),
+        )
+        .replace(
+            "root_dir = \"${base_dir}/objects\"",
+            &format!("root_dir = \"{}\"", root.display()),
+        );
+    std::fs::write(&config, sample).expect("config");
+    let run = |action: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "traces",
+                "purge-legacy-capture",
+                "--action",
+                action,
+                "--journal",
+                journal,
+                "--maintenance-manifest",
+            ])
+            .arg(&manifest)
+            .env("MEGA_BASE_DIR", temp.path().join("base"))
+            .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+            .output()
+            .expect("run purge CLI")
+    };
+    let inventory = run("inventory");
+    assert!(
+        inventory.status.success(),
+        "inventory: {}",
+        String::from_utf8_lossy(&inventory.stderr)
+    );
+    // Simulate a crash after the first object: its file is gone and the item is
+    // already marked. The next run must resume with the remaining two.
+    let keys: Vec<String> = db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT object_key FROM trace_legacy_purge_item WHERE purge_id = '{journal}' ORDER BY object_key"
+            ),
+        ))
+        .await
+        .expect("items")
+        .iter()
+        .map(|row| row.try_get::<String>("", "object_key").expect("key"))
+        .collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    std::fs::remove_file(root.join(&keys[0])).expect("remove first");
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_purge_item SET deleted_at = now()
+         WHERE purge_id = '{journal}' AND object_key = '{}'",
+        keys[0]
+    ))
+    .await
+    .expect("mark first");
+
+    let deleted = run("delete");
+    assert!(
+        deleted.status.success(),
+        "delete: {}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&deleted.stdout);
+    assert!(stdout.contains("deleted=2"), "{stdout}");
+    assert!(stdout.contains("already=1"), "{stdout}");
+    assert!(stdout.contains("remaining=0"), "{stdout}");
+    assert!(stdout.contains("rescan_empty=true"), "{stdout}");
+    assert!(stdout.contains("owner-a"), "{stdout}");
+    for key in &keys {
+        assert!(!root.join(key).exists(), "{key} must be gone");
+    }
+    assert!(root.join("other/keep").exists(), "shared prefix untouched");
+    assert!(root.join("traces/v1/keep").exists(), "new traces untouched");
+    // AC-8: the legacy table still exists after the delete step.
+    let present: bool = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT to_regclass('agent_capture_session') IS NOT NULL AS present",
+        ))
+        .await
+        .expect("table lookup")
+        .expect("table row")
+        .try_get("", "present")
+        .expect("present");
+    assert!(present, "the delete step must not drop the legacy tables");
+    // A second delete is a no-op rescan.
+    let again = run("delete");
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("deleted=0"));
+    // Without the active fence the step refuses to run.
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_writer_fence SET active = FALSE, released_at = now() WHERE purge_id = '{journal}'"
+    ))
+    .await
+    .expect("release fence");
+    let unfenced = run("delete");
+    assert!(!unfenced.status.success(), "delete needs the active fence");
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}

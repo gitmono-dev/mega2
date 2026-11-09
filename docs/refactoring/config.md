@@ -208,3 +208,4 @@ profiles are documented in [`test-infra.md`](./test-infra.md).
 ## Legacy purge maintenance
 
 `traces purge-legacy-capture` uses the configured `[object_storage]` backend for its inventory step. The inventory enumerates only the frozen manifest prefixes; a cloud backend without a provable native version inventory blocks the step, while `local` records objects without provider versions.
+The delete step removes only the frozen inventory of a journal and advances its cursor per object, so an interrupted run resumes; it never drops the legacy tables.

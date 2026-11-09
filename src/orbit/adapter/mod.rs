@@ -229,6 +229,17 @@ impl ObjectStoreAdapter {
         store
     }
 
+    /// Deletes one backend path. A missing object is not an error: the caller's
+    /// journal records the intent, and a resumed purge must not fail on an
+    /// object a previous attempt already removed.
+    pub async fn delete_backend_path(&self, path: &str) -> OrbitResult<()> {
+        let path = object_store::path::Path::from(path);
+        match self.to_store().delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(IoOrbitError::from(error)),
+        }
+    }
+
     /// Lists every backend object under `prefix`, returning its backend path and
     /// byte size, sorted by path. The prefix is a literal backend path prefix
     /// (for example `agent/raw/`); callers own the prefix policy.
