@@ -1,3 +1,5 @@
+**MTR-46 工具链与旧 Capture 退场链发布收口（2026-11-09）：** 主仓 `1f47bb42` 的 main deploy run `42701213864` success；`v0.42.147` 签名标注 tag（对象 `03322b88`）指向该树，tag Docker run `42703266449` 的 arm64、amd64 与 docker manifest 全部 success。因此 **MTR-24、MTR-25、MTR-44**（代码由 `.147` 覆盖，自身 `.145`/`.146` 未单独打 tag）与 Release N/A 的 **MTR-26、MTR-27、MTR-28、MTR-31、MTR-32、MTR-35、MTR-57** 转为 `done / complete`。MTR-46 的真实部署 AC（实例/历史 backend、provider PUT 撤销、旧 image 重启探针）与 VER-2 仍未勾选，保持 `in-progress / locally-accepted`；MTR-29（minor + H6）与 MTR-30 仍待该 live 证据与 Libra LTR-08。用户免交叉 Review，不记 Review PASS。
+
 **MTR-31 本地门禁（2026-11-09）：** 删除 11 个旧 Capture entity 模块与 `callisto` 再导出；`agent_capture_stream_blob` 无实体、仅 SQL；历史 add migration 纯 SQL 且从零迁移仍建出 12 表。VER-1、VER-2 通过；fmt、严格 Clippy exit 0。本卡 Release write set N/A，不 bump。Lifecycle 为 `in-progress` / `locally-accepted`，main/tag D 门待完成。用户免交叉 Review，不记 Review PASS。
 
 **MTR-35 本地门禁（2026-11-09）：** 删除 `ObjectNamespace::Agent`（变体/字符串/分片/匹配与测试），traces 隔离测试改用 `Log`；其余 namespace 字符串与分片不变，维护 locator 的字面 `agent/` 前缀保留。VER-1、VER-2 通过；fmt、严格 Clippy exit 0。本卡 Release write set N/A，不 bump。Lifecycle 为 `in-progress` / `locally-accepted`，main/tag D 门待完成。用户免交叉 Review，不记 Review PASS。
