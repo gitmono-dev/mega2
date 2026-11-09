@@ -4,7 +4,7 @@
 # (ADR-BB-06).
 #
 # Usage:
-#   scripts/bb_optin_run.sh <none|gc|local|views> <script> <case> <log>
+#   scripts/bb_optin_run.sh <none|gc|local|views|traces> <script> <case> <log>
 #   scripts/bb_optin_run.sh --selftest <none|gc|local|views> <log>
 #
 # Modes (mega2 is recreated with --force-recreate):
@@ -12,6 +12,7 @@
 #   gc     --env-file config/compose.env.storage-only.artifacts-gc
 #   local  --env-file config/compose.env.storage-only.local (local object storage)
 #   views overlay docker/docker-compose-storage-only.views.yml (isolated views stack)
+#   traces run the pinned live HTTP traces case on the host without switching Compose
 #
 # The case runs inside the `interop-smoke` service with its opt-in switch set
 # (MEGA2_SMOKE_AUTH_NONE / MEGA2_SMOKE_ARTIFACTS_GC /
@@ -88,13 +89,17 @@ case "$mode" in
         switched_args=(-f docker/docker-compose-storage-only.views.yml)
         switch_var=MEGA2_SMOKE_VIEWS
         ;;
+    traces)
+        switched_args=()
+        switch_var=MEGA2_TRACES_INTEROP
+        ;;
     *)
         echo "bb-optin: unknown mode '$mode'; nothing switched" >&2
-        echo "usage: $0 <none|gc|local|views> <script> <case> <log> | --selftest <mode> <log>" >&2
+        echo "usage: $0 <none|gc|local|views|traces> <script> <case> <log> | --selftest <mode> <log>" >&2
         exit 2
         ;;
 esac
-if [ "${switched_args[0]}" = "--env-file" ] && [ ! -f "${switched_args[1]}" ]; then
+if [ "${switched_args[0]:-}" = "--env-file" ] && [ ! -f "${switched_args[1]}" ]; then
     echo "bb-optin: env file ${switched_args[1]} not found; nothing switched" >&2
     exit 2
 fi
@@ -108,21 +113,52 @@ if [ "$selftest" -eq 0 ]; then
         exit 2
     fi
     case "$script" in
-        oci_client_smoke_storage_only.sh|artifacts_smoke_storage_only.sh|libra_smoke_storage_only.sh|libra_view_smoke.sh) ;;
+        oci_client_smoke_storage_only.sh|artifacts_smoke_storage_only.sh|libra_smoke_storage_only.sh|libra_view_smoke.sh|traces_interop_smoke.sh) ;;
         *)
             echo "bb-optin: '$script' is not an allowed smoke entrypoint; nothing switched" >&2
             exit 2
             ;;
     esac
     if { [ "$mode" = views ] && [ "$script" != libra_view_smoke.sh ]; } \
-        || { [ "$mode" != views ] && [ "$script" = libra_view_smoke.sh ]; }; then
+        || { [ "$mode" != views ] && [ "$script" = libra_view_smoke.sh ]; } \
+        || { [ "$mode" = traces ] && [ "$script" != traces_interop_smoke.sh ]; } \
+        || { [ "$mode" != traces ] && [ "$script" = traces_interop_smoke.sh ]; }; then
         echo "bb-optin: script '$script' does not match mode '$mode'; nothing switched" >&2
+        exit 2
+    fi
+    if [ "$mode" = traces ] && [ "$case_name" != http ]; then
+        echo "bb-optin: traces mode currently supports only the http case; nothing switched" >&2
         exit 2
     fi
     if [ ! -f "scripts/$script" ]; then
         echo "bb-optin: scripts/$script not found; nothing switched" >&2
         exit 2
     fi
+fi
+
+if [ "$mode" = traces ]; then
+    if [ "$selftest" -eq 1 ]; then
+        echo "bb-optin: traces mode has no Compose selftest; nothing switched" >&2
+        exit 2
+    fi
+    if [ "${MEGA2_TRACES_INTEROP:-}" != "1" ]; then
+        echo "bb-optin: MEGA2_TRACES_INTEROP=1 is required; nothing switched" >&2
+        exit 2
+    fi
+    mkdir -p "$(dirname "$log")"
+    umask 077
+    : > "$log"
+    chmod 600 "$log"
+    say "bb-optin: running pinned traces HTTP case on host without changing Compose"
+    set +e
+    "$ROOT/scripts/$script" --case "$case_name" 2>&1 | tee -a "$log"
+    case_rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$case_rc" -eq 0 ] && ! grep -qxF "PASS: http" "$log"; then
+        say "bb-optin: traces case exited 0 without a PASS line; treating as failure"
+        case_rc=1
+    fi
+    exit "$case_rc"
 fi
 
 LOCK_DIR="${TMPDIR:-/tmp}/mega2-trunk-optin.lock"

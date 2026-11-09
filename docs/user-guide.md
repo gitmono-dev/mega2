@@ -233,6 +233,8 @@ Traces v1 accepts only PACKs without deltas. Set `git config pack.window 0` in t
 
 Fetch the traces ref explicitly, for example `git -c protocol.version=2 fetch <traces-url> refs/libra/traces:refs/libra/traces`; set the version to `0` to check v0. Ordinary clone selects heads by default and does not establish whether a traces ref exists. Supply the Basic password or Bearer token through credential management; keep real tokens out of URLs and logs.
 
+An upload-pack `want` outside the selected scope returns 404 `unknown_scope` without a PACK. A `have` from another scope is ignored: it is not acknowledged or used as a delta base. The server returns a pack that can be indexed independently for the in-scope `want`.
+
 Receive and fetch have independent capacity limits. A 503 `query_timeout` indicates retryable overload or temporary unavailability; back off before retrying and inspect server capacity. A disconnected transfer or failed PACK checksum is not a successful fetch. See the [Deployment Guide](./deployment.md) for provisioning and occupancy recovery.
 
 ### 5.3 SSH traces Git

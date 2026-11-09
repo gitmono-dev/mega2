@@ -15275,3 +15275,65 @@ async fn search_api_returns_representative_evidence_and_a_coverage_report() {
         "the runtime OpenAPI is missing the search schema"
     );
 }
+
+fn interop_http_script() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/traces_interop_smoke.sh")
+}
+
+#[test]
+fn interop_http_driver_rejects_unsupported_case_offline() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let output = std::process::Command::new("bash")
+        .arg(interop_http_script())
+        .args(["--case", "ssh"])
+        .env("MEGA2_TRACES_INTEROP", "1")
+        .env("TMPDIR", temporary.path())
+        .output()
+        .expect("run interop driver");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsupported interop case"),
+        "unexpected driver output: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        temporary.path().read_dir().expect("temporary entries").next().is_none(),
+        "argument rejection must not create a fixture workspace"
+    );
+}
+
+#[test]
+fn interop_http_missing_fixture_fails_and_cleans_workspace_offline() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let mut command = std::process::Command::new("bash");
+    command
+        .arg(interop_http_script())
+        .args(["--case", "http"])
+        .env("MEGA2_TRACES_INTEROP", "1")
+        .env("TMPDIR", temporary.path());
+    for name in [
+        "LIBRA_TRACES_LIVE_ENABLED",
+        "LIBRA_TRACES_LIVE_HTTP_URL",
+        "LIBRA_TRACES_LIVE_TOKEN_FILE",
+        "LIBRA_TRACES_LIVE_TARGET",
+        "LIBRA_TRACES_LIVE_SERVER_ID",
+        "LIBRA_TRACES_LIVE_CLIENT_BINARY_SHA256",
+        "LIBRA_TRACES_LIVE_CONTRACT_SHA256",
+        "LIBRA_TRACES_LIVE_INSTALLED_BINARY",
+        "MEGA2_TRACES_LIBRA_BIN",
+    ] {
+        command.env_remove(name);
+    }
+    let output = command.output().expect("run interop driver without fixture");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("live fixture is missing"), "{stderr}");
+    assert!(stderr.contains("LIBRA_TRACES_LIVE_ENABLED"), "{stderr}");
+    assert!(
+        temporary.path().read_dir().expect("temporary entries").next().is_none(),
+        "missing-fixture failure must clean its temporary workspace"
+    );
+}

@@ -233,6 +233,8 @@ Traces v1 只接收无 delta 的 PACK。为推送仓库设置 `git config pack.w
 
 显式 fetch traces 引用，例如 `git -c protocol.version=2 fetch <traces-url> refs/libra/traces:refs/libra/traces`；验证 v0 时将版本设为 `0`。普通 clone 默认只选择 heads，不能用它判断 traces 引用是否存在。按凭据管理方式向 Git 提供 Basic 密码或 Bearer token，勿把真实 token 写进 URL 或日志。
 
+upload-pack 请求的 `want` 不属于当前 scope 时返回 404 `unknown_scope`，且不返回 PACK。来自其它 scope 的 `have` 会被忽略：服务不会 ACK，也不会把它用作 delta base。对于当前 scope 内的 `want`，服务返回可独立索引的 pack。
+
 接收与 fetch 分别有独立容量限制。503 `query_timeout` 是可重试的过载或暂时不可用；退避后重试，并检查服务端容量。连接中断或 PACK 校验失败不能视为 fetch 成功。部署条件及占用恢复见[部署指南](./deployment.zh.md)。
 
 ### 5.3 SSH traces Git
