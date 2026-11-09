@@ -1624,3 +1624,9 @@ Libra交接实际证据（2026-10-26）：单文件main提交a4d84829，parent b
 原现行表格列： 当前状态（2026-10-26，实际收口01:54:13 UTC）：MTR-103已done/complete；C1完整21 targets、3140 PASS、0 failed、3原ignored，nightly fmt、all-target/all-feature严格Clippy及双build全部exit0/0warning；自己的本地Claude ER05与执行/发布审查均PASS，root在原3600秒内2298.567秒观察最终C。签名DCO提交5a2b93d9ca5a4071dbb5d1a1a6c7a403742a6102已推main，v0.42.75原生签名标注tag与手写Release已核；main CI40254455937、tag CI40254547920的amd64/arm64/Docker manifest全部attempt1实际success，未用Harbor例外。正式Mega23/118、Libra原计划0/26、联合23/144；外部资格1/4。
 原现行表格列： 当前依赖与后续门（2026-10-26）：MTR102与103完整C/D已闭合；当前执行前沿MTR-11，pending/空，仅来源与开工核验，尚未准入实现或认领A/C。顺序11→40→13→39→92→12/H1→LTR10→11→12→LTR01/H2；各卡自身门与跨仓资格/WRITERS/LIVE前置不省略。Libra FIX04 C1仍FAIL/STOP，F1/F2 P1未修；实际Claude2891a30b来源PASS/发布次序FAIL。仅FIX-LTR-05一次release保留现有ingress两方法同一dead_code诊断的具名例外仍待用户明确答复；未准入新Libra实现/A/C/发布，PR636已满足旧Rustdoc下一提交要求。旧FIX3诊断3/3、B8失败及8/8 STOP、所有原失败和历史数据库根因未知均保留。
 ```
+## MTR-21 发布与 D 收口（2026-11-09）
+
+MTR-21 `done/complete`：本地 C 已通过（24 targets、3310 passed/0 failed/3 ignored；fmt、strict Clippy、build、build-tests 均 exit 0）；签名+DCO 提交 `f0ca9d5a8ff52ff5e2e843eadce008dd8dda8655` 已推送 `main`，签名标注 tag `v0.42.132` 与 GitHub Release 已发布。main Harbor run `42557215364` success；tag Docker run `42557325490` 的 amd64、arm64 与多架构 manifest jobs 均 success。前两轮全量失败原件和隔离诊断保留在 `/tmp`。用户豁免交叉 Review，不记 Review PASS。
+
+卡片进度：Mega2 `79/138`、Libra `1/27`，合计 `80/165`（`48.5%`）。下一卡 MTR-58 仍需先取得 `DEP-TR-H4` 的固定 source/binary/contract pin 与七个 selector 的逐案结果，并核实 `DEP-TR-SERVICES`；当前不把这些未交接前置记为已满足。
+
