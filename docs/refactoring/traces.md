@@ -961,6 +961,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 **全库旧 scope 授权 preflight（MTR-62）：** 任何不可逆删除前，`trace_legacy_scope_guard::preflight_legacy_scopes` 从全部 12 张旧表枚举 DISTINCT `(deployment_id, tenant_id)`（8 张直接列、4 张经父 session/blob 关联），要求每个 scope 恰有一个明确 owner 且该 owner 的 receipt 已完成；未知 owner、清单外 scope、重复 owner、非可信 orphan prefix 一律阻断，不会先删已知部分。`bucket_scope` 为空或 `/`（共享 bucket 根）被拒绝，`delete_git_traces=true` 被拒绝；全部通过后才生成绑定 owner 集合、receipt ID 与枚举 scope 的 aggregate receipt 摘要，owner 集合变化即失效。
 
+**旧 writer DB 权限屏障准备（MTR-61）：** 部署 DBA 用既有维护连接执行 `trace_legacy_roles::prepare_legacy_roles`：校验 app role 与 maintenance role 为两个不同的普通标识符，且旧 app role 不是 superuser、没有 `BYPASSRLS`、没有 `CREATEROLE`；随后把 12 张旧表与 `trace_legacy_write_fence()` 的 ownership 转交 maintenance role，并用受控回滚事务证明旧 app role 既不能 `ALTER TABLE` 也不能 `DISABLE TRIGGER`。撤销有效 DML 与激活 fence 分别由 MTR-67 与 MTR-33 承接；本步骤不删除任何数据。
+
 **持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
 - `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
 - `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；

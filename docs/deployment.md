@@ -157,3 +157,7 @@ HTTP traces permits one receive request and one fetch per process; overload retu
 - [`contributing.md`](./contributing.md) — local development and testing.
 - [`config/config.toml`](../config/config.toml) — the commented list of configuration keys and defaults.
 - [`architecture.md`](./architecture.md) — storage, protocol, authorization, and optional service boundaries.
+
+### Legacy Capture role preparation (MTR-61)
+
+Before the legacy writer fence is activated, the deployment DBA runs the role preparation against the maintenance connection: the old app role must be a plain role (no SUPERUSER, no BYPASSRLS, no CREATEROLE) and distinct from the maintenance role, ownership of the 12 legacy tables and `trace_legacy_write_fence()` moves to the maintenance role, and the app role is proved unable to ALTER those tables or disable their triggers. DML revocation and fence activation stay separate steps.

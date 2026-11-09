@@ -158,3 +158,7 @@ HTTP traces 每进程分别允许一个接收请求和一个 fetch；过载返�
 - [`development.md`](./development.md) — 本地开发与测试。
 - [`config/config.toml`](../config/config.toml) + [`refactoring/config.md`](./refactoring/config.md) — 配置键与加载 / 校验语义。
 - [`refactoring/orbit.md`](./refactoring/orbit.md)、[`refactoring/vault.md`](./refactoring/vault.md)、[`refactoring/oci.md`](./refactoring/oci.md)、[`refactoring/agent-capture.md`](./refactoring/agent-capture.md) — 各子系统契约。
+
+### 旧 Capture 角色准备（MTR-61）
+
+激活旧 writer fence 前，部署 DBA 在维护连接上执行角色准备：旧 app role 必须是普通角色（无 SUPERUSER、BYPASSRLS、CREATEROLE）且与 maintenance role 不同，12 张旧表与 `trace_legacy_write_fence()` 的 ownership 转交 maintenance role，并证明旧 app role 不能 ALTER 这些表或禁用其 trigger。DML 撤销与 fence 激活仍是独立步骤。
