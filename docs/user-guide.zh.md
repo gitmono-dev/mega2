@@ -235,7 +235,7 @@ Traces v1 只接收无 delta 的 PACK。为推送仓库设置 `git config pack.w
 
 接收与 fetch 分别有独立容量限制。503 `query_timeout` 是可重试的过载或暂时不可用；退避后重试，并检查服务端容量。连接中断或 PACK 校验失败不能视为 fetch 成功。部署条件及占用恢复见[部署指南](./deployment.zh.md)。
 
-双仓互操作检查使用 `MEGA2_TRACES_INTEROP=1 scripts/traces_interop_smoke.sh --case http` 或 `--case ssh` 或 `--case agent`，fixture 由运维提供。该 driver 会执行真实的 Libra scoped push 与显式 fetch、拒绝无认证协议请求（401 且带 Basic challenge），并拒绝跨 scope 的 want 与 delta；缺少 fixture 值一律算失败，不能当 skip。fixture 变量与退出码见[traces 协议](./refactoring/traces.md#81-双仓互操作-smoke-drivermtr-5869)。
+双仓互操作检查使用 `MEGA2_TRACES_INTEROP=1 scripts/traces_interop_smoke.sh --case http` 或 `--case ssh` 或 `--case agent` 或 `--case history`，fixture 由运维提供。该 driver 会执行真实的 Libra scoped push 与显式 fetch、拒绝无认证协议请求（401 且带 Basic challenge），并拒绝跨 scope 的 want 与 delta；缺少 fixture 值一律算失败，不能当 skip。fixture 变量与退出码见[traces 协议](./refactoring/traces.md#81-双仓互操作-smoke-drivermtr-5869)。
 
 ### 5.3 SSH traces Git
 

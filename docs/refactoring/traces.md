@@ -987,6 +987,10 @@ MTR-60 的 agent driver 使用 `MEGA2_TRACES_INTEROP_HTTP_URL`、`MEGA2_TRACES_I
 
 2026-11-09 的本地真实 agent fixture：同一 `mega2` 进程、primary/peer 两个 token、两把 SSH key 与两套静态绑定、两个 target 与真实 Libra live checkpoint；`--case agent` 7/7 通过（日志 SHA256 `611a7981da97accc4166a8e9ba3c83828ada70872dd87094fa167554423002a3`，不含 token/密钥）。
 
+MTR-68 的 history driver 只要求 `LIBRA_REPO`（pin 的 Libra checkout，含 `.env.test` 与 `.env.live-test`）与 `MEGA2_TRACES_INTEROP=1`，逐项执行 LTR-22/23 的 `live_epoch_history_retained`、`live_clean_rewrite_denied`、`live_new_stream_epoch_created`、`live_old_stream_bytes_readable`；每个 selector 独立计数，未运行即失败，末行为 `traces interop history summary: executed=<n> passed=<n> failed=<n>`。离线 selector 为 `interop_history_`。
+
+2026-11-09 的本地真实运行：四个 selector 4/4 通过（日志 SHA256 `3fd4209068ade720dc8961529f4f5bf661fb9476114d5767a9f8bb19644b1399`，不含 token/密钥）。
+
 2026-11-09 的本地真实 fixture 证据：mega2 `0.42.133` debug binary、ephemeral PostgreSQL `mega2_interop`、`[traces].enabled=true`、两个 static push token（分别覆盖 `/project/interop` 与 `/project/other`）与两条真实 Libra scoped push；`--case http` 的 5/5 逐案通过（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`，日志 SHA256 `f96343c72b7f51935d6c58a6cee415385f5a30c6a8f89f31095e3738dd090431`，不含 token 或 DSN）。
 
 
