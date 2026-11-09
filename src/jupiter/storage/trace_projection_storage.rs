@@ -33,6 +33,22 @@ struct CheckpointWrite<'a> {
     index_version: i64,
 }
 
+#[derive(Debug)]
+pub struct TraceIndexRebuildSnapshot {
+    pub stream_id: String,
+    pub accepted_seq: i64,
+    pub indexed_seq: i64,
+    accepted_tip: Option<String>,
+    rows: Vec<trace_ref_update::Model>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceIndexRebuildResult {
+    pub accepted_seq: i64,
+    pub indexed_seq: i64,
+    pub rebuilt_seq: i64,
+}
+
 /// One pass over the durable ref journal.
 pub struct TraceProjectionStore<'a> {
     db: &'a DatabaseConnection,
@@ -165,32 +181,74 @@ impl<'a> TraceProjectionStore<'a> {
         Ok(())
     }
 
-    /// Replay already indexed journal rows into a new fragment version.
-    ///
-    /// Stops at the first checkpoint that cannot be reread. Later sequences are
-    /// left untouched, and raw objects are only read.
-    pub async fn rebuild_indexed(
+    /// Capture the accepted and contiguous indexed watermarks with one
+    /// repeatable-read snapshot.
+    pub async fn rebuild_snapshot(
         &self,
         stream_id: &str,
+    ) -> Result<TraceIndexRebuildSnapshot, MegaError> {
+        let txn = self.db.begin().await?;
+        txn.execute_unprepared("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
+        let stream = trace_stream::Entity::find_by_id(stream_id.to_owned())
+            .one(&txn)
+            .await?
+            .ok_or_else(|| MegaError::Other("trace stream does not exist".into()))?;
+        let rows = trace_ref_update::Entity::find()
+            .filter(trace_ref_update::Column::StreamId.eq(stream_id))
+            .order_by_asc(trace_ref_update::Column::RefSequence)
+            .all(&txn)
+            .await?;
+        let accepted_seq = rows.last().map_or(0, |row| row.ref_sequence);
+        let mut indexed_seq = 0;
+        let mut indexed_rows = Vec::new();
+        for row in rows {
+            if row.ref_sequence != indexed_seq + 1 || row.state != "indexed" {
+                break;
+            }
+            indexed_seq = row.ref_sequence;
+            indexed_rows.push(row);
+        }
+        txn.commit().await?;
+        Ok(TraceIndexRebuildSnapshot {
+            stream_id: stream_id.to_owned(),
+            accepted_seq,
+            indexed_seq,
+            accepted_tip: stream.tip_oid,
+            rows: indexed_rows,
+        })
+    }
+
+    /// Replay the fixed indexed prefix into a new fragment version.
+    ///
+    /// Each journal row commits atomically. Replaying a completed row is
+    /// idempotent, so a later invocation can resume after an interruption.
+    pub async fn rebuild_indexed<F>(
+        &self,
+        snapshot: TraceIndexRebuildSnapshot,
         index_version: i64,
-    ) -> Result<(), MegaError> {
+        mut progress: F,
+    ) -> Result<TraceIndexRebuildResult, MegaError>
+    where
+        F: FnMut(i64),
+    {
         if index_version < 1 {
             return Err(MegaError::Other(
                 "trace fragment index version must be positive".into(),
             ));
         }
-        let rows = trace_ref_update::Entity::find()
-            .filter(trace_ref_update::Column::StreamId.eq(stream_id))
-            .filter(trace_ref_update::Column::State.eq("indexed"))
-            .order_by_asc(trace_ref_update::Column::RefSequence)
-            .all(self.db)
-            .await?;
-        for row in rows {
+        let stream_id = snapshot.stream_id.as_str();
+        let mut rebuilt_seq = 0;
+        for row in snapshot.rows {
             let stream = trace_stream::Entity::find_by_id(row.stream_id.clone())
                 .one(self.db)
                 .await?
                 .ok_or_else(|| MegaError::Other("trace journal names a missing stream".into()))?;
-            let accepted = stream.tip_oid.clone();
+            if stream.tip_oid != snapshot.accepted_tip {
+                return Err(MegaError::Other(
+                    "accepted trace tip changed during index rebuild".into(),
+                ));
+            }
             let projected = TraceProjectionService::new(self.objects.clone())
                 .checkpoints_at_commit(
                     self.db,
@@ -221,13 +279,30 @@ impl<'a> TraceProjectionStore<'a> {
                 .ok_or_else(|| {
                     MegaError::Other("trace stream disappeared during version rebuild".into())
                 })?;
-            if after.tip_oid != accepted {
+            if after.tip_oid != snapshot.accepted_tip {
                 return Err(MegaError::Other(
                     "trace index rebuild changed the accepted tip".into(),
                 ));
             }
+            rebuilt_seq = row.ref_sequence;
+            progress(rebuilt_seq);
         }
-        Ok(())
+        let after = trace_stream::Entity::find_by_id(stream_id.to_owned())
+            .one(self.db)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other("trace stream disappeared during version rebuild".into())
+            })?;
+        if after.tip_oid != snapshot.accepted_tip {
+            return Err(MegaError::Other(
+                "accepted trace tip changed during index rebuild".into(),
+            ));
+        }
+        Ok(TraceIndexRebuildResult {
+            accepted_seq: snapshot.accepted_seq,
+            indexed_seq: snapshot.indexed_seq,
+            rebuilt_seq,
+        })
     }
 
     async fn write_checkpoint(

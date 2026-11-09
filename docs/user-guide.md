@@ -275,6 +275,7 @@ Global flags: `--config <PATH>` (env `MEGA_CONFIG`) and `--profile <NAME>` (env 
 | `mega2 path provision --server <URL> <PATH>` | Provision a monorepo path (before its first push, see §2.5); the token comes only from the environment variable `MEGA2_TOKEN`, no config file is read |
 | `mega2 import-repo remove --path <P> --yes [--cleanup-id <ID>] [--max-rounds <N>]` | Remove an ImportRepo on the server (storage-only; put `--config` before `import-repo` or set `MEGA_CONFIG`); outcome lines and exit codes in §2.6 |
 | `mega2 --config <existing> traces rebind-target --target <UUID> --path <canonical-path>` | Move an existing trace target onto a directory that is already canonical (§5). No default config is generated |
+| `mega2 --config <existing> traces rebuild-index --stream <UUID> --index-version <N>` | Rebuild the selected stream's indexed prefix into a new index version |
 | `mega2 --config <existing> traces credentials bind --principal <UUID> --namespace <NAMESPACE> --credential <KEY>` | Explicitly bind an existing credential (§5.1) |
 | `mega2 --config <existing> traces credentials rotate --binding <UUID> --namespace <NAMESPACE> --credential <KEY>` | Rotate an existing binding's credential (§5.1) |
 | `mega2 --config <existing> traces credentials retire --binding <UUID>` | Retire a binding while keeping its history (§5.1) |
@@ -285,6 +286,8 @@ Global flags: `--config <PATH>` (env `MEGA_CONFIG`) and `--profile <NAME>` (env 
 | `mega2 debug storage-smoke [--key ...]` | Hidden command: object-storage read / write / delete smoke; absent from top-level help |
 
 The `authz-audit` subcommand audits authorization in review mode. Under storage-only, `cedar.enforcement` is always `off`, so this command is not part of day-to-day use. The [Architecture Guide](./architecture.md) summarizes the authorization modes.
+
+`traces rebuild-index` requires an existing config named with `--config` or `MEGA_CONFIG`. It fixes and reports the `accepted_seq` and `indexed_seq` watermarks, then replays only that stream's contiguous indexed prefix. Each sequence commits independently, so rerunning the same command after an interruption is safe. It does not change raw objects, the accepted tip, or journal state.
 
 The full flag list lives in `--help` and `src/commands/`. See the [Deployment Guide](./deployment.md) for Compose setup and the [Contributing Guide](./contributing.md) for the development workflow and required checks.
 

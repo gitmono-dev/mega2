@@ -275,6 +275,7 @@ libra mega2 browser
 | `mega2 path provision --server <URL> <PATH>` | 开通 Monorepo 路径(首次推送前,见 2.5);token 只从环境变量 `MEGA2_TOKEN` 读取,不读配置文件 |
 | `mega2 import-repo remove --path <P> --yes [--cleanup-id <ID>] [--max-rounds <N>]` | 在服务器上清理 ImportRepo(storage-only;`--config` 放在 `import-repo` 之前或设 `MEGA_CONFIG`);结局行与退出码见 2.6 |
 | `mega2 --config <现存配置> traces rebind-target --target <UUID> --path <canonical-path>` | 把已有 trace target 指到已经是目录的 canonical 路径（第 5 节）。不生成默认配置 |
+| `mega2 --config <现存配置> traces rebuild-index --stream <UUID> --index-version <N>` | 将指定 stream 的已索引连续前缀重建到新索引版本 |
 | `mega2 --config <现存配置> traces credentials bind --principal <UUID> --namespace <NAMESPACE> --credential <KEY>` | 显式绑定已有凭据（第 5.1 节） |
 | `mega2 --config <现存配置> traces credentials rotate --binding <UUID> --namespace <NAMESPACE> --credential <KEY>` | 轮换已有绑定的凭据（第 5.1 节） |
 | `mega2 --config <现存配置> traces credentials retire --binding <UUID>` | 退役绑定并保留历史（第 5.1 节） |
@@ -285,6 +286,8 @@ libra mega2 browser
 | `mega2 debug storage-smoke [--key ...]` | 隐藏命令:对象存储读 / 写 / 删冒烟,不出现在顶层帮助 |
 
 `authz-audit` 子命令面向 review 形态的授权审计;storage-only 下 `cedar.enforcement` 恒为 `off`,日常用不到(review 形态口径见 [`manual/authz.md`](./manual/authz.md))。
+
+`traces rebuild-index` 需要 `--config` 或 `MEGA_CONFIG` 指定现存配置。命令固定并报告 `accepted_seq` 与 `indexed_seq` 水位，只重放该 stream 已 indexed 的连续前缀；逐 sequence 提交使中断后的相同命令可安全重跑。它不改 raw 对象、accepted tip 或 journal 状态。
 
 完整 flag 列表见 `--help` 与 `src/commands/`。Compose 启动和 smoke 命令示例见 [`deploy-trunk.md`](./deploy-trunk.md) 第 8 节；本地开发与测试入口见 [`development.md`](./development.md)。
 

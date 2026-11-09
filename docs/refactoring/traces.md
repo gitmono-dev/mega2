@@ -848,6 +848,8 @@ HTTP命令段与解压后的upload请求解析上限各64KiB、单ref receive；
 
 **MTR-75 片段去重与版本（不改 raw）：** 同一 stream、同一 `content_digest`、同一 `index_version` 只保留一行 `trace_fragment`。每个 checkpoint/resource 仍各有一条 membership。`TraceIndexWorker::rebuild_index_version` 只重读已 `indexed` 的 journal，按 `ref_sequence` 顺序把片段写入新版本；中途失败不再处理更后的 sequence。raw 对象 OID 和字节不变，accepted tip 不变。
 
+**MTR-21 可恢复索引重建命令：** `mega2 --config <existing-config> traces rebuild-index --stream <UUID> --index-version <version>` 只重放指定 stream。命令在同一 repeatable-read 快照中固定并报告 `accepted_seq`（journal 的最高 `ref_sequence`）与 `indexed_seq`（从 1 起连续的 indexed 前缀），只重建不高于 `indexed_seq` 的行。每个 sequence 独立提交，重复写入同一 index version 幂等；中断后用相同参数重跑即可完成该快照的前缀。输出报告重建进度。命令只读取 raw 对象，不改变 `trace_stream.tip_oid` 或 `trace_ref_update`；若执行期间 accepted tip 改变则失败，已提交的版本行可安全重放。
+
 **MTR-16 正文片段（不改归档）：** 已知 schema 的逻辑 transcript 按 manifest part 顺序拼接后再切片。每片 UTF-8 正文最多 16KiB，切在字符边界上；比一片更长时，相邻片至少重叠 256 字节。`body` 是原文切片，`ascii_fold` 只把 ASCII 大写折成小写。`index_version` 从 1 开始。归档 Git 对象字节不改。
 
 **MTR-15 journal 索引（不改 accepted tip）：** 服务在 `[traces].enabled` 时启动索引 worker。它只读取已提交的 `trace_ref_update`，按 `ref_sequence` 连续认领 `pending` 或已过期的 `claimed` 行，把 checkpoint 写成 `trace_checkpoint`。已知 schema 另写 session、ordinal 0 的 resource 和 code link；未知或无效 schema 写入 `session_key = unsupported:<checkpoint id>`，可以用这条 key 查到。完成后把 journal 标成 `indexed`。`trace_stream.tip_oid` 仍是发布时的 accepted tip，worker 不改它。进程退出后，未完成的 claim 过期，重启从 journal 继续，已索引的行不会再插一行。

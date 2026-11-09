@@ -5876,6 +5876,626 @@ mod disabled_http {
         closed.expect("close projection worker pool");
     }
 
+    fn write_rebuild_checkpoint(
+        fixture: &ScopeAuthFixture,
+        source_repo: &str,
+        checkpoint_id: &str,
+        transcript: &[u8],
+    ) -> String {
+        let checkpoint_path = format!("checkpoint/{}/{}", &checkpoint_id[..2], &checkpoint_id[2..]);
+        let leaf = fixture
+            .fixture
+            .shared
+            .path()
+            .join(source_repo)
+            .join(&checkpoint_path);
+        fs::create_dir_all(leaf.join("events")).expect("rebuild events directory");
+        fs::create_dir_all(leaf.join("transcript")).expect("rebuild transcript directory");
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "checkpoint_id": checkpoint_id,
+            "agent_kind": "claude_code",
+            "created_at": 1700000000
+        }))
+        .expect("rebuild checkpoint metadata");
+        let events = b"{}\n";
+        let report = b"{}";
+        fs::write(leaf.join("metadata.json"), &metadata).expect("rebuild metadata");
+        fs::write(leaf.join("events/lifecycle.jsonl"), events).expect("rebuild events");
+        fs::write(leaf.join("transcript/claude_code.jsonl"), transcript)
+            .expect("rebuild transcript");
+        fs::write(leaf.join("redaction_report.json"), report).expect("rebuild report");
+
+        let mut covered = Sha256::new();
+        covered.update(&metadata);
+        covered.update(events);
+        covered.update(transcript);
+        covered.update(report);
+        let content_hash = format!("sha256:{}", hex::encode(covered.finalize()));
+        fs::write(leaf.join("content_hash.txt"), &content_hash).expect("rebuild content hash");
+
+        let oid = |relative: &str| {
+            let path = format!("{checkpoint_path}/{relative}");
+            fixture
+                .fixture
+                .git_text(&["-C", source_repo, "hash-object", "-w", &path])
+        };
+        let metadata_oid = oid("metadata.json");
+        let events_oid = oid("events/lifecycle.jsonl");
+        let transcript_oid = oid("transcript/claude_code.jsonl");
+        let report_oid = oid("redaction_report.json");
+        let content_hash_oid = oid("content_hash.txt");
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "checkpoint_id": checkpoint_id,
+            "content_hash": {
+                "algorithm": "sha256",
+                "path": "content_hash.txt",
+                "coverage": ["metadata", "lifecycle_events", "transcript", "redaction_report"]
+            },
+            "entries": {
+                "metadata": {
+                    "path": "metadata.json",
+                    "oid": metadata_oid,
+                    "byte_len": metadata.len()
+                },
+                "lifecycle_events": {
+                    "path": "events/lifecycle.jsonl",
+                    "oid": events_oid,
+                    "byte_len": events.len(),
+                    "schema_version": 2
+                },
+                "transcript": {
+                    "path": "transcript/claude_code.jsonl",
+                    "oid": transcript_oid,
+                    "byte_len": transcript.len()
+                },
+                "redaction_report": {
+                    "path": "redaction_report.json",
+                    "oid": report_oid,
+                    "byte_len": report.len()
+                },
+                "content_hash": {
+                    "path": "content_hash.txt",
+                    "oid": content_hash_oid,
+                    "byte_len": content_hash.len()
+                }
+            }
+        });
+        fs::write(
+            leaf.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("rebuild manifest JSON"),
+        )
+        .expect("rebuild manifest");
+        transcript_oid
+    }
+
+    fn rebuild_commit(fixture: &ScopeAuthFixture, source_repo: &str, message: &str) -> String {
+        fixture.fixture.git(&["-C", source_repo, "add", "."]);
+        fixture.fixture.git(&[
+            "-C",
+            source_repo,
+            "-c",
+            "user.name=MTR21",
+            "-c",
+            "user.email=mtr21@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            message,
+        ]);
+        fixture
+            .fixture
+            .git_text(&["-C", source_repo, "rev-parse", "HEAD"])
+    }
+
+    fn rebuild_push(fixture: &ScopeAuthFixture, ssh: &str, source_repo: &str, url: &str) {
+        let push = git_cli::git_cli_ssh(
+            fixture.fixture.shared.path(),
+            ssh,
+            &[
+                "-C",
+                source_repo,
+                "push",
+                "--no-thin",
+                url,
+                "HEAD:refs/libra/traces",
+            ],
+        );
+        assert!(
+            push.status.success(),
+            "MTR21 real Git push failed: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+    }
+
+    async fn wait_rebuild_indexed(
+        db: &sea_orm::DatabaseConnection,
+        fixture: &ScopeAuthFixture,
+        stream_id: &str,
+        expected: i64,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let rows = db
+                .query_all_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT ref_sequence, state
+                     FROM trace_ref_update
+                     WHERE stream_id = $1
+                     ORDER BY ref_sequence",
+                    [stream_id.to_owned().into()],
+                ))
+                .await
+                .expect("rebuild journal states")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.try_get::<i64>("", "ref_sequence")
+                            .expect("journal sequence"),
+                        row.try_get::<String>("", "state").expect("journal state"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if rows.iter().filter(|(_, state)| state == "indexed").count() >= expected as usize {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let logs = fs::read_to_string(fixture.fixture.temp.path().join("process.err"))
+                    .unwrap_or_default();
+                let tail = logs
+                    .lines()
+                    .rev()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                panic!(
+                    "the real service worker did not index journal sequence {expected}; \
+                     journal={rows:?}; service log tail:\n{tail}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn rebuild_cli_search(
+        fixture: &ScopeAuthFixture,
+        stream_id: &str,
+        token: &str,
+        query: &str,
+    ) -> serde_json::Value {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("rebuild search client");
+        let url = format!(
+            "http://127.0.0.1:{}/api/v1/traces/streams/{}/search",
+            fixture.http_port, stream_id
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = client
+                .get(format!("{url}?q={query}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("rebuild public search request");
+            let status = response.status();
+            let body = response.text().await.expect("rebuild public search body");
+            if status == reqwest::StatusCode::OK {
+                return serde_json::from_str(&body).expect("rebuild search JSON");
+            }
+            assert!(
+                status == reqwest::StatusCode::SERVICE_UNAVAILABLE && Instant::now() < deadline,
+                "rebuild public search returned {status}: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn rebuild_version_checkpoints(
+        db: &sea_orm::DatabaseConnection,
+        stream_id: &str,
+        index_version: i64,
+    ) -> BTreeMap<String, (i64, i64)> {
+        db.query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT c.checkpoint_key,
+                    count(DISTINCT f.id)::bigint AS fragments,
+                    count(*)::bigint AS memberships
+             FROM trace_fragment f
+             JOIN trace_fragment_membership m ON m.fragment_id = f.id
+             JOIN trace_checkpoint c ON c.id = m.checkpoint_id
+             WHERE f.stream_id = $1 AND f.index_version = $2
+             GROUP BY c.checkpoint_key
+             ORDER BY c.checkpoint_key",
+            [stream_id.to_owned().into(), index_version.into()],
+        ))
+        .await
+        .expect("rebuild version checkpoint query")
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get("", "checkpoint_key")
+                    .expect("rebuild checkpoint key"),
+                (
+                    row.try_get("", "fragments")
+                        .expect("rebuild fragment count"),
+                    row.try_get("", "memberships")
+                        .expect("rebuild membership count"),
+                ),
+            )
+        })
+        .collect()
+    }
+
+    async fn clear_rebuild_fragments(db: &sea_orm::DatabaseConnection, stream_id: &str) {
+        let txn = db.begin().await.expect("begin rebuild index reset");
+        txn.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM trace_fragment_membership WHERE stream_id = $1",
+            [stream_id.to_owned().into()],
+        ))
+        .await
+        .expect("clear rebuild memberships");
+        txn.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM trace_fragment WHERE stream_id = $1",
+            [stream_id.to_owned().into()],
+        ))
+        .await
+        .expect("clear rebuild fragments");
+        txn.commit().await.expect("commit rebuild index reset");
+    }
+
+    fn rebuild_raw_path(
+        fixture: &ScopeAuthFixture,
+        stream_id: &str,
+        oid: &str,
+    ) -> std::path::PathBuf {
+        let oid_shard = format!("{}/{}/{}/{}", &oid[..2], &oid[2..4], &oid[4..6], &oid[6..]);
+        let key = mega2_core::orbit_api::object_storage::ObjectKey {
+            namespace: mega2_core::orbit_api::object_storage::ObjectNamespace::Traces,
+            key: format!("v1/{stream_id}/objects/sha1/{oid_shard}"),
+        };
+        fixture
+            .fixture
+            .temp
+            .path()
+            .join("objects")
+            .join(key.default_sharding())
+    }
+
+    fn run_rebuild_cli_command(
+        fixture: &ScopeAuthFixture,
+        stream_id: &str,
+        index_version: i64,
+    ) -> std::process::Output {
+        let mut command = fixture.fixture.command(true, "trunk", "/third-party");
+        let version = index_version.to_string();
+        command.args([
+            "traces",
+            "rebuild-index",
+            "--stream",
+            stream_id,
+            "--index-version",
+            &version,
+        ]);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.output().expect("run real traces rebuild-index CLI")
+    }
+
+    pub async fn run_rebuild_cli() {
+        let (guard, db) = traces_db::TracesDb::migrated().await;
+        let mut fixture = None;
+        let result = AssertUnwindSafe(async {
+            fixture = Some(ScopeAuthFixture::new(&db).await);
+            let scope_fixture = fixture.as_mut().expect("rebuild CLI fixture");
+            let key = scope_fixture.key(SCOPE_WRITER).await;
+            let name = format!("trace-ssh-key:{}", key.id);
+            let token = scope_fixture.static_token(&name, "/project");
+            scope_fixture
+                .bind(
+                    &scope_fixture.owner,
+                    "mono_account",
+                    &format!("ssh-key:{}", key.id),
+                )
+                .await;
+            scope_fixture
+                .bind(&scope_fixture.owner, "static_push_token", &name)
+                .await;
+            scope_fixture.start(true, true, "off").await;
+
+            let source_repo = "mtr21-rebuild-source";
+            let shared = scope_fixture.fixture.shared.path();
+            let ssh_dir = shared.join("ssh");
+            fs::create_dir_all(&ssh_dir).expect("rebuild SSH directory");
+            fs::copy(&key.path, ssh_dir.join("client_ed25519")).expect("rebuild client key");
+            git_cli::write_known_hosts_via_keyscan(
+                &ssh_dir.join("known_hosts"),
+                scope_fixture.fixture.port,
+            );
+            let ssh = git_cli::git_ssh_command(shared, scope_fixture.fixture.port);
+            let path = wire_by_path(
+                "/project",
+                source_repo,
+                &scope_fixture.fixture.epoch,
+                "sha1",
+            );
+            let url = format!(
+                "ssh://traces@{}:{}{}",
+                git_cli::mega2_reachable_host(),
+                scope_fixture.fixture.port,
+                path
+            );
+            scope_fixture
+                .fixture
+                .git(&["init", "--object-format=sha1", source_repo]);
+
+            let first_transcript = b"mtr21firsttoken first indexed transcript\n";
+            let first_transcript_oid =
+                write_rebuild_checkpoint(scope_fixture, source_repo, "beef", first_transcript);
+            let first_tip = rebuild_commit(scope_fixture, source_repo, "first rebuild checkpoint");
+            rebuild_push(scope_fixture, &ssh, source_repo, &url);
+            let stream_id = trace_stream::Entity::find()
+                .filter(trace_stream::Column::SourceRepoId.eq(source_repo))
+                .filter(trace_stream::Column::EpochId.eq(scope_fixture.fixture.epoch.clone()))
+                .one(&db)
+                .await
+                .expect("query rebuilt stream")
+                .expect("first push created stream")
+                .id;
+            wait_rebuild_indexed(&db, scope_fixture, &stream_id, 1).await;
+
+            let second_transcript = b"mtr21secondtoken second indexed transcript\n";
+            let second_transcript_oid =
+                write_rebuild_checkpoint(scope_fixture, source_repo, "cafe", second_transcript);
+            let second_tip =
+                rebuild_commit(scope_fixture, source_repo, "second rebuild checkpoint");
+            rebuild_push(scope_fixture, &ssh, source_repo, &url);
+            wait_rebuild_indexed(&db, scope_fixture, &stream_id, 2).await;
+
+            let first_search =
+                rebuild_cli_search(scope_fixture, &stream_id, &token, "mtr21firsttoken").await;
+            let second_search =
+                rebuild_cli_search(scope_fixture, &stream_id, &token, "mtr21secondtoken").await;
+            assert_eq!(first_search["items"].as_array().map(Vec::len), Some(1));
+            assert_eq!(second_search["items"].as_array().map(Vec::len), Some(1));
+            assert_eq!(first_search["snapshot"]["accepted_seq"], 2);
+            assert_eq!(second_search["snapshot"]["indexed_seq"], 2);
+            assert_eq!(first_search["snapshot"]["index_version"], 1);
+            let first_digest = first_search["items"][0]["content_digest"].clone();
+            let second_digest = second_search["items"][0]["content_digest"].clone();
+
+            let raw_count: i64 = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT count(*)::bigint AS n FROM trace_object WHERE stream_id = $1",
+                    [stream_id.clone().into()],
+                ))
+                .await
+                .expect("rebuild raw object count")
+                .expect("rebuild raw object count row")
+                .try_get("", "n")
+                .expect("rebuild raw object count value");
+            clear_rebuild_fragments(&db, &stream_id).await;
+            let missing_path = rebuild_raw_path(scope_fixture, &stream_id, &second_transcript_oid);
+            let archived_transcript = fs::read(&missing_path).expect("second archived transcript");
+            assert_eq!(archived_transcript, second_transcript);
+            let first_path = rebuild_raw_path(scope_fixture, &stream_id, &first_transcript_oid);
+            let archived_first_transcript =
+                fs::read(&first_path).expect("first archived transcript");
+            assert_eq!(archived_first_transcript, first_transcript);
+            fs::remove_file(&missing_path).expect("remove second sequence transcript temporarily");
+
+            let interrupted = run_rebuild_cli_command(scope_fixture, &stream_id, 1);
+            fs::write(&missing_path, &archived_transcript)
+                .expect("restore second sequence transcript");
+            let interrupted_text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&interrupted.stdout),
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+            assert!(
+                !interrupted.status.success(),
+                "rebuild must stop when a raw member is missing: {interrupted_text}"
+            );
+            assert!(
+                interrupted_text.contains("accepted_seq=2 indexed_seq=2 rebuilt_seq=1"),
+                "the completed first sequence must remain committed: {interrupted_text}"
+            );
+            assert_eq!(
+                rebuild_version_checkpoints(&db, &stream_id, 1).await,
+                BTreeMap::from([("beef".to_owned(), (1, 1))])
+            );
+            let first_partial =
+                rebuild_cli_search(scope_fixture, &stream_id, &token, "mtr21firsttoken").await;
+            let second_partial =
+                rebuild_cli_search(scope_fixture, &stream_id, &token, "mtr21secondtoken").await;
+            assert_eq!(first_partial["items"].as_array().map(Vec::len), Some(1));
+            assert!(
+                second_partial["items"]
+                    .as_array()
+                    .expect("search items")
+                    .is_empty()
+            );
+            assert_eq!(first_partial["items"][0]["content_digest"], first_digest);
+
+            let state = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT s.tip_oid,
+                            (SELECT count(*)::bigint FROM trace_ref_update r
+                             WHERE r.stream_id = s.id AND r.state = 'indexed') AS indexed_rows,
+                            (SELECT count(*)::bigint FROM trace_object o
+                             WHERE o.stream_id = s.id) AS raw_objects
+                     FROM trace_stream s
+                     WHERE s.id = $1",
+                    [stream_id.clone().into()],
+                ))
+                .await
+                .expect("rebuild accepted state")
+                .expect("rebuild accepted stream");
+            let accepted_tip: String = state.try_get("", "tip_oid").expect("accepted tip");
+            let indexed_rows: i64 = state.try_get("", "indexed_rows").expect("indexed rows");
+            let raw_objects: i64 = state.try_get("", "raw_objects").expect("raw objects");
+            assert_eq!(accepted_tip, second_tip);
+            assert_eq!(indexed_rows, 2);
+            assert_eq!(raw_objects, raw_count);
+
+            let resumed = run_rebuild_cli_command(scope_fixture, &stream_id, 1);
+            let resumed_text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&resumed.stdout),
+                String::from_utf8_lossy(&resumed.stderr)
+            );
+            assert!(resumed.status.success(), "{resumed_text}");
+            assert!(
+                resumed_text.contains("accepted_seq=2 indexed_seq=2 rebuilt_seq=2"),
+                "{resumed_text}"
+            );
+            let complete =
+                BTreeMap::from([("beef".to_owned(), (1, 1)), ("cafe".to_owned(), (1, 1))]);
+            assert_eq!(
+                rebuild_version_checkpoints(&db, &stream_id, 1).await,
+                complete
+            );
+
+            let repeated = run_rebuild_cli_command(scope_fixture, &stream_id, 1);
+            let repeated_text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&repeated.stdout),
+                String::from_utf8_lossy(&repeated.stderr)
+            );
+            assert!(repeated.status.success(), "{repeated_text}");
+            assert_eq!(
+                rebuild_version_checkpoints(&db, &stream_id, 1).await,
+                complete
+            );
+            let first_search_after =
+                rebuild_cli_search(scope_fixture, &stream_id, &token, "mtr21firsttoken").await;
+            let second_search_after =
+                rebuild_cli_search(scope_fixture, &stream_id, &token, "mtr21secondtoken").await;
+            assert_eq!(
+                first_search_after["items"].as_array().map(Vec::len),
+                Some(1)
+            );
+            assert_eq!(
+                second_search_after["items"].as_array().map(Vec::len),
+                Some(1)
+            );
+            assert_eq!(
+                first_search_after["items"][0]["content_digest"],
+                first_digest
+            );
+            assert_eq!(
+                second_search_after["items"][0]["content_digest"],
+                second_digest
+            );
+            assert_eq!(first_search_after["snapshot"]["accepted_seq"], 2);
+            assert_eq!(second_search_after["snapshot"]["indexed_seq"], 2);
+            assert_eq!(first_search_after["snapshot"]["index_version"], 1);
+            assert_eq!(
+                fs::read(&first_path).expect("first raw transcript after rebuild"),
+                archived_first_transcript
+            );
+            assert_eq!(
+                fs::read(&missing_path).expect("second raw transcript after rebuild"),
+                archived_transcript
+            );
+
+            let tips: Vec<(i64, Option<String>, String)> = db
+                .query_all_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT ref_sequence, old_tip, new_tip
+                     FROM trace_ref_update
+                     WHERE stream_id = $1
+                     ORDER BY ref_sequence",
+                    [stream_id.clone().into()],
+                ))
+                .await
+                .expect("rebuild journal tip query")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.try_get("", "ref_sequence").expect("journal sequence"),
+                        row.try_get("", "old_tip").expect("journal old tip"),
+                        row.try_get("", "new_tip").expect("journal new tip"),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                tips,
+                vec![
+                    (1, None, first_tip.clone()),
+                    (2, Some(first_tip), second_tip)
+                ]
+            );
+
+            let version_two = run_rebuild_cli_command(scope_fixture, &stream_id, 2);
+            let version_two_text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&version_two.stdout),
+                String::from_utf8_lossy(&version_two.stderr)
+            );
+            assert!(version_two.status.success(), "{version_two_text}");
+            assert!(
+                version_two_text
+                    .contains("index_version=2 accepted_seq=2 indexed_seq=2 rebuilt_seq=2"),
+                "{version_two_text}"
+            );
+            assert_eq!(
+                rebuild_version_checkpoints(&db, &stream_id, 1).await,
+                complete
+            );
+            assert_eq!(
+                rebuild_version_checkpoints(&db, &stream_id, 2).await,
+                complete
+            );
+            let final_stream = trace_stream::Entity::find_by_id(stream_id.clone())
+                .one(&db)
+                .await
+                .expect("query stream after version two rebuild")
+                .expect("stream remains after version two rebuild");
+            assert_eq!(final_stream.tip_oid.as_deref(), Some(accepted_tip.as_str()));
+            let final_raw_count: i64 = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT count(*)::bigint AS n FROM trace_object WHERE stream_id = $1",
+                    [stream_id.clone().into()],
+                ))
+                .await
+                .expect("query raw objects after version two rebuild")
+                .expect("raw object count after version two rebuild")
+                .try_get("", "n")
+                .expect("raw object count value after version two rebuild");
+            assert_eq!(final_raw_count, raw_count);
+            assert_eq!(
+                fs::read(&first_path).expect("first raw transcript after version two rebuild"),
+                archived_first_transcript
+            );
+            assert_eq!(
+                fs::read(&missing_path).expect("second raw transcript after version two rebuild"),
+                archived_transcript
+            );
+        })
+        .catch_unwind()
+        .await;
+        if let Some(fixture) = fixture.as_mut() {
+            fixture.stop();
+        }
+        let closed = db.close().await;
+        drop(guard);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        closed.expect("close rebuild CLI pool");
+    }
+
     // MTR12: real standard Git over the running binary and authorized SSH key.
     pub async fn run_ssh_scoped_token_key_roundtrip() {
         let (guard, db) = traces_db::TracesDb::migrated().await;
@@ -13490,6 +14110,11 @@ async fn ssh_scoped_token_key_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn projection_worker_projects_real_push_and_resumes() {
     disabled_http::run_projection_worker().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_cli_replays_and_resumes_an_indexed_prefix() {
+    disabled_http::run_rebuild_cli().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

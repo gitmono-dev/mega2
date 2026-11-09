@@ -199,6 +199,22 @@ mod tests {
             Some(LoadMode::ParsedExistingConfig)
         );
         assert!(args.subcommand_matches("rebind-target").is_some());
+
+        let rebuild_args = traces::cli()
+            .try_get_matches_from([
+                "traces",
+                "rebuild-index",
+                "--stream",
+                "00000000-0000-0000-0000-000000000001",
+                "--index-version",
+                "2",
+            ])
+            .expect("traces rebuild-index arguments");
+        assert_eq!(
+            load_mode("traces", &rebuild_args),
+            Some(LoadMode::ParsedExistingConfig)
+        );
+        assert!(rebuild_args.subcommand_matches("rebuild-index").is_some());
     }
 
     /// plan-20260923 FU-08: `path` is registered in all three tables and

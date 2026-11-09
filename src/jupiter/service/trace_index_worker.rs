@@ -12,7 +12,9 @@ use crate::{
     common::errors::MegaError,
     jupiter::{
         service::trace_object_service::TraceObjectService,
-        storage::trace_projection_storage::TraceProjectionStore,
+        storage::trace_projection_storage::{
+            TraceIndexRebuildResult, TraceIndexRebuildSnapshot, TraceProjectionStore,
+        },
     },
 };
 
@@ -66,9 +68,32 @@ impl TraceIndexWorker {
         &self,
         stream_id: &str,
         index_version: i64,
-    ) -> Result<(), MegaError> {
+    ) -> Result<TraceIndexRebuildResult, MegaError> {
+        let snapshot = self.rebuild_snapshot(stream_id).await?;
+        self.rebuild_index_snapshot(snapshot, index_version, |_| {})
+            .await
+    }
+
+    pub async fn rebuild_snapshot(
+        &self,
+        stream_id: &str,
+    ) -> Result<TraceIndexRebuildSnapshot, MegaError> {
         TraceProjectionStore::new(&self.db, &self.objects)
-            .rebuild_indexed(stream_id, index_version)
+            .rebuild_snapshot(stream_id)
+            .await
+    }
+
+    pub async fn rebuild_index_snapshot<F>(
+        &self,
+        snapshot: TraceIndexRebuildSnapshot,
+        index_version: i64,
+        progress: F,
+    ) -> Result<TraceIndexRebuildResult, MegaError>
+    where
+        F: FnMut(i64),
+    {
+        TraceProjectionStore::new(&self.db, &self.objects)
+            .rebuild_indexed(snapshot, index_version, progress)
             .await
     }
 }
