@@ -111,7 +111,7 @@
 - **执行顺序与优先级**：P0 契约与可信摄取 → 任务／修订 → 依赖 `trunk-push` 阶段 1–3 的合并把关；随后 P1 团队历史与运维，P2 可选依赖图／外部 SCM。具体阶段 0–5 与 AC-LB-01…15 见 [libra.md](libra.md)。
 - **边界**：共用 trunk-push 根写入路径；ADR-TP-10 只约束 push 行，CL merge 不新增路径唯一入队约束；不要求 storage-only 部署接入 website 或人类审批。
 
-### 5c. **refactoring/agent-capture.md** — storage-only Agent Capture
+### 5c. **refactoring/agent-capture.md** — retired storage-only Agent Capture (HTTP surface removed by MTR-26)
 
 - **目标**：仅在 `git.storage_only()` 且 `[agent_capture].enabled=true` 时挂载 `/api/v1/agent-capture`
 - **核心内容**：独立 ingest token、`capture_id` 服务器 PK、raw 为事实源（`raw_accepted=true`）、`ObjectNamespace::Agent`、metadata-first 查询、transcript access_audit、tombstone 拒再 ingest

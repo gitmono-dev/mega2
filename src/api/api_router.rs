@@ -13,10 +13,10 @@ use crate::{
         MonoApiServiceState,
         api_doc::SYSTEM_COMMON,
         router::{
-            admin_router, agent_capture_router, artifacts_router, bot_router, buck_router,
-            cl_router, commit_router, gpg_router, group_router, import_repo_router,
-            merge_queue_router, preview_router, push_queue_router, repo_router, tag_router,
-            traces_router, user_router, view_router, webhook_router,
+            admin_router, artifacts_router, bot_router, buck_router, cl_router, commit_router,
+            gpg_router, group_router, import_repo_router, merge_queue_router, preview_router,
+            push_queue_router, repo_router, tag_router, traces_router, user_router, view_router,
+            webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
@@ -95,11 +95,10 @@ pub fn storage_only_routers_with(
         .merge(import_repo_router::routers())
         .merge(tag_router::routers())
         .merge(artifacts_router::routers());
-    if include_agent_capture {
-        router.merge(agent_capture_router::routers())
-    } else {
-        router
-    }
+    // The legacy Capture HTTP surface is retired (MTR-26): no routes are
+    // mounted for it in any profile.
+    let _ = include_agent_capture;
+    router
 }
 
 pub(crate) fn storage_only_routers_with_views(

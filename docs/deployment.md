@@ -9,7 +9,7 @@ Mega2 is the second-generation Mega engine built for Agents. Its Monorepo servic
 The only supported deployment shape is trunk / storage-only:
 
 - Single public branch `main`; all writes (git push and product API writes) are globally serialized through the MonoWriteQueue and share tip authority; no CL / issue / reviewer / OAuth user routes are registered.
-- HTTP surface: Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`), LFS (`/info/lfs`, `/api/v1/lfs`), storage-only `/api/v1/*` (status, file/blob, file/tree, preview reads; create-entry / delete-entry / move-entry / edit/save, tags writes), optional OCI `/v2` (`[oci].enabled`), optional Agent Session Capture `/api/v1/agent-capture` (`[agent_capture].enabled`, separate ingestion of session, event, checkpoint, transcript, and file-operation records; not triggered by Git push), Swagger UI `/swagger-ui`, OpenAPI `/api/openapi.json`.
+- HTTP surface: Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`), LFS (`/info/lfs`, `/api/v1/lfs`), storage-only `/api/v1/*` (status, file/blob, file/tree, preview reads; create-entry / delete-entry / move-entry / edit/save, tags writes), optional OCI `/v2` (`[oci].enabled`), the legacy Agent Session Capture HTTP surface `/api/v1/agent-capture` is retired (its routes are never mounted; session history is uploaded through scoped traces Git and queried through `/api/v1/traces`), Swagger UI `/swagger-ui`, OpenAPI `/api/openapi.json`.
 - SSH is upload-pack only (clone / fetch / pull); `ssh_receive_pack` must be explicitly `false` — omitting it refuses startup.
 - Write auth: `git.push_auth = "token"` (recommended) or `"none"` (controlled networks only). Configure authentication and SSH as described in sections 3–5 of this guide.
 

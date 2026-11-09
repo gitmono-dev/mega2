@@ -1,6 +1,8 @@
 #[path = "common/traces_db.rs"]
 mod traces_db;
 
+#[path = "common/traces_retirement_inventory.rs"]
+mod traces_retirement_inventory;
 #[path = "common/traces_runtime.rs"]
 mod traces_runtime;
 
@@ -16631,4 +16633,104 @@ async fn legacy_drop_guard_cli_consumes_a_verified_receipt() {
     let closed = db.close().await;
     drop(closed);
     drop(guard);
+}
+
+/// MTR-26 retirement gate: against the real binary service, the 12 legacy
+/// `/api/v1/agent-capture` paths are unmounted in every method, the runtime
+/// OpenAPI no longer lists them, and the new traces GET surface stays mounted.
+#[tokio::test]
+async fn legacy_http_removed_paths_and_openapi() {
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let paths = [
+        ("GET", "/api/v1/agent-capture/discovery"),
+        (
+            "PUT",
+            "/api/v1/agent-capture/repos/third-part%2Fmega/sessions/retire",
+        ),
+        ("POST", "/api/v1/agent-capture/sessions/1/blobs/staging"),
+        (
+            "POST",
+            "/api/v1/agent-capture/sessions/1/blobs/lease/finalize",
+        ),
+        ("POST", "/api/v1/agent-capture/sessions/1/events:batch"),
+        ("POST", "/api/v1/agent-capture/sessions/1/file-ops:batch"),
+        ("POST", "/api/v1/agent-capture/sessions/1/checkpoints"),
+        (
+            "GET",
+            "/api/v1/agent-capture/repos/third-part%2Fmega/sessions",
+        ),
+        ("GET", "/api/v1/agent-capture/sessions/1"),
+        ("GET", "/api/v1/agent-capture/sessions/1/checkpoints"),
+        ("GET", "/api/v1/agent-capture/sessions/1/transcript"),
+        ("GET", "/api/v1/agent-capture/sessions/1/file-ops"),
+    ];
+    for (method, path) in paths {
+        let url = format!("{}{path}", runtime.base_url());
+        let request = match method {
+            "GET" => client.get(url),
+            "PUT" => client.put(url),
+            _ => client.post(url),
+        };
+        let response = request
+            .header("Authorization", "Bearer synthetic")
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("legacy request");
+        assert_eq!(
+            response.status().as_u16(),
+            404,
+            "{method} {path} must be retired"
+        );
+    }
+    let (status, body) = runtime.get("/api/openapi.json").await;
+    assert_eq!(status, 200, "{body}");
+    let document: serde_json::Value = serde_json::from_str(&body).expect("openapi json");
+    let openapi_paths = document["paths"].as_object().expect("openapi paths");
+    assert!(
+        openapi_paths
+            .keys()
+            .all(|path| !path.contains("/api/v1/agent-capture")),
+        "the legacy capture paths are still documented"
+    );
+    let schemas = document["components"]["schemas"]
+        .as_object()
+        .expect("openapi schemas");
+    assert!(
+        schemas.keys().all(|name| !name.contains("AgentCapture")),
+        "the legacy capture DTOs are still documented"
+    );
+    // AC-3: the new traces GET surface is still mounted.
+    let (status, body) = runtime.get("/api/v1/traces/capabilities").await;
+    assert_eq!(
+        status, 200,
+        "traces capabilities must stay mounted: {status} {body}"
+    );
+    assert!(body.contains("libra-traces/v1"), "{body}");
+    assert!(
+        openapi_paths
+            .keys()
+            .any(|path| path == "/api/v1/traces/capabilities"),
+        "the traces capabilities route is missing from OpenAPI"
+    );
+}
+
+/// MTR-26 stage scanner: no retired HTTP-surface symbol survives outside the
+/// stage allowlist, and no legacy capture path is mounted or documented.
+#[test]
+fn legacy_retirement_stage_26() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_26(root).expect("retirement scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy capture symbols: {hits:?}"
+    );
+    // The DTO module and the router file are gone.
+    assert!(!root.join("src/api_model/agent_capture.rs").exists());
+    assert!(!root.join("src/api/router/agent_capture_router.rs").exists());
 }

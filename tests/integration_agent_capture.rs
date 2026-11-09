@@ -1,6 +1,10 @@
-//! Process-level Agent Capture HTTP black-box IT (plan-20260911 / AC-13).
+//! Process-level Agent Capture HTTP retirement IT (MTR-26).
 //!
-//! Boots a real `service http` with an isolated local object backend.
+//! The legacy `/api/v1/agent-capture` surface is removed. This target boots a
+//! real service with `agent_capture.enabled=true` (so the flag cannot be the
+//! reason the routes are absent) and asserts every legacy path is 404 while
+//! the new traces GET surface stays mounted.
+#![allow(dead_code)]
 
 mod common;
 
@@ -11,10 +15,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Barrier, Mutex,
+        Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    thread::{self, sleep},
+    thread::sleep,
     time::{Duration, Instant},
 };
 
@@ -268,449 +272,6 @@ impl Drop for ServiceProcess {
             let _ = self.child.wait();
         }
     }
-}
-
-#[test]
-fn integration_agent_capture_happy_path() {
-    let _gate = serial_gate();
-    let env = CaptureEnv::storage_only("it-default");
-    let (mut service, port, _stdout, stderr) = boot_storage_only(&env);
-    let client = http_client();
-    let base = api_base(port);
-
-    let discovery = client
-        .get(format!("{base}/discovery"))
-        .header("Authorization", bearer())
-        .send()
-        .expect("discovery");
-    assert_eq!(discovery.status().as_u16(), 200, "discovery");
-    let discovery_json: serde_json::Value = discovery.json().expect("discovery json");
-    assert_eq!(discovery_json["raw_accepted"], true);
-
-    let capture_id = put_session(&client, &base, "sess-happy");
-    let raw = format!("transcript {SENTINEL}");
-    let digest = stage_and_finalize(&client, &base, capture_id, raw.as_bytes());
-    let checkpoint = client
-        .post(format!("{base}/sessions/{capture_id}/checkpoints"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(format!(
-            r#"{{"checkpoint_id":"cp-1","transcript_digest":"{digest}"}}"#
-        ))
-        .send()
-        .expect("checkpoint");
-    assert_eq!(checkpoint.status().as_u16(), 200, "checkpoint");
-
-    let transcript = client
-        .get(format!("{base}/sessions/{capture_id}/transcript"))
-        .header("Authorization", bearer())
-        .send()
-        .expect("transcript");
-    assert_eq!(transcript.status().as_u16(), 200, "transcript");
-    assert_eq!(transcript.bytes().expect("bytes").as_ref(), raw.as_bytes());
-
-    assert!(
-        service
-            .shutdown_via_sigint(Duration::from_secs(60))
-            .success(),
-        "shutdown failed\n{}",
-        read_log(&stderr)
-    );
-}
-
-#[test]
-fn integration_agent_capture_review_404() {
-    let _gate = serial_gate();
-    let env = CaptureEnv::review();
-    let (mut service, port, _stdout, stderr) = boot_service_http(&env, &[]);
-    let client = http_client();
-    let discovery = client
-        .get(format!("{}/discovery", api_base(port)))
-        .header("Authorization", bearer())
-        .send()
-        .expect("discovery");
-    assert_eq!(discovery.status().as_u16(), 404, "review discovery");
-    assert!(
-        service
-            .shutdown_via_sigint(Duration::from_secs(60))
-            .success(),
-        "shutdown failed\n{}",
-        read_log(&stderr)
-    );
-}
-
-#[test]
-fn integration_agent_capture_unauthorized() {
-    let _gate = serial_gate();
-    let env = CaptureEnv::storage_only("it-default");
-    let (mut service, port, _stdout, stderr) = boot_storage_only(&env);
-    let client = http_client();
-    let discovery = client
-        .get(format!("{}/discovery", api_base(port)))
-        .send()
-        .expect("discovery");
-    assert_eq!(discovery.status().as_u16(), 401, "missing token");
-    assert!(
-        service
-            .shutdown_via_sigint(Duration::from_secs(60))
-            .success(),
-        "shutdown failed\n{}",
-        read_log(&stderr)
-    );
-}
-
-#[test]
-fn integration_agent_capture_tracing_has_no_raw_sentinel() {
-    let _gate = serial_gate();
-    let env = CaptureEnv::storage_only("it-default");
-    let (mut service, port, stdout, stderr) = boot_storage_only(&env);
-    let client = http_client();
-    let base = api_base(port);
-    let capture_id = put_session(&client, &base, "sess-trace");
-    let raw = format!("prompt={SENTINEL}");
-    let _digest = stage_and_finalize(&client, &base, capture_id, raw.as_bytes());
-    let events = client
-        .post(format!("{base}/sessions/{capture_id}/events:batch"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(format!(
-            r#"{{"batch_id":"b1","events":[{{"event_uid":"0:0","event_kind":"message","payload":{{"text":"{SENTINEL}"}}}}]}}"#
-        ))
-        .send()
-        .expect("events");
-    assert_eq!(events.status().as_u16(), 200, "events");
-    assert!(
-        service
-            .shutdown_via_sigint(Duration::from_secs(60))
-            .success(),
-        "shutdown failed\n{}",
-        read_log(&stderr)
-    );
-    let logs = format!("{}{}", read_log(&stdout), read_log(&stderr));
-    assert!(!logs.contains(SENTINEL), "tracing leaked raw sentinel");
-}
-
-#[test]
-fn integration_agent_capture_cross_deployment_isolated() {
-    let _gate = serial_gate();
-    let env = CaptureEnv::storage_only("it-a");
-    let (mut service_a, port_a, _stdout_a, stderr_a) = boot_service_http(
-        &env,
-        &[
-            ("MEGA_GIT__PUSH_AUTH", "none"),
-            ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
-            ("MEGA_AGENT_CAPTURE__DEPLOYMENT_ID", "it-a"),
-        ],
-    );
-    let (mut service_b, port_b, _stdout_b, stderr_b) = boot_service_http(
-        &env,
-        &[
-            ("MEGA_GIT__PUSH_AUTH", "none"),
-            ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
-            ("MEGA_AGENT_CAPTURE__DEPLOYMENT_ID", "it-b"),
-        ],
-    );
-    let client = http_client();
-    let capture_id = put_session(&client, &api_base(port_a), "sess-iso");
-    let foreign = client
-        .get(format!("{}/sessions/{capture_id}", api_base(port_b)))
-        .header("Authorization", bearer())
-        .send()
-        .expect("foreign get");
-    assert_eq!(foreign.status().as_u16(), 404, "cross-deployment");
-    assert!(
-        service_a
-            .shutdown_via_sigint(Duration::from_secs(60))
-            .success(),
-        "shutdown a failed\n{}",
-        read_log(&stderr_a)
-    );
-    assert!(
-        service_b
-            .shutdown_via_sigint(Duration::from_secs(60))
-            .success(),
-        "shutdown b failed\n{}",
-        read_log(&stderr_b)
-    );
-}
-
-#[test]
-fn integration_agent_capture_tombstone_race() {
-    let _gate = serial_gate();
-    let env = CaptureEnv::storage_only("it-default");
-    let (mut service, port, _stdout, stderr) = boot_storage_only(&env);
-    let client = http_client();
-    let base = api_base(port);
-    let capture_id = put_session(&client, &base, "sess-race");
-    let db_url = env.database.db_url.clone();
-    let barrier = Arc::new(Barrier::new(2));
-    let tomb_barrier = barrier.clone();
-    let tomb = thread::spawn(move || {
-        tomb_barrier.wait();
-        insert_tombstone_sql(&db_url, capture_id);
-    });
-    let ingest_barrier = barrier;
-    let ingest_base = base.clone();
-    let ingest = thread::spawn(move || {
-        ingest_barrier.wait();
-        http_client()
-            .post(format!("{ingest_base}/sessions/{capture_id}/events:batch"))
-            .header("Authorization", bearer())
-            .header("Content-Type", "application/json")
-            .body(r#"{"batch_id":"race","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#)
-            .send()
-            .expect("race ingest")
-            .status()
-            .as_u16()
-    });
-    tomb.join().expect("tombstone thread");
-    let racing_status = ingest.join().expect("ingest thread");
-    assert!(
-        racing_status == 200 || racing_status == 409,
-        "racing ingest must be 200 or 409, got {racing_status}"
-    );
-    let follow = client
-        .post(format!("{base}/sessions/{capture_id}/events:batch"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(r#"{"batch_id":"after","events":[{"event_uid":"0:1","event_kind":"message","payload":{}}]}"#)
-        .send()
-        .expect("follow ingest");
-    assert_eq!(
-        follow.status().as_u16(),
-        409,
-        "ingest after tombstone must not 200"
-    );
-    assert!(
-        service
-            .shutdown_via_sigint(Duration::from_secs(60))
-            .success(),
-        "shutdown failed\n{}",
-        read_log(&stderr)
-    );
-}
-
-/// Process-level WH-07 gates: real binary, push_auth=none, ingest-token auth,
-/// OpenAPI, cross-repo isolation. Does not assert an injected collector.
-#[test]
-fn storage_events_batch() {
-    let _gate = serial_gate();
-    let env = CaptureEnv::storage_only_with_events("it-default");
-    seed_target_secret(&env);
-    let (mut service, port, stdout, stderr) = boot_storage_only(&env);
-    let client = http_client();
-    let base = api_base(port);
-
-    let openapi = client
-        .get(format!("http://127.0.0.1:{port}/api/openapi.json"))
-        .send()
-        .expect("openapi");
-    assert_eq!(openapi.status().as_u16(), 200, "openapi");
-    let spec: serde_json::Value = openapi.json().expect("openapi json");
-    let paths = spec["paths"].as_object().expect("paths");
-    assert!(
-        paths.contains_key("/api/v1/agent-capture/sessions/{capture_id}/events:batch"),
-        "OpenAPI must still list events:batch"
-    );
-
-    let unauthorized = client
-        .post(format!("{base}/sessions/1/events:batch"))
-        .header("Authorization", "Bearer not-the-ingest-token")
-        .header("Content-Type", "application/json")
-        .body(r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#)
-        .send()
-        .expect("invalid token");
-    assert_eq!(
-        unauthorized.status().as_u16(),
-        401,
-        "invalid ingest token must 401 under push_auth=none"
-    );
-
-    let missing = client
-        .post(format!("{base}/sessions/1/events:batch"))
-        .header("Content-Type", "application/json")
-        .body(r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#)
-        .send()
-        .expect("missing token");
-    assert_eq!(missing.status().as_u16(), 401, "missing token must 401");
-
-    let capture_id = put_session(&client, &base, "sess-wh07");
-    let accepted = client
-        .post(format!("{base}/sessions/{capture_id}/events:batch"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{"n":1}}]}"#)
-        .send()
-        .expect("events batch");
-    assert_eq!(accepted.status().as_u16(), 200, "valid ingest token");
-    let body: serde_json::Value = accepted.json().expect("batch json");
-    assert_eq!(body["accepted"], true);
-
-    let replay = client
-        .post(format!("{base}/sessions/{capture_id}/events:batch"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{"n":1}}]}"#)
-        .send()
-        .expect("replay");
-    assert_eq!(replay.status().as_u16(), 200, "replay stays 200");
-
-    let cross = client
-        .put(format!("{base}/repos/other%2Fapp/sessions/sess-cross"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(r#"{"session_kind":"external_capture"}"#)
-        .send()
-        .expect("cross-repo session");
-    assert_eq!(
-        cross.status().as_u16(),
-        404,
-        "token must not cover a foreign repo"
-    );
-
-    assert!(
-        service
-            .shutdown_via_sigint(Duration::from_secs(60))
-            .success(),
-        "shutdown failed\nstdout:\n{}\nstderr:\n{}",
-        read_log(&stdout),
-        read_log(&stderr)
-    );
-    let captured = format!("{}{}", read_log(&stdout), read_log(&stderr));
-    assert!(
-        !captured.contains(SECRET_REF),
-        "logs must not contain the SecretRef URI"
-    );
-    assert!(
-        !captured.contains(INGEST_TOKEN),
-        "logs must not contain the ingest token"
-    );
-}
-
-/// Process-level WH-08 gates: real binary, push_auth=none, ingest-token auth,
-/// OpenAPI, new/replay/shared-blob/incomplete checkpoints, cross-repo
-/// isolation. Does not assert an injected collector.
-#[test]
-fn storage_events_checkpoint() {
-    let _gate = serial_gate();
-    let env = CaptureEnv::storage_only_with_events("it-default");
-    seed_target_secret(&env);
-    let (mut service, port, stdout, stderr) = boot_storage_only(&env);
-    let client = http_client();
-    let base = api_base(port);
-
-    let openapi = client
-        .get(format!("http://127.0.0.1:{port}/api/openapi.json"))
-        .send()
-        .expect("openapi");
-    assert_eq!(openapi.status().as_u16(), 200, "openapi");
-    let spec: serde_json::Value = openapi.json().expect("openapi json");
-    let paths = spec["paths"].as_object().expect("paths");
-    assert!(
-        paths.contains_key("/api/v1/agent-capture/sessions/{capture_id}/checkpoints"),
-        "OpenAPI must still list checkpoints"
-    );
-
-    let unauthorized = client
-        .post(format!("{base}/sessions/1/checkpoints"))
-        .header("Authorization", "Bearer not-the-ingest-token")
-        .header("Content-Type", "application/json")
-        .body(r#"{"checkpoint_id":"cp-1","redacted_digest":"sha256:x"}"#)
-        .send()
-        .expect("invalid token");
-    assert_eq!(
-        unauthorized.status().as_u16(),
-        401,
-        "invalid ingest token must 401 under push_auth=none"
-    );
-
-    let missing = client
-        .post(format!("{base}/sessions/1/checkpoints"))
-        .header("Content-Type", "application/json")
-        .body(r#"{"checkpoint_id":"cp-1","redacted_digest":"sha256:x"}"#)
-        .send()
-        .expect("missing token");
-    assert_eq!(missing.status().as_u16(), 401, "missing token must 401");
-
-    let capture_id = put_session(&client, &base, "sess-wh08");
-    let digest = stage_and_finalize(&client, &base, capture_id, b"wh08-raw");
-    let accepted = client
-        .post(format!("{base}/sessions/{capture_id}/checkpoints"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(format!(
-            r#"{{"checkpoint_id":"cp-1","transcript_digest":"{digest}"}}"#
-        ))
-        .send()
-        .expect("checkpoint");
-    assert_eq!(accepted.status().as_u16(), 200, "new checkpoint");
-    let body: serde_json::Value = accepted.json().expect("checkpoint json");
-    assert_eq!(body["accepted"], true);
-
-    let replay = client
-        .post(format!("{base}/sessions/{capture_id}/checkpoints"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(format!(
-            r#"{{"checkpoint_id":"cp-1","transcript_digest":"{digest}"}}"#
-        ))
-        .send()
-        .expect("replay");
-    assert_eq!(replay.status().as_u16(), 200, "replay stays 200");
-
-    let shared = client
-        .post(format!("{base}/sessions/{capture_id}/checkpoints"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(format!(
-            r#"{{"checkpoint_id":"cp-2","transcript_digest":"{digest}"}}"#
-        ))
-        .send()
-        .expect("shared blob");
-    assert_eq!(shared.status().as_u16(), 200, "shared blob new checkpoint");
-
-    let incomplete = client
-        .post(format!("{base}/sessions/{capture_id}/checkpoints"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(r#"{"checkpoint_id":"cp-redacted","redacted_digest":"sha256:redacted"}"#)
-        .send()
-        .expect("redacted");
-    assert_eq!(incomplete.status().as_u16(), 200, "redacted incomplete");
-    let incomplete_body: serde_json::Value = incomplete.json().expect("incomplete json");
-    assert_eq!(incomplete_body["completeness"], "incomplete");
-    assert_eq!(incomplete_body["partial_reason"], "missing_raw");
-
-    let cross = client
-        .put(format!("{base}/repos/other%2Fapp/sessions/sess-cross"))
-        .header("Authorization", bearer())
-        .header("Content-Type", "application/json")
-        .body(r#"{"session_kind":"external_capture"}"#)
-        .send()
-        .expect("cross-repo session");
-    assert_eq!(
-        cross.status().as_u16(),
-        404,
-        "token must not cover a foreign repo"
-    );
-
-    assert!(
-        service
-            .shutdown_via_sigint(Duration::from_secs(60))
-            .success(),
-        "shutdown failed\nstdout:\n{}\nstderr:\n{}",
-        read_log(&stdout),
-        read_log(&stderr)
-    );
-    let captured = format!("{}{}", read_log(&stdout), read_log(&stderr));
-    assert!(
-        !captured.contains(SECRET_REF),
-        "logs must not contain the SecretRef URI"
-    );
-    assert!(
-        !captured.contains(INGEST_TOKEN),
-        "logs must not contain the ingest token"
-    );
 }
 
 fn seed_target_secret(env: &CaptureEnv) {
@@ -1002,4 +563,82 @@ fn read_log(path: &Path) -> String {
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf);
     buf
+}
+
+const LEGACY_PATHS: [(&str, &str); 12] = [
+    ("GET", "/api/v1/agent-capture/discovery"),
+    (
+        "PUT",
+        "/api/v1/agent-capture/repos/third-part%2Fmega/sessions/ac-retire",
+    ),
+    ("POST", "/api/v1/agent-capture/sessions/1/blobs/staging"),
+    (
+        "POST",
+        "/api/v1/agent-capture/sessions/1/blobs/lease/finalize",
+    ),
+    ("POST", "/api/v1/agent-capture/sessions/1/events:batch"),
+    ("POST", "/api/v1/agent-capture/sessions/1/file-ops:batch"),
+    ("POST", "/api/v1/agent-capture/sessions/1/checkpoints"),
+    (
+        "GET",
+        "/api/v1/agent-capture/repos/third-part%2Fmega/sessions",
+    ),
+    ("GET", "/api/v1/agent-capture/sessions/1"),
+    ("GET", "/api/v1/agent-capture/sessions/1/checkpoints"),
+    ("GET", "/api/v1/agent-capture/sessions/1/transcript"),
+    ("GET", "/api/v1/agent-capture/sessions/1/file-ops"),
+];
+
+/// MTR-26: with `agent_capture.enabled=true` the 12 legacy HTTP paths are no
+/// longer mounted, the runtime OpenAPI no longer lists them, and the new traces
+/// GET surface stays available.
+#[test]
+fn legacy_agent_capture_http_surface_is_retired() {
+    let _guard = serial_gate();
+    let env = CaptureEnv::storage_only("retire-http");
+    let (mut service, port, out_path, err_path) = boot_storage_only(&env);
+    let client = http_client();
+    let base = format!("http://127.0.0.1:{port}");
+    for (method, path) in LEGACY_PATHS {
+        let request = match method {
+            "GET" => client.get(format!("{base}{path}")),
+            "PUT" => client.put(format!("{base}{path}")),
+            _ => client.post(format!("{base}{path}")),
+        };
+        let response = request
+            .header("Authorization", bearer())
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .expect("legacy request");
+        assert_eq!(
+            response.status().as_u16(),
+            404,
+            "{method} {path} must be retired, not {}",
+            response.status()
+        );
+    }
+    // The runtime OpenAPI no longer lists the legacy paths or DTOs.
+    let openapi = client
+        .get(format!("{base}/api/openapi.json"))
+        .send()
+        .expect("openapi")
+        .json::<serde_json::Value>()
+        .expect("openapi json");
+    let paths = openapi["paths"].as_object().expect("openapi paths");
+    assert!(
+        paths
+            .keys()
+            .all(|path| !path.contains("/api/v1/agent-capture")),
+        "the legacy capture paths are still documented"
+    );
+    let schemas = openapi["components"]["schemas"]
+        .as_object()
+        .expect("openapi schemas");
+    assert!(
+        schemas.keys().all(|name| !name.contains("AgentCapture")),
+        "the legacy capture DTOs are still documented"
+    );
+    service.shutdown_via_sigint(Duration::from_secs(30));
+    let _ = (&out_path, &err_path);
 }

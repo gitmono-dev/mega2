@@ -9,7 +9,7 @@ mega2 是面向 Agent 的第二代 Mega 引擎，其 Monorepo 服务是核心能
 唯一支持的部署形态是 trunk / storage-only：
 
 - 唯一公开分支 `main`；所有写（git push 与产品 API 写）经 MonoWriteQueue 全局串行化，共享 tip 权威；不注册 CL / issue / reviewer / OAuth user 路由。
-- HTTP 表面：Git smart HTTP（`info/refs`、`git-upload-pack`、`git-receive-pack`）、LFS（`/info/lfs`、`/api/v1/lfs`）、storage-only `/api/v1/*`（status、file/blob、file/tree、preview 读，create-entry / delete-entry / move-entry / edit/save、tags 写）、可选 OCI `/v2`（`[oci].enabled`）、可选 Agent Session Capture `/api/v1/agent-capture`（`[agent_capture].enabled`，独立接收会话、事件、checkpoint、transcript 和文件操作记录，不由 Git push 触发）、Swagger UI `/swagger-ui`、OpenAPI `/api/openapi.json`。
+- HTTP 表面：Git smart HTTP（`info/refs`、`git-upload-pack`、`git-receive-pack`）、LFS（`/info/lfs`、`/api/v1/lfs`）、storage-only `/api/v1/*`（status、file/blob、file/tree、preview 读，create-entry / delete-entry / move-entry / edit/save、tags 写）、可选 OCI `/v2`（`[oci].enabled`）、旧 Agent Session Capture HTTP 表面 `/api/v1/agent-capture` 已退场（路由不再挂载；会话历史经 scoped traces Git 上传、经 `/api/v1/traces` 查询）、Swagger UI `/swagger-ui`、OpenAPI `/api/openapi.json`。
 - SSH 仅 upload-pack（clone / fetch / pull）；`ssh_receive_pack` 必须显式 `false`，省略会拒绝启动。
 - 写鉴权：`git.push_auth = "token"`（推荐）或 `"none"`（仅限受控网络）。具体配置与 SSH 规则见本指南第 3–5 节。
 
