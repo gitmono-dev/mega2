@@ -58,6 +58,20 @@ pub(crate) async fn prepare_roles_file(
         .map_err(|error| error.to_string())
 }
 
+/// Revoke the old app role's effective INSERT/UPDATE/DELETE from one plan.
+pub(crate) async fn revoke_dml_file(
+    db: &DatabaseConnection,
+    plan_path: &Path,
+) -> Result<crate::jupiter::service::trace_legacy_roles::LegacyDmlRevocation, String> {
+    let raw = std::fs::read_to_string(plan_path)
+        .map_err(|error| format!("cannot read {}: {error}", plan_path.display()))?;
+    let plan: crate::jupiter::service::trace_legacy_roles::LegacyRolePlan =
+        serde_json::from_str(&raw).map_err(|error| format!("invalid role plan: {error}"))?;
+    crate::jupiter::service::trace_legacy_roles::revoke_legacy_dml(db, &plan)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// The maintenance driver refuses a config that was found implicitly: only an
 /// explicitly named `--config`/`MEGA_CONFIG` may authorize a purge manifest.
 pub(crate) fn require_named_config(source: ConfigSource) -> Result<(), String> {
@@ -189,6 +203,62 @@ mod tests {
         assert_eq!(prepared.tables_transferred, 12);
         assert!(prepared.app_cannot_alter);
         let missing = super::prepare_roles_file(&db, &temp_dir.path().join("absent.json"))
+            .await
+            .expect_err("a missing plan must fail");
+        assert!(missing.contains("cannot read"), "{missing}");
+        for table in crate::jupiter::service::trace_legacy_roles::LEGACY_TABLES {
+            let _ = db
+                .execute_unprepared(&format!("ALTER TABLE {table} OWNER TO CURRENT_USER"))
+                .await;
+        }
+        let _ = db
+            .execute_unprepared("ALTER FUNCTION trace_legacy_write_fence() OWNER TO CURRENT_USER")
+            .await;
+        for role in [&app, &maintenance] {
+            let _ = db
+                .execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
+                .await;
+        }
+        db.close().await.ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_dml_driver_revokes_from_one_plan() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&db, true).await.expect("migrations");
+        use sea_orm::ConnectionTrait;
+        let app = format!("mega2_l67d_app_{}", std::process::id());
+        let maintenance = format!("mega2_l67d_maint_{}", std::process::id());
+        for role in [&app, &maintenance] {
+            db.execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
+                .await
+                .ok();
+            db.execute_unprepared(&format!("CREATE ROLE {role} NOLOGIN"))
+                .await
+                .expect("create role");
+        }
+        let plan = crate::jupiter::service::trace_legacy_roles::LegacyRolePlan {
+            app_role: app.clone(),
+            maintenance_role: maintenance.clone(),
+        };
+        crate::jupiter::service::trace_legacy_roles::prepare_legacy_roles(&db, &plan)
+            .await
+            .expect("ownership");
+        db.execute_unprepared("GRANT INSERT, UPDATE, DELETE ON agent_capture_session TO PUBLIC")
+            .await
+            .expect("grant public");
+        let path = temp_dir.path().join("roles.json");
+        std::fs::write(
+            &path,
+            format!("{{\"app_role\": \"{app}\", \"maintenance_role\": \"{maintenance}\"}}"),
+        )
+        .expect("plan");
+        let revoked = super::revoke_dml_file(&db, &path)
+            .await
+            .expect("revoke through the driver");
+        assert_eq!(revoked.tables_revoked, 12);
+        let missing = super::revoke_dml_file(&db, &temp_dir.path().join("absent.json"))
             .await
             .expect_err("a missing plan must fail");
         assert!(missing.contains("cannot read"), "{missing}");

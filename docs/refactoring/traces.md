@@ -963,6 +963,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 **旧 writer DB 权限屏障准备（MTR-61）：** 部署 DBA 用既有维护连接执行 `trace_legacy_roles::prepare_legacy_roles`：校验 app role 与 maintenance role 为两个不同的普通标识符，且旧 app role 不是 superuser、没有 `BYPASSRLS`、没有 `CREATEROLE`；随后把 12 张旧表与 `trace_legacy_write_fence()` 的 ownership 转交 maintenance role，并用受控回滚事务证明旧 app role 既不能 `ALTER TABLE` 也不能 `DISABLE TRIGGER`。撤销有效 DML 与激活 fence 分别由 MTR-67 与 MTR-33 承接；本步骤不删除任何数据。
 
+**旧 app 三类 DML 撤销（MTR-67）：** ownership 准备之后，`trace_legacy_roles::revoke_legacy_dml` 对 12 张旧表分别 `REVOKE INSERT, UPDATE, DELETE` FROM 旧 app role 与 `PUBLIC`；随后用 `has_table_privilege` 逐个证明旧 app 无有效权限，若仍可经继承角色获得则显式失败（`InheritedGrant`），不报成功。真正 oracle 是在**无 active fence**时以 `SET LOCAL ROLE <app>` 尝试 INSERT：必须以 `permission denied`/`42501` 拒绝并回滚，不能由 MTR-33 的 trigger 拒绝冒充 REVOKE 完成；有 active fence 时拒绝执行撤销（无法证明权限结果）。
+
 **持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
 - `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
 - `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；

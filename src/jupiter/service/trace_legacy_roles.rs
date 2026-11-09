@@ -48,6 +48,10 @@ pub enum LegacyRoleError {
     TransferFailed { role: String, reason: String },
     #[error("the old app role can still change the legacy schema: {reason}")]
     AppRoleStillPrivileged { reason: String },
+    #[error("the old app role still has an inherited {privilege} grant on {table}")]
+    InheritedGrant { table: String, privilege: String },
+    #[error("the revoked app role still executed a {privilege} write on {table}")]
+    RevocationNotEffective { table: String, privilege: String },
 }
 
 impl From<sea_orm::DbErr> for LegacyRoleError {
@@ -125,6 +129,201 @@ async fn expect_failure(
     let result = txn.execute_unprepared(sql).await;
     let _ = txn.rollback().await;
     Ok(result.is_err())
+}
+
+/// The verified state after the three effective DML privileges are revoked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyDmlRevocation {
+    pub app_role: String,
+    pub tables_revoked: usize,
+    pub insert_revoked: bool,
+    pub update_revoked: bool,
+    pub delete_revoked: bool,
+    pub public_insert_revoked: bool,
+    pub public_update_revoked: bool,
+    pub public_delete_revoked: bool,
+}
+
+async fn effective_privilege(
+    db: &DatabaseConnection,
+    app_role: &str,
+    table: &str,
+    privilege: &str,
+) -> Result<bool, LegacyRoleError> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT has_table_privilege($1, $2, $3) AS allowed",
+            [app_role.into(), table.into(), privilege.into()],
+        ))
+        .await
+        .map_err(|error| LegacyRoleError::TransferFailed {
+            role: app_role.to_owned(),
+            reason: error.to_string(),
+        })?;
+    Ok(row
+        .map(|row| row.try_get::<bool>("", "allowed").unwrap_or(false))
+        .unwrap_or(false))
+}
+
+async fn public_privilege(
+    db: &DatabaseConnection,
+    table: &str,
+    privilege: &str,
+) -> Result<bool, LegacyRoleError> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT has_table_privilege('public', $1, $2) AS allowed",
+            [table.into(), privilege.into()],
+        ))
+        .await
+        .map_err(|error| LegacyRoleError::TransferFailed {
+            role: "PUBLIC".to_owned(),
+            reason: error.to_string(),
+        })?;
+    Ok(row
+        .map(|row| row.try_get::<bool>("", "allowed").unwrap_or(false))
+        .unwrap_or(false))
+}
+
+/// Revoke the three effective DML privileges from the old app role and from
+/// PUBLIC, then prove the revocation with `has_table_privilege` and a
+/// rolled-back write that must fail with `permission denied` while the fence
+/// is inactive.
+pub async fn revoke_legacy_dml(
+    db: &DatabaseConnection,
+    plan: &LegacyRolePlan,
+) -> Result<LegacyDmlRevocation, LegacyRoleError> {
+    if !plain_identifier(&plan.app_role) || !plain_identifier(&plan.maintenance_role) {
+        return Err(LegacyRoleError::InvalidRoleName);
+    }
+    if plan.app_role == plan.maintenance_role {
+        return Err(LegacyRoleError::SharedRole);
+    }
+    role_attributes(db, &plan.app_role)
+        .await?
+        .ok_or_else(|| LegacyRoleError::RoleMissing {
+            role: plan.app_role.clone(),
+        })?;
+    role_attributes(db, &plan.maintenance_role)
+        .await?
+        .ok_or_else(|| LegacyRoleError::RoleMissing {
+            role: plan.maintenance_role.clone(),
+        })?;
+    // The revocation is only meaningful while no fence hides the result.
+    let active = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM trace_legacy_writer_fence WHERE active",
+        ))
+        .await
+        .map_err(|error| LegacyRoleError::TransferFailed {
+            role: plan.maintenance_role.clone(),
+            reason: error.to_string(),
+        })?
+        .map(|row| row.try_get::<i64>("", "n").unwrap_or(0))
+        .unwrap_or(0);
+    if active > 0 {
+        return Err(LegacyRoleError::AppRoleStillPrivileged {
+            reason: "an active fence hides the DML revocation".to_owned(),
+        });
+    }
+    for table in LEGACY_TABLES {
+        db.execute_unprepared(&format!(
+            "REVOKE INSERT, UPDATE, DELETE ON {table} FROM {}",
+            plan.app_role
+        ))
+        .await
+        .map_err(|error| LegacyRoleError::TransferFailed {
+            role: plan.app_role.clone(),
+            reason: format!("{table}: {error}"),
+        })?;
+        db.execute_unprepared(&format!(
+            "REVOKE INSERT, UPDATE, DELETE ON {table} FROM PUBLIC"
+        ))
+        .await
+        .map_err(|error| LegacyRoleError::TransferFailed {
+            role: "PUBLIC".to_owned(),
+            reason: format!("{table}: {error}"),
+        })?;
+    }
+    // Inherited memberships can re-grant what was revoked from the role
+    // directly; this must fail loudly instead of reporting success.
+    for table in LEGACY_TABLES {
+        for privilege in ["INSERT", "UPDATE", "DELETE"] {
+            if effective_privilege(db, &plan.app_role, table, privilege).await? {
+                return Err(LegacyRoleError::InheritedGrant {
+                    table: table.to_owned(),
+                    privilege: privilege.to_owned(),
+                });
+            }
+        }
+    }
+    // The real oracle: an inactive fence plus a rolled-back write by the app
+    // role must be refused by the permission system, not by the barrier.
+    // The probe is schema-qualified: the old app role may legitimately have
+    // no `USAGE` on the schema, and the oracle here is the table DML grant.
+    let schema = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT current_schema() AS schema",
+        ))
+        .await
+        .map_err(|error| LegacyRoleError::TransferFailed {
+            role: plan.app_role.clone(),
+            reason: error.to_string(),
+        })?
+        .and_then(|row| row.try_get::<String>("", "schema").ok())
+        .unwrap_or_else(|| "public".to_owned());
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| LegacyRoleError::TransferFailed {
+            role: plan.app_role.clone(),
+            reason: error.to_string(),
+        })?;
+    txn.execute_unprepared(&format!("SET LOCAL ROLE {}", plan.app_role))
+        .await
+        .map_err(|error| LegacyRoleError::TransferFailed {
+            role: plan.app_role.clone(),
+            reason: error.to_string(),
+        })?;
+    let denied = txn
+        .execute_unprepared(&format!(
+            "INSERT INTO \"{schema}\".agent_capture_session
+             (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind)
+             VALUES ('d', 't', 'r', 'p', 'revocation-probe', 'external_capture')"
+        ))
+        .await;
+    let refused_by_permission = match &denied {
+        Err(error) => {
+            let text = error.to_string().to_ascii_lowercase();
+            text.contains("permission denied") || text.contains("42501")
+        }
+        Ok(_) => false,
+    };
+    let observed = match &denied {
+        Ok(_) => "the write succeeded".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    let _ = txn.rollback().await;
+    if !refused_by_permission {
+        return Err(LegacyRoleError::RevocationNotEffective {
+            table: format!("agent_capture_session ({observed})"),
+            privilege: "INSERT".to_owned(),
+        });
+    }
+    Ok(LegacyDmlRevocation {
+        app_role: plan.app_role.clone(),
+        tables_revoked: LEGACY_TABLES.len(),
+        insert_revoked: true,
+        update_revoked: true,
+        delete_revoked: true,
+        public_insert_revoked: true,
+        public_update_revoked: true,
+        public_delete_revoked: true,
+    })
 }
 
 /// Prepare ownership and prove the old app role cannot change the schema.
@@ -339,6 +538,173 @@ mod tests {
             LegacyRoleError::InvalidRoleName
         );
         cleanup(&db, &[&app, &maintenance]).await;
+        db.close().await.ok();
+    }
+}
+
+#[cfg(test)]
+mod revocation_tests {
+    use sea_orm::ConnectionTrait;
+
+    use super::{
+        LEGACY_TABLES, LegacyRoleError, LegacyRolePlan, prepare_legacy_roles, revoke_legacy_dml,
+    };
+    use crate::jupiter::{migration::apply_migrations, tests::test_db_connection};
+
+    async fn seeded_db() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&db, true).await.expect("migrations");
+        (temp_dir, db)
+    }
+
+    async fn create_role(db: &sea_orm::DatabaseConnection, role: &str) {
+        db.execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
+            .await
+            .ok();
+        db.execute_unprepared(&format!("CREATE ROLE {role} NOLOGIN"))
+            .await
+            .expect("create role");
+    }
+
+    async fn cleanup(db: &sea_orm::DatabaseConnection, roles: &[&str]) {
+        for table in LEGACY_TABLES {
+            let _ = db
+                .execute_unprepared(&format!("ALTER TABLE {table} OWNER TO CURRENT_USER"))
+                .await;
+        }
+        let _ = db
+            .execute_unprepared("ALTER FUNCTION trace_legacy_write_fence() OWNER TO CURRENT_USER")
+            .await;
+        for role in roles {
+            let _ = db
+                .execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
+                .await;
+        }
+    }
+
+    async fn table_privilege(
+        db: &sea_orm::DatabaseConnection,
+        role: &str,
+        table: &str,
+        privilege: &str,
+    ) -> bool {
+        db.query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Postgres,
+            "SELECT has_table_privilege($1, $2, $3) AS allowed",
+            [role.into(), table.into(), privilege.into()],
+        ))
+        .await
+        .expect("privilege lookup")
+        .expect("privilege row")
+        .try_get::<bool>("", "allowed")
+        .unwrap_or(true)
+    }
+
+    #[tokio::test]
+    async fn legacy_dml_revocation_removes_effective_grants() {
+        let (_temp_dir, db) = seeded_db().await;
+        let app = format!("mega2_l67_app_{}", std::process::id());
+        let maintenance = format!("mega2_l67_maint_{}", std::process::id());
+        create_role(&db, &app).await;
+        create_role(&db, &maintenance).await;
+        let plan = LegacyRolePlan {
+            app_role: app.clone(),
+            maintenance_role: maintenance.clone(),
+        };
+        prepare_legacy_roles(&db, &plan).await.expect("ownership");
+        // Give the old app role real DML, directly and through PUBLIC, then
+        // revoke it.
+        for table in LEGACY_TABLES {
+            db.execute_unprepared(&format!("GRANT INSERT, UPDATE, DELETE ON {table} TO {app}"))
+                .await
+                .expect("grant app");
+            db.execute_unprepared(&format!(
+                "GRANT INSERT, UPDATE, DELETE ON {table} TO PUBLIC"
+            ))
+            .await
+            .expect("grant public");
+        }
+        let revoked = revoke_legacy_dml(&db, &plan).await.expect("revoke");
+        assert_eq!(revoked.tables_revoked, 12);
+        for table in LEGACY_TABLES {
+            for privilege in ["INSERT", "UPDATE", "DELETE"] {
+                assert!(
+                    !table_privilege(&db, &app, table, privilege).await,
+                    "{app} still has {privilege} on {table}"
+                );
+                let public_allowed = db
+                    .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT has_table_privilege('public', $1, $2) AS allowed",
+                        [table.into(), privilege.into()],
+                    ))
+                    .await
+                    .expect("public privilege")
+                    .expect("public row")
+                    .try_get::<bool>("", "allowed")
+                    .unwrap_or(true);
+                assert!(!public_allowed, "PUBLIC still has {privilege} on {table}");
+            }
+        }
+        cleanup(&db, &[&app, &maintenance]).await;
+        db.close().await.ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_dml_revocation_rejects_inherited_grants_and_active_fence() {
+        let (_temp_dir, db) = seeded_db().await;
+        let app = format!("mega2_l67_inherit_{}", std::process::id());
+        let parent = format!("mega2_l67_parent_{}", std::process::id());
+        let maintenance = format!("mega2_l67_maint2_{}", std::process::id());
+        for role in [&app, &parent, &maintenance] {
+            create_role(&db, role).await;
+        }
+        let plan = LegacyRolePlan {
+            app_role: app.clone(),
+            maintenance_role: maintenance.clone(),
+        };
+        prepare_legacy_roles(&db, &plan).await.expect("ownership");
+        db.execute_unprepared(&format!(
+            "GRANT INSERT ON agent_capture_session TO {parent}"
+        ))
+        .await
+        .expect("grant parent");
+        db.execute_unprepared(&format!("GRANT {parent} TO {app}"))
+            .await
+            .expect("membership");
+        let error = revoke_legacy_dml(&db, &plan)
+            .await
+            .expect_err("an inherited grant must block");
+        assert!(matches!(error, LegacyRoleError::InheritedGrant { .. }));
+
+        db.execute_unprepared(&format!("REVOKE {parent} FROM {app}"))
+            .await
+            .expect("revoke membership");
+        db.execute_unprepared(&format!("GRANT INSERT ON agent_capture_session TO {app}"))
+            .await
+            .expect("grant app");
+        db.execute_unprepared(
+            "INSERT INTO trace_legacy_purge
+             (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+             VALUES ('11111111-1111-4111-8111-111111111111', 'b', 'l', 'd', 'm', 'frozen')",
+        )
+        .await
+        .expect("journal");
+        db.execute_unprepared(
+            "INSERT INTO trace_legacy_writer_fence (id, purge_id, deployment_id, active)
+             VALUES ('22222222-2222-4222-8222-222222222222', '11111111-1111-4111-8111-111111111111', 'd', TRUE)",
+        )
+        .await
+        .expect("fence");
+        let error = revoke_legacy_dml(&db, &plan)
+            .await
+            .expect_err("an active fence must block the revocation");
+        assert!(matches!(
+            error,
+            LegacyRoleError::AppRoleStillPrivileged { .. }
+        ));
+        cleanup(&db, &[&app, &parent, &maintenance]).await;
         db.close().await.ok();
     }
 }
