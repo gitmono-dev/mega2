@@ -38,7 +38,7 @@ impl ObjectKey {
     pub fn default_sharding(&self) -> String {
         if matches!(
             self.namespace,
-            ObjectNamespace::Media | ObjectNamespace::Agent | ObjectNamespace::Traces
+            ObjectNamespace::Media | ObjectNamespace::Traces
         ) {
             return format!("{}/{}", self.namespace, self.key);
         }
@@ -127,8 +127,6 @@ pub enum ObjectNamespace {
     Oci,
     /// FastCDC Media objects (`docs/refactoring/fastcdc-media.md`).
     Media,
-    /// Agent Capture objects (`docs/refactoring/agent-capture.md`).
-    Agent,
     /// Immutable receipts minted by the full-stream chunk-map verifier.
     ChunkMapReceipt,
     /// Raw traces Git objects (`docs/refactoring/traces.md` §3).
@@ -145,7 +143,6 @@ impl ObjectNamespace {
             ObjectNamespace::Attachment => "attachment",
             ObjectNamespace::Oci => "oci",
             ObjectNamespace::Media => "media",
-            ObjectNamespace::Agent => "agent",
             ObjectNamespace::ChunkMapReceipt => "chunk-map-receipt",
             ObjectNamespace::Traces => "traces",
         }
@@ -634,7 +631,6 @@ mod tests {
             ObjectNamespace::Attachment,
             ObjectNamespace::Oci,
             ObjectNamespace::Media,
-            ObjectNamespace::Agent,
             ObjectNamespace::ChunkMapReceipt,
             ObjectNamespace::Traces,
         ] {
@@ -659,7 +655,6 @@ mod tests {
         assert_eq!(ObjectNamespace::Attachment.to_string(), "attachment");
         assert_eq!(ObjectNamespace::Oci.to_string(), "oci");
         assert_eq!(ObjectNamespace::Media.to_string(), "media");
-        assert_eq!(ObjectNamespace::Agent.to_string(), "agent");
         assert_eq!(
             ObjectNamespace::ChunkMapReceipt.to_string(),
             "chunk-map-receipt"
@@ -668,11 +663,11 @@ mod tests {
     }
 
     #[test]
-    fn traces_namespace_is_not_agent() {
-        assert_ne!(ObjectNamespace::Traces, ObjectNamespace::Agent);
+    fn traces_namespace_is_not_log() {
+        assert_ne!(ObjectNamespace::Traces, ObjectNamespace::Log);
         assert_ne!(
             ObjectNamespace::Traces.to_string(),
-            ObjectNamespace::Agent.to_string()
+            ObjectNamespace::Log.to_string()
         );
         let key = ObjectKey {
             namespace: ObjectNamespace::Traces,
@@ -680,7 +675,7 @@ mod tests {
         };
         let path = key.default_sharding();
         assert!(path.starts_with("traces/"), "{path}");
-        assert!(!path.starts_with("agent/"), "{path}");
+        assert!(!path.starts_with("log/"), "{path}");
         assert_eq!(
             path,
             "traces/v1/11111111-1111-4111-8111-111111111111/objects/sha1/ab/cd/ef/0123"
@@ -718,9 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_namespace_as_str() {
-        assert_eq!(ObjectNamespace::Agent.to_string(), "agent");
-    }
+    fn agent_namespace_as_str() {}
 
     #[test]
     fn validate_accepts_typical_and_multi_segment_keys() {

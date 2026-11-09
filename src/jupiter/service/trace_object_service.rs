@@ -510,14 +510,14 @@ mod tests {
             .inner
             .put_stream(
                 &ObjectKey {
-                    namespace: ObjectNamespace::Agent,
+                    namespace: ObjectNamespace::Log,
                     key: traces_key.key,
                 },
-                b"agent-namespace-bytes".to_vec().into_stream(),
+                b"log-namespace-bytes".to_vec().into_stream(),
                 ObjectMeta::default(),
             )
             .await
-            .expect("agent plant");
+            .expect("log plant");
         service
             .put_raw(STREAM_B, "sha1", OID_SHA1, &other)
             .await

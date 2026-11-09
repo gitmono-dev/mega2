@@ -38,6 +38,15 @@ const STAGE_28_FORBIDDEN: [&str; 7] = [
     "token_covers_capture_repo",
 ];
 
+/// Stage 35: the removed legacy object namespace.
+const STAGE_35_FORBIDDEN: [&str; 2] = ["ObjectNamespace::Agent", "ObjectNamespace :: Agent"];
+
+/// Stage 35 allowlist: nothing may still name the removed namespace.
+const STAGE_35_ALLOWLIST: [&str; 2] = [
+    "tests/common/traces_retirement_inventory.rs",
+    "tests/integration_traces.rs",
+];
+
 /// Stage 27: the removed legacy config model and section. The storage-event
 /// filter names and Capture event kinds stay with MTR-57.
 const STAGE_27_FORBIDDEN: [&str; 4] = [
@@ -144,4 +153,9 @@ pub fn scan_stage_27(repo_root: &Path) -> Result<Vec<String>, String> {
 /// Stage 57 scan (removed Capture events and target filters).
 pub fn scan_stage_57(repo_root: &Path) -> Result<Vec<String>, String> {
     scan(repo_root, &STAGE_57_FORBIDDEN, &STAGE_57_ALLOWLIST)
+}
+
+/// Stage 35 scan (removed legacy object namespace).
+pub fn scan_stage_35(repo_root: &Path) -> Result<Vec<String>, String> {
+    scan(repo_root, &STAGE_35_FORBIDDEN, &STAGE_35_ALLOWLIST)
 }

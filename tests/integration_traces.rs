@@ -16872,3 +16872,58 @@ fn legacy_retirement_stage_57() {
         "non-allowlisted legacy event symbols: {hits:?}"
     );
 }
+
+/// MTR-35 namespace gate: the legacy `agent` object namespace is gone from the
+/// public object-storage surface, the remaining namespaces keep their stable
+/// strings and sharding, and the maintenance locator still addresses `agent/`
+/// prefixes literally.
+#[test]
+fn legacy_namespace_removed_public_surface() {
+    use mega2_core::orbit_api::object_storage::{ObjectKey, ObjectNamespace};
+    for (namespace, name, sharded) in [
+        (ObjectNamespace::Git, "git", "git/ab/cd/ef/g"),
+        (ObjectNamespace::Lfs, "lfs", "lfs/ab/cd/ef/g"),
+        (
+            ObjectNamespace::Media,
+            "media",
+            "media/fastcdc-v2020-32k/scope",
+        ),
+        (
+            ObjectNamespace::Traces,
+            "traces",
+            "traces/v1/11111111-1111-4111-8111-111111111111/objects/sha1/ab",
+        ),
+    ] {
+        assert_eq!(namespace.to_string(), name);
+        let key = match namespace {
+            ObjectNamespace::Git | ObjectNamespace::Lfs => "abcdefg",
+            ObjectNamespace::Media => "fastcdc-v2020-32k/scope",
+            _ => "v1/11111111-1111-4111-8111-111111111111/objects/sha1/ab",
+        };
+        let path = ObjectKey {
+            namespace,
+            key: key.to_owned(),
+        }
+        .default_sharding();
+        assert_eq!(path, sharded);
+        assert!(!path.starts_with("agent/"), "{path}");
+    }
+    // AC-3: the maintenance locator still uses literal `agent/` prefixes.
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/jupiter/service/trace_legacy_inventory.rs"),
+    )
+    .expect("inventory source");
+    assert!(source.contains("agent/raw/"), "maintenance locator lost");
+}
+
+/// MTR-35 stage scanner: no source still names `ObjectNamespace::Agent`.
+#[test]
+fn legacy_retirement_stage_35() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_35(root).expect("stage 35 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy namespace symbols: {hits:?}"
+    );
+}
