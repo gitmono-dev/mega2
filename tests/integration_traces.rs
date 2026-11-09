@@ -16779,3 +16779,84 @@ fn legacy_retirement_stage_28() {
         assert!(!root.join(removed).exists(), "{removed} must be gone");
     }
 }
+
+/// MTR-27 config retirement: a raw TOML file carrying `[agent_capture]` is
+/// rejected with the removal guidance, the removed environment override is
+/// rejected too, and the shipped samples no longer carry the section or its
+/// Capture event/filter names.
+#[test]
+fn legacy_config_events_removed_loader_rejects() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config = temp.path().join("removed.toml");
+    std::fs::write(
+        &config,
+        "[agent_capture]\nenabled = false\ntenant_id = \"default\"\n",
+    )
+    .expect("config");
+    let rejected = std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .output()
+        .expect("run config validate");
+    assert!(!rejected.status.success(), "the removed section must fail");
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("[agent_capture] section was removed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("/api/v1/traces"), "{stderr}");
+
+    // The removed environment override is rejected on the same load path.
+    let good = temp.path().join("good.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample");
+    std::fs::write(&good, sample).expect("good config");
+    let env_rejected = std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .arg("--config")
+        .arg(&good)
+        .args(["config", "validate"])
+        .env("MEGA_AGENT_CAPTURE__ENABLED", "true")
+        .output()
+        .expect("run env validate");
+    assert!(!env_rejected.status.success(), "the env override must fail");
+    assert!(String::from_utf8_lossy(&env_rejected.stderr).contains("MEGA_AGENT_CAPTURE__"));
+
+    // The three shipped samples no longer carry the removed section or its
+    // Capture event/filter names.
+    for name in [
+        "config/config.toml",
+        "config/config-review.toml",
+        "config/config-storage-only.toml",
+    ] {
+        let text =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name))
+                .expect("sample");
+        for forbidden in [
+            "[agent_capture]",
+            "agent_capture.ingest_tokens",
+            "agent_capture.events.committed",
+            "agent_capture.checkpoint.committed",
+            "agent_tenants",
+            "agent_repo_paths",
+        ] {
+            assert!(!text.contains(forbidden), "{name} still has {forbidden}");
+        }
+    }
+}
+
+/// MTR-27 stage scanner: no removed legacy config symbol survives outside the
+/// removal guard and the retirement assertions.
+#[test]
+fn legacy_retirement_stage_27() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_27(root).expect("stage 27 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy config symbols: {hits:?}"
+    );
+    let model = std::fs::read_to_string(root.join("src/config/model.rs")).expect("model");
+    assert!(!model.contains("AgentCaptureConfig"));
+}

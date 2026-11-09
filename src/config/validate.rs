@@ -143,7 +143,6 @@ impl Config {
         reject_legacy_oauth_environment()?;
         reject_legacy_mail_environment()?;
         validate_trunk_config_surface(self)?;
-        validate_agent_capture_config(self)?;
         validate_storage_events_config(self)?;
         validate_github_sync_config(self)?;
         validate_traces_config(&self.traces)?;
@@ -720,34 +719,6 @@ pub(crate) fn validate_trunk_config_surface(config: &Config) -> Result<(), MegaE
              Distribution surface is only mounted in storage-only deployments"
                 .to_string(),
         ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_agent_capture_config(config: &Config) -> Result<(), MegaError> {
-    let capture = &config.agent_capture;
-    if capture.enabled && !config.git.storage_only() {
-        return Err(MegaError::Other(
-            "[agent_capture] enabled=true requires git.push_auth (storage-only); \
-             the /api/v1/agent-capture surface is only mounted in storage-only deployments"
-                .to_string(),
-        ));
-    }
-    if capture.enabled && capture.ingest_tokens.is_empty() {
-        return Err(MegaError::Other(
-            "[agent_capture] enabled=true requires at least one [[agent_capture.ingest_tokens]] entry"
-                .to_string(),
-        ));
-    }
-    for token in &capture.ingest_tokens {
-        if let Some(token_tenant) = &token.tenant_id
-            && token_tenant != &capture.tenant_id
-        {
-            return Err(MegaError::Other(
-                "[[agent_capture.ingest_tokens]].tenant_id must equal [agent_capture].tenant_id"
-                    .to_string(),
-            ));
-        }
     }
     Ok(())
 }
@@ -1695,6 +1666,44 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
 ///
 /// `[oauth]` is a recognized section (`OAuthConfig`) with strongly-typed keys;
 /// unknown keys under the section fail like any other section.
+/// The legacy `[agent_capture]` section was removed with the Capture HTTP
+/// surface. It must not be silently ignored: a config that still carries it
+/// (or its environment override) is rejected with the replacement guidance.
+pub fn reject_removed_agent_capture_section(value: &Value) -> Result<(), MegaError> {
+    if value
+        .as_table()
+        .is_some_and(|table| table.contains_key("agent_capture"))
+    {
+        return Err(MegaError::Other(
+            "the [agent_capture] section was removed: legacy Capture HTTP ingestion is retired; \
+             upload agent history through scoped traces Git (refs/libra/traces) and query it \
+             through /api/v1/traces"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The removed section must not be injectable through `MEGA_AGENT_CAPTURE__*`
+/// environment keys on any load path.
+pub(crate) fn reject_legacy_agent_capture_environment() -> Result<(), MegaError> {
+    const PREFIX: &str = "MEGA_AGENT_CAPTURE__";
+    let mut found: Vec<String> = std::env::vars_os()
+        .filter_map(|(key, _)| {
+            let key = key.to_string_lossy();
+            key.starts_with(PREFIX).then(|| key.into_owned())
+        })
+        .collect();
+    found.sort();
+    if let Some(first) = found.first() {
+        return Err(MegaError::Other(format!(
+            "{first} targets the removed [agent_capture] section; legacy Capture ingestion is \
+             retired, use scoped traces Git and /api/v1/traces"
+        )));
+    }
+    Ok(())
+}
+
 pub fn reject_unknown_fields(value: &Value) -> Result<(), MegaError> {
     let mut errors = Vec::new();
 

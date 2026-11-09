@@ -178,7 +178,7 @@ rejects loopback/private/link-local/metadata/mixed results, pins the
 connection to that verified address, and keeps the original hostname for TLS
 SNI. All six source hooks are installed (WH-03..WH-08): `repo.push`,
 `oci.manifest.published`, `lfs.object.uploaded`, `lfs.media.finalized`,
-`agent_capture.events.committed` and `agent_capture.checkpoint.committed`.
+`agent_capture.events.committed` and `agent_capture.checkpoint.committed` are retired with the legacy Capture events (their removal from the storage-event model belongs to MTR-57).
 See [`storage-events.md`](storage-events.md) for the per-source commit points
 and the registered coverage gaps.
 

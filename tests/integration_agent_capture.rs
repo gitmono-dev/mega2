@@ -351,25 +351,17 @@ fn seed_target_secret(env: &CaptureEnv) {
     );
 }
 
-fn storage_only_append(deployment_id: &str) -> String {
-    format!(
-        r#"
+fn storage_only_append(_deployment_id: &str) -> String {
+    r#"
 [git]
 anonymous_access = true
 push_auth = "none"
 ssh_receive_pack = false
 
-[agent_capture]
-enabled = true
-tenant_id = "default"
-deployment_id = "{deployment_id}"
-
-[[agent_capture.ingest_tokens]]
-name = "hook"
-token = "{INGEST_TOKEN}"
-paths = ["/third-part"]
+# The legacy [agent_capture] section is removed (MTR-27); this retirement
+# fixture boots without it on purpose.
 "#
-    )
+    .to_owned()
 }
 
 fn boot_storage_only(env: &CaptureEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) {

@@ -143,7 +143,6 @@ impl Config {
             oauth: None,
             git: GitConfig::default(),
             oci: OciConfig::default(),
-            agent_capture: AgentCaptureConfig::default(),
             storage_events: StorageEventsConfig::default(),
             github_sync: GithubSyncConfig::default(),
             cedar: CedarConfig::default(),
@@ -156,6 +155,8 @@ impl Config {
         // let the `config` crate produce the original, redacted parse error
         // when it does not.
         if let Ok(value) = toml::from_str::<toml::Value>(content) {
+            validate::reject_removed_agent_capture_section(&value)
+                .map_err(|e| ConfigError::Message(e.to_string()))?;
             validate::reject_unknown_fields(&value)
                 .map_err(|e| ConfigError::Message(e.to_string()))?;
         }

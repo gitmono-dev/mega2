@@ -983,20 +983,13 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         )))
 }
 
-pub(crate) fn mount_agent_capture(config: &Config) -> bool {
-    config.git.storage_only() && config.agent_capture.enabled
-}
-
 pub(crate) fn mount_views(config: &Config) -> bool {
     config.views.enabled
 }
 
 pub(crate) fn storage_only_api_v1(config: &Config) -> OpenApiRouter<MonoApiServiceState> {
     with_traces(
-        api_router::storage_only_routers_with_views(
-            mount_agent_capture(config),
-            mount_views(config),
-        ),
+        api_router::storage_only_routers_with_views(false, mount_views(config)),
         config,
     )
 }

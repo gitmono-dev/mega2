@@ -38,6 +38,24 @@ const STAGE_28_FORBIDDEN: [&str; 7] = [
     "token_covers_capture_repo",
 ];
 
+/// Stage 27: the removed legacy config model and section. The storage-event
+/// filter names and Capture event kinds stay with MTR-57.
+const STAGE_27_FORBIDDEN: [&str; 4] = [
+    "AgentCaptureConfig",
+    "AgentCaptureIngestTokenConfig",
+    "agent_capture.ingest_tokens",
+    "MEGA_AGENT_CAPTURE__",
+];
+
+/// Stage 27 allowlist: the removal guard names what it rejects, and the
+/// retirement tests prove the names are gone.
+const STAGE_27_ALLOWLIST: [&str; 4] = [
+    "src/config/validate.rs",
+    "tests/common/traces_retirement_inventory.rs",
+    "tests/integration_traces.rs",
+    "tests/integration_agent_capture.rs",
+];
+
 /// Stage 28 allowlist: the scanner itself and the retirement assertions that
 /// name the removed paths to prove they are gone.
 const STAGE_28_ALLOWLIST: [&str; 2] = [
@@ -98,4 +116,9 @@ pub fn scan_stage_26(repo_root: &Path) -> Result<Vec<String>, String> {
 /// Stage 28 scan (legacy internal runtime).
 pub fn scan_stage_28(repo_root: &Path) -> Result<Vec<String>, String> {
     scan(repo_root, &STAGE_28_FORBIDDEN, &STAGE_28_ALLOWLIST)
+}
+
+/// Stage 27 scan (removed legacy config and event names).
+pub fn scan_stage_27(repo_root: &Path) -> Result<Vec<String>, String> {
+    scan(repo_root, &STAGE_27_FORBIDDEN, &STAGE_27_ALLOWLIST)
 }
