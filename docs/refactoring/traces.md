@@ -955,7 +955,14 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 旧 Capture 12 表及其全部所属对象（raw、redacted、staging 及可信清单确认的历史前缀）**全部删除，不迁移**；用户已明确选择这一策略。先通过 H5，再执行限定作用域、可恢复的清除流程，最后以 H6 放行终态。不能把所有共享 bucket 的 `agent/` 当可删除范围。
 
-`mega2 traces purge-legacy-capture` 维护操作流程：建立跨实例持久 writer fence → 根据可信维护清单冻结获授权 deployment/tenant 拥有的 backend 指纹及全部旧对象前缀 → 持久 journal 保存 inventory/cursor/retry 与所有删除意图（包括旧作用域中的无 DB 引用 orphan）→ 分批删除并复扫 → 完成收据 → 守卫迁移 DROP 12 表。前缀必须覆盖旧 blob 的所有 visibility，而非仅 raw：登记 raw/redacted/staging、DB 中实际派生键及可信历史清单确认的遗留项；未知 ownership 或前缀阻断清除，不猜测扩大共享 bucket 范围。fence 须由 DB 级触发器/权限屏障阻止旧12表的 runtime DML，不能只让新二进制查询 fence；维护 journal/清除角色不被该屏障阻塞。还须停旧入口、冻结部署控制面、核对所有实例并等待既有 lease/in-flight 写入终止，以受控旧 image 重启与旧凭据写探针证明不能继续产生旧对象；有独立对象存储写权限时须撤销旧作用域 PUT 权限（保留维护删除权限）。只有 DB 屏障但旧进程仍能创建 orphan 对象不能放行 inventory。旧 DB 不记录历史 backend，维护清单须对照当前配置、DB、历史部署位置和运维声明，任一历史存储位置未核实就不能宣称全部清除。receipt 必须绑定冻结 inventory、backend、scopes 与 fence；变更作用域或存储后必须重新审计，不能沿用旧 receipt。
+
+
+**持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
+- `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
+- `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；
+- `trace_legacy_writer_fence`：每个 journal 至多一行（`purge_id` 唯一外键），`active` 时由 DB 函数 `trace_legacy_write_fence()` 经 12 张旧表的 BEFORE INSERT/UPDATE/DELETE trigger 拒绝 runtime DML；无 active fence 时旧写行为不变。
+该迁移的 `down` 是显式 no-op：journal、items 与 fence 是破坏性清除的持久记录，回滚不得静默遗忘。schema-only 门为 `purge_schema_`，实体/migration 的 `db_contract` 门覆盖 fingerprint/location、version/generation、fence 唯一约束与 barrier 行为。
+建立跨实例持久 writer fence → 根据可信维护清单冻结获授权 deployment/tenant 拥有的 backend 指纹及全部旧对象前缀 → 持久 journal 保存 inventory/cursor/retry 与所有删除意图（包括旧作用域中的无 DB 引用 orphan）→ 分批删除并复扫 → 完成收据 → 守卫迁移 DROP 12 表。前缀必须覆盖旧 blob 的所有 visibility，而非仅 raw：登记 raw/redacted/staging、DB 中实际派生键及可信历史清单确认的遗留项；未知 ownership 或前缀阻断清除，不猜测扩大共享 bucket 范围。fence 须由 DB 级触发器/权限屏障阻止旧12表的 runtime DML，不能只让新二进制查询 fence；维护 journal/清除角色不被该屏障阻塞。还须停旧入口、冻结部署控制面、核对所有实例并等待既有 lease/in-flight 写入终止，以受控旧 image 重启与旧凭据写探针证明不能继续产生旧对象；有独立对象存储写权限时须撤销旧作用域 PUT 权限（保留维护删除权限）。只有 DB 屏障但旧进程仍能创建 orphan 对象不能放行 inventory。旧 DB 不记录历史 backend，维护清单须对照当前配置、DB、历史部署位置和运维声明，任一历史存储位置未核实就不能宣称全部清除。receipt 必须绑定冻结 inventory、backend、scopes 与 fence；变更作用域或存储后必须重新审计，不能沿用旧 receipt。
 
 12 表容纳多个 deployment/tenant，整表 DROP 不得凭单个 scope 的完成收据放行。任何破坏性删除前，preflight 须证明该数据库全部旧 scope 均属于这次明确授权的维护集合；未获授权 scope 或不明归属存在即阻断，等待具名 owner 的可信维护交接。多 owner 仅在各自授权 scope 全部完成且跨实例 fence 覆盖同一数据库后，才能生成覆盖全库 scope 的 aggregate receipt；guarded DROP 重新核验没有集合外的旧行。共享 bucket 中不属于这组 scope 的对象、新 traces 和旧 Git traces 一律排除。
 

@@ -542,3 +542,7 @@ C 段的生产路径及本卡新增生产代码均不调用它：`blob_path_inde
 `push_queue_storage.rs` 无此调用，`push_queue_service.rs` 与 `mono_storage.rs`
 的命中只在测试模块内。启用视图的物化链回归按 ADR-HP-11 重跑 N=1 三轮快进与
 N>1 squash 对齐两例并增加 I3；其他缺省配置下的 trunk 用例仍由全量门覆盖。
+
+### 旧 Capture 清除 schema（MTR-23）
+
+`cargo nextest run --test integration_traces -E "test(/^purge_schema_/)"` 只通过真实迁移 runner 观察 catalog：三张 journal 表、其命名约束与 12 张旧表上的 `*_legacy_write_fence` trigger。实体级 `db_contract` 门另行验证 fence 的 `purge_id` 唯一外键及 active/inactive 下的 barrier 行为；该测试不执行任何清除或 DROP。

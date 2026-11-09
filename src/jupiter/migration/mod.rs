@@ -161,6 +161,7 @@ mod m20261009_000100_upgrade_qualified_publication_handoff;
 mod m20261015_000100_trace_identity;
 mod m20261015_000200_trace_publication;
 mod m20261015_000300_trace_projection;
+mod m20261015_000400_trace_legacy_purge;
 pub(crate) mod qualified_native_runtime_upgrade;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
@@ -360,6 +361,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261015_000100_trace_identity::Migration),
             Box::new(m20261015_000200_trace_publication::Migration),
             Box::new(m20261015_000300_trace_projection::Migration),
+            Box::new(m20261015_000400_trace_legacy_purge::Migration),
         ]
     }
 }
@@ -1363,6 +1365,7 @@ mod tests {
             "m20261015_000100_trace_identity",
             "m20261015_000200_trace_publication",
             "m20261015_000300_trace_projection",
+            "m20261015_000400_trace_legacy_purge",
         ]
         .map(str::to_owned);
         assert_eq!(

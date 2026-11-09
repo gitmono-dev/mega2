@@ -15732,3 +15732,77 @@ mod interop_history {
         );
     }
 }
+
+/// MTR-23 schema-only gate: the purge journal, its inventory items and the
+/// writer fence are created with a barrier trigger on every legacy Capture
+/// table. The case only observes catalog state and the fence behavior.
+#[tokio::test]
+async fn purge_schema_journal_items_and_fence_contract() {
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let tables = [
+        ("trace_legacy_purge", Some("trace_legacy_purge_id_uuid")),
+        (
+            "trace_legacy_purge_item",
+            Some("trace_legacy_purge_item_natural_key"),
+        ),
+        (
+            "trace_legacy_writer_fence",
+            Some("trace_legacy_writer_fence_released"),
+        ),
+    ];
+    for (table, constraint) in tables {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass($1) IS NOT NULL AS present",
+                [format!("public.{table}").into()],
+            ))
+            .await
+            .expect("table lookup")
+            .expect("table row");
+        assert!(
+            row.try_get::<bool>("", "present").unwrap(),
+            "{table} missing"
+        );
+        if let Some(constraint) = constraint {
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT count(*) AS n FROM pg_constraint WHERE conname = $1",
+                    [constraint.into()],
+                ))
+                .await
+                .expect("constraint lookup")
+                .expect("constraint row");
+            assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1, "{constraint}");
+        }
+    }
+    for table in [
+        "agent_capture_session",
+        "agent_capture_event",
+        "agent_capture_source_stream",
+        "agent_capture_checkpoint",
+        "agent_capture_file_op",
+        "agent_capture_blob",
+        "agent_capture_blob_ref",
+        "agent_capture_ingest_receipt",
+        "agent_capture_stream_blob",
+        "agent_capture_access_audit",
+        "agent_capture_tombstone",
+        "agent_capture_deletion_ledger",
+    ] {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS n FROM pg_trigger WHERE tgname = $1 AND NOT tgisinternal",
+                [format!("{table}_legacy_write_fence").into()],
+            ))
+            .await
+            .expect("trigger lookup")
+            .expect("trigger row");
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1, "{table} barrier");
+    }
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}
