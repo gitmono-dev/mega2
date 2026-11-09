@@ -213,6 +213,41 @@ pub(crate) async fn exec(
             );
             Ok(())
         }
+        "drop" => {
+            // A repeated maintenance call is a no-op even though the legacy
+            // tables are already gone.
+            if crate::jupiter::migration::traces_maintenance::drop_legacy_capture::
+                maintenance_applied(connection.as_ref())
+                .await
+                .map_err(|error| MegaError::cli_exit(1, error.to_string()))?
+            {
+                println!("drop {} dropped=false already_applied=true", journal);
+                return Ok(());
+            }
+            let adapter =
+                crate::orbit::factory::ObjectStorageFactory::build_adapter(&config.object_storage)
+                    .await
+                    .map_err(|error| MegaError::cli_exit(1, error.to_string()))?;
+            let receipt =
+                verify_receipt_file(connection.as_ref(), &adapter, &journal, &manifest_path)
+                    .await
+                    .map_err(|error| MegaError::cli_exit(1, error))?;
+            let outcome =
+                crate::jupiter::migration::traces_maintenance::drop_legacy_capture::execute(
+                    connection.as_ref(),
+                    &receipt,
+                )
+                .await
+                .map_err(|error| MegaError::cli_exit(1, error.to_string()))?;
+            println!(
+                "drop {} dropped={} already_applied={} receipt={}",
+                journal,
+                outcome.dropped,
+                outcome.already_applied,
+                receipt.digest()
+            );
+            Ok(())
+        }
         other => Err(MegaError::cli_exit(
             1,
             format!("purge-legacy-capture --action {other} is not wired in this release"),

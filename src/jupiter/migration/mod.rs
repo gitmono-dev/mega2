@@ -164,6 +164,7 @@ mod m20261015_000300_trace_projection;
 mod m20261015_000400_trace_legacy_purge;
 pub(crate) mod qualified_native_runtime_upgrade;
 mod runner;
+pub mod traces_maintenance;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
 

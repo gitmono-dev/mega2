@@ -975,6 +975,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 **Verified 完成 receipt（MTR-44）：** `trace_legacy_receipt::verify_purge_complete` 只有在以下条件全部成立时才构造 `VerifiedLegacyPurgeReceipt`（字段私有，仅该函数可构造）：journal 为 `frozen`；存在属于该 journal 的 active fence；journal backend fingerprint 与冻结 manifest 完全一致；MTR-62 全库 scope preflight 通过（unknown/未授权 scope 阻断）；inventory 的每个 item 都已 `deleted_at`（并生成冻结 inventory digest）；逐冻结前缀复扫为空；历史部署位置全部已声明且非 `unknown`；云 backend 的历史 version/generation 无法由该连接证明时一律阻断（Local 无版本，故可直接验证）；空安装必须先由维护者显式声明 `empty_inventory_verified=true` 才能产生 Verified receipt。receipt digest 绑定 journal、fence、aggregate scope digest、inventory digest 与 backend fingerprint，由 MTR-32 的 guarded DROP 消费；本模块只用明确 SQL 与 manifest，不引用旧 Capture entity。
 
+**guarded DROP（MTR-32）：** 12 张旧表只由显式 maintenance migrator `TracesMaintenanceMigrator` 删除，普通启动 `Migrator::migrations()` 只保留历史 add migration（不依赖清除完成即可启动）。真实删除经 `drop_legacy_capture::execute`：只接受 MTR-44 的 `VerifiedLegacyPurgeReceipt`，执行前重验 journal 仍 `frozen`、receipt 的 fence 仍 active、当前 inventory digest 与 receipt 一致；12 表在**单事务**内 DROP，成功后写入独立 ledger `traces_maintenance_schema_migrations` 的版本行，失败则整体回滚且不记 ledger。重复调用在 ledger 已存在时直接幂等返回；maintenance migrator 的 `up` 无 receipt 时 fail-closed，`down` 为显式 no-op。
+
 **持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
 - `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
 - `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；

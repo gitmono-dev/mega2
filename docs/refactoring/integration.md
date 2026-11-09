@@ -546,3 +546,7 @@ N>1 squash 对齐两例并增加 I3；其他缺省配置下的 trunk 用例仍�
 ### 旧 Capture 清除 schema（MTR-23）
 
 `cargo nextest run --test integration_traces -E "test(/^purge_schema_/)"` 只通过真实迁移 runner 观察 catalog：三张 journal 表、其命名约束与 12 张旧表上的 `*_legacy_write_fence` trigger。实体级 `db_contract` 门另行验证 fence 的 `purge_id` 唯一外键及 active/inactive 下的 barrier 行为；该测试不执行任何清除或 DROP。
+
+### Legacy schema maintenance migrator (MTR-32)
+
+`jupiter::migration::traces_maintenance::TracesMaintenanceMigrator` is the only migrator that carries `drop_legacy_capture`; the normal startup migrator keeps the historic add migration. The maintenance ledger is `traces_maintenance_schema_migrations`, written only after the single-transaction DROP succeeds. `cargo test --test integration_traces -E "test(/^legacy_drop_guard_/)"` is the black-box gate.

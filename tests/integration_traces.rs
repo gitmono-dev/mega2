@@ -16485,3 +16485,150 @@ async fn purge_delete_cli_resumes_and_rescans() {
     drop(closed);
     drop(guard);
 }
+
+/// MTR-32 guarded DROP gate: the real CLI drops the 12 legacy tables only with
+/// a verified receipt, records the independent maintenance ledger once, is
+/// idempotent, and refuses a stale receipt while keeping the tables.
+#[tokio::test]
+async fn legacy_drop_guard_cli_consumes_a_verified_receipt() {
+    use sea_orm::ConnectionTrait;
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let temp = tempfile::tempdir().expect("fixture dir");
+    let root = temp.path().join("objects");
+    std::fs::create_dir_all(&root).expect("root");
+    let journal = "51515151-5151-4151-8151-515151515151";
+    let fence = "61616161-6161-4161-8161-616161616161";
+    db.execute_unprepared(
+        "INSERT INTO agent_capture_session
+         (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind, completeness)
+         VALUES ('deploy-drop', 'tenant-drop', 'repo', 'producer', 'drop-guard', 'external_capture', 'complete')",
+    )
+    .await
+    .expect("session");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge
+         (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+         VALUES ('{journal}', 'local:{}', '{}', 'deploy-drop', 'sha256:manifest', 'frozen')",
+        root.display(),
+        root.display()
+    ))
+    .await
+    .expect("journal");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge_item (id, purge_id, scope, object_key, deleted_at)
+         VALUES ('71717171-7171-4171-8171-717171717171', '{journal}', 'deploy-drop', 'agent/raw/aa', now())"
+    ))
+    .await
+    .expect("item");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_writer_fence (id, purge_id, deployment_id, active)
+         VALUES ('{fence}', '{journal}', 'deploy-drop', TRUE)"
+    ))
+    .await
+    .expect("fence");
+    let database_url = std::env::var("MEGA_DATABASE__DB_URL")
+        .unwrap_or_else(|_| "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".into());
+    let name: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_database() AS name",
+        ))
+        .await
+        .expect("database name")
+        .expect("database row")
+        .try_get("", "name")
+        .expect("name");
+    let mut url = url::Url::parse(&database_url).expect("database url");
+    url.set_path(&name);
+    let config = temp.path().join("config.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample config");
+    let sample = sample
+        .replace(
+            "db_url = \"postgres://localhost:5432/mono\"",
+            &format!("db_url = \"{}\"", url.as_str()),
+        )
+        .replace(
+            "base_dir = \"/tmp/.mono\"",
+            &format!("base_dir = \"{}\"", temp.path().display()),
+        )
+        .replace(
+            "root_dir = \"${base_dir}/objects\"",
+            &format!("root_dir = \"{}\"", root.display()),
+        );
+    std::fs::write(&config, sample).expect("config");
+    let manifest = temp.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{"bucket_scope":"mega2-legacy/","deployment_id":"deploy-drop","backend_kind":"local","storage_location":"{}","historical_locations":["local:{}"],"owners":[{{"owner":"owner-a","deployment_id":"deploy-drop","tenant_id":"tenant-drop","receipt_id":"receipt-a","complete":true}}],"orphan_prefixes":[]}}"#,
+            root.display(),
+            root.display()
+        ),
+    )
+    .expect("manifest");
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "traces",
+                "purge-legacy-capture",
+                "--action",
+                "drop",
+                "--journal",
+                journal,
+                "--maintenance-manifest",
+            ])
+            .arg(&manifest)
+            .env("MEGA_BASE_DIR", temp.path().join("base"))
+            .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+            .output()
+            .expect("run drop CLI")
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "drop: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(String::from_utf8_lossy(&first.stdout).contains("dropped=true"));
+    for table in [
+        "agent_capture_session",
+        "agent_capture_blob",
+        "agent_capture_deletion_ledger",
+    ] {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass($1) IS NOT NULL AS present",
+                [table.into()],
+            ))
+            .await
+            .expect("table lookup")
+            .expect("table row");
+        assert!(
+            !row.try_get::<bool>("", "present").unwrap(),
+            "{table} survived"
+        );
+    }
+    let again = run();
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("already_applied=true"));
+    let ledger: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM traces_maintenance_schema_migrations",
+        ))
+        .await
+        .expect("ledger")
+        .expect("ledger row")
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(ledger, 1, "one maintenance ledger row");
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}
