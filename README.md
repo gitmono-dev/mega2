@@ -1,6 +1,6 @@
 # Mega2: Monorepo Engine and Git Server for AI Agents
 
-> An open-source, trunk-based monorepo storage and Git hosting server written in Rust, with Git Smart HTTP, Git LFS, an OCI container registry, build-artifact storage, and Agent Session Capture.
+> An open-source, trunk-based monorepo storage and Git hosting server written in Rust, with Git Smart HTTP, Git LFS, an OCI container registry, build-artifact storage, and Agent Traces archive.
 
 English · [中文](README.zh.md)
 
@@ -8,7 +8,7 @@ English · [中文](README.zh.md)
 [![Docker Image](https://img.shields.io/badge/docker-genedna%2Fmega2-2496ED.svg)](https://hub.docker.com/r/genedna/mega2)
 [![Website](https://img.shields.io/badge/website-gitmega.ai-0A7BBB.svg)](https://gitmega.ai)
 
-The first-generation [Mega](https://github.com/web3infra-foundation/mega) established the foundation for our monorepo and Git-hosting platform. **Mega2 is the second-generation engine built for AI agents**, with two core capabilities: a **Monorepo engine** and **Agent Session Capture**.
+The first-generation [Mega](https://github.com/web3infra-foundation/mega) established the foundation for our monorepo and Git-hosting platform. **Mega2 is the second-generation engine built for AI agents**, with two core capabilities: a **Monorepo engine** and **Agent Traces archive**.
 
 The open-source edition of Mega2 runs in **trunk / storage-only** mode and does not include a Web UI or Change List. Mega2 provides the server-side monorepo storage and APIs; Libra provides a terminal interface for interactive browsing.
 
@@ -34,7 +34,7 @@ Start with the [Quick Start](docs/quick-start.md), then see the [documentation i
 
 The best practice for agent-oriented monorepo development is to use **Mega2 + ScorpioFS + Libra** together:
 
-- **Mega2** provides centralized monorepo storage and hosting, with optional Agent Session Capture.
+- **Mega2** provides centralized monorepo storage and hosting, with optional Agent Traces archive and retrieval.
 - **[ScorpioFS](https://github.com/gitmono-dev/scorpiofs)** mounts remote monorepo paths as a local filesystem for development tools and agents to browse.
 - **[Libra](https://libra.tools)** provides agent-side version-control workflows and a terminal browser for Mega2.
 
@@ -48,9 +48,9 @@ Mega2 provides trunk-based Git storage and hosting for monorepos. Regular Monore
 
 Git metadata is stored in Postgres, while Git objects live in local or S3-compatible object storage. ImportRepos under `[monorepo].import_dir` (default `/third-party`) follow ordinary Git semantics, including multiple branches and client-managed tags, and can hold third-party repositories that need independent synchronization. ImportRepos accept later pushes (branches and tags) and can be removed through `POST /api/v1/import-repo/remove` (which needs a push token; `push_auth=none` deployments run `mega2 import-repo remove` on the server instead); see [ImportRepo lifecycle](docs/user-guide.md#26-importrepo-lifecycle). See [Monorepo path policy and first use](docs/user-guide.md#25-monorepo-path-policy-and-first-use) for path provisioning and push rules.
 
-### Agent Session Capture
+### Agent Traces archive
 
-Agent Session Capture is an optional HTTP capability, separate from Git push. When enabled with `[agent_capture].enabled=true` and an ingest token in a storage-only deployment, Mega2 can capture agent sessions, events, checkpoints, file operations, and transcript data for later querying, review, and audit. Git branch and receive-pack rules do not govern this API. See the [Configuration Guide](docs/configuration.md) for setup.
+Traces provides session history and operational trajectory archiving for AI agents. Agent histories and checkpoints are uploaded through dedicated scoped traces Git references (`refs/libra/traces` over HTTP and SSH), and queried via read-only APIs (`/api/v1/traces/*`) with pg_trgm-backed literal search. Traces features isolated credential bindings, data integrity validation, and bounded protocol limits. See the [Configuration Guide](docs/configuration.md) and [User Guide](docs/user-guide.md#5-optional-service-surfaces) for enablement; note that the legacy `[agent_capture]` HTTP ingestion surface is retired.
 
 ## Other capabilities
 

@@ -1,8 +1,8 @@
-# Agent Capture（storage-only 会话捕获）
+# Agent Capture（已退役 / Retired）
 
-本文是 mega2 **storage-only** 形态下 `/api/v1/agent-capture` 的配置与配额事实源。产品边界与任务追溯见 [`../plan/plan-20260911.md`](../plan/plan-20260911.md)。
+> **已退役说明（2026-11-09）：** 本文档描述的旧版 `/api/v1/agent-capture` HTTP 写入接口、`[agent_capture]` 配置节及 12 张旧数据库表已在 MTR-26/27/28/31/35/57 中正式退场并移除。新版 Agent 历史与操作轨迹已迁移至 [Traces 协议](traces.md)（Scoped Git push `refs/libra/traces` 与 `/api/v1/traces/*` 查询接口）。配置文件携带 `[agent_capture]` 会被服务启动直接拒绝（fail-closed）。本文档仅保留作为历史演进与归档记录。
 
-> **替代计划（2026-10-15，尚未执行）：** [plan-20261015](../plan/plan-20261015.md) 规划以 [Libra Traces v1](traces.md) 的 scoped Git push 和独立只读查询替代本接口，并在双仓互操作通过后全量清除旧 Capture 的 12 表与限定作用域对象（包括历史版本），不迁移旧数据。当前接口/配置与下文契约仍代表现行实现；仅在该计划 H6 清除与退场门实际完成后标记退役。旧 Git `refs/libra/traces` 对象不属于本清除范围。
+本文是 mega2 早期 **storage-only** 形态下 `/api/v1/agent-capture` 的历史配置与配额归档。产品边界与任务追溯见 [`../plan/plan-20260911.md`](../plan/plan-20260911.md)。
 
 > **挂载门（ADR-AC-03）：** `/api/v1/agent-capture` 仅在 `git.storage_only()`（显式 `git.push_auth`）且 `[agent_capture].enabled=true` 时注册。review 形态或 `enabled=false` 时整面不存在（裸 404）。`enabled=true` 且非 storage-only → 启动拒绝。`enabled=true` 还要求至少一条 `[[agent_capture.ingest_tokens]]`。跟踪样例不得提交可用 ingest token。
 

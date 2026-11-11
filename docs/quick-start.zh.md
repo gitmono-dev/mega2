@@ -2,7 +2,7 @@
 
 [English](quick-start.md) · 中文
 
-Mega 是第一代 Monorepo 平台；mega2 是面向 Agent 的第二代引擎，核心能力是 Monorepo 与可选的 Agent Session Capture。推荐将 mega2 与 ScorpioFS（把仓库挂载到 Agent 的本地文件系统）和 Libra（Agent 版本控制与工作流工具）配合使用。本快速开始聚焦 Monorepo 的 Git 使用；Agent Session Capture 需单独启用，见[部署指南](./deployment.zh.md)和[配置参考](./configuration.zh.md)。
+Mega 是第一代 Monorepo 平台；mega2 是面向 Agent 的第二代引擎，核心能力是 Monorepo 与 Agent Traces 归档。推荐将 mega2 与 ScorpioFS（把仓库挂载到 Agent 的本地文件系统）和 Libra（Agent 版本控制与工作流工具）配合使用。本快速开始聚焦 Monorepo 的 Git 快速上手与首次推送；Traces 轨迹归档及进阶场景（LFS、OCI、构建产物、仓库迁移等）见[进阶使用场景](./recipes.zh.md)与[使用指南](./user-guide.zh.md)。
 
 从 gitmega.ai 下载适用于当前平台的 Compose 文件（不需要克隆 mega2 源码仓库），启动本地 mega2 评估栈：macOS + OrbStack 使用 [`macos-orbstack-mega2-compose.yml`](../macos-orbstack-mega2-compose.yml)，Linux 使用 [`linux-mega2-compose.yml`](../linux-mega2-compose.yml)。本指南会带你通过 HTTP 克隆仓库、推送到 `main`，再用 API 读回结果；后续示例还涵盖仓库迁移、Git LFS、OCI 镜像、构建产物和数据持久化。该栈从 **Docker Hub 拉取正式发布镜像**（`genedna/mega2:latest`），不从源码构建，也不需要单独执行初始化命令或提供 token。分支与 Tag 规则见[使用指南](./user-guide.zh.md)。
 

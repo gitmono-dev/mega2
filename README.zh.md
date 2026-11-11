@@ -1,6 +1,6 @@
 # Mega2：面向 AI Agent 的 Monorepo 引擎与 Git 托管服务
 
-> 用 Rust 编写的开源 trunk-based monorepo 存储与 Git 托管服务端，支持 Git Smart HTTP、Git LFS、OCI 镜像仓库、构建产物存储和 Agent 会话捕获（Agent Session Capture）。
+> 用 Rust 编写的开源 trunk-based monorepo 存储与 Git 托管服务端，支持 Git Smart HTTP、Git LFS、OCI 镜像仓库、构建产物存储和 Agent 轨迹归档（Traces）。
 
 [English](README.md) · 中文
 
@@ -8,7 +8,7 @@
 [![Docker Image](https://img.shields.io/badge/docker-genedna%2Fmega2-2496ED.svg)](https://hub.docker.com/r/genedna/mega2)
 [![Website](https://img.shields.io/badge/website-gitmega.ai-0A7BBB.svg)](https://gitmega.ai)
 
-第一代 [Mega](https://github.com/web3infra-foundation/mega) 奠定了 monorepo 与 Git 托管平台的基础。**Mega2 是面向 Agent 的第二代引擎**，以 **Monorepo 引擎**和 **Agent Session Capture（Agent 会话捕获）**为两项核心能力。
+第一代 [Mega](https://github.com/web3infra-foundation/mega) 奠定了 monorepo 与 Git 托管平台的基础。**Mega2 是面向 Agent 的第二代引擎**，以 **Monorepo 引擎**和 **Agent Traces 归档（会话与操作轨迹）**为两项核心能力。
 
 Mega2 开源版以 **trunk / storage-only** 模式运行，不提供 Web UI 或 Change List。它负责服务端的 monorepo 存储与 API；交互式浏览可使用 Libra 提供的终端命令。
 
@@ -34,7 +34,7 @@ Mega2 开源版以 **trunk / storage-only** 模式运行，不提供 Web UI 或 
 
 面向 Agent 的 monorepo 开发，最佳实践是配合使用 **Mega2 + ScorpioFS + Libra**：
 
-- **Mega2** 提供集中式 monorepo 存储与托管，并可选提供 Agent Session Capture。
+- **Mega2** 提供集中式 monorepo 存储与托管，并支持 Agent Traces 轨迹归档与检索。
 - **[ScorpioFS](https://github.com/gitmono-dev/scorpiofs)** 将远程 monorepo 路径挂载为本地文件系统，供开发工具和 Agent 浏览工作区。
 - **[Libra](https://libra.tools)** 提供 Agent 侧的版本控制工作流，以及连接 Mega2 的终端浏览器命令。
 
@@ -48,9 +48,9 @@ Mega2 为 monorepo 提供 trunk-based Git 存储与托管。普通 monorepo 路�
 
 Git 元数据存于 Postgres，Git 对象存于本地或 S3-compatible 对象存储。`[monorepo].import_dir`（默认 `/third-party`）下的 ImportRepo 遵循普通 Git 语义，可使用多个分支和客户端 Tag，适合存放需要独立同步的第三方仓库。ImportRepo 接受后续推送（分支与 tag），并可经 `POST /api/v1/import-repo/remove` 清理（需要 push token；`push_auth=none` 的部署在服务器上运行 `mega2 import-repo remove`），见[ImportRepo 生命周期](docs/user-guide.zh.md#26-importrepo-生命周期)。新路径开通与推送规则见[Monorepo 路径策略](docs/user-guide.zh.md#25-monorepo-路径策略与首次使用)。
 
-### Agent Session Capture
+### Agent Traces 轨迹归档
 
-Agent Session Capture 是独立于 Git push 的可选 HTTP 能力。在 storage-only 部署中启用 `[agent_capture].enabled=true` 并配置 ingest token 后，Mega2 可捕获 Agent 会话、事件、checkpoint、文件操作和 transcript，供后续查询、审查与审计。它不受 Git 分支或 receive-pack 规则控制；配置细节见[配置指南](docs/configuration.zh.md)。
+Traces 是面向 Agent 的会话历史与操作轨迹归档能力。历史会话与操作轨迹通过专属的 scoped traces Git 引用（`refs/libra/traces`，支持 HTTP 与 SSH）上传，并通过只读 API（`/api/v1/traces/*`）进行会话浏览与基于 pg_trgm 的关键词检索。Traces 具备独立的身份绑定、数据完整性校验与有界资源限制。启用方式见[配置指南](docs/configuration.zh.md)与[使用指南](docs/user-guide.zh.md#5-可选服务面)；注：旧版 `[agent_capture]` HTTP 写入接口已退场并废弃。
 
 ## 其他能力
 

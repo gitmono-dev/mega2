@@ -33,7 +33,7 @@ mega2 的责任是中央接收、身分与授权、持久化、关系索引、�
 | 证据不可替换保证 | 部分完成 | [`artifact_service.rs:677`](../../src/jupiter/service/artifact_service.rs) 的 `commit_artifacts` 拒绝同 set ID 的不同 manifest；但 `upload_artifact_object_bytes`（`:233`）对既有同大小 UUID 仍调用 `put_stream`，不是内容不可变保证 |
 | CL／队列 | 已实现 | [`mega_cl.rs:10`](../../src/callisto/mega_cl.rs)、目前的 [`push_queue_service.rs`](../../src/jupiter/service/push_queue_service.rs)；既有队列本身不能证明本提案所需的跨进程根树串行化保证 |
 | 按任务隔离 CL | 未实现 | [`monorepo.rs:1250`](../../src/ceres/pack/monorepo.rs) 的 `fetch_or_new_cl_link` 仍以 path＋username 查找 open CL |
-| CL 至 landing 的完整追溯 | 部分完成 | [`mono_api_service.rs:2582`](../../src/ceres/api_service/mono_api_service.rs) 的 `merge_cl_unchecked` 合成更新；`mega_cl` 无直接的 `merge_commit_id` 字段，尚缺本文要求的完整关系契约 |
+| CL 至 landing 的完整追溯 | 部分完成 | [`mono_api_service/merge.rs`](../../src/ceres/api_service/mono_api_service/merge.rs) 的 `merge_cl` 合成更新；`mega_cl` 无直接的 `merge_commit_id` 字段，尚缺本文要求的完整关系契约 |
 | Bot 与授权 | 部分完成 | [`bot_router.rs:80`](../../src/api/router/bot_router.rs) 有 token 管理，`src/api/oauth/mod.rs` 有 `BotIdentity`；[`mega.cedarschema:1`](../../src/contract/policy/mega.cedarschema) 的 action principal 仍为 User。`src/contract/policy/enforcement.rs:71` 的 off／shadow 均放行，`config/config.toml:343` 的现行默认为 off；授权运行前置与完整 Agent 委托模型均需补齐 |
 | Libra 捕获／模型 | 已实现 | [Agent 命令](../../../libra/docs/commands/agent.md)、[对象模型](../../../libra/docs/ai/object-model.md)：session、checkpoint、coverage、脱敏与 snapshot/event/projection 分层；外部捕获和 Libra 原生工作流的结构化程度不同 |
 | 多来源中央汇聚 | 未实现 | [`Libra agent/push.rs:1`](../../../libra/src/command/agent/push.rs) 使用固定 `refs/libra/traces`，有 force-with-lease；不是多人中央事件摄取契约 |

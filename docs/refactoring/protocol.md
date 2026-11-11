@@ -1277,6 +1277,7 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 每次 L0 拒绝使 `view_pack_tree_mismatch_total` 加一，并发出含 `metric`、`filter_id`、`tree_id` 的 ERROR 事件。缺对象也发出含 `filter_id`、`tree_id` 的 ERROR 事件，不带 `metric`，不增加该计数。v2 的 `NAK` 轮不做打包预检。打包方法只按计数结果编码，不再读取 `mega_view_commit_map`。四类失败的线上应答见[历史投影设计 §6.1 错误契约](history-projection.md)。
 
+<a id="场景覆盖表权威plan-20260803--adr-gm-01"></a>
 ### 场景覆盖表（权威，plan-20260803 / ADR-GM-01）
 
 > **口径（强制）:** `git clone` / `git fetch` **不等于**覆盖字面 `git pull`。字面 pull 仅以下方 `cargo:…_pull_…` 格计；不得用 clone/fetch 冒充 pull 覆盖。

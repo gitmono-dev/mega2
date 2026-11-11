@@ -111,26 +111,55 @@
 - **执行顺序与优先级**：P0 契约与可信摄取 → 任务／修订 → 依赖 `trunk-push` 阶段 1–3 的合并把关；随后 P1 团队历史与运维，P2 可选依赖图／外部 SCM。具体阶段 0–5 与 AC-LB-01…15 见 [libra.md](libra.md)。
 - **边界**：共用 trunk-push 根写入路径；ADR-TP-10 只约束 push 行，CL merge 不新增路径唯一入队约束；不要求 storage-only 部署接入 website 或人类审批。
 
-### 5c. **refactoring/agent-capture.md** — retired storage-only Agent Capture (HTTP surface removed by MTR-26)
+### 5c. **refactoring/traces.md** — Scoped Traces 轨迹归档与检索协议（现行核心契约）
 
-- **目标**：仅在 `git.storage_only()` 且 `[agent_capture].enabled=true` 时挂载 `/api/v1/agent-capture`
-- **核心内容**：独立 ingest token、`capture_id` 服务器 PK、raw 为事实源（`raw_accepted=true`）、`ObjectNamespace::Agent`、metadata-first 查询、transcript access_audit、tombstone 拒再 ingest
-- **计划**：[`../plan/plan-20260911.md`](../plan/plan-20260911.md)
-- **边界**：review 不挂载；不实现 libra 客户端、后台 GC sweeper、脱敏视图
+- **目标**：面向 Agent 的专属历史轨迹与会话归档服务；全面替代已退场的旧版 Capture
+- **核心内容**：
+  - Scoped Git push：通过 `refs/libra/traces`（HTTP / SSH）上传 checkpoint 与归档 pack
+  - 只读 API：`/api/v1/traces/*`（capabilities、targets/resolve、streams、sessions、checkpoints、search）
+  - 全文检索：基于 PostgreSQL `pg_trgm` GIN 索引的 literal search 及其后台构建与恢复运维
+  - 凭据与权限：静态 push token 与 Mono SSH key 绑定到稳定 principal，独立 Cedar 权限判定
+  - 协议常数：22 个固定在 `TracesProtocolLimits` 的资源与预算限制，禁止 operator 随意覆写
+- **计划与实现**：[`../plan/plan-20261015.md`](../plan/plan-20261015.md) MTR 系列卡片
 
-### 5d. **refactoring/storage-events.md** — storage-only 提交后出站事件
+### 5d. **refactoring/agent-capture.md** — retired storage-only Agent Capture（已退役）
+
+- **状态**：**已完全退役**。HTTP 路由（MTR-26）、`[agent_capture]` 配置与环境变量（MTR-27）、运行服务（MTR-28）及数据库实体（MTR-31）均已清理完毕；由 `traces.md` 全面替代。保留此文档仅作为历史演进与归档记录。
+
+### 5e. **refactoring/storage-events.md** — storage-only 提交后出站事件
 
 - **目标**：运维静态配置的 committed-write emitter；默认关闭，仅 storage-only `token`/`none` 可启用
 - **核心内容（WH-01..WH-13 已发布）**：`[storage_events]` 装载/未知字段/形态门/restart-required；HTTPS HMAC 运输 + DNS 地址钉住；事件投影与静态过滤；有界 emitter 运行时与 CLI/service 清理尾段；启动时经 vault 解析 target secret 并注入应用（WH-11）；四类来源 hook 全部挂上（`repo.push` / `oci.manifest.published` / `lfs.object.uploaded` / `lfs.media.finalized`）；两类旧 Capture 事件已随 MTR-57 退场
 - **计划**：[`../plan/plan-20260912.md`](../plan/plan-20260912.md)
 - **边界**：无 webhook CRUD、无 outbox/retry、不复用 review CL webhook 表
 
-### 5e. **refactoring/history-projection.md** — trunk 历史只读投影
+### 5f. **refactoring/history-projection.md** — trunk 历史只读投影
 
 - **目标**：从根历史确定性生成 Prefix / Exclude / Compose 视图，并通过只读 Git URL 提供完整前史
 - **核心内容**：过滤器代数、八张派生表、根链与追赶、ViewRepo、注册准入、HTTP / SSH v0 / v2 读路径及故障恢复
 - **计划**：[`../plan/plan-20261002.md`](../plan/plan-20261002.md)
 - **边界**：P0 仅 trunk、sha1 与线性根链；视图不是读 ACL，不接受 push；P1–P3 留给 PT-14
+
+### 5g. **refactoring/oci.md** — OCI Distribution 容器镜像服务
+
+- **目标**：在 storage-only 模式下提供轻量级 OCI 容器镜像 Registry（`/v2`）
+- **核心内容**：Manifest 与 Layer 存储、分块上传、Catalog 与 Tags 列表、与对象存储共用后端
+- **计划**：[`../plan/plan-20260902.md`](../plan/plan-20260902.md)
+
+### 5h. **refactoring/github-sync.md** — GitHub 出站同步
+
+- **目标**：将 Monorepo 指定子路径的变更自动单向同步到指定的 GitHub 远端仓库
+- **核心内容**：SSH 密钥托管、路径绑定、异步队列与重试、冲突检测
+- **计划**：[`../plan/plan-20260916.md`](../plan/plan-20260916.md)
+
+### 5i. **refactoring/fastcdc-media.md** — FastCDC 媒体与大文件切片
+
+- **目标**：为 Git LFS 和大型媒体对象引入 FastCDC 内容寻址分块存储，优化对象去重与传输效率
+
+### 5j. **refactoring/directory-entry-api.md** — Monorepo 目录与文件写入 API
+
+- **目标**：定义产品写接口（`create-entry` / `delete-entry` / `move-entry` / `edit/save`）的行为与原子性保证
+- **核心内容**：直接修改 Monorepo 目录树而不依赖客户端 Git clone，经由 MonoWriteQueue 统一推进 trunk tip
 
 ### 6. **其他文档**
 - **[`../user-guide.zh.md`](../user-guide.zh.md)**：Monorepo 路径、公开分支、Tag 和推送规则；初始化布局见 [`../manual/monorepo-init.zh.md`](../manual/monorepo-init.zh.md)，trunk 不变式见 [`trunk-push.md`](trunk-push.md)

@@ -2,7 +2,7 @@
 
 [English](recipes.md) · 中文
 
-mega2 的核心能力是 Monorepo 与可选的 Agent Session Capture。本篇补充 LFS、OCI、构建产物和数据持久化等其他功能的操作示例；首次启动与 Monorepo 推送见[快速开始](./quick-start.zh.md)，Agent 会话捕获见[使用指南](./user-guide.zh.md)和[接口配置说明](./refactoring/agent-capture.md)。
+mega2 的核心能力是 Monorepo 与 Agent Traces 归档。本篇补充 LFS、OCI、构建产物、Traces 归档和数据持久化等进阶操作示例；首次启动与 Monorepo 推送见[快速开始](./quick-start.zh.md)，Traces 详细规范见[使用指南](./user-guide.zh.md#5-可选服务面)和[Traces 协议](./refactoring/traces.md)。
 
 ## 推送嵌套目录
 
@@ -181,6 +181,29 @@ curl -s "$BASE/objects/$OID2?mode=link"
 ```
 
 产物写入与 `git.push_auth` 共用同一道闸门（本栈为匿名）。`object_type` 词汇表（`snapshot`、`provenance`、`run` 等）与协商限额都由 discovery 响应公布。
+
+## 使用 Traces 归档和检索 Agent 会话轨迹
+
+Traces 用于保存和检索 AI Agent 的会话、检查点（checkpoint）和操作历史：
+
+1. **启用 Traces**：在配置中设置 `[traces].enabled = true` 并填入操作者生成的 `server_id` UUID：
+   ```toml
+   [traces]
+   enabled = true
+   server_id = "00000000-0000-0000-0000-000000000001"
+   ```
+2. **推送 Traces 数据**：Agent 或客户端（如 Libra）使用专门的 Git 引用 `refs/libra/traces`，通过 HTTP 或 SSH 推送归档数据：
+   ```bash
+   git push --no-thin http://127.0.0.1:9000/.traces/<target_id>.git HEAD:refs/libra/traces
+   ```
+3. **查询与检索**：
+   ```bash
+   # 获取服务端 Traces 能力与限额
+   curl -fsS "http://127.0.0.1:9000/api/v1/traces/capabilities"
+   # 查询特定 stream 的关键词
+   curl -fsS "http://127.0.0.1:9000/api/v1/traces/streams/<stream_id>/search?q=keyword"
+   ```
+完整认证、权限绑定与协议限制见[使用指南](./user-guide.zh.md#5-可选服务面)与[Traces 协议](./refactoring/traces.md)。
 
 ## 查看日志、停止和清理
 
