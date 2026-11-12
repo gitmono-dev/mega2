@@ -5457,6 +5457,7 @@ mod disabled_http {
         assert_eq!(stream.principal_id, fixture.owner);
         assert_eq!(stream.tip_oid.as_deref(), Some(tip.as_str()));
         assert_eq!(stream.hash_kind, kind);
+        wait_for_trace_indexed(&git.db, &stream.id).await;
     }
 
     // MTR-16: a real push of a multi-part UTF-8 transcript is sliced by the service.
