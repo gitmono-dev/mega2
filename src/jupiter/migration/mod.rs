@@ -162,6 +162,7 @@ mod m20261015_000100_trace_identity;
 mod m20261015_000200_trace_publication;
 mod m20261015_000300_trace_projection;
 mod m20261015_000400_trace_legacy_purge;
+mod m20261111_000100_trace_legacy_fence_schema;
 pub(crate) mod qualified_native_runtime_upgrade;
 mod runner;
 pub mod traces_maintenance;
@@ -363,6 +364,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261015_000200_trace_publication::Migration),
             Box::new(m20261015_000300_trace_projection::Migration),
             Box::new(m20261015_000400_trace_legacy_purge::Migration),
+            Box::new(m20261111_000100_trace_legacy_fence_schema::Migration),
         ]
     }
 }
@@ -1367,6 +1369,7 @@ mod tests {
             "m20261015_000200_trace_publication",
             "m20261015_000300_trace_projection",
             "m20261015_000400_trace_legacy_purge",
+            "m20261111_000100_trace_legacy_fence_schema",
         ]
         .map(str::to_owned);
         assert_eq!(

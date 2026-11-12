@@ -15881,6 +15881,7 @@ async fn purge_fence_cli_activates_and_rejects() {
                 "--maintenance-manifest",
             ])
             .arg(manifest)
+            .env("MEGA_DATABASE__DB_URL", url.as_str())
             .env("MEGA_BASE_DIR", temp.path().join("base"))
             .env("MEGA_CACHE_DIR", temp.path().join("cache"))
             .output()
@@ -15890,6 +15891,11 @@ async fn purge_fence_cli_activates_and_rejects() {
     assert!(
         !refused.status.success(),
         "an unauthorized manifest must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("whole-database preflight failed"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
     );
     let rows: i64 = db
         .query_one_raw(Statement::from_string(
@@ -16201,6 +16207,9 @@ async fn purge_inventory_cli_freezes_the_local_prefixes() {
                 "--maintenance-manifest",
             ])
             .arg(manifest)
+            .env("MEGA_DATABASE__DB_URL", url.as_str())
+            .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &root)
             .env("MEGA_BASE_DIR", temp.path().join("base"))
             .env("MEGA_CACHE_DIR", temp.path().join("cache"))
             .output()
@@ -16407,6 +16416,9 @@ async fn purge_delete_cli_resumes_and_rescans() {
                 "--maintenance-manifest",
             ])
             .arg(&manifest)
+            .env("MEGA_DATABASE__DB_URL", url.as_str())
+            .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &root)
             .env("MEGA_BASE_DIR", temp.path().join("base"))
             .env("MEGA_CACHE_DIR", temp.path().join("cache"))
             .output()
@@ -16585,6 +16597,9 @@ async fn legacy_drop_guard_cli_consumes_a_verified_receipt() {
                 "--maintenance-manifest",
             ])
             .arg(&manifest)
+            .env("MEGA_DATABASE__DB_URL", url.as_str())
+            .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &root)
             .env("MEGA_BASE_DIR", temp.path().join("base"))
             .env("MEGA_CACHE_DIR", temp.path().join("cache"))
             .output()

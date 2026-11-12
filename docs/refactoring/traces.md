@@ -953,6 +953,8 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 ## 7. 旧 Capture 全量清除与接口退场
 
+**屏障 schema 绑定（FIX-MTR-34）：** 前滚 migration `m20261111_000100_trace_legacy_fence_schema` 将旧写入触发器绑定到 `TG_TABLE_SCHEMA` 中的持久 fence；标识符经 PostgreSQL `%I` 转义，函数 search_path 仅含 `pg_catalog, pg_temp`，不读取调用者或 `public` 的同名表。保留已安装函数 owner/ACL、journal 和 fence 数据；缺少真实 fence 时拒绝写入，down 不恢复旧函数，已清除的旧表不会被重建。
+
 **旧实体模型退场（MTR-31）：** `callisto` 中 11 个旧 Capture entity 模块（session/event/source_stream/checkpoint/file_op/blob/blob_ref/ingest_receipt/access_audit/tombstone/deletion_ledger）与其再导出已删除；`agent_capture_stream_blob` 从未有实体，只由明确 SQL 写入，删除时不得假设存在该实体。历史 add migration `m20260913_000100_add_agent_capture_tables` 保持纯 SQL，仍可从未升级历史库建出全部 12 张旧表；guarded DROP 之后由 maintenance ledger 记账。
 
 **旧对象 namespace 退场（MTR-35）：** `mega2_core::orbit_api::object_storage::ObjectNamespace` 不再有 `Agent` 变体与其 `"agent"` 字符串/匹配分支；`Git`/`Lfs`/`Log`/`Artifact`/`Attachment`/`Oci`/`Media`/`ChunkMapReceipt`/`Traces` 的稳定字符串与分片规则不变，`Traces` 仍按 `traces/...` 寻址。维护侧 typed legacy locator 不依赖该 enum，继续以 manifest 中的字面 `agent/` 前缀工作（MTR-24/25 已证）。
