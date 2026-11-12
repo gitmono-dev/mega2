@@ -458,7 +458,10 @@ mod tests {
             let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(value["schema_version"], 1);
             assert!(value["scope"].is_object());
-            assert!(value["scope"].get("tenant_id").is_none());
+            assert_eq!(
+                value["scope"].get("tenant_id"),
+                Some(&serde_json::Value::Null)
+            );
             assert!(
                 value["scope"].get("repo_path").is_some()
                     || value["scope"].get("repo_path") == Some(&serde_json::Value::Null)
