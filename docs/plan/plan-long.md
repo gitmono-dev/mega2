@@ -1,3 +1,29 @@
+**2026-11-12 C7 实际失败：** `integration_traces` 107 passed / 1 failed，`discovery_wire_http_sha256` 的 `trace_ref_update` 全表快照在异步索引状态变化时失败。runner 后续消失，observer 未取得退出码，双 build 未运行；不记 C7 PASS。单测诊断 1/1 通过但不抹除全量失败。按用户全权授权新增 FIX-MTR-36，在标准 push 后复用已有 index barrier，纳入 `.148` 最终合树；修复后 exact 用例 1/1。C7 测试阶段约 9444 秒，超过原7200秒预算；C8 是唯一新14400秒窗口，完整五门、签名发布/D及H6待完成。
+
+**2026-11-11 C6 中断与受控复验：** lib 在 2,422 条 ok 后遭 SIGKILL，完整门 exit101，未产全套结果；kernel/cgroup 与源码审计尚未确认原因，不称 OOM。保留原失败，登记单次 C7：原完整五门/7200s/全部测试，仅 harness 单线程并采集资源数值，源码不变。`.148`、后续发布和 H6 均未完成。
+
+**2026-11-11 当前 C6 前沿：** FIX34 同范围维护 fixture 的 DB/Local 对象根隔离完成，inventory/delete/guarded DROP/fence 四项 exact 逐案 1/1；原 C5 及第一次 fixture 复验失败保留。`.148` 冻结十路径，重开完整五门 C6；代码仍仅 FIX34/35，尚未提交/发布，真实 H6 待。
+
+**2026-11-11 C5 真实失败与 FIX34 fixture 恢复：** 20 个已完成结果组 3,298/3/3，Traces 105/3；三项维护 CLI 因继承管理库 URL 覆盖隔离 TOML 而报 schema 落后。仅在 FIX34 已登记的维护测试写集补三处子进程 DB 绑定，保留全部断言；先复验，再开最终 C6。原五轮失败、全部发布 D 与 H6 待验事实保留。
+
+**2026-11-11 C5 完整验收启动：** LFS 8/8 复验及 WH06 独立 feature-off/on 两次真实 offline build 全过且零警告；849 个源输入无漂移。完整 C5 五门、签名/发布/实际 D 仍待，C1–C4 失败保留，H6 未完成。
+
+**2026-11-11 历史发布记录恢复：** 已为现存不可变 `v0.42.147` / `1f47bb42a597f78a0192d664258d9df159df0b7c` 补建[人工 Release](https://github.com/gitmono-dev/mega2/releases/tag/v0.42.147)（id 441709187，13:09:10Z），正文与预备文案逐字核对；原 tag 未移动，SSH 签名数学核验 exit0，GitHub 仍为 unknown_key。`.133–.146` 仅有历史版本提交，当前无对应远端 tag/Release；其代码进入 `.147` 是实际发布事实，不把缺失的原独立发布或完整 C 日志补写为通过。原 main/tag D 收据保留，MTR-46 实机验收与 MTR-29 minor/H6 仍待。
+
+**2026-11-11 C4 真实失败：** 全量已完成目标 3,098/4/3，4 个 LFS 用例因主机缺少固定 Git LFS 失败；67 项 Git CLI 全绿。仅补齐隔离测试工具并复验 LFS、检查后续前置，再开最终 C5；完整 C/D 与 H6 仍待，历史 FAIL 不改。
+
+**2026-11-11 恢复复验通过：** 原 Git CLI 失败已通过本地测试容器网络修复消除，整个目标 67/67 通过，无产品/测试源码改动。`.148` 开最终 C4 五门窗口，签名/发布与实际 D 仍待；旧失败保留，H6 未完成。
+
+**2026-11-11 C3 环境失败与恢复：** `.148` 库测试 2,934/0/3 通过；Git CLI 39/28 失败，完整 C3 exit101，未发布。独立探针确认本机 Docker bridge 到宿主连接超时；同镜像 host-network 对照 200。仅修复隔离 git-cli 的本地 Compose 配置，随后复验整个 Git 目标及最终 C4 五门；两项代码发布范围不变，旧失败保留，H6 未完成。
+
+**2026-11-11 用户授权更新：** FIX-MTR-34 与 FIX-MTR-35 共同发布 `v0.42.148`（REL-MTR-148），仅这两项；两者 A/B 已过，完整 C2、签名/发布及实际 D 待。免交叉 Review，不记 PASS；C1 原 FAIL 保留，H6 未完成。
+
+**2026-11-11 当前修复前沿：** FIX-MTR-34 的完整 C1 失败于既有非 Capture JSON 断言（2,933/1/3），另登记 FIX-MTR-35，一条测试修正保留原 `tenant_id:null` wire 契约。两卡发布关系待具体裁定；`.148` 未发布，旧失败日志保留，H6 未完成。
+
+> 2026-11-11：FIX-MTR-33 三项新 CLI 测试通过，原 driver 回归发现非 public schema 屏障查询缺陷（3/5）；新增独立 FIX-MTR-34 前滚修复并先发布，未声明 H6 或计划完成。真实旧镜像对象写探针已运行，因只读挂载被拒绝。
+
+> **2026-11-11 新建验收部署准备：** 用户确认仅新建专用 Capture 验收部署、无其他待清理旧数据；隔离测试栈 PostgreSQL/Redis/RustFS/初始化服务已 healthy。发现四个旧 Capture 维护准备 driver 未注册 CLI，新增 FIX-MTR-33（pending，独立 patch）作为 MTR-46 前驱；真实旧镜像重启、H6 与双仓终态仍未完成。既有完成、取消和失败记录保持。
+
 **MTR-88 本地门禁（2026-11-08）：** target resolve 只返回已登记且可读的 active target，不创建行；未认证 401，未知或无权 404。定向 3 项通过。最终树全量 24 targets、3267 passed/0 failed/3 ignored，fmt/strict clippy 0 warning，两次构建完成。版本 `0.42.113`。签名提交 `33839e29191595e4a19fd08d4703d54b06337baf`、标注 tag `v0.42.113` 与 [Release](https://github.com/gitmono-dev/mega2/releases/tag/v0.42.113) 已核。main Harbor [42394739732](https://github.com/gitmono-dev/mega2/actions/runs/42394739732) 与 tag Docker [42394780061](https://github.com/gitmono-dev/mega2/actions/runs/42394780061) 的 amd64、arm64 和 docker 作业均 success。Lifecycle 为 `done` / `complete`。用户免交叉 Review，不记 Review PASS。
 
 **MTR-34 本地门禁（2026-11-07）：** capabilities 接口要求 push token，公开 `libra-traces/v1`、稳定 `server_id`、固定 http/ssh 与 sha1/sha256，limits 只投影既有 22 字段 mapper。定向 2 项通过。最终树全量 24 targets、3264 passed/0 failed/3 ignored，fmt/strict clippy 0 warning，两次构建完成。版本 `0.42.112`。签名提交 `75a65dde8454c0c8e8bb23f5c78ad209ceacdc0e`、标注 tag `v0.42.112` 与 [Release](https://github.com/gitmono-dev/mega2/releases/tag/v0.42.112) 已核。main Harbor [42388111495](https://github.com/gitmono-dev/mega2/actions/runs/42388111495) 与 tag Docker [42388147207](https://github.com/gitmono-dev/mega2/actions/runs/42388147207) 的 amd64、arm64 和 docker 作业均 success。Lifecycle 为 `done` / `complete`。用户免交叉 Review，不记 Review PASS。
