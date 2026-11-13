@@ -265,7 +265,10 @@ async fn spawn_config_reload_watcher_with_interval(
 mod tests {
     use super::*;
     use crate::config::{
-        Config, reload::ConfigHandle, template::config_init_template, testing::isolated_config,
+        Config,
+        reload::ConfigHandle,
+        template::config_init_template,
+        testing::{env_lock, isolated_config},
     };
 
     #[test]
@@ -307,40 +310,51 @@ mod tests {
         assert_eq!(handle.snapshot().expect("snapshot").log.level, "info");
     }
 
-    #[tokio::test]
-    async fn service_reload_watcher_task_reloads_changed_profile() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config_path = temp_dir.path().join("config.toml");
-        let profile_path = temp_dir.path().join("config.prod.toml");
-        std::fs::write(&config_path, config_init_template(temp_dir.path())).expect("base config");
+    #[test]
+    fn service_reload_watcher_task_reloads_changed_profile() {
+        // Config loading reads process-wide environment variables. Serialize
+        // this whole watcher test with tests that temporarily mutate them.
+        let _env = env_lock();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let temp_dir = tempfile::tempdir().expect("temp dir");
+                let config_path = temp_dir.path().join("config.toml");
+                let profile_path = temp_dir.path().join("config.prod.toml");
+                std::fs::write(&config_path, config_init_template(temp_dir.path()))
+                    .expect("base config");
 
-        let config = Config::new(config_path.to_str().expect("utf-8 config path"))
-            .expect("base config should load");
-        let handle = ConfigHandle::new(config);
-        let task = spawn_config_reload_watcher_with_interval(
-            handle.clone(),
-            Some(config_path),
-            Some(profile_path.clone()),
-            Duration::from_millis(10),
-        )
-        .await
-        .expect("watcher should start")
-        .expect("watcher task");
+                let config = Config::new(config_path.to_str().expect("utf-8 config path"))
+                    .expect("base config should load");
+                let handle = ConfigHandle::new(config);
+                let task = spawn_config_reload_watcher_with_interval(
+                    handle.clone(),
+                    Some(config_path),
+                    Some(profile_path.clone()),
+                    Duration::from_millis(10),
+                )
+                .await
+                .expect("watcher should start")
+                .expect("watcher task");
 
-        std::fs::write(&profile_path, "[log]\nlevel = \"debug\"\n").expect("profile config update");
+                std::fs::write(&profile_path, "[log]\nlevel = \"debug\"\n")
+                    .expect("profile config update");
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if handle.snapshot().expect("snapshot").log.level == "debug" {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("reload watcher should apply profile change");
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if handle.snapshot().expect("snapshot").log.level == "debug" {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("reload watcher should apply profile change");
 
-        task.stop().await.expect("watcher should stop");
+                task.stop().await.expect("watcher should stop");
+            });
     }
 
     // ----- WH-13: unified cleanup tail coverage -----
