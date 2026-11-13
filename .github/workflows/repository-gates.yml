@@ -9,13 +9,13 @@ permissions:
 
 concurrency:
   group: repository-gates-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  queue: max
 
 jobs:
   linux:
     name: Linux repository gates
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 360
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
