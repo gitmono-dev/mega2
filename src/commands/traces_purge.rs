@@ -72,6 +72,102 @@ pub(crate) async fn revoke_dml_file(
         .map_err(|error| error.to_string())
 }
 
+pub fn prepare_cli() -> clap::Command {
+    clap::Command::new("prepare-legacy-capture")
+        .about("Prepare legacy Capture maintenance without deleting data")
+        .arg(
+            clap::Arg::new("action")
+                .long("action")
+                .required(true)
+                .value_parser(["freeze", "preflight", "prepare-roles", "revoke-dml"])
+                .help(
+                    "Preparation action; role preparation and revocation precede fence activation",
+                ),
+        )
+        .arg(
+            clap::Arg::new("input")
+                .long("input")
+                .value_name("PATH")
+                .required(true)
+                .help("Provenance manifest, scope manifest or role plan for the selected action"),
+        )
+}
+
+pub(crate) async fn prepare(
+    ctx: crate::commands::CommandContext,
+    args: &clap::ArgMatches,
+) -> crate::common::errors::MegaResult {
+    use crate::common::errors::MegaError;
+
+    let error = |message: String| {
+        MegaError::cli_exit(1, format!("traces prepare-legacy-capture: {message}"))
+    };
+    let source = ctx
+        .config_summary
+        .as_ref()
+        .map(|summary| summary.source)
+        .ok_or_else(|| error("pass --config <path> or set MEGA_CONFIG".to_owned()))?;
+    require_named_config(source).map_err(error)?;
+    let config = crate::commands::require_config(ctx, "traces prepare-legacy-capture")?;
+    let action = args
+        .get_one::<String>("action")
+        .ok_or_else(|| error("--action is required".to_owned()))?;
+    let input = args
+        .get_one::<String>("input")
+        .ok_or_else(|| error("--input is required".to_owned()))?;
+    let input = Path::new(input);
+    // A preparation command must not migrate the deployment it is inspecting.
+    super::ensure_schema_current(&config.database).await?;
+    let db = crate::jupiter::storage::init::postgres_connection(&config.database).await?;
+    let result = match action.as_str() {
+        "freeze" => freeze_manifest_file(&db, &config, input)
+            .await
+            .map(|receipt| {
+                format!(
+                    "freeze journal={} digest={}",
+                    receipt.journal_id, receipt.digest
+                )
+            }),
+        "preflight" => preflight_scopes_file(&db, input).await.map(|receipt| {
+            format!(
+                "preflight aggregate={} scopes={} owners={}",
+                receipt.digest,
+                receipt.scope_count,
+                receipt.owners.len()
+            )
+        }),
+        "prepare-roles" => prepare_roles_file(&db, input).await.map(|receipt| {
+            format!(
+                "prepare-roles tables={} barrier={} app_plain={} cannot_alter={} cannot_disable_trigger={}",
+                receipt.tables_transferred,
+                receipt.barrier_transferred,
+                receipt.app_role_plain,
+                receipt.app_cannot_alter,
+                receipt.app_cannot_disable_trigger
+            )
+        }),
+        "revoke-dml" => revoke_dml_file(&db, input).await.map(|receipt| {
+            format!(
+                "revoke-dml tables={} insert={} update={} delete={} public_insert={} public_update={} public_delete={}",
+                receipt.tables_revoked,
+                receipt.insert_revoked,
+                receipt.update_revoked,
+                receipt.delete_revoked,
+                receipt.public_insert_revoked,
+                receipt.public_update_revoked,
+                receipt.public_delete_revoked
+            )
+        }),
+        _ => Err("unknown preparation action".to_owned()),
+    };
+    // Close even when a driver fails; do not emit a success receipt before it.
+    let closed = db.close().await;
+    let receipt = result.map_err(error)?;
+    closed.map_err(|_| error("cannot close the maintenance connection".to_owned()))?;
+    println!("{receipt}");
+    Ok(())
+}
+
 /// `traces purge-legacy-capture`: the public maintenance entry point frozen by
 /// MTR-33. `--action fence` re-runs the whole-database preflight and activates
 /// the persistent writer fence; the later inventory/delete/drop actions are

@@ -15996,6 +15996,250 @@ async fn purge_fence_cli_activates_and_rejects() {
     drop(guard);
 }
 
+#[test]
+fn legacy_prepare_cli_requires_action_and_input() {
+    for args in [
+        vec!["traces", "prepare-legacy-capture"],
+        vec!["traces", "prepare-legacy-capture", "--action", "freeze"],
+        vec![
+            "traces",
+            "prepare-legacy-capture",
+            "--action",
+            "drop",
+            "--input",
+            "/nonexistent",
+        ],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .args(args)
+            .output()
+            .expect("preparation argument check");
+        assert!(!output.status.success(), "invalid preparation must fail");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("error:"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_prepare_cli_freezes_and_preflights_without_migrating() {
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    db.execute_unprepared(
+        "INSERT INTO agent_capture_session
+         (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind, completeness)
+         VALUES ('prepare-deploy', 'prepare-tenant', 'repo', 'producer', 'session', 'external_capture', 'complete')",
+    ).await.expect("legacy session");
+    let input = fixture.root.path().join("maintenance.json");
+    let objects = fixture.root.path().join("objects");
+    let manifest = serde_json::json!({
+        "deployment_id": "prepare-deploy", "backend_kind": "local",
+        "storage_location": objects,
+        "historical_locations": [format!("local:{}", objects.display())],
+        "scopes": [{"deployment_id": "prepare-deploy", "tenant_id": "prepare-tenant"}],
+        "operator": {"identity": "fixture-owner", "statement_digest": "sha256:synthetic"},
+        "bucket_scope": "agent/prepare-deploy/",
+        "owners": [{"owner": "fixture-owner", "deployment_id": "prepare-deploy", "tenant_id": "prepare-tenant", "receipt_id": "synthetic-owner-receipt", "complete": true}]
+    });
+    std::fs::write(&input, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let run = |action: &str, named: bool| {
+        let mut command = fixture.command(
+            &[
+                "traces",
+                "prepare-legacy-capture",
+                "--action",
+                action,
+                "--input",
+                input.to_str().unwrap(),
+            ],
+            named,
+        );
+        command
+            .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &objects);
+        CredentialProcess::spawn(command, fixture.root.path()).finish()
+    };
+    let implicit = run("freeze", false);
+    assert!(!implicit.status.success(), "unnamed config must fail");
+    let count = |sql: &str| Statement::from_string(DatabaseBackend::Postgres, sql);
+    let row = db
+        .query_one_raw(count("SELECT count(*) AS n FROM trace_legacy_purge"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+    let frozen = run("freeze", true);
+    assert!(
+        frozen.status.success(),
+        "{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    let row = db
+        .query_one_raw(count("SELECT id, manifest_digest FROM trace_legacy_purge"))
+        .await
+        .unwrap()
+        .unwrap();
+    let journal: String = row.try_get("", "id").unwrap();
+    Uuid::parse_str(&journal).expect("actual journal UUID");
+    let digest: String = row.try_get("", "manifest_digest").unwrap();
+    let stdout = String::from_utf8_lossy(&frozen.stdout);
+    assert!(
+        stdout.contains(&format!("freeze journal={journal} digest={digest}")),
+        "{stdout}"
+    );
+    let preflight = run("preflight", true);
+    assert!(
+        preflight.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preflight.stderr)
+    );
+    assert!(String::from_utf8_lossy(&preflight.stdout).contains("scopes=1 owners=1"));
+    let mut unauthorized = manifest.clone();
+    unauthorized["owners"] = serde_json::json!([]);
+    std::fs::write(&input, serde_json::to_vec(&unauthorized).unwrap()).unwrap();
+    let refused = run("preflight", true);
+    assert!(!refused.status.success(), "unclaimed scope must fail");
+    std::fs::remove_file(&input).unwrap();
+    let missing = run("freeze", true);
+    assert!(!missing.status.success(), "missing file must fail");
+    std::fs::write(&input, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    db.execute_unprepared(
+        "DELETE FROM seaql_migrations WHERE version = (SELECT max(version) FROM seaql_migrations)",
+    )
+    .await
+    .unwrap();
+    let before = db
+        .query_one_raw(count("SELECT count(*) AS n FROM seaql_migrations"))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    let outdated = run("freeze", true);
+    assert!(!outdated.status.success(), "old schema must fail");
+    assert!(String::from_utf8_lossy(&outdated.stderr).contains("never migrates"));
+    let after = db
+        .query_one_raw(count("SELECT count(*) AS n FROM seaql_migrations"))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(before, after, "preparation must not apply migrations");
+    let row = db
+        .query_one_raw(count("SELECT count(*) AS n FROM trace_legacy_purge"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "n").unwrap(),
+        1,
+        "failed paths must not create journals"
+    );
+    db.close().await.unwrap();
+    drop(guard);
+}
+
+#[tokio::test]
+async fn legacy_prepare_cli_transfers_roles_and_revokes_dml() {
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app = format!("prepare_app_{suffix}");
+    let maintenance = format!("prepare_maint_{suffix}");
+    for role in [&app, &maintenance] {
+        db.execute_unprepared(&format!("CREATE ROLE {role} NOLOGIN"))
+            .await
+            .unwrap();
+    }
+    let input = fixture.root.path().join("roles.json");
+    std::fs::write(
+        &input,
+        serde_json::to_vec(&serde_json::json!({
+            "app_role": app, "maintenance_role": maintenance,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let run = |action: &str| {
+        fixture.run(
+            &[
+                "traces",
+                "prepare-legacy-capture",
+                "--action",
+                action,
+                "--input",
+                input.to_str().unwrap(),
+            ],
+            true,
+        )
+    };
+    let prepared = run("prepare-roles");
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    assert!(String::from_utf8_lossy(&prepared.stdout).contains(
+        "tables=12 barrier=true app_plain=true cannot_alter=true cannot_disable_trigger=true"
+    ));
+    let tables = db.query_all_raw(Statement::from_string(DatabaseBackend::Postgres,
+        "SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE 'agent_capture_%' ORDER BY tablename"))
+        .await.unwrap();
+    assert_eq!(tables.len(), 12);
+    for row in &tables {
+        assert_eq!(
+            row.try_get::<String>("", "tableowner").unwrap(),
+            maintenance
+        );
+    }
+    db.execute_unprepared(&format!(
+        "GRANT INSERT, UPDATE, DELETE ON agent_capture_session TO {app}, PUBLIC"
+    ))
+    .await
+    .unwrap();
+    let revoked = run("revoke-dml");
+    assert!(
+        revoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&revoked.stdout).contains("tables=12 insert=true update=true delete=true public_insert=true public_update=true public_delete=true"));
+    for row in &tables {
+        let table: String = row.try_get("", "tablename").unwrap();
+        for privilege in ["INSERT", "UPDATE", "DELETE"] {
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT has_table_privilege($1, $2, $3) AS allowed",
+                    [app.clone().into(), table.clone().into(), privilege.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !row.try_get::<bool>("", "allowed").unwrap(),
+                "{table} {privilege}"
+            );
+        }
+        db.execute_unprepared(&format!("ALTER TABLE {table} OWNER TO CURRENT_USER"))
+            .await
+            .unwrap();
+    }
+    db.execute_unprepared("ALTER FUNCTION trace_legacy_write_fence() OWNER TO CURRENT_USER")
+        .await
+        .unwrap();
+    for role in [&app, &maintenance] {
+        db.execute_unprepared(&format!("DROP ROLE {role}"))
+            .await
+            .unwrap();
+    }
+    db.close().await.unwrap();
+    drop(guard);
+}
+
 /// Offline selector for the deployment perimeter probe (MTR-46).
 ///
 /// Argument parsing, the missing-fixture failure and the cleanup guard only;

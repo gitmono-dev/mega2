@@ -306,3 +306,19 @@ The full flag list lives in `--help` and `src/commands/`. See the [Deployment Gu
 | OCI registry and Agent Capture routes | [`architecture.md`](./architecture.md) and [`deployment.md`](./deployment.md) |
 | Error handling implementation | `crate::common::errors` |
 | Contribution workflow and required checks | [`contributing.md`](./contributing.md) |
+
+
+### Preparing a legacy Capture acceptance deployment
+
+For a new dedicated acceptance deployment, pin a Capture-capable image digest and write identifiable sample sessions and objects through its legacy HTTP API. Record the deployment, tenant, instances and storage locations. The resulting evidence covers only that deployment. Remove `[agent_capture]` and legacy event filters when upgrading; the current version cannot re-enable legacy Capture.
+
+Explicitly name the maintenance configuration. Prepare the schema through the normal upgrade step first: these commands only check it and never migrate. Prepare and verify three JSON inputs (see the [traces protocol](./refactoring/traces.md#7-旧-capture-全量清除与接口退场)): a provenance manifest with deployment, backend, historical locations, scopes and operator declaration; a scope manifest with `bucket_scope`, owner authorizations and receipts; and a role plan with distinct `app_role` and `maintenance_role` values. The DBA must create both roles first; the old app role must not be a superuser.
+
+```bash
+mega2 --config maintenance.toml traces prepare-legacy-capture --action freeze --input provenance.json
+mega2 --config maintenance.toml traces prepare-legacy-capture --action preflight --input scopes.json
+mega2 --config maintenance.toml traces prepare-legacy-capture --action prepare-roles --input roles.json
+mega2 --config maintenance.toml traces prepare-legacy-capture --action revoke-dml --input roles.json
+```
+
+Use the journal UUID actually returned by `freeze`; do not invent it or insert journal rows manually. Resolve owner coverage before proceeding if `preflight` fails. Prepare ownership and revoke DML before activating the fence, then use the existing `purge-legacy-capture --action fence|inventory|delete|drop` workflow with the same journal. Preparation deletes neither objects nor tables, and failures never complete H6. Retain separate actual receipts for preventing old writers from restarting, denied DB/object writes after restarting the old image, absence of all 12 tables, and continued traces reads and writes. The existing perimeter script only probes credentials; by itself it does not prove that the old image ran.

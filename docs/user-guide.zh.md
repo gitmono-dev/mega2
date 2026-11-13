@@ -310,3 +310,19 @@ libra mega2 browser
 | 错误模型 | [`errors.md`](./errors.md) |
 | 认证与授权边界(review 形态) | [`manual/authz.md`](./manual/authz.md) |
 | 本地开发与测试 | [`development.md`](./development.md) · [`contributing.zh.md`](./contributing.zh.md) |
+
+
+### 旧 Capture 验收部署的维护准备
+
+新建专用验收部署须先固定仍支持 Capture 的旧镜像 digest，通过旧 HTTP 接口写入可核对的样例会话和对象；记录唯一 deployment、tenant、实例和存储位置。新建部署的结果只覆盖该部署。升级后移除 `[agent_capture]` 和旧事件过滤；现版本不会重新开启旧 Capture。
+
+维护连接必须显式指定配置，schema 先由正式升级步骤准备；下列命令只检查 schema，不自动迁移。先生成并人工核对三类输入 JSON（字段结构见 [traces 协议](./refactoring/traces.md#7-旧-capture-全量清除与接口退场)）：provenance manifest 包含 deployment、backend、历史位置、scope 和 operator 声明；scope manifest 包含 `bucket_scope`、owner 授权与 receipt；role plan 包含不同的 `app_role`、`maintenance_role`。role plan 的角色须由 DBA 事先创建，旧 app 不能是超级用户。
+
+```bash
+mega2 --config maintenance.toml traces prepare-legacy-capture --action freeze --input provenance.json
+mega2 --config maintenance.toml traces prepare-legacy-capture --action preflight --input scopes.json
+mega2 --config maintenance.toml traces prepare-legacy-capture --action prepare-roles --input roles.json
+mega2 --config maintenance.toml traces prepare-legacy-capture --action revoke-dml --input roles.json
+```
+
+使用 `freeze` 实际输出的 journal UUID；不能自行编造 journal 或直接写 journal 表。`preflight` 非零退出时先核 owner 范围。角色准备和撤权必须在激活 fence 前完成；随后按现有 `purge-legacy-capture --action fence|inventory|delete|drop` 流程使用同一 journal。准备入口不删除对象或表，任何失败都不算 H6 完成。部署控制面禁止旧 writer 恢复、旧镜像重启后的 DB/对象写拒绝、12 表缺失及新 traces 读写仍需分别留存实际收据。现有外围脚本仅发起凭据探针，不能独自证明旧镜像已被执行。
