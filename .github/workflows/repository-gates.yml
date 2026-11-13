@@ -27,10 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Verify system dependencies on self-hosted runner
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+          command -v pkg-config
+          pkg-config --exists openssl
+          test -r "$(pkg-config --variable=includedir openssl)/openssl/ssl.h"
+          command -v protoc
+          protoc --version
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
