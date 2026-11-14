@@ -1076,24 +1076,16 @@ mod tests {
     }
 
     fn oversized_event() -> CommittedEvent {
-        CommittedEvent {
-            event_id: Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("uuid"),
-            event_type: EventType::AgentCaptureEventsCommitted,
-            occurred_at: 1,
-            source: EventSource::AgentCapture,
-            scope: EventScope::AgentCapture {
-                tenant_id: "t".repeat(4096),
-                repo_path: format!("/{}", "r".repeat(4000)),
-            },
-            data: EventData::AgentCaptureEventsCommitted {
-                capture_id: "c".repeat(4096),
-                receipt_id: "r".repeat(4096),
-                new_event_count: 1,
-                stream_kind: "external_capture".to_string(),
-                generation: 1,
-                completeness: "complete".to_string(),
-            },
-        }
+        let mut event = sample_event();
+        event.data = EventData::RepoPush {
+            push_id: "p".repeat(4096),
+            operation_id: "o".repeat(4096),
+            ref_name: "r".repeat(4096),
+            old_oid: "a".repeat(4096),
+            requested_oid: "b".repeat(4096),
+            landed_oid: "c".repeat(4096),
+        };
+        event
     }
 
     fn compiled_target(id: &str) -> (StorageEventsTargetConfig, EventTarget) {
@@ -1108,8 +1100,6 @@ mod tests {
             oci_repositories: Vec::new(),
             lfs_paths: Vec::new(),
             include_unscoped_lfs: true,
-            agent_tenants: Vec::new(),
-            agent_repo_paths: Vec::new(),
         };
         let secret = SecretString::new(
             "hex:1111111111111111111111111111111111111111111111111111111111111111",
@@ -1915,5 +1905,74 @@ mod tests {
         drop(mid_drain);
         wait_until(|| mid_drain_transport.cancelled.load(Ordering::SeqCst)).await;
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod noncapture_event_tests {
+    use super::*;
+
+    /// MTR-57: the four non-Capture event producers keep their payload and
+    /// scope behaviour after the Capture events were removed.
+    #[test]
+    fn noncapture_event_preservation() {
+        let push = repo_push_event(
+            "prod-primary-01",
+            "/team/a",
+            RepoPushData {
+                push_id: "42".to_owned(),
+                operation_id: "op-1".to_owned(),
+                ref_name: "refs/heads/main".to_owned(),
+                old_oid: "a".repeat(40),
+                requested_oid: "b".repeat(40),
+                landed_oid: "c".repeat(40),
+            },
+        );
+        let push = push.expect("repo.push event");
+        assert_eq!(push.event_type.as_str(), "repo.push");
+        assert_eq!(push.source.as_str(), "git");
+        assert!(matches!(push.scope, EventScope::Git { .. }));
+
+        let lfs = CommittedEvent {
+            event_id: Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("uuid"),
+            event_type: EventType::LfsObjectUploaded,
+            occurred_at: 1,
+            source: EventSource::Lfs,
+            scope: EventScope::LfsUnscoped,
+            data: EventData::LfsObjectUploaded {
+                oid: "ab".to_owned(),
+                size: 4,
+            },
+        };
+        assert_eq!(lfs.event_type.as_str(), "lfs.object.uploaded");
+        let media = CommittedEvent {
+            event_type: EventType::LfsMediaFinalized,
+            source: EventSource::Lfs,
+            scope: EventScope::Media {
+                repo_path: "/team/a".to_owned(),
+            },
+            data: EventData::LfsMediaFinalized {
+                oid: "cd".to_owned(),
+                size: 8,
+                manifest_id: "m1".to_owned(),
+            },
+            ..lfs.clone()
+        };
+        assert_eq!(media.event_type.as_str(), "lfs.media.finalized");
+        let oci = CommittedEvent {
+            event_type: EventType::OciManifestPublished,
+            source: EventSource::Oci,
+            scope: EventScope::Oci {
+                oci_repository: "team/image".to_owned(),
+            },
+            data: EventData::OciManifestPublished {
+                digest: "sha256:ab".to_owned(),
+                reference: "latest".to_owned(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".to_owned(),
+                size: 1,
+            },
+            ..lfs
+        };
+        assert_eq!(oci.event_type.as_str(), "oci.manifest.published");
     }
 }

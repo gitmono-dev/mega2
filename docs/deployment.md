@@ -9,7 +9,7 @@ Mega2 is the second-generation Mega engine built for Agents. Its Monorepo servic
 The only supported deployment shape is trunk / storage-only:
 
 - Single public branch `main`; all writes (git push and product API writes) are globally serialized through the MonoWriteQueue and share tip authority; no CL / issue / reviewer / OAuth user routes are registered.
-- HTTP surface: Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`), LFS (`/info/lfs`, `/api/v1/lfs`), storage-only `/api/v1/*` (status, file/blob, file/tree, preview reads; create-entry / delete-entry / move-entry / edit/save, tags writes), optional OCI `/v2` (`[oci].enabled`), optional Agent Session Capture `/api/v1/agent-capture` (`[agent_capture].enabled`, separate ingestion of session, event, checkpoint, transcript, and file-operation records; not triggered by Git push), Swagger UI `/swagger-ui`, OpenAPI `/api/openapi.json`.
+- HTTP surface: Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`), LFS (`/info/lfs`, `/api/v1/lfs`), storage-only `/api/v1/*` (status, file/blob, file/tree, preview reads; create-entry / delete-entry / move-entry / edit/save, tags writes), optional OCI `/v2` (`[oci].enabled`), the legacy Agent Session Capture HTTP surface `/api/v1/agent-capture` is retired (its routes are never mounted; session history is uploaded through scoped traces Git and queried through `/api/v1/traces`), Swagger UI `/swagger-ui`, OpenAPI `/api/openapi.json`.
 - SSH is upload-pack only (clone / fetch / pull); `ssh_receive_pack` must be explicitly `false` — omitting it refuses startup.
 - Write auth: `git.push_auth = "token"` (recommended) or `"none"` (controlled networks only). Configure authentication and SSH as described in sections 3–5 of this guide.
 
@@ -157,3 +157,9 @@ HTTP traces permits one receive request and one fetch per process; overload retu
 - [`contributing.md`](./contributing.md) — local development and testing.
 - [`config/config.toml`](../config/config.toml) — the commented list of configuration keys and defaults.
 - [`architecture.md`](./architecture.md) — storage, protocol, authorization, and optional service boundaries.
+
+### Legacy Capture role preparation (MTR-61)
+
+Before the legacy writer fence is activated, the deployment DBA runs the role preparation against the maintenance connection: the old app role must be a plain role (no SUPERUSER, no BYPASSRLS, no CREATEROLE) and distinct from the maintenance role, ownership of the 12 legacy tables and `trace_legacy_write_fence()` moves to the maintenance role, and the app role is proved unable to ALTER those tables or disable their triggers. DML revocation and fence activation stay separate steps: the revocation removes INSERT/UPDATE/DELETE from the app role and PUBLIC on all 12 tables, fails on an inherited grant, and proves the result with a refused write while no fence is active.
+
+The legacy purge inventory step lists only the frozen manifest prefixes and stores one journal item per object. It requires the journal's active writer fence and does not migrate the database; a cloud backend must prove its native version inventory before the step can pass.

@@ -953,9 +953,52 @@ MTR-13 工作区候选已实现授权代码对象闭包规划并核准确计数�
 
 ## 7. 旧 Capture 全量清除与接口退场
 
+**屏障 schema 绑定（FIX-MTR-34）：** 前滚 migration `m20261111_000100_trace_legacy_fence_schema` 将旧写入触发器绑定到 `TG_TABLE_SCHEMA` 中的持久 fence；标识符经 PostgreSQL `%I` 转义，函数 search_path 仅含 `pg_catalog, pg_temp`，不读取调用者或 `public` 的同名表。保留已安装函数 owner/ACL、journal 和 fence 数据；缺少真实 fence 时拒绝写入，down 不恢复旧函数，已清除的旧表不会被重建。
+
+**旧实体模型退场（MTR-31）：** `callisto` 中 11 个旧 Capture entity 模块（session/event/source_stream/checkpoint/file_op/blob/blob_ref/ingest_receipt/access_audit/tombstone/deletion_ledger）与其再导出已删除；`agent_capture_stream_blob` 从未有实体，只由明确 SQL 写入，删除时不得假设存在该实体。历史 add migration `m20260913_000100_add_agent_capture_tables` 保持纯 SQL，仍可从未升级历史库建出全部 12 张旧表；guarded DROP 之后由 maintenance ledger 记账。
+
+**旧对象 namespace 退场（MTR-35）：** `mega2_core::orbit_api::object_storage::ObjectNamespace` 不再有 `Agent` 变体与其 `"agent"` 字符串/匹配分支；`Git`/`Lfs`/`Log`/`Artifact`/`Attachment`/`Oci`/`Media`/`ChunkMapReceipt`/`Traces` 的稳定字符串与分片规则不变，`Traces` 仍按 `traces/...` 寻址。维护侧 typed legacy locator 不依赖该 enum，继续以 manifest 中的字面 `agent/` 前缀工作（MTR-24/25 已证）。
+
+**事件与过滤退场（MTR-57）：** `agent_tenants`、`agent_repo_paths` 与 `agent_capture.events.committed`、`agent_capture.checkpoint.committed` 已从 storage-event 模型、事件字面量白名单与 target 过滤中删除；`StorageEventsTargetConfig` 现在启用 `deny_unknown_fields`，仍携带这些键的配置会被拒绝。其余四类事件（`repo.push`、`oci.manifest.published`、`lfs.object.uploaded`、`lfs.media.finalized`）的投影/范围/过滤行为保持不变，由 `noncapture_event_preservation` 与既有模块回归覆盖。
+
+**配置退场（MTR-27）：** `[agent_capture]` 已从配置模型与严格的未知字段白名单中删除；仍携带该节的 TOML 会得到明确的“section was removed”错误并指向 scoped traces Git 与 `/api/v1/traces`，`MEGA_AGENT_CAPTURE__*` 环境覆盖同样被拒绝。三份随仓样例（`config/config.toml`、`config-review.toml`、`config-storage-only.toml`）已移除该节与旧 Capture 事件/过滤示例；storage-event 模型中的旧 Capture 事件名与 `agent_tenants`/`agent_repo_paths` 字段留给 MTR-57。
+
+**内部运行时退场（MTR-28）：** 旧 `jupiter::service::agent_capture_service`、`jupiter::storage::agent_capture_storage` 与 `ceres::agent_capture`（auth）模块已删除；启动不再初始化旧 ingest token，`Storage` 不再持有旧 service；维护侧 typed legacy locator（`traces purge-legacy-capture`）保持可用，历史 SQL add migration 原样保留。stage 扫描 `legacy_retirement_stage_28` 以有限 allowlist 证明没有非列入的运行时符号残留。
+
+**HTTP 接口退场（MTR-26）：** 12 条旧 `/api/v1/agent-capture` 路由已从两个 profile 移除，运行时 OpenAPI 不再列出这些路径或旧 Capture DTO；即使 `[agent_capture].enabled=true` 也不会挂载。新客户端使用 scoped traces Git（`refs/libra/traces`，HTTP/SSH）上传，使用 `/api/v1/traces` 只读接口查询；旧的 session/event/checkpoint/transcript/file-op 端到端行为由 traces 目标覆盖，`[agent_capture]` 配置不再生效。
+
 旧 Capture 12 表及其全部所属对象（raw、redacted、staging 及可信清单确认的历史前缀）**全部删除，不迁移**；用户已明确选择这一策略。先通过 H5，再执行限定作用域、可恢复的清除流程，最后以 H6 放行终态。不能把所有共享 bucket 的 `agent/` 当可删除范围。
 
-`mega2 traces purge-legacy-capture` 维护操作流程：建立跨实例持久 writer fence → 根据可信维护清单冻结获授权 deployment/tenant 拥有的 backend 指纹及全部旧对象前缀 → 持久 journal 保存 inventory/cursor/retry 与所有删除意图（包括旧作用域中的无 DB 引用 orphan）→ 分批删除并复扫 → 完成收据 → 守卫迁移 DROP 12 表。前缀必须覆盖旧 blob 的所有 visibility，而非仅 raw：登记 raw/redacted/staging、DB 中实际派生键及可信历史清单确认的遗留项；未知 ownership 或前缀阻断清除，不猜测扩大共享 bucket 范围。fence 须由 DB 级触发器/权限屏障阻止旧12表的 runtime DML，不能只让新二进制查询 fence；维护 journal/清除角色不被该屏障阻塞。还须停旧入口、冻结部署控制面、核对所有实例并等待既有 lease/in-flight 写入终止，以受控旧 image 重启与旧凭据写探针证明不能继续产生旧对象；有独立对象存储写权限时须撤销旧作用域 PUT 权限（保留维护删除权限）。只有 DB 屏障但旧进程仍能创建 orphan 对象不能放行 inventory。旧 DB 不记录历史 backend，维护清单须对照当前配置、DB、历史部署位置和运维声明，任一历史存储位置未核实就不能宣称全部清除。receipt 必须绑定冻结 inventory、backend、scopes 与 fence；变更作用域或存储后必须重新审计，不能沿用旧 receipt。
+
+
+**维护准备 CLI（FIX-MTR-33）：** `mega2 --config <维护配置> traces prepare-legacy-capture --action <freeze|preflight|prepare-roles|revoke-dml> --input <PATH>` 接出既有四个 driver。`freeze` 接受下面的 provenance manifest，持久化后返回实际 journal UUID/digest；`preflight` 接受全库 scope manifest，返回 aggregate digest 与 scope/owner 数；`prepare-roles` 和 `revoke-dml` 接受 `{ "app_role": "old_app", "maintenance_role": "capture_maintenance" }`。配置须显式命名，schema 检查只读，成功和失败均关闭维护连接；角色动作须在 fence 前执行，不删除对象或表。原 purge 四 action 不变。新建专用部署仅证明自身范围；旧镜像 digest 标签或凭据探针不等于实际旧镜像重启证据。
+
+**维护范围 provenance（MTR-56）：** 清除只能从受控维护清单开始。服务端 `trace_legacy_manifest::verify_and_freeze` 同时核对四个来源：（1）运行配置的 object storage backend 与位置必须与清单一致；（2）旧 DB metadata（`agent_capture_session` 的 DISTINCT deployment/tenant）不得含清单外 scope；（3）清单必须逐项声明历史部署位置，空值或 `unknown` 一律阻断；（4）运维声明必须带非空 identity 与 statement digest。重复 scope 视为来源冲突并阻断。全部通过后计算规范化数字摘要并把 `manifest_digest`、backend fingerprint 与历史位置写入 `trace_legacy_purge` journal，才产生后续删除步骤可消费的冻结授权；本步骤不读取也不删除任何 Capture 正文。
+
+**全库旧 scope 授权 preflight（MTR-62）：** 任何不可逆删除前，`trace_legacy_scope_guard::preflight_legacy_scopes` 从全部 12 张旧表枚举 DISTINCT `(deployment_id, tenant_id)`（8 张直接列、4 张经父 session/blob 关联），要求每个 scope 恰有一个明确 owner 且该 owner 的 receipt 已完成；未知 owner、清单外 scope、重复 owner、非可信 orphan prefix 一律阻断，不会先删已知部分。`bucket_scope` 为空或 `/`（共享 bucket 根）被拒绝，`delete_git_traces=true` 被拒绝；全部通过后才生成绑定 owner 集合、receipt ID 与枚举 scope 的 aggregate receipt 摘要，owner 集合变化即失效。
+
+**旧 writer DB 权限屏障准备（MTR-61）：** 部署 DBA 用既有维护连接执行 `trace_legacy_roles::prepare_legacy_roles`：校验 app role 与 maintenance role 为两个不同的普通标识符，且旧 app role 不是 superuser、没有 `BYPASSRLS`、没有 `CREATEROLE`；随后把 12 张旧表与 `trace_legacy_write_fence()` 的 ownership 转交 maintenance role，并用受控回滚事务证明旧 app role 既不能 `ALTER TABLE` 也不能 `DISABLE TRIGGER`。撤销有效 DML 与激活 fence 分别由 MTR-67 与 MTR-33 承接；本步骤不删除任何数据。
+
+**旧 app 三类 DML 撤销（MTR-67）：** ownership 准备之后，`trace_legacy_roles::revoke_legacy_dml` 对 12 张旧表分别 `REVOKE INSERT, UPDATE, DELETE` FROM 旧 app role 与 `PUBLIC`；随后用 `has_table_privilege` 逐个证明旧 app 无有效权限，若仍可经继承角色获得则显式失败（`InheritedGrant`），不报成功。真正 oracle 是在**无 active fence**时以 `SET LOCAL ROLE <app>` 尝试 INSERT：必须以 `permission denied`/`42501` 拒绝并回滚，不能由 MTR-33 的 trigger 拒绝冒充 REVOKE 完成；有 active fence 时拒绝执行撤销（无法证明权限结果）。
+
+**持久 writer fence 与公开维护入口（MTR-33）：** `mega2 --config <现存配置> traces purge-legacy-capture --action fence --journal <UUID> --maintenance-manifest <PATH>` 是冻结的公开维护入口。`fence` 在同一事务内重跑 MTR-62 全库授权 preflight，未知/新增 scope 则不激活且不产生 receipt；journal 必须存在且为 `frozen`；同一 journal 的 active fence 重复激活幂等并返回同一 fence/receipt；只有 legacy 表 owner（maintenance role）成员可切换 fence。激活后 `trace_legacy_writer_fence.active` 持久存在，12 张旧表的 `trace_legacy_write_fence()`（`SECURITY DEFINER`，仅 owner 可读 fence 表）拒绝 INSERT/UPDATE/DELETE，旧 Capture HTTP 写入口以稳定 `legacy_capture_fenced`（409）拒绝；`inventory`/`delete`/`drop` 由后续卡接线，当前明确拒绝而不假装成功。
+
+**部署外围屏障探针（MTR-46）：** 部署维护者在 MTR-33 激活 fence 后，用 `scripts/traces_legacy_fence_probe.sh --maintenance-manifest <PATH> --old-image <DIGEST> --journal <UUID>` 对本部署真实 backend 逐一取证：旧 app role 的 DB INSERT 必须以 permission denied/fenced 拒绝，旧对象凭据对 legacy prefix 的 PUT 必须返回 401/403；缺少 fixture、探针未运行或探针意外成功都算失败，不 skip。旧 image digest 写入 sanitized 汇总，reports 不含凭据或 DSN；未取得真实部署的 DB/PUT 探针前不得进入 H6。
+
+**冻结对象 inventory（MTR-24）：** `traces purge-legacy-capture --action inventory` 只在 `frozen` journal 且该 journal 的 active writer fence 存在时运行，并使用维护连接（只做只读 schema 检查，不自动 apply migration）。枚举范围严格来自冻结 manifest：固定 `agent/raw/`、`agent/redacted/`、`agent/staging/` 加上 manifest 的 `trusted_prefixes`（必须以 `agent/` 开头且无 `..`/反斜杠/NUL），其余前缀不枚举。Local backend 无原生版本，item 的 `provider_version`/`provider_generation` 记 `None`；S3/S3-compatible/GCS 需要 provider 原生版本能力，本维护连接无法证明时整体阻断（不按当前 listing 放行）。重复运行幂等：已登记的 `(purge_id, scope, object_key)` 不重复插入。本步骤不删除任何对象。
+
+**journal 驱动的对象删除（MTR-25）：** `traces purge-legacy-capture --action delete` 只消费同一 frozen journal 的已冻结 inventory：逐项 `delete` 后在同一事务里写 `deleted_at` 并推进 journal cursor，进程中断后从首个未标记项续行（不从空桶推断"本来无数据"）；只允许 manifest 冻结前缀内的键，`traces/` 新 namespace 与共享 bucket 未授权前缀永不处理；删除完成后逐前缀复扫必须为空，并按 manifest owners 输出 owner 列表；本步骤不 DROP 任何旧表（DROP 由 MTR-32 guarded migration 承接）。Local 无历史版本；S3/GCS 的历史 version/generation 删除需要真实 provider 能力，由实际部署维护者按 VER-2 逐 backend 验证。
+
+**Verified 完成 receipt（MTR-44）：** `trace_legacy_receipt::verify_purge_complete` 只有在以下条件全部成立时才构造 `VerifiedLegacyPurgeReceipt`（字段私有，仅该函数可构造）：journal 为 `frozen`；存在属于该 journal 的 active fence；journal backend fingerprint 与冻结 manifest 完全一致；MTR-62 全库 scope preflight 通过（unknown/未授权 scope 阻断）；inventory 的每个 item 都已 `deleted_at`（并生成冻结 inventory digest）；逐冻结前缀复扫为空；历史部署位置全部已声明且非 `unknown`；云 backend 的历史 version/generation 无法由该连接证明时一律阻断（Local 无版本，故可直接验证）；空安装必须先由维护者显式声明 `empty_inventory_verified=true` 才能产生 Verified receipt。receipt digest 绑定 journal、fence、aggregate scope digest、inventory digest 与 backend fingerprint，由 MTR-32 的 guarded DROP 消费；本模块只用明确 SQL 与 manifest，不引用旧 Capture entity。
+
+**guarded DROP（MTR-32）：** 12 张旧表只由显式 maintenance migrator `TracesMaintenanceMigrator` 删除，普通启动 `Migrator::migrations()` 只保留历史 add migration（不依赖清除完成即可启动）。真实删除经 `drop_legacy_capture::execute`：只接受 MTR-44 的 `VerifiedLegacyPurgeReceipt`，执行前重验 journal 仍 `frozen`、receipt 的 fence 仍 active、当前 inventory digest 与 receipt 一致；12 表在**单事务**内 DROP，成功后写入独立 ledger `traces_maintenance_schema_migrations` 的版本行，失败则整体回滚且不记 ledger。重复调用在 ledger 已存在时直接幂等返回；maintenance migrator 的 `up` 无 receipt 时 fail-closed，`down` 为显式 no-op。
+
+**持久清除 journal（MTR-23）：** 迁移 `m20261015_000400_trace_legacy_purge` 只新增三张表：
+- `trace_legacy_purge`：冻结一次清除的 `backend_fingerprint`、`storage_location`、`deployment_id`、`manifest_digest` 与状态机（`frozen`/`deleting`/`rescanning`/`complete`），并记录 cursor 与 retry；
+- `trace_legacy_purge_item`：按 `(purge_id, scope, object_key)` 唯一登记每个对象，带有 provider 原生 `provider_version`/`provider_generation` 与删除时间；
+- `trace_legacy_writer_fence`：每个 journal 至多一行（`purge_id` 唯一外键），`active` 时由 DB 函数 `trace_legacy_write_fence()` 经 12 张旧表的 BEFORE INSERT/UPDATE/DELETE trigger 拒绝 runtime DML；无 active fence 时旧写行为不变。
+该迁移的 `down` 是显式 no-op：journal、items 与 fence 是破坏性清除的持久记录，回滚不得静默遗忘。schema-only 门为 `purge_schema_`，实体/migration 的 `db_contract` 门覆盖 fingerprint/location、version/generation、fence 唯一约束与 barrier 行为。
+建立跨实例持久 writer fence → 根据可信维护清单冻结获授权 deployment/tenant 拥有的 backend 指纹及全部旧对象前缀 → 持久 journal 保存 inventory/cursor/retry 与所有删除意图（包括旧作用域中的无 DB 引用 orphan）→ 分批删除并复扫 → 完成收据 → 守卫迁移 DROP 12 表。前缀必须覆盖旧 blob 的所有 visibility，而非仅 raw：登记 raw/redacted/staging、DB 中实际派生键及可信历史清单确认的遗留项；未知 ownership 或前缀阻断清除，不猜测扩大共享 bucket 范围。fence 须由 DB 级触发器/权限屏障阻止旧12表的 runtime DML，不能只让新二进制查询 fence；维护 journal/清除角色不被该屏障阻塞。还须停旧入口、冻结部署控制面、核对所有实例并等待既有 lease/in-flight 写入终止，以受控旧 image 重启与旧凭据写探针证明不能继续产生旧对象；有独立对象存储写权限时须撤销旧作用域 PUT 权限（保留维护删除权限）。只有 DB 屏障但旧进程仍能创建 orphan 对象不能放行 inventory。旧 DB 不记录历史 backend，维护清单须对照当前配置、DB、历史部署位置和运维声明，任一历史存储位置未核实就不能宣称全部清除。receipt 必须绑定冻结 inventory、backend、scopes 与 fence；变更作用域或存储后必须重新审计，不能沿用旧 receipt。
 
 12 表容纳多个 deployment/tenant，整表 DROP 不得凭单个 scope 的完成收据放行。任何破坏性删除前，preflight 须证明该数据库全部旧 scope 均属于这次明确授权的维护集合；未获授权 scope 或不明归属存在即阻断，等待具名 owner 的可信维护交接。多 owner 仅在各自授权 scope 全部完成且跨实例 fence 覆盖同一数据库后，才能生成覆盖全库 scope 的 aggregate receipt；guarded DROP 重新核验没有集合外的旧行。共享 bucket 中不属于这组 scope 的对象、新 traces 和旧 Git traces 一律排除。
 
@@ -968,6 +1011,89 @@ DROP 依 FK 顺序删除 `agent_capture_session/event/source_stream/checkpoint/f
 退场还包括旧路由/DTO/service/storage/entity/config/OpenAPI、`agent_capture.events.committed` / `agent_capture.checkpoint.committed` 两事件及旧 scope 过滤项；旧配置显式报移除错误，不静默忽略。新 traces 读侧按已选能力独立实现，不能复用旧 raw-only / `missing_raw` 语义。旧设计文档在实际 H6 前保留为**现行实现**事实，H6 后标退役并指向本契约。history-projection 的未来 code/view 关联改为新 `trace_code_link` 承接，视图 P1/P2 仍按自己的计划。
 
 ## 8. 联合验收与发布证据
+
+### 8.2 双仓 H5 功能移交（MTR-22）
+
+2026-11-09 只读取用 MTR-58/59/60/68 的已交付 driver 与 MTR-69 的逐 transport 审计，形成两仓 H5 功能移交。15 条 AC 与 MTR-69 的 8 条 transport AC 逐条登记，不合并：
+
+| AC | 来源 case / selector | 结果 |
+|---|---|---|
+| AC-1 HTTP 真实 push | `http_push` | pass |
+| AC-2 SSH 真实 push | `ssh_push` | pass |
+| AC-3 JSON 搜索 | `agent_search` | pass |
+| AC-4 预算续读 | `agent_transcript_budget` | pass |
+| AC-5 固定 evidence 重读 | `agent_evidence_reread` | pass |
+| AC-6 普通 clone sentinel 排除 | `agent_code_clone_excludes_traces` | pass |
+| AC-7 peer principal 覆盖被拒 | `live_peer_principal_write_denied` | pass |
+| AC-8 T1/T2 独立作用域 | `live_other_target_ref_isolation` | pass |
+| AC-9 两个 source 独立作用域 | `live_other_source_ref_isolation` | pass |
+| AC-10 两个 epoch 保留历史 | `live_epoch_history_retained` | pass |
+| AC-11 clean 改写旧流拒绝 | `live_clean_rewrite_denied` | pass |
+| AC-12 new-stream 显式新建 | `live_new_stream_epoch_created` | pass |
+| AC-13 旧 stream 仍可读 | `live_old_stream_bytes_readable` | pass |
+| AC-14 两仓 commit 与 fixture pin 一致 | 见下方 pin 表 | pass |
+| AC-15 只功能移交、不等 MTR-29 C/D | 审计仅消费已交付证据 | pass |
+
+MTR-69 的 8 条 transport AC（HTTP/SSH delete、non-FF、cross-scope want、cross-scope delta）按其 §8.0 报告的 count 与 digest 原样消费，全部通过。
+
+逐 case 计数：`--case http` 5/5、`--case ssh` 5/5、`--case agent` 7/7、`--case history` 4/4，均 `failed=0`，无 skip。
+
+两仓 pin：mega2 `152babe5`（MTR-22 审计基线，MTR-69 提交）、Libra `7d9daa77e`、Libra binary SHA256 `e07e3c00f26091b9b0b827008c8548e6b4e284fb6ba70c8477838cef4aa087f0`、契约 SHA256 `f483925ddefb7f482b1100f1ee07a22f410b47f48662edbd01cbcfef7488e497`、server id `22222222-2222-4222-8222-222222222222`、targets `/project/interop`（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`）与 `/project/other`（scope `2ad3bc80-9dd3-4462-8430-9eabc06f4452`）。
+
+sanitized 报告 digest：`mtr22-http.log` `eae7f6685c528b606e84b499f192b3e5cb44f8f10f13703aec47fd50fe96a447`、`mtr22-ssh.log` `3f009f5dcb57eadf99fbe54232c1d7c46d1f91ec812fe2c89c56f4581db1c06a`、`mtr22-agent.log` `b250613ed29ea0ac730cefcdb1ebca92fa53134a7971e0cbc17fed4a4f754bda`、`mtr22-history.log` `69c2349a1a6a44342073a5d55628b968bf01a4477bea34e9997934b4fc726d3b`。报告不含 token、私钥或 DSN。
+
+移交边界：本审计只证明功能可用与双仓 pin 一致；正式 C/D 由 MTR-29（旧 Capture 退场 minor 发布）承载，H5 不等待该 C/D，也不能把 locally-accepted 当作 formal C/D 完成。
+
+### 8.0 逐 transport 拒绝证据审计（MTR-69）
+
+2026-11-09 只读重跑 MTR-58/59/64 的已发布脚本，对同一 fixture 逐 transport 审计 8 个独立拒绝 oracle：
+
+| # | transport | oracle | 观察到的拒绝 | case 计数 |
+|---|---|---|---|---|
+| 1 | HTTP | delete | advertisement 无 `delete-refs`，ref-policy 拒绝后 tip 不变 | `http_delete` 1/1 |
+| 2 | SSH | delete | advertisement 无 `delete-refs`，ref-policy 拒绝后 tip 不变 | `ssh_delete` 1/1 |
+| 3 | HTTP | non-FF | HTTP 409 + `object_integrity`，tip 不变 | `http_non_ff` 1/1 |
+| 4 | SSH | non-FF | `remote error: object_integrity`，tip 不变 | `ssh_non_ff` 1/1 |
+| 5 | HTTP | cross-scope want | 跨 scope 对象请求被拒绝 | `http_cross_scope_want` 1/1 |
+| 6 | SSH | cross-scope want | 跨 scope 对象请求被拒绝 | `ssh_cross_scope_want` 1/1 |
+| 7 | HTTP | cross-scope delta | 跨 scope delta push 整体被拒绝 | `http_cross_scope_delta` 1/1 |
+| 8 | SSH | cross-scope delta | 跨 scope delta push 整体被拒绝 | `ssh_cross_scope_delta` 1/1 |
+
+逐 case 计数：`--case ref-reject` 4/4、`--case http` 5/5、`--case ssh` 5/5，均 `failed=0`，无 skip、无 zero-case。
+
+固定 pin：mega2 `0.42.137` source/binary、Libra binary SHA256 `e07e3c00f26091b9b0b827008c8548e6b4e284fb6ba70c8477838cef4aa087f0`、被审计契约 SHA256 `0962d83061f4491315890516f953f71852f868c8286f781ea5d37b5c6188207e`、server id `22222222-2222-4222-8222-222222222222`、targets `/project/interop`（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`）与 `/project/other`（scope `2ad3bc80-9dd3-4462-8430-9eabc06f4452`）；fixture 使用 synthetic token/SSH key，报告不含凭据或 DSN。
+
+sanitized 报告 digest：`mtr69-http.log` SHA256 `0b83048a1bee10daeafc87b1f17846bc32c56c37c333d27a9158d79c13740c4f`、`mtr69-ssh.log` SHA256 `0df3557306812b807fa579f96763669d28eed23ff730d0349994609579096e2e`、`mtr69-ref.log` SHA256 `7e781f0c44778115a6a6050d14c744d0d513ce4188d8453bbb4b9b8058eb4e85`。本审计不改生产脚本，功能消费由 MTR-22 承接。
+
+
+### 8.1 双仓互操作 smoke driver（MTR-58..69）
+
+`scripts/traces_interop_smoke.sh --case <http|ssh|agent|history|ref-reject>` 是双仓互操作的唯一入口，每个 case 由同名的 `scripts/traces_interop_<case>.sh` 真实驱动，必需 `MEGA2_TRACES_INTEROP=1` 且由运维提供 fixture。缺少 fixture 值、`skip`、或零 case 一律算失败；退出码 `0` 全部通过、`1` 至少一个 case 失败（含缺 fixture）、`2` 用法或前置错误（未知 case、开关未打开、driver 缺失），此时不运行任何 case。
+
+MTR-58 的 HTTP driver 使用的 fixture：`MEGA2_TRACES_INTEROP_HTTP_URL`（mega2 origin）、`MEGA2_TRACES_INTEROP_TARGET`（拥有该 traces 的 canonical 项目路径）、`MEGA2_TRACES_INTEROP_TOKEN_FILE`（HTTP push token）、`MEGA2_TRACES_INTEROP_AGENT_REPO`（已绑定 epoch 的 Libra 仓库）、`MEGA2_TRACES_INTEROP_SCOPE`（该 stream UUID）、`MEGA2_TRACES_INTEROP_FOREIGN_WANT`（另一 scope 的 commit）。`LIBRA_BIN`/`GIT_BIN` 可覆盖客户端，`MEGA2_TRACES_INTEROP_WORKDIR` 指定自有工作目录（默认新建临时目录，退出时由 cleanup guard 删除；`MEGA2_TRACES_INTEROP_KEEP_WORKDIR=1` 保留）。
+
+HTTP driver 逐案执行并计数：`http_push`（Libra `agent push --mega2` 真实 scoped push）、`http_fetch`（Libra `mega2 traces fetch` 显式 fetch）、`http_unauthenticated`（直接请求协议端点，要求 401 与 Basic challenge）、`http_cross_scope_want`（向本 scope 索取他 scope 对象被拒）、`http_cross_scope_delta`（以他 scope commit 为父的 delta push 整体被拒）。输出契约为 `==> <case>` / `PASS: <case>` / `FAIL: <case>` 与末行 `traces interop http summary: executed=<n> passed=<n> failed=<n>`。离线 selector `cargo test --test integration_traces interop_http_` 只验证参数解析、缺 fixture 非零退出与 cleanup guard，不连接真实服务。
+
+MTR-59 的 SSH driver 使用 `MEGA2_TRACES_INTEROP_SSH_URL`（`ssh://git@host:port/project/<name>.git`）、`MEGA2_TRACES_INTEROP_TARGET`、`MEGA2_TRACES_INTEROP_AGENT_REPO`、`MEGA2_TRACES_INTEROP_SCOPE`、`MEGA2_TRACES_INTEROP_FOREIGN_WANT` 与 `LIBRA_SSH_COMMAND`（指向携带已绑定私钥的 ssh wrapper 可执行文件）；逐案执行 `ssh_push`、`ssh_fetch`、`ssh_none_auth`（保留 login `traces` 的 none-auth 以 Permission denied 拒绝）、`ssh_cross_scope_want` 与 `ssh_cross_scope_delta`，输出契约与 HTTP driver 相同但末行为 `traces interop ssh summary: executed=<n> passed=<n> failed=<n>`。离线 selector `cargo test --test integration_traces interop_ssh_` 只验证参数解析、缺 fixture 非零退出与 cleanup guard。
+
+2026-11-09 的本地真实 SSH fixture：同一 `mega2` 进程组内的 `service ssh`（`127.0.0.1:2222`）、`ssh_keys` 记录 9001 与同一 principal 的 `static_push_token / trace-ssh-key:9001`、`mono_account / ssh-key:9001` 绑定；`--case ssh` 5/5 逐案通过（日志 SHA256 `741d0d2821eaf38c337b83ec642ff51c1b9ec88952662bde1ca7279f968dfcfd`，不含密钥或 token）。
+
+MTR-60 的 agent driver 使用 `MEGA2_TRACES_INTEROP_HTTP_URL`、`MEGA2_TRACES_INTEROP_TARGET`、`MEGA2_TRACES_INTEROP_TOKEN_FILE`、`MEGA2_TRACES_INTEROP_SEARCH_STREAM`、`MEGA2_TRACES_INTEROP_QUERY` 与 `LIBRA_REPO`；逐案执行 `agent_search`（机器搜索命中且带代表 evidence）、`agent_transcript_budget`（有界读取加 cursor 续读等于完整正文）、`agent_evidence_reread`（按命中 checkpoint 重读正文）、`agent_code_clone_excludes_traces`（普通 clone 不含 traces 专属 sentinel）与三个 LTR-21 selector （`live_peer_principal_write_denied`、`live_other_target_ref_isolation`、`live_other_source_ref_isolation`，各自执行并计数，未运行即失败）。末行为 `traces interop agent summary: executed=<n> passed=<n> failed=<n>`；离线 selector 为 `interop_agent_`。
+
+**H4 客户端缺口（MTR-60 记录，2026-11-09 已由 Libra 修复）：** 当时 pin 的 Libra 客户端 `mega2 traces search` 请求旧 `/api/v1/traces/search`、`transcript` 请求无 session 的旧路径，与已挂载路由不一致；MTR-60 的 AC-1..AC-3 因而以服务端已挂载 API 直测。Libra `0.30.168`（`fc972f9cc`）已把 search 切到 `/streams/<id>/search`（`--stream` 必填、路由自管正文预算）并把 transcript 切到带 session 的已挂载路由（缺省解析所属 session），真实 fixture 验证命中与正文读取通过；客户端缺口自此关闭，后续 real-client 证据按新的 pin 重取。
+
+2026-11-09 的本地真实 agent fixture：同一 `mega2` 进程、primary/peer 两个 token、两把 SSH key 与两套静态绑定、两个 target 与真实 Libra live checkpoint；`--case agent` 7/7 通过（日志 SHA256 `611a7981da97accc4166a8e9ba3c83828ada70872dd87094fa167554423002a3`，不含 token/密钥）。
+
+MTR-68 的 history driver 只要求 `LIBRA_REPO`（pin 的 Libra checkout，含 `.env.test` 与 `.env.live-test`）与 `MEGA2_TRACES_INTEROP=1`，逐项执行 LTR-22/23 的 `live_epoch_history_retained`、`live_clean_rewrite_denied`、`live_new_stream_epoch_created`、`live_old_stream_bytes_readable`；每个 selector 独立计数，未运行即失败，末行为 `traces interop history summary: executed=<n> passed=<n> failed=<n>`。离线 selector 为 `interop_history_`。
+
+2026-11-09 的本地真实运行：四个 selector 4/4 通过（日志 SHA256 `3fd4209068ade720dc8961529f4f5bf661fb9476114d5767a9f8bb19644b1399`，不含 token/密钥）。
+
+MTR-64 的 ref-reject driver 使用 `MEGA2_TRACES_INTEROP_HTTP_URL`、`MEGA2_TRACES_INTEROP_TARGET`、`MEGA2_TRACES_INTEROP_TOKEN_FILE`、`MEGA2_TRACES_INTEROP_SSH_URL`、`MEGA2_TRACES_INTEROP_AGENT_REPO`、`MEGA2_TRACES_INTEROP_SCOPE` 与 `LIBRA_SSH_COMMAND`。每个 case 先建立一次真实成功 push 的基线，再向同一 by-scope 入口发送删除或 forced non-fast-forward：删除依据是 advertisement 不提供 `delete-refs`，forced 更新在 HTTP 以 409 与 `object_integrity`、SSH 以 `remote error: object_integrity` 拒绝；两类拒绝都必须不是 401/403/`unauthenticated`，且拒绝后 remote tip 与基线一致。逐案为 `http_delete`、`ssh_delete`、`http_non_ff`、`ssh_non_ff`，末行为 `traces interop ref-reject summary: executed=<n> passed=<n> failed=<n>`。
+
+2026-11-09 的本地真实运行：4/4 通过（日志 SHA256 `13320967a4fcc79f6e06b4f6cb43574005974d5eefd9214d6ee7609b78ac8fa9`，不含 token/密钥）。
+
+2026-11-09 的本地真实 fixture 证据：mega2 `0.42.133` debug binary、ephemeral PostgreSQL `mega2_interop`、`[traces].enabled=true`、两个 static push token（分别覆盖 `/project/interop` 与 `/project/other`）与两条真实 Libra scoped push；`--case http` 的 5/5 逐案通过（scope `6a56fc3c-002a-4bcb-96dc-dc6e89d9011d`，日志 SHA256 `f96343c72b7f51935d6c58a6cee415385f5a30c6a8f89f31095e3738dd090431`，不含 token 或 DSN）。
+
 
 固定同一组服务/客户端 commit+version/fixture，覆盖：两种 transport 的有效与无效身份；同项目跨 principal/source/epoch、跨项目隔离；首次推送并发与回复丢失；FF/删除/中途 checkpoint 篡改；SHA-1/SHA-256 raw byte round-trip；跨 scope wants/delta base拒绝；普通 fresh/bare/mirror/shallow clone 不传 traces专属对象；已混存旧ref与错误HEAD；索引 crash/replay/unsupported/invalid 水位；关键词 CJK/ASCII/标点/part边界/超长行/重复片段；有界读取和原证据重读；跨项目搜索计数/游标权限隔离；旧清除中断续跑/历史version/共享bucket不误删/receipt-before-DROP。
 

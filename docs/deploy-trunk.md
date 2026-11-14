@@ -4,7 +4,7 @@
 
 > **范围**：不接入 mega2 用户系统、不使用 Issue / Change List、不走评审门控的存储与分发部署。`push_policy` 默认为 `trunk`，`config/config.toml` 默认配置使用 `push_auth = "none"`（仅限本机或受信网络）；仍需 CL / 评审管线的部署须显式设置 `push_policy = "review"`，示例见 `config/config-review.toml`。
 
-该部署形态提供 Monorepo Git 服务；Agent Session Capture 是独立的可选 HTTP 接口，需单独启用和配置 ingest token，不会由 Git push 自动产生会话记录。配置条件与数据接口见 [`refactoring/agent-capture.md`](./refactoring/agent-capture.md)。
+该部署形态提供 Monorepo Git 服务；Traces 会话轨迹归档是可选的服务面（`[traces].enabled=true`），通过专属的 scoped traces Git 引用（`refs/libra/traces`）上传并经 `/api/v1/traces` 接口查询，配置条件与协议契约见 [`refactoring/traces.md`](./refactoring/traces.md)；旧版 `[agent_capture]` HTTP 接口已完全退场。
 
 ## 1. `push_policy=trunk`
 
@@ -37,7 +37,7 @@ CL merge 只经 MonoWriteQueue；`[monorepo]` 无 `merge_writer` 键（[`plan-20
 6. storage-only（显式 `push_auth`）⇒ 必须 `git.ssh_receive_pack = false`（省略 ≠ 关闭）。
 7. 形态切换后执行索引水位重置（第 5 节）。
 
-HTTP 表面：只读 preview + **产品写**（`create-entry` / `delete-entry` / `move-entry` / `edit/save`；目录变更契约见 [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md)）+ **monorepo tags**（`POST /tags`、`GET /tags/list`、`GET` / `DELETE /tags/{name}`；LB-04 / FT-04 / FT-06；`POST /tags/list` 为 405）+ Git smart HTTP + **LFS**（`/info/lfs`、`/api/v1/lfs`）；**不**注册 CL / issue / reviewer / OAuth user 路由；OpenAPI（`/api/openapi.json`）列出 LFS 与上述写路径，CL/issue 为空。只读 blob/tree/blame 保留。
+HTTP 表面：只读 preview + **产品写**（`create-entry` / `delete-entry` / `move-entry` / `edit/save`；目录变更契约见 [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md)）+ **monorepo tags**（`POST /tags`、`GET /tags/list`、`GET` / `DELETE /tags/{name}`；LB-04 / FT-04 / FT-06；`POST /tags/list` 为 405）+ Git smart HTTP + **LFS**（`/info/lfs`、`/api/v1/lfs`）+ **可选 Traces 读接口**（`[traces].enabled` 时挂载 `/api/v1/traces/*`）；**不**注册 CL / issue / reviewer / OAuth user 路由（旧 `/api/v1/agent-capture` 亦不挂载）；OpenAPI（`/api/openapi.json`）列出 LFS、写路径及启用时的 Traces 路由，CL/issue 为空。只读 blob/tree/blame 保留。
 
 ## 2. 安全边界（无评审授权 ≠ 无访问控制）
 

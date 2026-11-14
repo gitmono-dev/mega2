@@ -727,7 +727,7 @@ mod tests {
         let own = commit_payload();
         let other = b"other-stream".to_vec();
         let git_bytes = b"global-git-object".to_vec();
-        let agent_bytes = b"agent-object".to_vec();
+        let log_bytes = b"agent-object".to_vec();
         let traces_key = object_key(STREAM_A, "sha1", OID_SHA1).expect("key");
         assert_eq!(
             traces_key.default_sharding(),
@@ -758,17 +758,17 @@ mod tests {
             .inner
             .put_stream(
                 &ObjectKey {
-                    namespace: ObjectNamespace::Agent,
+                    namespace: ObjectNamespace::Log,
                     key: traces_key.key.clone(),
                 },
-                agent_bytes.clone().into_stream(),
+                log_bytes.clone().into_stream(),
                 ObjectMeta {
-                    size: agent_bytes.len() as i64,
+                    size: log_bytes.len() as i64,
                     ..Default::default()
                 },
             )
             .await
-            .expect("agent plant");
+            .expect("log plant");
         put_raw(&store, STREAM_B, "sha1", OID_SHA1, &other)
             .await
             .expect("other stream");

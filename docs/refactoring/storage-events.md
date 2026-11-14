@@ -2,7 +2,7 @@
 
 本文是 mega2 **storage-only** 形态下 `[storage_events]` 静态配置的事实源。产品边界与任务追溯见 [`../plan/plan-20260912.md`](../plan/plan-20260912.md)。
 
-> **状态（WH-01/WH-09/WH-12/WH-10/WH-02/WH-13/WH-11/WH-03/WH-04/WH-05/WH-06/WH-07/WH-08/WH-14 均已发布；WH-15 已实现——本文所在提交即其 `v0.10.40` bump 提交，推送、tag 与 `docker` job 绿灯的证据以 plan-20260912 的 WH-15 卡为准）：** 配置表面 + HTTPS HMAC 运输 + DNS 地址钉住（WH-12）+ 事件投影与静态过滤（WH-10）+ 有界 emitter 运行时（WH-02）+ CLI/service 清理尾段（WH-13）+ 启动 secret 绑定均已落地；WH-14 补齐 `shutdown_grace_seconds` 范围门与 `oci_repositories` 规范名门，WH-15 补齐 `installation_id` 记录字段与 drop 记账；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口），WH-06 挂上 FastCDC media finalize 的 `lfs.media.finalized`，WH-07 挂上 Agent Capture 批提交的 `agent_capture.events.committed`，WH-08 挂上 checkpoint 提交的 `agent_capture.checkpoint.committed`。HMAC `secret_ref` 在 disabled 时不解析。
+> **状态（WH-01/WH-09/WH-12/WH-10/WH-02/WH-13/WH-11/WH-03/WH-04/WH-05/WH-06/WH-07/WH-08/WH-14 均已发布；WH-15 已实现——本文所在提交即其 `v0.10.40` bump 提交，推送、tag 与 `docker` job 绿灯的证据以 plan-20260912 的 WH-15 卡为准）：** 配置表面 + HTTPS HMAC 运输 + DNS 地址钉住（WH-12）+ 事件投影与静态过滤（WH-10）+ 有界 emitter 运行时（WH-02）+ CLI/service 清理尾段（WH-13）+ 启动 secret 绑定均已落地；WH-14 补齐 `shutdown_grace_seconds` 范围门与 `oci_repositories` 规范名门，WH-15 补齐 `installation_id` 记录字段与 drop 记账；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口），WH-06 挂上 FastCDC media finalize 的 `lfs.media.finalized`，WH-07/WH-08 的 Agent Capture 事件已随旧 Capture 退场（MTR-57）删除；当前只保留 `repo.push` / `oci.manifest.published` / `lfs.object.uploaded` / `lfs.media.finalized` 四类。HMAC `secret_ref` 在 disabled 时不解析。
 
 ## 配置
 
@@ -20,7 +20,7 @@
 
 `[[storage_events.targets]]` 在该项存在时必填 `id`、`url`、`secret_ref`、非空 `events`。`id` 为 1..32 ASCII `[A-Za-z0-9_-]`，不得重复。过滤数组缺省为空（空集合表示该来源不订阅，不是通配）。`url` 必须是 HTTPS，禁止 userinfo / query / fragment。以上数值范围与结构校验在 disabled 形态同样执行，只跳过 vault 取值。
 
-过滤项按来源各自的维度校验（WH-10 / WH-14）：`git_paths`、`lfs_paths`、`agent_repo_paths` 必须是绝对 canonical 路径；`oci_repositories` 必须是 canonical 小写 distribution `remoteName`，与入站 `/v2` 用同一判定——`valid_repository_name` 的唯一实现在 `src/common/oci_name.rs`，由 OCI router 与 config 校验共用（GC-02），大小写敏感、不做折叠。router 永不会产生的名字也永不会匹配，这种过滤项是静默失效的订阅，故 fail-closed 拒绝而不是接受。`agent_tenants` 与服务端值逐字比较。每个集合上限 64 项、每项 1..=256 bytes。
+过滤项按来源各自的维度校验（WH-10 / WH-14）：`git_paths`、`lfs_paths` 必须是绝对 canonical 路径；`oci_repositories` 必须是 canonical 小写 distribution `remoteName`，与入站 `/v2` 用同一判定——`valid_repository_name` 的唯一实现在 `src/common/oci_name.rs`，由 OCI router 与 config 校验共用（GC-02），大小写敏感、不做折叠。router 永不会产生的名字也永不会匹配，这种过滤项是静默失效的订阅，故 fail-closed 拒绝而不是接受。`agent_tenants`/`agent_repo_paths` 已随旧 Capture 退场（MTR-57）删除，仍出现的配置会被 strict unknown-field 校验拒绝。每个集合上限 64 项、每项 1..=256 bytes。
 
 ## 运输（WH-09；自 WH-11 起注入应用）
 
@@ -61,14 +61,6 @@ LFS basic 上传在本次请求实际 `put_stream` 成功后发一次 `lfs.objec
 ## 来源适配：`lfs.media.finalized`（WH-06，已交付）
 
 既有 media finalize 的 finalized manifest 实际 put 成功后发一次 `lfs.media.finalized`：scope 只填服务端 `MediaScope` 的 canonical `repo_path`（HTTP 路径带来的 `.git` 后缀会保留，例如 `/acme/app.git`；`lfs_paths` 必须写成同样形式，不能照抄 `git_paths` 的无后缀仓库路径），data 为 `oid,size,manifest_id,transfer="fastcdc"`。`occurred_at` 取本次 finalize 操作钟（生产 `finalize()` 在入口取 `unix_now()`，测试经 `finalize_at` 注入），与 reassembled 校验耗时同一快照。no-op / 中间步骤 / 中途失败不发；并发 finalize（同进程 `MAX_CONCURRENT_FINALIZE=2` 或跨进程）在 exists→put 窗口内可重复通知。HTTP 认证仍为 `AccessTokenUser` 的 DB access token（匿名/静态 push token 不发且 401）。见 [`fastcdc-media.md`](fastcdc-media.md)「出站事件」。
-
-## 来源适配：`agent_capture.events.committed`（WH-07，已交付）
-
-Agent Capture `events:batch` 在 ingest receipt 事务提交后，按本次实际 insert 的新 event 行**每 generation 一份** `agent_capture.events.committed`（ADR-WH-04；该 generation 新行数为 0 则不发）。摘要来自提交返回快照：`capture_id`、`receipt_id`、该组 `new_event_count` / `generation`、`stream_kind`（session 的 `session_kind`，不是水位流名 `jsonl`）、`completeness`，以及可信 `tenant_id` / `repo_path`。同批若插入两个 generation，就发两份摘要。HTTP 层同 fingerprint 的 replay 在进事务前 200 返回，不调用 commit、不发事件；事务内同 receipt 或仅旧 uid 的批 `new_event_count=0`，也不发。投影在 `try_emit` 同步完成，发送任务不回读 session/watermark 最新状态。过滤为 `agent_tenants` 与 `agent_repo_paths` 的 AND 交集。`push_auth=none` 不改变 ingest token 门。file-op / blob / session PUT 不发。见 [`agent-capture.md`](agent-capture.md)「出站事件」。
-
-## 来源适配：`agent_capture.checkpoint.committed`（WH-08，已交付）
-
-Agent Capture `POST .../checkpoints` 在 ingest receipt 事务提交且本次新建 checkpoint 行后发一次 `agent_capture.checkpoint.committed`。快照来自提交返回值：`capture_id`、`checkpoint_id`、该次提交后的 `completeness`、`raw_committed`（仅当本次关联了已 committed raw blob 为 true；仅 redacted / incomplete 为 false），以及可信 `tenant_id` / `repo_path`。同一 `checkpoint_id` 的 fingerprint replay（HTTP 早退或事务内同 receipt）不发；共享同一 raw blob 的**新** checkpoint 各自发一次。投影在 `try_emit` 同步完成，发送任务不回读 session latest。过滤仍为 tenant 与 repo 的 AND。`push_auth=none` 不改变 ingest token 门。见 [`agent-capture.md`](agent-capture.md)「出站事件」。
 
 ## 事件投影与过滤（WH-10）
 

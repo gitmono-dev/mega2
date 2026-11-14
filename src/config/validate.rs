@@ -143,7 +143,6 @@ impl Config {
         reject_legacy_oauth_environment()?;
         reject_legacy_mail_environment()?;
         validate_trunk_config_surface(self)?;
-        validate_agent_capture_config(self)?;
         validate_storage_events_config(self)?;
         validate_github_sync_config(self)?;
         validate_traces_config(&self.traces)?;
@@ -724,34 +723,6 @@ pub(crate) fn validate_trunk_config_surface(config: &Config) -> Result<(), MegaE
     Ok(())
 }
 
-pub(crate) fn validate_agent_capture_config(config: &Config) -> Result<(), MegaError> {
-    let capture = &config.agent_capture;
-    if capture.enabled && !config.git.storage_only() {
-        return Err(MegaError::Other(
-            "[agent_capture] enabled=true requires git.push_auth (storage-only); \
-             the /api/v1/agent-capture surface is only mounted in storage-only deployments"
-                .to_string(),
-        ));
-    }
-    if capture.enabled && capture.ingest_tokens.is_empty() {
-        return Err(MegaError::Other(
-            "[agent_capture] enabled=true requires at least one [[agent_capture.ingest_tokens]] entry"
-                .to_string(),
-        ));
-    }
-    for token in &capture.ingest_tokens {
-        if let Some(token_tenant) = &token.tenant_id
-            && token_tenant != &capture.tenant_id
-        {
-            return Err(MegaError::Other(
-                "[[agent_capture.ingest_tokens]].tenant_id must equal [agent_capture].tenant_id"
-                    .to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), MegaError> {
     let events = &config.storage_events;
     if events.enabled && !config.git.storage_only() {
@@ -827,28 +798,10 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
         validate_storage_events_filter_list("git_paths", &target.git_paths, FilterKind::Path)?;
         validate_storage_events_filter_list("lfs_paths", &target.lfs_paths, FilterKind::Path)?;
         validate_storage_events_filter_list(
-            "agent_repo_paths",
-            &target.agent_repo_paths,
-            FilterKind::Path,
-        )?;
-        validate_storage_events_filter_list(
             "oci_repositories",
             &target.oci_repositories,
             FilterKind::OciRepository,
         )?;
-        validate_storage_events_filter_list(
-            "agent_tenants",
-            &target.agent_tenants,
-            FilterKind::Opaque,
-        )?;
-        let agent_tenants_empty = target.agent_tenants.is_empty();
-        let agent_repos_empty = target.agent_repo_paths.is_empty();
-        if agent_tenants_empty != agent_repos_empty {
-            return Err(MegaError::Other(
-                "[[storage_events.targets]] agent_tenants and agent_repo_paths must both be empty or both be non-empty"
-                    .to_string(),
-            ));
-        }
     }
     if events.targets.len() > 16 {
         return Err(MegaError::Other(
@@ -1134,8 +1087,6 @@ const STORAGE_EVENTS_EVENT_LITERALS: &[&str] = &[
     "oci.manifest.published",
     "lfs.object.uploaded",
     "lfs.media.finalized",
-    "agent_capture.events.committed",
-    "agent_capture.checkpoint.committed",
 ];
 
 fn is_storage_events_event_literal(value: &str) -> bool {
@@ -1147,13 +1098,10 @@ fn is_storage_events_event_literal(value: &str) -> bool {
 /// form. Count and byte-size limits are shared.
 #[derive(Clone, Copy)]
 enum FilterKind {
-    /// Absolute canonical repository path (`git_paths`, `lfs_paths`,
-    /// `agent_repo_paths`).
+    /// Absolute canonical repository path (`git_paths`, `lfs_paths`).
     Path,
     /// Canonical distribution `remoteName` (`oci_repositories`).
     OciRepository,
-    /// Server-supplied opaque value compared verbatim (`agent_tenants`).
-    Opaque,
 }
 
 fn validate_storage_events_filter_list(
@@ -1190,7 +1138,6 @@ fn validate_storage_events_filter_list(
                     )));
                 }
             }
-            FilterKind::Opaque => {}
         }
     }
     Ok(())
@@ -1695,6 +1642,44 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
 ///
 /// `[oauth]` is a recognized section (`OAuthConfig`) with strongly-typed keys;
 /// unknown keys under the section fail like any other section.
+/// The legacy `[agent_capture]` section was removed with the Capture HTTP
+/// surface. It must not be silently ignored: a config that still carries it
+/// (or its environment override) is rejected with the replacement guidance.
+pub fn reject_removed_agent_capture_section(value: &Value) -> Result<(), MegaError> {
+    if value
+        .as_table()
+        .is_some_and(|table| table.contains_key("agent_capture"))
+    {
+        return Err(MegaError::Other(
+            "the [agent_capture] section was removed: legacy Capture HTTP ingestion is retired; \
+             upload agent history through scoped traces Git (refs/libra/traces) and query it \
+             through /api/v1/traces"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The removed section must not be injectable through `MEGA_AGENT_CAPTURE__*`
+/// environment keys on any load path.
+pub(crate) fn reject_legacy_agent_capture_environment() -> Result<(), MegaError> {
+    const PREFIX: &str = "MEGA_AGENT_CAPTURE__";
+    let mut found: Vec<String> = std::env::vars_os()
+        .filter_map(|(key, _)| {
+            let key = key.to_string_lossy();
+            key.starts_with(PREFIX).then(|| key.into_owned())
+        })
+        .collect();
+    found.sort();
+    if let Some(first) = found.first() {
+        return Err(MegaError::Other(format!(
+            "{first} targets the removed [agent_capture] section; legacy Capture ingestion is \
+             retired, use scoped traces Git and /api/v1/traces"
+        )));
+    }
+    Ok(())
+}
+
 pub fn reject_unknown_fields(value: &Value) -> Result<(), MegaError> {
     let mut errors = Vec::new();
 
@@ -2304,8 +2289,6 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "oci_repositories",
             "lfs_paths",
             "include_unscoped_lfs",
-            "agent_tenants",
-            "agent_repo_paths",
         ]),
         "traces" => Some(&["enabled", "server_id", "scope"]),
         "github_sync" => Some(&[
@@ -4665,8 +4648,6 @@ mod tests {
             oci_repositories: Vec::new(),
             lfs_paths: Vec::new(),
             include_unscoped_lfs: false,
-            agent_tenants: Vec::new(),
-            agent_repo_paths: Vec::new(),
         }
     }
 
@@ -4822,8 +4803,6 @@ mod tests {
             oci_repositories: Vec::new(),
             lfs_paths: Vec::new(),
             include_unscoped_lfs: false,
-            agent_tenants: Vec::new(),
-            agent_repo_paths: Vec::new(),
         }];
         let err = config
             .validate()
@@ -4868,14 +4847,6 @@ mod tests {
         let err = config.validate().expect_err("too many filter items");
         assert!(err.to_string().contains("at most 64"), "{err}");
 
-        let mut config = valid_config();
-        let mut target = sample_target();
-        target.agent_tenants = vec!["acme".to_string()];
-        target.agent_repo_paths = Vec::new();
-        config.storage_events.targets = vec![target];
-        let err = config.validate().expect_err("agent filters must be paired");
-        assert!(err.to_string().contains("agent_tenants"), "{err}");
-
         // WH-14 / ADR-WH-01: `oci_repositories` uses the same canonical
         // `remoteName` rule as the inbound `/v2` router — a name the router
         // would reject can never match, so it is a dead subscription.
@@ -4913,19 +4884,6 @@ mod tests {
         let err = config.validate().expect_err("too many oci filter items");
         assert!(err.to_string().contains("oci_repositories"), "{err}");
         assert!(err.to_string().contains("at most 64"), "{err}");
-
-        // `agent_tenants` is `FilterKind::Opaque`: a tenant is compared
-        // verbatim and is neither a path nor a remoteName, so a value that
-        // fails both of those rules must still be accepted. Guards against
-        // wiring the tenant list to the wrong arm.
-        let mut config = valid_config();
-        let mut target = sample_target();
-        target.agent_tenants = vec!["Acme Corp".to_string()];
-        target.agent_repo_paths = vec!["/team/a".to_string()];
-        config.storage_events.targets = vec![target];
-        config
-            .validate()
-            .expect("opaque tenant values are compared verbatim, not parsed");
 
         for invalid in [
             "Team/Image",

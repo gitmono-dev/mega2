@@ -164,6 +164,7 @@ report-status 行为 `ng refs/heads/main <文本>`；`git push` 显示为 `! [re
 - 500 `Internal server error` 可重试（写入队列暂停 / 硬停 / 满、detach 轮次未完成、存储错误；计划 `DEFER-FU-42`）；带 `cleanup_id` 的续做重试对重新导入安全，只带 `path`（不带 `cleanup_id`）的重试会 detach 当时存活的仓库。请求、结局语义与客户端协议见 [refactoring/directory-entry-api.md](refactoring/directory-entry-api.md) 的「ImportRepo 叶子清理」。
 - 运维 CLI `mega2 import-repo remove`（FU-21 起）把本域的错误原文写到 stderr、不输出结局行，以退出码 1 结束；结局行、其它退出码与续做见[使用指南](./user-guide.zh.md#26-importrepo-生命周期)第 2.6 节。
 
+<a id="megaerrorviewunavailable--viewpackrejected视图协议错误plan-20261002"></a>
 ## MegaError::ViewUnavailable / ViewPackRejected：视图协议错误（plan-20261002）
 
 `MegaError::ViewUnavailable { filter_id: String, reason: ViewUnavailableReason }` 与

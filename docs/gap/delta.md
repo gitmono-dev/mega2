@@ -13,7 +13,7 @@
 | checkout | `git HEAD = 0836675`（`fix(test): align LFS batch URLs with git-cli bridge networking`） |
 | 版本 | `Cargo.toml` version `0.3.5` |
 | 形态 | 单 package `mega2`（lib `mega2_core`），Rust 2024 |
-| 核对范围 | `src/ceres/`、`src/jupiter/`、`src/callisto/`、`src/api/`、`src/contract/`、`src/orbit*/`、`docs/plan/`、`docs/refactoring/`、`docs/manuel/` |
+| 核对范围 | `src/ceres/`、`src/jupiter/`、`src/callisto/`、`src/api/`、`src/contract/`、`src/orbit*/`、`docs/plan/`、`docs/refactoring/`、`docs/manual/` |
 
 **Delta 侧（二手转引 + 一手来源留档）**
 
@@ -519,7 +519,7 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 - 官方说明（`src/contract/policy/guard/http_enforcement.rs`）："A full bot authorization model (schema plus identity mapping) is deferred."
 - 行为矩阵：`off` → 200 短路；`shadow` → 200 + would-deny；`enforce` → **403**。
 - `un27_a_bot_does_not_inherit_a_same_named_users_permissions` 明确断言 principal 的类型是身份的一部分。
-- **官方迁移建议是反向的**：`docs/manuel/authz.md:96` 逐字写着「Bot 对受保护 CL 面的操作须在 enforce 前迁移到**用户 token**；完整 Bot 授权模型归后续计划」——即架构性地要求 agent 冒充人。
+- **官方迁移建议是反向的**：`docs/manual/authz.md:96` 逐字写着「Bot 对受保护 CL 面的操作须在 enforce 前迁移到**用户 token**；完整 Bot 授权模型归后续计划」——即架构性地要求 agent 冒充人。
 
 **这与「决策链归因」直接冲突：你无法归因一个冒充人的主体。** 全仓唯一**被持久化审计**的人/机类型是 `ActorTypeEnum { Human, Bot }`（`sea_orm_active_enums.rs:8-13`），而它属于一张**从未写入过**的表（`log_audit` 在 `src/jupiter/storage/audit_storage.rs:33` 定义，全 `src/` **零调用点**，已 grep 确认）。
 *（精度限定）*：请求路径上并非完全不区分——`cedar_guard.rs:343` 已能返回 `("Bot".to_string(), bot_id)`，另有 `TargetTypeEnum::Bot`。准确说法是「唯一被持久化审计的人/机类型，而它所属的表零写入」。
@@ -855,7 +855,7 @@ ME-C*  ── 边界与叙事，随时可写
 
 **关于锚定评审的诚实结论（原版头条已撤回）**：原版拿一句不在基线内的话（"comments attach to snapshots and fall out of date"）当作 Zed 的论点再宣布它不成立，是自设靶子，已删除。真实情况是：mega2 的锚**不是内容锚**，是**带校验的行号锚 + diff 偏移，无内容检索兜底**（Tier 1 第一步就按 `original_line_number` 取下标，`code_review_service.rs:387`；Tier 3 是 TODO）。因此三条结论各归其位——① **生命周期**：`Open/Resolved` + **resolve 与 reopen 两个端点**，Delta 明确没有，**硬差异**；② **可审计性**：算法在源码里、有置信度与显式失配态，Delta 机制未公开——**开放性优势，不等于效果优势**；③ **锚定原理**：Delta 锚到不可变 delta 的身份锚在原理上强于启发式重匹配，五态降级恰是失配的证据而非优势，mega2 的等价物是「补 Tier 3 + 锚绑稳定 ID」——**那是 ME-A4 的目标，不是既有胜势**。而且这套机制还有四个洞，其中最严重的是：**重锚喂给 Tier 2 的 diff 被 `Pagination::default()`（per_page=20）截断**（`monorepo.rs:1179-1181`），CL 改动超 20 文件时第 21 个起的线程静默落 `NotFound`——正是 agent 的典型工作形态。
 
-**唯一的真瓶颈**：`mega.cedarschema` 里没有 `entity Bot`（`grep -c "Bot"` = 0），四条 action 声明的 principal 全是 `[User]`。全仓唯一被持久化审计的人/机类型属于一张从未写入过的表（`log_audit` 零调用）；官方迁移建议是让 agent 改用**用户 token**（`docs/manuel/authz.md:96`），即架构性地要求 agent 冒充人——**而你无法归因一个冒充人的主体**。这个判断完全由 mega2 自证支撑，不依赖任何对 Delta roadmap 的解读。
+**唯一的真瓶颈**：`mega.cedarschema` 里没有 `entity Bot`（`grep -c "Bot"` = 0），四条 action 声明的 principal 全是 `[User]`。全仓唯一被持久化审计的人/机类型属于一张从未写入过的表（`log_audit` 零调用）；官方迁移建议是让 agent 改用**用户 token**（`docs/manual/authz.md:96`），即架构性地要求 agent 冒充人——**而你无法归因一个冒充人的主体**。这个判断完全由 mega2 自证支撑，不依赖任何对 Delta roadmap 的解读。
 
 ---
 

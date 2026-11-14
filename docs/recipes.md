@@ -2,7 +2,7 @@
 
 English · [中文](recipes.zh.md)
 
-Mega2's core capabilities are the Monorepo engine and optional Agent Session Capture. These recipes cover additional workflows such as LFS, OCI, build artifacts, and persistent data. Start with the [Quick Start](./quick-start.md) for Monorepo Git operations; see the [User Guide](./user-guide.md) and [Agent Capture API reference](./refactoring/agent-capture.md) (Chinese) for session capture.
+Mega2's core capabilities are the Monorepo engine and Agent Traces archive. These recipes cover additional workflows such as LFS, OCI, build artifacts, Traces archiving, and persistent data. Start with the [Quick Start](./quick-start.md) for initial Monorepo Git operations; see the [User Guide](./user-guide.md#5-optional-service-surfaces) and [Traces protocol](./refactoring/traces.md) for Traces archiving.
 
 ## Push nested directories
 
@@ -181,6 +181,29 @@ curl -s "$BASE/objects/$OID2?mode=link"
 ```
 
 Artifact writes share the `git.push_auth` gate (anonymous here). The `object_type` vocabulary (`snapshot`, `provenance`, `run`, …) and the negotiated limits are advertised by the discovery payload.
+
+## Archive and query Agent trajectories with Traces
+
+Traces stores and queries AI Agent sessions, checkpoints, and operation histories:
+
+1. **Enable Traces**: Set `[traces].enabled = true` and provide a persistent `server_id` UUID:
+   ```toml
+   [traces]
+   enabled = true
+   server_id = "00000000-0000-0000-0000-000000000001"
+   ```
+2. **Push Traces data**: Agents or clients (such as Libra) push archives using the dedicated Git ref `refs/libra/traces` over HTTP or SSH:
+   ```bash
+   git push --no-thin http://127.0.0.1:9000/.traces/<target_id>.git HEAD:refs/libra/traces
+   ```
+3. **Query and search**:
+   ```bash
+   # Retrieve server Traces capabilities and limits
+   curl -fsS "http://127.0.0.1:9000/api/v1/traces/capabilities"
+   # Literal search on a specific stream
+   curl -fsS "http://127.0.0.1:9000/api/v1/traces/streams/<stream_id>/search?q=keyword"
+   ```
+For complete credential binding, authorization, and protocol limits, see the [User Guide](./user-guide.md#5-optional-service-surfaces) and the [Traces protocol](./refactoring/traces.md).
 
 ## Check logs, stop, and clean up
 

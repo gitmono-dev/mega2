@@ -1,6 +1,8 @@
 #[path = "common/traces_db.rs"]
 mod traces_db;
 
+#[path = "common/traces_retirement_inventory.rs"]
+mod traces_retirement_inventory;
 #[path = "common/traces_runtime.rs"]
 mod traces_runtime;
 
@@ -5455,6 +5457,7 @@ mod disabled_http {
         assert_eq!(stream.principal_id, fixture.owner);
         assert_eq!(stream.tip_oid.as_deref(), Some(tip.as_str()));
         assert_eq!(stream.hash_kind, kind);
+        wait_for_trace_indexed(&git.db, &stream.id).await;
     }
 
     // MTR-16: a real push of a multi-part UTF-8 transcript is sliced by the service.
@@ -15276,64 +15279,1997 @@ async fn search_api_returns_representative_evidence_and_a_coverage_report() {
     );
 }
 
-fn interop_http_script() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts/traces_interop_smoke.sh")
-}
+/// Offline selector for the traces interop HTTP driver (MTR-58).
+///
+/// These cases never reach a live service: they only start the audited shell
+/// driver with a controlled environment and assert its argument parsing, the
+/// missing-fixture failure path, and the cleanup guard.
+mod interop_http {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+    };
 
-#[test]
-fn interop_http_driver_rejects_unsupported_case_offline() {
-    let temporary = tempfile::tempdir().expect("temporary root");
-    let output = std::process::Command::new("bash")
-        .arg(interop_http_script())
-        .args(["--case", "ssh"])
-        .env("MEGA2_TRACES_INTEROP", "1")
-        .env("TMPDIR", temporary.path())
-        .output()
-        .expect("run interop driver");
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unsupported interop case"),
-        "unexpected driver output: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        temporary.path().read_dir().expect("temporary entries").next().is_none(),
-        "argument rejection must not create a fixture workspace"
-    );
-}
-
-#[test]
-fn interop_http_missing_fixture_fails_and_cleans_workspace_offline() {
-    let temporary = tempfile::tempdir().expect("temporary root");
-    let mut command = std::process::Command::new("bash");
-    command
-        .arg(interop_http_script())
-        .args(["--case", "http"])
-        .env("MEGA2_TRACES_INTEROP", "1")
-        .env("TMPDIR", temporary.path());
-    for name in [
-        "LIBRA_TRACES_LIVE_ENABLED",
-        "LIBRA_TRACES_LIVE_HTTP_URL",
-        "LIBRA_TRACES_LIVE_TOKEN_FILE",
-        "LIBRA_TRACES_LIVE_TARGET",
-        "LIBRA_TRACES_LIVE_SERVER_ID",
-        "LIBRA_TRACES_LIVE_CLIENT_BINARY_SHA256",
-        "LIBRA_TRACES_LIVE_CONTRACT_SHA256",
-        "LIBRA_TRACES_LIVE_INSTALLED_BINARY",
-        "MEGA2_TRACES_LIBRA_BIN",
-    ] {
-        command.env_remove(name);
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
     }
-    let output = command.output().expect("run interop driver without fixture");
-    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("live fixture is missing"), "{stderr}");
-    assert!(stderr.contains("LIBRA_TRACES_LIVE_ENABLED"), "{stderr}");
-    assert!(
-        temporary.path().read_dir().expect("temporary entries").next().is_none(),
-        "missing-fixture failure must clean its temporary workspace"
+    fn driver(case: Option<&str>, interop: bool) -> Output {
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .current_dir(repo_root())
+            .arg("scripts/traces_interop_smoke.sh");
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        if interop {
+            command.env("MEGA2_TRACES_INTEROP", "1");
+        }
+        if let Some(case) = case {
+            command.args(["--case", case]);
+        }
+        command.output().expect("run the interop driver")
+    }
+
+    fn stdout(output: &Output) -> String {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn interop_http_lists_cases() {
+        let output = Command::new("bash")
+            .current_dir(repo_root())
+            .args(["scripts/traces_interop_smoke.sh", "--list-cases"])
+            .output()
+            .expect("list interop cases");
+        assert!(output.status.success());
+        let cases = stdout(&output);
+        assert_eq!(
+            cases.lines().collect::<Vec<_>>(),
+            vec!["http", "ssh", "agent", "history", "ref-reject"]
+        );
+    }
+
+    #[test]
+    fn interop_http_requires_a_case_and_the_switch() {
+        let missing = driver(None, true);
+        assert_eq!(missing.status.code(), Some(2), "missing --case");
+        let off = driver(Some("http"), false);
+        assert_eq!(off.status.code(), Some(2), "switch off");
+        assert!(String::from_utf8_lossy(&off.stderr).contains("MEGA2_TRACES_INTEROP=1"));
+        let unknown = driver(Some("nope"), true);
+        assert_eq!(unknown.status.code(), Some(2), "unknown case");
+    }
+
+    #[test]
+    fn interop_http_missing_fixture_fails_the_run() {
+        let output = driver(Some("http"), true);
+        assert_eq!(output.status.code(), Some(1), "missing fixture must fail");
+        assert!(
+            stdout(&output).contains("FAIL: fixture"),
+            "missing fixture output: {}",
+            stdout(&output)
+        );
+    }
+
+    #[test]
+    fn interop_http_cleanup_guard_removes_owned_workdir() {
+        let root = tempfile::tempdir().expect("interop workdir parent");
+        let fixture = root.path().join("fixture");
+        fs::create_dir_all(fixture.join("agent-repo")).expect("prepared repo dir");
+        fs::write(fixture.join("token"), "synthetic").expect("token file");
+        let libra_stub = fixture.join("libra-stub");
+        fs::write(&libra_stub, "#!/bin/sh\nexit 1\n").expect("libra stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&libra_stub, fs::Permissions::from_mode(0o700)).expect("exec bit");
+        }
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .current_dir(repo_root())
+            .args(["scripts/traces_interop_smoke.sh", "--case", "http"])
+            .env("MEGA2_TRACES_INTEROP", "1")
+            .env("MEGA2_TRACES_INTEROP_HTTP_URL", "http://127.0.0.1:9")
+            .env("MEGA2_TRACES_INTEROP_TARGET", "/project/interop")
+            .env("MEGA2_TRACES_INTEROP_TOKEN_FILE", fixture.join("token"))
+            .env("LIBRA_BIN", fixture.join("libra-stub"))
+            .env(
+                "MEGA2_TRACES_INTEROP_AGENT_REPO",
+                fixture.join("agent-repo"),
+            )
+            .env(
+                "MEGA2_TRACES_INTEROP_SCOPE",
+                "3f1d2c4b-5a6e-4f70-8a9b-0c1d2e3f4a5b",
+            )
+            .env(
+                "MEGA2_TRACES_INTEROP_FOREIGN_WANT",
+                "0123456789abcdef0123456789abcdef01234567",
+            );
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = command.output().expect("run the interop driver");
+        assert_eq!(output.status.code(), Some(1), "unreachable fixture fails");
+        let text = stdout(&output);
+        assert!(
+            text.contains("traces interop http summary:"),
+            "summary missing: {text}"
+        );
+        let workdir = text
+            .lines()
+            .find_map(|line| line.strip_prefix("traces interop workdir: "))
+            .expect("driver prints its owned workdir");
+        assert!(
+            !Path::new(workdir).exists(),
+            "the cleanup guard must remove the owned workdir {workdir}"
+        );
+    }
+}
+
+/// Offline selector for the traces interop SSH driver (MTR-59).
+///
+/// Never reaches a live service: it starts the audited shell driver with a
+/// controlled environment and asserts argument parsing, the missing-fixture
+/// failure and the cleanup guard.
+mod interop_ssh {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+    };
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    }
+
+    fn driver(case: Option<&str>, interop: bool) -> Output {
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .current_dir(repo_root())
+            .arg("scripts/traces_interop_smoke.sh");
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        if interop {
+            command.env("MEGA2_TRACES_INTEROP", "1");
+        }
+        if let Some(case) = case {
+            command.args(["--case", case]);
+        }
+        command.output().expect("run the interop driver")
+    }
+
+    #[test]
+    fn interop_ssh_requires_a_case_and_the_switch() {
+        assert_eq!(driver(None, true).status.code(), Some(2), "missing --case");
+        let off = driver(Some("ssh"), false);
+        assert_eq!(off.status.code(), Some(2), "switch off");
+        assert!(String::from_utf8_lossy(&off.stderr).contains("MEGA2_TRACES_INTEROP=1"));
+        assert_eq!(
+            driver(Some("nope"), true).status.code(),
+            Some(2),
+            "unknown case"
+        );
+    }
+
+    #[test]
+    fn interop_ssh_missing_fixture_fails_the_run() {
+        let output = driver(Some("ssh"), true);
+        assert_eq!(output.status.code(), Some(1), "missing fixture must fail");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("FAIL: fixture"),
+            "missing fixture output: {text}"
+        );
+    }
+
+    #[test]
+    fn interop_ssh_cleanup_guard_removes_owned_workdir() {
+        let root = tempfile::tempdir().expect("interop workdir parent");
+        let fixture = root.path().join("fixture");
+        fs::create_dir_all(fixture.join("agent-repo")).expect("prepared repo dir");
+        let wrapper = fixture.join("sshwrap");
+        fs::write(&wrapper, "#!/bin/sh\nexit 1\n").expect("wrapper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).expect("exec bit");
+        }
+        let output = Command::new("bash")
+            .env_clear()
+            .current_dir(repo_root())
+            .args(["scripts/traces_interop_smoke.sh", "--case", "ssh"])
+            .env("MEGA2_TRACES_INTEROP", "1")
+            .env(
+                "MEGA2_TRACES_INTEROP_SSH_URL",
+                "ssh://git@127.0.0.1:9/project/interop.git",
+            )
+            .env("MEGA2_TRACES_INTEROP_TARGET", "/project/interop")
+            .env(
+                "MEGA2_TRACES_INTEROP_AGENT_REPO",
+                fixture.join("agent-repo"),
+            )
+            .env(
+                "MEGA2_TRACES_INTEROP_SCOPE",
+                "3f1d2c4b-5a6e-4f70-8a9b-0c1d2e3f4a5b",
+            )
+            .env(
+                "MEGA2_TRACES_INTEROP_FOREIGN_WANT",
+                "0123456789abcdef0123456789abcdef01234567",
+            )
+            .env("LIBRA_SSH_COMMAND", &wrapper)
+            .env("LIBRA_BIN", &wrapper)
+            .output()
+            .expect("run the ssh interop driver");
+        assert_eq!(output.status.code(), Some(1), "unreachable fixture fails");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("traces interop ssh summary:"),
+            "summary missing: {text}"
+        );
+        let workdir = text
+            .lines()
+            .find_map(|line| line.strip_prefix("traces interop workdir: "))
+            .expect("driver prints its owned workdir");
+        assert!(
+            !Path::new(workdir).exists(),
+            "the cleanup guard must remove the owned workdir {workdir}"
+        );
+    }
+}
+
+/// Offline selector for the traces interop agent driver (MTR-60).
+///
+/// Starts the audited shell driver with a controlled environment and asserts
+/// argument parsing, the missing-fixture failure and the cleanup guard; it
+/// never reaches a live service or the Libra checkout.
+mod interop_agent {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+    };
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    }
+
+    fn driver(case: Option<&str>, interop: bool) -> Output {
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .current_dir(repo_root())
+            .arg("scripts/traces_interop_smoke.sh");
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        if interop {
+            command.env("MEGA2_TRACES_INTEROP", "1");
+        }
+        if let Some(case) = case {
+            command.args(["--case", case]);
+        }
+        command.output().expect("run the interop driver")
+    }
+
+    #[test]
+    fn interop_agent_requires_a_case_and_the_switch() {
+        assert_eq!(driver(None, true).status.code(), Some(2), "missing --case");
+        let off = driver(Some("agent"), false);
+        assert_eq!(off.status.code(), Some(2), "switch off");
+        assert!(String::from_utf8_lossy(&off.stderr).contains("MEGA2_TRACES_INTEROP=1"));
+        assert_eq!(
+            driver(Some("nope"), true).status.code(),
+            Some(2),
+            "unknown case"
+        );
+    }
+
+    #[test]
+    fn interop_agent_missing_fixture_fails_the_run() {
+        let output = driver(Some("agent"), true);
+        assert_eq!(output.status.code(), Some(1), "missing fixture must fail");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("FAIL: fixture"),
+            "missing fixture output: {text}"
+        );
+    }
+
+    #[test]
+    fn interop_agent_cleanup_guard_removes_owned_workdir() {
+        let root = tempfile::tempdir().expect("interop workdir parent");
+        let fixture = root.path().join("fixture");
+        fs::create_dir_all(fixture.join("libra-repo")).expect("fixture dir");
+        fs::write(fixture.join("token"), "synthetic").expect("token file");
+        let libra_stub = fixture.join("libra-stub");
+        fs::write(&libra_stub, "#!/bin/sh\nexit 1\n").expect("libra stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&libra_stub, fs::Permissions::from_mode(0o700)).expect("exec bit");
+        }
+        let output = Command::new("bash")
+            .env_clear()
+            .current_dir(repo_root())
+            .args(["scripts/traces_interop_smoke.sh", "--case", "agent"])
+            .env("MEGA2_TRACES_INTEROP", "1")
+            .env("MEGA2_TRACES_INTEROP_HTTP_URL", "http://127.0.0.1:9")
+            .env("MEGA2_TRACES_INTEROP_TARGET", "/project/interop")
+            .env("MEGA2_TRACES_INTEROP_TOKEN_FILE", fixture.join("token"))
+            .env(
+                "MEGA2_TRACES_INTEROP_SEARCH_STREAM",
+                "597b9eb7-61f4-432a-a814-21b58d1a2157",
+            )
+            .env("MEGA2_TRACES_INTEROP_QUERY", "connection timeout")
+            .env("LIBRA_REPO", fixture.join("libra-repo"))
+            .env("LIBRA_BIN", &libra_stub)
+            .output()
+            .expect("run the agent interop driver");
+        assert_eq!(output.status.code(), Some(1), "unreachable fixture fails");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("traces interop agent summary:"),
+            "summary missing: {text}"
+        );
+        let workdir = text
+            .lines()
+            .find_map(|line| line.strip_prefix("traces interop workdir: "))
+            .expect("driver prints its owned workdir");
+        assert!(
+            !Path::new(workdir).exists(),
+            "the cleanup guard must remove the owned workdir {workdir}"
+        );
+    }
+}
+
+/// Offline selector for the traces interop history driver (MTR-68).
+///
+/// Starts the audited shell driver with a controlled environment and asserts
+/// argument parsing, the missing-fixture failure and the cleanup guard; the
+/// four live selectors run only through `--case history`.
+mod interop_history {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+    };
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    }
+
+    fn driver(case: Option<&str>, interop: bool) -> Output {
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .current_dir(repo_root())
+            .arg("scripts/traces_interop_smoke.sh");
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        if interop {
+            command.env("MEGA2_TRACES_INTEROP", "1");
+        }
+        if let Some(case) = case {
+            command.args(["--case", case]);
+        }
+        command.output().expect("run the interop driver")
+    }
+
+    #[test]
+    fn interop_history_requires_a_case_and_the_switch() {
+        assert_eq!(driver(None, true).status.code(), Some(2), "missing --case");
+        let off = driver(Some("history"), false);
+        assert_eq!(off.status.code(), Some(2), "switch off");
+        assert!(String::from_utf8_lossy(&off.stderr).contains("MEGA2_TRACES_INTEROP=1"));
+        assert_eq!(
+            driver(Some("nope"), true).status.code(),
+            Some(2),
+            "unknown case"
+        );
+    }
+
+    #[test]
+    fn interop_history_missing_fixture_fails_the_run() {
+        let output = driver(Some("history"), true);
+        assert_eq!(output.status.code(), Some(1), "missing fixture must fail");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("FAIL: fixture"),
+            "missing fixture output: {text}"
+        );
+    }
+
+    #[test]
+    fn interop_history_cleanup_guard_removes_owned_workdir() {
+        let root = tempfile::tempdir().expect("interop workdir parent");
+        let libra_repo = root.path().join("libra-repo");
+        fs::create_dir_all(&libra_repo).expect("libra repo dir");
+        fs::write(libra_repo.join(".env.test"), "export RUST_MIN_STACK=1\n").expect("env.test");
+        fs::write(
+            libra_repo.join(".env.live-test"),
+            "export LIBRA_TRACES_LIVE_ENABLED=0\n",
+        )
+        .expect("env.live-test");
+        let output = Command::new("bash")
+            .env_clear()
+            .current_dir(repo_root())
+            .args(["scripts/traces_interop_smoke.sh", "--case", "history"])
+            .env("MEGA2_TRACES_INTEROP", "1")
+            .env("LIBRA_REPO", &libra_repo)
+            .output()
+            .expect("run the history interop driver");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a failing selector fails the run"
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("traces interop history summary:"),
+            "summary missing: {text}"
+        );
+        let workdir = text
+            .lines()
+            .find_map(|line| line.strip_prefix("traces interop workdir: "))
+            .expect("driver prints its owned workdir");
+        assert!(
+            !Path::new(workdir).exists(),
+            "the cleanup guard must remove the owned workdir {workdir}"
+        );
+    }
+}
+
+/// MTR-23 schema-only gate: the purge journal, its inventory items and the
+/// writer fence are created with a barrier trigger on every legacy Capture
+/// table. The case only observes catalog state and the fence behavior.
+#[tokio::test]
+async fn purge_schema_journal_items_and_fence_contract() {
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let tables = [
+        ("trace_legacy_purge", Some("trace_legacy_purge_id_uuid")),
+        (
+            "trace_legacy_purge_item",
+            Some("trace_legacy_purge_item_natural_key"),
+        ),
+        (
+            "trace_legacy_writer_fence",
+            Some("trace_legacy_writer_fence_released"),
+        ),
+    ];
+    for (table, constraint) in tables {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass($1) IS NOT NULL AS present",
+                [format!("public.{table}").into()],
+            ))
+            .await
+            .expect("table lookup")
+            .expect("table row");
+        assert!(
+            row.try_get::<bool>("", "present").unwrap(),
+            "{table} missing"
+        );
+        if let Some(constraint) = constraint {
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT count(*) AS n FROM pg_constraint WHERE conname = $1",
+                    [constraint.into()],
+                ))
+                .await
+                .expect("constraint lookup")
+                .expect("constraint row");
+            assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1, "{constraint}");
+        }
+    }
+    for table in [
+        "agent_capture_session",
+        "agent_capture_event",
+        "agent_capture_source_stream",
+        "agent_capture_checkpoint",
+        "agent_capture_file_op",
+        "agent_capture_blob",
+        "agent_capture_blob_ref",
+        "agent_capture_ingest_receipt",
+        "agent_capture_stream_blob",
+        "agent_capture_access_audit",
+        "agent_capture_tombstone",
+        "agent_capture_deletion_ledger",
+    ] {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS n FROM pg_trigger WHERE tgname = $1 AND NOT tgisinternal",
+                [format!("{table}_legacy_write_fence").into()],
+            ))
+            .await
+            .expect("trigger lookup")
+            .expect("trigger row");
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1, "{table} barrier");
+    }
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}
+/// MTR-33 black-box fence gate: the real `traces purge-legacy-capture
+/// --action fence` CLI persists the persistent fence, repeats idempotently and
+/// refuses an unauthorized manifest without writing a fence row.
+#[tokio::test]
+async fn purge_fence_cli_activates_and_rejects() {
+    use sea_orm::ConnectionTrait;
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    db.execute_unprepared(
+        "INSERT INTO agent_capture_session
+         (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind, completeness)
+         VALUES ('deploy-m33', 'tenant-m33', 'repo', 'producer', 'fence-session', 'external_capture', 'complete')",
+    )
+    .await
+    .expect("legacy session");
+    let journal = "33333333-3333-4333-8333-333333333333";
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge
+         (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+         VALUES ('{journal}', 'local:/srv/mega2/objects', 'local:/srv/mega2/objects', 'deploy-m33', 'sha256:manifest', 'frozen')"
+    ))
+    .await
+    .expect("journal");
+
+    let temp = tempfile::tempdir().expect("fixture dir");
+    let database_url = std::env::var("MEGA_DATABASE__DB_URL")
+        .unwrap_or_else(|_| "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".into());
+    let name: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_database() AS name",
+        ))
+        .await
+        .expect("database name")
+        .expect("database row")
+        .try_get("", "name")
+        .expect("name");
+    let mut url = url::Url::parse(&database_url).expect("database url");
+    url.set_path(&name);
+    let config = temp.path().join("config.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample config");
+    let sample = sample.replace(
+        "db_url = \"postgres://localhost:5432/mono\"",
+        &format!("db_url = \"{}\"", url.as_str()),
     );
+    let sample = sample.replace(
+        "base_dir = \"/tmp/.mono\"",
+        &format!("base_dir = \"{}\"", temp.path().display()),
+    );
+    std::fs::write(&config, sample).expect("config");
+    // The CLI refuses a config that was not explicitly named.
+    let invalid_manifest = temp.path().join("invalid.json");
+    std::fs::write(
+        &invalid_manifest,
+        r#"{"bucket_scope": "mega2-legacy/", "owners": [], "orphan_prefixes": []}"#,
+    )
+    .expect("invalid manifest");
+    let run = |manifest: &std::path::Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "traces",
+                "purge-legacy-capture",
+                "--action",
+                "fence",
+                "--journal",
+                journal,
+                "--maintenance-manifest",
+            ])
+            .arg(manifest)
+            .env("MEGA_DATABASE__DB_URL", url.as_str())
+            .env("MEGA_BASE_DIR", temp.path().join("base"))
+            .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+            .output()
+            .expect("run purge CLI")
+    };
+    let refused = run(&invalid_manifest);
+    assert!(
+        !refused.status.success(),
+        "an unauthorized manifest must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("whole-database preflight failed"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let rows: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM trace_legacy_writer_fence",
+        ))
+        .await
+        .expect("fence count")
+        .expect("fence row")
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(rows, 0, "no fence row for an invalid activation");
+
+    let manifest = temp.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+            "bucket_scope": "mega2-legacy/",
+            "owners": [{"owner": "owner-a", "deployment_id": "deploy-m33", "tenant_id": "tenant-m33", "receipt_id": "receipt-a", "complete": true}],
+            "orphan_prefixes": []
+        }"#,
+    )
+    .expect("manifest");
+    let activated = run(&manifest);
+    assert!(
+        activated.status.success(),
+        "activation failed: {}",
+        String::from_utf8_lossy(&activated.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&activated.stdout);
+    assert!(stdout.contains("activated"), "{stdout}");
+    let again = run(&manifest);
+    assert!(again.status.success(), "idempotent activation");
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("already-active"),
+        "{}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+    let persisted: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM trace_legacy_writer_fence WHERE active",
+        ))
+        .await
+        .expect("active fence count")
+        .expect("active fence row")
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(persisted, 1, "one persistent active fence");
+
+    // The barrier is the trigger, proved with a role that holds an explicit
+    // DML grant. The guard restores the pre-test grants afterwards.
+    let role = format!("mega2_m33_probe_{}", std::process::id());
+    db.execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .ok();
+    db.execute_unprepared(&format!("CREATE ROLE {role} NOLOGIN"))
+        .await
+        .expect("probe role");
+    db.execute_unprepared(&format!(
+        "GRANT INSERT, UPDATE, DELETE, SELECT ON agent_capture_session TO {role}"
+    ))
+    .await
+    .expect("probe grants");
+    use sea_orm::TransactionTrait;
+    for statement in [
+        "INSERT INTO agent_capture_session
+         (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind)
+         VALUES ('d', 't', 'r', 'p', 'fenced-insert', 'external_capture')".to_owned(),
+        "UPDATE agent_capture_session SET completeness = 'empty' WHERE client_session_id = 'fence-session'".to_owned(),
+        "DELETE FROM agent_capture_session WHERE client_session_id = 'fence-session'".to_owned(),
+    ] {
+        // Each probe uses its own transaction: the barrier aborts the current
+        // transaction, which must not hide the next probe's result.
+        let txn = db.begin().await.expect("probe txn");
+        txn.execute_unprepared(&format!("SET LOCAL ROLE {role}"))
+            .await
+            .expect("set role");
+        let error = txn
+            .execute_unprepared(&statement)
+            .await
+            .expect_err("the barrier must reject the write");
+        assert!(
+            error.to_string().contains("fenced"),
+            "unexpected barrier error: {error}"
+        );
+        txn.rollback().await.ok();
+    }
+    db.execute_unprepared(&format!("REVOKE ALL ON agent_capture_session FROM {role}"))
+        .await
+        .expect("restore grants");
+    db.execute_unprepared(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .expect("drop probe role");
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}
+
+#[test]
+fn legacy_prepare_cli_requires_action_and_input() {
+    for args in [
+        vec!["traces", "prepare-legacy-capture"],
+        vec!["traces", "prepare-legacy-capture", "--action", "freeze"],
+        vec![
+            "traces",
+            "prepare-legacy-capture",
+            "--action",
+            "drop",
+            "--input",
+            "/nonexistent",
+        ],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .args(args)
+            .output()
+            .expect("preparation argument check");
+        assert!(!output.status.success(), "invalid preparation must fail");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("error:"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_prepare_cli_freezes_and_preflights_without_migrating() {
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    db.execute_unprepared(
+        "INSERT INTO agent_capture_session
+         (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind, completeness)
+         VALUES ('prepare-deploy', 'prepare-tenant', 'repo', 'producer', 'session', 'external_capture', 'complete')",
+    ).await.expect("legacy session");
+    let input = fixture.root.path().join("maintenance.json");
+    let objects = fixture.root.path().join("objects");
+    let manifest = serde_json::json!({
+        "deployment_id": "prepare-deploy", "backend_kind": "local",
+        "storage_location": objects,
+        "historical_locations": [format!("local:{}", objects.display())],
+        "scopes": [{"deployment_id": "prepare-deploy", "tenant_id": "prepare-tenant"}],
+        "operator": {"identity": "fixture-owner", "statement_digest": "sha256:synthetic"},
+        "bucket_scope": "agent/prepare-deploy/",
+        "owners": [{"owner": "fixture-owner", "deployment_id": "prepare-deploy", "tenant_id": "prepare-tenant", "receipt_id": "synthetic-owner-receipt", "complete": true}]
+    });
+    std::fs::write(&input, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let run = |action: &str, named: bool| {
+        let mut command = fixture.command(
+            &[
+                "traces",
+                "prepare-legacy-capture",
+                "--action",
+                action,
+                "--input",
+                input.to_str().unwrap(),
+            ],
+            named,
+        );
+        command
+            .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &objects);
+        CredentialProcess::spawn(command, fixture.root.path()).finish()
+    };
+    let implicit = run("freeze", false);
+    assert!(!implicit.status.success(), "unnamed config must fail");
+    let count = |sql: &str| Statement::from_string(DatabaseBackend::Postgres, sql);
+    let row = db
+        .query_one_raw(count("SELECT count(*) AS n FROM trace_legacy_purge"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+    let frozen = run("freeze", true);
+    assert!(
+        frozen.status.success(),
+        "{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    let row = db
+        .query_one_raw(count("SELECT id, manifest_digest FROM trace_legacy_purge"))
+        .await
+        .unwrap()
+        .unwrap();
+    let journal: String = row.try_get("", "id").unwrap();
+    Uuid::parse_str(&journal).expect("actual journal UUID");
+    let digest: String = row.try_get("", "manifest_digest").unwrap();
+    let stdout = String::from_utf8_lossy(&frozen.stdout);
+    assert!(
+        stdout.contains(&format!("freeze journal={journal} digest={digest}")),
+        "{stdout}"
+    );
+    let preflight = run("preflight", true);
+    assert!(
+        preflight.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preflight.stderr)
+    );
+    assert!(String::from_utf8_lossy(&preflight.stdout).contains("scopes=1 owners=1"));
+    let mut unauthorized = manifest.clone();
+    unauthorized["owners"] = serde_json::json!([]);
+    std::fs::write(&input, serde_json::to_vec(&unauthorized).unwrap()).unwrap();
+    let refused = run("preflight", true);
+    assert!(!refused.status.success(), "unclaimed scope must fail");
+    std::fs::remove_file(&input).unwrap();
+    let missing = run("freeze", true);
+    assert!(!missing.status.success(), "missing file must fail");
+    std::fs::write(&input, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    db.execute_unprepared(
+        "DELETE FROM seaql_migrations WHERE version = (SELECT max(version) FROM seaql_migrations)",
+    )
+    .await
+    .unwrap();
+    let before = db
+        .query_one_raw(count("SELECT count(*) AS n FROM seaql_migrations"))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    let outdated = run("freeze", true);
+    assert!(!outdated.status.success(), "old schema must fail");
+    assert!(String::from_utf8_lossy(&outdated.stderr).contains("never migrates"));
+    let after = db
+        .query_one_raw(count("SELECT count(*) AS n FROM seaql_migrations"))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(before, after, "preparation must not apply migrations");
+    let row = db
+        .query_one_raw(count("SELECT count(*) AS n FROM trace_legacy_purge"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "n").unwrap(),
+        1,
+        "failed paths must not create journals"
+    );
+    db.close().await.unwrap();
+    drop(guard);
+}
+
+#[tokio::test]
+async fn legacy_prepare_cli_transfers_roles_and_revokes_dml() {
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let fixture = CredentialCliFixture::new(&db).await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app = format!("prepare_app_{suffix}");
+    let maintenance = format!("prepare_maint_{suffix}");
+    for role in [&app, &maintenance] {
+        db.execute_unprepared(&format!("CREATE ROLE {role} NOLOGIN"))
+            .await
+            .unwrap();
+    }
+    let input = fixture.root.path().join("roles.json");
+    std::fs::write(
+        &input,
+        serde_json::to_vec(&serde_json::json!({
+            "app_role": app, "maintenance_role": maintenance,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let run = |action: &str| {
+        fixture.run(
+            &[
+                "traces",
+                "prepare-legacy-capture",
+                "--action",
+                action,
+                "--input",
+                input.to_str().unwrap(),
+            ],
+            true,
+        )
+    };
+    let prepared = run("prepare-roles");
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    assert!(String::from_utf8_lossy(&prepared.stdout).contains(
+        "tables=12 barrier=true app_plain=true cannot_alter=true cannot_disable_trigger=true"
+    ));
+    let tables = db.query_all_raw(Statement::from_string(DatabaseBackend::Postgres,
+        "SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE 'agent_capture_%' ORDER BY tablename"))
+        .await.unwrap();
+    assert_eq!(tables.len(), 12);
+    for row in &tables {
+        assert_eq!(
+            row.try_get::<String>("", "tableowner").unwrap(),
+            maintenance
+        );
+    }
+    db.execute_unprepared(&format!(
+        "GRANT INSERT, UPDATE, DELETE ON agent_capture_session TO {app}, PUBLIC"
+    ))
+    .await
+    .unwrap();
+    let revoked = run("revoke-dml");
+    assert!(
+        revoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&revoked.stdout).contains("tables=12 insert=true update=true delete=true public_insert=true public_update=true public_delete=true"));
+    for row in &tables {
+        let table: String = row.try_get("", "tablename").unwrap();
+        for privilege in ["INSERT", "UPDATE", "DELETE"] {
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT has_table_privilege($1, $2, $3) AS allowed",
+                    [app.clone().into(), table.clone().into(), privilege.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !row.try_get::<bool>("", "allowed").unwrap(),
+                "{table} {privilege}"
+            );
+        }
+        db.execute_unprepared(&format!("ALTER TABLE {table} OWNER TO CURRENT_USER"))
+            .await
+            .unwrap();
+    }
+    db.execute_unprepared("ALTER FUNCTION trace_legacy_write_fence() OWNER TO CURRENT_USER")
+        .await
+        .unwrap();
+    for role in [&app, &maintenance] {
+        db.execute_unprepared(&format!("DROP ROLE {role}"))
+            .await
+            .unwrap();
+    }
+    db.close().await.unwrap();
+    drop(guard);
+}
+
+/// Offline selector for the deployment perimeter probe (MTR-46).
+///
+/// Argument parsing, the missing-fixture failure and the cleanup guard only;
+/// the real probes need the named deployment maintainer and never run here.
+mod purge_perimeter {
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    fn script() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/traces_legacy_fence_probe.sh")
+    }
+
+    fn run(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+        let mut command = Command::new("bash");
+        command.env_clear().arg(script()).args(args);
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().expect("run the perimeter probe")
+    }
+
+    #[test]
+    fn purge_perimeter_requires_arguments() {
+        let missing = run(&[], &[]);
+        assert_eq!(missing.status.code(), Some(2), "missing arguments");
+        let bad_journal = run(
+            &[
+                "--maintenance-manifest",
+                "/dev/null",
+                "--old-image",
+                "sha256:old",
+                "--journal",
+                "not-a-uuid",
+            ],
+            &[],
+        );
+        assert_eq!(bad_journal.status.code(), Some(2), "invalid journal");
+    }
+
+    #[test]
+    fn purge_perimeter_missing_fixture_fails() {
+        let manifest = tempfile::NamedTempFile::new().expect("manifest");
+        let output = run(
+            &[
+                "--maintenance-manifest",
+                manifest.path().to_str().expect("path"),
+                "--old-image",
+                "sha256:old",
+                "--journal",
+                "66666666-6666-4666-8666-666666666666",
+            ],
+            &[],
+        );
+        assert_eq!(output.status.code(), Some(1), "missing fixture must fail");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("FAIL: fixture"),
+            "missing fixture output: {text}"
+        );
+    }
+
+    #[test]
+    fn purge_perimeter_unreachable_fixture_counts_each_probe() {
+        let manifest = tempfile::NamedTempFile::new().expect("manifest");
+        let token = tempfile::NamedTempFile::new().expect("token");
+        std::fs::write(token.path(), "synthetic").expect("token");
+        let output = run(
+            &[
+                "--maintenance-manifest",
+                manifest.path().to_str().expect("path"),
+                "--old-image",
+                "sha256:old",
+                "--journal",
+                "66666666-6666-4666-8666-666666666666",
+            ],
+            &[
+                // A closed port: both probes run and are refused, which is the
+                // expected outcome only for a reachable deployment. Here they
+                // must be counted, never skipped.
+                (
+                    "MEGA2_TRACES_PROBE_DB_URL",
+                    "postgres://probe:probe@127.0.0.1:9/probe",
+                ),
+                (
+                    "MEGA2_TRACES_PROBE_OBJECT_PUT_URL",
+                    "http://127.0.0.1:9/legacy",
+                ),
+                (
+                    "MEGA2_TRACES_PROBE_OBJECT_TOKEN_FILE",
+                    token.path().to_str().expect("path"),
+                ),
+            ],
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("traces legacy fence probe: executed=2"),
+            "each probe must be counted: {text}"
+        );
+    }
+}
+
+/// MTR-24 inventory gate: the real CLI enumerates only the frozen prefixes of a
+/// Local backend, writes one journal item per object, refuses a backend whose
+/// native version capability is unknown, and requires the journal's active
+/// fence.
+#[tokio::test]
+async fn purge_inventory_cli_freezes_the_local_prefixes() {
+    use sea_orm::ConnectionTrait;
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let temp = tempfile::tempdir().expect("fixture dir");
+    let root = temp.path().join("objects");
+    for path in [
+        "agent/raw/aa",
+        "agent/redacted/bb",
+        "agent/staging/cc",
+        "agent/trusted/old",
+        "other/outside",
+    ] {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+        std::fs::write(full, b"sentinel").expect("object");
+    }
+    let journal = "77777777-7777-4777-8777-777777777777";
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge
+         (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+         VALUES ('{journal}', 'local:{}', '{}', 'deploy-inv', 'sha256:manifest', 'frozen')",
+        root.display(),
+        root.display()
+    ))
+    .await
+    .expect("journal");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_writer_fence (id, purge_id, deployment_id, active)
+         VALUES ('88888888-8888-4888-8888-888888888888', '{journal}', 'deploy-inv', TRUE)"
+    ))
+    .await
+    .expect("fence");
+
+    let database_url = std::env::var("MEGA_DATABASE__DB_URL")
+        .unwrap_or_else(|_| "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".into());
+    let name: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_database() AS name",
+        ))
+        .await
+        .expect("database name")
+        .expect("database row")
+        .try_get("", "name")
+        .expect("name");
+    let mut url = url::Url::parse(&database_url).expect("database url");
+    url.set_path(&name);
+    let config = temp.path().join("config.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample config");
+    let sample = sample
+        .replace(
+            "db_url = \"postgres://localhost:5432/mono\"",
+            &format!("db_url = \"{}\"", url.as_str()),
+        )
+        .replace(
+            "base_dir = \"/tmp/.mono\"",
+            &format!("base_dir = \"{}\"", temp.path().display()),
+        )
+        .replace(
+            "root_dir = \"${base_dir}/objects\"",
+            &format!("root_dir = \"{}\"", root.display()),
+        );
+    std::fs::write(&config, sample).expect("config");
+    let manifest = temp.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{
+                "bucket_scope": "mega2-legacy/",
+                "deployment_id": "deploy-inv",
+                "backend_kind": "local",
+                "storage_location": "{}",
+                "historical_locations": ["local:{}"],
+                "scopes": [],
+                "operator": {{"identity": "operator@example.invalid", "statement_digest": "sha256:statement"}},
+                "trusted_prefixes": ["agent/trusted/"]
+            }}"#,
+            root.display(),
+            root.display()
+        ),
+    )
+    .expect("manifest");
+    let run = |journal: &str, manifest: &std::path::Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "traces",
+                "purge-legacy-capture",
+                "--action",
+                "inventory",
+                "--journal",
+                journal,
+                "--maintenance-manifest",
+            ])
+            .arg(manifest)
+            .env("MEGA_DATABASE__DB_URL", url.as_str())
+            .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &root)
+            .env("MEGA_BASE_DIR", temp.path().join("base"))
+            .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+            .output()
+            .expect("run inventory CLI")
+    };
+
+    let refused = run("99999999-9999-4999-8999-999999999999", &manifest);
+    assert!(!refused.status.success(), "a missing journal must fail");
+
+    // AC-1: the maintenance connection never applies a migration.
+    let applied_before: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM seaql_migrations",
+        ))
+        .await
+        .expect("migration count")
+        .expect("migration row")
+        .try_get("", "n")
+        .expect("count");
+    let first = run(journal, &manifest);
+    assert!(
+        first.status.success(),
+        "inventory failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let applied_after: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM seaql_migrations",
+        ))
+        .await
+        .expect("migration count")
+        .expect("migration row")
+        .try_get("", "n")
+        .expect("count");
+    assert_eq!(applied_before, applied_after, "inventory must not migrate");
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(stdout.contains("items=4"), "{stdout}");
+    assert!(stdout.contains("agent/raw/"), "{stdout}");
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT object_key FROM trace_legacy_purge_item WHERE purge_id = '{journal}' ORDER BY object_key"
+            ),
+        ))
+        .await
+        .expect("items");
+    let keys: Vec<String> = rows
+        .iter()
+        .map(|row| row.try_get::<String>("", "object_key").expect("key"))
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "agent/raw/aa".to_owned(),
+            "agent/redacted/bb".to_owned(),
+            "agent/staging/cc".to_owned(),
+            "agent/trusted/old".to_owned(),
+        ],
+        "outside prefixes must not be inventoried"
+    );
+    // Re-running the inventory is idempotent.
+    let again = run(journal, &manifest);
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("items=0"));
+
+    // A cloud backend needs the native version inventory and must block.
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_purge SET backend_fingerprint = 's3:bucket' WHERE id = '{journal}'"
+    ))
+    .await
+    .expect("backend");
+    let blocked = run(journal, &manifest);
+    assert!(!blocked.status.success(), "s3 inventory must block");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("native version"),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+
+    // Without the journal's active fence there is no inventory.
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_purge SET backend_fingerprint = 'local:{}' WHERE id = '{journal}'",
+        root.display()
+    ))
+    .await
+    .expect("backend restore");
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_writer_fence SET active = FALSE, released_at = now() WHERE purge_id = '{journal}'"
+    ))
+    .await
+    .expect("release fence");
+    let unfenced = run(journal, &manifest);
+    assert!(
+        !unfenced.status.success(),
+        "inventory needs the active fence"
+    );
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}
+
+/// MTR-25 deletion gate: the real CLI deletes only the frozen inventory,
+/// resumes from a partially deleted journal, leaves unauthorized prefixes and
+/// the new traces namespace untouched, and never drops the legacy tables.
+#[tokio::test]
+async fn purge_delete_cli_resumes_and_rescans() {
+    use sea_orm::ConnectionTrait;
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let temp = tempfile::tempdir().expect("fixture dir");
+    let root = temp.path().join("objects");
+    for path in [
+        "agent/raw/aa",
+        "agent/redacted/bb",
+        "agent/staging/cc",
+        "other/keep",
+        "traces/v1/keep",
+    ] {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+        std::fs::write(full, b"sentinel").expect("object");
+    }
+    let journal = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge
+         (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+         VALUES ('{journal}', 'local:{}', '{}', 'deploy-del', 'sha256:manifest', 'frozen')",
+        root.display(),
+        root.display()
+    ))
+    .await
+    .expect("journal");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_writer_fence (id, purge_id, deployment_id, active)
+         VALUES ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '{journal}', 'deploy-del', TRUE)"
+    ))
+    .await
+    .expect("fence");
+    let manifest = temp.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{
+                "bucket_scope": "mega2-legacy/",
+                "deployment_id": "deploy-del",
+                "backend_kind": "local",
+                "storage_location": "{}",
+                "historical_locations": ["local:{}"],
+                "scopes": [],
+                "owners": [{{"owner": "owner-a", "deployment_id": "deploy-del", "tenant_id": "tenant-a", "receipt_id": "receipt-a", "complete": true}}],
+                "operator": {{"identity": "operator@example.invalid", "statement_digest": "sha256:statement"}}
+            }}"#,
+            root.display(),
+            root.display()
+        ),
+    )
+    .expect("manifest");
+    let database_url = std::env::var("MEGA_DATABASE__DB_URL")
+        .unwrap_or_else(|_| "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".into());
+    let name: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_database() AS name",
+        ))
+        .await
+        .expect("database name")
+        .expect("database row")
+        .try_get("", "name")
+        .expect("name");
+    let mut url = url::Url::parse(&database_url).expect("database url");
+    url.set_path(&name);
+    let config = temp.path().join("config.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample config");
+    let sample = sample
+        .replace(
+            "db_url = \"postgres://localhost:5432/mono\"",
+            &format!("db_url = \"{}\"", url.as_str()),
+        )
+        .replace(
+            "base_dir = \"/tmp/.mono\"",
+            &format!("base_dir = \"{}\"", temp.path().display()),
+        )
+        .replace(
+            "root_dir = \"${base_dir}/objects\"",
+            &format!("root_dir = \"{}\"", root.display()),
+        );
+    std::fs::write(&config, sample).expect("config");
+    let run = |action: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "traces",
+                "purge-legacy-capture",
+                "--action",
+                action,
+                "--journal",
+                journal,
+                "--maintenance-manifest",
+            ])
+            .arg(&manifest)
+            .env("MEGA_DATABASE__DB_URL", url.as_str())
+            .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &root)
+            .env("MEGA_BASE_DIR", temp.path().join("base"))
+            .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+            .output()
+            .expect("run purge CLI")
+    };
+    let inventory = run("inventory");
+    assert!(
+        inventory.status.success(),
+        "inventory: {}",
+        String::from_utf8_lossy(&inventory.stderr)
+    );
+    // Simulate a crash after the first object: its file is gone and the item is
+    // already marked. The next run must resume with the remaining two.
+    let keys: Vec<String> = db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT object_key FROM trace_legacy_purge_item WHERE purge_id = '{journal}' ORDER BY object_key"
+            ),
+        ))
+        .await
+        .expect("items")
+        .iter()
+        .map(|row| row.try_get::<String>("", "object_key").expect("key"))
+        .collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    std::fs::remove_file(root.join(&keys[0])).expect("remove first");
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_purge_item SET deleted_at = now()
+         WHERE purge_id = '{journal}' AND object_key = '{}'",
+        keys[0]
+    ))
+    .await
+    .expect("mark first");
+
+    let deleted = run("delete");
+    assert!(
+        deleted.status.success(),
+        "delete: {}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&deleted.stdout);
+    assert!(stdout.contains("deleted=2"), "{stdout}");
+    assert!(stdout.contains("already=1"), "{stdout}");
+    assert!(stdout.contains("remaining=0"), "{stdout}");
+    assert!(stdout.contains("rescan_empty=true"), "{stdout}");
+    assert!(stdout.contains("owner-a"), "{stdout}");
+    for key in &keys {
+        assert!(!root.join(key).exists(), "{key} must be gone");
+    }
+    assert!(root.join("other/keep").exists(), "shared prefix untouched");
+    assert!(root.join("traces/v1/keep").exists(), "new traces untouched");
+    // AC-8: the legacy table still exists after the delete step.
+    let present: bool = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT to_regclass('agent_capture_session') IS NOT NULL AS present",
+        ))
+        .await
+        .expect("table lookup")
+        .expect("table row")
+        .try_get("", "present")
+        .expect("present");
+    assert!(present, "the delete step must not drop the legacy tables");
+    // A second delete is a no-op rescan.
+    let again = run("delete");
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("deleted=0"));
+    // Without the active fence the step refuses to run.
+    db.execute_unprepared(&format!(
+        "UPDATE trace_legacy_writer_fence SET active = FALSE, released_at = now() WHERE purge_id = '{journal}'"
+    ))
+    .await
+    .expect("release fence");
+    let unfenced = run("delete");
+    assert!(!unfenced.status.success(), "delete needs the active fence");
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}
+
+/// MTR-32 guarded DROP gate: the real CLI drops the 12 legacy tables only with
+/// a verified receipt, records the independent maintenance ledger once, is
+/// idempotent, and refuses a stale receipt while keeping the tables.
+#[tokio::test]
+async fn legacy_drop_guard_cli_consumes_a_verified_receipt() {
+    use sea_orm::ConnectionTrait;
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let temp = tempfile::tempdir().expect("fixture dir");
+    let root = temp.path().join("objects");
+    std::fs::create_dir_all(&root).expect("root");
+    let journal = "51515151-5151-4151-8151-515151515151";
+    let fence = "61616161-6161-4161-8161-616161616161";
+    db.execute_unprepared(
+        "INSERT INTO agent_capture_session
+         (deployment_id, tenant_id, repo_id, producer_id, client_session_id, session_kind, completeness)
+         VALUES ('deploy-drop', 'tenant-drop', 'repo', 'producer', 'drop-guard', 'external_capture', 'complete')",
+    )
+    .await
+    .expect("session");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge
+         (id, backend_fingerprint, storage_location, deployment_id, manifest_digest, state)
+         VALUES ('{journal}', 'local:{}', '{}', 'deploy-drop', 'sha256:manifest', 'frozen')",
+        root.display(),
+        root.display()
+    ))
+    .await
+    .expect("journal");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_purge_item (id, purge_id, scope, object_key, deleted_at)
+         VALUES ('71717171-7171-4171-8171-717171717171', '{journal}', 'deploy-drop', 'agent/raw/aa', now())"
+    ))
+    .await
+    .expect("item");
+    db.execute_unprepared(&format!(
+        "INSERT INTO trace_legacy_writer_fence (id, purge_id, deployment_id, active)
+         VALUES ('{fence}', '{journal}', 'deploy-drop', TRUE)"
+    ))
+    .await
+    .expect("fence");
+    let database_url = std::env::var("MEGA_DATABASE__DB_URL")
+        .unwrap_or_else(|_| "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2".into());
+    let name: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT current_database() AS name",
+        ))
+        .await
+        .expect("database name")
+        .expect("database row")
+        .try_get("", "name")
+        .expect("name");
+    let mut url = url::Url::parse(&database_url).expect("database url");
+    url.set_path(&name);
+    let config = temp.path().join("config.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample config");
+    let sample = sample
+        .replace(
+            "db_url = \"postgres://localhost:5432/mono\"",
+            &format!("db_url = \"{}\"", url.as_str()),
+        )
+        .replace(
+            "base_dir = \"/tmp/.mono\"",
+            &format!("base_dir = \"{}\"", temp.path().display()),
+        )
+        .replace(
+            "root_dir = \"${base_dir}/objects\"",
+            &format!("root_dir = \"{}\"", root.display()),
+        );
+    std::fs::write(&config, sample).expect("config");
+    let manifest = temp.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{"bucket_scope":"mega2-legacy/","deployment_id":"deploy-drop","backend_kind":"local","storage_location":"{}","historical_locations":["local:{}"],"owners":[{{"owner":"owner-a","deployment_id":"deploy-drop","tenant_id":"tenant-drop","receipt_id":"receipt-a","complete":true}}],"orphan_prefixes":[]}}"#,
+            root.display(),
+            root.display()
+        ),
+    )
+    .expect("manifest");
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "traces",
+                "purge-legacy-capture",
+                "--action",
+                "drop",
+                "--journal",
+                journal,
+                "--maintenance-manifest",
+            ])
+            .arg(&manifest)
+            .env("MEGA_DATABASE__DB_URL", url.as_str())
+            .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &root)
+            .env("MEGA_BASE_DIR", temp.path().join("base"))
+            .env("MEGA_CACHE_DIR", temp.path().join("cache"))
+            .output()
+            .expect("run drop CLI")
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "drop: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(String::from_utf8_lossy(&first.stdout).contains("dropped=true"));
+    for table in [
+        "agent_capture_session",
+        "agent_capture_blob",
+        "agent_capture_deletion_ledger",
+    ] {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass($1) IS NOT NULL AS present",
+                [table.into()],
+            ))
+            .await
+            .expect("table lookup")
+            .expect("table row");
+        assert!(
+            !row.try_get::<bool>("", "present").unwrap(),
+            "{table} survived"
+        );
+    }
+    let again = run();
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("already_applied=true"));
+    let ledger: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM traces_maintenance_schema_migrations",
+        ))
+        .await
+        .expect("ledger")
+        .expect("ledger row")
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(ledger, 1, "one maintenance ledger row");
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}
+
+/// MTR-26 retirement gate: against the real binary service, the 12 legacy
+/// `/api/v1/agent-capture` paths are unmounted in every method, the runtime
+/// OpenAPI no longer lists them, and the new traces GET surface stays mounted.
+#[tokio::test]
+async fn legacy_http_removed_paths_and_openapi() {
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let paths = [
+        ("GET", "/api/v1/agent-capture/discovery"),
+        (
+            "PUT",
+            "/api/v1/agent-capture/repos/third-part%2Fmega/sessions/retire",
+        ),
+        ("POST", "/api/v1/agent-capture/sessions/1/blobs/staging"),
+        (
+            "POST",
+            "/api/v1/agent-capture/sessions/1/blobs/lease/finalize",
+        ),
+        ("POST", "/api/v1/agent-capture/sessions/1/events:batch"),
+        ("POST", "/api/v1/agent-capture/sessions/1/file-ops:batch"),
+        ("POST", "/api/v1/agent-capture/sessions/1/checkpoints"),
+        (
+            "GET",
+            "/api/v1/agent-capture/repos/third-part%2Fmega/sessions",
+        ),
+        ("GET", "/api/v1/agent-capture/sessions/1"),
+        ("GET", "/api/v1/agent-capture/sessions/1/checkpoints"),
+        ("GET", "/api/v1/agent-capture/sessions/1/transcript"),
+        ("GET", "/api/v1/agent-capture/sessions/1/file-ops"),
+    ];
+    for (method, path) in paths {
+        let url = format!("{}{path}", runtime.base_url());
+        let request = match method {
+            "GET" => client.get(url),
+            "PUT" => client.put(url),
+            _ => client.post(url),
+        };
+        let response = request
+            .header("Authorization", "Bearer synthetic")
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("legacy request");
+        assert_eq!(
+            response.status().as_u16(),
+            404,
+            "{method} {path} must be retired"
+        );
+    }
+    let (status, body) = runtime.get("/api/openapi.json").await;
+    assert_eq!(status, 200, "{body}");
+    let document: serde_json::Value = serde_json::from_str(&body).expect("openapi json");
+    let openapi_paths = document["paths"].as_object().expect("openapi paths");
+    assert!(
+        openapi_paths
+            .keys()
+            .all(|path| !path.contains("/api/v1/agent-capture")),
+        "the legacy capture paths are still documented"
+    );
+    let schemas = document["components"]["schemas"]
+        .as_object()
+        .expect("openapi schemas");
+    assert!(
+        schemas.keys().all(|name| !name.contains("AgentCapture")),
+        "the legacy capture DTOs are still documented"
+    );
+    // AC-3: the new traces GET surface is still mounted.
+    let (status, body) = runtime.get("/api/v1/traces/capabilities").await;
+    assert_eq!(
+        status, 200,
+        "traces capabilities must stay mounted: {status} {body}"
+    );
+    assert!(body.contains("libra-traces/v1"), "{body}");
+    assert!(
+        openapi_paths
+            .keys()
+            .any(|path| path == "/api/v1/traces/capabilities"),
+        "the traces capabilities route is missing from OpenAPI"
+    );
+}
+
+/// MTR-26 stage scanner: no retired HTTP-surface symbol survives outside the
+/// stage allowlist, and no legacy capture path is mounted or documented.
+#[test]
+fn legacy_retirement_stage_26() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_26(root).expect("retirement scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy capture symbols: {hits:?}"
+    );
+    // The DTO module and the router file are gone.
+    assert!(!root.join("src/api_model/agent_capture.rs").exists());
+    assert!(!root.join("src/api/router/agent_capture_router.rs").exists());
+}
+
+/// MTR-28 runtime retirement: the real binary starts without the legacy Capture
+/// service/storage/auth modules, the maintenance CLI still answers, and the
+/// stage scanner finds no non-allowlisted reference to the removed runtime.
+#[tokio::test]
+async fn legacy_runtime_removed_smoke() {
+    // The real service boots with traces enabled and without the legacy
+    // Capture runtime linked in.
+    let runtime = traces_runtime::TracesRuntime::start().await;
+    let (status, _body) = runtime.get("/api/openapi.json").await;
+    assert_eq!(status, 200, "the real binary still serves OpenAPI");
+    // The maintenance CLI still accepts its typed legacy locator commands.
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .args(["traces", "purge-legacy-capture", "--help"])
+        .output()
+        .expect("run help");
+    assert!(
+        help.status.success(),
+        "maintenance CLI help failed: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let text = String::from_utf8_lossy(&help.stdout);
+    for flag in ["--action", "--journal", "--maintenance-manifest"] {
+        assert!(text.contains(flag), "missing {flag} in help: {text}");
+    }
+}
+
+/// MTR-28 stage scanner: no removed runtime module or symbol survives outside
+/// the scanner's own pattern table.
+#[test]
+fn legacy_retirement_stage_28() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_28(root).expect("stage 28 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy runtime symbols: {hits:?}"
+    );
+    for removed in [
+        "src/jupiter/service/agent_capture_service.rs",
+        "src/jupiter/storage/agent_capture_storage.rs",
+        "src/ceres/agent_capture",
+    ] {
+        assert!(!root.join(removed).exists(), "{removed} must be gone");
+    }
+}
+
+/// MTR-27 config retirement: a raw TOML file carrying `[agent_capture]` is
+/// rejected with the removal guidance, the removed environment override is
+/// rejected too, and the shipped samples no longer carry the section or its
+/// Capture event/filter names.
+#[test]
+fn legacy_config_events_removed_loader_rejects() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config = temp.path().join("removed.toml");
+    std::fs::write(
+        &config,
+        "[agent_capture]\nenabled = false\ntenant_id = \"default\"\n",
+    )
+    .expect("config");
+    let rejected = std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .output()
+        .expect("run config validate");
+    assert!(!rejected.status.success(), "the removed section must fail");
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("[agent_capture] section was removed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("/api/v1/traces"), "{stderr}");
+
+    // The removed environment override is rejected on the same load path.
+    let good = temp.path().join("good.toml");
+    let sample = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.toml"),
+    )
+    .expect("sample");
+    std::fs::write(&good, sample).expect("good config");
+    let env_rejected = std::process::Command::new(env!("CARGO_BIN_EXE_mega2"))
+        .arg("--config")
+        .arg(&good)
+        .args(["config", "validate"])
+        .env("MEGA_AGENT_CAPTURE__ENABLED", "true")
+        .output()
+        .expect("run env validate");
+    assert!(!env_rejected.status.success(), "the env override must fail");
+    assert!(String::from_utf8_lossy(&env_rejected.stderr).contains("MEGA_AGENT_CAPTURE__"));
+
+    // The three shipped samples no longer carry the removed section or its
+    // Capture event/filter names.
+    for name in [
+        "config/config.toml",
+        "config/config-review.toml",
+        "config/config-storage-only.toml",
+    ] {
+        let text =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name))
+                .expect("sample");
+        for forbidden in [
+            "[agent_capture]",
+            "agent_capture.ingest_tokens",
+            "agent_capture.events.committed",
+            "agent_capture.checkpoint.committed",
+            "agent_tenants",
+            "agent_repo_paths",
+        ] {
+            assert!(!text.contains(forbidden), "{name} still has {forbidden}");
+        }
+    }
+}
+
+/// MTR-27 stage scanner: no removed legacy config symbol survives outside the
+/// removal guard and the retirement assertions.
+#[test]
+fn legacy_retirement_stage_27() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_27(root).expect("stage 27 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy config symbols: {hits:?}"
+    );
+    let model = std::fs::read_to_string(root.join("src/config/model.rs")).expect("model");
+    assert!(!model.contains("AgentCaptureConfig"));
+}
+
+/// MTR-57 stage scanner: the removed Capture event kinds and target filters
+/// survive only in the retirement assertions that prove they are gone.
+#[test]
+fn legacy_retirement_stage_57() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_57(root).expect("stage 57 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy event symbols: {hits:?}"
+    );
+}
+
+/// MTR-35 namespace gate: the legacy `agent` object namespace is gone from the
+/// public object-storage surface, the remaining namespaces keep their stable
+/// strings and sharding, and the maintenance locator still addresses `agent/`
+/// prefixes literally.
+#[test]
+fn legacy_namespace_removed_public_surface() {
+    use mega2_core::orbit_api::object_storage::{ObjectKey, ObjectNamespace};
+    for (namespace, name, sharded) in [
+        (ObjectNamespace::Git, "git", "git/ab/cd/ef/g"),
+        (ObjectNamespace::Lfs, "lfs", "lfs/ab/cd/ef/g"),
+        (
+            ObjectNamespace::Media,
+            "media",
+            "media/fastcdc-v2020-32k/scope",
+        ),
+        (
+            ObjectNamespace::Traces,
+            "traces",
+            "traces/v1/11111111-1111-4111-8111-111111111111/objects/sha1/ab",
+        ),
+    ] {
+        assert_eq!(namespace.to_string(), name);
+        let key = match namespace {
+            ObjectNamespace::Git | ObjectNamespace::Lfs => "abcdefg",
+            ObjectNamespace::Media => "fastcdc-v2020-32k/scope",
+            _ => "v1/11111111-1111-4111-8111-111111111111/objects/sha1/ab",
+        };
+        let path = ObjectKey {
+            namespace,
+            key: key.to_owned(),
+        }
+        .default_sharding();
+        assert_eq!(path, sharded);
+        assert!(!path.starts_with("agent/"), "{path}");
+    }
+    // AC-3: the maintenance locator still uses literal `agent/` prefixes.
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/jupiter/service/trace_legacy_inventory.rs"),
+    )
+    .expect("inventory source");
+    assert!(source.contains("agent/raw/"), "maintenance locator lost");
+}
+
+/// MTR-35 stage scanner: no source still names `ObjectNamespace::Agent`.
+#[test]
+fn legacy_retirement_stage_35() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_35(root).expect("stage 35 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy namespace symbols: {hits:?}"
+    );
+}
+
+/// MTR-31 entity retirement: the 11 legacy Capture entity modules are gone,
+/// the historic add migration is SQL-only and still builds the 12 legacy
+/// tables from scratch (a historical upgrade), and SeaORM/SQL can still read
+/// them through the public seam.
+#[tokio::test]
+async fn legacy_entities_removed_migration_still_upgrades() {
+    use sea_orm::{ConnectionTrait, Statement};
+    let (guard, db) = traces_db::TracesDb::migrated().await;
+    let tables = [
+        "agent_capture_session",
+        "agent_capture_event",
+        "agent_capture_source_stream",
+        "agent_capture_checkpoint",
+        "agent_capture_file_op",
+        "agent_capture_blob",
+        "agent_capture_blob_ref",
+        "agent_capture_ingest_receipt",
+        "agent_capture_stream_blob",
+        "agent_capture_access_audit",
+        "agent_capture_tombstone",
+        "agent_capture_deletion_ledger",
+    ];
+    for table in tables {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass($1) IS NOT NULL AS present",
+                [table.into()],
+            ))
+            .await
+            .expect("table lookup")
+            .expect("table row");
+        assert!(
+            row.try_get::<bool>("", "present").unwrap(),
+            "the historic add migration must still create {table}"
+        );
+    }
+    // AC-1/AC-2: no legacy entity module or file remains.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for module in [
+        "agent_capture_session",
+        "agent_capture_event",
+        "agent_capture_source_stream",
+        "agent_capture_checkpoint",
+        "agent_capture_file_op",
+        "agent_capture_blob",
+        "agent_capture_blob_ref",
+        "agent_capture_ingest_receipt",
+        "agent_capture_access_audit",
+        "agent_capture_tombstone",
+        "agent_capture_deletion_ledger",
+    ] {
+        assert!(
+            !root.join(format!("src/callisto/{module}.rs")).exists(),
+            "{module}.rs must be gone"
+        );
+    }
+    // AC-3: no entity is assumed for `agent_capture_stream_blob`; the table is
+    // only written through explicit SQL.
+    assert!(
+        !root
+            .join("src/callisto/agent_capture_stream_blob.rs")
+            .exists()
+    );
+    // AC-4: the historic migration stays SQL-only (no entity import).
+    let migration = std::fs::read_to_string(
+        root.join("src/jupiter/migration/m20260913_000100_add_agent_capture_tables.rs"),
+    )
+    .expect("migration source");
+    assert!(!migration.contains("callisto::agent_capture"));
+    assert!(migration.contains("CREATE TABLE IF NOT EXISTS agent_capture_session"));
+    let closed = db.close().await;
+    drop(closed);
+    drop(guard);
+}
+
+/// MTR-31 stage scanner: no removed entity module or re-export survives.
+#[test]
+fn legacy_retirement_stage_31() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hits = traces_retirement_inventory::scan_stage_31(root).expect("stage 31 scan");
+    assert!(
+        hits.is_empty(),
+        "non-allowlisted legacy entity symbols: {hits:?}"    );
 }

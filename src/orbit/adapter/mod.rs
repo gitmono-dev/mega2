@@ -229,6 +229,32 @@ impl ObjectStoreAdapter {
         store
     }
 
+    /// Deletes one backend path. A missing object is not an error: the caller's
+    /// journal records the intent, and a resumed purge must not fail on an
+    /// object a previous attempt already removed.
+    pub async fn delete_backend_path(&self, path: &str) -> OrbitResult<()> {
+        let path = object_store::path::Path::from(path);
+        match self.to_store().delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(IoOrbitError::from(error)),
+        }
+    }
+
+    /// Lists every backend object under `prefix`, returning its backend path and
+    /// byte size, sorted by path. The prefix is a literal backend path prefix
+    /// (for example `agent/raw/`); callers own the prefix policy.
+    pub async fn list_prefix(&self, prefix: &str) -> OrbitResult<Vec<(String, u64)>> {
+        let path = object_store::path::Path::from(prefix);
+        let mut stream = self.to_store().list(Some(&path));
+        let mut objects = Vec::new();
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(IoOrbitError::from)?;
+            objects.push((meta.location.to_string(), meta.size));
+        }
+        objects.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(objects)
+    }
+
     /// Buffers an [`ObjectByteStream`] into [`Bytes`]. Used for log appends (need length) and manifest handling.
     async fn buffer_stream(mut data: ObjectByteStream, max_bytes: u64) -> OrbitResult<Bytes> {
         // NOTE: this buffers the ENTIRE input in memory. `max_bytes` bounds the

@@ -983,20 +983,13 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         )))
 }
 
-pub(crate) fn mount_agent_capture(config: &Config) -> bool {
-    config.git.storage_only() && config.agent_capture.enabled
-}
-
 pub(crate) fn mount_views(config: &Config) -> bool {
     config.views.enabled
 }
 
 pub(crate) fn storage_only_api_v1(config: &Config) -> OpenApiRouter<MonoApiServiceState> {
     with_traces(
-        api_router::storage_only_routers_with_views(
-            mount_agent_capture(config),
-            mount_views(config),
-        ),
+        api_router::storage_only_routers_with_views(false, mount_views(config)),
         config,
     )
 }
@@ -1268,22 +1261,6 @@ mod tests {
             entity_store: Arc::new(SharedEntityStore::new()),
             storage: Storage::mock(),
         }
-    }
-
-    async fn discovery_status(
-        v1: utoipa_axum::router::OpenApiRouter<MonoApiServiceState>,
-    ) -> StatusCode {
-        let (router, _) = OpenApiRouter::new().nest("/api/v1", v1).split_for_parts();
-        router
-            .with_state(dummy_api_state())
-            .oneshot(
-                Request::get("/api/v1/agent-capture/discovery")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response")
-            .status()
     }
 
     #[tokio::test]
@@ -2073,119 +2050,29 @@ mod tests {
     }
 
     #[test]
-    fn storage_only_openapi_omits_agent_capture_when_flag_false() {
-        let paths: Vec<String> = storage_only_openapi_doc(false, false, false)
-            .paths
-            .paths
-            .keys()
-            .cloned()
-            .collect();
-        assert!(
-            paths.iter().all(|p| !p.contains("/api/v1/agent-capture")),
-            "include_agent_capture=false must omit agent-capture: {paths:?}"
-        );
-    }
-
-    #[test]
-    fn storage_only_openapi_doc_takes_include_agent_capture() {
-        let with_paths: Vec<String> = storage_only_openapi_doc(false, true, false)
-            .paths
-            .paths
-            .keys()
-            .cloned()
-            .collect();
-        assert!(
-            with_paths
-                .iter()
-                .any(|p| p == "/api/v1/agent-capture/discovery"),
-            "include_agent_capture=true must document discovery: {with_paths:?}"
-        );
-        let without_paths: Vec<String> = storage_only_openapi_doc(false, false, false)
-            .paths
-            .paths
-            .keys()
-            .cloned()
-            .collect();
-        assert!(
-            without_paths
-                .iter()
-                .all(|p| !p.contains("/api/v1/agent-capture")),
-            "include_agent_capture=false must omit agent-capture: {without_paths:?}"
-        );
-    }
-
-    #[test]
-    fn storage_only_openapi_includes_agent_capture_when_flag_true() {
-        let paths: Vec<String> = storage_only_openapi_doc(false, true, false)
-            .paths
-            .paths
-            .keys()
-            .cloned()
-            .collect();
-        assert!(
-            paths.iter().any(|p| p == "/api/v1/agent-capture/discovery"),
-            "include_agent_capture=true must include discovery: {paths:?}"
-        );
-    }
-
-    #[test]
-    fn trunk_openapi_doc_takes_include_agent_capture() {
-        let with_paths: Vec<String> = trunk_openapi_doc(false, true, false)
-            .paths
-            .paths
-            .keys()
-            .cloned()
-            .collect();
-        assert!(
-            with_paths
-                .iter()
-                .any(|p| p.contains("/api/v1/agent-capture")),
-            "trunk include_agent_capture=true must document agent-capture: {with_paths:?}"
-        );
-        let without_paths: Vec<String> = trunk_openapi_doc(false, false, false)
-            .paths
-            .paths
-            .keys()
-            .cloned()
-            .collect();
-        assert!(
-            without_paths
-                .iter()
-                .all(|p| !p.contains("/api/v1/agent-capture")),
-            "trunk include_agent_capture=false must omit agent-capture: {without_paths:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn storage_only_nests_agent_capture_when_enabled() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut config = isolated_config(temp_dir.path().join("base"));
-        config.git.push_auth = Some(PushAuth::None);
-        config.agent_capture.enabled = true;
-        assert!(mount_agent_capture(&config));
-        let status = discovery_status(api_router::storage_only_routers_with(true)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn review_morphology_does_not_register_agent_capture() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut config = isolated_config(temp_dir.path().join("base"));
-        config.agent_capture.enabled = true;
-        assert!(!mount_agent_capture(&config));
-        let status = discovery_status(api_router::routers()).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn disabled_storage_only_does_not_register_agent_capture() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut config = isolated_config(temp_dir.path().join("base"));
-        config.git.push_auth = Some(PushAuth::None);
-        config.agent_capture.enabled = false;
-        assert!(!mount_agent_capture(&config));
-        let status = discovery_status(api_router::storage_only_routers_with(false)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+    fn openapi_omits_agent_capture_for_both_flags() {
+        for include in [false, true] {
+            let paths: Vec<String> = storage_only_openapi_doc(false, include, false)
+                .paths
+                .paths
+                .keys()
+                .cloned()
+                .collect();
+            assert!(
+                paths.iter().all(|p| !p.contains("agent-capture")),
+                "storage-only include={include} must omit the retired surface: {paths:?}"
+            );
+            let trunk: Vec<String> = trunk_openapi_doc(false, include, false)
+                .paths
+                .paths
+                .keys()
+                .cloned()
+                .collect();
+            assert!(
+                trunk.iter().all(|p| !p.contains("agent-capture")),
+                "trunk include={include} must omit the retired surface: {trunk:?}"
+            );
+        }
     }
 
     #[test]

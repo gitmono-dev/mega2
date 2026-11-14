@@ -23,24 +23,47 @@ pub struct ObjectStorageFactory;
 impl ObjectStorageFactory {
     /// Builds object storage from [`ObjectStorageConfig::storage_type`] and nested credentials/paths.
     pub async fn build(cfg: &ObjectStorageConfig) -> OrbitResult<MegaObjectStorageWrapper> {
+        let adapter = Arc::new(Self::build_adapter(cfg).await?);
+        Ok(MegaObjectStorageWrapper::new(adapter))
+    }
+
+    /// Builds the concrete adapter. Maintenance paths that need a provider
+    /// listing (for example the legacy purge inventory) use this instead of the
+    /// type-erased wrapper.
+    pub async fn build_adapter(cfg: &ObjectStorageConfig) -> OrbitResult<ObjectStoreAdapter> {
         cfg.validate()?;
         match cfg.storage_type {
-            ObjectStorageBackend::S3 => build_s3_like(cfg, false).await,
-            ObjectStorageBackend::S3Compatible => build_s3_like(cfg, true).await,
-            ObjectStorageBackend::Gcs => build_gcs(cfg).await,
-            ObjectStorageBackend::Local => build_local(cfg).await,
+            ObjectStorageBackend::S3 => s3_adapter(&cfg.s3, false),
+            ObjectStorageBackend::S3Compatible => s3_adapter(&cfg.s3, true),
+            ObjectStorageBackend::Gcs => gcs_adapter(cfg),
+            ObjectStorageBackend::Local => local_adapter(cfg),
         }
     }
 }
 
-/// Shared S3 / S3-compatible construction (differs only by endpoint and upload strategy).
-async fn build_s3_like(
-    cfg: &ObjectStorageConfig,
-    compatible: bool,
-) -> OrbitResult<MegaObjectStorageWrapper> {
-    let adapter = Arc::new(s3_adapter(&cfg.s3, compatible)?);
+fn gcs_adapter(cfg: &ObjectStorageConfig) -> OrbitResult<ObjectStoreAdapter> {
+    let gcs = GoogleCloudStorageBuilder::from_env()
+        .with_bucket_name(&cfg.gcs.bucket)
+        .build()
+        .map_err(|e| IoOrbitError::Other(e.to_string()))?;
+    Ok(ObjectStoreAdapter {
+        store: BackendStore::Gcs(Arc::new(gcs)),
+        upload_strategy: UploadStrategy::SinglePut,
+        presign_store: None,
+    })
+}
 
-    Ok(MegaObjectStorageWrapper::new(adapter))
+fn local_adapter(cfg: &ObjectStorageConfig) -> OrbitResult<ObjectStoreAdapter> {
+    if !exists(&cfg.local.root_dir)? {
+        create_dir_all(&cfg.local.root_dir)?
+    }
+    let fs = LocalFileSystem::new_with_prefix(&cfg.local.root_dir)
+        .map_err(|e| IoOrbitError::Other(e.to_string()))?;
+    Ok(ObjectStoreAdapter {
+        store: BackendStore::Local(Arc::new(fs)),
+        upload_strategy: UploadStrategy::SinglePut,
+        presign_store: None,
+    })
 }
 
 /// Data reads and writes use `endpoint_url`. On S3-compatible backends a
@@ -85,39 +108,6 @@ fn s3_client(s3_cfg: &S3Config, endpoint: Option<&str>) -> OrbitResult<AmazonS3>
     builder
         .build()
         .map_err(|e| IoOrbitError::Other(e.to_string()))
-}
-
-async fn build_gcs(cfg: &ObjectStorageConfig) -> OrbitResult<MegaObjectStorageWrapper> {
-    let gcp_cfg = cfg.gcs.clone();
-    let gcs = GoogleCloudStorageBuilder::from_env()
-        .with_bucket_name(&gcp_cfg.bucket)
-        .build()
-        .map_err(|e| IoOrbitError::Other(e.to_string()))?;
-    let store = BackendStore::Gcs(Arc::new(gcs));
-    let adapter = Arc::new(ObjectStoreAdapter {
-        store,
-        upload_strategy: UploadStrategy::SinglePut,
-        presign_store: None,
-    });
-
-    Ok(MegaObjectStorageWrapper::new(adapter))
-}
-
-async fn build_local(cfg: &ObjectStorageConfig) -> OrbitResult<MegaObjectStorageWrapper> {
-    if !exists(&cfg.local.root_dir)? {
-        create_dir_all(&cfg.local.root_dir)?
-    }
-    let fs = LocalFileSystem::new_with_prefix(&cfg.local.root_dir)
-        .map_err(|e| IoOrbitError::Other(e.to_string()))?;
-
-    let store = BackendStore::Local(Arc::new(fs));
-    let adapter = Arc::new(ObjectStoreAdapter {
-        store,
-        upload_strategy: UploadStrategy::SinglePut,
-        presign_store: None,
-    });
-
-    Ok(MegaObjectStorageWrapper::new(adapter))
 }
 
 #[cfg(test)]

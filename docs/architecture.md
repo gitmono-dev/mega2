@@ -2,13 +2,13 @@ English · [中文](architecture.zh.md)
 
 # Mega2 Architecture
 
-The original Mega was the first-generation monorepo platform; Mega2 is the second-generation engine built for Agents. Its core capabilities are the Monorepo engine and optional Agent Session Capture. The recommended Agent setup combines Mega2 with [ScorpioFS](https://github.com/gitmono-dev/scorpiofs), which mounts Monorepo paths as a local filesystem, and [Libra](https://libra.tools), which provides Agent version-control workflows and terminal browsing. This document maps Mega2's modules, storage layers, write path, protocol surfaces, and configuration reload flow. It reflects the source in this checkout; inline `src/...` paths point to the relevant implementation.
+The original Mega was the first-generation monorepo platform; Mega2 is the second-generation engine built for Agents. Its core capabilities are the Monorepo engine and Agent Traces archive. The recommended Agent setup combines Mega2 with [ScorpioFS](https://github.com/gitmono-dev/scorpiofs), which mounts Monorepo paths as a local filesystem, and [Libra](https://libra.tools), which provides Agent version-control workflows and terminal browsing. This document maps Mega2's modules, storage layers, write path, protocol surfaces, and configuration reload flow. It reflects the source in this checkout; inline `src/...` paths point to the relevant implementation.
 
 > **Scope:** the open-source service is deployed in trunk / storage-only mode. It has no Web UI; use Libra's `libra mega2 browser` for interactive browsing. The [User Guide](./user-guide.md) covers repository paths, branches, tags, and push behavior; the [Deployment Guide](./deployment.md) covers installation and operations. This page provides an architecture overview and links to implementation references.
 
 ## 1. Overview and dependency flow
 
-Mega2 is a second-generation engine for Agent workflows; the first-generation Mega project and this repository are separate codebases. The Monorepo service manages the code tree and Git protocols, while Agent Session Capture stores and queries Agent session records through a separate, optional API. Mega2 is a single Cargo package (lib `mega2_core` + binaries; see [`../Cargo.toml`](../Cargo.toml)) and ports and refactors selected parts of the first-generation Mega project; it is not a mirror, and the two repositories do not share identical module boundaries. Evaluate upstream changes against this checkout's code and dependency lockfile before adopting them. Entry point: `src/main.rs` → `cli::parse` → the subcommand registry in `src/commands/mod.rs`. Runtime dependency flow is one-directional: upper layers compose lower layers; lower layers never reference back up.
+Mega2 is a second-generation engine for Agent workflows; the first-generation Mega project and this repository are separate codebases. The Monorepo service manages the code tree and Git protocols, while Traces archiving stores and queries Agent session records and operational histories through scoped Git references and dedicated query APIs. Mega2 is a single Cargo package (lib `mega2_core` + binaries; see [`../Cargo.toml`](../Cargo.toml)) and ports and refactors selected parts of the first-generation Mega project; it is not a mirror, and the two repositories do not share identical module boundaries. Evaluate upstream changes against this checkout's code and dependency lockfile before adopting them. Entry point: `src/main.rs` → `cli::parse` → the subcommand registry in `src/commands/mod.rs`. Runtime dependency flow is one-directional: upper layers compose lower layers; lower layers never reference back up.
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -66,9 +66,9 @@ For implementation details, start from the module paths listed in this guide and
 | `config` | TOML config pipeline: `loader` (source resolution), `model` (config model), `validate` (startup validation), `secret` (SecretRef), `reload` (hot reload). Note: the config module is `src/config/`, **not** `src/common/config` |
 | `context` | The composition root `AppContext` and the read-only assembly `ReadOnlyContext` (see §1) |
 | `server` | Service bootstrap: `http_server` (axum router assembly, CORS/session/trace middleware), `ssh_server`, `trace_context` |
-| `api` | HTTP handlers and routes: `api_router` (mode-specific `/api/v1` routes), `lfs_router`, `oci_router`, `preview_router`, `tag_router`, `agent_capture_router`, `api_write_auth` (product-write auth), `api_doc` (OpenAPI) |
+| `api` | HTTP handlers and routes: `api_router` (mode-specific `/api/v1` routes), `lfs_router`, `oci_router`, `preview_router`, `tag_router`, `api_write_auth` (product-write auth), `api_doc` (OpenAPI) |
 | `api_model` | Request/response DTOs (utoipa schemas) |
-| `ceres` | Business services: `protocol` + `pack` (Git smart protocol and pack handling), `api_service` (monorepo read/write core), `lfs`, `oci`, `agent_capture`, `code_edit`, `snapshot` (MST/2), `github_sync`, `merge_checker` |
+| `ceres` | Business services: `protocol` + `pack` (Git smart protocol and pack handling), `api_service` (monorepo read/write core), `lfs`, `oci`, `code_edit`, `snapshot` (MST/2), `github_sync`, `merge_checker` |
 | `jupiter` | Storage and service foundation: `storage/` (`*Storage` wrappers), `service/` (`push_queue_service` and friends), `migration/` (sea-orm-migration), `redis/` |
 | `callisto` | sea-orm entities, one file per table; re-exported via `pub use crate::callisto::*` in `lib.rs` |
 | `orbit_api` + `orbit` | Object-storage contract (traits/config) and backend implementations (local / S3 / GCS), built through `orbit::factory::ObjectStorageFactory` |
@@ -120,7 +120,9 @@ See the [Configuration Guide](./configuration.md) for SecretRef settings and val
 | Git view URLs (read-only) | `/.filter/<filter_id>.git`, `/.view/<name>.git`, `/.view/<name>@<version>.git` (HTTP and SSH upload-pack) | `[views].enabled` defaults off and requires restart; receive-pack is rejected and LFS under view prefixes returns 404 |
 | Views API | `/api/v1/views` (`POST ?wait=true` registration and `GET ?name=&version=`), `GET /api/v1/views/{filter_id}`, `GET /api/v1/views/metrics`; see [views operations](./deploy-trunk.md) | `[views].enabled` defaults off and requires restart; mounted only in trunk / storage-only, returns 404 when disabled |
 | OCI registry | `/v2/` | `[oci].enabled` and storage-only; fail-closed (not registered) under review |
-| Agent Capture | `/api/v1/agent-capture` | `[agent_capture].enabled` and storage-only |
+| Traces Git transport | `/.traces/<target_id>.git` (HTTP / SSH `refs/libra/traces`, upload-pack and receive-pack) | `[traces].enabled`, requires operator `server_id` UUID; returns 404 on root namespace when disabled |
+| Traces API | `/api/v1/traces/*` (capabilities, targets/resolve, streams, sessions, checkpoints, search) | `[traces].enabled`, mounted only when enabled; included in runtime OpenAPI |
+| Legacy Agent Capture (retired) | `/api/v1/agent-capture` (never mounted) | surface and runtime removed by MTR-26/MTR-28; config loader fail-closed |
 | MST/2 snapshot surface | `/api/v2` | nest is static; handlers fail closed unless `[mst2].enabled`; toggling needs a restart |
 | Swagger UI / OpenAPI | `/swagger-ui`, `/api/openapi.json` | always mounted; document content varies by mode |
 

@@ -18,8 +18,6 @@ pub const BUCK_TAG: &str = "Buck Upload API";
 pub const LFS_TAG: &str = "Git LFS";
 /// OpenAPI tag for OCI Distribution API (`/v2/...`).
 pub const OCI_TAG: &str = "OCI Distribution";
-/// OpenAPI tag for storage-only Agent Capture (`/api/v1/agent-capture`, including discovery).
-pub const AGENT_CAPTURE_TAG: &str = "Agent Capture";
 pub const GROUP_PERMISSION_TAG: &str = "Group Permission Management";
 
 /// Shared OpenAPI tag for automation / integration–related APIs.

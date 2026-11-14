@@ -1410,8 +1410,6 @@ mod tests {
             oci_repositories: Vec::new(),
             lfs_paths: Vec::new(),
             include_unscoped_lfs: false,
-            agent_tenants: Vec::new(),
-            agent_repo_paths: Vec::new(),
         }];
 
         let report = handle.reload(candidate).expect("reload should succeed");

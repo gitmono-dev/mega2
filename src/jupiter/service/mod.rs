@@ -1,4 +1,3 @@
-pub mod agent_capture_service;
 pub mod artifact_service;
 pub mod buck_service;
 pub mod cl_service;
@@ -15,6 +14,13 @@ pub mod storage_event_emitter;
 pub mod storage_event_transport;
 pub(crate) mod trace_fetch_service;
 pub(crate) mod trace_index_worker;
+pub mod trace_legacy_fence;
+pub mod trace_legacy_inventory;
+pub mod trace_legacy_manifest;
+pub mod trace_legacy_purge;
+pub mod trace_legacy_receipt;
+pub mod trace_legacy_roles;
+pub mod trace_legacy_scope_guard;
 pub mod trace_object_service;
 pub(crate) mod trace_projection_service;
 pub mod trace_publish_service;

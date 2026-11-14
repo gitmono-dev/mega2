@@ -14,6 +14,8 @@ fn validate_toml_file(path: &str) -> Result<(), ConfigError> {
     // tests and CLI diagnostics rely on. We only enforce the strict
     // unknown-field whitelist when the file already parses.
     if let Ok(value) = toml::from_str::<Value>(&content) {
+        crate::config::validate::reject_removed_agent_capture_section(&value)
+            .map_err(|e| ConfigError::Message(e.to_string()))?;
         reject_unknown_fields(&value).map_err(|e| ConfigError::Message(e.to_string()))?;
     }
     Ok(())
@@ -30,6 +32,8 @@ pub(crate) fn config_from_path_with_profile(
     // MN-03: removed `[mail]` must not be injectable via env on any load path
     // (service/debug startup, `config validate`, vault bootstrap).
     crate::config::validate::reject_legacy_mail_environment()
+        .map_err(|e| ConfigError::Message(e.to_string()))?;
+    crate::config::validate::reject_legacy_agent_capture_environment()
         .map_err(|e| ConfigError::Message(e.to_string()))?;
 
     validate_toml_file(path)?;

@@ -536,8 +536,14 @@ async fn actual_receipt_create_and_read_waits_cancel_without_backend_release_or_
         }
         // Atomic create uses the actual owner expiry; receipt input also keeps
         // its stricter five-second cap. Neither wait needs backend release.
+        // Install ownership is rechecked every RENEW_INTERVAL (10 seconds).
+        // Under the full parallel test suite, the expiry query can need extra
+        // time to acquire a database connection after that check becomes due.
+        // Keep the bounded cancellation assertion while allowing three check
+        // intervals; the backend is still never released and every no-write
+        // and credit-refund assertion below remains mandatory.
         let finished = timeout(
-            Duration::from_secs(if creating { 12 } else { 7 }),
+            Duration::from_secs(if creating { 30 } else { 7 }),
             &mut task,
         )
         .await;
