@@ -78,6 +78,8 @@ HTTP：`http://127.0.0.1:9000/`。这是仅限本机的匿名设置（`push_auth
 
 本地开发与测试见[贡献指南](docs/contributing.zh.md)。
 
+完整的 mega2 + MegaUI 工作区请将 `megaui` 检出放在本仓库同级目录，在 macOS + OrbStack 上运行 `docker compose -f macos-orbstack-megaui-compose.yml up -d --wait`，或在 Linux 上运行 `docker compose -f linux-megaui-compose.yml up -d --wait`。原 storage-only 文件保持不变。
+
 ### 停止
 
 在 compose 文件所在目录运行。使用 `down -v` 会删除 Docker 数据卷中的数据。

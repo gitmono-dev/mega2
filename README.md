@@ -78,6 +78,8 @@ HTTP: `http://127.0.0.1:9000/`. This is a local-only anonymous setup (`push_auth
 
 For local development and tests, see the [Contributing Guide](docs/contributing.md).
 
+For a full mega2 + MegaUI workspace, keep the sibling `megaui` checkout next to this repository and run `docker compose -f macos-orbstack-megaui-compose.yml up -d --wait` on macOS with OrbStack, or `docker compose -f linux-megaui-compose.yml up -d --wait` on Linux. The original storage-only files remain unchanged.
+
 ### Stop
 
 Run this from the directory that holds the compose file. The `-v` flag deletes data stored in the Docker volumes.

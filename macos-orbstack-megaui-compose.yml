@@ -1,0 +1,238 @@
+# mega2 + MegaUI local evaluation stack — macOS with OrbStack.
+#
+# This is the full-stack counterpart of macos-orbstack-mega2-compose.yml
+# (storage-only). OrbStack resolves `mega2-rustfs.orb.local` on the host and
+# inside containers, so artifact presigned URLs work in both places.
+#
+# Start with Docker Compose v2:
+#   docker compose -f macos-orbstack-megaui-compose.yml up -d --wait
+#
+# mega2 defaults to the Docker Hub release. MegaUI builds from the sibling
+# ../megaui checkout. To use published MegaUI images instead, set
+# MEGAUI_BUILD=0 and optionally override MEGAUI_IMAGE/MEGAUI_COLLAB_IMAGE.
+#
+# Access:
+#   mega2 API:       http://127.0.0.1:9000/api/openapi.json
+#   MegaUI Web:      http://127.0.0.1:7001/en/signin
+#   Collab health:   http://127.0.0.1:7002/health
+#
+# Local-only anonymous Git HTTP and development collab access. Do not expose
+# these ports publicly. Use a proper authentication configuration for a shared
+# deployment.
+name: mega2-megaui-macos
+
+services:
+  postgres:
+    image: postgres:18.6-alpine3.24
+    environment:
+      POSTGRES_USER: mega2
+      POSTGRES_PASSWORD: mega2_local_password
+      POSTGRES_DB: mega2
+    volumes:
+      - mega2-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mega2 -d mega2"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:8.10.1-alpine3.23
+    volumes:
+      - mega2-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    container_name: mega2-rustfs
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: rustfs_secret
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+    volumes:
+      - mega2-rustfs:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  rustfs-init:
+    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/rc alias set local http://rustfs:9000 rustfs rustfs_secret &&
+      /usr/bin/rc mb --ignore-existing local/mega2 &&
+      exec sleep infinity
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/bin/rc ls local/mega2"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 3s
+
+  mega2:
+    image: ${MEGA2_IMAGE:-genedna/mega2:latest}
+    pull_policy: ${MEGA2_PULL_POLICY:-always}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_healthy
+    environment:
+      MEGA_BASE_DIR: /var/lib/mega2
+      MEGA_DATABASE__DB_TYPE: postgres
+      MEGA_DATABASE__DB_URL: postgres://mega2:mega2_local_password@postgres:5432/mega2
+      MEGA_DATABASE__MIN_CONNECTION: 1
+      MEGA_REDIS__URL: redis://redis:6379
+      MEGA_MONOREPO__PUSH_POLICY: trunk
+      MEGA_CEDAR__ENFORCEMENT: "off"
+      MEGA_GIT__ANONYMOUS_ACCESS: "true"
+      MEGA_GIT__PUSH_AUTH: none
+      MEGA_GIT__SSH_RECEIVE_PACK: "false"
+      MEGA_OBJECT_STORAGE__STORAGE_TYPE: s3compatible
+      MEGA_OBJECT_STORAGE__S3__REGION: us-east-1
+      MEGA_OBJECT_STORAGE__S3__BUCKET: mega2
+      MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID: rustfs
+      MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY: rustfs_secret
+      MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: http://rustfs:9000
+      MEGA_OBJECT_STORAGE__S3__PUBLIC_ENDPOINT_URL: http://mega2-rustfs.orb.local:9000
+      MEGA_OCI__ENABLED: "true"
+      MEGA_OAUTH__WEBSITE_API_BASE_URL: http://website-next:7001
+      MEGA_LOG__PRINT_STD: "true"
+    command: ["service", "http", "--host", "0.0.0.0", "-p", "8000"]
+    volumes:
+      - mega2-data:/var/lib/mega2
+    ports:
+      - "127.0.0.1:9000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/openapi.json"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  website-db-init:
+    image: ${MEGAUI_DB_INIT_IMAGE:-megaui-db-init:local}
+    pull_policy: ${MEGAUI_PULL_POLICY:-never}
+    build:
+      context: ../megaui
+      dockerfile: apps/web/Dockerfile
+      target: db-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://mega2:mega2_local_password@postgres:5432/megaui
+      DATABASE_ADMIN_URL: postgresql://mega2:mega2_local_password@postgres:5432/postgres
+    working_dir: /app
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        node -e "
+        const { createRequire } = require('module');
+        const requireFromDb = createRequire('/app/packages/database/package.json');
+        const { Client } = requireFromDb('pg');
+        (async () => {
+          const admin = new Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+          await admin.connect();
+          const { rowCount } = await admin.query(\"SELECT 1 FROM pg_database WHERE datname = 'megaui'\");
+          if (rowCount === 0) await admin.query('CREATE DATABASE megaui');
+          await admin.end();
+        })().catch((error) => { console.error(error); process.exit(1); });
+        "
+        cd /app/packages/database && pnpm exec drizzle-kit migrate
+
+  megaui-collab:
+    image: ${MEGAUI_COLLAB_IMAGE:-megaui-collab:local}
+    pull_policy: ${MEGAUI_PULL_POLICY:-never}
+    build:
+      context: ../megaui
+      dockerfile: apps/collab-server/Dockerfile
+    depends_on:
+      website-db-init:
+        condition: service_completed_successfully
+    environment:
+      MEGA_COLLAB_PORT: "7002"
+      MEGA_COLLAB_BIND: 0.0.0.0
+      MEGA_COLLAB_QUIET: "1"
+      MEGA_COLLAB_INTERNAL_TOKEN: mega2-local-collab-token
+      MEGA_COLLAB_DEV_ALLOW_AUTHENTICATED: "1"
+    ports:
+      - "127.0.0.1:7002:7002"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7002/health"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  website-next:
+    image: ${MEGAUI_IMAGE:-website-next:local}
+    pull_policy: ${MEGAUI_PULL_POLICY:-never}
+    build:
+      context: ../megaui
+      dockerfile: apps/web/Dockerfile
+      target: runner
+      args:
+        NEXT_PUBLIC_MEGA_COLLAB_PUBLIC_URL: ws://127.0.0.1:7002
+    depends_on:
+      mega2:
+        condition: service_healthy
+      megaui-collab:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://mega2:mega2_local_password@postgres:5432/megaui
+      APP_BASE_URL: http://127.0.0.1:7001
+      BETTER_AUTH_URL: http://127.0.0.1:7001
+      BETTER_AUTH_TRUSTED_ORIGINS: "http://localhost:7001,http://127.0.0.1:7001"
+      BETTER_AUTH_SECRET: mega2-local-website-auth-secret
+      MEGA2_PUBLIC_BASE_URL: http://mega2:8000
+      MEGA_CODE_DATA_BACKEND: mega2
+      MEGA2_INTERNAL_MAIL_BEARER: mega2-local-website-mail-bearer
+      EMAIL_PROVIDER: test
+      EMAIL_DEFAULT_FROM: noreply@mega2-local.test
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: rustfs
+      S3_ACCESS_KEY_SECRET: rustfs_secret
+      S3_BUCKET: mega2
+      S3_ENDPOINT: http://rustfs:9000
+      S3_PUBLIC_URL: http://mega2-rustfs.orb.local:9000/mega2
+      S3_FORCE_PATH_STYLE: "true"
+      MEGA_COLLAB_INTERNAL_URL: http://megaui-collab:7002
+      MEGA_COLLAB_INTERNAL_TOKEN: mega2-local-collab-token
+      NEXT_PUBLIC_MEGA_COLLAB_PUBLIC_URL: ws://127.0.0.1:7002
+      PORT: "7001"
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "127.0.0.1:7001:7001"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:7001/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+volumes:
+  mega2-postgres:
+  mega2-redis:
+  mega2-rustfs:
+  mega2-data:
