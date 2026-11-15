@@ -1706,11 +1706,11 @@ mod tests {
         async fn auth_publickey(
             &mut self,
             user: &str,
-            public_key: &russh::keys::PublicKey,
+            public_key: russh::server::VerifiedPublicKey<'_>,
         ) -> Result<russh::server::Auth, Self::Error> {
             if user == self.user
-                && public_key.algorithm() == self.public.algorithm()
-                && public_key.key_data() == self.public.key_data()
+                && *public_key.algorithm == self.public.algorithm()
+                && public_key.public_key.key_data() == self.public.key_data()
             {
                 Ok(russh::server::Auth::Accept)
             } else {

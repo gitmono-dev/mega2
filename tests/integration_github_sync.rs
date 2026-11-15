@@ -45,11 +45,11 @@ impl Handler for LoopServer {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        public_key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         if user == self.user
-            && public_key.algorithm() == self.public.algorithm()
-            && public_key.key_data() == self.public.key_data()
+            && *public_key.algorithm == self.public.algorithm()
+            && public_key.public_key.key_data() == self.public.key_data()
         {
             Ok(Auth::Accept)
         } else {

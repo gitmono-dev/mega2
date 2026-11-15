@@ -14,8 +14,8 @@ use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
 use russh::{
     Channel, ChannelId,
-    keys::{HashAlg, PublicKey},
-    server::{self, Auth, ChannelOpenHandle, Msg, Session},
+    keys::HashAlg,
+    server::{self, Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey},
 };
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, sync::Mutex};
@@ -664,6 +664,23 @@ impl SshServer {
         self.authenticated_credential = None;
     }
 
+    /// Storage-only deployments reject ordinary public-key logins before any
+    /// key lookup. `VerifiedPublicKey` can only be constructed by russh, so
+    /// unit tests exercise this decision through the same helper.
+    fn reject_publickey_before_lookup(&mut self, user: &str) -> Option<Auth> {
+        self.clear_authentication();
+        let config = self.state.storage.config();
+        let traces_login = user == "traces" && config.traces.enabled;
+        if config.git.storage_only() && !traces_login {
+            Some(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
+        } else {
+            None
+        }
+    }
+
     async fn authorize_traces_exec(
         &self,
         locator: &TracesLocator,
@@ -1099,21 +1116,22 @@ impl server::Handler for SshServer {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        public_key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        self.clear_authentication();
+        if let Some(rejection) = self.reject_publickey_before_lookup(user) {
+            return Ok(rejection);
+        }
         let config = self.state.storage.config();
         let traces_login = user == "traces" && config.traces.enabled;
-        if config.git.storage_only() && !traces_login {
-            return Ok(Auth::Reject {
-                proceed_with_methods: None,
-                partial_success: false,
-            });
-        }
 
         if traces_login {
             let mono = self.state.storage.mono_storage();
-            let key = match authenticate_traces_ssh_key(mono.get_connection(), public_key).await {
+            let key = match authenticate_traces_ssh_key(
+                mono.get_connection(),
+                public_key.public_key,
+            )
+            .await
+            {
                 Ok(Some(key)) => key,
                 Ok(None) => {
                     return Ok(Auth::Reject {
@@ -1137,7 +1155,10 @@ impl server::Handler for SshServer {
             return Ok(Auth::Accept);
         }
 
-        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        let fingerprint = public_key
+            .public_key
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
 
         tracing::info!("auth_publickey: {} / {}", user, fingerprint);
         let res = match lookup_ssh_key_finger_for_review(&self.state.storage, &fingerprint).await {
@@ -1661,7 +1682,7 @@ async fn lookup_ssh_key_finger_for_review(
 
 #[cfg(test)]
 mod tests {
-    use russh::server::Handler;
+    use russh::{keys::PublicKey, server::Handler};
 
     use super::*;
     use crate::{
@@ -2624,9 +2645,8 @@ mod tests {
         )
         .await;
         let auth = server
-            .auth_publickey("git", &sample_public_key())
-            .await
-            .expect("auth_publickey");
+            .reject_publickey_before_lookup("git")
+            .expect("storage-only public key auth is rejected before lookup");
         assert!(matches!(
             auth,
             Auth::Reject {

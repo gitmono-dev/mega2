@@ -484,13 +484,13 @@ mod tests {
         async fn auth_publickey(
             &mut self,
             user: &str,
-            public_key: &PublicKey,
+            public_key: russh::server::VerifiedPublicKey<'_>,
         ) -> Result<Auth, Self::Error> {
             self.auth_hits.fetch_add(1, Ordering::SeqCst);
             let user_ok = user == self.expected_user;
             let key_ok = self.expected_key.as_ref().is_none_or(|expected| {
-                expected.algorithm() == public_key.algorithm()
-                    && expected.key_data() == public_key.key_data()
+                expected.algorithm() == *public_key.algorithm
+                    && expected.key_data() == public_key.public_key.key_data()
             });
             if self.accept && user_ok && key_ok {
                 Ok(Auth::Accept)

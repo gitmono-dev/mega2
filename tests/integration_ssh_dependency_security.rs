@@ -106,9 +106,9 @@ impl server::Handler for AcceptFixtureKey {
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        key: &PublicKey,
+        key: russh::server::PublicKeyOffer<'_>,
     ) -> Result<server::Auth, Self::Error> {
-        Ok(if user == "fixture" && key == &self.key {
+        Ok(if user == "fixture" && key.public_key == &self.key {
             server::Auth::Accept
         } else {
             server::Auth::reject()
@@ -118,10 +118,10 @@ impl server::Handler for AcceptFixtureKey {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        key: &PublicKey,
+        key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<server::Auth, Self::Error> {
         assert_eq!(user, "fixture");
-        assert_eq!(key, &self.key);
+        assert_eq!(key.public_key, &self.key);
         self.authenticated.fetch_add(1, Ordering::SeqCst);
         Ok(server::Auth::Accept)
     }
