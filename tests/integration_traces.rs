@@ -17271,5 +17271,6 @@ fn legacy_retirement_stage_31() {
     let hits = traces_retirement_inventory::scan_stage_31(root).expect("stage 31 scan");
     assert!(
         hits.is_empty(),
-        "non-allowlisted legacy entity symbols: {hits:?}"    );
+        "non-allowlisted legacy entity symbols: {hits:?}"
+    );
 }
