@@ -41,6 +41,8 @@ Both stacks are a **local-only, anonymous setup**: `push_auth=none`, anonymous r
 
 For the full mega2 + MegaUI workspace, use [`macos-orbstack-megaui-compose.yml`](../macos-orbstack-megaui-compose.yml) or [`linux-megaui-compose.yml`](../linux-megaui-compose.yml). These files keep the storage-only variants unchanged, add `website-next`, `megaui-collab`, and `website-db-init`, and create separate `mega2` and `megaui` databases on the shared PostgreSQL service. MegaUI is built from the sibling `../megaui` checkout; mega2 defaults to `genedna/mega2:latest`. Start them from the mega2 repository root with `docker compose -f <file> up -d --wait`. Web is at `http://127.0.0.1:7001/en/signin`, mega2 API at `http://127.0.0.1:9000`, and collab at `http://127.0.0.1:7002`.
 
+**Coordinated releases:** mega2 and MegaUI must publish the same stable version. Both repositories need the matching tag and successful latest CI on `main`; `.github/workflows/docker.yml` blocks image publication when either side is missing the tag or has failing or incomplete CI.
+
 ### 2.2 Source-built test / lab stack: `docker/docker-compose-storage-only.yml`
 
 [`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml) is the local / lab reference stack that **builds** the image from source (for deployment rehearsals and smoke tests — not the official distribution form): mega2 + Postgres + Redis + RustFS, mounting [`config/config-storage-only.toml`](../config/config-storage-only.toml). It can coexist with the IT stack `docker/docker-compose.test.yml` (no port conflicts).

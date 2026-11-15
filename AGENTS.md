@@ -283,6 +283,8 @@ edits and again on agent `stop` when a reload was requested.
 
 ## Task card release (plan-20260905 and other `docs/plan/` cards)
 
+**双仓同版本发布（ER-08 强制门禁）：** `gitmono-dev/mega2` 与 `gitmono-dev/megaui` 使用同一稳定版本号发布。任一仓库发布 `v<major>.<minor>.<patch>` 前，另一个仓库必须已经存在同名 tag，且两个仓库最新 `main` CI 均为 `success`；版本不一致、CI 缺失、运行中或失败时不得创建或推送发布 tag、GitHub Release 或 Docker 镜像。不得用旧 CI、局部测试或其它 workflow 冒充最新质量门。`.github/workflows/docker.yml` 的 `release-gate` 是机器门禁，必须先于任何构建或推送成功；发布保持串行，禁止绕过该门禁。以下 C/D 流程仍须完整执行，该门禁不替代逐卡验收、签名、远端引用或 Docker 结果核验。
+
 By default, when an independent plan task card or a release point passes its
 A/B local acceptance gates and the required review says `PASS`, proceed
 through C release close-out without waiting for another request. Do not mark

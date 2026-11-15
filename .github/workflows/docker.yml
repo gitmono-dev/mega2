@@ -12,9 +12,50 @@ permissions:
 
 env:
   REGISTRY_IMAGE: ${{ vars.DOCKER_USER }}/mega2
+  PARTNER_REPOSITORY: gitmono-dev/megaui
+  PARTNER_CI_WORKFLOW: ci.yml
 
 jobs:
+  release-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require matching release tags and green CI in both repositories
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          SELF_REPOSITORY: ${{ github.repository }}
+          PARTNER_REPOSITORY: ${{ env.PARTNER_REPOSITORY }}
+          PARTNER_CI_WORKFLOW: ${{ env.PARTNER_CI_WORKFLOW }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$SELF_REPOSITORY/git/ref/tags/$REF_NAME" >/dev/null
+          gh api "repos/$PARTNER_REPOSITORY/git/ref/tags/$REF_NAME" >/dev/null || {
+            echo "Release $REF_NAME must exist in both $SELF_REPOSITORY and $PARTNER_REPOSITORY" >&2
+            exit 1
+          }
+          for repository in "$SELF_REPOSITORY" "$PARTNER_REPOSITORY"; do
+            if [[ "$repository" == "$SELF_REPOSITORY" ]]; then
+              workflow="docker.yml"
+            else
+              workflow="$PARTNER_CI_WORKFLOW"
+            fi
+            gh api "repos/$repository/actions/workflows/$workflow" >/dev/null || workflow="ci.yml"
+            latest_run="$(gh api "repos/$repository/actions/workflows/$workflow/runs?branch=main&event=push&per_page=1")"
+            count="$(jq -r '.total_count' <<<"$latest_run")"
+            [[ "$count" != 0 ]] || {
+              echo "No completed CI run was found on main in $repository" >&2
+              exit 1
+            }
+            conclusion="$(jq -r '.workflow_runs[0].conclusion // ""' <<<"$latest_run")"
+            [[ "$conclusion" == success ]] || {
+              echo "Latest main CI in $repository is not successful: ${conclusion:-missing}" >&2
+              exit 1
+            }
+          done
+
   build:
+    needs: release-gate
     strategy:
       fail-fast: true
       matrix:
@@ -99,7 +140,7 @@ jobs:
           retention-days: 1
 
   docker:
-    needs: build
+    needs: [release-gate, build]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     concurrency:

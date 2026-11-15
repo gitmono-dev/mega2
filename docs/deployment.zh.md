@@ -41,6 +41,8 @@ docker compose -f <文件> down      # 具名卷保留数据；down -v 清空
 
 完整的 mega2 + MegaUI 工作区改用 [`macos-orbstack-megaui-compose.yml`](../macos-orbstack-megaui-compose.yml) 或 [`linux-megaui-compose.yml`](../linux-megaui-compose.yml)。原 storage-only 文件保持不变；新文件增加 `website-next`、`megaui-collab` 与 `website-db-init`，并在共享 PostgreSQL 实例上分别创建 `mega2` 和 `megaui` 数据库。MegaUI 从相邻的 `../megaui` 检出构建，mega2 默认使用 `genedna/mega2:latest`。在 mega2 仓库根目录运行 `docker compose -f <文件> up -d --wait`。Web 地址为 `http://127.0.0.1:7001/en/signin`，mega2 API 为 `http://127.0.0.1:9000`，协作服务为 `http://127.0.0.1:7002`。
 
+**双仓协同发布：** mega2 与 MegaUI 必须发布同一稳定版本。两个仓库都要存在同名 tag，且最新 `main` CI 均为 `success`；任一仓库缺少同名 tag、CI 运行中或失败时，`.github/workflows/docker.yml` 会阻止镜像发布。
+
 ### 2.2 源码构建的测试 / 实验栈：`docker/docker-compose-storage-only.yml`
 
 [`docker/docker-compose-storage-only.yml`](../docker/docker-compose-storage-only.yml) 是从源码**构建**镜像的本地 / 实验室参考栈（用于部署演练与 smoke，不是正式分发形态）：mega2 + Postgres + Redis + RustFS，挂载 [`config/config-storage-only.toml`](../config/config-storage-only.toml)。与 IT 栈 `docker/docker-compose.test.yml` 可并存（端口不冲突）。
