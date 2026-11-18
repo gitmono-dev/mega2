@@ -178,7 +178,7 @@ RustFS 使用本页固定镜像、公开测试凭据及 `mega2` 桶，端点来�
 | 项 | 值 |
 |---|---|
 | 服务名 | `rustfs`、`rustfs-init` |
-| 镜像 | `rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff`；桶初始化客户端 `rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699`（固定 tag，非 `latest`；`rc` 为 RustFS 官方 S3 客户端，不使用 MinIO `mc`） |
+| 镜像 | `rustfs/rustfs:1.0.6@sha256:ee717072290bec9b11abfc0365f8310b00df1cd9b3639943edae47bdef05044a`；桶初始化客户端 `rustfs/rc:v0.1.38@sha256:3c080aff53f0d3b06554fd08711d05c80be40bd7e56001874d7df5e18d5ec88a`（固定 tag，非 `latest`；`rc` 为 RustFS 官方 S3 客户端，不使用 MinIO `mc`） |
 | 端口 | `127.0.0.1:19000:9000`、`127.0.0.1:19001:9001`（高位 + 仅回环；S3 API / console） |
 | healthcheck | `rustfs`：`curl -f http://127.0.0.1:9000/health`；`rustfs-init`：`rc ls local/mega2` **且** `rc ls local/monoui`（建桶后 `sleep infinity`，见 `docker/docker-compose.test.yml`） |
 | 网络 | 默认 `networks.default` → `mega2-test-network` |

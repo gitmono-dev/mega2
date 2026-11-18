@@ -65,7 +65,7 @@ name: mega2-macos
 
 services:
   postgres:
-    image: postgres:18.6-alpine3.24
+    image: postgres:18.7-alpine3.24
     environment:
       POSTGRES_USER: mega2
       POSTGRES_PASSWORD: mega2_local_password
@@ -89,7 +89,7 @@ services:
       retries: 20
 
   rustfs:
-    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    image: rustfs/rustfs:1.0.6@sha256:ee717072290bec9b11abfc0365f8310b00df1cd9b3639943edae47bdef05044a
     # Fixed container name → stable OrbStack DNS name `mega2-rustfs.orb.local`,
     # which resolves both on the host and inside containers. Artifact presigned
     # URLs carry this host in their SigV4 signature, so one name must serve both.
@@ -112,7 +112,7 @@ services:
       start_period: 10s
 
   rustfs-init:
-    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
+    image: rustfs/rc:v0.1.38@sha256:3c080aff53f0d3b06554fd08711d05c80be40bd7e56001874d7df5e18d5ec88a
     depends_on:
       rustfs:
         condition: service_healthy
