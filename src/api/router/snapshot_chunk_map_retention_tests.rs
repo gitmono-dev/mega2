@@ -367,7 +367,10 @@ async fn actual_warm_body_owner_cancels_never_returning_open_and_next_without_ba
                     response_bytes
                 }
             );
-            db.execute_unprepared("UPDATE mst2_chunk_reader SET deadline=pg_catalog.clock_timestamp()+interval '20 milliseconds'").await.unwrap();
+            // 1 s rather than 20 ms: the reader guard rejects a deadline that is
+            // already past when it runs, and a loaded runner can spend longer
+            // than 20 ms between evaluating SET and running the trigger.
+            db.execute_unprepared("UPDATE mst2_chunk_reader SET deadline=pg_catalog.clock_timestamp()+interval '1 second'").await.unwrap();
             // Never release the backend and never cancel the caller. The
             // request must observe actual expiry during its pending await.
             // FIX-OX-26: measured owner self-cancellation under parallel load was 4.2-10.0 s (one
@@ -635,7 +638,8 @@ async fn held_raw_and_exact_range_do_not_resume_after_actual_reader_expiry() {
             .await
             .unwrap();
         assert_eq!(count(db, "mst2_chunk_reader").await, 1);
-        db.execute_unprepared("UPDATE mst2_chunk_reader SET deadline=pg_catalog.clock_timestamp()+interval '20 milliseconds'").await.unwrap();
+        // 1 s rather than 20 ms: see the warm-body expiry test above.
+        db.execute_unprepared("UPDATE mst2_chunk_reader SET deadline=pg_catalog.clock_timestamp()+interval '1 second'").await.unwrap();
         // The request must stop at actual reader expiry while the backend is
         // still held. Releasing it first would allow a resumed poll to pass.
         // FIX-OX-26: measured self-cancellation under parallel load was ~9.9 s (one reader check
@@ -1124,8 +1128,33 @@ async fn expired_reader_arc_cannot_resurrect_or_authenticate_a_page() {
         .unwrap()
         .try_get("", "generation")
         .unwrap();
-    db.execute_unprepared("UPDATE mst2_chunk_reader SET deadline=pg_catalog.clock_timestamp()+interval '20 milliseconds'").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // 1 s rather than 20 ms (see the warm-body expiry test), then wait until
+    // PostgreSQL itself reports the reader expired instead of a fixed sleep.
+    db.execute_unprepared(
+        "UPDATE mst2_chunk_reader SET deadline=pg_catalog.clock_timestamp()+interval '1 second'",
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let expired: Option<bool> = db
+                .query_one_raw(statement(
+                    "SELECT pg_catalog.bool_and(deadline<=pg_catalog.clock_timestamp()) AS expired FROM mst2_chunk_reader",
+                    [],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "expired")
+                .unwrap();
+            if expired == Some(true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
     map.test_check_next_owner_operation().await;
     assert_eq!(
         map.ensure_live().await.unwrap_err().code,
