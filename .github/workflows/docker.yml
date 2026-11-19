@@ -36,11 +36,10 @@ jobs:
           }
           for repository in "$SELF_REPOSITORY" "$PARTNER_REPOSITORY"; do
             if [[ "$repository" == "$SELF_REPOSITORY" ]]; then
-              workflow="docker.yml"
+              workflow="repository-gates.yml"
             else
               workflow="$PARTNER_CI_WORKFLOW"
             fi
-            gh api "repos/$repository/actions/workflows/$workflow" >/dev/null || workflow="ci.yml"
             latest_run="$(gh api "repos/$repository/actions/workflows/$workflow/runs?branch=main&event=push&per_page=1")"
             count="$(jq -r '.total_count' <<<"$latest_run")"
             [[ "$count" != 0 ]] || {
