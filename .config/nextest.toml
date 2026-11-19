@@ -6,3 +6,47 @@ test-threads = "num-cpus"
 failure-output = "immediate"
 status-level = "leak"
 retries = 0
+
+# Test groups bound how many tests share one external service at a time. A
+# test belongs to the first override below whose filter matches it.
+[test-groups]
+# Library tests that clone a database from the `mega2_tpl` template.
+pg = { max-threads = 6 }
+# Integration binaries that drive the shared git-cli container. Concurrent
+# clones from that container hang until the in-container timeout kills them,
+# so these binaries run one test at a time across all of them.
+git-cli = { max-threads = 1 }
+# The remaining integration binaries, one test at a time, as
+# `docs/development.md` runs `integration_vault` (`--test-threads=1`).
+it-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# Every `tests/*.rs` binary with a test that runs Git inside the git-cli
+# container (`docker exec` beyond the `git --version` probe), measured with a
+# `docker` shim. Add a binary here when its tests start cloning or pushing
+# through `tests/common/git_cli.rs`.
+filter = 'binary(/^integration_(git_cli|git_lfs|git_ssh|import_hash|native_hash|native_push_hash|traces)$/)'
+test-group = 'git-cli'
+
+[[profile.default.overrides]]
+filter = 'kind(test)'
+test-group = 'it-serial'
+
+[[profile.default.overrides]]
+# These parents re-run a database test in child processes (`db_cleanup_repro`
+# starts 16 at once), so one of them takes the whole `pg` lane.
+filter = 'kind(lib) & test(/^jupiter::tests::schema_guard_tests::(db_cleanup_repro|db_cleanup_parallel_parent|db_namespace_pid_reuse_parent)$/)'
+test-group = 'pg'
+threads-required = 6
+
+[[profile.default.overrides]]
+# Fail closed: every library test is capped unless its module was measured to
+# open no PostgreSQL connection (PGAPPNAME-tagged nextest run, 1,395 of 2,846
+# library tests connect). Only subtrees of 20 or more such tests are listed.
+# Move a subtree out of this list when one of its tests starts using
+# `test_db_connection`, `test_db_config`, `test_storage*` or another fixture
+# from `src/jupiter/tests.rs`.
+filter = '''
+kind(lib) & !test(/^(api::router::lfs_router|ceres::api_service::mono_api_service::test|ceres::view|commands::config|common|config::(reload|test|validate)|contract::policy::guard::cedar_guard|jupiter::redis|jupiter::service::buck_service|orbit|orbit_api)::/)
+'''
+test-group = 'pg'

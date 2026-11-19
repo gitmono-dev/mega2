@@ -49,6 +49,11 @@ jobs:
         with:
           save-if: "true"
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+
       - name: Check formatting
         run: cargo +nightly fmt --all --check
 
@@ -122,10 +127,14 @@ jobs:
           set -euo pipefail
           source .env.test
           export no_proxy="$NO_PROXY"
-          # Bounded parallelism: ~2,900 database-backed tests at full core
-          # count overload the single isolated Postgres container and fail on
-          # load (cleanup guards, transient storage 503s, timeouts).
-          cargo test --all -- --nocapture --test-threads=4
+          # One process per test. `.config/nextest.toml` caps the library
+          # tests that clone a Postgres database at 6 at a time (`pg`), and
+          # runs the integration binaries one test at a time: those that run
+          # Git in the shared git-cli container in one lane (`git-cli`), the
+          # rest in another (`it-serial`). Other library tests keep full core
+          # parallelism. The library sets `doctest = false`, so nextest
+          # covers every test target.
+          cargo nextest run --workspace --no-fail-fast
 
       - name: Stop isolated test dependencies
         if: always()
