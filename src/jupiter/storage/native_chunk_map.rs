@@ -23,7 +23,7 @@ use crate::{
     ceres::snapshot::{
         chunk_map_index::{ChunkMapNode, indexed_nodes, proof_intervals, selected_proof},
         chunks::{ChunkMapSource, VerifiedSourceChunkMap},
-        content_budget::{MemoryBudget, MemoryLease, projection_budget},
+        content_budget::{MemoryBudget, MemoryLease, PROJECTION_LIVE_BYTES, projection_budget},
         error::{SnapshotError, SnapshotErrorCode},
     },
     orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
@@ -34,6 +34,43 @@ const PAGE_CREDIT: usize = 64 * 1024;
 const RECEIPT_DOMAIN: &[u8] = b"MST2-CHUNK-MAP-RECEIPT\0";
 
 pub(crate) mod retention;
+
+/// Process-wide credit pool for `kind`. Production shares one pool across all
+/// repositories. Unit tests run in parallel inside one process, each on its
+/// own isolated schema, so test builds give every schema its own pool with the
+/// same limit: requests inside one test still contend exactly as in production,
+/// but concurrently running tests cannot exhaust each other's credit.
+#[cfg(not(test))]
+fn schema_budget(
+    global: &'static Arc<MemoryBudget>,
+    _kind: &'static str,
+    _limit: usize,
+    _schema: &str,
+) -> Arc<MemoryBudget> {
+    global.clone()
+}
+
+#[cfg(test)]
+fn schema_budget(
+    _global: &'static Arc<MemoryBudget>,
+    kind: &'static str,
+    limit: usize,
+    schema: &str,
+) -> Arc<MemoryBudget> {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+    type Pools = Mutex<HashMap<(&'static str, String), Arc<MemoryBudget>>>;
+    static POOLS: OnceLock<Pools> = OnceLock::new();
+    POOLS
+        .get_or_init(Pools::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((kind, schema.to_owned()))
+        .or_insert_with(|| MemoryBudget::new(limit))
+        .clone()
+}
 
 #[derive(Clone)]
 pub(crate) struct PostgresChunkMapRepository {
@@ -125,7 +162,12 @@ impl PostgresChunkMapRepository {
         Ok(Self {
             connection,
             primary_scope,
-            budget: projection_budget().clone(),
+            budget: schema_budget(
+                projection_budget(),
+                "projection",
+                PROJECTION_LIVE_BYTES,
+                &schema,
+            ),
             schema,
             receipt_observation: Arc::default(),
             cancelled_installs: Arc::default(),
@@ -722,6 +764,36 @@ impl super::Storage {
 #[cfg(test)]
 mod sql_tests {
     use super::*;
+
+    #[test]
+    fn test_budgets_are_shared_within_a_schema_and_isolated_across_schemas() {
+        static GLOBAL: std::sync::OnceLock<Arc<MemoryBudget>> = std::sync::OnceLock::new();
+        let global = GLOBAL.get_or_init(|| MemoryBudget::new(16));
+        let a = schema_budget(global, "pool-test", 16, "pool_test_schema_a");
+        let same = schema_budget(global, "pool-test", 16, "pool_test_schema_a");
+        let other = schema_budget(global, "pool-test", 16, "pool_test_schema_b");
+        let other_kind = schema_budget(global, "pool-test-other", 16, "pool_test_schema_a");
+        assert!(Arc::ptr_eq(&a, &same));
+        assert!(!Arc::ptr_eq(&a, &other));
+        assert!(!Arc::ptr_eq(&a, &other_kind));
+        let held = a.reserve(16).unwrap();
+        // Requests in the same schema still contend for one pool...
+        assert_eq!(
+            same.reserve(1).err().unwrap().code,
+            SnapshotErrorCode::TemporaryUnavailable
+        );
+        // ...over-limit requests still fail as LimitExceeded...
+        assert_eq!(
+            same.reserve(17).err().unwrap().code,
+            SnapshotErrorCode::LimitExceeded
+        );
+        // ...and another test's schema or pool kind keeps its own full credit.
+        assert!(other.reserve(16).is_ok());
+        assert!(other_kind.reserve(16).is_ok());
+        assert_eq!(global.used(), 0);
+        drop(held);
+        assert!(same.reserve(16).is_ok());
+    }
 
     #[test]
     fn authority_relations_are_qualified_without_rewriting_catalog_literals() {

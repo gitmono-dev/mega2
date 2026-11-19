@@ -76,11 +76,18 @@ fn remaining_deadline(started: Instant, row: &QueryResult) -> Result<Instant, Sn
         .ok_or_else(|| integrity("chunk-map ownership deadline is not representable"))
 }
 
-fn retention_budget() -> &'static Arc<MemoryBudget> {
+const RETENTION_LIVE_BYTES: usize = 128 * 1024 * 1024;
+
+fn retention_budget(schema: &str) -> Arc<MemoryBudget> {
     // Inventory survives requests. Its separate process-wide credits bound
     // independent repositories without retaining source or response credit.
     static BUDGET: OnceLock<Arc<MemoryBudget>> = OnceLock::new();
-    BUDGET.get_or_init(|| MemoryBudget::new(128 * 1024 * 1024))
+    schema_budget(
+        BUDGET.get_or_init(|| MemoryBudget::new(RETENTION_LIVE_BYTES)),
+        "retention",
+        RETENTION_LIVE_BYTES,
+        schema,
+    )
 }
 
 pub(super) struct BackingObservation {
@@ -671,7 +678,7 @@ impl PostgresChunkMapRepository {
             Err(error) => return Err(error),
         }
         self.replay_cancelled_installs().await?;
-        let _memory = retention_budget().reserve(8 * 1024 * 1024)?;
+        let _memory = retention_budget(&self.schema).reserve(8 * 1024 * 1024)?;
         let txn = self.transaction().await?;
         let result=async {
             self.require_scope(&txn).await?;
@@ -1046,7 +1053,7 @@ pub(super) async fn inventory(
     }) {
         return Ok(observation.clone());
     }
-    let memory = retention_budget().reserve(4 * 1024 * 1024)?;
+    let memory = retention_budget(&repository.schema).reserve(4 * 1024 * 1024)?;
     let txn = repository.transaction().await?;
     repository.require_scope(&txn).await?;
     let started_at = txn
