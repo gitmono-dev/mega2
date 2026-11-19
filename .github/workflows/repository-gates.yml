@@ -122,7 +122,10 @@ jobs:
           set -euo pipefail
           source .env.test
           export no_proxy="$NO_PROXY"
-          cargo test --all -- --nocapture
+          # Bounded parallelism: ~2,900 database-backed tests at full core
+          # count overload the single isolated Postgres container and fail on
+          # load (cleanup guards, transient storage 503s, timeouts).
+          cargo test --all -- --nocapture --test-threads=4
 
       - name: Stop isolated test dependencies
         if: always()
