@@ -2,6 +2,13 @@
 //
 // This file is kept byte-identical in gitmono-dev/megaui and gitmono-dev/mega2
 // (`.github/scripts/release-gate.mjs`). It has no third-party dependencies.
+//
+// Command line: `node .github/scripts/release-gate.mjs`, configured only by
+// GH_TOKEN, REF_NAME, SELF_REPOSITORY, SELF_CI_WORKFLOW, PARTNER_REPOSITORY,
+// PARTNER_CI_WORKFLOW and the optional GITHUB_API_URL. Exit code 0 lets the
+// release proceed; 1 rejects it.
+
+import { pathToFileURL } from "node:url";
 
 /**
  * Decides whether a release tag may be built.
@@ -173,4 +180,57 @@ function isSha(value) {
 
 function reject(reason) {
   return { ok: false, reason };
+}
+
+export const REQUIRED_ENV = [
+  "GH_TOKEN",
+  "REF_NAME",
+  "SELF_REPOSITORY",
+  "SELF_CI_WORKFLOW",
+  "PARTNER_REPOSITORY",
+  "PARTNER_CI_WORKFLOW",
+];
+
+/**
+ * Runs the gate from environment variables and returns the exit code.
+ *
+ * @param {{ env: Record<string, string | undefined>, stdout: { write(s: string): unknown },
+ *   stderr: { write(s: string): unknown }, fetch?: typeof fetch }} io
+ */
+export async function main({ env, stdout, stderr, fetch: fetchImpl = globalThis.fetch }) {
+  const token = env.GH_TOKEN || "";
+  const mask = (text) => (token ? text.split(token).join("***") : text);
+  const missing = REQUIRED_ENV.filter((name) => !env[name]);
+  if (missing.length > 0) {
+    stderr.write(mask(`release-gate: missing environment variables: ${missing.join(", ")}\n`));
+    return 1;
+  }
+  const client = createGitHubClient({
+    baseUrl: env.GITHUB_API_URL || "https://api.github.com",
+    token,
+    fetch: fetchImpl,
+  });
+  const result = await evaluateReleaseGate({
+    client,
+    inputs: {
+      refName: env.REF_NAME,
+      selfRepository: env.SELF_REPOSITORY,
+      selfCiWorkflow: env.SELF_CI_WORKFLOW,
+      partnerRepository: env.PARTNER_REPOSITORY,
+      partnerCiWorkflow: env.PARTNER_CI_WORKFLOW,
+    },
+  });
+  if (result.ok) {
+    stdout.write(mask(`release-gate: pass: ${result.reason}\n`));
+    return 0;
+  }
+  stderr.write(mask(`release-gate: reject: ${result.reason}\n`));
+  return 1;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main({ env: process.env, stdout: process.stdout, stderr: process.stderr }).then(
+    (code) => { process.exitCode = code; },
+    () => { process.stderr.write("release-gate: reject: unexpected failure\n"); process.exitCode = 1; },
+  );
 }

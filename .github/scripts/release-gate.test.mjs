@@ -1,8 +1,14 @@
 // Deterministic tests for release-gate.mjs (node:test, no network).
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { test } from "node:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { createGitHubClient, evaluateReleaseGate } from "./release-gate.mjs";
+import { createGitHubClient, evaluateReleaseGate, REQUIRED_ENV } from "./release-gate.mjs";
 
 const SELF = "gitmono-dev/megaui";
 const PARTNER = "gitmono-dev/mega2";
@@ -227,4 +233,146 @@ test("client times out while the body is still pending", async () => {
   const { result } = await gateWith(okRoutes({ [`repos/${SELF}/git/ref/heads/main`]: stalledBody }), { timers });
   assert.equal(result.ok, false);
   assert.match(result.reason, /timed out/);
+});
+
+// --- command line entry (FSL-72) -------------------------------------------
+
+const SCRIPT = fileURLToPath(new URL("./release-gate.mjs", import.meta.url));
+
+function startStandIn(routes) {
+  return new Promise((resolveServer) => {
+    const server = createServer((request, response) => {
+      const path = request.url.slice(1);
+      const route = routes[path];
+      if (!route) { response.writeHead(500); response.end("{}"); return; }
+      response.writeHead(route.status, { "content-type": "application/json" });
+      response.end(typeof route.body === "string" ? route.body : JSON.stringify(route.body));
+    });
+    server.listen(0, "127.0.0.1", () => resolveServer(server));
+  });
+}
+
+function standInRoutes(overrides = {}) {
+  return {
+    [`repos/${SELF}/git/ref/tags/v1.2.3`]: { status: 200, body: { object: { sha: "1".repeat(40) } } },
+    [`repos/${PARTNER}/git/ref/tags/v1.2.3`]: { status: 200, body: { object: { sha: "2".repeat(40) } } },
+    [`repos/${SELF}/git/ref/heads/main`]: { status: 200, body: { object: { sha: HEADS[SELF] } } },
+    [`repos/${PARTNER}/git/ref/heads/main`]: { status: 200, body: { object: { sha: HEADS[PARTNER] } } },
+    [`repos/${SELF}/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=1`]:
+      { status: 200, body: { total_count: 1, workflow_runs: [{ head_sha: HEADS[SELF], status: "completed", conclusion: "success" }] } },
+    [`repos/${PARTNER}/actions/workflows/repository-gates.yml/runs?branch=main&event=push&per_page=1`]:
+      { status: 200, body: { total_count: 1, workflow_runs: [{ head_sha: HEADS[PARTNER], status: "completed", conclusion: "success" }] } },
+    ...overrides,
+  };
+}
+
+function baseEnv(apiUrl) {
+  return {
+    PATH: process.env.PATH,
+    GH_TOKEN: TOKEN,
+    REF_NAME: "v1.2.3",
+    SELF_REPOSITORY: SELF,
+    SELF_CI_WORKFLOW: "ci.yml",
+    PARTNER_REPOSITORY: PARTNER,
+    PARTNER_CI_WORKFLOW: "repository-gates.yml",
+    ...(apiUrl ? { GITHUB_API_URL: apiUrl } : {}),
+  };
+}
+
+function runCli(env, nodeArgs = []) {
+  return new Promise((resolveRun) => {
+    const child = spawn(process.execPath, [...nodeArgs, SCRIPT], { env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("close", (code) => resolveRun({ code, stdout, stderr }));
+  });
+}
+
+async function withStandIn(routes, body) {
+  const server = await startStandIn(routes);
+  try {
+    return await body(`http://127.0.0.1:${server.address().port}`);
+  } finally {
+    await new Promise((done) => server.close(done));
+  }
+}
+
+test("cli reads the API address from GITHUB_API_URL and passes", async () => {
+  await withStandIn(standInRoutes(), async (url) => {
+    const run = await runCli(baseEnv(url));
+    assert.equal(run.code, 0, run.stderr);
+    assert.match(run.stdout, /release-gate: pass:/);
+  });
+});
+
+test("cli defaults the API address to https://api.github.com", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "release-gate-test-"));
+  try {
+    const preload = join(dir, "record-fetch.mjs");
+    await writeFile(preload, 'globalThis.fetch = async (url) => { process.stderr.write(`FETCH ${url}\\n`); return { status: 404, text: async () => "{}" }; };\n');
+    const env = baseEnv(undefined);
+    const run = await runCli(env, ["--import", pathToFileURL(preload).href]);
+    const urls = run.stderr.split("\n").filter((line) => line.startsWith("FETCH ")).map((line) => line.slice(6));
+    assert.ok(urls.length > 0, run.stderr);
+    assert.ok(urls.every((url) => url.startsWith("https://api.github.com/")), urls.join(","));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli reads inputs only from the six documented variables", async () => {
+  assert.deepEqual(REQUIRED_ENV, ["GH_TOKEN", "REF_NAME", "SELF_REPOSITORY", "SELF_CI_WORKFLOW", "PARTNER_REPOSITORY", "PARTNER_CI_WORKFLOW"]);
+  await withStandIn(standInRoutes(), async (url) => {
+    const decoys = { GITHUB_REPOSITORY: "evil/repo", GITHUB_REF_NAME: "v9.9.9", GITHUB_TOKEN: "decoy", CI_WORKFLOW: "docker.yml" };
+    const run = await runCli({ ...baseEnv(url), ...decoys });
+    assert.equal(run.code, 0, run.stderr);
+  });
+});
+
+test("cli exits 1 and names only the missing variables", async () => {
+  for (const name of REQUIRED_ENV) {
+    const env = baseEnv("http://127.0.0.1:9");
+    delete env[name];
+    const run = await runCli(env);
+    assert.equal(run.code, 1);
+    assert.equal(run.stderr.trim(), `release-gate: missing environment variables: ${name}`);
+    assert.ok(!run.stderr.includes(TOKEN));
+  }
+});
+
+test("cli exits 1 with a reason when the gate rejects or the client fails", async () => {
+  const cases = [
+    standInRoutes({ [`repos/${PARTNER}/git/ref/tags/v1.2.3`]: { status: 404, body: { message: "Not Found" } } }),
+    standInRoutes({ [`repos/${SELF}/git/ref/heads/main`]: { status: 500, body: { message: TOKEN } } }),
+  ];
+  for (const routes of cases) {
+    await withStandIn(routes, async (url) => {
+      const run = await runCli(baseEnv(url));
+      assert.equal(run.code, 1);
+      assert.match(run.stderr, /release-gate: reject: /);
+    });
+  }
+});
+
+test("cli output never contains the token", async () => {
+  // The token is chosen so that it occurs in every message the gate can print.
+  const tokenInRef = "v1.2.3";
+  const refRoutes = standInRoutes();
+  await withStandIn(refRoutes, async (url) => {
+    const pass = await runCli({ ...baseEnv(url), GH_TOKEN: tokenInRef });
+    assert.equal(pass.code, 0, pass.stderr);
+    assert.ok(!pass.stdout.includes(tokenInRef) && !pass.stderr.includes(tokenInRef), pass.stdout);
+  });
+  await withStandIn(standInRoutes({ [`repos/${PARTNER}/git/ref/tags/v1.2.3`]: { status: 404, body: {} } }), async (url) => {
+    const reject = await runCli({ ...baseEnv(url), GH_TOKEN: tokenInRef });
+    assert.equal(reject.code, 1);
+    assert.ok(!reject.stdout.includes(tokenInRef) && !reject.stderr.includes(tokenInRef), reject.stderr);
+  });
+  const env = { ...baseEnv("http://127.0.0.1:9"), GH_TOKEN: "REF_NAME" };
+  delete env.REF_NAME;
+  const missing = await runCli(env);
+  assert.equal(missing.code, 1);
+  assert.ok(!missing.stderr.includes("REF_NAME") && !missing.stdout.includes("REF_NAME"), missing.stderr);
 });
