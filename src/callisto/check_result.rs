@@ -18,6 +18,14 @@ pub struct Model {
     pub check_type_code: CheckTypeEnum,
     pub status: String,
     pub message: String,
+    pub head_revision: i64,
+    pub ci_generation: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub ci_task_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub ci_attempt_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub details_url: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

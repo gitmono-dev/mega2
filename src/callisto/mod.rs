@@ -16,6 +16,8 @@ pub mod bots;
 pub mod buck_session;
 pub mod buck_session_file;
 pub mod check_result;
+pub mod ci_callback_nonces;
+pub mod cl_webhook_outbox;
 pub mod commit_auths;
 pub mod entity_ext;
 pub mod git_blob;

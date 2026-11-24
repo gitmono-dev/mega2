@@ -53,6 +53,7 @@ impl mega_cl::Model {
             to_hash,
             username,
             revision: 0,
+            head_revision: 1,
         }
     }
 
@@ -80,6 +81,7 @@ impl mega_cl::Model {
             to_hash: String::new(),
             username,
             revision: 0,
+            head_revision: 1,
         }
     }
 }

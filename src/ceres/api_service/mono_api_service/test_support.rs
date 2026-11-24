@@ -358,6 +358,7 @@ pub(in crate::ceres::api_service::mono_api_service) fn gate_test_cl(
         username: "gate-tester".to_string(),
         base_branch: "main".to_string(),
         revision: 0,
+        head_revision: 1,
     }
 }
 

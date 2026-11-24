@@ -4542,6 +4542,7 @@ mod tests {
             username: "fixture".to_owned(),
             base_branch: "main".to_owned(),
             revision: 0,
+            head_revision: 1,
         };
         bridge.validate(&cmd, &mono, Some(&cl), 3).await.unwrap();
         assert!(

@@ -25,6 +25,8 @@ pub struct Model {
     pub base_branch: String,
     /// Monotonic CAS token for merge/rebase (TP-07 / GAP-12).
     pub revision: i64,
+    /// Monotonic CL head revision for CI check & webhook ordering (`CLB-10`).
+    pub head_revision: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

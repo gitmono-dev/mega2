@@ -247,6 +247,7 @@ mod tests {
             username: Set("alice".to_string()),
             base_branch: Set("main".to_string()),
             revision: Set(0),
+            head_revision: Set(1),
         }
         .insert(&db)
         .await

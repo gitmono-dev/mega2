@@ -20,6 +20,11 @@ impl check_result::Model {
             check_type_code,
             status: status.to_owned(),
             message: message.to_owned(),
+            head_revision: 0,
+            ci_generation: 0,
+            ci_task_id: None,
+            ci_attempt_id: None,
+            details_url: None,
         }
     }
 }

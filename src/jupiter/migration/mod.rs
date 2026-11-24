@@ -163,6 +163,7 @@ mod m20261015_000200_trace_publication;
 mod m20261015_000300_trace_projection;
 mod m20261015_000400_trace_legacy_purge;
 mod m20261111_000100_trace_legacy_fence_schema;
+mod m20261124_000100_add_cl_ci_check_columns;
 pub(crate) mod qualified_native_runtime_upgrade;
 mod runner;
 pub mod traces_maintenance;
@@ -365,6 +366,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261015_000300_trace_projection::Migration),
             Box::new(m20261015_000400_trace_legacy_purge::Migration),
             Box::new(m20261111_000100_trace_legacy_fence_schema::Migration),
+            Box::new(m20261124_000100_add_cl_ci_check_columns::Migration),
         ]
     }
 }
@@ -1370,6 +1372,7 @@ mod tests {
             "m20261015_000300_trace_projection",
             "m20261015_000400_trace_legacy_purge",
             "m20261111_000100_trace_legacy_fence_schema",
+            "m20261124_000100_add_cl_ci_check_columns",
         ]
         .map(str::to_owned);
         assert_eq!(

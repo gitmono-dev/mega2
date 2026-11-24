@@ -1467,6 +1467,7 @@ mod tests {
             username: "tester".to_string(),
             base_branch: "main".to_string(),
             revision: 0,
+            head_revision: 1,
         }
     }
 

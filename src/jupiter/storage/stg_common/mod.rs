@@ -65,6 +65,7 @@ mod tests {
             path: String::from("/"),
             base_branch: String::from("main"),
             revision: 0,
+            head_revision: 1,
         };
 
         let conv = mega_conversation::Model {
