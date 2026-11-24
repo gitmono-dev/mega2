@@ -5,19 +5,19 @@ use std::{
 
 use git_internal::internal::object::commit::Commit;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
-    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set,
-    TransactionTrait,
+    ActiveEnum, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction,
+    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+    Set, TransactionTrait,
     prelude::Expr,
     sea_query::{LockType, OnConflict},
 };
 
 use crate::{
     callisto::{
-        check_result, ci_callback_nonces,
+        check_result, ci_callback_nonces, cl_webhook_outbox,
         entity_ext::generate_id,
         mega_cl, mega_cl_commits, mega_commit, mega_conversation, path_check_configs,
-        sea_orm_active_enums::{CheckTypeEnum, MergeStatusEnum},
+        sea_orm_active_enums::{CheckTypeEnum, MergeStatusEnum, WebhookEventTypeEnum},
     },
     common::errors::MegaError,
     contract::api::common::Pagination,
@@ -482,7 +482,8 @@ impl ClStorage {
                    SET from_hash = $1,
                        to_hash = $2,
                        updated_at = $3,
-                       revision = revision + 1
+                       revision = revision + 1,
+                       head_revision = head_revision + 1
                  WHERE link = $4
                    AND revision = $5
                    AND status = 'open'::merge_status_enum
@@ -499,6 +500,108 @@ impl ClStorage {
             ))
             .await?;
         Ok(rows.rows_affected() == 1)
+    }
+
+    /// CLB-15: In-place invalidation of an existing `CiStatus` check row inside
+    /// the CL head-advance transaction. Preserves `ci_generation` (high-water
+    /// mark) and clears `ci_task_id`, `ci_attempt_id`, and `details_url`.
+    /// Must be called AFTER locking/updating `mega_cl` to maintain canonical
+    /// lock ordering (`mega_cl -> check_result`).
+    pub async fn invalidate_ci_check_in_txn(
+        &self,
+        cl_link: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<bool, MegaError> {
+        let Some(row) = check_result::Entity::find()
+            .filter(check_result::Column::ClLink.eq(cl_link))
+            .filter(check_result::Column::CheckTypeCode.eq(CheckTypeEnum::CiStatus))
+            .lock_exclusive()
+            .one(txn)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        let mut active = row.into_active_model();
+        active.status = Set("INVALIDATED".to_owned());
+        active.message = Set("CL head advanced; awaiting new CI check".to_owned());
+        active.ci_task_id = Set(None);
+        active.ci_attempt_id = Set(None);
+        active.details_url = Set(None);
+        active.updated_at = Set(chrono::Utc::now().naive_utc());
+        active.update(txn).await?;
+        Ok(true)
+    }
+
+    /// CLB-15: Transactionally enqueue a `cl.created` or `cl.updated` webhook
+    /// event into `cl_webhook_outbox` with an immutable `event_id` and frozen
+    /// canonical payload carrying `cl.head_revision`.
+    pub async fn enqueue_cl_webhook_outbox_in_txn(
+        &self,
+        event_type: WebhookEventTypeEnum,
+        cl: &mega_cl::Model,
+        txn: &DatabaseTransaction,
+    ) -> Result<cl_webhook_outbox::Model, MegaError> {
+        let event_type_str = event_type.to_value();
+        let event_id = format!("clwh-{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+        let now_naive = now.naive_utc();
+        let status_str = match cl.status {
+            MergeStatusEnum::Open => "open",
+            MergeStatusEnum::Draft => "draft",
+            MergeStatusEnum::Closed => "closed",
+            MergeStatusEnum::Merged => "merged",
+        };
+        let repo_name = cl
+            .path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown");
+        let payload = serde_json::json!({
+            "mega_version": env!("CARGO_PKG_VERSION"),
+            "event": event_type_str,
+            "timestamp": now.timestamp(),
+            "cl": {
+                "id": cl.id,
+                "link": cl.link,
+                "title": cl.title,
+                "author": {
+                    "name": cl.username,
+                },
+                "status": status_str,
+                "path": cl.path,
+                "base_branch": cl.base_branch,
+                "head_commit": cl.to_hash,
+                "head_revision": cl.head_revision,
+            },
+            "repository": {
+                "path": cl.path,
+                "name": repo_name,
+            },
+        });
+        let payload_json = serde_json::to_string(&payload)?;
+        let active = cl_webhook_outbox::ActiveModel {
+            id: Set(generate_id()),
+            event_id: Set(event_id),
+            event_type: Set(event_type_str),
+            cl_link: Set(cl.link.clone()),
+            cl_path: Set(cl.path.clone()),
+            head_revision: Set(cl.head_revision),
+            payload_json: Set(payload_json),
+            state: Set("pending".to_owned()),
+            lease_owner: Set(None),
+            lease_epoch: Set(0),
+            lease_expires_at: Set(None),
+            attempt_count: Set(0),
+            next_retry_at: Set(now_naive),
+            last_error: Set(None),
+            created_at: Set(now_naive),
+            updated_at: Set(now_naive),
+        };
+        let inserted = active.insert(txn).await?;
+        Ok(inserted)
     }
 
     /// Delete a CL's commit listing inside the caller's transaction (MC-04 R2:
@@ -1676,5 +1779,114 @@ mod tests {
             "rebase after merge must miss on status=Open even with current revision"
         );
         txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cl_head_revision_outbox_rollback_leaves_no_outbox_or_invalidation() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let conn = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&conn, true).await.expect("migrations");
+        let storage = ClStorage {
+            base: BaseStorage::new(std::sync::Arc::new(conn)),
+        };
+
+        let cl = storage
+            .new_cl_model(
+                "/project/demo",
+                "CLRBK001",
+                "rollback test",
+                "main",
+                &mc04_sha(1),
+                &mc04_sha(2),
+                "alice",
+            )
+            .await
+            .expect("create CL");
+        assert_eq!(cl.head_revision, 1);
+
+        let now = chrono::Utc::now().naive_utc();
+        check_result::Model {
+            id: generate_id(),
+            created_at: now,
+            updated_at: now,
+            path: cl.path.clone(),
+            cl_link: cl.link.clone(),
+            commit_id: cl.to_hash.clone(),
+            check_type_code: CheckTypeEnum::CiStatus,
+            status: "PASSED".to_owned(),
+            message: "green".to_owned(),
+            head_revision: 1,
+            ci_generation: 5,
+            ci_task_id: Some("tsk_old".to_owned()),
+            ci_attempt_id: Some("att_old".to_owned()),
+            details_url: Some("https://ci.example/tasks/tsk_old".to_owned()),
+        }
+        .into_active_model()
+        .insert(storage.get_connection())
+        .await
+        .expect("seed CiStatus");
+
+        // Perform head advance + CI invalidation + outbox enqueue inside a txn, then roll back.
+        let txn = storage.get_connection().begin().await.expect("begin txn");
+        storage
+            .update_cl_to_hash_in_txn(cl.clone(), &mc04_sha(3), &txn)
+            .await
+            .expect("advance hash in txn");
+        let updated = storage
+            .get_cl_in_txn(&cl.link, &txn)
+            .await
+            .expect("read in txn")
+            .expect("cl exists");
+        assert_eq!(updated.head_revision, 2);
+        assert!(
+            storage
+                .invalidate_ci_check_in_txn(&cl.link, &txn)
+                .await
+                .expect("invalidate in txn")
+        );
+        let row = storage
+            .enqueue_cl_webhook_outbox_in_txn(WebhookEventTypeEnum::ClUpdated, &updated, &txn)
+            .await
+            .expect("enqueue outbox in txn");
+        assert_eq!(row.head_revision, 2);
+        assert_eq!(row.event_type, "cl.updated");
+        assert_eq!(row.state, "pending");
+        let payload: serde_json::Value =
+            serde_json::from_str(&row.payload_json).expect("valid json");
+        assert_eq!(payload["cl"]["head_revision"], 2);
+        assert_eq!(payload["cl"]["head_commit"], mc04_sha(3));
+        assert_eq!(payload["repository"]["name"], "demo");
+        txn.rollback().await.expect("rollback txn");
+
+        // After rollback, head_revision, CiStatus, and cl_webhook_outbox must all be untouched.
+        let after_cl = storage
+            .get_cl(&cl.link)
+            .await
+            .expect("read cl")
+            .expect("cl present");
+        assert_eq!(after_cl.head_revision, 1);
+        assert_eq!(after_cl.to_hash, mc04_sha(2));
+
+        let after_ci = check_result::Entity::find()
+            .filter(check_result::Column::ClLink.eq(&cl.link))
+            .filter(check_result::Column::CheckTypeCode.eq(CheckTypeEnum::CiStatus))
+            .one(storage.get_connection())
+            .await
+            .expect("read ci")
+            .expect("ci present");
+        assert_eq!(after_ci.status, "PASSED");
+        assert_eq!(after_ci.ci_generation, 5);
+        assert_eq!(after_ci.ci_task_id.as_deref(), Some("tsk_old"));
+        assert_eq!(after_ci.ci_attempt_id.as_deref(), Some("att_old"));
+
+        let outbox_rows = cl_webhook_outbox::Entity::find()
+            .filter(cl_webhook_outbox::Column::ClLink.eq(&cl.link))
+            .all(storage.get_connection())
+            .await
+            .expect("read outbox");
+        assert!(
+            outbox_rows.is_empty(),
+            "rolled-back transaction must leave zero cl_webhook_outbox rows"
+        );
     }
 }

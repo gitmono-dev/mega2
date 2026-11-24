@@ -14,6 +14,7 @@ impl crate::ceres::code_edit::model::CLRefUpdateVisitor for OnpushVisitor {
         _: &mega_cl::Model,
         _: &str,
         _: &str,
+        _: &sea_orm::DatabaseTransaction,
     ) -> Result<mega_refs::Model, MegaError> {
         panic!("visit not implemented");
     }
@@ -24,7 +25,14 @@ pub struct OnpushAcceptor {}
 impl<VT: CLRefUpdateVisitor> crate::ceres::code_edit::model::CLRefUpdateAcceptor<VT>
     for OnpushAcceptor
 {
-    async fn accept(&self, _: &VT, _: &mega_cl::Model, _: &str, _: &str) -> Result<(), MegaError> {
+    async fn accept(
+        &self,
+        _: &VT,
+        _: &mega_cl::Model,
+        _: &str,
+        _: &str,
+        _: &sea_orm::DatabaseTransaction,
+    ) -> Result<(), MegaError> {
         Ok(())
     }
 }

@@ -32,6 +32,7 @@ impl crate::ceres::code_edit::model::CLRefUpdateVisitor for OneditVisitor {
         cl: &mega_cl::Model,
         commit_hash: &str,
         tree_hash: &str,
+        txn: &sea_orm::DatabaseTransaction,
     ) -> Result<mega_refs::Model, MegaError> {
         let cl_ref = mega_refs::Model::new(
             &cl.path,
@@ -40,7 +41,9 @@ impl crate::ceres::code_edit::model::CLRefUpdateVisitor for OneditVisitor {
             tree_hash.to_string(),
             true,
         );
-        self.mono_storage.save_refs(cl_ref.clone(), None).await?;
+        self.mono_storage
+            .save_refs(cl_ref.clone(), Some(txn))
+            .await?;
         Ok(cl_ref)
     }
 }
@@ -56,8 +59,9 @@ impl<VT: crate::ceres::code_edit::model::CLRefUpdateVisitor>
         cl: &mega_cl::Model,
         commit_hash: &str,
         tree_hash: &str,
+        txn: &sea_orm::DatabaseTransaction,
     ) -> Result<(), MegaError> {
-        visitor.visit(cl, commit_hash, tree_hash).await?;
+        visitor.visit(cl, commit_hash, tree_hash, txn).await?;
         Ok(())
     }
 }

@@ -1039,11 +1039,6 @@ async fn update_branch(
         .monorepo()
         .update_branch(&user.username, &link)
         .await?;
-    if let Ok(Some(cl_model)) = state.cl_stg().get_cl(&link).await {
-        state
-            .webhook_svc()
-            .dispatch(WebhookEvent::ClUpdated, &cl_model);
-    }
     Ok(Json(CommonResult::success(Some(new_head))))
 }
 

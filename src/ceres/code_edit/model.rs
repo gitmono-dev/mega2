@@ -110,6 +110,7 @@ pub(crate) trait CLRefUpdateVisitor {
         cl: &mega_cl::Model,
         commit_hash: &str,
         tree_hash: &str,
+        txn: &sea_orm::DatabaseTransaction,
     ) -> Result<mega_refs::Model, MegaError>;
 }
 
@@ -120,8 +121,9 @@ pub(crate) trait CLRefUpdateAcceptor<VT: CLRefUpdateVisitor> {
         cl: &mega_cl::Model,
         commit_hash: &str,
         tree_hash: &str,
+        txn: &sea_orm::DatabaseTransaction,
     ) -> Result<(), MegaError> {
-        visitor.visit(cl, commit_hash, tree_hash).await?;
+        visitor.visit(cl, commit_hash, tree_hash, txn).await?;
         Ok(())
     }
 }
@@ -191,6 +193,7 @@ impl CLRefUpdateVisitor for DefaultVisitor<'_> {
         _: &mega_cl::Model,
         _: &str,
         _: &str,
+        _: &sea_orm::DatabaseTransaction,
     ) -> Result<mega_refs::Model, MegaError> {
         let _ = self.ref_name;
         let _ = self.mono_storage;
@@ -253,41 +256,45 @@ impl<
         let cl_stg = storage.cl_storage();
         let comment_stg = storage.conversation_storage();
 
-        let from_same = cl.from_hash == from_hash;
         let to_same = cl.to_hash == to_hash;
-        match (from_same, to_same) {
-            (true, true) => {
-                tracing::info!("repeat commit with change_list: {}, do nothing", cl.id);
-            }
-            _ => {
-                // MC-04: the to_hash advance and the commit-listing rebuild
-                // share one DB transaction — neither takes effect without the
-                // other, so a listing failure rolls the advance back and a
-                // retried push simply re-runs this path. The listing is the
-                // complete chain over the frozen `(from_hash, to_hash]`, never
-                // the push's increment.
-                let chain = collect_cl_chain(storage, &cl.from_hash, to_hash).await?;
-                let txn = storage.begin_db_transaction().await?;
-                cl_stg
-                    .update_cl_to_hash_in_txn(cl.clone(), to_hash, &txn)
-                    .await?;
-                cl_stg
-                    .save_cl_commits_in_txn(&cl.link, &chain, &txn)
-                    .await?;
-                txn.commit().await.map_err(MegaError::Db)?;
-                // Freeze cl base for Open cl: do NOT auto-update from_hash here.
-                // Only update to_hash to reflect latest edits, and prompt user to run Update Branch.
-                // The conversation entry narrates the committed advance, so it
-                // is written only after the transaction commits.
-                comment_stg
-                    .add_conversation(
-                        &cl.link,
-                        username,
-                        Some(self.formator.format(&cl, from_hash, to_hash, username)),
-                        ConvTypeEnum::Comment,
-                    )
-                    .await?;
-            }
+        if to_same {
+            tracing::info!("repeat commit with change_list: {}, do nothing", cl.id);
+        } else {
+            // MC-04: the to_hash advance, commit-listing rebuild, CI check
+            // invalidation, and transactional CL webhook outbox enqueue share
+            // one DB transaction — neither takes effect without the other
+            // (CLB-15). The listing is the complete chain over the frozen
+            // `(from_hash, to_hash]`, never the push's increment.
+            let chain = collect_cl_chain(storage, &cl.from_hash, to_hash).await?;
+            let txn = storage.begin_db_transaction().await?;
+            cl_stg
+                .update_cl_to_hash_in_txn(cl.clone(), to_hash, &txn)
+                .await?;
+            cl_stg
+                .save_cl_commits_in_txn(&cl.link, &chain, &txn)
+                .await?;
+            let updated_cl = cl_stg.get_cl_in_txn(&cl.link, &txn).await?.ok_or_else(|| {
+                MegaError::Other(format!("CL {} disappeared after hash update", cl.link))
+            })?;
+            cl_stg
+                .invalidate_ci_check_in_txn(&updated_cl.link, &txn)
+                .await?;
+            cl_stg
+                .enqueue_cl_webhook_outbox_in_txn(WebhookEvent::ClUpdated, &updated_cl, &txn)
+                .await?;
+            txn.commit().await.map_err(MegaError::Db)?;
+            // Freeze cl base for Open cl: do NOT auto-update from_hash here.
+            // Only update to_hash to reflect latest edits, and prompt user to run Update Branch.
+            // The conversation entry narrates the committed advance, so it
+            // is written only after the transaction commits.
+            comment_stg
+                .add_conversation(
+                    &cl.link,
+                    username,
+                    Some(self.formator.format(&cl, from_hash, to_hash, username)),
+                    ConvTypeEnum::Comment,
+                )
+                .await?;
         }
         Ok(())
     }
@@ -310,9 +317,10 @@ impl<
                 .expect("invalid to_hash"),
         );
         let cl_stg = storage.cl_storage();
-        // MC-04: CL creation and the commit-listing rebuild share one DB
-        // transaction — the listing is the complete `(from_hash, to_hash]`
-        // chain, rebuilt at write time.
+        // MC-04 + CLB-15: CL creation (head_revision = 1), commit-listing
+        // rebuild, CL ref persistence, and cl.created outbox enqueue share one
+        // DB transaction so an outbox event can never be committed without its
+        // CL ref.
         let chain = collect_cl_chain(storage, from_hash, to_hash).await?;
         let txn = storage.begin_db_transaction().await?;
         let cl = cl_stg
@@ -330,16 +338,20 @@ impl<
         cl_stg
             .save_cl_commits_in_txn(&cl_link, &chain, &txn)
             .await?;
-        txn.commit().await.map_err(MegaError::Db)?;
-
         self.clref_acceptor
             .accept(
                 &self.clref_visitor,
                 &cl,
                 to_hash,
                 &dst_commit.tree_id.to_string(),
+                &txn,
             )
             .await?;
+        cl_stg
+            .enqueue_cl_webhook_outbox_in_txn(WebhookEvent::ClCreated, &cl, &txn)
+            .await?;
+        txn.commit().await.map_err(MegaError::Db)?;
+
         storage
             .conversation_storage()
             .add_conversation(
@@ -349,9 +361,6 @@ impl<
                 ConvTypeEnum::Comment,
             )
             .await?;
-        storage
-            .webhook_service
-            .dispatch(WebhookEvent::ClCreated, &cl);
         Ok(cl)
     }
 
@@ -690,5 +699,366 @@ mod tests {
                 .is_none(),
             "trunk must not persist a mega_cl row"
         );
+    }
+
+    #[tokio::test]
+    async fn cl_head_revision_outbox_create_update_and_branch_lifecycle() {
+        use sea_orm::{ActiveModelTrait, QueryOrder};
+
+        use crate::callisto::{
+            check_result, cl_webhook_outbox, mega_refs, sea_orm_active_enums::CheckTypeEnum,
+        };
+
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        // Commits: 800 (initial main) -> 801 (CL v1) -> 802 (CL v2), and 810 (advanced main).
+        mc04_seed(
+            &storage,
+            vec![
+                mc04_commit_row(800, &[]),
+                mc04_commit_row(801, &[800]),
+                mc04_commit_row(802, &[801]),
+                mc04_commit_row(810, &[800]),
+            ],
+        )
+        .await;
+        let cl_stg = storage.cl_storage();
+        let conn = cl_stg.get_connection();
+
+        let connection = ::redis::aio::ConnectionManager::new_lazy_with_config(
+            ::redis::Client::open("redis://127.0.0.1:6379").expect("redis client"),
+            ::redis::aio::ConnectionManagerConfig::new(),
+        )
+        .expect("lazy connection manager");
+        let api = MonoApiService {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection,
+                prefix: "clb15-test".to_string(),
+            }),
+        };
+        let editor = OnpushCodeEdit::from("/", "main", &mc04_sha(800), &api);
+
+        // 1. create_new_cl -> head_revision = 1 and 1 cl.created outbox row.
+        let cl1 = editor
+            .update_or_create_cl(&storage, &mc04_sha(800), &mc04_sha(801), "tester")
+            .await
+            .expect("create CL");
+        assert_eq!(cl1.head_revision, 1);
+
+        let rows1 = cl_webhook_outbox::Entity::find()
+            .filter(cl_webhook_outbox::Column::ClLink.eq(&cl1.link))
+            .order_by_asc(cl_webhook_outbox::Column::Id)
+            .all(conn)
+            .await
+            .expect("query outbox after create");
+        assert_eq!(rows1.len(), 1);
+        assert_eq!(rows1[0].event_type, "cl.created");
+        assert_eq!(rows1[0].head_revision, 1);
+        let p1: serde_json::Value = serde_json::from_str(&rows1[0].payload_json).unwrap();
+        assert_eq!(p1["cl"]["head_revision"], 1);
+        assert_eq!(p1["cl"]["head_commit"], mc04_sha(801));
+
+        // Seed a PASSED CiStatus row at head_revision = 1, ci_generation = 7.
+        let now = chrono::Utc::now().naive_utc();
+        check_result::Model {
+            id: crate::callisto::entity_ext::generate_id(),
+            created_at: now,
+            updated_at: now,
+            path: cl1.path.clone(),
+            cl_link: cl1.link.clone(),
+            commit_id: cl1.to_hash.clone(),
+            check_type_code: CheckTypeEnum::CiStatus,
+            status: "PASSED".to_owned(),
+            message: "green v1".to_owned(),
+            head_revision: 1,
+            ci_generation: 7,
+            ci_task_id: Some("tsk_v1".to_owned()),
+            ci_attempt_id: Some("att_v1".to_owned()),
+            details_url: Some("https://ci.example/tasks/tsk_v1".to_owned()),
+        }
+        .into_active_model()
+        .insert(conn)
+        .await
+        .expect("seed CiStatus v1");
+
+        // 2a. Repeat push with unchanged to_hash -> no-op (no head_revision bump, no invalidation, no outbox).
+        let cl_noop = editor
+            .update_or_create_cl(&storage, &mc04_sha(800), &mc04_sha(801), "tester")
+            .await
+            .expect("repeat push");
+        assert_eq!(cl_noop.head_revision, 1);
+        assert_eq!(
+            cl_webhook_outbox::Entity::find()
+                .filter(cl_webhook_outbox::Column::ClLink.eq(&cl1.link))
+                .all(conn)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 2b. update_existing_cl with new to_hash -> head_revision = 2, CiStatus = INVALIDATED (ci_generation=7 preserved), cl.updated outbox row.
+        let cl2 = editor
+            .update_or_create_cl(&storage, &mc04_sha(800), &mc04_sha(802), "tester")
+            .await
+            .expect("update CL");
+        assert_eq!(cl2.head_revision, 2);
+
+        let ci_after_update = check_result::Entity::find()
+            .filter(check_result::Column::ClLink.eq(&cl1.link))
+            .filter(check_result::Column::CheckTypeCode.eq(CheckTypeEnum::CiStatus))
+            .one(conn)
+            .await
+            .expect("load ci")
+            .expect("ci row exists");
+        assert_eq!(ci_after_update.status, "INVALIDATED");
+        assert_eq!(ci_after_update.ci_generation, 7);
+        assert_eq!(ci_after_update.ci_task_id, None);
+        assert_eq!(ci_after_update.ci_attempt_id, None);
+        assert_eq!(ci_after_update.details_url, None);
+
+        let rows2 = cl_webhook_outbox::Entity::find()
+            .filter(cl_webhook_outbox::Column::ClLink.eq(&cl1.link))
+            .order_by_asc(cl_webhook_outbox::Column::Id)
+            .all(conn)
+            .await
+            .expect("query outbox after update");
+        assert_eq!(rows2.len(), 2);
+        assert_eq!(rows2[1].event_type, "cl.updated");
+        assert_eq!(rows2[1].head_revision, 2);
+        assert_ne!(rows2[0].event_id, rows2[1].event_id);
+        let p2: serde_json::Value = serde_json::from_str(&rows2[1].payload_json).unwrap();
+        assert_eq!(p2["cl"]["head_revision"], 2);
+        assert_eq!(p2["cl"]["head_commit"], mc04_sha(802));
+
+        // 3a. Seed main ref at cl2.from_hash (800) -> update_branch returns "Already up-to-date" with ZERO new outbox rows.
+        let main_ref = mega_refs::Model {
+            id: crate::callisto::entity_ext::generate_id(),
+            path: "/".to_owned(),
+            ref_name: "refs/heads/main".to_owned(),
+            ref_commit_hash: mc04_sha(800),
+            ref_tree_hash: MC04_TREE.to_owned(),
+            created_at: now,
+            updated_at: now,
+            is_cl: false,
+        };
+        storage
+            .mono_storage()
+            .save_refs(main_ref.clone(), None)
+            .await
+            .expect("save main ref");
+        let cl_ref = mega_refs::Model {
+            id: crate::callisto::entity_ext::generate_id(),
+            path: "/".to_owned(),
+            ref_name: format!("refs/cl/{}", cl1.link),
+            ref_commit_hash: mc04_sha(802),
+            ref_tree_hash: MC04_TREE.to_owned(),
+            created_at: now,
+            updated_at: now,
+            is_cl: true,
+        };
+        storage
+            .mono_storage()
+            .save_refs(cl_ref, None)
+            .await
+            .expect("save cl ref");
+
+        let up_to_date = api
+            .update_branch("tester", &cl1.link)
+            .await
+            .expect("update_branch up to date");
+        assert_eq!(up_to_date, "Already up-to-date");
+        assert_eq!(
+            storage
+                .cl_storage()
+                .get_cl(&cl1.link)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_revision,
+            2
+        );
+        assert_eq!(
+            cl_webhook_outbox::Entity::find()
+                .filter(cl_webhook_outbox::Column::ClLink.eq(&cl1.link))
+                .all(conn)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "Already up-to-date must enqueue zero outbox rows"
+        );
+
+        // 3b. Mark CiStatus PASSED at head_revision = 2, ci_generation = 11, then advance main ref to 810 and call update_branch.
+        let mut ci_active: check_result::ActiveModel = ci_after_update.into();
+        ci_active.status = sea_orm::Set("PASSED".to_owned());
+        ci_active.head_revision = sea_orm::Set(2);
+        ci_active.ci_generation = sea_orm::Set(11);
+        ci_active.ci_task_id = sea_orm::Set(Some("tsk_v2".to_owned()));
+        ci_active.ci_attempt_id = sea_orm::Set(Some("att_v2".to_owned()));
+        sea_orm::ActiveModelTrait::update(ci_active, conn)
+            .await
+            .expect("update CiStatus to PASSED v2");
+
+        let mut moved_main = main_ref;
+        moved_main.ref_commit_hash = mc04_sha(810);
+        storage
+            .mono_storage()
+            .update_ref(moved_main, None)
+            .await
+            .expect("advance main ref");
+
+        let rebased_head = api
+            .update_branch("tester", &cl1.link)
+            .await
+            .expect("update_branch advances head_revision");
+        assert_eq!(rebased_head, mc04_sha(810));
+
+        let cl3 = storage
+            .cl_storage()
+            .get_cl(&cl1.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cl3.head_revision, 3);
+
+        let ci_after_branch = check_result::Entity::find()
+            .filter(check_result::Column::ClLink.eq(&cl1.link))
+            .filter(check_result::Column::CheckTypeCode.eq(CheckTypeEnum::CiStatus))
+            .one(conn)
+            .await
+            .expect("load ci")
+            .expect("ci row exists");
+        assert_eq!(ci_after_branch.status, "INVALIDATED");
+        assert_eq!(ci_after_branch.ci_generation, 11);
+        assert_eq!(ci_after_branch.ci_task_id, None);
+        assert_eq!(ci_after_branch.ci_attempt_id, None);
+
+        let rows3 = cl_webhook_outbox::Entity::find()
+            .filter(cl_webhook_outbox::Column::ClLink.eq(&cl1.link))
+            .order_by_asc(cl_webhook_outbox::Column::Id)
+            .all(conn)
+            .await
+            .expect("query outbox after update_branch");
+        assert_eq!(rows3.len(), 3);
+        assert_eq!(rows3[2].event_type, "cl.updated");
+        assert_eq!(rows3[2].head_revision, 3);
+        let p3: serde_json::Value = serde_json::from_str(&rows3[2].payload_json).unwrap();
+        assert_eq!(p3["cl"]["head_revision"], 3);
+        assert_eq!(p3["cl"]["head_commit"], mc04_sha(810));
+    }
+
+    #[tokio::test]
+    async fn cl_head_revision_outbox_create_rolls_back_when_cl_ref_creation_fails() {
+        use crate::{
+            callisto::{cl_webhook_outbox, mega_cl, mega_refs},
+            ceres::code_edit::{
+                model::{
+                    CLRefUpdateAcceptor, CLRefUpdateVisitor, Checker, CodeEditService,
+                    ConversationMessageFormater, DefualtDirector,
+                },
+                on_edit::OneditCodeEdit,
+            },
+        };
+
+        struct DummyFormater;
+        impl ConversationMessageFormater for DummyFormater {}
+        struct FailingVisitor;
+        impl CLRefUpdateVisitor for FailingVisitor {
+            async fn visit(
+                &self,
+                _: &mega_cl::Model,
+                _: &str,
+                _: &str,
+                _: &sea_orm::DatabaseTransaction,
+            ) -> Result<mega_refs::Model, crate::common::errors::MegaError> {
+                Err(crate::common::errors::MegaError::Other(
+                    "injected cl ref write failure".to_owned(),
+                ))
+            }
+        }
+        struct FailingAcceptor;
+        impl CLRefUpdateAcceptor<FailingVisitor> for FailingAcceptor {}
+        struct DummyChecker;
+        impl Checker for DummyChecker {}
+
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        mc04_seed(
+            &storage,
+            vec![mc04_commit_row(900, &[]), mc04_commit_row(901, &[900])],
+        )
+        .await;
+
+        let connection = ::redis::aio::ConnectionManager::new_lazy_with_config(
+            ::redis::Client::open("redis://127.0.0.1:6379").expect("redis client"),
+            ::redis::aio::ConnectionManagerConfig::new(),
+        )
+        .expect("lazy connection manager");
+        let api = MonoApiService {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection,
+                prefix: "clb15-ref-atomicity".to_string(),
+            }),
+        };
+
+        // 1. Failing CL ref write must roll back both mega_cl and cl_webhook_outbox.
+        let failing_editor = CodeEditService::new(
+            "/",
+            "main",
+            &mc04_sha(900),
+            DummyFormater,
+            FailingVisitor,
+            FailingAcceptor,
+            DummyChecker,
+            DefualtDirector {
+                handler: api.clone(),
+            },
+        );
+        let err = failing_editor
+            .create_new_cl(&storage, "/", &mc04_sha(900), &mc04_sha(901), "tester")
+            .await
+            .expect_err("injected cl ref write failure must fail create_new_cl");
+        assert!(err.to_string().contains("injected cl ref write failure"));
+
+        let cl_stg = storage.cl_storage();
+        let conn = cl_stg.get_connection();
+        assert!(
+            mega_cl::Entity::find().all(conn).await.unwrap().is_empty(),
+            "failed CL ref creation must not commit mega_cl"
+        );
+        assert!(
+            cl_webhook_outbox::Entity::find()
+                .all(conn)
+                .await
+                .unwrap()
+                .is_empty(),
+            "failed CL ref creation must not commit cl_webhook_outbox"
+        );
+
+        // 2. Real OneditCodeEdit commits mega_cl, refs/cl/<link>, and cl_webhook_outbox atomically.
+        let onedit =
+            OneditCodeEdit::from("/", "main", &mc04_sha(900), &api, storage.mono_storage());
+        let created = onedit
+            .create_new_cl(&storage, "/", &mc04_sha(900), &mc04_sha(901), "tester")
+            .await
+            .expect("onedit create_new_cl succeeds");
+        let cl_ref = storage
+            .mono_storage()
+            .get_ref_by_name(&format!("refs/cl/{}", created.link))
+            .await
+            .expect("query cl ref")
+            .expect("refs/cl/<link> committed atomically");
+        assert_eq!(cl_ref.ref_commit_hash, mc04_sha(901));
+        let outbox_rows = cl_webhook_outbox::Entity::find()
+            .filter(cl_webhook_outbox::Column::ClLink.eq(&created.link))
+            .all(conn)
+            .await
+            .expect("query outbox");
+        assert_eq!(outbox_rows.len(), 1);
+        assert_eq!(outbox_rows[0].event_type, "cl.created");
+        assert_eq!(outbox_rows[0].head_revision, 1);
     }
 }

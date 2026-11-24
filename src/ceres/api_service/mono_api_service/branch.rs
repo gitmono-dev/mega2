@@ -142,6 +142,23 @@ impl super::MonoApiService {
             stg.delete_cl_commits_in_txn(cl_link, &txn)
                 .await
                 .map_err(|e| GitError::CustomError(e.to_string()))?;
+            let updated_cl = stg
+                .get_cl_in_txn(cl_link, &txn)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?
+                .ok_or_else(|| {
+                    GitError::CustomError(format!("CL {cl_link} disappeared after hash update"))
+                })?;
+            stg.invalidate_ci_check_in_txn(cl_link, &txn)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            stg.enqueue_cl_webhook_outbox_in_txn(
+                crate::callisto::sea_orm_active_enums::WebhookEventTypeEnum::ClUpdated,
+                &updated_cl,
+                &txn,
+            )
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
             txn.commit()
                 .await
                 .map_err(|e| GitError::CustomError(e.to_string()))?;
@@ -202,6 +219,23 @@ impl super::MonoApiService {
         stg.save_cl_commits_in_txn(cl_link, &prepared.commits, &txn)
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let updated_cl = stg
+            .get_cl_in_txn(cl_link, &txn)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?
+            .ok_or_else(|| {
+                GitError::CustomError(format!("CL {cl_link} disappeared after hash update"))
+            })?;
+        stg.invalidate_ci_check_in_txn(cl_link, &txn)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        stg.enqueue_cl_webhook_outbox_in_txn(
+            crate::callisto::sea_orm_active_enums::WebhookEventTypeEnum::ClUpdated,
+            &updated_cl,
+            &txn,
+        )
+        .await
+        .map_err(|e| GitError::CustomError(e.to_string()))?;
         txn.commit()
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
