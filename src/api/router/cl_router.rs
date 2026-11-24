@@ -1,7 +1,13 @@
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
@@ -47,8 +53,398 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(update_cl_status))
             .routes(routes!(update_branch_status))
             .routes(routes!(update_branch))
-            .routes(routes!(cl_commits)),
+            .routes(routes!(cl_commits))
+            .routes(routes!(put_cl_ci_check)),
     )
+}
+
+const CANONICAL_V2_VERSION: &str = "orion-mega-v2";
+const MAX_CI_CALLBACK_BODY_BYTES: usize = 65_536;
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CiCheckCallbackReq {
+    pub commit_sha: String,
+    pub head_revision: i64,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub ci_generation: i64,
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub details_url: Option<String>,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CiCheckCallbackRes {
+    pub applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub action: String,
+    pub cl_link: String,
+    pub head_revision: i64,
+    pub ci_generation: i64,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CiCheckErrorRes {
+    pub code: String,
+    pub message: String,
+}
+
+fn ci_error_response(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(CiCheckErrorRes {
+            code: code.to_owned(),
+            message: message.into(),
+        }),
+    )
+        .into_response()
+}
+
+fn extract_single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    first.to_str().ok()
+}
+
+pub(crate) fn compute_orion_ci_v2_signature(
+    secret: &str,
+    cl_link: &str,
+    timestamp_ascii: &str,
+    nonce: &str,
+    body_sha256_hex: &str,
+) -> String {
+    let canonical = format!(
+        "{CANONICAL_V2_VERSION}\nPUT\n/api/v1/cl/{cl_link}/checks/ci\n{timestamp_ascii}\n{nonce}\n\n{body_sha256_hex}"
+    );
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let tag = ring::hmac::sign(&key, canonical.as_bytes());
+    format!("sha256={}", hex::encode(tag.as_ref()))
+}
+
+fn verify_orion_ci_v2_signature(
+    secret: &str,
+    cl_link: &str,
+    timestamp_ascii: &str,
+    nonce: &str,
+    body_sha256_hex: &str,
+    provided_header: &str,
+) -> bool {
+    let Some(provided_hex) = provided_header.strip_prefix("sha256=") else {
+        return false;
+    };
+    if provided_hex.len() != 64
+        || !provided_hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return false;
+    }
+    let Ok(provided_bytes) = hex::decode(provided_hex) else {
+        return false;
+    };
+    let canonical = format!(
+        "{CANONICAL_V2_VERSION}\nPUT\n/api/v1/cl/{cl_link}/checks/ci\n{timestamp_ascii}\n{nonce}\n\n{body_sha256_hex}"
+    );
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    ring::hmac::verify(&key, canonical.as_bytes(), &provided_bytes).is_ok()
+}
+
+fn is_valid_commit_sha(sha: &str) -> bool {
+    (sha.len() == 40 || sha.len() == 64)
+        && sha
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn is_valid_opaque_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn canonicalize_ci_status(raw: &str) -> Option<&'static str> {
+    match raw {
+        "pending" => Some("PENDING"),
+        "running" => Some("RUNNING"),
+        "passed" => Some("PASSED"),
+        "failed" => Some("FAILED"),
+        "cancelled" => Some("CANCELLED"),
+        _ => None,
+    }
+}
+
+/// Receive canonical V2 HMAC-signed CI check status callback from Orion2 (`CLB-13`).
+#[utoipa::path(
+    put,
+    params(
+        ("link", description = "CL link"),
+    ),
+    request_body = CiCheckCallbackReq,
+    path = "/{link}/checks/ci",
+    responses(
+        (status = 200, body = CiCheckCallbackRes, content_type = "application/json"),
+        (status = 400, body = CiCheckErrorRes, content_type = "application/json"),
+        (status = 401, body = CiCheckErrorRes, content_type = "application/json"),
+        (status = 404, body = CiCheckErrorRes, content_type = "application/json"),
+        (status = 409, body = CiCheckErrorRes, content_type = "application/json"),
+        (status = 503, body = CiCheckErrorRes, content_type = "application/json"),
+    ),
+    tag = CL_TAG
+)]
+async fn put_cl_ci_check(
+    Path(link): Path<String>,
+    State(state): State<MonoApiServiceState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let ci_cfg = state.storage.config().ci_checks.clone();
+    if !ci_cfg.enabled {
+        return ci_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ci_checks_disabled",
+            "CI check callbacks are disabled",
+        );
+    }
+    let Some(secret) = ci_cfg.hmac_secret.as_ref().map(|s| s.expose_secret()) else {
+        return ci_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ci_checks_disabled",
+            "CI check callback HMAC secret is not configured",
+        );
+    };
+    if secret.len() < crate::config::CI_CHECKS_MIN_HMAC_SECRET_BYTES {
+        return ci_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ci_checks_disabled",
+            "CI check callback HMAC secret is invalid",
+        );
+    }
+
+    if body.len() > MAX_CI_CALLBACK_BODY_BYTES {
+        return ci_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "CI callback payload exceeds maximum allowed size",
+        );
+    }
+    if link.is_empty()
+        || link.len() > 128
+        || link.contains('/')
+        || link.contains('\\')
+        || link.contains("..")
+        || link.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return ci_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid CL link",
+        );
+    }
+
+    let Some(timestamp_str) = extract_single_header(&headers, "x-orion-timestamp") else {
+        return ci_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "missing or duplicate X-Orion-Timestamp header",
+        );
+    };
+    let Some(nonce) = extract_single_header(&headers, "x-orion-nonce") else {
+        return ci_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "missing or duplicate X-Orion-Nonce header",
+        );
+    };
+    let Some(signature_v2) = extract_single_header(&headers, "x-orion-signature-v2") else {
+        return ci_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "missing or duplicate X-Orion-Signature-V2 header",
+        );
+    };
+    if !is_valid_opaque_id(nonce) {
+        return ci_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "invalid X-Orion-Nonce header",
+        );
+    }
+    let Ok(timestamp) = timestamp_str.parse::<i64>() else {
+        return ci_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "invalid X-Orion-Timestamp header",
+        );
+    };
+    let now_utc = chrono::Utc::now();
+    if now_utc.timestamp().abs_diff(timestamp) > ci_cfg.max_skew_secs {
+        return ci_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "X-Orion-Timestamp outside allowed skew window",
+        );
+    }
+
+    let body_sha256 = hex::encode(Sha256::digest(&body));
+    if !verify_orion_ci_v2_signature(
+        secret,
+        &link,
+        timestamp_str,
+        nonce,
+        &body_sha256,
+        signature_v2,
+    ) {
+        return ci_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "canonical V2 HMAC signature verification failed",
+        );
+    }
+
+    let now_naive = now_utc.naive_utc();
+    let parse_and_validate =
+        || -> Result<crate::jupiter::storage::cl_storage::CiCheckCallbackValidated, String> {
+            let req: CiCheckCallbackReq = serde_json::from_slice(&body)
+                .map_err(|err| format!("invalid CI callback JSON payload: {err}"))?;
+
+            if !is_valid_commit_sha(&req.commit_sha) {
+                return Err("commit_sha must be 40 or 64 lowercase hex characters".to_owned());
+            }
+            if req.head_revision < 1 {
+                return Err("head_revision must be >= 1".to_owned());
+            }
+            if !is_valid_opaque_id(&req.task_id) || !is_valid_opaque_id(&req.attempt_id) {
+                return Err(
+                    "task_id and attempt_id must be non-empty identifiers (<= 128 bytes)"
+                        .to_owned(),
+                );
+            }
+            if req.ci_generation <= 0 {
+                return Err("ci_generation must be > 0".to_owned());
+            }
+            if chrono::DateTime::parse_from_rfc3339(&req.occurred_at).is_err() {
+                return Err("occurred_at must be a valid RFC 3339 timestamp".to_owned());
+            }
+            let status_upper = canonicalize_ci_status(&req.status).ok_or_else(|| {
+                "status must be one of: pending, running, passed, failed, cancelled".to_owned()
+            })?;
+            if req.summary.len() > 4096 {
+                return Err("summary exceeds 4096 bytes".to_owned());
+            }
+            if let Some(ref details_url) = req.details_url {
+                let valid_url = details_url.len() <= 2048
+                    && url::Url::parse(details_url)
+                        .ok()
+                        .is_some_and(|u| matches!(u.scheme(), "http" | "https"));
+                if !valid_url {
+                    return Err(
+                        "details_url must be a valid http or https URL (<= 2048 bytes)".to_owned(),
+                    );
+                }
+            }
+            Ok(
+                crate::jupiter::storage::cl_storage::CiCheckCallbackValidated {
+                    commit_sha: req.commit_sha,
+                    head_revision: req.head_revision,
+                    task_id: req.task_id,
+                    attempt_id: req.attempt_id,
+                    ci_generation: req.ci_generation,
+                    status_upper: status_upper.to_owned(),
+                    summary: req.summary,
+                    details_url: req.details_url,
+                },
+            )
+        };
+
+    match state
+        .cl_stg()
+        .apply_ci_check_callback(
+            crate::jupiter::storage::cl_storage::CiCheckCallbackInput {
+                cl_link: link,
+                nonce: nonce.to_owned(),
+                body_sha256,
+                nonce_retention_secs: ci_cfg.nonce_retention_secs,
+                now: now_naive,
+            },
+            parse_and_validate,
+        )
+        .await
+    {
+        Ok(outcome) => {
+            let applied = outcome.action == "updated";
+            let reason = if applied {
+                None
+            } else {
+                Some(outcome.action.to_owned())
+            };
+            (
+                StatusCode::OK,
+                Json(CiCheckCallbackRes {
+                    applied,
+                    reason,
+                    action: outcome.action.to_owned(),
+                    cl_link: outcome.cl_link,
+                    head_revision: outcome.head_revision,
+                    ci_generation: outcome.ci_generation,
+                    status: outcome.status,
+                }),
+            )
+                .into_response()
+        }
+        Err(crate::jupiter::storage::cl_storage::CiCheckCallbackError::InvalidRequest(msg)) => {
+            ci_error_response(StatusCode::BAD_REQUEST, "invalid_request", msg)
+        }
+        Err(crate::jupiter::storage::cl_storage::CiCheckCallbackError::NonceConflict) => {
+            ci_error_response(
+                StatusCode::CONFLICT,
+                "nonce_conflict",
+                "X-Orion-Nonce already used for a different path or payload",
+            )
+        }
+        Err(crate::jupiter::storage::cl_storage::CiCheckCallbackError::ClNotFound) => {
+            ci_error_response(StatusCode::NOT_FOUND, "cl_not_found", "CL not found")
+        }
+        Err(crate::jupiter::storage::cl_storage::CiCheckCallbackError::ClNotOpen) => {
+            ci_error_response(StatusCode::CONFLICT, "cl_not_open", "CL is not open")
+        }
+        Err(crate::jupiter::storage::cl_storage::CiCheckCallbackError::StaleHeadRevision) => {
+            ci_error_response(
+                StatusCode::CONFLICT,
+                "stale_head_revision",
+                "callback head_revision does not match current CL head_revision",
+            )
+        }
+        Err(crate::jupiter::storage::cl_storage::CiCheckCallbackError::StaleCommit) => {
+            ci_error_response(
+                StatusCode::CONFLICT,
+                "stale_commit",
+                "callback commit_sha does not match current CL head commit",
+            )
+        }
+        Err(crate::jupiter::storage::cl_storage::CiCheckCallbackError::AlreadyTerminal) => {
+            ci_error_response(
+                StatusCode::CONFLICT,
+                "already_terminal",
+                "CI check is already in a different terminal state for this generation",
+            )
+        }
+        Err(crate::jupiter::storage::cl_storage::CiCheckCallbackError::Internal(err)) => {
+            ci_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("failed to persist CI check callback: {err}"),
+            )
+        }
+    }
 }
 
 /// List a Change List's commits (DEP-01 frozen contract; plan-20260827
@@ -954,16 +1350,20 @@ mod cl_commits_tests {
 
     use std::sync::Arc;
 
-    use axum::{body::Body, http::Request};
-    use sea_orm::{EntityTrait, IntoActiveModel};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel};
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use tower::ServiceExt;
     use utoipa_axum::router::OpenApiRouter;
 
-    use super::routers;
+    use super::{compute_orion_ci_v2_signature, routers};
     use crate::{
         api::{MonoApiServiceState, oauth::api_store::BrowserSessionStore},
-        callisto::{mega_cl_commits, mega_commit},
+        callisto::{mega_cl, mega_cl_commits, mega_commit, sea_orm_active_enums::MergeStatusEnum},
         contract::policy::entitystore::SharedEntityStore,
         jupiter::{
             storage::{Storage, base_storage::StorageConnector},
@@ -1172,5 +1572,591 @@ mod cl_commits_tests {
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
         let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
         assert_eq!(json["req_result"], false);
+    }
+
+    const CI_TEST_SECRET: &str = "clb13-test-hmac-secret-at-least-32-bytes-long";
+
+    async fn ci_test_storage(temp: &TempDir, enabled: bool) -> Storage {
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.ci_checks.enabled = enabled;
+        config.ci_checks.hmac_secret =
+            Some(crate::config::secret::SecretString::new(CI_TEST_SECRET));
+        config.ci_checks.max_skew_secs = 300;
+        config.ci_checks.nonce_retention_secs = 604_800;
+        crate::jupiter::tests::test_storage_with_config(temp.path(), config).await
+    }
+
+    async fn seed_ci_cl(
+        storage: &Storage,
+        link: &str,
+        to_hash: &str,
+        head_revision: i64,
+        status: MergeStatusEnum,
+    ) {
+        let now = chrono::Utc::now().naive_utc();
+        let mut model = mega_cl::Model::new(
+            "/project".to_owned(),
+            format!("CI CL {link}"),
+            link.to_owned(),
+            "main".to_owned(),
+            "0000000000000000000000000000000000000000".to_owned(),
+            to_hash.to_owned(),
+            "alice".to_owned(),
+        );
+        model.status = status;
+        model.head_revision = head_revision;
+        model.created_at = now;
+        model.updated_at = now;
+        model
+            .into_active_model()
+            .insert(storage.cl_storage().get_connection())
+            .await
+            .expect("seed mega_cl");
+    }
+
+    async fn put_ci_signed(
+        state: MonoApiServiceState,
+        target_link: &str,
+        sign_link: &str,
+        secret: &str,
+        timestamp: i64,
+        nonce: &str,
+        raw_body: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let ts_str = timestamp.to_string();
+        let body_sha256 = hex::encode(Sha256::digest(raw_body.as_bytes()));
+        let sig = compute_orion_ci_v2_signature(secret, sign_link, &ts_str, nonce, &body_sha256);
+        let (router, _api) = OpenApiRouter::new().merge(routers()).split_for_parts();
+        let resp = router
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/cl/{target_link}/checks/ci"))
+                    .header("content-type", "application/json")
+                    .header("x-orion-timestamp", ts_str)
+                    .header("x-orion-nonce", nonce)
+                    .header("x-orion-signature-v2", sig)
+                    .body(Body::from(raw_body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json response");
+        (status, json)
+    }
+
+    fn ci_payload(
+        commit_sha: &str,
+        head_revision: i64,
+        ci_generation: i64,
+        status: &str,
+    ) -> String {
+        serde_json::json!({
+            "commit_sha": commit_sha,
+            "head_revision": head_revision,
+            "task_id": "task_clb13_01",
+            "attempt_id": "att_clb13_01",
+            "ci_generation": ci_generation,
+            "status": status,
+            "summary": format!("status {status}"),
+            "details_url": "http://127.0.0.1:3000/workspace/cls/CL1/checks",
+            "occurred_at": "2026-11-24T12:00:00Z"
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn cl_ci_check_disabled_returns_503_and_invalid_signatures_return_401() {
+        let temp = TempDir::new().expect("temp");
+        let storage_off = ci_test_storage(&temp, false).await;
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let now_ts = chrono::Utc::now().timestamp();
+        let body = ci_payload(sha_a, 1, 1, "pending");
+
+        // 503 when disabled
+        let (status, json) = put_ci_signed(
+            mc05_state(storage_off),
+            "CLCI001",
+            "CLCI001",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-disabled",
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], "ci_checks_disabled");
+
+        // Enabled: test 401 cases (wrong secret, expired skew, cross-CL path substitution)
+        let temp2 = TempDir::new().expect("temp2");
+        let storage = ci_test_storage(&temp2, true).await;
+        seed_ci_cl(&storage, "CLCI001", sha_a, 1, MergeStatusEnum::Open).await;
+        seed_ci_cl(&storage, "CLCI002", sha_a, 1, MergeStatusEnum::Open).await;
+
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI001",
+            "CLCI001",
+            "wrong-secret-0123456789abcdef0123456789abcdef",
+            now_ts,
+            "nonce-bad-sig",
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json["code"], "invalid_signature");
+
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI001",
+            "CLCI001",
+            CI_TEST_SECRET,
+            now_ts - 301,
+            "nonce-expired",
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json["code"], "invalid_signature");
+
+        // Cross-CL path substitution: signed for CLCI001, sent to CLCI002 -> 401
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI002",
+            "CLCI001",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-path-swap",
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json["code"], "invalid_signature");
+    }
+
+    #[tokio::test]
+    async fn cl_ci_check_nonce_replay_conflict_aba_and_monotonic_state_machine() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let temp = TempDir::new().expect("temp");
+        let storage = ci_test_storage(&temp, true).await;
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        seed_ci_cl(&storage, "CLCI100", sha_a, 1, MergeStatusEnum::Open).await;
+        seed_ci_cl(&storage, "CLCI_CLOSED", sha_a, 1, MergeStatusEnum::Closed).await;
+        let now_ts = chrono::Utc::now().timestamp();
+
+        // 404 cl_not_found
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CL_MISSING",
+            "CL_MISSING",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-404",
+            &ci_payload(sha_a, 1, 1, "pending"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["code"], "cl_not_found");
+
+        // 409 cl_not_open
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI_CLOSED",
+            "CLCI_CLOSED",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-closed",
+            &ci_payload(sha_a, 1, 1, "pending"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["code"], "cl_not_open");
+
+        // 409 stale_commit (right head_revision, wrong commit_sha)
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-stale-commit",
+            &ci_payload(sha_b, 1, 1, "pending"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["code"], "stale_commit");
+
+        // 1) Initial PENDING (rev=1, gen=1) -> 200 updated
+        let p_pending = ci_payload(sha_a, 1, 1, "pending");
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-1",
+            &p_pending,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["applied"], true);
+        assert!(json.get("reason").is_none());
+        assert_eq!(json["action"], "updated");
+        assert_eq!(json["status"], "PENDING");
+
+        // Exact replay of nonce-1 -> 200 replayed
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-1",
+            &p_pending,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["applied"], false);
+        assert_eq!(json["reason"], "replayed");
+        assert_eq!(json["action"], "replayed");
+
+        // Same nonce-1 with different body (even malformed JSON!) -> 409 nonce_conflict
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-1",
+            "{not-valid-json",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["code"], "nonce_conflict");
+
+        // 2) PENDING -> RUNNING (gen=1) -> 200 updated
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-2",
+            &ci_payload(sha_a, 1, 1, "running"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["action"], "updated");
+        assert_eq!(json["status"], "RUNNING");
+
+        // Regression RUNNING -> PENDING (same gen=1) -> 200 { applied: false, reason: "stale_status_transition" }, zero overwrite
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-3",
+            &ci_payload(sha_a, 1, 1, "pending"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["applied"], false);
+        assert_eq!(json["reason"], "stale_status_transition");
+        assert_eq!(json["action"], "stale_status_transition");
+        assert_eq!(json["status"], "RUNNING");
+
+        // 3) RUNNING -> PASSED (gen=1) -> 200 updated
+        let p_passed = ci_payload(sha_a, 1, 1, "passed");
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-4",
+            &p_passed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["action"], "updated");
+        assert_eq!(json["status"], "PASSED");
+
+        // Regression PASSED -> RUNNING (same gen=1) -> 200 { applied: false, reason: "stale_status_transition" }, zero overwrite
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-5",
+            &ci_payload(sha_a, 1, 1, "running"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["applied"], false);
+        assert_eq!(json["reason"], "stale_status_transition");
+        assert_eq!(json["action"], "stale_status_transition");
+        assert_eq!(json["status"], "PASSED");
+
+        // Different terminal state PASSED -> FAILED (same gen=1) -> 409 already_terminal
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-6",
+            &ci_payload(sha_a, 1, 1, "failed"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["code"], "already_terminal");
+
+        // Higher generation gen=2 advances PASSED -> FAILED, then lower gen=1 is stale_generation
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-7",
+            &ci_payload(sha_a, 1, 2, "failed"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["action"], "updated");
+        assert_eq!(json["ci_generation"], 2);
+        assert_eq!(json["status"], "FAILED");
+
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-8",
+            &ci_payload(sha_a, 1, 1, "passed"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["applied"], false);
+        assert_eq!(json["reason"], "stale_generation");
+        assert_eq!(json["action"], "stale_generation");
+        assert_eq!(json["ci_generation"], 2);
+        assert_eq!(json["status"], "FAILED");
+
+        // 4) Simulate nonce expiry (delete nonce-7) + ack-loss redrive:
+        //    (a) head unchanged -> 200 unchanged, zero overwrite
+        crate::callisto::ci_callback_nonces::Entity::delete_by_id("nonce-7".to_owned())
+            .exec(storage.cl_storage().get_connection())
+            .await
+            .expect("delete nonce-7");
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-7",
+            &ci_payload(sha_a, 1, 2, "failed"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["action"], "unchanged");
+        assert_eq!(json["status"], "FAILED");
+
+        //    (b) Simulate A(rev=1) -> B(rev=2) -> A(rev=3): commit_sha is STILL sha_a,
+        //        but head_revision is now 3! After nonce deletion, rev=1 callback MUST be rejected
+        //        with permanent 409 stale_head_revision (zero overwrite).
+        let cl_row = mega_cl::Entity::find()
+            .filter(mega_cl::Column::Link.eq("CLCI100"))
+            .one(storage.cl_storage().get_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active_cl = cl_row.into_active_model();
+        active_cl.head_revision = sea_orm::Set(3);
+        active_cl.to_hash = sea_orm::Set(sha_a.to_owned());
+        active_cl
+            .update(storage.cl_storage().get_connection())
+            .await
+            .unwrap();
+
+        crate::callisto::ci_callback_nonces::Entity::delete_by_id("nonce-7".to_owned())
+            .exec(storage.cl_storage().get_connection())
+            .await
+            .expect("delete nonce-7 again");
+
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-7",
+            &ci_payload(sha_a, 1, 2, "failed"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["code"], "stale_head_revision");
+
+        //    (c) Valid callback for the new head_revision = 3 supersedes the old rev=1 row even
+        //        with the same/lower ci_generation and without prior INVALIDATED status.
+        let (status, json) = put_ci_signed(
+            mc05_state(storage.clone()),
+            "CLCI100",
+            "CLCI100",
+            CI_TEST_SECRET,
+            now_ts,
+            "nonce-new-head-rev3",
+            &ci_payload(sha_a, 3, 1, "pending"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["action"], "updated");
+        assert_eq!(json["head_revision"], 3);
+        assert_eq!(json["ci_generation"], 1);
+        assert_eq!(json["status"], "PENDING");
+        let persisted = storage
+            .cl_storage()
+            .get_check_result("CLCI100")
+            .await
+            .expect("get check_result");
+        let ci_row = persisted
+            .into_iter()
+            .find(|r| {
+                r.check_type_code == crate::callisto::sea_orm_active_enums::CheckTypeEnum::CiStatus
+            })
+            .expect("ci_status row");
+        assert_eq!(ci_row.head_revision, 3);
+        assert_eq!(ci_row.ci_generation, 1);
+        assert_eq!(ci_row.status, "PENDING");
+    }
+
+    #[tokio::test]
+    async fn cl_ci_check_concurrent_same_nonce_serializes_without_deadlock() {
+        let temp = TempDir::new().expect("temp");
+        let storage = ci_test_storage(&temp, true).await;
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        seed_ci_cl(&storage, "CLCONC1", sha_a, 1, MergeStatusEnum::Open).await;
+        seed_ci_cl(&storage, "CLCONC2", sha_a, 1, MergeStatusEnum::Open).await;
+        let now_ts = chrono::Utc::now().timestamp();
+
+        // 1. Concurrent conflicting requests sharing the exact same nonce (even across different CLs):
+        //    advisory lock serializes them so strictly one succeeds (200) and the other gets 409 nonce_conflict.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+        let s1 = storage.clone();
+        let s2 = storage.clone();
+        let body1 = ci_payload(sha_a, 1, 1, "pending");
+        let body2 = ci_payload(sha_a, 1, 1, "running");
+
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            put_ci_signed(
+                mc05_state(s1),
+                "CLCONC1",
+                "CLCONC1",
+                CI_TEST_SECRET,
+                now_ts,
+                "shared-concurrent-nonce",
+                &body1,
+            )
+            .await
+        });
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            put_ci_signed(
+                mc05_state(s2),
+                "CLCONC2",
+                "CLCONC2",
+                CI_TEST_SECRET,
+                now_ts,
+                "shared-concurrent-nonce",
+                &body2,
+            )
+            .await
+        });
+        let (r1, r2) = tokio::join!(t1, t2);
+        let (st1, j1) = r1.expect("task 1");
+        let (st2, j2) = r2.expect("task 2");
+        let outcomes = [(st1, j1), (st2, j2)];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(s, _)| *s == StatusCode::OK)
+                .count(),
+            1,
+            "expected exactly one 200 winner: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(s, j)| *s == StatusCode::CONFLICT && j["code"] == "nonce_conflict")
+                .count(),
+            1,
+            "expected exactly one 409 nonce_conflict loser: {outcomes:?}"
+        );
+
+        // 2. Concurrent callbacks reclaiming DIFFERENT expired nonces across different CLs must
+        //    both succeed 200 without deadlocking on expired-nonce cleanup.
+        let expired_at = chrono::Utc::now().naive_utc() - chrono::TimeDelta::seconds(60);
+        for (n, link) in [("exp-nonce-1", "CLCONC1"), ("exp-nonce-2", "CLCONC2")] {
+            crate::callisto::ci_callback_nonces::ActiveModel {
+                nonce: sea_orm::Set(n.to_owned()),
+                cl_link: sea_orm::Set(link.to_owned()),
+                body_sha256: sea_orm::Set("0".repeat(64)),
+                expires_at: sea_orm::Set(expired_at),
+            }
+            .insert(storage.cl_storage().get_connection())
+            .await
+            .expect("seed expired nonce");
+        }
+        let barrier2 = Arc::new(tokio::sync::Barrier::new(2));
+        let b3 = Arc::clone(&barrier2);
+        let b4 = Arc::clone(&barrier2);
+        let s3 = storage.clone();
+        let s4 = storage.clone();
+        let body3 = ci_payload(sha_a, 1, 2, "passed");
+        let body4 = ci_payload(sha_a, 1, 2, "passed");
+        let t3 = tokio::spawn(async move {
+            b3.wait().await;
+            put_ci_signed(
+                mc05_state(s3),
+                "CLCONC1",
+                "CLCONC1",
+                CI_TEST_SECRET,
+                now_ts,
+                "exp-nonce-1",
+                &body3,
+            )
+            .await
+        });
+        let t4 = tokio::spawn(async move {
+            b4.wait().await;
+            put_ci_signed(
+                mc05_state(s4),
+                "CLCONC2",
+                "CLCONC2",
+                CI_TEST_SECRET,
+                now_ts,
+                "exp-nonce-2",
+                &body4,
+            )
+            .await
+        });
+        let (r3, r4) = tokio::join!(t3, t4);
+        assert_eq!(r3.unwrap().0, StatusCode::OK);
+        assert_eq!(r4.unwrap().0, StatusCode::OK);
     }
 }

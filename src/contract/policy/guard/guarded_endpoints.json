@@ -28,6 +28,9 @@
         },
         "delete": {
             "/{link}/reviewers": "editMergeRequest"
+        },
+        "put": {
+            "/{link}/checks/ci": "unprotectedRequest"
         }
     }
 }

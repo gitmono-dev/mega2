@@ -196,6 +196,12 @@ impl CheckerRegistry {
             let Ok(check_type) = CheckType::try_from(c_config.check_type_code) else {
                 continue;
             };
+            // External CI status is exclusively written by the signed `PUT /api/v1/cl/{link}/checks/ci`
+            // callback endpoint (`CLB-13`); local `CheckerRegistry::run_checks` must never execute or
+            // overwrite `CheckType::CiStatus`.
+            if check_type == CheckType::CiStatus {
+                continue;
+            }
             if let Some(checker) = self.checkers.get(&check_type) {
                 let params = checker.build_params(&cl_info).await?;
                 let res = checker.run(&params).await;
@@ -209,6 +215,9 @@ impl CheckerRegistry {
                 );
                 save_models.push(model);
             }
+        }
+        if save_models.is_empty() {
+            return Ok(());
         }
         self.storage
             .cl_storage()
@@ -253,5 +262,98 @@ mod tests {
             err.to_string().contains("CheckerRegistry is closed"),
             "{err}"
         );
+    }
+
+    struct DummyCiStatusChecker;
+
+    #[async_trait::async_trait]
+    impl Checker for DummyCiStatusChecker {
+        async fn run(&self, _params: &serde_json::Value) -> CheckResult {
+            CheckResult {
+                check_type_code: CheckType::CiStatus,
+                status: ConditionResult::FAILED,
+                message: "must never overwrite ci_status".to_owned(),
+            }
+        }
+
+        async fn build_params(&self, _cl_info: &ClInfoDto) -> Result<serde_json::Value, MegaError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_checks_explicitly_skips_ci_status() {
+        use sea_orm::{ActiveModelTrait, Set};
+
+        use crate::{
+            callisto::{path_check_configs, sea_orm_active_enums::CheckTypeEnum},
+            jupiter::storage::base_storage::StorageConnector,
+        };
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let config = crate::config::testing::isolated_config(temp.path().join("config"));
+        let storage = std::sync::Arc::new(test_storage_with_config(temp.path(), config).await);
+        let now = chrono::Utc::now().naive_utc();
+
+        path_check_configs::ActiveModel {
+            id: Set(9101),
+            created_at: Set(now),
+            updated_at: Set(now),
+            path: Set("/".to_owned()),
+            check_type_code: Set(CheckTypeEnum::CiStatus),
+            enabled: Set(true),
+            required: Set(true),
+        }
+        .insert(storage.cl_storage().get_connection())
+        .await
+        .expect("insert path_check_configs");
+
+        let mut existing = check_result::Model::new(
+            "/",
+            "CLSKIPCI",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            CheckTypeEnum::CiStatus,
+            "PASSED",
+            "from orion",
+        );
+        existing.head_revision = 2;
+        existing.ci_generation = 3;
+        storage
+            .cl_storage()
+            .save_check_results(vec![existing])
+            .await
+            .expect("seed existing ci_status");
+
+        let mut registry = CheckerRegistry::new(storage.clone(), "tester".into());
+        registry.register(CheckType::CiStatus, Box::new(DummyCiStatusChecker));
+
+        let now = chrono::Utc::now().naive_utc();
+        registry
+            .run_checks(ClInfoDto {
+                link: "CLSKIPCI".into(),
+                title: "t".into(),
+                merge_date: None,
+                status: MergeStatusEnum::Open,
+                path: "/".into(),
+                from_hash: "0000000000000000000000000000000000000000".into(),
+                to_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                created_at: now,
+                updated_at: now,
+                username: "tester".into(),
+            })
+            .await
+            .expect("run_checks succeeds while skipping CiStatus");
+
+        let rows = storage
+            .cl_storage()
+            .get_check_result("CLSKIPCI")
+            .await
+            .expect("get check results");
+        let ci_row = rows
+            .into_iter()
+            .find(|r| r.check_type_code == CheckTypeEnum::CiStatus)
+            .expect("ci_status row preserved");
+        assert_eq!(ci_row.status, "PASSED");
+        assert_eq!(ci_row.message, "from orion");
     }
 }

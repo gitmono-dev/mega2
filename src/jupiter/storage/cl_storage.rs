@@ -14,8 +14,10 @@ use sea_orm::{
 
 use crate::{
     callisto::{
-        check_result, mega_cl, mega_cl_commits, mega_commit, mega_conversation, path_check_configs,
-        sea_orm_active_enums::MergeStatusEnum,
+        check_result, ci_callback_nonces,
+        entity_ext::generate_id,
+        mega_cl, mega_cl_commits, mega_commit, mega_conversation, path_check_configs,
+        sea_orm_active_enums::{CheckTypeEnum, MergeStatusEnum},
     },
     common::errors::MegaError,
     contract::api::common::Pagination,
@@ -27,6 +29,67 @@ use crate::{
         },
     },
 };
+
+#[derive(Clone, Debug)]
+pub struct CiCheckCallbackValidated {
+    pub commit_sha: String,
+    pub head_revision: i64,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub ci_generation: i64,
+    pub status_upper: String,
+    pub summary: String,
+    pub details_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CiCheckCallbackInput {
+    pub cl_link: String,
+    pub nonce: String,
+    pub body_sha256: String,
+    pub nonce_retention_secs: u64,
+    pub now: chrono::NaiveDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiCheckCallbackOutcome {
+    pub action: &'static str,
+    pub cl_link: String,
+    pub head_revision: i64,
+    pub ci_generation: i64,
+    pub status: String,
+}
+
+#[derive(Debug)]
+pub enum CiCheckCallbackError {
+    InvalidRequest(String),
+    NonceConflict,
+    ClNotFound,
+    ClNotOpen,
+    StaleHeadRevision,
+    StaleCommit,
+    AlreadyTerminal,
+    Internal(MegaError),
+}
+
+fn ci_nonce_advisory_lock_key(nonce: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"mega2:ci_callback_nonce:");
+    hasher.update(nonce.as_bytes());
+    let digest = hasher.finalize();
+    i64::from_be_bytes(digest[..8].try_into().expect("sha256 >= 8 bytes"))
+}
+
+fn ci_status_rank(status: &str) -> i8 {
+    match status {
+        "PENDING" => 0,
+        "RUNNING" => 1,
+        "PASSED" | "FAILED" | "CANCELLED" => 2,
+        _ => -1,
+    }
+}
 
 #[derive(Clone)]
 pub struct ClStorage {
@@ -512,6 +575,307 @@ impl ClStorage {
             .all(self.get_connection())
             .await?;
         Ok(models)
+    }
+
+    /// Atomically serializes `nonce` verification (via transaction-scoped advisory lock BEFORE
+    /// payload parsing and business checks), locks `mega_cl FOR UPDATE -> check_result FOR UPDATE`,
+    /// enforces exact `Open` + `head_revision` + `to_hash` binding, applies the monotonic
+    /// `ci_generation` / `PENDING(0) < RUNNING(1) < TERMINAL(2)` state machine, persists the
+    /// nonce in the same transaction, and performs bounded deadlock-free expired-nonce pruning
+    /// after commit (`CLB-13`).
+    pub async fn apply_ci_check_callback<F>(
+        &self,
+        input: CiCheckCallbackInput,
+        parse_and_validate: F,
+    ) -> Result<CiCheckCallbackOutcome, CiCheckCallbackError>
+    where
+        F: FnOnce() -> Result<CiCheckCallbackValidated, String>,
+    {
+        let txn = self
+            .get_connection()
+            .begin()
+            .await
+            .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+
+        // 1. Serialize all concurrent requests sharing the same `nonce` strictly BEFORE JSON
+        //    parsing and BEFORE acquiring `mega_cl -> check_result` row locks (canonical lock order:
+        //    `nonce_advisory -> mega_cl -> check_result`).
+        let lock_key = ci_nonce_advisory_lock_key(&input.nonce);
+        txn.execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1)",
+            [lock_key.into()],
+        ))
+        .await
+        .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+
+        // 2. Check nonce replay/conflict BEFORE JSON parsing so a reused nonce with a different
+        //    (even malformed) body or path ALWAYS returns `409 nonce_conflict`, including under
+        //    concurrent in-flight requests.
+        if let Some(existing_nonce) = ci_callback_nonces::Entity::find_by_id(input.nonce.clone())
+            .lock_exclusive()
+            .one(&txn)
+            .await
+            .map_err(|e| CiCheckCallbackError::Internal(e.into()))?
+        {
+            if existing_nonce.expires_at > input.now {
+                if existing_nonce.cl_link == input.cl_link
+                    && existing_nonce.body_sha256 == input.body_sha256
+                {
+                    let cur = check_result::Entity::find()
+                        .filter(check_result::Column::ClLink.eq(&input.cl_link))
+                        .filter(check_result::Column::CheckTypeCode.eq(CheckTypeEnum::CiStatus))
+                        .one(&txn)
+                        .await
+                        .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+                    txn.commit()
+                        .await
+                        .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+                    let (hr, gen_val, st) = match cur {
+                        Some(r) => (r.head_revision, r.ci_generation, r.status),
+                        None => (0, 0, "PENDING".to_owned()),
+                    };
+                    return Ok(CiCheckCallbackOutcome {
+                        action: "replayed",
+                        cl_link: input.cl_link,
+                        head_revision: hr,
+                        ci_generation: gen_val,
+                        status: st,
+                    });
+                }
+                let _ = txn.rollback().await;
+                return Err(CiCheckCallbackError::NonceConflict);
+            }
+            // Expired nonce record for this exact PK: remove so this slot can be reclaimed cleanly.
+            ci_callback_nonces::Entity::delete_by_id(input.nonce.clone())
+                .exec(&txn)
+                .await
+                .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+        }
+
+        // 3. Parse and validate JSON payload now that nonce uniqueness is established.
+        let payload = match parse_and_validate() {
+            Ok(p) => p,
+            Err(msg) => {
+                let _ = txn.rollback().await;
+                return Err(CiCheckCallbackError::InvalidRequest(msg));
+            }
+        };
+
+        // 4. Lock `mega_cl` FOR UPDATE and validate existence, Open state, exact head_revision,
+        //    and exact commit_sha.
+        let locked_cl = mega_cl::Entity::find()
+            .filter(mega_cl::Column::Link.eq(&input.cl_link))
+            .lock_exclusive()
+            .one(&txn)
+            .await
+            .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+
+        let Some(cl) = locked_cl else {
+            let _ = txn.rollback().await;
+            return Err(CiCheckCallbackError::ClNotFound);
+        };
+        if cl.status != MergeStatusEnum::Open {
+            let _ = txn.rollback().await;
+            return Err(CiCheckCallbackError::ClNotOpen);
+        }
+        if payload.head_revision != cl.head_revision {
+            let _ = txn.rollback().await;
+            return Err(CiCheckCallbackError::StaleHeadRevision);
+        }
+        if payload.commit_sha != cl.to_hash {
+            let _ = txn.rollback().await;
+            return Err(CiCheckCallbackError::StaleCommit);
+        }
+
+        // 5. Lock existing `check_result(CiStatus)` row FOR UPDATE and apply monotonic state machine.
+        let existing_check = check_result::Entity::find()
+            .filter(check_result::Column::ClLink.eq(&input.cl_link))
+            .filter(check_result::Column::CheckTypeCode.eq(CheckTypeEnum::CiStatus))
+            .lock_exclusive()
+            .one(&txn)
+            .await
+            .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+
+        let outcome = match existing_check {
+            None => {
+                let model = check_result::Model {
+                    id: generate_id(),
+                    created_at: input.now,
+                    updated_at: input.now,
+                    path: cl.path.clone(),
+                    cl_link: cl.link.clone(),
+                    commit_id: payload.commit_sha.clone(),
+                    check_type_code: CheckTypeEnum::CiStatus,
+                    status: payload.status_upper.clone(),
+                    message: payload.summary.clone(),
+                    head_revision: payload.head_revision,
+                    ci_generation: payload.ci_generation,
+                    ci_task_id: Some(payload.task_id.clone()),
+                    ci_attempt_id: Some(payload.attempt_id.clone()),
+                    details_url: payload.details_url.clone(),
+                };
+                model
+                    .into_active_model()
+                    .insert(&txn)
+                    .await
+                    .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+                CiCheckCallbackOutcome {
+                    action: "updated",
+                    cl_link: input.cl_link.clone(),
+                    head_revision: payload.head_revision,
+                    ci_generation: payload.ci_generation,
+                    status: payload.status_upper.clone(),
+                }
+            }
+            Some(row) if payload.head_revision < row.head_revision => {
+                let _ = txn.rollback().await;
+                return Err(CiCheckCallbackError::StaleHeadRevision);
+            }
+            Some(row) if payload.head_revision > row.head_revision => {
+                // Strictly newer validated CL head_revision supersedes any older revision's
+                // check_result row unconditionally (even if the older row was not yet invalidated).
+                let mut active = row.into_active_model();
+                active.updated_at = Set(input.now);
+                active.path = Set(cl.path.clone());
+                active.commit_id = Set(payload.commit_sha.clone());
+                active.status = Set(payload.status_upper.clone());
+                active.message = Set(payload.summary.clone());
+                active.head_revision = Set(payload.head_revision);
+                active.ci_generation = Set(payload.ci_generation);
+                active.ci_task_id = Set(Some(payload.task_id.clone()));
+                active.ci_attempt_id = Set(Some(payload.attempt_id.clone()));
+                active.details_url = Set(payload.details_url.clone());
+                active
+                    .update(&txn)
+                    .await
+                    .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+                CiCheckCallbackOutcome {
+                    action: "updated",
+                    cl_link: input.cl_link.clone(),
+                    head_revision: payload.head_revision,
+                    ci_generation: payload.ci_generation,
+                    status: payload.status_upper.clone(),
+                }
+            }
+            Some(row) => match payload.ci_generation.cmp(&row.ci_generation) {
+                std::cmp::Ordering::Less => CiCheckCallbackOutcome {
+                    action: "stale_generation",
+                    cl_link: input.cl_link.clone(),
+                    head_revision: row.head_revision,
+                    ci_generation: row.ci_generation,
+                    status: row.status,
+                },
+                std::cmp::Ordering::Greater => {
+                    let mut active = row.into_active_model();
+                    active.updated_at = Set(input.now);
+                    active.path = Set(cl.path.clone());
+                    active.commit_id = Set(payload.commit_sha.clone());
+                    active.status = Set(payload.status_upper.clone());
+                    active.message = Set(payload.summary.clone());
+                    active.head_revision = Set(payload.head_revision);
+                    active.ci_generation = Set(payload.ci_generation);
+                    active.ci_task_id = Set(Some(payload.task_id.clone()));
+                    active.ci_attempt_id = Set(Some(payload.attempt_id.clone()));
+                    active.details_url = Set(payload.details_url.clone());
+                    active
+                        .update(&txn)
+                        .await
+                        .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+                    CiCheckCallbackOutcome {
+                        action: "updated",
+                        cl_link: input.cl_link.clone(),
+                        head_revision: payload.head_revision,
+                        ci_generation: payload.ci_generation,
+                        status: payload.status_upper.clone(),
+                    }
+                }
+                std::cmp::Ordering::Equal => {
+                    let cur_rank = ci_status_rank(&row.status);
+                    let new_rank = ci_status_rank(&payload.status_upper);
+
+                    if new_rank > cur_rank {
+                        let mut active = row.into_active_model();
+                        active.updated_at = Set(input.now);
+                        active.path = Set(cl.path.clone());
+                        active.commit_id = Set(payload.commit_sha.clone());
+                        active.status = Set(payload.status_upper.clone());
+                        active.message = Set(payload.summary.clone());
+                        active.head_revision = Set(payload.head_revision);
+                        active.ci_generation = Set(payload.ci_generation);
+                        active.ci_task_id = Set(Some(payload.task_id.clone()));
+                        active.ci_attempt_id = Set(Some(payload.attempt_id.clone()));
+                        active.details_url = Set(payload.details_url.clone());
+                        active
+                            .update(&txn)
+                            .await
+                            .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+                        CiCheckCallbackOutcome {
+                            action: "updated",
+                            cl_link: input.cl_link.clone(),
+                            head_revision: payload.head_revision,
+                            ci_generation: payload.ci_generation,
+                            status: payload.status_upper.clone(),
+                        }
+                    } else if row.status == payload.status_upper {
+                        CiCheckCallbackOutcome {
+                            action: "unchanged",
+                            cl_link: input.cl_link.clone(),
+                            head_revision: row.head_revision,
+                            ci_generation: row.ci_generation,
+                            status: row.status,
+                        }
+                    } else if new_rank < cur_rank {
+                        CiCheckCallbackOutcome {
+                            action: "stale_status_transition",
+                            cl_link: input.cl_link.clone(),
+                            head_revision: row.head_revision,
+                            ci_generation: row.ci_generation,
+                            status: row.status,
+                        }
+                    } else {
+                        let _ = txn.rollback().await;
+                        return Err(CiCheckCallbackError::AlreadyTerminal);
+                    }
+                }
+            },
+        };
+
+        // 6. Persist replay nonce atomically under the held advisory lock.
+        let expires_at = input.now + chrono::TimeDelta::seconds(input.nonce_retention_secs as i64);
+        let nonce_active = ci_callback_nonces::ActiveModel {
+            nonce: Set(input.nonce.clone()),
+            cl_link: Set(input.cl_link.clone()),
+            body_sha256: Set(input.body_sha256.clone()),
+            expires_at: Set(expires_at),
+        };
+        nonce_active
+            .insert(&txn)
+            .await
+            .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+
+        txn.commit()
+            .await
+            .map_err(|e| CiCheckCallbackError::Internal(e.into()))?;
+
+        // 7. Best-effort bounded expired-nonce cleanup OUTSIDE the callback transaction using
+        //    `FOR UPDATE SKIP LOCKED` so concurrent callbacks can never deadlock on pruning.
+        let _ = self
+            .get_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM ci_callback_nonces
+                 WHERE ctid IN (
+                     SELECT ctid FROM ci_callback_nonces
+                     WHERE expires_at <= $1
+                     LIMIT 64
+                     FOR UPDATE SKIP LOCKED
+                 )",
+                [input.now.into()],
+            ))
+            .await;
+
+        Ok(outcome)
     }
 
     /// MC-04: idempotently replace a CL's commit listing inside the caller's
