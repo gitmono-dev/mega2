@@ -24,7 +24,8 @@
             "/{link}/merge-box": "viewRepo",
             "/{link}/update-status": "viewRepo",
             "/{link}/reviewers": "viewRepo",
-            "/{link}/commits": "viewRepo"
+            "/{link}/commits": "viewRepo",
+            "/{link}/ci-authz": "unprotectedRequest"
         },
         "delete": {
             "/{link}/reviewers": "editMergeRequest"

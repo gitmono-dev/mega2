@@ -769,6 +769,13 @@ mod tests {
     }
 
     #[test]
+    fn clb14_get_ci_authz_is_registered_as_unprotected_request() {
+        let (action, link) = resolve_cl_action("GET", "/api/v1/cl/ABC123/ci-authz").unwrap();
+        assert_eq!(action, ActionEnum::UnprotectedRequest);
+        assert_eq!(link, "ABC123");
+    }
+
+    #[test]
     fn un23_the_method_key_is_case_insensitive() {
         let lower = resolve_cl_action("post", "/cl/ABC123/merge").unwrap().0;
         let upper = resolve_cl_action("POST", "/cl/ABC123/merge").unwrap().0;

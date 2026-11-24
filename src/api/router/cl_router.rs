@@ -1,7 +1,7 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -54,7 +54,8 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(update_branch_status))
             .routes(routes!(update_branch))
             .routes(routes!(cl_commits))
-            .routes(routes!(put_cl_ci_check)),
+            .routes(routes!(put_cl_ci_check))
+            .routes(routes!(get_cl_ci_authz)),
     )
 }
 
@@ -444,6 +445,152 @@ async fn put_cl_ci_check(
                 format!("failed to persist CI check callback: {err}"),
             )
         }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CiAuthzRes {
+    pub allowed: bool,
+    pub action: String,
+    pub cl_link: String,
+    pub principal: String,
+}
+
+fn parse_ci_authz_action(raw_query: Option<&str>) -> Result<&'static str, &'static str> {
+    let raw = raw_query.ok_or("missing required query parameter 'action'")?;
+    let mut action: Option<String> = None;
+    for (k, v) in url::form_urlencoded::parse(raw.as_bytes()) {
+        if k != "action" {
+            return Err("unexpected query parameter; only 'action=read|write' is allowed");
+        }
+        if action.is_some() {
+            return Err("duplicate 'action' query parameter");
+        }
+        action = Some(v.into_owned());
+    }
+    match action.as_deref() {
+        Some("read") => Ok("read"),
+        Some("write") => Ok("write"),
+        Some(_) => Err("invalid 'action' query parameter; expected 'read' or 'write'"),
+        None => Err("missing required query parameter 'action'"),
+    }
+}
+
+fn with_no_store_cache_control(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp
+}
+
+/// Fail-closed enforced Cedar authorization decision endpoint for CL CI read/write operations
+/// (`CLB-14`, `ADR-CLB-05`).
+#[utoipa::path(
+    get,
+    params(
+        ("link", description = "CL link"),
+        ("action" = String, Query, description = "CI operation scope: 'read' (viewRepo) or 'write' (editMergeRequest)"),
+    ),
+    path = "/{link}/ci-authz",
+    responses(
+        (status = 200, body = CiAuthzRes, content_type = "application/json"),
+        (status = 400, body = CiCheckErrorRes, content_type = "application/json"),
+        (status = 401, description = "Login required"),
+        (status = 403, body = CiCheckErrorRes, content_type = "application/json"),
+        (status = 404, body = CiCheckErrorRes, content_type = "application/json"),
+        (status = 503, body = CiCheckErrorRes, content_type = "application/json"),
+    ),
+    tag = CL_TAG
+)]
+async fn get_cl_ci_authz(
+    user: LoginUser,
+    Path(link): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    State(state): State<MonoApiServiceState>,
+) -> Response {
+    let resp = evaluate_cl_ci_authz(user, link, raw_query, state).await;
+    with_no_store_cache_control(resp)
+}
+
+async fn evaluate_cl_ci_authz(
+    user: LoginUser,
+    link: String,
+    raw_query: Option<String>,
+    state: MonoApiServiceState,
+) -> Response {
+    let action = match parse_ci_authz_action(raw_query.as_deref()) {
+        Ok(a) => a,
+        Err(msg) => return ci_error_response(StatusCode::BAD_REQUEST, "invalid_request", msg),
+    };
+
+    let enforcement = crate::contract::policy::enforcement::Enforcement::parse(
+        &state.storage.config().cedar.enforcement,
+    );
+    if enforcement != Some(crate::contract::policy::enforcement::Enforcement::Enforce) {
+        return ci_error_response(
+            StatusCode::FORBIDDEN,
+            "ci_authz_policy_not_enforced",
+            "Cedar authorization enforcement must be set to 'enforce' for CI operations",
+        );
+    }
+
+    let Some(snapshot) = state.entity_store.snapshot() else {
+        return ci_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ci_authz_unavailable",
+            "Cedar authorization entity store snapshot is unavailable",
+        );
+    };
+
+    let cl = match state.cl_stg().get_cl(&link).await {
+        Ok(Some(cl)) => cl,
+        Ok(None) => {
+            return ci_error_response(StatusCode::NOT_FOUND, "cl_not_found", "CL not found");
+        }
+        Err(err) => {
+            tracing::error!(
+                cl_link = %link,
+                error = %err,
+                "failed to load CL for CI authorization"
+            );
+            return ci_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "failed to load CL for authorization",
+            );
+        }
+    };
+
+    let cedar_action = match action {
+        "read" => "viewRepo",
+        "write" => "editMergeRequest",
+        _ => unreachable!("parse_ci_authz_action restricts to read|write"),
+    };
+
+    match crate::contract::policy::guard::cedar_guard::decide_guard(
+        crate::contract::policy::enforcement::Enforcement::Enforce,
+        &snapshot,
+        "User",
+        &user.username,
+        cedar_action,
+        &crate::contract::policy::guard::cedar_guard::GuardResource::Path(cl.path),
+    ) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(CiAuthzRes {
+                allowed: true,
+                action: action.to_owned(),
+                cl_link: link,
+                principal: user.username,
+            }),
+        )
+            .into_response(),
+        Err(_) => ci_error_response(
+            StatusCode::FORBIDDEN,
+            "ci_authz_denied",
+            "authorization denied for this CL CI operation",
+        ),
     }
 }
 
@@ -2158,5 +2305,283 @@ mod cl_commits_tests {
         let (r3, r4) = tokio::join!(t3, t4);
         assert_eq!(r3.unwrap().0, StatusCode::OK);
         assert_eq!(r4.unwrap().0, StatusCode::OK);
+    }
+
+    fn ci_authz_state(
+        storage: Storage,
+        entity_store: Arc<SharedEntityStore>,
+        username: Option<&str>,
+    ) -> MonoApiServiceState {
+        let mut st = mc05_state(storage);
+        st.entity_store = entity_store;
+        st.session_store = match username {
+            Some(name) => {
+                BrowserSessionStore::Fixed(crate::api::oauth::api_store::FixedUserSessionStore {
+                    user: crate::api::oauth::model::LoginUser {
+                        website_user_id: format!("uid-{name}"),
+                        username: name.to_owned(),
+                        avatar_url: String::new(),
+                        email: format!("{name}@example.invalid"),
+                    },
+                })
+            }
+            None => BrowserSessionStore::Counting(
+                crate::api::oauth::api_store::CountingSessionStore::new(vec![Ok(None)]),
+            ),
+        };
+        st
+    }
+
+    fn private_repo_entity_store() -> Arc<SharedEntityStore> {
+        let store = Arc::new(SharedEntityStore::new());
+        let entity_json = serde_json::json!({
+            "users": {
+                "User::\"admin-user\"": {
+                    "euid": "User::\"admin-user\"",
+                    "parents": ["UserGroup::\"admin\""]
+                },
+                "User::\"maintainer-user\"": {
+                    "euid": "User::\"maintainer-user\"",
+                    "parents": ["UserGroup::\"maintainer\""]
+                },
+                "User::\"reader-user\"": {
+                    "euid": "User::\"reader-user\"",
+                    "parents": ["UserGroup::\"reader\""]
+                },
+                "User::\"outsider-user\"": {
+                    "euid": "User::\"outsider-user\"",
+                    "parents": []
+                }
+            },
+            "repos": {
+                "Repository::\"/\"": {
+                    "euid": "Repository::\"/\"",
+                    "is_private": true,
+                    "admins": "UserGroup::\"admin\"",
+                    "maintainers": "UserGroup::\"maintainer\"",
+                    "readers": "UserGroup::\"reader\"",
+                    "parents": []
+                }
+            },
+            "user_groups": {
+                "UserGroup::\"admin\"": {
+                    "euid": "UserGroup::\"admin\"",
+                    "parents": ["UserGroup::\"maintainer\""]
+                },
+                "UserGroup::\"maintainer\"": {
+                    "euid": "UserGroup::\"maintainer\"",
+                    "parents": ["UserGroup::\"reader\""]
+                },
+                "UserGroup::\"reader\"": {
+                    "euid": "UserGroup::\"reader\"",
+                    "parents": []
+                }
+            },
+            "merge_requests": {},
+            "issues": {}
+        })
+        .to_string();
+        store.ensure(&entity_json).expect("build private snapshot");
+        store
+    }
+
+    async fn get_ci_authz_req(
+        state: MonoApiServiceState,
+        uri: &str,
+    ) -> (StatusCode, Option<String>, serde_json::Value) {
+        let (v1_router, _api) = OpenApiRouter::new().merge(routers()).split_for_parts();
+        let guarded_v1 =
+            v1_router
+                .with_state(state.clone())
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::contract::policy::guard::cedar_guard::cedar_guard,
+                ));
+        let app = axum::Router::new().nest("/api/v1", guarded_v1);
+        let full_uri = format!("/api/v1{uri}");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(&full_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let cache_control = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned());
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&bytes) }));
+        (status, cache_control, json)
+    }
+
+    #[tokio::test]
+    async fn cl_ci_authz_enforces_login_mode_snapshot_and_read_write_separation() {
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // 1. Cedar mode = off -> 403 ci_authz_policy_not_enforced (even for admin)
+        let temp_off = TempDir::new().expect("temp off");
+        let mut cfg_off = crate::config::testing::isolated_config(temp_off.path().join("cfg"));
+        cfg_off.cedar.enforcement = "off".to_owned();
+        let stg_off =
+            crate::jupiter::tests::test_storage_with_config(temp_off.path(), cfg_off).await;
+        seed_ci_cl(&stg_off, "CLAUTHZ1", sha_a, 1, MergeStatusEnum::Open).await;
+        let (status, cc, json) = get_ci_authz_req(
+            ci_authz_state(stg_off, private_repo_entity_store(), Some("admin-user")),
+            "/cl/CLAUTHZ1/ci-authz?action=read",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        assert_eq!(cc.as_deref(), Some("no-store"));
+        assert_eq!(json["code"], "ci_authz_policy_not_enforced");
+
+        // 2. Cedar mode = shadow -> 403 ci_authz_policy_not_enforced (even for admin)
+        let temp_shadow = TempDir::new().expect("temp shadow");
+        let mut cfg_shadow =
+            crate::config::testing::isolated_config(temp_shadow.path().join("cfg"));
+        cfg_shadow.cedar.enforcement = "shadow".to_owned();
+        let stg_shadow =
+            crate::jupiter::tests::test_storage_with_config(temp_shadow.path(), cfg_shadow).await;
+        seed_ci_cl(&stg_shadow, "CLAUTHZ1", sha_a, 1, MergeStatusEnum::Open).await;
+        let (status, cc, json) = get_ci_authz_req(
+            ci_authz_state(stg_shadow, private_repo_entity_store(), Some("admin-user")),
+            "/cl/CLAUTHZ1/ci-authz?action=read",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        assert_eq!(cc.as_deref(), Some("no-store"));
+        assert_eq!(json["code"], "ci_authz_policy_not_enforced");
+
+        // 3. Cedar mode = enforce (exercising full cedar_guard middleware -> handler path)
+        let temp_enf = TempDir::new().expect("temp enforce");
+        let mut cfg_enf = crate::config::testing::isolated_config(temp_enf.path().join("cfg"));
+        cfg_enf.cedar.enforcement = "enforce".to_owned();
+        let stg_enf =
+            crate::jupiter::tests::test_storage_with_config(temp_enf.path(), cfg_enf).await;
+        seed_ci_cl(&stg_enf, "CLAUTHZ1", sha_a, 1, MergeStatusEnum::Open).await;
+
+        // 3a. Anonymous -> 401
+        let (status, _, _) = get_ci_authz_req(
+            ci_authz_state(stg_enf.clone(), private_repo_entity_store(), None),
+            "/cl/CLAUTHZ1/ci-authz?action=read",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // 3b. Missing / invalid / duplicate / extra query params -> 400
+        for bad_uri in [
+            "/cl/CLAUTHZ1/ci-authz",
+            "/cl/CLAUTHZ1/ci-authz?action=delete",
+            "/cl/CLAUTHZ1/ci-authz?action=read&action=write",
+            "/cl/CLAUTHZ1/ci-authz?action=read&extra=1",
+        ] {
+            let (status, cc, json) = get_ci_authz_req(
+                ci_authz_state(
+                    stg_enf.clone(),
+                    private_repo_entity_store(),
+                    Some("admin-user"),
+                ),
+                bad_uri,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad_uri} -> {json}");
+            assert_eq!(cc.as_deref(), Some("no-store"));
+            assert_eq!(json["code"], "invalid_request");
+        }
+
+        // 3c. Entity store snapshot unavailable -> 503 ci_authz_unavailable
+        let empty_unbuilt_store = Arc::new(SharedEntityStore::new());
+        let (status, cc, json) = get_ci_authz_req(
+            ci_authz_state(stg_enf.clone(), empty_unbuilt_store, Some("admin-user")),
+            "/cl/CLAUTHZ1/ci-authz?action=read",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(cc.as_deref(), Some("no-store"));
+        assert_eq!(json["code"], "ci_authz_unavailable");
+
+        // 3d. Unknown CL link -> 404 cl_not_found
+        let (status, cc, json) = get_ci_authz_req(
+            ci_authz_state(
+                stg_enf.clone(),
+                private_repo_entity_store(),
+                Some("admin-user"),
+            ),
+            "/cl/CL_UNKNOWN/ci-authz?action=read",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+        assert_eq!(cc.as_deref(), Some("no-store"));
+        assert_eq!(json["code"], "cl_not_found");
+
+        // 3e. Read-only user: read=200, write=403 ci_authz_denied
+        let (status, cc, json) = get_ci_authz_req(
+            ci_authz_state(
+                stg_enf.clone(),
+                private_repo_entity_store(),
+                Some("reader-user"),
+            ),
+            "/cl/CLAUTHZ1/ci-authz?action=read",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(cc.as_deref(), Some("no-store"));
+        assert_eq!(json["allowed"], true);
+        assert_eq!(json["action"], "read");
+        assert_eq!(json["cl_link"], "CLAUTHZ1");
+        assert_eq!(json["principal"], "reader-user");
+
+        let (status, cc, json) = get_ci_authz_req(
+            ci_authz_state(
+                stg_enf.clone(),
+                private_repo_entity_store(),
+                Some("reader-user"),
+            ),
+            "/cl/CLAUTHZ1/ci-authz?action=write",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        assert_eq!(cc.as_deref(), Some("no-store"));
+        assert_eq!(json["code"], "ci_authz_denied");
+
+        // 3f. Maintainer user: read=200, write=200
+        let (status, cc, json) = get_ci_authz_req(
+            ci_authz_state(
+                stg_enf.clone(),
+                private_repo_entity_store(),
+                Some("maintainer-user"),
+            ),
+            "/cl/CLAUTHZ1/ci-authz?action=write",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(cc.as_deref(), Some("no-store"));
+        assert_eq!(json["allowed"], true);
+        assert_eq!(json["action"], "write");
+        assert_eq!(json["principal"], "maintainer-user");
+
+        // 3g. Unauthorized member (outsider): read=403, write=403
+        for act in ["read", "write"] {
+            let (status, cc, json) = get_ci_authz_req(
+                ci_authz_state(
+                    stg_enf.clone(),
+                    private_repo_entity_store(),
+                    Some("outsider-user"),
+                ),
+                &format!("/cl/CLAUTHZ1/ci-authz?action={act}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{act} -> {json}");
+            assert_eq!(cc.as_deref(), Some("no-store"));
+            assert_eq!(json["code"], "ci_authz_denied");
+        }
     }
 }
