@@ -284,6 +284,9 @@ impl AppContext {
                 crate::jupiter::service::mono_write_audit::DEFAULT_INSPECT_INTERVAL,
                 notification_shutdown.clone(),
             );
+            storage
+                .webhook_service
+                .spawn_outbox_worker(notification_shutdown.clone());
             if config.traces.enabled {
                 crate::jupiter::service::trace_index_worker::TraceIndexWorker::new(
                     storage

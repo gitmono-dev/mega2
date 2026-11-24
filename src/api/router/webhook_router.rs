@@ -15,7 +15,9 @@ use crate::{
     common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, Pagination},
     jupiter::{
-        service::webhook_service::{encrypt_webhook_secret, validate_webhook_target_url},
+        service::webhook_service::{
+            encrypt_webhook_secret, validate_webhook_target_url_with_config,
+        },
         storage::webhook_storage::WebhookWithEventTypes,
     },
 };
@@ -96,7 +98,11 @@ async fn create_webhook(
     state: State<MonoApiServiceState>,
     Json(payload): Json<CreateWebhookRequest>,
 ) -> Result<Json<CommonResult<WebhookResponse>>, ApiError> {
-    validate_webhook_target_url(&payload.target_url).map_err(ApiError::bad_request)?;
+    validate_webhook_target_url_with_config(
+        &payload.target_url,
+        &state.storage.config().webhook_delivery,
+    )
+    .map_err(ApiError::bad_request)?;
     if payload.secret.is_empty() {
         return Err(ApiError::bad_request(anyhow::anyhow!(
             "webhook secret cannot be empty"

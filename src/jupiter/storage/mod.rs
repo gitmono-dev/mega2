@@ -375,7 +375,8 @@ impl Storage {
             git_service.clone(),
         )?;
 
-        let webhook_service = WebhookService::new(webhook_storage.clone())?;
+        let webhook_service =
+            WebhookService::new(webhook_storage.clone(), config.webhook_delivery.clone())?;
         // Same disabled-with-installation-id emitter as the two services
         // above; `bind_storage_event_emitter` swaps in the enabled one.
         let storage_event_emitter =
