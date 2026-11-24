@@ -15,6 +15,11 @@ pub struct ItemRes {
     pub merge_timestamp: Option<i64>,
     pub updated_at: i64,
     pub comment_num: usize,
+    pub path: String,
+    pub from_hash: String,
+    pub to_hash: String,
+    pub head_revision: i64,
+    pub base_branch: String,
 }
 
 impl From<ItemDetails> for ItemRes {
@@ -31,6 +36,11 @@ impl From<ItemDetails> for ItemRes {
             closed_at: None,
             updated_at: model.updated_at.and_utc().timestamp(),
             comment_num: value.comment_num,
+            path: model.path,
+            from_hash: model.from_hash,
+            to_hash: model.to_hash,
+            head_revision: model.head_revision,
+            base_branch: model.base_branch,
         }
     }
 }

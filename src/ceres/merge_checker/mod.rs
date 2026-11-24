@@ -47,6 +47,22 @@ pub enum CheckType {
 pub enum ConditionResult {
     FAILED,
     PASSED,
+    PENDING,
+}
+
+impl ConditionResult {
+    /// Non-panicking mapping from a stored `check_result.status` string to
+    /// `ConditionResult` (`CLB-16`, `GC-11`).
+    ///
+    /// `PASSED` -> `PASSED`, `PENDING` -> `PENDING`, and all other or unknown
+    /// values fail closed to `FAILED`.
+    pub fn from_status(status: &str) -> Self {
+        match status {
+            "PASSED" => ConditionResult::PASSED,
+            "PENDING" => ConditionResult::PENDING,
+            _ => ConditionResult::FAILED,
+        }
+    }
 }
 
 impl fmt::Display for ConditionResult {
@@ -54,6 +70,7 @@ impl fmt::Display for ConditionResult {
         let s = match self {
             ConditionResult::FAILED => "FAILED",
             ConditionResult::PASSED => "PASSED",
+            ConditionResult::PENDING => "PENDING",
         };
         write!(f, "{}", s)
     }
@@ -65,6 +82,7 @@ impl FromStr for ConditionResult {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "PASSED" => Ok(ConditionResult::PASSED),
+            "PENDING" => Ok(ConditionResult::PENDING),
             "FAILED" => Ok(ConditionResult::FAILED),
             _ => Err(()),
         }

@@ -1072,7 +1072,7 @@ async fn merge_box(
                 .get_check_result(&link)
                 .await?
                 .into_iter()
-                .map(|m| m.into())
+                .filter_map(|m| Condition::try_from(m).ok())
                 .collect();
             MergeBoxRes::from_condition(check_res)
         }

@@ -44,6 +44,11 @@ pub struct CLDetailRes {
     pub merge_timestamp: Option<i64>,
     pub conversations: Vec<ConversationItem>,
     pub path: String,
+    pub from_hash: String,
+    pub to_hash: String,
+    pub head_revision: i64,
+    pub base_branch: String,
+    pub author: String,
 }
 
 impl From<CLDetails> for CLDetailRes {
@@ -61,6 +66,11 @@ impl From<CLDetails> for CLDetailRes {
                 .map(|x| ConversationItem::from_model(x.conversation))
                 .collect(),
             path: value.cl.path,
+            from_hash: value.cl.from_hash,
+            to_hash: value.cl.to_hash,
+            head_revision: value.cl.head_revision,
+            base_branch: value.cl.base_branch,
+            author: value.cl.username,
         }
     }
 }
@@ -262,8 +272,8 @@ impl MergeBoxRes {
     pub fn from_condition(conditions: Vec<Condition>) -> Self {
         let mut state = RequirementsState::MERGEABLE;
         for cond in &conditions {
-            if cond.result == ConditionResult::FAILED {
-                state = RequirementsState::UNMERGEABLE
+            if cond.result != ConditionResult::PASSED {
+                state = RequirementsState::UNMERGEABLE;
             }
         }
         MergeBoxRes {
@@ -286,19 +296,42 @@ pub struct Condition {
     pub description: String,
     pub message: String,
     pub result: ConditionResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_generation: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_status: Option<String>,
 }
 
-impl From<check_result::Model> for Condition {
-    fn from(value: check_result::Model) -> Self {
-        let check_type = CheckType::try_from(value.check_type_code)
-            .expect("code_review check rows are deleted (RM-CC)");
-        Self {
+impl TryFrom<check_result::Model> for Condition {
+    type Error = ();
+
+    fn try_from(value: check_result::Model) -> Result<Self, Self::Error> {
+        let check_type = CheckType::try_from(value.check_type_code)?;
+        let result = ConditionResult::from_status(&value.status);
+        Ok(Self {
             condition_type: check_type.clone(),
-            display_name: check_type.clone().display_name().to_string(),
+            display_name: check_type.display_name().to_string(),
             description: check_type.description().to_string(),
             message: value.message,
-            result: value.status.parse().unwrap(),
-        }
+            result,
+            commit_id: (!value.commit_id.is_empty()).then_some(value.commit_id),
+            head_revision: (value.head_revision > 0).then_some(value.head_revision),
+            ci_task_id: value.ci_task_id,
+            ci_attempt_id: value.ci_attempt_id,
+            ci_generation: (value.ci_generation > 0).then_some(value.ci_generation),
+            details_url: value.details_url,
+            raw_status: Some(value.status),
+        })
     }
 }
 
@@ -454,5 +487,227 @@ mod tests {
 
         assert!(regular_json.get("old_path").is_none());
         assert_eq!(renamed_json["old_path"], "old_dir/file.rs");
+    }
+
+    #[test]
+    fn condition_from_model_maps_all_ci_statuses_without_panicking() {
+        use crate::{
+            callisto::{check_result, sea_orm_active_enums::CheckTypeEnum},
+            ceres::merge_checker::ConditionResult,
+        };
+
+        let now = chrono::Utc::now().naive_utc();
+        let cases = [
+            ("PASSED", ConditionResult::PASSED),
+            ("PENDING", ConditionResult::PENDING),
+            ("RUNNING", ConditionResult::FAILED),
+            ("FAILED", ConditionResult::FAILED),
+            ("CANCELLED", ConditionResult::FAILED),
+            ("INVALIDATED", ConditionResult::FAILED),
+            ("UNEXPECTED_FUTURE_STATUS", ConditionResult::FAILED),
+            ("", ConditionResult::FAILED),
+        ];
+
+        for (raw, expected) in cases {
+            let model = check_result::Model {
+                id: 1,
+                created_at: now,
+                updated_at: now,
+                path: "/project/demo".to_owned(),
+                cl_link: "CL123456".to_owned(),
+                commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                check_type_code: CheckTypeEnum::CiStatus,
+                status: raw.to_owned(),
+                message: format!("status={raw}"),
+                head_revision: 3,
+                ci_generation: 9,
+                ci_task_id: Some("tsk_1".to_owned()),
+                ci_attempt_id: Some("att_1".to_owned()),
+                details_url: Some("https://ci.example/tasks/tsk_1".to_owned()),
+            };
+            let cond = super::Condition::try_from(model).expect("supported CiStatus converts");
+            assert_eq!(cond.result, expected, "raw status: {raw}");
+            assert_eq!(cond.raw_status.as_deref(), Some(raw));
+            assert_eq!(
+                cond.commit_id.as_deref(),
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            );
+            assert_eq!(cond.head_revision, Some(3));
+            assert_eq!(cond.ci_generation, Some(9));
+            assert_eq!(cond.ci_task_id.as_deref(), Some("tsk_1"));
+            assert_eq!(cond.ci_attempt_id.as_deref(), Some("att_1"));
+            assert_eq!(
+                cond.details_url.as_deref(),
+                Some("https://ci.example/tasks/tsk_1")
+            );
+        }
+
+        // Legacy non-CI check rows omit zero/empty optional CI metadata cleanly.
+        let legacy = check_result::Model {
+            id: 2,
+            created_at: now,
+            updated_at: now,
+            path: "/project/demo".to_owned(),
+            cl_link: "CL123456".to_owned(),
+            commit_id: String::new(),
+            check_type_code: CheckTypeEnum::CommitMessage,
+            status: "PASSED".to_owned(),
+            message: "ok".to_owned(),
+            head_revision: 0,
+            ci_generation: 0,
+            ci_task_id: None,
+            ci_attempt_id: None,
+            details_url: None,
+        };
+        let legacy_json: Value = serde_json::to_value(
+            super::Condition::try_from(legacy).expect("supported CommitMessage converts"),
+        )
+        .unwrap();
+        assert_eq!(legacy_json["result"], "PASSED");
+        assert_eq!(legacy_json["raw_status"], "PASSED");
+        assert!(legacy_json.get("commit_id").is_none());
+        assert!(legacy_json.get("head_revision").is_none());
+        assert!(legacy_json.get("ci_task_id").is_none());
+        assert!(legacy_json.get("ci_attempt_id").is_none());
+        assert!(legacy_json.get("ci_generation").is_none());
+        assert!(legacy_json.get("details_url").is_none());
+
+        // Retired enum variants (CodeReview / ClaSign) must return Err without panicking.
+        for retired in [CheckTypeEnum::CodeReview, CheckTypeEnum::ClaSign] {
+            let retired_model = check_result::Model {
+                id: 3,
+                created_at: now,
+                updated_at: now,
+                path: "/project/demo".to_owned(),
+                cl_link: "CL123456".to_owned(),
+                commit_id: String::new(),
+                check_type_code: retired,
+                status: "PASSED".to_owned(),
+                message: "retired".to_owned(),
+                head_revision: 0,
+                ci_generation: 0,
+                ci_task_id: None,
+                ci_attempt_id: None,
+                details_url: None,
+            };
+            assert!(
+                super::Condition::try_from(retired_model).is_err(),
+                "retired check type must return Err instead of panicking"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_box_res_requires_all_conditions_passed() {
+        use crate::ceres::merge_checker::{CheckType, ConditionResult};
+
+        let make = |result: ConditionResult| super::Condition {
+            condition_type: CheckType::CiStatus,
+            display_name: "Ci status".to_owned(),
+            description: "desc".to_owned(),
+            message: "msg".to_owned(),
+            result,
+            commit_id: None,
+            head_revision: None,
+            ci_task_id: None,
+            ci_attempt_id: None,
+            ci_generation: None,
+            details_url: None,
+            raw_status: None,
+        };
+
+        let all_passed = super::MergeBoxRes::from_condition(vec![make(ConditionResult::PASSED)]);
+        assert_eq!(
+            all_passed.merge_requirements.unwrap().state,
+            super::RequirementsState::MERGEABLE
+        );
+
+        let with_pending = super::MergeBoxRes::from_condition(vec![
+            make(ConditionResult::PASSED),
+            make(ConditionResult::PENDING),
+        ]);
+        assert_eq!(
+            with_pending.merge_requirements.unwrap().state,
+            super::RequirementsState::UNMERGEABLE
+        );
+
+        let with_failed = super::MergeBoxRes::from_condition(vec![
+            make(ConditionResult::PASSED),
+            make(ConditionResult::FAILED),
+        ]);
+        assert_eq!(
+            with_failed.merge_requirements.unwrap().state,
+            super::RequirementsState::UNMERGEABLE
+        );
+    }
+
+    #[test]
+    fn cl_detail_and_item_res_serialize_additive_metadata() {
+        use crate::{
+            callisto::{mega_cl, sea_orm_active_enums::MergeStatusEnum},
+            ceres::model::issue::ItemRes,
+            jupiter::model::{
+                cl_dto::CLDetails,
+                common::{ItemDetails, ItemKind},
+            },
+        };
+
+        let now = chrono::Utc::now().naive_utc();
+        let cl = mega_cl::Model {
+            id: 42,
+            link: "CLDTO001".to_owned(),
+            title: "add ci pipeline".to_owned(),
+            merge_date: None,
+            status: MergeStatusEnum::Open,
+            path: "/project/buck2_test".to_owned(),
+            from_hash: "1111111111111111111111111111111111111111".to_owned(),
+            to_hash: "2222222222222222222222222222222222222222".to_owned(),
+            created_at: now,
+            updated_at: now,
+            username: "alice".to_owned(),
+            base_branch: "main".to_owned(),
+            revision: 4,
+            head_revision: 5,
+        };
+
+        let detail = super::CLDetailRes::from(CLDetails {
+            username: "viewer".to_owned(),
+            cl: cl.clone(),
+            conversations: vec![],
+        });
+        let detail_json: Value = serde_json::to_value(detail).unwrap();
+        assert_eq!(detail_json["link"], "CLDTO001");
+        assert_eq!(detail_json["path"], "/project/buck2_test");
+        assert_eq!(
+            detail_json["from_hash"],
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            detail_json["to_hash"],
+            "2222222222222222222222222222222222222222"
+        );
+        assert_eq!(detail_json["head_revision"], 5);
+        assert_eq!(detail_json["base_branch"], "main");
+        assert_eq!(detail_json["author"], "alice");
+
+        let item = ItemRes::from(ItemDetails {
+            item: ItemKind::Cl(cl),
+            comment_num: 3,
+        });
+        let item_json: Value = serde_json::to_value(item).unwrap();
+        assert_eq!(item_json["link"], "CLDTO001");
+        assert_eq!(item_json["path"], "/project/buck2_test");
+        assert_eq!(
+            item_json["from_hash"],
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            item_json["to_hash"],
+            "2222222222222222222222222222222222222222"
+        );
+        assert_eq!(item_json["head_revision"], 5);
+        assert_eq!(item_json["base_branch"], "main");
+        assert_eq!(item_json["author"], "alice");
+        assert_eq!(item_json["comment_num"], 3);
     }
 }
