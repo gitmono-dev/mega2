@@ -74,6 +74,47 @@ pub struct Config {
     /// of this section.
     #[serde(default)]
     pub traces: TracesConfig,
+    /// External CI check callback verification and merge gate (`[ci_checks]`, `CLB-11`).
+    /// Default disabled (`enabled = false`) for safe backward compatibility.
+    #[serde(default)]
+    pub ci_checks: CiChecksConfig,
+}
+
+pub const CI_CHECKS_MIN_HMAC_SECRET_BYTES: usize = 32;
+pub const CI_CHECKS_DEFAULT_MAX_SKEW_SECS: u64 = 300;
+pub const CI_CHECKS_DEFAULT_NONCE_RETENTION_SECS: u64 = 604_800;
+pub const CI_CHECKS_MIN_NONCE_RETENTION_SECS: u64 = 604_800;
+
+/// `[ci_checks]` external CI callback verification and merge-gate configuration.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CiChecksConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub hmac_secret: Option<secret::SecretString>,
+    #[serde(default = "default_ci_checks_max_skew_secs")]
+    pub max_skew_secs: u64,
+    #[serde(default = "default_ci_checks_nonce_retention_secs")]
+    pub nonce_retention_secs: u64,
+}
+
+fn default_ci_checks_max_skew_secs() -> u64 {
+    CI_CHECKS_DEFAULT_MAX_SKEW_SECS
+}
+
+fn default_ci_checks_nonce_retention_secs() -> u64 {
+    CI_CHECKS_DEFAULT_NONCE_RETENTION_SECS
+}
+
+impl Default for CiChecksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hmac_secret: None,
+            max_skew_secs: CI_CHECKS_DEFAULT_MAX_SKEW_SECS,
+            nonce_retention_secs: CI_CHECKS_DEFAULT_NONCE_RETENTION_SECS,
+        }
+    }
 }
 
 /// `[traces]` enablement and identity. Scope is an optional operator label.

@@ -48,6 +48,14 @@ pub fn redact_object_storage_endpoint(input: &str) -> String {
     redact_url(input)
 }
 
+/// Completely masks `ci_checks.hmac_secret` for logs and diagnostics without revealing any prefix.
+pub fn redact_ci_checks_hmac_secret(secret: Option<&super::secret::SecretString>) -> &'static str {
+    match secret {
+        Some(_) => REDACTED,
+        None => "<unset>",
+    }
+}
+
 pub fn redact_secret_value(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.chars().count() <= 4 {
@@ -174,5 +182,44 @@ mod tests {
     fn redact_secret_value_counts_chars_not_bytes_for_non_ascii() {
         assert_eq!(redact_secret_value("你好"), REDACTED);
         assert_eq!(redact_secret_value("你好世界xyz"), "你好世界***");
+    }
+
+    #[test]
+    fn ci_checks_hmac_secret_is_fully_redacted_in_debug_serialize_and_logs() {
+        let secret_plain = "super-secret-ci-hmac-key-0123456789abcdef";
+        let cfg = crate::config::CiChecksConfig {
+            enabled: true,
+            hmac_secret: Some(crate::config::secret::SecretString::new(secret_plain)),
+            max_skew_secs: 300,
+            nonce_retention_secs: 604_800,
+        };
+
+        let dbg_out = format!("{cfg:?}");
+        assert!(
+            !dbg_out.contains(secret_plain),
+            "Debug leaked secret: {dbg_out}"
+        );
+        assert!(
+            !dbg_out.contains("super-secret"),
+            "Debug leaked prefix: {dbg_out}"
+        );
+        assert!(dbg_out.contains(REDACTED), "{dbg_out}");
+
+        let json_out = serde_json::to_string(&cfg).expect("serialize CiChecksConfig");
+        assert!(
+            !json_out.contains(secret_plain),
+            "JSON leaked secret: {json_out}"
+        );
+        assert!(
+            !json_out.contains("super-secret"),
+            "JSON leaked prefix: {json_out}"
+        );
+        assert!(json_out.contains(REDACTED), "{json_out}");
+
+        assert_eq!(
+            redact_ci_checks_hmac_secret(cfg.hmac_secret.as_ref()),
+            REDACTED
+        );
+        assert_eq!(redact_ci_checks_hmac_secret(None), "<unset>");
     }
 }

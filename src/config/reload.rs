@@ -690,6 +690,30 @@ fn collect_static_restart_fields(
     collect_storage_events_restart_fields(current, candidate, report);
     collect_github_sync_restart_fields(current, candidate, report);
     collect_traces_restart_fields(current, candidate, report);
+    collect_ci_checks_restart_fields(current, candidate, report);
+}
+
+fn collect_ci_checks_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.ci_checks.enabled != candidate.ci_checks.enabled {
+        report.restart_required_fields.push("ci_checks.enabled");
+    }
+    if current.ci_checks.hmac_secret != candidate.ci_checks.hmac_secret {
+        report.restart_required_fields.push("ci_checks.hmac_secret");
+    }
+    if current.ci_checks.max_skew_secs != candidate.ci_checks.max_skew_secs {
+        report
+            .restart_required_fields
+            .push("ci_checks.max_skew_secs");
+    }
+    if current.ci_checks.nonce_retention_secs != candidate.ci_checks.nonce_retention_secs {
+        report
+            .restart_required_fields
+            .push("ci_checks.nonce_retention_secs");
+    }
 }
 
 fn preserve_traces_deployment_id(current: &Config, next: &mut Config) {

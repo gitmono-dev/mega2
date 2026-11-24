@@ -147,6 +147,7 @@ impl Config {
             github_sync: GithubSyncConfig::default(),
             cedar: CedarConfig::default(),
             traces: TracesConfig::default(),
+            ci_checks: CiChecksConfig::default(),
         }
     }
 

@@ -8,7 +8,8 @@ use toml::Value;
 use url::Url;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig,
+    ArtifactGcConfig, BlameConfig, BuckConfig, CI_CHECKS_MIN_HMAC_SECRET_BYTES,
+    CI_CHECKS_MIN_NONCE_RETENTION_SECS, CedarConfig, CiChecksConfig, Config, DbConfig, GitConfig,
     GithubSyncConfig, LFSConfig, LogConfig, MonoConfig, MonoObjectFormat, Mst2Config,
     NotificationConfig, OAuthConfig, PackConfig, PushAuth, PushPolicy, RedisConfig, TracesConfig,
     VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
@@ -146,9 +147,39 @@ impl Config {
         validate_storage_events_config(self)?;
         validate_github_sync_config(self)?;
         validate_traces_config(&self.traces)?;
+        validate_ci_checks_config(&self.ci_checks)?;
 
         Ok(())
     }
+}
+
+fn validate_ci_checks_config(config: &CiChecksConfig) -> Result<(), MegaError> {
+    if config.nonce_retention_secs < CI_CHECKS_MIN_NONCE_RETENTION_SECS {
+        return Err(MegaError::Other(format!(
+            "ci_checks.nonce_retention_secs must be >= {} seconds (7 days), got {}",
+            CI_CHECKS_MIN_NONCE_RETENTION_SECS, config.nonce_retention_secs
+        )));
+    }
+    if config.max_skew_secs == 0 {
+        return Err(MegaError::Other(
+            "ci_checks.max_skew_secs must be >= 1 second".to_string(),
+        ));
+    }
+    if config.enabled {
+        let Some(secret) = config.hmac_secret.as_ref() else {
+            return Err(MegaError::Other(
+                "ci_checks.hmac_secret is required when ci_checks.enabled is true".to_string(),
+            ));
+        };
+        let raw = secret.expose_secret();
+        if raw.trim().is_empty() || raw.len() < CI_CHECKS_MIN_HMAC_SECRET_BYTES {
+            return Err(MegaError::Other(format!(
+                "ci_checks.hmac_secret must be at least {} bytes when ci_checks.enabled is true",
+                CI_CHECKS_MIN_HMAC_SECRET_BYTES
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_traces_config(config: &TracesConfig) -> Result<(), MegaError> {
@@ -1985,6 +2016,7 @@ fn is_sensitive_source_field_path(field_path: &str) -> bool {
             | "object_storage.s3.endpoint_url"
             | "object_storage.s3.public_endpoint_url"
             | "notification.webhook.token_ref"
+            | "ci_checks.hmac_secret"
     )
 }
 
@@ -2159,6 +2191,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "github_sync",
             "cedar",
             "traces",
+            "ci_checks",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -2306,6 +2339,12 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
         ]),
         "github_sync.bindings" => Some(&["id", "path", "remote"]),
         "cedar" => Some(&["enforcement"]),
+        "ci_checks" => Some(&[
+            "enabled",
+            "hmac_secret",
+            "max_skew_secs",
+            "nonce_retention_secs",
+        ]),
         _ => None,
     }
 }
@@ -4147,6 +4186,86 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("build"), "{message}");
         assert!(message.contains("orion_server"), "{message}");
+    }
+
+    #[test]
+    fn ci_checks_config_defaults_bounds_and_secret_validation_fail_closed() {
+        let mut config = valid_config();
+        assert!(!config.ci_checks.enabled);
+        assert!(config.ci_checks.hmac_secret.is_none());
+        assert_eq!(config.ci_checks.max_skew_secs, 300);
+        assert_eq!(config.ci_checks.nonce_retention_secs, 604_800);
+        config.validate().expect("default disabled ci_checks valid");
+
+        // Receiver replay retention lower bound (< 7d) rejected even when disabled.
+        config.ci_checks.nonce_retention_secs = 604_799;
+        let err = config
+            .validate()
+            .expect_err("nonce_retention_secs < 604800 must fail closed");
+        assert!(err.to_string().contains("nonce_retention_secs"), "{err}");
+        config.ci_checks.nonce_retention_secs = 604_800;
+
+        // Zero skew rejected.
+        config.ci_checks.max_skew_secs = 0;
+        let err = config
+            .validate()
+            .expect_err("max_skew_secs == 0 must fail closed");
+        assert!(err.to_string().contains("max_skew_secs"), "{err}");
+        config.ci_checks.max_skew_secs = 300;
+
+        // Enabled without secret rejected.
+        config.ci_checks.enabled = true;
+        let err = config
+            .validate()
+            .expect_err("enabled ci_checks without hmac_secret must fail closed");
+        assert!(err.to_string().contains("ci_checks.hmac_secret"), "{err}");
+
+        // Enabled with < 32 byte secret rejected without leaking secret value.
+        let short_secret = "too-short-ci-secret-31-bytes-xx";
+        assert_eq!(short_secret.len(), 31);
+        config.ci_checks.hmac_secret = Some(crate::config::secret::SecretString::new(short_secret));
+        let err = config
+            .validate()
+            .expect_err("31-byte hmac_secret must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("at least 32 bytes"), "{msg}");
+        assert!(
+            !msg.contains(short_secret),
+            "validation error must never leak hmac_secret: {msg}"
+        );
+
+        // Enabled with 32-byte secret passes.
+        config.ci_checks.hmac_secret = Some(crate::config::secret::SecretString::new(
+            "0123456789abcdef0123456789abcdef",
+        ));
+        config
+            .validate()
+            .expect("enabled ci_checks with 32-byte secret must pass");
+
+        // Known fields & sensitive path registration.
+        assert!(known_fields("").unwrap().contains(&"ci_checks"));
+        assert_eq!(
+            known_fields("ci_checks").unwrap(),
+            &[
+                "enabled",
+                "hmac_secret",
+                "max_skew_secs",
+                "nonce_retention_secs"
+            ]
+        );
+        assert!(is_sensitive_source_field_path("ci_checks.hmac_secret"));
+
+        // Unknown field under [ci_checks] rejected.
+        let unknown = toml::from_str::<Value>(
+            r#"
+            [ci_checks]
+            enabled = false
+            rogue_key = true
+            "#,
+        )
+        .unwrap();
+        let err = reject_unknown_fields(&unknown).expect_err("unknown ci_checks key must fail");
+        assert!(err.to_string().contains("ci_checks.rogue_key"), "{err}");
     }
 
     #[test]

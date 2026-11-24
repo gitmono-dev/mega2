@@ -350,6 +350,7 @@ impl TestConfigBuilder {
             github_sync: crate::config::GithubSyncConfig::default(),
             cedar: CedarConfig::default(),
             traces: crate::config::TracesConfig::default(),
+            ci_checks: crate::config::CiChecksConfig::default(),
         }
     }
 }
