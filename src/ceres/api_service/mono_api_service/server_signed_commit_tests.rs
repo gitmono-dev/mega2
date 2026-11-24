@@ -1417,6 +1417,7 @@ async fn enqueue_merge_row(storage: &Storage, cl: &mega_cl::Model) -> i64 {
         execution_actor: "gate-tester".into(),
         apply_queue_execution_decision: false,
         requester: Some("gate-tester".into()),
+        expected_head_revision: Some(cl.head_revision),
     };
     let old_id = storage
         .mono_storage()

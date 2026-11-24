@@ -1088,6 +1088,7 @@ mod merge_acl_unavailable {
                     "execution_actor": "system",
                     "apply_queue_execution_decision": true,
                     "requester": "un19-admin",
+                    "expected_head_revision": 1,
                 }),
             })
             .await
@@ -1206,6 +1207,7 @@ mod merge_authz_freeze {
                     "execution_actor": "system",
                     "apply_queue_execution_decision": true,
                     "requester": requester,
+                    "expected_head_revision": 1,
                 }),
             })
             .await

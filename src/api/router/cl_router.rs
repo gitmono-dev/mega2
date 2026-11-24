@@ -1042,6 +1042,98 @@ async fn update_branch(
     Ok(Json(CommonResult::success(Some(new_head))))
 }
 
+fn build_merge_box_res(
+    cl: &crate::callisto::mega_cl::Model,
+    rows: Vec<crate::callisto::check_result::Model>,
+    ci_checks_enabled: bool,
+) -> MergeBoxRes {
+    use crate::{
+        callisto::sea_orm_active_enums::CheckTypeEnum,
+        ceres::merge_checker::{CheckType, ConditionResult},
+    };
+
+    if cl.status != MergeStatusEnum::Open {
+        return MergeBoxRes {
+            merge_requirements: None,
+        };
+    }
+
+    if !ci_checks_enabled {
+        let check_res: Vec<Condition> = rows
+            .into_iter()
+            .filter_map(|m| Condition::try_from(m).ok())
+            .collect();
+        return MergeBoxRes::from_condition(check_res);
+    }
+
+    let mut conditions = Vec::with_capacity(rows.len() + 1);
+    let mut ci_row: Option<crate::callisto::check_result::Model> = None;
+    for row in rows {
+        if row.check_type_code == CheckTypeEnum::CiStatus {
+            ci_row = Some(row);
+        } else if let Ok(cond) = Condition::try_from(row) {
+            conditions.push(cond);
+        }
+    }
+
+    let ci_condition = match ci_row {
+        Some(row) if row.head_revision == cl.head_revision && row.commit_id == cl.to_hash => {
+            match Condition::try_from(row) {
+                Ok(cond) => cond,
+                Err(()) => Condition {
+                    condition_type: CheckType::CiStatus,
+                    display_name: CheckType::CiStatus.display_name().to_owned(),
+                    description: CheckType::CiStatus.description().to_owned(),
+                    message: "Invalid CI check row".to_owned(),
+                    result: ConditionResult::FAILED,
+                    commit_id: Some(cl.to_hash.clone()),
+                    head_revision: Some(cl.head_revision),
+                    ci_task_id: None,
+                    ci_attempt_id: None,
+                    ci_generation: None,
+                    details_url: None,
+                    raw_status: None,
+                },
+            }
+        }
+        stale_or_missing => {
+            let is_invalidated = stale_or_missing
+                .as_ref()
+                .is_some_and(|r| r.status == "INVALIDATED");
+            let message = if is_invalidated {
+                "CI check invalidated by CL head update; awaiting new run".to_owned()
+            } else if stale_or_missing.is_some() {
+                "CI check is for an older CL revision; awaiting check for current head".to_owned()
+            } else {
+                "Awaiting CI check for current CL head".to_owned()
+            };
+            Condition {
+                condition_type: CheckType::CiStatus,
+                display_name: CheckType::CiStatus.display_name().to_owned(),
+                description: CheckType::CiStatus.description().to_owned(),
+                message,
+                result: ConditionResult::PENDING,
+                commit_id: Some(cl.to_hash.clone()),
+                head_revision: Some(cl.head_revision),
+                ci_task_id: None,
+                ci_attempt_id: None,
+                ci_generation: stale_or_missing
+                    .as_ref()
+                    .and_then(|r| (r.ci_generation > 0).then_some(r.ci_generation)),
+                details_url: None,
+                raw_status: Some(if is_invalidated {
+                    "INVALIDATED".to_owned()
+                } else {
+                    "PENDING".to_owned()
+                }),
+            }
+        }
+    };
+    conditions.push(ci_condition);
+
+    MergeBoxRes::from_condition(conditions)
+}
+
 /// Get Merge Box to check merge status
 #[utoipa::path(
     get,
@@ -1065,21 +1157,12 @@ async fn merge_box(
         .await?
         .ok_or(MegaError::Other("CL Not Found".to_string()))?;
 
-    let res = match cl.status {
-        MergeStatusEnum::Open => {
-            let check_res: Vec<Condition> = state
-                .cl_stg()
-                .get_check_result(&link)
-                .await?
-                .into_iter()
-                .filter_map(|m| Condition::try_from(m).ok())
-                .collect();
-            MergeBoxRes::from_condition(check_res)
-        }
-        MergeStatusEnum::Draft | MergeStatusEnum::Merged | MergeStatusEnum::Closed => MergeBoxRes {
-            merge_requirements: None,
-        },
+    let rows = if cl.status == MergeStatusEnum::Open {
+        state.cl_stg().get_check_result(&link).await?
+    } else {
+        Vec::new()
     };
+    let res = build_merge_box_res(&cl, rows, state.storage.config().ci_checks.enabled);
     Ok(Json(CommonResult::success(Some(res))))
 }
 
@@ -2578,5 +2661,123 @@ mod cl_commits_tests {
             assert_eq!(cc.as_deref(), Some("no-store"));
             assert_eq!(json["code"], "ci_authz_denied");
         }
+    }
+
+    #[test]
+    fn ci_merge_gate_merge_box_synthesizes_pending_when_enabled() {
+        use super::build_merge_box_res;
+        use crate::{
+            callisto::{check_result, mega_cl, sea_orm_active_enums::CheckTypeEnum},
+            ceres::{
+                merge_checker::{CheckType, ConditionResult},
+                model::change_list::RequirementsState,
+            },
+        };
+
+        let now = chrono::Utc::now().naive_utc();
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let cl = mega_cl::Model {
+            id: 1,
+            link: "CLMBOX1".to_owned(),
+            title: "merge box test".to_owned(),
+            merge_date: None,
+            status: MergeStatusEnum::Open,
+            path: "/project/demo".to_owned(),
+            from_hash: "0000000000000000000000000000000000000001".to_owned(),
+            to_hash: sha_a.to_owned(),
+            created_at: now,
+            updated_at: now,
+            username: "alice".to_owned(),
+            base_branch: "main".to_owned(),
+            revision: 2,
+            head_revision: 3,
+        };
+
+        // 1. ci_checks.enabled == false: missing CiStatus does not block mergeability.
+        let disabled = build_merge_box_res(&cl, vec![], false);
+        let req = disabled.merge_requirements.unwrap();
+        assert_eq!(req.state, RequirementsState::MERGEABLE);
+        assert!(req.conditions.is_empty());
+
+        // 2. ci_checks.enabled == true, missing CiStatus -> synthesized PENDING + UNMERGEABLE.
+        let missing = build_merge_box_res(&cl, vec![], true);
+        let req = missing.merge_requirements.unwrap();
+        assert_eq!(req.state, RequirementsState::UNMERGEABLE);
+        assert_eq!(req.conditions.len(), 1);
+        assert_eq!(req.conditions[0].condition_type, CheckType::CiStatus);
+        assert_eq!(req.conditions[0].result, ConditionResult::PENDING);
+        assert_eq!(req.conditions[0].head_revision, Some(3));
+        assert_eq!(req.conditions[0].commit_id.as_deref(), Some(sha_a));
+
+        // 3. Stale head_revision (A->B->A: same commit_id sha_a, old head_revision=1) -> synthesized PENDING + UNMERGEABLE.
+        let stale_rev = check_result::Model {
+            id: 10,
+            created_at: now,
+            updated_at: now,
+            path: cl.path.clone(),
+            cl_link: cl.link.clone(),
+            commit_id: sha_a.to_owned(),
+            check_type_code: CheckTypeEnum::CiStatus,
+            status: "PASSED".to_owned(),
+            message: "old green".to_owned(),
+            head_revision: 1,
+            ci_generation: 4,
+            ci_task_id: Some("tsk_old".to_owned()),
+            ci_attempt_id: Some("att_old".to_owned()),
+            details_url: None,
+        };
+        let stale_rev_box = build_merge_box_res(&cl, vec![stale_rev], true);
+        let req = stale_rev_box.merge_requirements.unwrap();
+        assert_eq!(req.state, RequirementsState::UNMERGEABLE);
+        assert_eq!(req.conditions.len(), 1);
+        assert_eq!(req.conditions[0].result, ConditionResult::PENDING);
+        assert_eq!(req.conditions[0].raw_status.as_deref(), Some("PENDING"));
+
+        // 4. Stale commit_id (head_revision matches 3, commit_id is sha_b) -> synthesized PENDING + UNMERGEABLE.
+        let stale_commit = check_result::Model {
+            id: 11,
+            created_at: now,
+            updated_at: now,
+            path: cl.path.clone(),
+            cl_link: cl.link.clone(),
+            commit_id: sha_b.to_owned(),
+            check_type_code: CheckTypeEnum::CiStatus,
+            status: "PASSED".to_owned(),
+            message: "wrong commit".to_owned(),
+            head_revision: 3,
+            ci_generation: 5,
+            ci_task_id: None,
+            ci_attempt_id: None,
+            details_url: None,
+        };
+        let stale_commit_box = build_merge_box_res(&cl, vec![stale_commit], true);
+        let req = stale_commit_box.merge_requirements.unwrap();
+        assert_eq!(req.state, RequirementsState::UNMERGEABLE);
+        assert_eq!(req.conditions[0].result, ConditionResult::PENDING);
+
+        // 5. Exact match PASSED -> MERGEABLE.
+        let exact_pass = check_result::Model {
+            id: 12,
+            created_at: now,
+            updated_at: now,
+            path: cl.path.clone(),
+            cl_link: cl.link.clone(),
+            commit_id: sha_a.to_owned(),
+            check_type_code: CheckTypeEnum::CiStatus,
+            status: "PASSED".to_owned(),
+            message: "green".to_owned(),
+            head_revision: 3,
+            ci_generation: 6,
+            ci_task_id: Some("tsk_3".to_owned()),
+            ci_attempt_id: Some("att_3".to_owned()),
+            details_url: Some("https://ci.example/tasks/tsk_3".to_owned()),
+        };
+        let passed_box = build_merge_box_res(&cl, vec![exact_pass], true);
+        let req = passed_box.merge_requirements.unwrap();
+        assert_eq!(req.state, RequirementsState::MERGEABLE);
+        assert_eq!(req.conditions.len(), 1);
+        assert_eq!(req.conditions[0].result, ConditionResult::PASSED);
+        assert_eq!(req.conditions[0].ci_task_id.as_deref(), Some("tsk_3"));
     }
 }

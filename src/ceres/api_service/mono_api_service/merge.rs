@@ -57,7 +57,8 @@ impl super::MonoApiService {
             return Err(GitError::CustomError("ref hash conflict".to_owned()));
         }
 
-        self.ensure_gpg_check_passed(&cl.link).await
+        self.ensure_gpg_check_passed(&cl.link).await?;
+        self.ensure_ci_check_passed(cl).await
     }
 
     pub(in crate::ceres::api_service::mono_api_service) async fn queue_merge_defers_from_hash_conflict_to_b3(
@@ -115,6 +116,7 @@ impl super::MonoApiService {
             execution_actor: execution_actor.to_owned(),
             apply_queue_execution_decision,
             requester: queue_requester,
+            expected_head_revision: Some(cl.head_revision),
         };
         let wait = self
             .storage
@@ -240,6 +242,23 @@ impl super::MonoApiService {
             )));
         }
         Ok(())
+    }
+
+    /// CLB-17 CI merge gate: when `[ci_checks].enabled == true`, require a
+    /// `CiStatus` check row matching the CL's exact `head_revision`, `to_hash`,
+    /// and `status == "PASSED"`. When disabled, this gate is a no-op.
+    pub(crate) async fn ensure_ci_check_passed(&self, cl: &mega_cl::Model) -> Result<(), GitError> {
+        if !self.storage.config().ci_checks.enabled {
+            return Ok(());
+        }
+        let ci_row = self
+            .storage
+            .cl_storage()
+            .get_ci_check_result(&cl.link)
+            .await
+            .map_err(|e| GitError::CustomError(format!("Failed to load CI check result: {e}")))?;
+        crate::jupiter::storage::cl_storage::ci_check_satisfies_cl(cl, ci_row.as_ref())
+            .map_err(GitError::CustomError)
     }
 
     /// Apply all CL changes onto the target_head in-memory and construct +
@@ -1303,5 +1322,974 @@ impl super::MonoApiService {
             tree_models,
             new_commit_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod ci_merge_gate_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use git_internal::internal::object::{
+        blob::Blob,
+        commit::Commit,
+        signature::{Signature, SignatureType},
+        tree::{Tree, TreeItem, TreeItemMode},
+    };
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter};
+    use tempfile::TempDir;
+
+    use crate::{
+        callisto::{
+            check_result, mega_cl, mega_refs,
+            sea_orm_active_enums::{CheckTypeEnum, MergeStatusEnum, PushQueueKindEnum},
+        },
+        ceres::api_service::{cache::GitObjectCache, mono_api_service::MonoApiService},
+        jupiter::{
+            service::push_queue_service::{
+                EnqueueRequest, ExecuteOutcome, ExecuteRequest, MergeExecContext, MergePayload,
+                QueueWaitResult, merge_operation_id,
+            },
+            storage::{Storage, base_storage::StorageConnector},
+            tests::test_storage_with_config,
+        },
+    };
+
+    fn make_service(storage: &Storage) -> MonoApiService {
+        let connection = ::redis::aio::ConnectionManager::new_lazy_with_config(
+            ::redis::Client::open("redis://127.0.0.1:6379").expect("redis client"),
+            ::redis::aio::ConnectionManagerConfig::new(),
+        )
+        .expect("lazy redis");
+        MonoApiService {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection,
+                prefix: "clb17-test".to_owned(),
+            }),
+        }
+    }
+
+    async fn seed_mergeable_cl(
+        ci_enabled: bool,
+        link: &str,
+    ) -> (TempDir, Storage, MonoApiService, mega_cl::Model, String) {
+        let temp = TempDir::new().expect("temp dir");
+        let mut cfg = crate::config::testing::isolated_config(temp.path().join("cfg"));
+        cfg.ci_checks.enabled = ci_enabled;
+        if ci_enabled {
+            cfg.ci_checks.hmac_secret = Some(crate::config::secret::SecretString::new(
+                "clb17-test-hmac-secret-32-bytes-minimum!",
+            ));
+        }
+        let storage = test_storage_with_config(temp.path(), cfg).await;
+        let mono = storage.mono_storage();
+
+        let base_blob = Blob::from_content("base\n");
+        let cl_blob_a = Blob::from_content("cl-a\n");
+        let cl_blob_b = Blob::from_content("cl-b\n");
+
+        let base_tree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            base_blob.id,
+            "README.md".to_owned(),
+        )])
+        .expect("base tree");
+        let cl_tree_a = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            cl_blob_a.id,
+            "README.md".to_owned(),
+        )])
+        .expect("cl tree a");
+        let cl_tree_b = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            cl_blob_b.id,
+            "README.md".to_owned(),
+        )])
+        .expect("cl tree b");
+
+        let sig = Signature::new(
+            SignatureType::Author,
+            "Tester".to_owned(),
+            "tester@example.invalid".to_owned(),
+        );
+        let base_commit = Commit::new(sig.clone(), sig.clone(), base_tree.id, vec![], "base");
+        let cl_commit_a = Commit::new(
+            sig.clone(),
+            sig.clone(),
+            cl_tree_a.id,
+            vec![base_commit.id],
+            "cl commit a",
+        );
+        let cl_commit_b = Commit::new(
+            sig.clone(),
+            sig,
+            cl_tree_b.id,
+            vec![base_commit.id],
+            "cl commit b",
+        );
+
+        mono.save_mega_commits(
+            vec![
+                base_commit.clone(),
+                cl_commit_a.clone(),
+                cl_commit_b.clone(),
+            ],
+            None,
+        )
+        .await
+        .expect("save commits");
+        mono.save_mega_trees(vec![base_tree.clone()], base_commit.id, None)
+            .await
+            .expect("save base tree");
+        mono.save_mega_trees(vec![cl_tree_a.clone()], cl_commit_a.id, None)
+            .await
+            .expect("save cl tree a");
+        mono.save_mega_trees(vec![cl_tree_b.clone()], cl_commit_b.id, None)
+            .await
+            .expect("save cl tree b");
+
+        let now = chrono::Utc::now().naive_utc();
+        mono.save_refs(
+            mega_refs::Model {
+                id: crate::callisto::entity_ext::generate_id(),
+                path: "/".to_owned(),
+                ref_name: "refs/heads/main".to_owned(),
+                ref_commit_hash: base_commit.id.to_string(),
+                ref_tree_hash: base_tree.id.to_string(),
+                created_at: now,
+                updated_at: now,
+                is_cl: false,
+            },
+            None,
+        )
+        .await
+        .expect("save main ref");
+
+        let cl = storage
+            .cl_storage()
+            .new_cl_model(
+                "/",
+                link,
+                "clb17 merge gate",
+                "main",
+                &base_commit.id.to_string(),
+                &cl_commit_a.id.to_string(),
+                "alice",
+            )
+            .await
+            .expect("create CL");
+        let service = make_service(&storage);
+        (temp, storage, service, cl, cl_commit_b.id.to_string())
+    }
+
+    async fn upsert_ci_row(
+        storage: &Storage,
+        cl: &mega_cl::Model,
+        commit_id: &str,
+        head_revision: i64,
+        status: &str,
+    ) {
+        let cl_stg = storage.cl_storage();
+        let conn = cl_stg.get_connection();
+        check_result::Entity::delete_many()
+            .filter(check_result::Column::ClLink.eq(&cl.link))
+            .filter(check_result::Column::CheckTypeCode.eq(CheckTypeEnum::CiStatus))
+            .exec(conn)
+            .await
+            .expect("clear old CiStatus");
+        let now = chrono::Utc::now().naive_utc();
+        check_result::Model {
+            id: crate::callisto::entity_ext::generate_id(),
+            created_at: now,
+            updated_at: now,
+            path: cl.path.clone(),
+            cl_link: cl.link.clone(),
+            commit_id: commit_id.to_owned(),
+            check_type_code: CheckTypeEnum::CiStatus,
+            status: status.to_owned(),
+            message: format!("ci {status}"),
+            head_revision,
+            ci_generation: 1,
+            ci_task_id: Some("tsk_1".to_owned()),
+            ci_attempt_id: Some("att_1".to_owned()),
+            details_url: None,
+        }
+        .into_active_model()
+        .insert(conn)
+        .await
+        .expect("insert CiStatus");
+    }
+
+    async fn enqueue_and_run_b3(
+        storage: &Storage,
+        service: &MonoApiService,
+        cl: &mega_cl::Model,
+        enqueued_new_id: &str,
+    ) -> ExecuteOutcome {
+        let payload = MergePayload {
+            cl_link: cl.link.clone(),
+            authz_principal: "alice".to_owned(),
+            execution_actor: "alice".to_owned(),
+            apply_queue_execution_decision: false,
+            requester: Some("alice".to_owned()),
+            expected_head_revision: Some(cl.head_revision),
+        };
+        let old_id = storage
+            .mono_storage()
+            .get_main_ref(&cl.path)
+            .await
+            .unwrap()
+            .unwrap()
+            .ref_commit_hash;
+        let id = match storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Merge,
+                operation_id: format!(
+                    "{}-{}",
+                    merge_operation_id(&cl.link),
+                    crate::callisto::entity_ext::generate_id()
+                ),
+                path: cl.path.clone(),
+                old_id,
+                new_id: enqueued_new_id.to_owned(),
+                requester: Some("alice".to_owned()),
+                payload: serde_json::to_value(&payload).unwrap(),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap()
+        {
+            crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Inserted { id }
+            | crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Adopted { id } => id,
+            other => panic!("unexpected enqueue outcome: {other:?}"),
+        };
+        assert_eq!(
+            storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+            QueueWaitResult::Ready { id }
+        );
+        let ctx = MergeExecContext {
+            storage: storage.clone(),
+            git_object_cache: service.git_object_cache.clone(),
+            abort_before_cl_status: false,
+            pause_after_apply: Duration::ZERO,
+            pause_after_apply_barrier: None,
+        };
+        storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+                Some(&ctx),
+                None,
+            )
+            .await
+            .expect("execute_b3")
+    }
+
+    #[tokio::test]
+    async fn ci_merge_gate_disabled_allows_merge_without_ci_row() {
+        let (_temp, storage, service, cl, _sha_b) = seed_mergeable_cl(false, "CLGATE00").await;
+        service
+            .ensure_merge_entry_prechecks(&cl)
+            .await
+            .expect("disabled ci_checks passes entry precheck without CiStatus");
+        let outcome = enqueue_and_run_b3(&storage, &service, &cl, &cl.to_hash).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Done { .. }),
+            "expected Done when ci_checks disabled, got {outcome:?}"
+        );
+        let merged = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.status, MergeStatusEnum::Merged);
+    }
+
+    #[tokio::test]
+    async fn ci_merge_gate_precheck_and_b3_reject_non_passed_and_stale_head_revision() {
+        let (_temp, storage, service, cl, sha_b) = seed_mergeable_cl(true, "CLGATE01").await;
+
+        // 1. Missing CiStatus row -> rejected at both precheck and B3.
+        assert!(service.ensure_merge_entry_prechecks(&cl).await.is_err());
+        let outcome = enqueue_and_run_b3(&storage, &service, &cl, &cl.to_hash).await;
+        assert!(
+            matches!(
+                outcome,
+                ExecuteOutcome::Failed {
+                    ref failure, ..
+                } if failure == "MergeFailure"
+            ),
+            "missing CiStatus must fail B3: {outcome:?}"
+        );
+
+        // 2. Non-PASSED statuses -> rejected at both precheck and B3.
+        for bad_status in ["PENDING", "RUNNING", "FAILED", "INVALIDATED", "CANCELLED"] {
+            upsert_ci_row(&storage, &cl, &cl.to_hash, cl.head_revision, bad_status).await;
+            assert!(
+                service.ensure_merge_entry_prechecks(&cl).await.is_err(),
+                "{bad_status} must fail entry precheck"
+            );
+            let outcome = enqueue_and_run_b3(&storage, &service, &cl, &cl.to_hash).await;
+            assert!(
+                matches!(
+                    outcome,
+                    ExecuteOutcome::Failed {
+                        ref failure, ..
+                    } if failure == "MergeFailure"
+                ),
+                "{bad_status} must fail B3: {outcome:?}"
+            );
+        }
+
+        // 3. Stale commit_id with PASSED -> rejected at both precheck and B3.
+        upsert_ci_row(&storage, &cl, &sha_b, cl.head_revision, "PASSED").await;
+        assert!(service.ensure_merge_entry_prechecks(&cl).await.is_err());
+        let outcome = enqueue_and_run_b3(&storage, &service, &cl, &cl.to_hash).await;
+        assert!(
+            matches!(
+                outcome,
+                ExecuteOutcome::Failed {
+                    ref failure, ..
+                } if failure == "MergeFailure"
+            ),
+            "stale commit_id must fail B3: {outcome:?}"
+        );
+
+        // 4. A->B->A: advance CL to sha_b (rev=2) then back to sha_a (rev=3), keep old PASSED row at rev=1 & sha_a.
+        let sha_a = cl.to_hash.clone();
+        let txn = storage.begin_db_transaction().await.unwrap();
+        storage
+            .cl_storage()
+            .update_cl_to_hash_in_txn(cl.clone(), &sha_b, &txn)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let cl_rev2 = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cl_rev2.head_revision, 2);
+
+        let txn = storage.begin_db_transaction().await.unwrap();
+        storage
+            .cl_storage()
+            .update_cl_to_hash_in_txn(cl_rev2, &sha_a, &txn)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let cl_rev3 = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cl_rev3.head_revision, 3);
+        assert_eq!(cl_rev3.to_hash, sha_a);
+
+        upsert_ci_row(&storage, &cl_rev3, &sha_a, 1, "PASSED").await;
+        assert!(
+            service
+                .ensure_merge_entry_prechecks(&cl_rev3)
+                .await
+                .is_err(),
+            "A->B->A old rev=1 PASSED must fail precheck"
+        );
+        let outcome = enqueue_and_run_b3(&storage, &service, &cl_rev3, &sha_a).await;
+        assert!(
+            matches!(
+                outcome,
+                ExecuteOutcome::Failed {
+                    ref failure, ..
+                } if failure == "MergeFailure"
+            ),
+            "A->B->A old rev=1 PASSED must fail B3: {outcome:?}"
+        );
+
+        // 5. Exact matching (rev=3, sha_a, PASSED) passes precheck AND completes B3 merge!
+        upsert_ci_row(&storage, &cl_rev3, &sha_a, 3, "PASSED").await;
+        service
+            .ensure_merge_entry_prechecks(&cl_rev3)
+            .await
+            .expect("exact matching PASSED passes precheck");
+        let outcome = enqueue_and_run_b3(&storage, &service, &cl_rev3, &sha_a).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Done { .. }),
+            "exact matching PASSED must complete B3: {outcome:?}"
+        );
+        let merged = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.status, MergeStatusEnum::Merged);
+    }
+
+    #[tokio::test]
+    async fn ci_merge_gate_b3_blocks_head_advance_after_enqueue_including_aba() {
+        // Part A: even with ci_checks disabled, advancing CL head A->B after enqueue blocks B3 via cl.to_hash == row.new_id.
+        {
+            let (_temp, storage, service, cl, sha_b) = seed_mergeable_cl(false, "CLGATE02").await;
+            let sha_a = cl.to_hash.clone();
+            let payload = MergePayload {
+                cl_link: cl.link.clone(),
+                authz_principal: "alice".to_owned(),
+                execution_actor: "alice".to_owned(),
+                apply_queue_execution_decision: false,
+                requester: Some("alice".to_owned()),
+                expected_head_revision: Some(cl.head_revision),
+            };
+            let old_id = storage
+                .mono_storage()
+                .get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap()
+                .ref_commit_hash;
+            let id = match storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Merge,
+                    operation_id: merge_operation_id(&cl.link),
+                    path: "/".to_owned(),
+                    old_id,
+                    new_id: sha_a.clone(),
+                    requester: Some("alice".to_owned()),
+                    payload: serde_json::to_value(&payload).unwrap(),
+                    ref_name: None,
+                    is_delete: false,
+                })
+                .await
+                .unwrap()
+            {
+                crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Inserted { id }
+                | crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Adopted { id } => id,
+                other => panic!("unexpected enqueue outcome: {other:?}"),
+            };
+
+            // Advance CL head A -> B AFTER enqueueing.
+            let txn = storage.begin_db_transaction().await.unwrap();
+            storage
+                .cl_storage()
+                .update_cl_to_hash_in_txn(cl.clone(), &sha_b, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+
+            assert_eq!(
+                storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+                QueueWaitResult::Ready { id }
+            );
+            let ctx = MergeExecContext {
+                storage: storage.clone(),
+                git_object_cache: service.git_object_cache.clone(),
+                abort_before_cl_status: false,
+                pause_after_apply: Duration::ZERO,
+                pause_after_apply_barrier: None,
+            };
+            let outcome = storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id,
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&ctx),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    ExecuteOutcome::Failed {
+                        ref failure, ..
+                    } if failure == "MergeFailure"
+                ),
+                "post-enqueue A->B must fail B3: {outcome:?}"
+            );
+            assert_eq!(
+                storage
+                    .cl_storage()
+                    .get_cl(&cl.link)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                MergeStatusEnum::Open
+            );
+        }
+
+        // Part B: with ci_checks enabled, enqueue at (rev=1, A, PASSED), then advance A->B->A (rev=3, A) with invalidation -> B3 blocks!
+        {
+            let (_temp, storage, service, cl, sha_b) = seed_mergeable_cl(true, "CLGATE03").await;
+            let sha_a = cl.to_hash.clone();
+            upsert_ci_row(&storage, &cl, &sha_a, 1, "PASSED").await;
+            service
+                .ensure_merge_entry_prechecks(&cl)
+                .await
+                .expect("rev=1 PASSED passes entry precheck");
+
+            let payload = MergePayload {
+                cl_link: cl.link.clone(),
+                authz_principal: "alice".to_owned(),
+                execution_actor: "alice".to_owned(),
+                apply_queue_execution_decision: false,
+                requester: Some("alice".to_owned()),
+                expected_head_revision: Some(cl.head_revision),
+            };
+            let old_id = storage
+                .mono_storage()
+                .get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap()
+                .ref_commit_hash;
+            let id = match storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Merge,
+                    operation_id: merge_operation_id(&cl.link),
+                    path: "/".to_owned(),
+                    old_id,
+                    new_id: sha_a.clone(),
+                    requester: Some("alice".to_owned()),
+                    payload: serde_json::to_value(&payload).unwrap(),
+                    ref_name: None,
+                    is_delete: false,
+                })
+                .await
+                .unwrap()
+            {
+                crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Inserted { id }
+                | crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Adopted { id } => id,
+                other => panic!("unexpected enqueue outcome: {other:?}"),
+            };
+
+            // Advance A -> B (rev=2, invalidate CI) then B -> A (rev=3, invalidate CI) before B3 runs.
+            let txn = storage.begin_db_transaction().await.unwrap();
+            storage
+                .cl_storage()
+                .update_cl_to_hash_in_txn(cl.clone(), &sha_b, &txn)
+                .await
+                .unwrap();
+            storage
+                .cl_storage()
+                .invalidate_ci_check_in_txn(&cl.link, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+
+            let cl_rev2 = storage
+                .cl_storage()
+                .get_cl(&cl.link)
+                .await
+                .unwrap()
+                .unwrap();
+            let txn = storage.begin_db_transaction().await.unwrap();
+            storage
+                .cl_storage()
+                .update_cl_to_hash_in_txn(cl_rev2, &sha_a, &txn)
+                .await
+                .unwrap();
+            storage
+                .cl_storage()
+                .invalidate_ci_check_in_txn(&cl.link, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+
+            assert_eq!(
+                storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+                QueueWaitResult::Ready { id }
+            );
+            let ctx = MergeExecContext {
+                storage: storage.clone(),
+                git_object_cache: service.git_object_cache.clone(),
+                abort_before_cl_status: false,
+                pause_after_apply: Duration::ZERO,
+                pause_after_apply_barrier: None,
+            };
+            let outcome = storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id,
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&ctx),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    ExecuteOutcome::Failed {
+                        ref failure, ..
+                    } if failure == "MergeFailure"
+                ),
+                "post-enqueue A->B->A must fail B3: {outcome:?}"
+            );
+            assert_eq!(
+                storage
+                    .cl_storage()
+                    .get_cl(&cl.link)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                MergeStatusEnum::Open
+            );
+        }
+
+        // Part C: ci_checks disabled, enqueue at (rev=1, A), advance A->B->A (rev=3, A) -> B3 still blocks via expected_head_revision.
+        {
+            let (_temp, storage, service, cl, sha_b) = seed_mergeable_cl(false, "CLGATE04").await;
+            let sha_a = cl.to_hash.clone();
+            let payload = MergePayload {
+                cl_link: cl.link.clone(),
+                authz_principal: "alice".to_owned(),
+                execution_actor: "alice".to_owned(),
+                apply_queue_execution_decision: false,
+                requester: Some("alice".to_owned()),
+                expected_head_revision: Some(cl.head_revision),
+            };
+            let old_id = storage
+                .mono_storage()
+                .get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap()
+                .ref_commit_hash;
+            let id = match storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Merge,
+                    operation_id: merge_operation_id(&cl.link),
+                    path: "/".to_owned(),
+                    old_id,
+                    new_id: sha_a.clone(),
+                    requester: Some("alice".to_owned()),
+                    payload: serde_json::to_value(&payload).unwrap(),
+                    ref_name: None,
+                    is_delete: false,
+                })
+                .await
+                .unwrap()
+            {
+                crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Inserted { id }
+                | crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Adopted { id } => id,
+                other => panic!("unexpected enqueue outcome: {other:?}"),
+            };
+
+            let txn = storage.begin_db_transaction().await.unwrap();
+            storage
+                .cl_storage()
+                .update_cl_to_hash_in_txn(cl.clone(), &sha_b, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            let cl_rev2 = storage
+                .cl_storage()
+                .get_cl(&cl.link)
+                .await
+                .unwrap()
+                .unwrap();
+            let txn = storage.begin_db_transaction().await.unwrap();
+            storage
+                .cl_storage()
+                .update_cl_to_hash_in_txn(cl_rev2, &sha_a, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+
+            assert_eq!(
+                storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+                QueueWaitResult::Ready { id }
+            );
+            let ctx = MergeExecContext {
+                storage: storage.clone(),
+                git_object_cache: service.git_object_cache.clone(),
+                abort_before_cl_status: false,
+                pause_after_apply: Duration::ZERO,
+                pause_after_apply_barrier: None,
+            };
+            let outcome = storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id,
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&ctx),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    ExecuteOutcome::Failed {
+                        ref failure, ..
+                    } if failure == "MergeFailure"
+                ),
+                "post-enqueue A->B->A with ci_checks disabled must fail B3: {outcome:?}"
+            );
+            assert_eq!(
+                storage
+                    .cl_storage()
+                    .get_cl(&cl.link)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                MergeStatusEnum::Open
+            );
+        }
+
+        // Part D: ci_checks enabled, enqueue at (rev=1, A, PASSED), advance A->B->A (rev=3, A) AND
+        // persist a fresh (rev=3, A, PASSED) check -> the original rev=1 queued merge must STILL fail B3.
+        {
+            let (_temp, storage, service, cl, sha_b) = seed_mergeable_cl(true, "CLGATE05").await;
+            let sha_a = cl.to_hash.clone();
+            upsert_ci_row(&storage, &cl, &sha_a, 1, "PASSED").await;
+            let payload = MergePayload {
+                cl_link: cl.link.clone(),
+                authz_principal: "alice".to_owned(),
+                execution_actor: "alice".to_owned(),
+                apply_queue_execution_decision: false,
+                requester: Some("alice".to_owned()),
+                expected_head_revision: Some(cl.head_revision),
+            };
+            let old_id = storage
+                .mono_storage()
+                .get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap()
+                .ref_commit_hash;
+            let id = match storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Merge,
+                    operation_id: merge_operation_id(&cl.link),
+                    path: "/".to_owned(),
+                    old_id,
+                    new_id: sha_a.clone(),
+                    requester: Some("alice".to_owned()),
+                    payload: serde_json::to_value(&payload).unwrap(),
+                    ref_name: None,
+                    is_delete: false,
+                })
+                .await
+                .unwrap()
+            {
+                crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Inserted { id }
+                | crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Adopted { id } => id,
+                other => panic!("unexpected enqueue outcome: {other:?}"),
+            };
+
+            let txn = storage.begin_db_transaction().await.unwrap();
+            storage
+                .cl_storage()
+                .update_cl_to_hash_in_txn(cl.clone(), &sha_b, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            let cl_rev2 = storage
+                .cl_storage()
+                .get_cl(&cl.link)
+                .await
+                .unwrap()
+                .unwrap();
+            let txn = storage.begin_db_transaction().await.unwrap();
+            storage
+                .cl_storage()
+                .update_cl_to_hash_in_txn(cl_rev2, &sha_a, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            let cl_rev3 = storage
+                .cl_storage()
+                .get_cl(&cl.link)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cl_rev3.head_revision, 3);
+            upsert_ci_row(&storage, &cl_rev3, &sha_a, 3, "PASSED").await;
+
+            assert_eq!(
+                storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+                QueueWaitResult::Ready { id }
+            );
+            let ctx = MergeExecContext {
+                storage: storage.clone(),
+                git_object_cache: service.git_object_cache.clone(),
+                abort_before_cl_status: false,
+                pause_after_apply: Duration::ZERO,
+                pause_after_apply_barrier: None,
+            };
+            let outcome = storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id,
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&ctx),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    ExecuteOutcome::Failed {
+                        ref failure, ..
+                    } if failure == "MergeFailure"
+                ),
+                "post-enqueue A->B->A even with rev=3 PASSED must fail original rev=1 queued merge: {outcome:?}"
+            );
+            assert_eq!(
+                storage
+                    .cl_storage()
+                    .get_cl(&cl.link)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                MergeStatusEnum::Open
+            );
+        }
+
+        // Part E & F: legacy queued merge payload missing `expected_head_revision` must fail closed
+        // at B3 under both ci_checks disabled and ci_checks enabled (even with a fresh rev=3 PASSED).
+        for (ci_enabled, link) in [(false, "CLGATE06"), (true, "CLGATE07")] {
+            let (_temp, storage, service, cl, sha_b) = seed_mergeable_cl(ci_enabled, link).await;
+            let sha_a = cl.to_hash.clone();
+            let old_id = storage
+                .mono_storage()
+                .get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap()
+                .ref_commit_hash;
+            let legacy_payload = serde_json::json!({
+                "cl_link": cl.link,
+                "authz_principal": "alice",
+                "execution_actor": "alice",
+                "apply_queue_execution_decision": false,
+                "requester": "alice",
+            });
+            let id = match storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Merge,
+                    operation_id: merge_operation_id(&cl.link),
+                    path: "/".to_owned(),
+                    old_id,
+                    new_id: sha_a.clone(),
+                    requester: Some("alice".to_owned()),
+                    payload: legacy_payload,
+                    ref_name: None,
+                    is_delete: false,
+                })
+                .await
+                .unwrap()
+            {
+                crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Inserted { id }
+                | crate::jupiter::storage::push_queue_storage::EnqueueOutcome::Adopted { id } => id,
+                other => panic!("unexpected enqueue outcome: {other:?}"),
+            };
+
+            // Advance A -> B -> A (rev=1 -> 2 -> 3) and seed fresh rev=3 PASSED when CI is enabled.
+            let txn = storage.begin_db_transaction().await.unwrap();
+            storage
+                .cl_storage()
+                .update_cl_to_hash_in_txn(cl.clone(), &sha_b, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            let cl_rev2 = storage
+                .cl_storage()
+                .get_cl(&cl.link)
+                .await
+                .unwrap()
+                .unwrap();
+            let txn = storage.begin_db_transaction().await.unwrap();
+            storage
+                .cl_storage()
+                .update_cl_to_hash_in_txn(cl_rev2, &sha_a, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            let cl_rev3 = storage
+                .cl_storage()
+                .get_cl(&cl.link)
+                .await
+                .unwrap()
+                .unwrap();
+            if ci_enabled {
+                upsert_ci_row(&storage, &cl_rev3, &sha_a, 3, "PASSED").await;
+            }
+
+            assert_eq!(
+                storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+                QueueWaitResult::Ready { id }
+            );
+            let ctx = MergeExecContext {
+                storage: storage.clone(),
+                git_object_cache: service.git_object_cache.clone(),
+                abort_before_cl_status: false,
+                pause_after_apply: Duration::ZERO,
+                pause_after_apply_barrier: None,
+            };
+            let outcome = storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id,
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&ctx),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    ExecuteOutcome::Failed {
+                        ref failure, ..
+                    } if failure == "MergeFailure"
+                ),
+                "legacy payload without expected_head_revision (ci_enabled={ci_enabled}) must fail closed at B3: {outcome:?}"
+            );
+            assert_eq!(
+                storage
+                    .cl_storage()
+                    .get_cl(&cl.link)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                MergeStatusEnum::Open
+            );
+        }
     }
 }

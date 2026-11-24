@@ -380,6 +380,11 @@ pub struct MergePayload {
     /// Recorded requester for UN-17 (`None` = anonymous / missing).
     #[serde(default)]
     pub requester: Option<String>,
+    /// CL `head_revision` captured at merge enqueue time (`CLB-17`). When
+    /// present, B3 rejects the queued merge if the CL head moved (including
+    /// `A -> B -> A` back to the same commit SHA) after enqueueing.
+    #[serde(default)]
+    pub expected_head_revision: Option<i64>,
 }
 
 /// Serializable push descriptor (trunk-push 1.3). `n` is the client-baseline
@@ -3281,7 +3286,7 @@ impl PushQueueService {
         let Some(cl) = ctx
             .storage
             .cl_storage()
-            .get_cl_in_txn(&payload.cl_link, &txn)
+            .get_cl_for_update_in_txn(&payload.cl_link, &txn)
             .await?
         else {
             return self
@@ -3317,6 +3322,48 @@ impl PushQueueService {
             return self
                 .b3_fail_merge(txn, row.id, "MergeFailure", "CL is already merged".into())
                 .await;
+        }
+        if cl.to_hash != row.new_id {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "MergeFailure",
+                    format!(
+                        "CL {} head commit {} changed after merge was enqueued for {}",
+                        cl.link, cl.to_hash, row.new_id
+                    ),
+                )
+                .await;
+        }
+        match payload.expected_head_revision {
+            None => {
+                return self
+                    .b3_fail_merge(
+                        txn,
+                        row.id,
+                        "MergeFailure",
+                        format!(
+                            "CL {} queued merge is missing expected_head_revision; re-enqueue merge",
+                            cl.link
+                        ),
+                    )
+                    .await;
+            }
+            Some(expected_head_revision) if cl.head_revision != expected_head_revision => {
+                return self
+                    .b3_fail_merge(
+                        txn,
+                        row.id,
+                        "MergeFailure",
+                        format!(
+                            "CL {} head_revision {} changed after merge was enqueued for head_revision {}",
+                            cl.link, cl.head_revision, expected_head_revision
+                        ),
+                    )
+                    .await;
+            }
+            Some(_) => {}
         }
 
         let mut authz_principal = payload.authz_principal.clone();
@@ -3364,6 +3411,21 @@ impl PushQueueService {
             return self
                 .b3_fail_merge(txn, row.id, "MergeFailure", error.to_string())
                 .await;
+        }
+
+        if ctx.storage.config().ci_checks.enabled {
+            let ci_row = ctx
+                .storage
+                .cl_storage()
+                .get_ci_check_result_in_txn(&cl.link, &txn)
+                .await?;
+            if let Err(reason) =
+                crate::jupiter::storage::cl_storage::ci_check_satisfies_cl(&cl, ci_row.as_ref())
+            {
+                return self
+                    .b3_fail_merge(txn, row.id, "MergeFailure", reason)
+                    .await;
+            }
         }
 
         let path_main = self

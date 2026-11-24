@@ -91,6 +91,39 @@ fn ci_status_rank(status: &str) -> i8 {
     }
 }
 
+/// Fail-closed CI merge gate predicate shared by merge entry prechecks and the
+/// locked B3 merge transaction (`CLB-17`).
+pub fn ci_check_satisfies_cl(
+    cl: &mega_cl::Model,
+    ci: Option<&check_result::Model>,
+) -> Result<(), String> {
+    let Some(row) = ci else {
+        return Err(format!(
+            "CL {} cannot be merged: required CI status check is missing",
+            cl.link
+        ));
+    };
+    if row.head_revision != cl.head_revision {
+        return Err(format!(
+            "CL {} cannot be merged: CI status check head_revision {} does not match CL head_revision {}",
+            cl.link, row.head_revision, cl.head_revision
+        ));
+    }
+    if row.commit_id != cl.to_hash {
+        return Err(format!(
+            "CL {} cannot be merged: CI status check commit {} does not match CL head commit {}",
+            cl.link, row.commit_id, cl.to_hash
+        ));
+    }
+    if row.status != "PASSED" {
+        return Err(format!(
+            "CL {} cannot be merged: CI status check is {} (expected PASSED)",
+            cl.link, row.status
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ClStorage {
     pub base: BaseStorage,
@@ -231,6 +264,44 @@ impl ClStorage {
     ) -> Result<Option<mega_cl::Model>, MegaError> {
         let model = mega_cl::Entity::find()
             .filter(mega_cl::Column::Link.eq(link))
+            .one(txn)
+            .await?;
+        Ok(model)
+    }
+
+    pub async fn get_cl_for_update_in_txn(
+        &self,
+        link: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<mega_cl::Model>, MegaError> {
+        let model = mega_cl::Entity::find()
+            .filter(mega_cl::Column::Link.eq(link))
+            .lock_exclusive()
+            .one(txn)
+            .await?;
+        Ok(model)
+    }
+
+    pub async fn get_ci_check_result(
+        &self,
+        link: &str,
+    ) -> Result<Option<check_result::Model>, MegaError> {
+        let model = check_result::Entity::find()
+            .filter(check_result::Column::ClLink.eq(link))
+            .filter(check_result::Column::CheckTypeCode.eq(CheckTypeEnum::CiStatus))
+            .one(self.get_connection())
+            .await?;
+        Ok(model)
+    }
+
+    pub async fn get_ci_check_result_in_txn(
+        &self,
+        link: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<check_result::Model>, MegaError> {
+        let model = check_result::Entity::find()
+            .filter(check_result::Column::ClLink.eq(link))
+            .filter(check_result::Column::CheckTypeCode.eq(CheckTypeEnum::CiStatus))
             .one(txn)
             .await?;
         Ok(model)
