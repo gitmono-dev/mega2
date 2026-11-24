@@ -351,6 +351,7 @@ impl TestConfigBuilder {
             cedar: CedarConfig::default(),
             traces: crate::config::TracesConfig::default(),
             ci_checks: crate::config::CiChecksConfig::default(),
+            webhook_delivery: crate::config::WebhookDeliveryConfig::default(),
         }
     }
 }

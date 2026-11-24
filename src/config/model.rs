@@ -78,6 +78,197 @@ pub struct Config {
     /// Default disabled (`enabled = false`) for safe backward compatibility.
     #[serde(default)]
     pub ci_checks: CiChecksConfig,
+    /// Outbound CL webhook delivery policy and outbox bounds (`[webhook_delivery]`, `CLB-12`).
+    /// Defaults to strict public HTTPS delivery with bounded deadlines and lease fencing.
+    #[serde(default)]
+    pub webhook_delivery: WebhookDeliveryConfig,
+}
+
+pub const WEBHOOK_DELIVERY_MIN_TOTAL_DEADLINE_SECS: u64 = 5;
+pub const WEBHOOK_DELIVERY_MAX_TOTAL_DEADLINE_SECS: u64 = 60;
+pub const WEBHOOK_DELIVERY_DEFAULT_TOTAL_DEADLINE_SECS: u64 = 60;
+pub const WEBHOOK_DELIVERY_LEASE_MARGIN_SECS: u64 = 30;
+pub const WEBHOOK_DELIVERY_DEFAULT_OUTBOX_LEASE_SECS: u64 = 90;
+pub const WEBHOOK_DELIVERY_MIN_MAX_IN_FLIGHT: usize = 1;
+pub const WEBHOOK_DELIVERY_MAX_MAX_IN_FLIGHT: usize = 16;
+pub const WEBHOOK_DELIVERY_DEFAULT_MAX_IN_FLIGHT: usize = 4;
+pub const WEBHOOK_DELIVERY_MIN_REDRIVE_AGE_SECS: u64 = 3_600;
+pub const WEBHOOK_DELIVERY_MAX_REDRIVE_AGE_SECS: u64 = 604_800;
+pub const WEBHOOK_DELIVERY_DEFAULT_REDRIVE_AGE_SECS: u64 = 604_800;
+
+/// `[webhook_delivery]` outbound delivery policy and transactional outbox limits.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WebhookDeliveryConfig {
+    #[serde(default)]
+    pub allow_http: bool,
+    #[serde(default)]
+    pub allow_loopback: bool,
+    #[serde(default)]
+    pub allowed_private_cidrs: Vec<String>,
+    #[serde(default = "default_webhook_total_deadline_secs")]
+    pub total_deadline_secs: u64,
+    #[serde(default = "default_webhook_outbox_lease_secs")]
+    pub outbox_lease_secs: u64,
+    #[serde(default = "default_webhook_max_in_flight")]
+    pub max_in_flight: usize,
+    #[serde(default = "default_webhook_max_redrive_age_secs")]
+    pub max_redrive_age_secs: u64,
+}
+
+fn default_webhook_total_deadline_secs() -> u64 {
+    WEBHOOK_DELIVERY_DEFAULT_TOTAL_DEADLINE_SECS
+}
+
+fn default_webhook_outbox_lease_secs() -> u64 {
+    WEBHOOK_DELIVERY_DEFAULT_OUTBOX_LEASE_SECS
+}
+
+fn default_webhook_max_in_flight() -> usize {
+    WEBHOOK_DELIVERY_DEFAULT_MAX_IN_FLIGHT
+}
+
+fn default_webhook_max_redrive_age_secs() -> u64 {
+    WEBHOOK_DELIVERY_DEFAULT_REDRIVE_AGE_SECS
+}
+
+impl Default for WebhookDeliveryConfig {
+    fn default() -> Self {
+        Self {
+            allow_http: false,
+            allow_loopback: false,
+            allowed_private_cidrs: Vec::new(),
+            total_deadline_secs: WEBHOOK_DELIVERY_DEFAULT_TOTAL_DEADLINE_SECS,
+            outbox_lease_secs: WEBHOOK_DELIVERY_DEFAULT_OUTBOX_LEASE_SECS,
+            max_in_flight: WEBHOOK_DELIVERY_DEFAULT_MAX_IN_FLIGHT,
+            max_redrive_age_secs: WEBHOOK_DELIVERY_DEFAULT_REDRIVE_AGE_SECS,
+        }
+    }
+}
+
+/// Parsed IPv4/IPv6 CIDR block shared by startup validation (`CLB-12`) and runtime
+/// webhook IP-pinning (`CLB-18`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedCidr {
+    V4 { network: u32, prefix_len: u8 },
+    V6 { network: u128, prefix_len: u8 },
+}
+
+impl ParsedCidr {
+    pub fn parse(raw: &str) -> Result<Self, MegaError> {
+        let trimmed = raw.trim();
+        let Some((ip_part, prefix_part)) = trimmed.split_once('/') else {
+            return Err(MegaError::Other(format!(
+                "invalid CIDR '{raw}': expected <ip>/<prefix>"
+            )));
+        };
+        if prefix_part.contains('/') {
+            return Err(MegaError::Other(format!(
+                "invalid CIDR '{raw}': unexpected extra '/'"
+            )));
+        }
+        let ip: std::net::IpAddr = ip_part
+            .parse()
+            .map_err(|_| MegaError::Other(format!("invalid IP address in CIDR '{raw}'")))?;
+        let prefix_len: u8 = prefix_part
+            .parse()
+            .map_err(|_| MegaError::Other(format!("invalid prefix length in CIDR '{raw}'")))?;
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if prefix_len > 32 {
+                    return Err(MegaError::Other(format!(
+                        "invalid IPv4 CIDR prefix length in '{raw}': must be <= 32"
+                    )));
+                }
+                let mask = ipv4_prefix_mask(prefix_len);
+                Ok(Self::V4 {
+                    network: u32::from(v4) & mask,
+                    prefix_len,
+                })
+            }
+            std::net::IpAddr::V6(v6) => {
+                if prefix_len > 128 {
+                    return Err(MegaError::Other(format!(
+                        "invalid IPv6 CIDR prefix length in '{raw}': must be <= 128"
+                    )));
+                }
+                let mask = ipv6_prefix_mask(prefix_len);
+                Ok(Self::V6 {
+                    network: u128::from(v6) & mask,
+                    prefix_len,
+                })
+            }
+        }
+    }
+
+    pub fn is_wildcard(self) -> bool {
+        match self {
+            Self::V4 { prefix_len, .. } | Self::V6 { prefix_len, .. } => prefix_len == 0,
+        }
+    }
+
+    /// Returns `true` if this CIDR overlaps `169.254.0.0/16` (or IPv4-mapped
+    /// `::ffff:169.254.0.0/112`).
+    pub fn overlaps_link_local_metadata(self) -> bool {
+        const METADATA_V4_NET: u32 = u32::from_be_bytes([169, 254, 0, 0]);
+        const METADATA_V4_PREFIX: u8 = 16;
+        const METADATA_V4_MAPPED_V6_NET: u128 = 0x0000_0000_0000_0000_0000_ffff_a9fe_0000;
+        const METADATA_V4_MAPPED_V6_PREFIX: u8 = 112;
+
+        match self {
+            Self::V4 {
+                network,
+                prefix_len,
+            } => {
+                let common = prefix_len.min(METADATA_V4_PREFIX);
+                let mask = ipv4_prefix_mask(common);
+                (network & mask) == (METADATA_V4_NET & mask)
+            }
+            Self::V6 {
+                network,
+                prefix_len,
+            } => {
+                let common = prefix_len.min(METADATA_V4_MAPPED_V6_PREFIX);
+                let mask = ipv6_prefix_mask(common);
+                (network & mask) == (METADATA_V4_MAPPED_V6_NET & mask)
+            }
+        }
+    }
+
+    pub fn contains(self, ip: std::net::IpAddr) -> bool {
+        match (self, ip) {
+            (
+                Self::V4 {
+                    network,
+                    prefix_len,
+                },
+                std::net::IpAddr::V4(v4),
+            ) => (u32::from(v4) & ipv4_prefix_mask(prefix_len)) == network,
+            (
+                Self::V6 {
+                    network,
+                    prefix_len,
+                },
+                std::net::IpAddr::V6(v6),
+            ) => (u128::from(v6) & ipv6_prefix_mask(prefix_len)) == network,
+            _ => false,
+        }
+    }
+}
+
+fn ipv4_prefix_mask(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    }
+}
+
+fn ipv6_prefix_mask(prefix_len: u8) -> u128 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix_len)
+    }
 }
 
 pub const CI_CHECKS_MIN_HMAC_SECRET_BYTES: usize = 32;

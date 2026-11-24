@@ -148,6 +148,7 @@ impl Config {
             cedar: CedarConfig::default(),
             traces: TracesConfig::default(),
             ci_checks: CiChecksConfig::default(),
+            webhook_delivery: WebhookDeliveryConfig::default(),
         }
     }
 

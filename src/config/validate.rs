@@ -11,8 +11,12 @@ use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, CI_CHECKS_MIN_HMAC_SECRET_BYTES,
     CI_CHECKS_MIN_NONCE_RETENTION_SECS, CedarConfig, CiChecksConfig, Config, DbConfig, GitConfig,
     GithubSyncConfig, LFSConfig, LogConfig, MonoConfig, MonoObjectFormat, Mst2Config,
-    NotificationConfig, OAuthConfig, PackConfig, PushAuth, PushPolicy, RedisConfig, TracesConfig,
-    VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
+    NotificationConfig, OAuthConfig, PackConfig, ParsedCidr, PushAuth, PushPolicy, RedisConfig,
+    TracesConfig, VAULT_AUDIT_SINKS, VaultConfig, WEBHOOK_DELIVERY_LEASE_MARGIN_SECS,
+    WEBHOOK_DELIVERY_MAX_MAX_IN_FLIGHT, WEBHOOK_DELIVERY_MAX_REDRIVE_AGE_SECS,
+    WEBHOOK_DELIVERY_MAX_TOTAL_DEADLINE_SECS, WEBHOOK_DELIVERY_MIN_MAX_IN_FLIGHT,
+    WEBHOOK_DELIVERY_MIN_REDRIVE_AGE_SECS, WEBHOOK_DELIVERY_MIN_TOTAL_DEADLINE_SECS,
+    WebhookDeliveryConfig, normalize_token_path,
     secret::{SecretRef, SecretResolver, is_secret_ref_value},
 };
 use crate::{
@@ -148,9 +152,66 @@ impl Config {
         validate_github_sync_config(self)?;
         validate_traces_config(&self.traces)?;
         validate_ci_checks_config(&self.ci_checks)?;
+        validate_webhook_delivery_config(&self.webhook_delivery)?;
 
         Ok(())
     }
+}
+
+fn validate_webhook_delivery_config(config: &WebhookDeliveryConfig) -> Result<(), MegaError> {
+    if !(WEBHOOK_DELIVERY_MIN_REDRIVE_AGE_SECS..=WEBHOOK_DELIVERY_MAX_REDRIVE_AGE_SECS)
+        .contains(&config.max_redrive_age_secs)
+    {
+        return Err(MegaError::Other(format!(
+            "webhook_delivery.max_redrive_age_secs must be in [{}, {}] seconds, got {}",
+            WEBHOOK_DELIVERY_MIN_REDRIVE_AGE_SECS,
+            WEBHOOK_DELIVERY_MAX_REDRIVE_AGE_SECS,
+            config.max_redrive_age_secs
+        )));
+    }
+    if !(WEBHOOK_DELIVERY_MIN_TOTAL_DEADLINE_SECS..=WEBHOOK_DELIVERY_MAX_TOTAL_DEADLINE_SECS)
+        .contains(&config.total_deadline_secs)
+    {
+        return Err(MegaError::Other(format!(
+            "webhook_delivery.total_deadline_secs must be in [{}, {}] seconds, got {}",
+            WEBHOOK_DELIVERY_MIN_TOTAL_DEADLINE_SECS,
+            WEBHOOK_DELIVERY_MAX_TOTAL_DEADLINE_SECS,
+            config.total_deadline_secs
+        )));
+    }
+    let min_lease_secs = config
+        .total_deadline_secs
+        .saturating_add(WEBHOOK_DELIVERY_LEASE_MARGIN_SECS);
+    if config.outbox_lease_secs < min_lease_secs {
+        return Err(MegaError::Other(format!(
+            "webhook_delivery.outbox_lease_secs ({}) must be >= total_deadline_secs + {} ({})",
+            config.outbox_lease_secs, WEBHOOK_DELIVERY_LEASE_MARGIN_SECS, min_lease_secs
+        )));
+    }
+    if !(WEBHOOK_DELIVERY_MIN_MAX_IN_FLIGHT..=WEBHOOK_DELIVERY_MAX_MAX_IN_FLIGHT)
+        .contains(&config.max_in_flight)
+    {
+        return Err(MegaError::Other(format!(
+            "webhook_delivery.max_in_flight must be in [{}, {}], got {}",
+            WEBHOOK_DELIVERY_MIN_MAX_IN_FLIGHT,
+            WEBHOOK_DELIVERY_MAX_MAX_IN_FLIGHT,
+            config.max_in_flight
+        )));
+    }
+    for raw_cidr in &config.allowed_private_cidrs {
+        let parsed = ParsedCidr::parse(raw_cidr)?;
+        if parsed.is_wildcard() {
+            return Err(MegaError::Other(format!(
+                "webhook_delivery.allowed_private_cidrs must not contain wildcard CIDR '{raw_cidr}'"
+            )));
+        }
+        if parsed.overlaps_link_local_metadata() {
+            return Err(MegaError::Other(format!(
+                "webhook_delivery.allowed_private_cidrs must not overlap cloud metadata range 169.254.0.0/16: '{raw_cidr}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_ci_checks_config(config: &CiChecksConfig) -> Result<(), MegaError> {
@@ -2192,6 +2253,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "cedar",
             "traces",
             "ci_checks",
+            "webhook_delivery",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -2344,6 +2406,15 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "hmac_secret",
             "max_skew_secs",
             "nonce_retention_secs",
+        ]),
+        "webhook_delivery" => Some(&[
+            "allow_http",
+            "allow_loopback",
+            "allowed_private_cidrs",
+            "total_deadline_secs",
+            "outbox_lease_secs",
+            "max_in_flight",
+            "max_redrive_age_secs",
         ]),
         _ => None,
     }
@@ -4266,6 +4337,138 @@ mod tests {
         .unwrap();
         let err = reject_unknown_fields(&unknown).expect_err("unknown ci_checks key must fail");
         assert!(err.to_string().contains("ci_checks.rogue_key"), "{err}");
+    }
+
+    #[test]
+    fn webhook_delivery_config_enforces_hard_bounds_and_rejects_wildcard_and_metadata_cidrs() {
+        let mut config = valid_config();
+        assert!(!config.webhook_delivery.allow_http);
+        assert!(!config.webhook_delivery.allow_loopback);
+        assert!(config.webhook_delivery.allowed_private_cidrs.is_empty());
+        assert_eq!(config.webhook_delivery.total_deadline_secs, 60);
+        assert_eq!(config.webhook_delivery.outbox_lease_secs, 90);
+        assert_eq!(config.webhook_delivery.max_in_flight, 4);
+        assert_eq!(config.webhook_delivery.max_redrive_age_secs, 604_800);
+        config.validate().expect("default webhook_delivery valid");
+
+        // max_redrive_age_secs bounds [3600, 604800].
+        for bad in [0, 3_599, 604_801] {
+            config.webhook_delivery.max_redrive_age_secs = bad;
+            let err = config
+                .validate()
+                .expect_err("out-of-range max_redrive_age_secs must fail");
+            assert!(err.to_string().contains("max_redrive_age_secs"), "{err}");
+        }
+        config.webhook_delivery.max_redrive_age_secs = 3_600;
+        config.validate().expect("min redrive age valid");
+        config.webhook_delivery.max_redrive_age_secs = 604_800;
+
+        // total_deadline_secs bounds [5, 60].
+        for bad in [0, 4, 61] {
+            config.webhook_delivery.total_deadline_secs = bad;
+            config.webhook_delivery.outbox_lease_secs = bad + 30;
+            let err = config
+                .validate()
+                .expect_err("out-of-range total_deadline_secs must fail");
+            assert!(err.to_string().contains("total_deadline_secs"), "{err}");
+        }
+        config.webhook_delivery.total_deadline_secs = 5;
+        config.webhook_delivery.outbox_lease_secs = 35;
+        config.validate().expect("min deadline + 30 lease valid");
+
+        // outbox_lease_secs >= total_deadline_secs + 30.
+        config.webhook_delivery.total_deadline_secs = 60;
+        config.webhook_delivery.outbox_lease_secs = 89;
+        let err = config
+            .validate()
+            .expect_err("lease < deadline + 30 must fail");
+        assert!(err.to_string().contains("outbox_lease_secs"), "{err}");
+        config.webhook_delivery.outbox_lease_secs = 90;
+
+        // max_in_flight bounds [1, 16].
+        for bad in [0, 17] {
+            config.webhook_delivery.max_in_flight = bad;
+            let err = config
+                .validate()
+                .expect_err("out-of-range max_in_flight must fail");
+            assert!(err.to_string().contains("max_in_flight"), "{err}");
+        }
+        config.webhook_delivery.max_in_flight = 1;
+        config.validate().expect("max_in_flight = 1 valid");
+        config.webhook_delivery.max_in_flight = 16;
+        config.validate().expect("max_in_flight = 16 valid");
+        config.webhook_delivery.max_in_flight = 4;
+
+        // Wildcard CIDRs rejected.
+        for wildcard in ["0.0.0.0/0", "::/0"] {
+            config.webhook_delivery.allowed_private_cidrs = vec![wildcard.to_string()];
+            let err = config
+                .validate()
+                .expect_err("wildcard CIDR must be rejected");
+            assert!(err.to_string().contains("wildcard"), "{err}");
+        }
+
+        // Cloud metadata CIDRs (exact, subnet, supernet, and IPv4-mapped IPv6) rejected.
+        for metadata in [
+            "169.254.0.0/16",
+            "169.254.169.254/32",
+            "169.254.0.0/15",
+            "169.0.0.0/8",
+            "128.0.0.0/1",
+            "::ffff:169.254.0.0/112",
+            "::ffff:169.254.169.254/128",
+        ] {
+            config.webhook_delivery.allowed_private_cidrs = vec![metadata.to_string()];
+            let err = config
+                .validate()
+                .expect_err("metadata-overlapping CIDR must be rejected");
+            assert!(err.to_string().contains("169.254.0.0/16"), "{err}");
+        }
+
+        // Malformed CIDRs rejected.
+        for bad_cidr in ["not-a-cidr", "10.0.0.0/33", "fc00::/129", "10.0.0.1"] {
+            config.webhook_delivery.allowed_private_cidrs = vec![bad_cidr.to_string()];
+            assert!(
+                config.validate().is_err(),
+                "malformed CIDR '{bad_cidr}' must be rejected"
+            );
+        }
+
+        // Legitimate private/Docker CIDRs accepted.
+        config.webhook_delivery.allowed_private_cidrs = vec![
+            "10.0.0.0/8".to_string(),
+            "172.16.0.0/12".to_string(),
+            "192.168.0.0/16".to_string(),
+            "fd00::/8".to_string(),
+        ];
+        config
+            .validate()
+            .expect("legitimate private CIDRs must pass");
+
+        // Known fields & unknown key rejection.
+        assert!(known_fields("").unwrap().contains(&"webhook_delivery"));
+        assert_eq!(
+            known_fields("webhook_delivery").unwrap(),
+            &[
+                "allow_http",
+                "allow_loopback",
+                "allowed_private_cidrs",
+                "total_deadline_secs",
+                "outbox_lease_secs",
+                "max_in_flight",
+                "max_redrive_age_secs",
+            ]
+        );
+        let unknown = toml::from_str::<Value>(
+            r#"
+            [webhook_delivery]
+            bogus = 1
+            "#,
+        )
+        .unwrap();
+        let err =
+            reject_unknown_fields(&unknown).expect_err("unknown webhook_delivery key must fail");
+        assert!(err.to_string().contains("webhook_delivery.bogus"), "{err}");
     }
 
     #[test]

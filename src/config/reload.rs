@@ -691,6 +691,55 @@ fn collect_static_restart_fields(
     collect_github_sync_restart_fields(current, candidate, report);
     collect_traces_restart_fields(current, candidate, report);
     collect_ci_checks_restart_fields(current, candidate, report);
+    collect_webhook_delivery_restart_fields(current, candidate, report);
+}
+
+fn collect_webhook_delivery_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.webhook_delivery.allow_http != candidate.webhook_delivery.allow_http {
+        report
+            .restart_required_fields
+            .push("webhook_delivery.allow_http");
+    }
+    if current.webhook_delivery.allow_loopback != candidate.webhook_delivery.allow_loopback {
+        report
+            .restart_required_fields
+            .push("webhook_delivery.allow_loopback");
+    }
+    if current.webhook_delivery.allowed_private_cidrs
+        != candidate.webhook_delivery.allowed_private_cidrs
+    {
+        report
+            .restart_required_fields
+            .push("webhook_delivery.allowed_private_cidrs");
+    }
+    if current.webhook_delivery.total_deadline_secs
+        != candidate.webhook_delivery.total_deadline_secs
+    {
+        report
+            .restart_required_fields
+            .push("webhook_delivery.total_deadline_secs");
+    }
+    if current.webhook_delivery.outbox_lease_secs != candidate.webhook_delivery.outbox_lease_secs {
+        report
+            .restart_required_fields
+            .push("webhook_delivery.outbox_lease_secs");
+    }
+    if current.webhook_delivery.max_in_flight != candidate.webhook_delivery.max_in_flight {
+        report
+            .restart_required_fields
+            .push("webhook_delivery.max_in_flight");
+    }
+    if current.webhook_delivery.max_redrive_age_secs
+        != candidate.webhook_delivery.max_redrive_age_secs
+    {
+        report
+            .restart_required_fields
+            .push("webhook_delivery.max_redrive_age_secs");
+    }
 }
 
 fn collect_ci_checks_restart_fields(
