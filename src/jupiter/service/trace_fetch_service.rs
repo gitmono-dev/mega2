@@ -664,8 +664,24 @@ mod tests {
         release: CancellationToken,
     }
 
+    fn strip_hop_by_hop_headers(headers: &mut axum::http::HeaderMap) {
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            headers.remove(name);
+        }
+    }
+
     async fn proxy(State(state): State<ProxyState>, request: Request) -> Response {
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
         if parts.method == axum::http::Method::GET {
             state.gets.lock().unwrap().push(parts.uri.path().to_owned());
             if state.blocked.load(Ordering::Acquire) {
@@ -673,6 +689,7 @@ mod tests {
                 state.release.cancelled().await;
             }
         }
+        strip_hop_by_hop_headers(&mut parts.headers);
         let bytes = axum::body::to_bytes(body, 70 * 1024 * 1024).await.unwrap();
         let response = state
             .client
@@ -683,7 +700,9 @@ mod tests {
             .await
             .unwrap();
         let mut builder = Response::builder().status(response.status());
-        *builder.headers_mut().unwrap() = response.headers().clone();
+        let mut response_headers = response.headers().clone();
+        strip_hop_by_hop_headers(&mut response_headers);
+        *builder.headers_mut().unwrap() = response_headers;
         builder
             .body(Body::from_stream(response.bytes_stream()))
             .unwrap()
@@ -704,7 +723,10 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let proxy_state = ProxyState {
-                client: reqwest::Client::new(),
+                client: reqwest::Client::builder()
+                    .pool_idle_timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
                 upstream: std::env::var("MEGA2_IT_RUSTFS_URL")
                     .unwrap_or_else(|_| "http://127.0.0.1:19000".into()),
                 gets: Arc::new(Mutex::new(Vec::new())),
@@ -835,13 +857,65 @@ mod tests {
         }
 
         async fn cleanup(mut self) {
+            use futures::{StreamExt, stream};
+            use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder};
+
             self.proxy.release.cancel();
-            for (oid, _, _) in &self.git.objects {
-                self.store
-                    .inner
-                    .delete(&object_key(&self.auth.stream_id, self.git.hash_kind(), oid).unwrap())
-                    .await
-                    .unwrap();
+            let paths: Vec<_> = self
+                .git
+                .objects
+                .iter()
+                .map(|(oid, _, _)| {
+                    object_key(&self.auth.stream_id, self.git.hash_kind(), oid)
+                        .unwrap()
+                        .to_object_store_path()
+                })
+                .collect();
+            if !paths.is_empty() {
+                // Batch-delete directly against upstream RustFS rather than sending
+                // hundreds of sequential single-object POST ?delete calls through the
+                // single-threaded test proxy, which can exceed the 30s default timeout
+                // under concurrent CI RustFS load.
+                let direct = AmazonS3Builder::new()
+                    .with_region("us-east-1")
+                    .with_bucket_name("mega2")
+                    .with_access_key_id("rustfs")
+                    .with_secret_access_key("rustfs_secret")
+                    .with_endpoint(&self.proxy.upstream)
+                    .with_virtual_hosted_style_request(false)
+                    .with_client_options(
+                        ClientOptions::new()
+                            .with_allow_http(true)
+                            .with_timeout(std::time::Duration::from_secs(60)),
+                    )
+                    .build()
+                    .expect("direct RustFS cleanup client");
+                let mut last_err = None;
+                for attempt in 0..3 {
+                    let locations = stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+                    let mut results = direct.delete_stream(locations);
+                    let mut failed = None;
+                    while let Some(res) = results.next().await {
+                        match res {
+                            Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                            Err(err) => {
+                                failed = Some(err);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(err) = failed {
+                        last_err = Some(err);
+                        tokio::time::sleep(std::time::Duration::from_millis(250 * (attempt + 1)))
+                            .await;
+                    } else {
+                        last_err = None;
+                        break;
+                    }
+                }
+                if let Some(err) = last_err {
+                    panic!("RustFS fixture cleanup failed after retries: {err}");
+                }
             }
             self.shutdown.cancel();
             self.server.take().unwrap().await.unwrap();
