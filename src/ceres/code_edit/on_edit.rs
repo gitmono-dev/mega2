@@ -34,17 +34,31 @@ impl crate::ceres::code_edit::model::CLRefUpdateVisitor for OneditVisitor {
         tree_hash: &str,
         txn: &sea_orm::DatabaseTransaction,
     ) -> Result<mega_refs::Model, MegaError> {
-        let cl_ref = mega_refs::Model::new(
-            &cl.path,
-            utils::cl_ref_name(&cl.link),
-            commit_hash.to_string(),
-            tree_hash.to_string(),
-            true,
-        );
-        self.mono_storage
-            .save_refs(cl_ref.clone(), Some(txn))
-            .await?;
-        Ok(cl_ref)
+        let ref_name = utils::cl_ref_name(&cl.link);
+        if let Some(mut cl_ref) = self
+            .mono_storage
+            .get_ref_by_name_in_txn(&ref_name, txn)
+            .await?
+        {
+            cl_ref.ref_commit_hash = commit_hash.to_string();
+            cl_ref.ref_tree_hash = tree_hash.to_string();
+            self.mono_storage
+                .update_ref(cl_ref.clone(), Some(txn))
+                .await?;
+            Ok(cl_ref)
+        } else {
+            let cl_ref = mega_refs::Model::new(
+                &cl.path,
+                ref_name,
+                commit_hash.to_string(),
+                tree_hash.to_string(),
+                true,
+            );
+            self.mono_storage
+                .save_refs(cl_ref.clone(), Some(txn))
+                .await?;
+            Ok(cl_ref)
+        }
     }
 }
 

@@ -1,22 +1,49 @@
 use crate::{
     callisto::{mega_cl, mega_refs},
     ceres::{api_service::mono_api_service::MonoApiService, code_edit::model::CLRefUpdateVisitor},
-    common::errors::MegaError,
+    common::{errors::MegaError, utils},
+    jupiter::storage::mono_storage::MonoStorage,
 };
 
 pub struct OnpushFormator;
 impl crate::ceres::code_edit::model::ConversationMessageFormater for OnpushFormator {}
 
-pub struct OnpushVisitor {}
+pub struct OnpushVisitor {
+    mono_storage: MonoStorage,
+}
 impl crate::ceres::code_edit::model::CLRefUpdateVisitor for OnpushVisitor {
     async fn visit(
         &self,
-        _: &mega_cl::Model,
-        _: &str,
-        _: &str,
-        _: &sea_orm::DatabaseTransaction,
+        cl: &mega_cl::Model,
+        commit_hash: &str,
+        tree_hash: &str,
+        txn: &sea_orm::DatabaseTransaction,
     ) -> Result<mega_refs::Model, MegaError> {
-        panic!("visit not implemented");
+        let ref_name = utils::cl_ref_name(&cl.link);
+        if let Some(mut cl_ref) = self
+            .mono_storage
+            .get_ref_by_name_in_txn(&ref_name, txn)
+            .await?
+        {
+            cl_ref.ref_commit_hash = commit_hash.to_string();
+            cl_ref.ref_tree_hash = tree_hash.to_string();
+            self.mono_storage
+                .update_ref(cl_ref.clone(), Some(txn))
+                .await?;
+            Ok(cl_ref)
+        } else {
+            let cl_ref = mega_refs::Model::new(
+                &cl.path,
+                ref_name,
+                commit_hash.to_string(),
+                tree_hash.to_string(),
+                true,
+            );
+            self.mono_storage
+                .save_refs(cl_ref.clone(), Some(txn))
+                .await?;
+            Ok(cl_ref)
+        }
     }
 }
 
@@ -27,12 +54,13 @@ impl<VT: CLRefUpdateVisitor> crate::ceres::code_edit::model::CLRefUpdateAcceptor
 {
     async fn accept(
         &self,
-        _: &VT,
-        _: &mega_cl::Model,
-        _: &str,
-        _: &str,
-        _: &sea_orm::DatabaseTransaction,
+        visitor: &VT,
+        cl: &mega_cl::Model,
+        commit_hash: &str,
+        tree_hash: &str,
+        txn: &sea_orm::DatabaseTransaction,
     ) -> Result<(), MegaError> {
+        visitor.visit(cl, commit_hash, tree_hash, txn).await?;
         Ok(())
     }
 }
@@ -56,13 +84,14 @@ impl OnpushCodeEdit {
         base_branch: &str,
         from_hash: &str,
         handler: &MonoApiService,
+        mono_storage: MonoStorage,
     ) -> Self {
         Self::new(
             repo_path,
             base_branch,
             from_hash,
             OnpushFormator {},
-            OnpushVisitor {},
+            OnpushVisitor { mono_storage },
             OnpushAcceptor {},
             OnpushChecker {},
             crate::ceres::code_edit::model::DefualtDirector {

@@ -260,11 +260,18 @@ impl<
         if to_same {
             tracing::info!("repeat commit with change_list: {}, do nothing", cl.id);
         } else {
-            // MC-04: the to_hash advance, commit-listing rebuild, CI check
-            // invalidation, and transactional CL webhook outbox enqueue share
-            // one DB transaction — neither takes effect without the other
-            // (CLB-15). The listing is the complete chain over the frozen
-            // `(from_hash, to_hash]`, never the push's increment.
+            // MC-04: the to_hash advance, commit-listing rebuild, CL ref
+            // upsert, CI check invalidation, and transactional CL webhook
+            // outbox enqueue share one DB transaction — neither takes effect
+            // without the other (CLB-15). The listing is the complete chain
+            // over the frozen `(from_hash, to_hash]`, never the push's increment.
+            let dst_commit = Commit::from_mega_model(
+                storage
+                    .mono_storage()
+                    .get_commit_by_hash(to_hash)
+                    .await?
+                    .ok_or_else(|| MegaError::Other(format!("invalid to_hash: {to_hash}")))?,
+            );
             let chain = collect_cl_chain(storage, &cl.from_hash, to_hash).await?;
             let txn = storage.begin_db_transaction().await?;
             cl_stg
@@ -276,6 +283,15 @@ impl<
             let updated_cl = cl_stg.get_cl_in_txn(&cl.link, &txn).await?.ok_or_else(|| {
                 MegaError::Other(format!("CL {} disappeared after hash update", cl.link))
             })?;
+            self.clref_acceptor
+                .accept(
+                    &self.clref_visitor,
+                    &updated_cl,
+                    to_hash,
+                    &dst_commit.tree_id.to_string(),
+                    &txn,
+                )
+                .await?;
             cl_stg
                 .invalidate_ci_check_in_txn(&updated_cl.link, &txn)
                 .await?;
@@ -308,7 +324,6 @@ impl<
         username: &str,
     ) -> Result<mega_cl::Model, MegaError> {
         reject_trunk_cl_write(storage)?;
-        let cl_link = generate_link();
         let dst_commit = Commit::from_mega_model(
             storage
                 .mono_storage()
@@ -323,6 +338,7 @@ impl<
         // CL ref.
         let chain = collect_cl_chain(storage, from_hash, to_hash).await?;
         let txn = storage.begin_db_transaction().await?;
+        let cl_link = generate_link();
         let cl = cl_stg
             .new_cl_model_in_txn(
                 repo_path,
@@ -557,7 +573,7 @@ mod tests {
                 prefix: "mc04-test".to_string(),
             }),
         };
-        OnpushCodeEdit::from("/", "main", &mc04_sha(0), &api)
+        OnpushCodeEdit::from("/", "main", &mc04_sha(0), &api, storage.mono_storage())
     }
 
     #[tokio::test]
@@ -737,7 +753,8 @@ mod tests {
                 prefix: "clb15-test".to_string(),
             }),
         };
-        let editor = OnpushCodeEdit::from("/", "main", &mc04_sha(800), &api);
+        let editor =
+            OnpushCodeEdit::from("/", "main", &mc04_sha(800), &api, storage.mono_storage());
 
         // 1. create_new_cl -> head_revision = 1 and 1 cl.created outbox row.
         let cl1 = editor
@@ -848,21 +865,14 @@ mod tests {
             .save_refs(main_ref.clone(), None)
             .await
             .expect("save main ref");
-        let cl_ref = mega_refs::Model {
-            id: crate::callisto::entity_ext::generate_id(),
-            path: "/".to_owned(),
-            ref_name: format!("refs/cl/{}", cl1.link),
-            ref_commit_hash: mc04_sha(802),
-            ref_tree_hash: MC04_TREE.to_owned(),
-            created_at: now,
-            updated_at: now,
-            is_cl: true,
-        };
-        storage
+        // OnpushCodeEdit already persisted and advanced refs/cl/<link> atomically.
+        let cl_ref = storage
             .mono_storage()
-            .save_refs(cl_ref, None)
+            .get_ref_by_name(&format!("refs/cl/{}", cl1.link))
             .await
-            .expect("save cl ref");
+            .expect("query cl ref")
+            .expect("refs/cl/<link> must already exist from OnpushCodeEdit");
+        assert_eq!(cl_ref.ref_commit_hash, mc04_sha(802));
 
         let up_to_date = api
             .update_branch("tester", &cl1.link)
@@ -1060,5 +1070,60 @@ mod tests {
         assert_eq!(outbox_rows.len(), 1);
         assert_eq!(outbox_rows[0].event_type, "cl.created");
         assert_eq!(outbox_rows[0].head_revision, 1);
+
+        // 3. OnpushCodeEdit creates CL + refs/cl/<cl.link> + cl_webhook_outbox atomically
+        //    with the same generated link, and advances refs/cl/<cl.link> atomically on update.
+        let onpush = crate::ceres::code_edit::on_push::OnpushCodeEdit::from(
+            "/project",
+            "main",
+            &mc04_sha(900),
+            &api,
+            storage.mono_storage(),
+        );
+        let pushed_cl = onpush
+            .create_new_cl(
+                &storage,
+                "/project",
+                &mc04_sha(900),
+                &mc04_sha(901),
+                "tester",
+            )
+            .await
+            .expect("onpush create_new_cl succeeds");
+        let pushed_ref_name = format!("refs/cl/{}", pushed_cl.link);
+        let pushed_ref = storage
+            .mono_storage()
+            .get_ref_by_name(&pushed_ref_name)
+            .await
+            .expect("query pushed ref")
+            .expect("refs/cl/<link> must be persisted atomically");
+        assert_eq!(pushed_ref.ref_commit_hash, mc04_sha(901));
+        let push_outbox = cl_webhook_outbox::Entity::find()
+            .filter(cl_webhook_outbox::Column::ClLink.eq(&pushed_cl.link))
+            .all(conn)
+            .await
+            .expect("query push outbox");
+        assert_eq!(push_outbox.len(), 1);
+        assert_eq!(push_outbox[0].cl_link, pushed_cl.link);
+
+        // Advance existing CL to commit 902 -> refs/cl/<link> must advance atomically.
+        mc04_seed(&storage, vec![mc04_commit_row(902, &[901])]).await;
+        onpush
+            .update_existing_cl(
+                pushed_cl.clone(),
+                &storage,
+                &mc04_sha(900),
+                &mc04_sha(902),
+                "tester",
+            )
+            .await
+            .expect("onpush update_existing_cl succeeds");
+        let advanced_ref = storage
+            .mono_storage()
+            .get_ref_by_name(&pushed_ref_name)
+            .await
+            .expect("query advanced ref")
+            .expect("refs/cl/<link> exists");
+        assert_eq!(advanced_ref.ref_commit_hash, mc04_sha(902));
     }
 }

@@ -23,7 +23,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    callisto::{entity_ext::generate_link, mega_refs, sea_orm_active_enums::RefTypeEnum},
+    callisto::sea_orm_active_enums::RefTypeEnum,
     ceres::{
         api_service::{cache::GitObjectCache, mono_api_service::MonoApiService},
         code_edit::{model::collect_cl_chain, on_push::OnpushCodeEdit},
@@ -39,7 +39,7 @@ use crate::{
     },
     common::{
         errors::{MegaError, PathPolicyError},
-        utils::{self, MEGA_BRANCH_NAME, is_protocol_zero_id},
+        utils::{MEGA_BRANCH_NAME, is_protocol_zero_id},
     },
     config::PushPolicy,
     contract::policy::notify::{
@@ -977,30 +977,28 @@ impl Monorepo {
         let Some(chain) = self.build_push_chain(cmd).await? else {
             return Ok(());
         };
-        let cl_link = self.fetch_or_new_cl_link(&chain.base).await?;
-        let ref_name = utils::cl_ref_name(&cl_link);
-
-        let existing = match txn {
-            Some(t) => storage.get_ref_by_name_in_txn(&ref_name, t).await?,
-            None => storage.get_ref_by_name(&ref_name).await?,
-        };
-
-        // `ref_commit_hash` and `ref_tree_hash` come from the same tip commit
-        // (`cmd.new_id` and its tree).
-        if let Some(mut cl_ref) = existing {
-            cl_ref.ref_commit_hash = chain.tip.id.to_string();
-            cl_ref.ref_tree_hash = chain.tip.tree_id.to_string();
-            storage.update_ref(cl_ref, txn).await?;
-        } else {
-            let new_ref = mega_refs::Model::new(
-                &self.path,
-                ref_name,
-                chain.tip.id.to_string(),
-                chain.tip.tree_id.to_string(),
-                true,
-            );
-            storage.save_refs(new_ref, txn).await?;
+        let path_str = self
+            .path
+            .to_str()
+            .ok_or_else(|| MegaError::Other("repository path is not valid UTF-8".into()))?;
+        if is_protocol_zero_id(&chain.base)
+            && self
+                .storage
+                .cl_storage()
+                .get_open_cl_by_path(path_str, &self.username())
+                .await?
+                .is_none()
+        {
+            return Err(MegaError::Other(
+                "Can not init directory under monorepo directory!".to_string(),
+            ));
         }
+        // Non-delete CL refs (`refs/cl/<link>`) are persisted atomically with
+        // `mega_cl`, `cl_commits`, and `cl_webhook_outbox` inside
+        // `OnpushCodeEdit::update_or_create_cl` during
+        // `run_mono_post_push_pipeline`. Deferring the ref upsert avoids
+        // pre-writing a mismatched or orphaned `refs/cl/*` if the CL
+        // transaction rolls back or races with a closed CL.
         Ok(())
     }
 
@@ -1022,10 +1020,12 @@ impl Monorepo {
             &self.base_branch,
             &from_hash,
             &mono_api_service,
+            self.storage.mono_storage(),
         );
         let cl = editor
             .update_or_create_cl(&self.storage, &from_hash, &to_hash, &username)
             .await?;
+        *self.cl_link.write().await = Some(cl.link.clone());
         // MC-04: the commit listing is rebuilt in the CL update's own
         // transaction (code_edit/model.rs). A CL whose listing is missing or
         // does not cover its current `to_hash` — legacy CLs, or intermediate
@@ -1097,8 +1097,8 @@ impl Monorepo {
     ///    keeps the B3 create semantics.
     /// 3. MC-03 chain validation — the primary branch command's resolved
     ///    [`PushChain`] is validated against storage, with the path's existing
-    ///    open CL (queried on the same path as `fetch_or_new_cl_link` /
-    ///    `update_or_create_cl`) supplying the ADR-MC-07 cumulative boundary.
+    ///    open CL (queried on the same path as `update_or_create_cl`) supplying
+    ///    the ADR-MC-07 cumulative boundary.
     ///
     /// A failure aborts `finalize_receive_pack`; the protocol layer marks every
     /// still-`ok` branch command `ng` with this message. The ADR-MC-05 no-op
@@ -1308,28 +1308,6 @@ impl Monorepo {
             .expect("push_chain_cache lock poisoned")
             .insert(cmd.new_id.clone(), chain.clone());
         Ok(chain)
-    }
-
-    async fn fetch_or_new_cl_link(&self, from_hash: &str) -> Result<String, MegaError> {
-        let storage = self.storage.cl_storage();
-        let path_str = self.path.to_str().unwrap();
-        let cl_link = match storage
-            .get_open_cl_by_path(path_str, &self.username())
-            .await?
-        {
-            Some(cl) => cl.link.clone(),
-            None => {
-                if is_protocol_zero_id(from_hash) {
-                    return Err(MegaError::Other(
-                        "Can not init directory under monorepo directory!".to_string(),
-                    ));
-                }
-                generate_link()
-            }
-        };
-        let mut lock = self.cl_link.write().await;
-        *lock = Some(cl_link.clone());
-        Ok(cl_link)
     }
 
     pub fn username(&self) -> String {
@@ -4923,5 +4901,93 @@ mod tests {
             crate::config::MonoObjectFormat::Blake3,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn review_finalize_persists_cl_ref_atomically_with_cl_and_outbox() {
+        use crate::callisto::cl_webhook_outbox;
+
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        let (root_commit_id, _root_tree_id) = seed_root_with_dir(&storage, "foo").await;
+
+        let new_tree = Tree::from_tree_items(vec![blob_item(
+            "hello.txt",
+            "dddddddddddddddddddddddddddddddddddddddd",
+        )])
+        .expect("new tree");
+        let parent_oid = ObjectHash::from_str(&root_commit_id).expect("parent oid");
+        let new_commit = Commit::from_tree_id(new_tree.id, vec![parent_oid], "feat: atomic cl ref");
+        let new_commit_id = new_commit.id.to_string();
+        let new_tree_id = new_tree.id.to_string();
+
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![new_tree], new_commit.id, None)
+            .await
+            .expect("save new tree");
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit], None)
+            .await
+            .expect("save new commit");
+
+        let cmd = RefCommand::new(
+            root_commit_id.clone(),
+            new_commit_id.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let mut pack_commits = HashSet::new();
+        pack_commits.insert(new_commit_id.clone());
+        let repo = test_monorepo(&storage, vec![cmd], pack_commits.clone(), pack_commits);
+
+        // Pre-pipeline step must NOT pre-write any refs/cl/* row for non-delete review pushes.
+        repo.persist_mono_branch_cl_mega_refs_transaction()
+            .await
+            .expect("pre-pipeline step succeeds");
+        let mono = storage.mono_storage();
+        let conn = mono.get_connection();
+        let pre_cl_refs = mega_refs::Entity::find()
+            .filter(mega_refs::Column::IsCl.eq(true))
+            .count(conn)
+            .await
+            .expect("count pre-pipeline cl refs");
+        assert_eq!(
+            pre_cl_refs, 0,
+            "non-delete review push must not pre-write refs/cl/* before CL transaction"
+        );
+
+        // Full review finalize atomically creates mega_cl, refs/cl/<cl.link>, and outbox with the exact same link.
+        repo.finalize_receive_pack()
+            .await
+            .expect("review finalize_receive_pack succeeds");
+
+        let cl = storage
+            .cl_storage()
+            .get_open_cl_by_path("/", "tester")
+            .await
+            .expect("query open cl")
+            .expect("open cl must exist");
+        assert_eq!(cl.to_hash, new_commit_id);
+        assert_eq!(repo.cl_link.read().await.as_deref(), Some(cl.link.as_str()));
+
+        let cl_refs = mega_refs::Entity::find()
+            .filter(mega_refs::Column::IsCl.eq(true))
+            .all(conn)
+            .await
+            .expect("query cl refs");
+        assert_eq!(cl_refs.len(), 1, "exactly one refs/cl/* row must exist");
+        assert_eq!(cl_refs[0].ref_name, format!("refs/cl/{}", cl.link));
+        assert_eq!(cl_refs[0].ref_commit_hash, new_commit_id);
+        assert_eq!(cl_refs[0].ref_tree_hash, new_tree_id);
+
+        let outbox = cl_webhook_outbox::Entity::find()
+            .filter(cl_webhook_outbox::Column::ClLink.eq(&cl.link))
+            .all(conn)
+            .await
+            .expect("query cl webhook outbox");
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].event_type, "cl.created");
+        assert_eq!(outbox[0].head_revision, 1);
     }
 }
