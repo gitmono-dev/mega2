@@ -124,6 +124,21 @@ pub fn ci_check_satisfies_cl(
     Ok(())
 }
 
+/// Format a CI merge-gate rejection for HTTP `ApiError` conversion (`409 Conflict`)
+/// while keeping the underlying domain/queue reason free of transport markers.
+pub fn format_ci_merge_gate_http_error(reason: &str) -> String {
+    if reason.contains("[code:") {
+        reason.to_owned()
+    } else {
+        format!("[code:409] {reason}")
+    }
+}
+
+/// Returns true when a merge failure reason originated from `ci_check_satisfies_cl`.
+pub fn is_ci_merge_gate_rejection(reason: &str) -> bool {
+    reason.contains("cannot be merged:") && reason.contains("CI status check")
+}
+
 #[derive(Clone)]
 pub struct ClStorage {
     pub base: BaseStorage,

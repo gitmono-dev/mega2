@@ -462,4 +462,74 @@ mod tests {
             assert!(!message.contains(object_key), "{message}");
         }
     }
+
+    #[tokio::test]
+    async fn ci_merge_gate_error_maps_to_http_409_without_code_prefix() {
+        let now = chrono::Utc::now().naive_utc();
+        let cl = crate::callisto::mega_cl::Model {
+            id: 1,
+            link: "CLCI409A".to_owned(),
+            title: "ci gate 409".to_owned(),
+            merge_date: None,
+            status: crate::callisto::sea_orm_active_enums::MergeStatusEnum::Open,
+            path: "/project".to_owned(),
+            from_hash: "a".repeat(40),
+            to_hash: "b".repeat(40),
+            created_at: now,
+            updated_at: now,
+            username: "tester".to_owned(),
+            base_branch: "main".to_owned(),
+            revision: 0,
+            head_revision: 2,
+        };
+        let failed_ci = crate::callisto::check_result::Model {
+            id: 1,
+            path: "/project".to_owned(),
+            cl_link: cl.link.clone(),
+            commit_id: cl.to_hash.clone(),
+            check_type_code: crate::callisto::sea_orm_active_enums::CheckTypeEnum::CiStatus,
+            status: "FAILED".to_owned(),
+            message: "Build failed".to_owned(),
+            created_at: now,
+            updated_at: now,
+            head_revision: 2,
+            ci_task_id: Some("task-1".to_owned()),
+            ci_attempt_id: Some("att-1".to_owned()),
+            ci_generation: 1,
+            details_url: None,
+        };
+
+        let raw_reason =
+            crate::jupiter::storage::cl_storage::ci_check_satisfies_cl(&cl, Some(&failed_ci))
+                .expect_err("failed CI must reject merge");
+        // Domain/queue message stored in push_queue.error_message must stay clean of transport markers.
+        assert!(
+            !raw_reason.contains("[code:"),
+            "domain CI gate reason must not embed transport marker: {raw_reason}"
+        );
+        assert!(crate::jupiter::storage::cl_storage::is_ci_merge_gate_rejection(&raw_reason));
+
+        // HTTP conversion boundary wraps the reason with [code:409] and ApiError strips it on output.
+        let git_err = git_internal::errors::GitError::CustomError(
+            crate::jupiter::storage::cl_storage::format_ci_merge_gate_http_error(&raw_reason),
+        );
+        let api_err = ApiError::from(git_err);
+        assert_eq!(api_err.status(), StatusCode::CONFLICT);
+
+        let resp = api_err.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_message = json["err_message"].as_str().unwrap();
+        assert!(
+            !err_message.contains("[code:409]"),
+            "response must strip [code:409] prefix: {err_message}"
+        );
+        assert!(
+            err_message.contains("CI status check is FAILED (expected PASSED)"),
+            "{err_message}"
+        );
+    }
 }

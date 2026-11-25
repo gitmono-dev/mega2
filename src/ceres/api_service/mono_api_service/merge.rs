@@ -161,9 +161,16 @@ impl super::MonoApiService {
                     )));
                 }
                 QueueWaitResult::Rejected { id, message } => {
-                    return Err(GitError::CustomError(format!(
-                        "merge rejected for push_queue id {id}: {message}"
-                    )));
+                    let err_msg = if crate::jupiter::storage::cl_storage::is_ci_merge_gate_rejection(
+                        &message,
+                    ) {
+                        crate::jupiter::storage::cl_storage::format_ci_merge_gate_http_error(
+                            &message,
+                        )
+                    } else {
+                        format!("merge rejected for push_queue id {id}: {message}")
+                    };
+                    return Err(GitError::CustomError(err_msg));
                 }
                 QueueWaitResult::Ready { id } => {
                     let outcome = self
@@ -199,7 +206,15 @@ impl super::MonoApiService {
                                 .map_err(|e| GitError::CustomError(e.to_string()))?;
                         }
                         ExecuteOutcome::Failed { message, .. } => {
-                            return Err(GitError::CustomError(message));
+                            let err_msg =
+                                if crate::jupiter::storage::cl_storage::is_ci_merge_gate_rejection(
+                                    &message,
+                                ) {
+                                    crate::jupiter::storage::cl_storage::format_ci_merge_gate_http_error(&message)
+                                } else {
+                                    message
+                                };
+                            return Err(GitError::CustomError(err_msg));
                         }
                         ExecuteOutcome::HardStopped { id } => {
                             return Err(GitError::CustomError(format!(
@@ -257,8 +272,13 @@ impl super::MonoApiService {
             .get_ci_check_result(&cl.link)
             .await
             .map_err(|e| GitError::CustomError(format!("Failed to load CI check result: {e}")))?;
-        crate::jupiter::storage::cl_storage::ci_check_satisfies_cl(cl, ci_row.as_ref())
-            .map_err(GitError::CustomError)
+        crate::jupiter::storage::cl_storage::ci_check_satisfies_cl(cl, ci_row.as_ref()).map_err(
+            |reason| {
+                GitError::CustomError(
+                    crate::jupiter::storage::cl_storage::format_ci_merge_gate_http_error(&reason),
+                )
+            },
+        )
     }
 
     /// Apply all CL changes onto the target_head in-memory and construct +
@@ -2291,5 +2311,47 @@ mod ci_merge_gate_tests {
                 MergeStatusEnum::Open
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ci_merge_gate_queue_rejected_maps_to_http_409() {
+        let (_temp, storage, service, _cl, _sha_b) = seed_mergeable_cl(true, "CLQ409A").await;
+        let ctx = MergeExecContext {
+            storage: storage.clone(),
+            git_object_cache: service.git_object_cache.clone(),
+            abort_before_cl_status: false,
+            pause_after_apply: Duration::ZERO,
+            pause_after_apply_barrier: None,
+        };
+        let ci_err = service
+            .follow_merge_queue(
+                QueueWaitResult::Rejected {
+                    id: 99,
+                    message:
+                        "CL CLQ409A cannot be merged: CI status check is FAILED (expected PASSED)"
+                            .to_owned(),
+                },
+                &ctx,
+            )
+            .await
+            .expect_err("CI-rejected queue outcome must return error");
+        let ci_api = crate::common::errors::ApiError::from(ci_err);
+        assert_eq!(ci_api.status(), axum::http::StatusCode::CONFLICT);
+
+        let other_err = service
+            .follow_merge_queue(
+                QueueWaitResult::Rejected {
+                    id: 100,
+                    message: "unexpected internal failure".to_owned(),
+                },
+                &ctx,
+            )
+            .await
+            .expect_err("non-CI queue rejection must return error");
+        let other_api = crate::common::errors::ApiError::from(other_err);
+        assert_eq!(
+            other_api.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
