@@ -569,7 +569,10 @@ impl ClStorage {
                        to_hash = $2,
                        updated_at = $3,
                        revision = revision + 1,
-                       head_revision = head_revision + 1
+                       head_revision = CASE
+                           WHEN to_hash IS DISTINCT FROM $2 THEN head_revision + 1
+                           ELSE head_revision
+                       END
                  WHERE link = $4
                    AND revision = $5
                    AND status = 'open'::merge_status_enum
@@ -1974,5 +1977,60 @@ mod tests {
             outbox_rows.is_empty(),
             "rolled-back transaction must leave zero cl_webhook_outbox rows"
         );
+    }
+
+    #[tokio::test]
+    async fn cas_update_cl_hashes_preserves_head_revision_when_to_hash_unchanged() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let conn = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&conn, true).await.expect("migrations");
+        let storage = ClStorage {
+            base: BaseStorage::new(std::sync::Arc::new(conn)),
+        };
+
+        let cl = storage
+            .new_cl_model(
+                "/project/demo",
+                "CLHREV01",
+                "head_revision unchanged to_hash test",
+                "main",
+                &mc04_sha(1),
+                &mc04_sha(2),
+                "alice",
+            )
+            .await
+            .expect("create CL");
+        assert_eq!(cl.revision, 0);
+        assert_eq!(cl.head_revision, 1);
+
+        // Updating only from_hash while keeping to_hash unchanged advances TP-07
+        // optimistic CAS `revision`, but preserves `head_revision`.
+        let txn = storage.get_connection().begin().await.expect("begin txn");
+        assert!(
+            storage
+                .cas_update_cl_hashes_in_txn(&cl, &mc04_sha(9), &cl.to_hash, &txn)
+                .await
+                .expect("cas update from_hash only")
+        );
+        txn.commit().await.expect("commit txn");
+        let after_from_only = storage.get_cl(&cl.link).await.expect("read").expect("cl");
+        assert_eq!(after_from_only.from_hash, mc04_sha(9));
+        assert_eq!(after_from_only.to_hash, mc04_sha(2));
+        assert_eq!(after_from_only.revision, 1);
+        assert_eq!(after_from_only.head_revision, 1);
+
+        // Advancing to_hash increments both `revision` and `head_revision`.
+        let txn = storage.get_connection().begin().await.expect("begin txn");
+        assert!(
+            storage
+                .cas_update_cl_hashes_in_txn(&after_from_only, &mc04_sha(9), &mc04_sha(3), &txn)
+                .await
+                .expect("cas update to_hash")
+        );
+        txn.commit().await.expect("commit txn");
+        let after_head_move = storage.get_cl(&cl.link).await.expect("read").expect("cl");
+        assert_eq!(after_head_move.to_hash, mc04_sha(3));
+        assert_eq!(after_head_move.revision, 2);
+        assert_eq!(after_head_move.head_revision, 2);
     }
 }

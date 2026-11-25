@@ -986,8 +986,8 @@ async fn queue_merge_new_id_differs_from_landed_commit() {
     let parents: Vec<String> = serde_json::from_value(landed.parents_id).unwrap_or_default();
     assert_eq!(
         parents,
-        vec![to_hash.clone()],
-        "parent is execute-time to_hash"
+        vec![cl.from_hash.clone()],
+        "ADR-MC-01: landed merge commit is single-parented on pre-merge main head"
     );
     let row = crate::callisto::push_queue::Entity::find()
         .filter(crate::callisto::push_queue::Column::OperationId.eq(&cl.link))

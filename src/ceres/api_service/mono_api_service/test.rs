@@ -360,6 +360,11 @@ async fn test_root_merge_flow_updates_cl_ref_and_main() {
     .expect("root merge flow should produce ref updates");
 
     assert_eq!(commits.len(), 1);
+    assert_eq!(
+        commits[0].parent_commit_ids,
+        vec![ObjectHash::from_str("3333333333333333333333333333333333333333").unwrap()],
+        "ADR-MC-01: root merge commit must parent on pre-merge main head, not refs/cl/*"
+    );
     assert_eq!(updates.len(), 2);
     assert!(!new_commit_id.is_empty());
 

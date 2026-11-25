@@ -387,21 +387,23 @@ impl MonoServiceLogic {
         // (plan-20260923 ADR-FU-02).
         let commit_msg = format_commit_msg(commit_msg, None);
         for update in &result.ref_updates {
-            // GAP-07 / ADR-MC-01 coupling — re-review both before changing
-            // this lookup: the synthesized trunk commit's parent is the FIRST
-            // candidate ref on the update's path, and
-            // `get_refs_for_paths_and_cls` sorts by `ref_name` ascending, so
-            // `refs/cl/<cl.link>` (when present in the candidate set) sorts
-            // before `refs/heads/main` and the parent becomes the CL tip
-            // instead of the pre-merge main head. Under GAP-07's naming
-            // divergence the push-side CL ref name differs from the CL row's
-            // link, so the candidate set contains no matching CL ref for a
-            // never-updated CL and the parent lands on main's head — the MC-06
-            // e2e pins that shape. A GAP-07 same-source fix makes the CL ref
-            // always match, flipping every merge parent to the chain tip and
-            // reversing ADR-MC-01's "chain commits never reach trunk"
-            // invariant.
-            if let Some(p_ref) = refs.iter().find(|r| r.path == update.path) {
+            // ADR-MC-01: the synthesized trunk commit must always be
+            // single-parented on the pre-merge `refs/heads/main` head when
+            // present on `update.path`, never on `refs/cl/<link>` (which sorts
+            // before `refs/heads/main` in `get_refs_for_paths_and_cls`).
+            // Preserving `main` as parent keeps ADR-MC-01's "chain commits
+            // never reach trunk" invariant intact even with same-source
+            // `refs/cl/<cl.link>` persistence.
+            let cl_ref = refs
+                .iter()
+                .find(|r| r.path == update.path && r.ref_name.starts_with("refs/cl/"));
+            let main_ref = refs
+                .iter()
+                .find(|r| r.path == update.path && r.ref_name == MEGA_BRANCH_NAME);
+            let parent_ref = main_ref
+                .or(cl_ref)
+                .or_else(|| refs.iter().find(|r| r.path == update.path));
+            if let Some(p_ref) = parent_ref {
                 let commit = Commit::from_tree_id(
                     update.tree_id,
                     vec![
@@ -424,9 +426,11 @@ impl MonoServiceLogic {
                     });
                 };
 
-                push_update(&p_ref.ref_name);
-                if p_ref.ref_name.starts_with("refs/cl/") {
+                if let Some(cl) = cl_ref {
+                    push_update(&cl.ref_name);
                     push_update(MEGA_BRANCH_NAME);
+                } else {
+                    push_update(&p_ref.ref_name);
                 }
             }
         }

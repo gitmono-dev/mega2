@@ -4185,8 +4185,7 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
         &["-C", clone_name, "rev-parse", "HEAD"],
     );
 
-    // First push: creates the CL and the push-side CL ref (name generated
-    // independently of the CL row's link — discovered via `is_cl`).
+    // First push: creates the CL and its canonical `refs/cl/<cl.link>` ref.
     let refspec = format!("HEAD:refs/heads/{branch}");
     let push1 = git_cli::git_cli(
         &env.case_dir,
@@ -4207,7 +4206,15 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
     let cl_refs = cl_ref_rows(&env.database.db_url);
     assert_eq!(cl_refs.len(), 1, "exactly one CL ref after the first push");
     let first_ref = cl_refs[0].0.clone();
+    let first_tree = cl_refs[0].2.clone();
     assert_eq!(cl_refs[0].1, c1, "first CL ref must point at c1");
+
+    // Seed a distinct stale CL ref to delete alongside the active branch
+    // update (now that the active CL persists its canonical `refs/cl/<link>`
+    // atomically, deleting that same ref while updating the same CL would
+    // immediately recreate it at c2).
+    let stale_ref = "refs/cl/MC06STALE";
+    insert_cl_ref(&env.database.db_url, stale_ref, &c1, &first_tree);
 
     // c2 on top of c1.
     fs::write(clone.join("mc06-mixed-2.txt"), b"mc06 mixed c2\n").expect("write c2 file");
@@ -4233,7 +4240,7 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
         &["-C", clone_name, "rev-parse", "HEAD"],
     );
 
-    // ONE receive-pack: delete the first CL ref + push the c2 update. The
+    // ONE receive-pack: delete the stale CL ref + push the c2 update. The
     // delete must not trip the ADR-MC-04 multi-branch refusal.
     let mixed = git_cli::git_cli(
         &env.case_dir,
@@ -4247,7 +4254,7 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
             "pack.depth=0",
             "push",
             "origin",
-            &format!(":{first_ref}"),
+            &format!(":{stale_ref}"),
             &refspec,
         ],
     );
@@ -4256,7 +4263,7 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
         "a receive-pack with one delete plus one update must be accepted",
     );
 
-    // The delete took effect; the update advanced the CL and its ref.
+    // The delete took effect; the update advanced the CL and its canonical ref.
     let cl_refs = cl_ref_rows(&env.database.db_url);
     assert_eq!(
         cl_refs.len(),
@@ -4264,8 +4271,12 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
         "exactly one CL ref after the mixed push: {cl_refs:?}"
     );
     assert_ne!(
-        cl_refs[0].0, first_ref,
+        cl_refs[0].0, stale_ref,
         "the deleted CL ref must be gone: {cl_refs:?}"
+    );
+    assert_eq!(
+        cl_refs[0].0, first_ref,
+        "the active CL must retain its canonical refs/cl/<link>: {cl_refs:?}"
     );
     assert_eq!(cl_refs[0].1, c2, "the CL ref must advance to c2");
     let cls = cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
@@ -4277,7 +4288,7 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
     assert_eq!(cls[0].to_hash, c2, "CL to_hash advances to c2");
     let remote_cls = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
     assert!(
-        !remote_cls.iter().any(|r| r == &first_ref),
+        !remote_cls.iter().any(|r| r == stale_ref),
         "deleted CL ref must not be advertised: {remote_cls:?}"
     );
     assert!(
@@ -5212,6 +5223,26 @@ fn cl_rows_for_user(db_url: &str, username: &str) -> Vec<ClRow> {
 /// by CL link: the push-side CL ref name is generated independently of the CL
 /// row's link (pre-existing behavior — see `fetch_or_new_cl_link` vs
 /// `create_new_cl`), so the two cannot be joined by name.
+fn insert_cl_ref(db_url: &str, ref_name: &str, commit: &str, tree: &str) {
+    let ref_sql = ref_name.replace('\'', "''");
+    let commit_sql = commit.replace('\'', "''");
+    let tree_sql = tree.replace('\'', "''");
+    let id = 9_000_000_000_001_i64 + i64::from(std::process::id());
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB to insert CL ref: {err}"));
+        execute_postgres(
+            &db,
+            format!(
+                "INSERT INTO mega_refs (id, path, ref_name, ref_commit_hash, ref_tree_hash, created_at, updated_at, is_cl) \
+                 VALUES ({id}, '/', '{ref_sql}', '{commit_sql}', '{tree_sql}', NOW(), NOW(), true)"
+            ),
+        )
+        .await;
+    });
+}
+
 fn update_cl_ref_commit(db_url: &str, ref_name: &str, commit: &str) {
     let ref_sql = ref_name.replace('\'', "''");
     let commit_sql = commit.replace('\'', "''");
