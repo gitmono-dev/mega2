@@ -996,7 +996,7 @@ impl WebhookService {
     ) {
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return,
+            _ = shutdown.cancelled() => (),
             res = timeout(Duration::from_secs(5), self.handle_outbox_failure(row, lease_owner, msg)) => {
                 if res.is_err() {
                     tracing::warn!(
@@ -1948,15 +1948,15 @@ mod tests {
         let secret = "clb18-concurrent-batch-secret-32-bytes-min";
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_seen_concurrent = Arc::new(AtomicUsize::new(0));
-        let received = Arc::new(Mutex::new(
-            Vec::<(String, String, String, String, String)>::new(),
-        ));
+        type ReceivedWebhookCall = (String, String, String, String, String);
+
+        let received = Arc::new(Mutex::new(Vec::<ReceivedWebhookCall>::new()));
 
         #[derive(Clone)]
         struct MockState {
             in_flight: Arc<AtomicUsize>,
             max_seen: Arc<AtomicUsize>,
-            received: Arc<Mutex<Vec<(String, String, String, String, String)>>>,
+            received: Arc<Mutex<Vec<ReceivedWebhookCall>>>,
         }
         let app = Router::new()
             .route(

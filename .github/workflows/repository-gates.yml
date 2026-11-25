@@ -49,10 +49,33 @@ jobs:
         with:
           save-if: "true"
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.143
+      - name: Ensure cargo-nextest
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_version="0.9.143"
+          if command -v cargo-nextest >/dev/null 2>&1; then
+            installed_version="$(cargo-nextest --version | awk 'NR==1 && $1=="cargo-nextest" { print $2 }')"
+            if [[ "${installed_version}" == "${required_version}" ]]; then
+              cargo-nextest --version
+              exit 0
+            fi
+          fi
+          install_dir="${RUNNER_TEMP}/cargo-nextest-${required_version}/bin"
+          archive="${RUNNER_TEMP}/cargo-nextest-${required_version}.tar.gz"
+          trap 'rm -f "${archive}"' EXIT
+          mkdir -p "${install_dir}"
+          curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused \
+            --fail --location --silent --show-error \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${required_version}/cargo-nextest-${required_version}-x86_64-unknown-linux-gnu.tar.gz" \
+            --output "${archive}"
+          printf '%s  %s\n' \
+            '66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e' \
+            "${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${install_dir}" cargo-nextest
+          chmod 0755 "${install_dir}/cargo-nextest"
+          printf '%s\n' "${install_dir}" >> "${GITHUB_PATH}"
+          "${install_dir}/cargo-nextest" --version
 
       - name: Check formatting
         run: cargo +nightly fmt --all --check
