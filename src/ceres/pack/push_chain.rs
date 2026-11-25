@@ -11,16 +11,17 @@
 //! primary branch command's chain before any ref/CL mutation, alongside the
 //! ADR-MC-04 multi-branch rejection.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use git_internal::internal::object::commit::Commit;
 
 use crate::{
-    callisto::{mega_cl, sea_orm_active_enums::RefTypeEnum},
+    callisto::{mega_cl, mega_cl_commits, sea_orm_active_enums::RefTypeEnum},
     ceres::protocol::import_refs::{CommandType, RefCommand},
     common::{errors::MegaError, utils::is_protocol_zero_id},
     jupiter::{
-        storage::mono_storage::MonoStorage, utils::converter::commit_from_mega_model_with_kind,
+        storage::{base_storage::StorageConnector, mono_storage::MonoStorage},
+        utils::converter::commit_from_mega_model_with_kind,
     },
 };
 
@@ -71,6 +72,11 @@ pub struct PushChain {
     /// post-finalize commit binding (Codex R1 P1-2) covers only the newly
     /// introduced members.
     pub ordered_commits: Vec<Commit>,
+    /// Already-known first-parent ancestors redundantly carried by a non-thin
+    /// pack and already read during [`Self::resolve`], keyed by commit id ->
+    /// parent ids. Reused by [`Self::validate`] so non-thin packs never re-read
+    /// the same commits from storage twice (MC-03 single-read budget).
+    known_ancestor_parents: HashMap<String, Vec<String>>,
 }
 
 /// Result of resolving a branch command against post-unpack storage.
@@ -276,18 +282,33 @@ impl PushChain {
                     )));
                 }
 
-                let (ordered_commits, fork) = if tip_is_new {
+                let (ordered_commits, fork, known_ancestor_parents) = if tip_is_new {
                     // Normal push: the increment is the leading newly
                     // introduced prefix of the path; the fork point is the
                     // first already-known path member (a redundantly carried
                     // ancestor) or, when the whole path is new, the parent
-                    // just past the path end.
+                    // just past the path end. Retain already-read known
+                    // ancestors so `validate` never re-reads them from DB.
                     let split = path
                         .iter()
                         .position(|c| !new_commit_ids.contains(&c.id.to_string()));
                     match split {
-                        Some(i) => (path[..i].to_vec(), Some(path[i].id.to_string())),
-                        None => (path.clone(), walk_stop),
+                        Some(i) => {
+                            let known: HashMap<String, Vec<String>> = path[i..]
+                                .iter()
+                                .map(|c| {
+                                    (
+                                        c.id.to_string(),
+                                        c.parent_commit_ids
+                                            .iter()
+                                            .map(ToString::to_string)
+                                            .collect(),
+                                    )
+                                })
+                                .collect();
+                            (path[..i].to_vec(), Some(path[i].id.to_string()), known)
+                        }
+                        None => (path.clone(), walk_stop, HashMap::new()),
                     }
                 } else {
                     // No-new content push (a verbatim retry, or a hand-crafted
@@ -301,7 +322,7 @@ impl PushChain {
                     // as on the first attempt (ADR-FU-07) — using the root as
                     // the baseline made retries drift to "push chain is
                     // broken".
-                    (path.clone(), walk_stop)
+                    (path.clone(), walk_stop, HashMap::new())
                 };
                 let base = if !is_protocol_zero_id(&cmd.old_id) {
                     // The ref contract pins the base; the validator's
@@ -317,7 +338,9 @@ impl PushChain {
                     // (`old_id`-bearing updates get the same guarantee from
                     // the validator: the base must terminate the increment
                     // walk, and the cumulative history walk reads it.)
-                    if storage.get_commit_by_hash(&fork).await?.is_none() {
+                    if !known_ancestor_parents.contains_key(&fork)
+                        && storage.get_commit_by_hash(&fork).await?.is_none()
+                    {
                         return Err(MegaError::Other(format!(
                             "push chain base {fork} for `{}` is not a known commit; \
                              fetch the repository and rebase onto a known head before pushing",
@@ -330,6 +353,7 @@ impl PushChain {
                     base,
                     tip,
                     ordered_commits,
+                    known_ancestor_parents,
                 })))
             }
         }
@@ -360,6 +384,7 @@ impl PushChain {
                 base: cmd.old_id.clone(),
                 tip: tip.clone(),
                 ordered_commits: vec![tip],
+                known_ancestor_parents: HashMap::new(),
             });
         }
 
@@ -405,6 +430,7 @@ impl PushChain {
             base: cmd.old_id.clone(),
             tip,
             ordered_commits: path,
+            known_ancestor_parents: HashMap::new(),
         })
     }
 
@@ -481,14 +507,92 @@ impl PushChain {
                          history"
                     )));
                 }
-                // The oldest increment commit must be parented on the base —
-                // otherwise the claimed base is not on the tip's chain.
+                // The oldest increment commit must be parented on `self.base`,
+                // OR — when updating an existing open CL whose `refs/cl/<link>`
+                // was already advertised while `refs/heads/main` (`cmd.old_id`)
+                // stayed frozen at `cl.from_hash` — parented on an already-
+                // accepted commit of this exact open CL (`parent_id == cl.to_hash`
+                // or present in `mega_cl_commits` for `cl.link`, O(1) primary-key
+                // lookup). Because `mega_cl_commits` holds only commits already
+                // accepted into `(cl.from_hash, cl.to_hash]` (matching the
+                // acceptance boundary of existing new-branch open-CL updates),
+                // unaccepted/rejected commits left in `mega_commit` (linear or
+                // merge) can never be bridged, while walking directly from
+                // `parent_id` down to `cl.from_hash` strictly bounds DB reads to
+                // `<= max_commits` (MC-03 budget) and allows trimming an
+                // oversized legacy CL down within `max_commits`.
                 None if first_parent.as_deref() != Some(self.base.as_str()) => {
-                    return Err(MegaError::Other(format!(
-                        "push chain is broken: base {} is not on the first-parent chain of \
-                         tip {tip_id}; rebase onto the current base and re-push",
-                        self.base
-                    )));
+                    let mut bridged = false;
+                    if let (Some(cl), Some(parent_id)) = (open_cl, first_parent.as_deref())
+                        && self.base == cl.from_hash
+                    {
+                        use sea_orm::EntityTrait;
+
+                        let parent_accepted = if parent_id == cl.to_hash {
+                            true
+                        } else {
+                            mega_cl_commits::Entity::find_by_id((
+                                cl.link.clone(),
+                                parent_id.to_owned(),
+                            ))
+                            .one(storage.get_connection())
+                            .await?
+                            .is_some()
+                        };
+                        if parent_accepted {
+                            let mut bridge_visited = HashSet::new();
+                            let mut cur = parent_id.to_owned();
+                            let mut bridge_len = 0usize;
+                            while cur != cl.from_hash {
+                                if !bridge_visited.insert(cur.clone()) {
+                                    return Err(MegaError::Other(format!(
+                                        "push chain contains a cycle at commit {cur}; \
+                                         re-create the commits with a linear history and re-push"
+                                    )));
+                                }
+                                bridge_len += 1;
+                                if increment_len + bridge_len > max_commits {
+                                    return Err(MegaError::Other(format!(
+                                        "updating CL {} would exceed the {max_commits}-commit \
+                                         cumulative limit ({} → {tip_id}); \
+                                         merge the current CL first or open a new CL",
+                                        cl.link, cl.from_hash
+                                    )));
+                                }
+                                let parents: Vec<String> = if let Some(cached) =
+                                    self.known_ancestor_parents.get(&cur)
+                                {
+                                    cached.clone()
+                                } else {
+                                    let Some(model) = storage.get_commit_by_hash(&cur).await?
+                                    else {
+                                        break;
+                                    };
+                                    serde_json::from_value(model.parents_id.clone()).map_err(
+                                            |e| {
+                                                MegaError::Other(format!(
+                                                    "push chain is broken: corrupt parents_id for commit {cur}: {e}"
+                                                ))
+                                            },
+                                        )?
+                                };
+                                let Some(next) = parents.first() else {
+                                    break;
+                                };
+                                cur = next.clone();
+                            }
+                            if cur == cl.from_hash {
+                                bridged = true;
+                            }
+                        }
+                    }
+                    if !bridged {
+                        return Err(MegaError::Other(format!(
+                            "push chain is broken: base {} is not on the first-parent chain of \
+                             tip {tip_id}; rebase onto the current base and re-push",
+                            self.base
+                        )));
+                    }
                 }
                 _ => {}
             }
@@ -514,18 +618,22 @@ impl PushChain {
                          re-create the commits with a linear history and re-push"
                     )));
                 }
-                let model = storage.get_commit_by_hash(&current).await?.ok_or_else(|| {
-                    MegaError::Other(format!(
-                        "push chain is broken: commit {current} is missing from storage; \
-                         re-push including the full commit history"
-                    ))
-                })?;
-                let parents: Vec<String> = serde_json::from_value(model.parents_id.clone())
-                    .map_err(|e| {
-                        MegaError::Other(format!(
-                            "push chain is broken: corrupt parents_id for commit {current}: {e}"
-                        ))
-                    })?;
+                let parents: Vec<String> =
+                    if let Some(cached) = self.known_ancestor_parents.get(&current) {
+                        cached.clone()
+                    } else {
+                        let model = storage.get_commit_by_hash(&current).await?.ok_or_else(|| {
+                            MegaError::Other(format!(
+                                "push chain is broken: commit {current} is missing from storage; \
+                                 re-push including the full commit history"
+                            ))
+                        })?;
+                        serde_json::from_value(model.parents_id.clone()).map_err(|e| {
+                            MegaError::Other(format!(
+                                "push chain is broken: corrupt parents_id for commit {current}: {e}"
+                            ))
+                        })?
+                    };
                 history_len += 1;
                 if increment_len + history_len > max_commits {
                     // The increment itself fit; the overflow comes from the
@@ -590,7 +698,10 @@ pub fn attribution_commit_id(commands: &[RefCommand]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, str::FromStr};
+    use std::{
+        collections::{HashMap, HashSet},
+        str::FromStr,
+    };
 
     use git_internal::{
         hash::ObjectHash,
@@ -599,7 +710,7 @@ mod tests {
             signature::{Signature, SignatureType},
         },
     };
-    use sea_orm::{EntityTrait, Set};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
     use tempfile::TempDir;
 
     use super::{
@@ -1438,6 +1549,7 @@ mod tests {
             base: base.to_string(),
             tip,
             ordered_commits: ordered,
+            known_ancestor_parents: HashMap::new(),
         }
     }
 
@@ -1859,5 +1971,233 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_thin_open_cl_update_when_old_id_is_cl_from_hash() {
+        let (_temp, storage) = setup_storage().await;
+        // C0 = frozen main / cl.from_hash; C1 -> C2 already accepted on open CL.
+        let c0 = sha(9100);
+        insert_linear_chain(&storage, 9100, 2).await;
+        let c1 = sha(9101);
+        let c2 = sha(9102);
+        let cl = open_cl(&c0, &c2);
+        // Persist accepted CL commit membership in `mega_cl_commits` (mirrors
+        // MC-04 atomic CL creation/update persistence).
+        {
+            let now = chrono::Utc::now().naive_utc();
+            crate::callisto::mega_cl_commits::Entity::insert_many([
+                crate::callisto::mega_cl_commits::ActiveModel {
+                    created_at: sea_orm::Set(now),
+                    updated_at: sea_orm::Set(now),
+                    cl_link: sea_orm::Set(cl.link.clone()),
+                    commit_sha: sea_orm::Set(c1.clone()),
+                    author_name: sea_orm::Set("tester".to_owned()),
+                    author_email: sea_orm::Set("tester@example.com".to_owned()),
+                    message: sea_orm::Set("c1".to_owned()),
+                },
+                crate::callisto::mega_cl_commits::ActiveModel {
+                    created_at: sea_orm::Set(now),
+                    updated_at: sea_orm::Set(now),
+                    cl_link: sea_orm::Set(cl.link.clone()),
+                    commit_sha: sea_orm::Set(c2.clone()),
+                    author_name: sea_orm::Set("tester".to_owned()),
+                    author_email: sea_orm::Set("tester@example.com".to_owned()),
+                    message: sea_orm::Set("c2".to_owned()),
+                },
+            ])
+            .exec(storage.mono_storage().get_connection())
+            .await
+            .expect("seed mega_cl_commits for cl");
+        }
+
+        // 1. Follow-up push C3 (parent C2 == cl.to_hash) against refs/heads/main
+        //    (old_id = C0) with thin pack containing only [C3] must pass.
+        let c3 = commit_row(9103, &sha(9103), std::slice::from_ref(&c2));
+        let cmd3 = branch_command(c0.clone(), c3.commit_id.clone());
+        chain_from_increment(&c0, std::slice::from_ref(&c3))
+            .validate(
+                &cmd3,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
+            .await
+            .expect("thin follow-up push onto open CL tip must pass");
+
+        // 2. Amend push C2' (parent C1 in mega_cl_commits) against
+        //    refs/heads/main (old_id = C0) must also pass.
+        let c2_amend = commit_row(9192, &sha(9192), std::slice::from_ref(&c1));
+        let cmd_amend = branch_command(c0.clone(), c2_amend.commit_id.clone());
+        chain_from_increment(&c0, std::slice::from_ref(&c2_amend))
+            .validate(
+                &cmd_amend,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
+            .await
+            .expect("amend push onto accepted CL ancestor must pass");
+
+        // 3a. Unaccepted linear commit left in mega_commit from a rejected push
+        //     must NEVER be bridged without attribution.
+        let rogue_linear = commit_row(9149, &sha(9149), std::slice::from_ref(&c0));
+        insert_commits(&storage, vec![rogue_linear.clone()]).await;
+        let child_of_linear = commit_row(
+            9148,
+            &sha(9148),
+            std::slice::from_ref(&rogue_linear.commit_id),
+        );
+        let cmd_linear = branch_command(c0.clone(), child_of_linear.commit_id.clone());
+        let linear_err = chain_from_increment(&c0, std::slice::from_ref(&child_of_linear))
+            .validate(
+                &cmd_linear,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
+            .await
+            .expect_err("unaccepted linear commit outside CL must be rejected");
+        assert!(
+            linear_err.to_string().contains("push chain is broken"),
+            "{linear_err}"
+        );
+
+        // 3b. Previously-rejected merge commit in DB outside CL must also be rejected.
+        let rogue_merge = commit_row(9150, &sha(9150), &[c0.clone(), sha(9999)]);
+        insert_commits(&storage, vec![rogue_merge.clone()]).await;
+        let child_of_rogue = commit_row(
+            9151,
+            &sha(9151),
+            std::slice::from_ref(&rogue_merge.commit_id),
+        );
+        let cmd_rogue = branch_command(c0.clone(), child_of_rogue.commit_id.clone());
+        let rogue_err = chain_from_increment(&c0, std::slice::from_ref(&child_of_rogue))
+            .validate(
+                &cmd_rogue,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
+            .await
+            .expect_err("rejected merge commit outside CL must be rejected");
+        assert!(
+            rogue_err.to_string().contains("push chain is broken"),
+            "{rogue_err}"
+        );
+
+        // 4. Cumulative limit still enforced across increment + bridged CL history.
+        let c0_lim = sha(9400);
+        insert_linear_chain(&storage, 9400, 249).await;
+        let mut cl_lim = open_cl(&c0_lim, &sha(9400 + 249));
+        cl_lim.link = "CLCHAIN02".to_owned();
+        let over_inc = increment_rows(9400 + 249, 2);
+        let cmd_over = branch_command(c0_lim.clone(), over_inc[0].commit_id.clone());
+        let lim_err = chain_from_increment(&c0_lim, &over_inc)
+            .validate(
+                &cmd_over,
+                &storage.mono_storage(),
+                Some(&cl_lim),
+                MAX_CL_CHAIN_COMMITS,
+            )
+            .await
+            .expect_err("249 bridged + 2 increment must exceed 250 cumulative limit");
+        assert!(
+            lim_err.to_string().contains("cumulative limit"),
+            "{lim_err}"
+        );
+
+        // 5. Trimming an oversized existing CL by branching off an older accepted
+        //    commit (in mega_cl_commits) so the resulting chain fits within
+        //    `max_commits` must pass in O(new chain length) PK reads.
+        {
+            let now = chrono::Utc::now().naive_utc();
+            crate::callisto::mega_cl_commits::Entity::insert(
+                crate::callisto::mega_cl_commits::ActiveModel {
+                    created_at: sea_orm::Set(now),
+                    updated_at: sea_orm::Set(now),
+                    cl_link: sea_orm::Set(cl_lim.link.clone()),
+                    commit_sha: sea_orm::Set(sha(9400 + 2)),
+                    author_name: sea_orm::Set("tester".to_owned()),
+                    author_email: sea_orm::Set("tester@example.com".to_owned()),
+                    message: sea_orm::Set("c2".to_owned()),
+                },
+            )
+            .exec(storage.mono_storage().get_connection())
+            .await
+            .expect("seed accepted ancestor in mega_cl_commits");
+        }
+        let trim_tip = commit_row(9800, &sha(9800), std::slice::from_ref(&sha(9400 + 2)));
+        let cmd_trim = branch_command(c0_lim.clone(), trim_tip.commit_id.clone());
+        chain_from_increment(&c0_lim, std::slice::from_ref(&trim_tip))
+            .validate(&cmd_trim, &storage.mono_storage(), Some(&cl_lim), 5)
+            .await
+            .expect("trimming an oversized CL down within max_commits must pass");
+
+        // 6. Non-thin pack carrying already-known CL ancestors must reuse
+        //    resolve's cached parents with ZERO duplicate DB reads in validate
+        //    (both for existing-ref updates and new-branch zero-old_id pushes).
+        let c4 = commit_row(9104, &sha(9104), std::slice::from_ref(&c2));
+        insert_commits(&storage, vec![c4.clone()]).await;
+        let cmd4 = branch_command(c0.clone(), c4.commit_id.clone());
+        let cmd4_new_branch = branch_command(ZERO_ID.to_string(), c4.commit_id.clone());
+        let pack_ids: HashSet<String> = [c4.commit_id.clone(), c2.clone(), c1.clone()]
+            .into_iter()
+            .collect();
+        let new_ids: HashSet<String> = [c4.commit_id.clone()].into_iter().collect();
+        let resolved_non_thin = PushChain::resolve(
+            &cmd4,
+            &pack_ids,
+            &new_ids,
+            Some(Commit::from_mega_model(c4.clone())),
+            &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
+        )
+        .await
+        .expect("resolve non-thin pack succeeds");
+        let PushChainResolution::Chain(non_thin_chain) = resolved_non_thin else {
+            panic!("expected Chain");
+        };
+        let resolved_new_branch = PushChain::resolve(
+            &cmd4_new_branch,
+            &pack_ids,
+            &new_ids,
+            Some(Commit::from_mega_model(c4.clone())),
+            &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
+        )
+        .await
+        .expect("resolve non-thin new-branch pack succeeds");
+        let PushChainResolution::Chain(new_branch_chain) = resolved_new_branch else {
+            panic!("expected Chain");
+        };
+        assert_eq!(new_branch_chain.base, c2);
+        // Delete c1 and c2 from mega_commit BEFORE validate to prove validate
+        // performs zero duplicate DB reads for ancestors already read by resolve.
+        crate::callisto::mega_commit::Entity::delete_many()
+            .filter(crate::callisto::mega_commit::Column::CommitId.is_in([c1.clone(), c2.clone()]))
+            .exec(storage.mono_storage().get_connection())
+            .await
+            .expect("delete c1/c2 after resolve");
+        non_thin_chain
+            .validate(
+                &cmd4,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
+            .await
+            .expect("validate must reuse resolve's cached known ancestors without re-reading DB");
+        new_branch_chain
+            .validate(
+                &cmd4_new_branch,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
+            .await
+            .expect(
+                "new-branch validate must also reuse resolve's cached known ancestors without re-reading DB",
+            );
     }
 }
