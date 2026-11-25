@@ -65,5 +65,6 @@ pub(crate) fn mega_environment_source() -> c::Environment {
         .with_list_parse_key("oauth.session_cookie_names")
         .with_list_parse_key("monorepo.admin")
         .with_list_parse_key("monorepo.root_dirs")
+        .with_list_parse_key("webhook_delivery.allowed_private_cidrs")
         .list_separator(",")
 }

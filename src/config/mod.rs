@@ -705,6 +705,51 @@ mod test {
         assert_eq!(loaded.database.db_type, "postgres");
         assert_eq!(loaded.database.max_connection, 4);
     }
+
+    #[test]
+    fn webhook_delivery_allowed_private_cidrs_parses_comma_env_and_rejects_empty() {
+        let lock = env_lock();
+        let template = config_init_template(Path::new("/tmp/mega2-test"));
+
+        {
+            let _cidrs = EnvVarGuard::set(
+                &lock,
+                "MEGA_WEBHOOK_DELIVERY__ALLOWED_PRIVATE_CIDRS",
+                "172.16.0.0/12,10.0.0.0/8",
+            );
+            let _http = EnvVarGuard::set(&lock, "MEGA_WEBHOOK_DELIVERY__ALLOW_HTTP", "true");
+            let loaded = Config::load_str(&template).expect("comma-separated CIDRs should parse");
+            assert!(loaded.webhook_delivery.allow_http);
+            assert_eq!(
+                loaded.webhook_delivery.allowed_private_cidrs,
+                vec!["172.16.0.0/12".to_string(), "10.0.0.0/8".to_string()]
+            );
+            loaded
+                .validate()
+                .expect("parsed private CIDRs should pass config validation");
+        }
+
+        {
+            let _cidrs =
+                EnvVarGuard::set(&lock, "MEGA_WEBHOOK_DELIVERY__ALLOWED_PRIVATE_CIDRS", "");
+            let loaded = Config::load_str(&template)
+                .expect("empty CIDR env parses as single empty entry before validation");
+            assert!(
+                loaded.validate().is_err(),
+                "empty MEGA_WEBHOOK_DELIVERY__ALLOWED_PRIVATE_CIDRS must fail closed rather than silently inheriting"
+            );
+        }
+
+        {
+            let _enabled = EnvVarGuard::set(&lock, "MEGA_CI_CHECKS__ENABLED", "true");
+            let _hmac = EnvVarGuard::set(&lock, "MEGA_CI_CHECKS__HMAC_SECRET", "");
+            let loaded = Config::load_str(&template).expect("ci_checks config parses");
+            assert!(
+                loaded.validate().is_err(),
+                "empty MEGA_CI_CHECKS__HMAC_SECRET with enabled=true must fail closed"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

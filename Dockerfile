@@ -42,6 +42,7 @@ RUN apt-get update \
 
 COPY --from=builder /usr/local/bin/mega2 /usr/local/bin/mega2
 COPY config/config.toml /etc/mega2/config.toml
+COPY config/config-review.toml /etc/mega2/config-review.toml
 
 ENV MEGA_BASE_DIR=/var/lib/mega2 \
     MEGA_CONFIG=/etc/mega2/config.toml
