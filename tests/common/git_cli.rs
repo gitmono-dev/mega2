@@ -21,6 +21,14 @@ use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 pub const GIT_CLI_UNAVAILABLE: &str = "git-cli runner unavailable";
 pub const COMPOSE_PROJECT: &str = "mega2-it";
 pub const GIT_ASKPASS_ENV: &str = "MEGA2_IT_GIT_PASSWORD";
+
+pub fn compose_project() -> String {
+    env::var("MEGA2_IT_PROJECT")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| COMPOSE_PROJECT.to_owned())
+}
 pub const DEFAULT_GIT_AUTH_USER: &str = "it-git-cli";
 /// Host loopback for probes from the cargo test process (curl, TcpStream, service bind).
 pub const HOST_LOOPBACK: &str = "127.0.0.1";
@@ -413,12 +421,13 @@ pub fn mega2_ssh_repo_url(port: u16, user: &str) -> String {
 /// does not contend on the Compose project lock (parallel cargo tests were
 /// timing out the 15s probe while waiting on that lock).
 fn running_git_cli_container_id() -> Result<String, String> {
+    let project = compose_project();
     let mut command = Command::new("docker");
     command.args([
         "ps",
         "-q",
         "--filter",
-        &format!("label=com.docker.compose.project={COMPOSE_PROJECT}"),
+        &format!("label=com.docker.compose.project={project}"),
         "--filter",
         "label=com.docker.compose.service=git-cli",
         "--filter",
@@ -435,7 +444,7 @@ fn running_git_cli_container_id() -> Result<String, String> {
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if id.is_empty() {
         Err(format!(
-            "no running git-cli container for project {COMPOSE_PROJECT}"
+            "no running git-cli container for project {project}"
         ))
     } else {
         // `docker ps -q` may return multiple lines if replicas exist; take first.

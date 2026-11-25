@@ -94,10 +94,40 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/lib/mega2-it.sh
-          mega2_it_ensure_env_test
+          export MEGA2_IT_PROJECT="mega2-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export MEGA2_IT_NETWORK="${MEGA2_IT_PROJECT}-net"
+          export MEGA2_IT_GIT_WORKDIR="/tmp/mega2-git-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export MEGA2_IT_PG_PORT=0
+          export MEGA2_IT_REDIS_PORT=0
+          export MEGA2_IT_RUSTFS_PORT=0
+          export MEGA2_IT_RUSTFS_CONSOLE_PORT=0
+          {
+            echo "MEGA2_IT_PROJECT=${MEGA2_IT_PROJECT}"
+            echo "MEGA2_IT_NETWORK=${MEGA2_IT_NETWORK}"
+            echo "MEGA2_IT_GIT_WORKDIR=${MEGA2_IT_GIT_WORKDIR}"
+          } >> "${GITHUB_ENV}"
           mega2_it_prepare_git_workdir
-          docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git \
+          docker compose -p "${MEGA2_IT_PROJECT}" -f docker/docker-compose.test.yml --profile git \
             up -d --build --wait postgres redis rustfs rustfs-init git-cli
+
+          pg_port="$(docker compose -p "${MEGA2_IT_PROJECT}" -f docker/docker-compose.test.yml port postgres 5432 | head -n 1)"
+          pg_port="${pg_port##*:}"
+          redis_port="$(docker compose -p "${MEGA2_IT_PROJECT}" -f docker/docker-compose.test.yml port redis 6379 | head -n 1)"
+          redis_port="${redis_port##*:}"
+          rustfs_port="$(docker compose -p "${MEGA2_IT_PROJECT}" -f docker/docker-compose.test.yml port rustfs 9000 | head -n 1)"
+          rustfs_port="${rustfs_port##*:}"
+          test -n "${pg_port}" && test -n "${redis_port}" && test -n "${rustfs_port}"
+
+          printf '%s\n' \
+            "export MEGA2_IT_PROJECT=${MEGA2_IT_PROJECT}" \
+            "export MEGA2_IT_GIT_WORKDIR=${MEGA2_IT_GIT_WORKDIR}" \
+            "export MEGA_DATABASE__DB_TYPE=postgres" \
+            "export MEGA_DATABASE__DB_URL=postgres://mega2:mega2_test_password@127.0.0.1:${pg_port}/mega2" \
+            "export MEGA2_IT_DB_ADMIN_URL=postgres://mega2:mega2_test_password@127.0.0.1:${pg_port}/mega2" \
+            "export MEGA_REDIS__URL=redis://127.0.0.1:${redis_port}" \
+            "export MEGA2_IT_RUSTFS_URL=http://127.0.0.1:${rustfs_port}" \
+            > .env.test
+          echo "==> isolated CI stack ${MEGA2_IT_PROJECT} ready (pg=${pg_port} redis=${redis_port} rustfs=${rustfs_port})"
 
       - name: Verify traces pg_trgm test prerequisites
         shell: bash
@@ -161,4 +191,9 @@ jobs:
 
       - name: Stop isolated test dependencies
         if: always()
-        run: docker compose -p mega2-it -f docker/docker-compose.test.yml --profile git down -v
+        shell: bash
+        run: |
+          docker compose -p "${MEGA2_IT_PROJECT:-mega2-it}" -f docker/docker-compose.test.yml --profile git down -v --remove-orphans
+          if [[ -n "${MEGA2_IT_GIT_WORKDIR:-}" && "${MEGA2_IT_GIT_WORKDIR}" == /tmp/mega2-git-* ]]; then
+            rm -rf "${MEGA2_IT_GIT_WORKDIR}"
+          fi

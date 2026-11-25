@@ -6293,12 +6293,13 @@ fn hp22_fetch_with_trace(case_dir: &Path, clone: &str, v0: bool) {
     let old = git_cli::git_cli_no_auth(case_dir, &["-C", clone, "rev-parse", "origin/main"]);
     git_cli::assert_git_success(&old, "HP-22 old view tip");
     let old = String::from_utf8(old.stdout).unwrap().trim().to_owned();
+    let project = git_cli::compose_project();
     let discovered = Command::new("docker")
         .args([
             "ps",
             "-q",
             "--filter",
-            "label=com.docker.compose.project=mega2-it",
+            &format!("label=com.docker.compose.project={project}"),
             "--filter",
             "label=com.docker.compose.service=git-cli",
             "--filter",

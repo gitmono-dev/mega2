@@ -3567,12 +3567,13 @@ fn view_ssh_halt_root_chain(env: &GitSshEnv) {
 }
 
 fn view_ssh_container_id() -> String {
+    let project = git_cli::compose_project();
     let output = Command::new("docker")
         .args([
             "ps",
             "-q",
             "--filter",
-            "label=com.docker.compose.project=mega2-it",
+            &format!("label=com.docker.compose.project={project}"),
             "--filter",
             "label=com.docker.compose.service=git-cli",
             "--filter",
