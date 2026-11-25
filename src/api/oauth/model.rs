@@ -11,6 +11,7 @@ pub struct WebsiteGetSessionResponse {
 #[serde(rename_all = "camelCase")]
 pub struct WebsiteSessionJson {
     pub id: String,
+    #[serde(default)]
     pub user_id: String,
 }
 
@@ -70,7 +71,22 @@ pub struct LoginUser {
 
 #[cfg(test)]
 mod tests {
-    use super::WebsiteAuthUserJson;
+    use super::{WebsiteAuthUserJson, WebsiteGetSessionResponse};
+
+    #[test]
+    fn deserializes_projected_megaui_session_without_user_id() {
+        let raw = r#"{"session":{"id":"sess-1","expiresAt":"2026-12-01T00:00:00.000Z"},"user":{"id":"u-1","name":"clbdev","email":"clbdev@example.test","image":null,"banned":false}}"#;
+        let parsed: WebsiteGetSessionResponse =
+            serde_json::from_str(raw).expect("projected session without session.userId must parse");
+        assert_eq!(parsed.session.expect("session").id, "sess-1");
+        let login = parsed
+            .user
+            .expect("user")
+            .into_login_user()
+            .expect("login user");
+        assert_eq!(login.username, "clbdev");
+        assert_eq!(login.website_user_id, "u-1");
+    }
 
     #[test]
     fn rejects_banned_users() {
