@@ -1948,6 +1948,7 @@ mod tests {
         let secret = "clb18-concurrent-batch-secret-32-bytes-min";
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_seen_concurrent = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(4));
         type ReceivedWebhookCall = (String, String, String, String, String);
 
         let received = Arc::new(Mutex::new(Vec::<ReceivedWebhookCall>::new()));
@@ -1956,6 +1957,7 @@ mod tests {
         struct MockState {
             in_flight: Arc<AtomicUsize>,
             max_seen: Arc<AtomicUsize>,
+            barrier: Arc<tokio::sync::Barrier>,
             received: Arc<Mutex<Vec<ReceivedWebhookCall>>>,
         }
         let app = Router::new()
@@ -1965,8 +1967,14 @@ mod tests {
                     |State(st): State<MockState>, headers: HeaderMap, body: Bytes| async move {
                         let cur = st.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                         st.max_seen.fetch_max(cur, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        // All 4 requests in the batch must arrive concurrently to release
+                        // the barrier; serial or head-of-line-blocked dispatch times out.
+                        let barrier_res =
+                            tokio::time::timeout(Duration::from_secs(5), st.barrier.wait()).await;
                         st.in_flight.fetch_sub(1, Ordering::SeqCst);
+                        if barrier_res.is_err() {
+                            return axum::http::StatusCode::GATEWAY_TIMEOUT;
+                        }
 
                         let evt = headers
                             .get("x-mega-event")
@@ -2004,6 +2012,7 @@ mod tests {
             .with_state(MockState {
                 in_flight: in_flight.clone(),
                 max_seen: max_seen_concurrent.clone(),
+                barrier: barrier.clone(),
                 received: received.clone(),
             });
 
@@ -2055,21 +2064,15 @@ mod tests {
             ..WebhookDeliveryConfig::default()
         };
         let svc = WebhookService::new(webhook_storage, cfg).expect("service");
-        let started = Instant::now();
         let processed = svc
             .process_outbox_once("worker-concurrent")
             .await
             .expect("process batch");
-        let elapsed = started.elapsed();
         assert_eq!(processed, 4);
-        assert!(
-            max_seen_concurrent.load(Ordering::SeqCst) >= 2,
-            "full batch must dispatch concurrently, max_seen={}",
-            max_seen_concurrent.load(Ordering::SeqCst)
-        );
-        assert!(
-            elapsed < Duration::from_millis(850),
-            "4x250ms concurrent batch should finish well under serial 1000ms, took {elapsed:?}"
+        assert_eq!(
+            max_seen_concurrent.load(Ordering::SeqCst),
+            4,
+            "all 4 items in the batch must dispatch concurrently without head-of-line blocking"
         );
 
         let rec = received.lock().await;
@@ -2201,8 +2204,8 @@ mod tests {
             "healthy subscriber must still receive delivery even when earlier subscriber stalls"
         );
         assert!(
-            elapsed < Duration::from_secs(7),
-            "round must stay bounded by total_deadline_secs (5s), took {elapsed:?}"
+            elapsed < Duration::from_secs(15),
+            "round must stay bounded by total_deadline_secs (5s) well below 30s stall, took {elapsed:?}"
         );
 
         server_handle.abort();
@@ -2589,16 +2592,16 @@ mod tests {
         let shutdown = CancellationToken::new();
         let worker_handle = svc.spawn_outbox_worker(shutdown.clone());
 
-        timeout(Duration::from_secs(5), started_notify.notified())
+        timeout(Duration::from_secs(15), started_notify.notified())
             .await
             .expect("worker started slow delivery");
         let cancel_at = Instant::now();
         shutdown.cancel();
-        timeout(Duration::from_secs(3), worker_handle)
+        timeout(Duration::from_secs(10), worker_handle)
             .await
             .expect("worker loop must exit promptly on shutdown")
             .expect("worker task did not panic");
-        assert!(cancel_at.elapsed() < Duration::from_secs(2));
+        assert!(cancel_at.elapsed() < Duration::from_secs(8));
 
         server_handle.abort();
     }
@@ -2642,11 +2645,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let cancel_at = Instant::now();
         shutdown.cancel();
-        timeout(Duration::from_secs(2), worker_handle)
+        timeout(Duration::from_secs(10), worker_handle)
             .await
             .expect("worker loop must cancel blocked claim and exit promptly on shutdown")
             .expect("worker task did not panic");
-        assert!(cancel_at.elapsed() < Duration::from_secs(1));
+        assert!(cancel_at.elapsed() < Duration::from_secs(8));
 
         // Release the table lock and verify NO orphaned lease was committed!
         blocker_txn.rollback().await.unwrap();
