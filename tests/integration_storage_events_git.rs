@@ -169,8 +169,8 @@ impl GitCase {
             .env("MEGA_DATABASE__DB_URL", &self.database.db_url)
             .env("MEGA_DATABASE__MAX_CONNECTION", "4")
             .env("MEGA_DATABASE__MIN_CONNECTION", "1")
-            .env("MEGA_DATABASE__ACQUIRE_TIMEOUT", "5")
-            .env("MEGA_DATABASE__CONNECT_TIMEOUT", "5")
+            .env("MEGA_DATABASE__ACQUIRE_TIMEOUT", "60")
+            .env("MEGA_DATABASE__CONNECT_TIMEOUT", "60")
             .env("MEGA_DATABASE__SQLX_LOGGING", "false")
             .env("MEGA_LOG__PRINT_STD", "true")
             .env("MEGA_LOG__WITH_ANSI", "false")
@@ -562,8 +562,8 @@ fn seed_storage_events_hmac(case: &GitCase, value: &str) {
             db_url = "{}"
             max_connection = 4
             min_connection = 1
-            acquire_timeout = 5
-            connect_timeout = 5
+            acquire_timeout = 60
+            connect_timeout = 60
             sqlx_logging = false
             "#,
             case.database.db_url

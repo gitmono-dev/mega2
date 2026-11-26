@@ -107,7 +107,16 @@ fn s3_client(s3_cfg: &S3Config, endpoint: Option<&str>) -> OrbitResult<AmazonS3>
                 object_store::ClientOptions::new()
                     .with_allow_http(true)
                     .with_timeout(std::time::Duration::from_secs(120)),
-            );
+            )
+            .with_retry(object_store::RetryConfig {
+                backoff: object_store::BackoffConfig {
+                    init_backoff: std::time::Duration::from_millis(500),
+                    max_backoff: std::time::Duration::from_secs(15),
+                    base: 2.0,
+                },
+                max_retries: 10,
+                retry_timeout: std::time::Duration::from_secs(180),
+            });
     }
     builder
         .build()

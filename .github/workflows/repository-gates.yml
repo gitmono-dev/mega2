@@ -87,7 +87,11 @@ jobs:
         run: cargo build
 
       - name: Build tests
-        run: cargo build --tests
+        run: |
+          cargo build -p mega2 --features fastcdc
+          mkdir -p target/wh06-fastcdc-on/debug
+          cp target/debug/mega2 target/wh06-fastcdc-on/debug/mega2
+          cargo build --bins --tests
 
       - name: Start isolated test dependencies
         shell: bash
@@ -180,13 +184,14 @@ jobs:
           set -euo pipefail
           source .env.test
           export no_proxy="$NO_PROXY"
+          export MEGA2_IT_WH06_FASTCDC_ON_BIN="${PWD}/target/wh06-fastcdc-on/debug/mega2"
           # One process per test. `.config/nextest.toml` caps the library
-          # tests that clone a Postgres database at 6 at a time (`pg`), and
+          # tests that clone a Postgres database at 4 at a time (`pg`), and
           # runs the integration binaries one test at a time: those that run
           # Git in the shared git-cli container in one lane (`git-cli`), the
-          # rest in another (`it-serial`). Other library tests keep full core
-          # parallelism. The library sets `doctest = false`, so nextest
-          # covers every test target.
+          # rest (plus RustFS-heavy library tests) in another (`it-serial`).
+          # Other library tests keep full core parallelism. The library sets
+          # `doctest = false`, so nextest covers every test target.
           cargo nextest run --workspace --no-fail-fast
 
       - name: Stop isolated test dependencies

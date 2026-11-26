@@ -2519,8 +2519,8 @@ mod disabled_http {
                 .env("MEGA_DATABASE__DB_URL", &self.database_url)
                 .env("MEGA_DATABASE__MAX_CONNECTION", "4")
                 .env("MEGA_DATABASE__MIN_CONNECTION", "1")
-                .env("MEGA_DATABASE__ACQUIRE_TIMEOUT", "5")
-                .env("MEGA_DATABASE__CONNECT_TIMEOUT", "5")
+                .env("MEGA_DATABASE__ACQUIRE_TIMEOUT", "60")
+                .env("MEGA_DATABASE__CONNECT_TIMEOUT", "60")
                 .env("MEGA_DATABASE__SQLX_LOGGING", "false")
                 .env(
                     "MEGA_REDIS__URL",

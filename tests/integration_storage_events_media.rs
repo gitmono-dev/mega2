@@ -202,8 +202,8 @@ paths = ["/acme"]
             .env("MEGA_DATABASE__DB_URL", &self.database.db_url)
             .env("MEGA_DATABASE__MAX_CONNECTION", "4")
             .env("MEGA_DATABASE__MIN_CONNECTION", "1")
-            .env("MEGA_DATABASE__ACQUIRE_TIMEOUT", "5")
-            .env("MEGA_DATABASE__CONNECT_TIMEOUT", "5")
+            .env("MEGA_DATABASE__ACQUIRE_TIMEOUT", "60")
+            .env("MEGA_DATABASE__CONNECT_TIMEOUT", "60")
             .env("MEGA_DATABASE__SQLX_LOGGING", "false")
             .env("MEGA_LOG__PRINT_STD", "true")
             .env("MEGA_LOG__WITH_ANSI", "false")
@@ -320,6 +320,27 @@ impl Drop for ServiceProcess {
 /// its own target dir so the default-feature `cargo test` build lock is never
 /// contended. Bounded at 20 minutes per binary (cold cache).
 fn ensure_binary(feature_on: bool) -> PathBuf {
+    if feature_on == cfg!(feature = "fastcdc") {
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_mega2"));
+        assert!(
+            binary.is_file(),
+            "expected the built binary at {}",
+            binary.display()
+        );
+        return binary;
+    }
+    if feature_on
+        && let Ok(prebuilt) = std::env::var("MEGA2_IT_WH06_FASTCDC_ON_BIN")
+        && !prebuilt.is_empty()
+    {
+        let binary = PathBuf::from(prebuilt);
+        assert!(
+            binary.is_file(),
+            "expected the prebuilt feature-on binary at {}",
+            binary.display()
+        );
+        return binary;
+    }
     let target_dir = if feature_on {
         "target/wh06-fastcdc-on"
     } else {
@@ -445,8 +466,8 @@ fn seed_target_secret(case: &MediaCase, off_binary: &Path) {
             db_url = "{}"
             max_connection = 4
             min_connection = 1
-            acquire_timeout = 5
-            connect_timeout = 5
+            acquire_timeout = 60
+            connect_timeout = 60
             sqlx_logging = false
             "#,
             case.database.db_url

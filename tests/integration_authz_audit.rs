@@ -540,8 +540,8 @@ impl Fixture {
                  db_url = \"{}\"\n\
                  max_connection = 4\n\
                  min_connection = 1\n\
-                 acquire_timeout = 5\n\
-                 connect_timeout = 5\n\
+                 acquire_timeout = 60\n\
+                 connect_timeout = 60\n\
                  sqlx_logging = false\n\
                  \n\
                  [redis]\n\
@@ -575,8 +575,8 @@ impl Fixture {
         env.set("MEGA_DATABASE__DB_URL", &database.db_url);
         env.set("MEGA_DATABASE__MAX_CONNECTION", "4");
         env.set("MEGA_DATABASE__MIN_CONNECTION", "1");
-        env.set("MEGA_DATABASE__ACQUIRE_TIMEOUT", "5");
-        env.set("MEGA_DATABASE__CONNECT_TIMEOUT", "5");
+        env.set("MEGA_DATABASE__ACQUIRE_TIMEOUT", "60");
+        env.set("MEGA_DATABASE__CONNECT_TIMEOUT", "60");
         env.set("MEGA_DATABASE__SQLX_LOGGING", "false");
         env.set("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local");
         env.set("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &object_root);

@@ -164,7 +164,7 @@ async fn test_db_config_kind(kind: TestDatabaseKind) -> (DbConfig, TestSchemaGua
         // instead of hanging it; it is simply long enough that only a real
         // problem reaches it.
         acquire_timeout: 180,
-        connect_timeout: 30,
+        connect_timeout: 60,
         sqlx_logging: false,
     };
     (config, schema)
@@ -286,9 +286,10 @@ fn drop_test_schema(admin_url: &str, schema: &str) -> bool {
             .await;
         // A barrier wait inside DROP deadlocks with a backend that is still
         // starting. Cancel that wait so the other session can finish, then
-        // retry once it has gone.
+        // retry once it has gone. Keep the timeout generous enough that an
+        // unblocked DROP DATABASE under CI load finishes without aborting.
         let _ = admin
-            .execute_unprepared("SET statement_timeout = '500ms'")
+            .execute_unprepared("SET statement_timeout = '5s'")
             .await;
         let drop_sql = format!("DROP DATABASE IF EXISTS {schema}");
         let mut dropped = admin.execute_unprepared(&drop_sql).await;
@@ -1171,7 +1172,7 @@ fn drop_traces_isolated_database(admin_url: &str, name: &str) -> bool {
             ))
             .await;
         let _ = admin
-            .execute_unprepared("SET statement_timeout = '500ms'")
+            .execute_unprepared("SET statement_timeout = '5s'")
             .await;
         let drop_sql = format!("DROP DATABASE IF EXISTS {name}");
         let mut dropped = admin.execute_unprepared(&drop_sql).await;
