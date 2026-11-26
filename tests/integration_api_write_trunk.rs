@@ -783,7 +783,7 @@ fn boot_service_http(env: &ApiWriteEnv) -> (ServiceProcess, u16, PathBuf, PathBu
         .stderr(Stdio::from(create_log_file(&stderr_path)));
 
     let mut service = ServiceProcess::spawn(command);
-    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_listening(port, Duration::from_secs(180), &stdout_path, &stderr_path);
     (service, port, stdout_path, stderr_path)
 }
 

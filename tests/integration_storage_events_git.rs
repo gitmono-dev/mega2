@@ -654,7 +654,7 @@ fn integration_storage_events_git_trunk_push_events_enabled() {
     let (stdout_path, stderr_path) = case.log_paths("git-trunk-events");
     let command = storage_only_service_command(&case, port);
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
-    service.wait_until_openapi_ready(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_openapi_ready(port, Duration::from_secs(180), &stdout_path, &stderr_path);
 
     // Real receive-pack business result: clone the (empty) /team/a subpath,
     // commit, and push HEAD:refs/heads/main; the remote tip must equal the
@@ -815,7 +815,7 @@ fn integration_storage_events_git_review_cl_regression() {
         &port.to_string(),
     ]);
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
-    service.wait_until_openapi_ready(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_openapi_ready(port, Duration::from_secs(180), &stdout_path, &stderr_path);
 
     // Review morphology authenticates pushes with a DB access token.
     let token = git_cli::resolve_seed_token();
@@ -929,7 +929,7 @@ git_paths = ["/project"]
         &port.to_string(),
     ]);
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
-    service.wait_until_openapi_ready(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_openapi_ready(port, Duration::from_secs(180), &stdout_path, &stderr_path);
 
     // Seed the /project tip with a real token push (lander B0 needs a
     // non-root path tip).

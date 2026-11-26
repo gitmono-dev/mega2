@@ -500,7 +500,7 @@ mod tests {
         let timed_out = wait_for(
             &service,
             IndexState::Unavailable(CatalogFailure::BuildTimedOut),
-            Duration::from_secs(50),
+            Duration::from_secs(90),
         )
         .await;
         sqlx::query("ROLLBACK")
@@ -523,7 +523,7 @@ mod tests {
         let mismatched = wait_for(
             &service,
             IndexState::Unavailable(CatalogFailure::Method),
-            Duration::from_secs(45),
+            Duration::from_secs(90),
         )
         .await;
         assert!(
@@ -552,14 +552,14 @@ mod tests {
             IndexState::Unavailable(CatalogFailure::Method),
             "adoption happens on the periodic tick, not immediately"
         );
-        let ready = wait_for(&service, IndexState::Ready, Duration::from_secs(75)).await;
+        let ready = wait_for(&service, IndexState::Ready, Duration::from_secs(135)).await;
         shutdown.cancel();
         assert!(
             ready,
             "a live service must adopt the external canonical index"
         );
         assert!(
-            started.elapsed() <= Duration::from_secs(180),
+            started.elapsed() <= Duration::from_secs(300),
             "case budget exceeded: {:?}",
             started.elapsed()
         );

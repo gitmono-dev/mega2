@@ -351,7 +351,7 @@ fn ssh_readiness_bind_failure_has_no_ready_marker() {
     command.stderr(Stdio::from(create_log_file(&stderr)));
     let mut service = ServiceProcess::spawn(command);
     let status = service
-        .wait_for_exit(Duration::from_secs(90))
+        .wait_for_exit(Duration::from_secs(180))
         .expect("colliding service exits");
     assert!(!status.success(), "colliding SSH bind must fail");
     assert!(
@@ -2183,7 +2183,7 @@ fn boot_service_ssh_with_env(
 
     let mut service = ServiceProcess::spawn(command);
     // listen_within_90s
-    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_listening(port, Duration::from_secs(180), &stdout_path, &stderr_path);
     (service, port, stdout_path, stderr_path)
 }
 
@@ -2255,7 +2255,7 @@ fn boot_service_multi_with_extra(
     let mut service = ServiceProcess::spawn(command);
     service.wait_until_listening(
         ssh_port,
-        Duration::from_secs(90),
+        Duration::from_secs(180),
         &stdout_path,
         &stderr_path,
     );

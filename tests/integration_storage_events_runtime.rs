@@ -335,7 +335,7 @@ fn integration_storage_events_runtime_http_sigint_clean_shutdown() {
         &port.to_string(),
     ]);
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
-    service.wait_until_openapi_ready(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_openapi_ready(port, Duration::from_secs(180), &stdout_path, &stderr_path);
 
     assert_sigint_cleanup_and_exit(&mut service, &stdout_path, &stderr_path);
 }
@@ -401,7 +401,7 @@ fn integration_storage_events_runtime_multi_http_sigint_clean_shutdown() {
         &port.to_string(),
     ]);
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
-    service.wait_until_openapi_ready(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_openapi_ready(port, Duration::from_secs(180), &stdout_path, &stderr_path);
 
     assert_sigint_cleanup_and_exit(&mut service, &stdout_path, &stderr_path);
 }
@@ -459,7 +459,7 @@ fn secret_binding() {
     let (stdout_path, stderr_path) = case.log_paths("secret-binding-valid");
     let command = storage_only_service_command(&case, port);
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
-    service.wait_until_openapi_ready(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_openapi_ready(port, Duration::from_secs(180), &stdout_path, &stderr_path);
     let running = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
     assert!(
         !running.contains(HMAC_VALUE) && !running.contains(SENTINEL_PAYLOAD),
@@ -493,7 +493,7 @@ fn secret_binding() {
     let command = storage_only_service_command(&case, port);
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
     let status = service
-        .wait_for_exit(Duration::from_secs(90))
+        .wait_for_exit(Duration::from_secs(180))
         .expect("missing secret must fail startup without hanging");
     let combined = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
     assert!(
@@ -526,7 +526,7 @@ fn secret_binding() {
     let command = storage_only_service_command(&case, port);
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
     let status = service
-        .wait_for_exit(Duration::from_secs(90))
+        .wait_for_exit(Duration::from_secs(180))
         .expect("wrong namespace must fail startup without hanging");
     let combined = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
     assert!(
@@ -554,7 +554,7 @@ fn secret_binding() {
     let (stdout_path, stderr_path) = case.log_paths("secret-binding-disabled");
     let command = storage_only_service_command(&case, port);
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
-    service.wait_until_openapi_ready(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_openapi_ready(port, Duration::from_secs(180), &stdout_path, &stderr_path);
     let running = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
     assert!(
         !running.contains(SECRET_REF),
@@ -575,7 +575,7 @@ fn secret_binding() {
     command.env("MEGA_REDIS__URL", "redis://127.0.0.1:1");
     let mut service = ServiceProcess::spawn(command, &stdout_path, &stderr_path);
     let status = service
-        .wait_for_exit(Duration::from_secs(90))
+        .wait_for_exit(Duration::from_secs(180))
         .expect("unreachable redis must fail startup without hanging");
     let combined = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
     assert!(

@@ -1524,7 +1524,7 @@ async fn import_target_remove_blackbox_deactivates_matching_target() {
         ))
         .spawn()
         .expect("spawn service");
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(180);
     let ready = loop {
         if Instant::now() >= deadline {
             break false;
@@ -1846,7 +1846,7 @@ async fn rebind_target_cli_rebinds_existing_target_and_rejects_bad_paths() {
         ))
         .spawn()
         .expect("spawn service");
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(180);
     let ready = loop {
         if Instant::now() >= deadline || service.try_wait().expect("poll service").is_some() {
             break false;

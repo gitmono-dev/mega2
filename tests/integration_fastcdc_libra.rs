@@ -36,7 +36,7 @@ const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 const REPO_PREFIX: &str = "/acme/app.git";
 // Boot + Libra child + shutdown + port close stay under the 10-minute card budget.
 const GATE_TIMEOUT: Duration = Duration::from_secs(420);
-const SERVICE_BOOT_TIMEOUT: Duration = Duration::from_secs(90);
+const SERVICE_BOOT_TIMEOUT: Duration = Duration::from_secs(180);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const PORT_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 

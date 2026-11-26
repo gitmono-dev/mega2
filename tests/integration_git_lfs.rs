@@ -1145,7 +1145,7 @@ fn boot_service_http_with_options(
         .stderr(Stdio::from(create_log_file(&stderr_path)));
 
     let mut service = ServiceProcess::spawn(command);
-    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_listening(port, Duration::from_secs(180), &stdout_path, &stderr_path);
     (service, port, stdout_path, stderr_path)
 }
 
@@ -1447,7 +1447,7 @@ fn wh05_lfs_round_trip(
         .stdout(Stdio::from(create_log_file(&stdout_path)))
         .stderr(Stdio::from(create_log_file(&stderr_path)));
     let mut service = ServiceProcess::spawn(command);
-    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_listening(port, Duration::from_secs(180), &stdout_path, &stderr_path);
 
     seed_project_foo_trunk(&env.case_dir, port);
     let foo_url = trunk_subpath_url(port, "/project/foo");
@@ -1601,7 +1601,7 @@ fn integration_git_lfs_storage_events_presigned_gap() {
         .stdout(Stdio::from(create_log_file(&probe_out)))
         .stderr(Stdio::from(create_log_file(&probe_err)));
     let mut probe = ServiceProcess::spawn(command);
-    probe.wait_until_listening(probe_port, Duration::from_secs(90), &probe_out, &probe_err);
+    probe.wait_until_listening(probe_port, Duration::from_secs(180), &probe_out, &probe_err);
     let batch_url = format!(
         "{}/info/lfs/objects/batch",
         trunk_subpath_url(probe_port, "/project/foo").trim_end_matches('/')

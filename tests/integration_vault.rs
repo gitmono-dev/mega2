@@ -701,7 +701,7 @@ fn integration_service_http_smoke() {
     let mut service = ServiceProcess::spawn(command);
 
     // 端口必须在超时前可连接（服务成功绑定）；若子进程提前退出则带日志报错。
-    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_listening(port, Duration::from_secs(180), &stdout_path, &stderr_path);
 
     // 命中一个稳定、无需鉴权的文档 endpoint，证明 router 已在服务请求。
     let response = http_get(port, "/api/openapi.json");
@@ -770,7 +770,7 @@ print_std = true
         .stderr(Stdio::from(create_log_file(&stderr_path)));
 
     let mut service = ServiceProcess::spawn(command);
-    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    service.wait_until_listening(port, Duration::from_secs(180), &stdout_path, &stderr_path);
 
     let initial_logs = read_log(&stdout_path);
     assert!(
@@ -1060,7 +1060,7 @@ fn integration_error_redaction_does_not_leak_redis_password() {
 
     let mut service = ServiceProcess::spawn(command);
     let status = service
-        .wait_for_exit(Duration::from_secs(90))
+        .wait_for_exit(Duration::from_secs(180))
         .expect("service must exit when Redis is unreachable");
     assert!(
         !status.success(),

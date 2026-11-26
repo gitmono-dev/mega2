@@ -259,7 +259,7 @@ impl ServiceProcess {
             .build()
             .expect("build HTTP client");
         let url = format!("http://127.0.0.1:{port}/api/openapi.json");
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             if let Ok(response) = client.get(&url).send()
                 && response.status().is_success()

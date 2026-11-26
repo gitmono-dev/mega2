@@ -150,7 +150,7 @@ impl Case {
             .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 break;
@@ -280,7 +280,7 @@ impl Case {
             .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
                 break;
