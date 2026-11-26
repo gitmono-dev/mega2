@@ -102,8 +102,12 @@ fn s3_client(s3_cfg: &S3Config, endpoint: Option<&str>) -> OrbitResult<AmazonS3>
     if let Some(endpoint) = endpoint {
         builder = builder
             .with_endpoint(endpoint)
-            .with_allow_http(true)
-            .with_virtual_hosted_style_request(false);
+            .with_virtual_hosted_style_request(false)
+            .with_client_options(
+                object_store::ClientOptions::new()
+                    .with_allow_http(true)
+                    .with_timeout(std::time::Duration::from_secs(120)),
+            );
     }
     builder
         .build()

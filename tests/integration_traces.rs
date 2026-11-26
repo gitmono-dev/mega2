@@ -6957,6 +6957,7 @@ mod disabled_http {
                 .expect("first push created scope");
             assert_eq!(stream.tip_oid.as_deref(), Some(tip.as_str()));
             assert_eq!(stream.hash_kind, kind);
+            wait_for_trace_indexed(&db, &stream.id).await;
             let scope_path = format!("/.traces/by-scope/{}.git", stream.id);
             let http_scope = git_cli::mega2_http_url(f.http_port, &scope_path);
             let session = f.key_session("traces", &writer, true).await;
@@ -8388,7 +8389,7 @@ mod disabled_http {
     /// Wait for the background journal indexer to settle before asserting that
     /// subsequent read-only Git requests do not change business state.
     async fn wait_for_trace_indexed(db: &sea_orm::DatabaseConnection, stream_id: &str) {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let total = scalar(db, &format!(
                 "SELECT count(*)::text AS value FROM trace_ref_update WHERE stream_id = '{stream_id}'"
@@ -9446,6 +9447,7 @@ mod disabled_http {
                 .as_deref(),
             Some(second.as_str())
         );
+        wait_for_trace_indexed(db, &stream.id).await;
         let second = if kind == "sha1" {
             #[cfg(target_os = "linux")]
             {
@@ -9492,6 +9494,7 @@ mod disabled_http {
                 "large stream fixture push: {}",
                 String::from_utf8_lossy(&push.stderr)
             );
+            wait_for_trace_indexed(db, &stream.id).await;
             let before = snapshot(db).await;
             http_git_failed_stream(fixture, &by_scope, &token, &large_tip, &first).await;
             unchanged(&before, &snapshot(db).await);

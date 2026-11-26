@@ -501,9 +501,28 @@ mod tests {
                         if rustfs { "RustFS" } else { "Local" }
                     );
                 }));
-                runtime
-                    .block_on(store.inner.delete(&key))
-                    .expect("cleanup owned raw key");
+                let mut delete_err = None;
+                for attempt in 0..3 {
+                    match runtime.block_on(store.inner.delete(&key)) {
+                        Ok(()) => {
+                            delete_err = None;
+                            break;
+                        }
+                        Err(err) if err.is_not_found() => {
+                            delete_err = None;
+                            break;
+                        }
+                        Err(err) => {
+                            delete_err = Some(err);
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                250 * (attempt + 1),
+                            ));
+                        }
+                    }
+                }
+                if let Some(err) = delete_err {
+                    panic!("cleanup owned raw key: {err}");
+                }
                 assert!(read().is_none(), "owned raw key leaked");
                 if let Err(panic) = result {
                     std::panic::resume_unwind(panic);

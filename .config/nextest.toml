@@ -16,6 +16,9 @@ pg = { max-threads = 6 }
 # clones from that container hang until the in-container timeout kills them,
 # so these binaries run one test at a time across all of them.
 git-cli = { max-threads = 1 }
+# Heavy RustFS tests that hammer the shared S3 test container; keep them from
+# piling on top of each other and starving 30s S3 requests under CI load.
+rustfs = { max-threads = 1 }
 # The remaining integration binaries, one test at a time, as
 # `docs/development.md` runs `integration_vault` (`--test-threads=1`).
 it-serial = { max-threads = 1 }
@@ -27,6 +30,10 @@ it-serial = { max-threads = 1 }
 # through `tests/common/git_cli.rs`.
 filter = 'binary(/^integration_(git_cli|git_lfs|git_ssh|import_hash|native_hash|native_push_hash|traces)$/)'
 test-group = 'git-cli'
+
+[[profile.default.overrides]]
+filter = 'binary(/^integration_storage_events_media$/) | (kind(lib) & test(/^jupiter::(storage::trace_object_storage::tests::raw_cross_process_rustfs_|service::trace_fetch_service::tests::)/))'
+test-group = 'rustfs'
 
 [[profile.default.overrides]]
 filter = 'kind(test)'
