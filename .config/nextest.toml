@@ -10,17 +10,18 @@ retries = 0
 # Test groups bound how many tests share one external service at a time. A
 # test belongs to the first override below whose filter matches it.
 [test-groups]
-# Library tests that clone a database from the `mega2_tpl` template.
-pg = { max-threads = 6 }
+# Library tests that clone a database from the `mega2_tpl` template. Kept at 4
+# so the shared test Postgres and self-hosted runner do not hit 5s pool acquire
+# timeouts while `git-cli` and `it-serial` boot full service instances.
+pg = { max-threads = 4 }
 # Integration binaries that drive the shared git-cli container. Concurrent
 # clones from that container hang until the in-container timeout kills them,
 # so these binaries run one test at a time across all of them.
 git-cli = { max-threads = 1 }
-# Heavy RustFS tests that hammer the shared S3 test container; keep them from
-# piling on top of each other and starving 30s S3 requests under CI load.
-rustfs = { max-threads = 1 }
-# The remaining integration binaries, one test at a time, as
-# `docs/development.md` runs `integration_vault` (`--test-threads=1`).
+# The remaining integration binaries (including RustFS-heavy media tests) plus
+# the RustFS-heavy library tests, one at a time, as `docs/development.md` runs
+# `integration_vault` (`--test-threads=1`). Sharing one serial lane keeps
+# RustFS contention low without adding an extra concurrent Postgres worker.
 it-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
@@ -32,11 +33,7 @@ filter = 'binary(/^integration_(git_cli|git_lfs|git_ssh|import_hash|native_hash|
 test-group = 'git-cli'
 
 [[profile.default.overrides]]
-filter = 'binary(/^integration_storage_events_media$/) | (kind(lib) & test(/^jupiter::(storage::trace_object_storage::tests::raw_cross_process_rustfs_|service::trace_fetch_service::tests::)/))'
-test-group = 'rustfs'
-
-[[profile.default.overrides]]
-filter = 'kind(test)'
+filter = 'kind(test) | (kind(lib) & test(/^jupiter::(storage::trace_object_storage::tests::raw_cross_process_rustfs_|service::trace_fetch_service::tests::)/))'
 test-group = 'it-serial'
 
 [[profile.default.overrides]]
@@ -44,7 +41,7 @@ test-group = 'it-serial'
 # starts 16 at once), so one of them takes the whole `pg` lane.
 filter = 'kind(lib) & test(/^jupiter::tests::schema_guard_tests::(db_cleanup_repro|db_cleanup_parallel_parent|db_namespace_pid_reuse_parent)$/)'
 test-group = 'pg'
-threads-required = 6
+threads-required = 4
 
 [[profile.default.overrides]]
 # Fail closed: every library test is capped unless its module was measured to
